@@ -56,9 +56,11 @@ const S = {
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  taskTab: null, // open tab on the task page ('overview'|'checkin'|'parameters'|'advanced'; null → auto)
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
+  approvalRequests: [], // credential decisions for the selected task
+  approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
@@ -1815,6 +1817,8 @@ const LIST_RELOAD_EVENTS = new Set([
   'task.deleted',
   'task.tags-changed',
   'task.responsibility-changed',
+  'credential.approval-requested',
+  'credential.approval-resolved',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -1876,7 +1880,8 @@ function connectWs() {
         if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
-      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
+      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
+        || ev.type === 'credential.approval-requested' || ev.type === 'credential.approval-resolved') {
         S.liveOutput = '';
         refreshTask();
       } else if (ev.type === 'session.started') {
@@ -1896,7 +1901,7 @@ function connectWs() {
     // Collaboration state changes only for collaboration events. Reloading five
     // organization endpoints for every workflow view transition multiplied the
     // websocket refresh storm without changing any of that data.
-    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
@@ -2473,7 +2478,7 @@ function runSubRow(r) {
     <div class="task-row run-row" data-id="${r.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span></div>
+        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
       <div class="task-right">${pipeline(v)}</div>
@@ -2529,6 +2534,7 @@ function taskRow(t, { showTags = true } = {}) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
+          ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
@@ -3879,6 +3885,7 @@ async function openTaskForm(workflow, draft, seedText) {
 const TASK_TABS = [
   { key: 'overview', label: 'Overview' },
   { key: 'checkin', label: 'Check-in' },
+  { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
   { key: 'advanced', label: 'Advanced' },
 ];
@@ -3888,6 +3895,7 @@ const TASK_TABS = [
 // the conversation that led here is the thing to read, so open Check-in on the
 // stage's agent. Otherwise Overview.
 function defaultTaskTab(v) {
+  if (v.approvalRequests) return 'approvals';
   return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
 }
 
@@ -4089,11 +4097,15 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.widgets = [];
   S.paramDefaults = {};
   S.attemptGroup = null;
+  S.approvalRequests = [];
+  S.approvalItems = [];
   try {
     // Start secondary resources in parallel, but let the compact task projection
     // paint as soon as it arrives. A large event history or a slow session lookup
     // must never hold the entire task page hostage.
     const draft = !!rec?.params?.draft;
+    const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+    const approvalQuery = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
     const details = Promise.all([
       // The websocket keeps this window current. Older history remains durable,
       // but opening a task should have a fixed memory and response-size budget.
@@ -4101,6 +4113,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
+      draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
+      draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId) return;
@@ -4111,7 +4125,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, approvalItems] = await details;
     if (S.selected !== taskId) return;
     // Events may have arrived over the websocket while the bounded durable window
     // was loading. Preserve those instead of replacing them with the older response.
@@ -4123,6 +4137,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    S.approvalRequests = approvalRequests;
+    S.approvalItems = approvalItems;
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
   // Param defaults only feed the Parameters tab, and resolving them costs a git
@@ -4146,11 +4162,16 @@ async function refreshTask() {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
-    const [view, widgets, sessions, attempts] = await Promise.all([
+    const rec = taskRecord(id);
+    const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+    const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const [view, widgets, sessions, attempts, approvalRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
+      api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
+      api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
     if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
       await openTask(attempts.principalAttemptId, S.taskTab);
@@ -4160,6 +4181,8 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    S.approvalRequests = approvalRequests;
+    S.approvalItems = approvalItems;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -4380,6 +4403,7 @@ function renderTaskPage() {
           <h2>${esc(v.title)}</h2>
           ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
+          ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
         <div class="meta">
           <span>${v.workflowOptions?.length > 1
@@ -4395,7 +4419,7 @@ function renderTaskPage() {
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
-          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}</a>`).join('')}
+          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
         </div>
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -4425,6 +4449,8 @@ function renderTaskPage() {
     wireFollowups(v);
     wireTerminal(v.taskId);
     wireWorldFileLinks(v);
+  } else if (tab === 'approvals') {
+    wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
@@ -4564,9 +4590,30 @@ function cycleTaskTab(delta) {
 
 function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
+  if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
   if (tab === 'advanced') return advancedTab(v);
   return overviewTab(v);
+}
+
+function approvalRequestsTab(v) {
+  const pending = S.approvalRequests.filter((request) => request.status === 'pending').length;
+  return `<div class="task-approvals" id="task-approval-requests">
+    <div class="approval-page-head">
+      <div><div class="section-h">Approval Requests</div>
+        <p class="task-sub">Credential decisions raised by this task. Approving or denying one automatically resumes the agent.</p></div>
+      ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
+    </div>
+    <div class="approval-list">${credentialRequestRows(S.approvalRequests, S.approvalItems, { historyLimit: 20 })}</div>
+  </div>`;
+}
+
+function wireTaskApprovalRequests(v) {
+  const rec = taskRecord(v.taskId);
+  const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+  });
 }
 
 // Whether renderTaskPage should hand keyboard focus to the scrollable page body.
@@ -4875,9 +4922,10 @@ function wireTerminal(taskId) {
 // ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
 function reviewActionBtn(a, i) {
   const isRun = a.kind === 'run';
-  const icon = isRun ? (a.server ? '▶' : '⚡') : '↗';
-  const label = `${icon} ${esc(a.label || (isRun ? 'Run' : 'Open'))}`;
-  const title = isRun ? esc(a.command || '') : esc(a.target || '');
+  const isPayment = a.kind === 'payment';
+  const icon = isPayment ? (a.operation === 'deny' ? '✕' : '✓') : isRun ? (a.server ? '▶' : '⚡') : '↗';
+  const label = `${icon} ${esc(a.label || (isPayment ? 'Resolve spend' : isRun ? 'Run' : 'Open'))}`;
+  const title = isPayment ? `Payment request ${esc(a.requestId || '')}` : isRun ? esc(a.command || '') : esc(a.target || '');
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
@@ -4904,6 +4952,12 @@ function wireReviewActions(v) {
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'payment') {
+          toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
+            r.result?.status === 'denied');
+          await refreshTask(v.taskId);
+          return;
+        }
         // kind === 'run': stream output; open follow-up URLs; offer Stop.
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
@@ -8170,9 +8224,8 @@ function globalSettingsView(embedded = false) {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
     </div>
-    <div class="settings-section-title" id="settings-access"><div>Access<small>How you open Karmax from another device</small></div></div>
+    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open Karmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
-      <div class="section-h">Phone access <span class="chip">private by default</span></div>
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>`;
 }
@@ -8185,45 +8238,185 @@ function phoneInstallHelp() {
     <span class="task-sub" id="phone-install-note">No native Karmax app is needed.</span>`;
 }
 
+function isFetchInterruption(error) {
+  return !error?.status && /failed to fetch|fetch failed|networkerror|load failed/i.test(error?.message || '');
+}
+
 function renderPhoneAccess(status) {
   const box = $('#phone-access-status');
   if (!box) return;
   const ready = status.state === 'ready';
   const hosted = status.method === 'hosted';
-  const label = ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
+  const label = status.setupInProgress ? 'Setting up…' : ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
     : status.state === 'needs-login' ? 'Sign-in needed'
-      : status.state === 'conflict' ? 'Already in use' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
-  const link = status.url
-    ? `<a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a>`
-    : '';
-  const setup = hosted
+      : status.state === 'conflict' ? 'Another service is connected' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
+  const address = status.state === 'conflict' && status.url
+    ? `<div class="phone-access-address conflict"><span>Tailscale is already serving</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : status.state === 'conflict'
+      ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
+      : status.url
+    ? `<div class="phone-access-address"><span>Access your Karmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Access your Karmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
+  const phoneSteps = hosted
     ? '<li>Open this same HTTPS address on your phone.</li>'
-    : `<li>Install <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Tailscale</a> on your phone and sign in to the same tailnet.</li>
-       <li>Open the private Karmax address shown here. Keep Tailscale connected.</li>`;
-  box.innerHTML = `<div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span>${link}</div>
-    <p>${esc(status.detail)}</p>
-    ${ready ? `<ol class="phone-steps">${setup}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
-      <div class="phone-access-actions">${phoneInstallHelp()}${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}</div>`
-      : `<div class="phone-access-actions">
-          ${status.canEnable ? '<button class="btn sm primary" id="remote-enable">Turn on private access</button>' : ''}
-          ${status.method === 'none' ? '<a class="btn sm" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install Tailscale</a>' : ''}
-          <button class="btn sm" id="remote-refresh">Check again</button>
-        </div>`}
+    : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
+       <li>Open the private Karmax address shown here in your phone’s browser.</li>`;
+  const recovery = ready && !hosted
+    ? `<details class="phone-troubleshooting">
+        <summary>Address won’t open?</summary>
+        <ol>
+          <li>Disconnect Mullvad or any other VPN on both devices, then reconnect Tailscale. Android and iOS allow only one active VPN.</li>
+          <li>On Android, check Tailscale → Settings → App-based split tunneling. Your browser must not bypass Tailscale.</li>
+          <li>If the error mentions DNS or “name not found,” set Android Private DNS to Automatic, turn off browser Secure DNS temporarily, and reconnect Tailscale.</li>
+          <li>Keep this computer awake with Karmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
+        </ol>
+       </details>`
+    : '';
+  const helpLink = status.helpUrl
+    ? `<a class="btn sm primary" href="${esc(status.helpUrl)}" target="_blank" rel="noopener noreferrer">Continue in Tailscale</a>`
+    : '';
+  const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
+    : status.setupStage === 'serve' ? 'Finish setup'
+      : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
+  const setupSummary = status.state === 'conflict' ? 'Why this Karmax is not being served' : 'Set up instructions';
+  const setupIntro = status.state === 'conflict'
+    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or Karmax instance.</p>'
+    : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
+        (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
+        or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
+        Sign in to the same Tailscale account on both.</p>`;
+  const fallbackCommands = status.fallbackCommands || [];
+  const fallback = !hosted && fallbackCommands.length
+    ? `<details class="phone-terminal-fallback">
+        <summary>Doesn’t work? Use the terminal instead</summary>
+        <pre><code>${esc(fallbackCommands.join('\n'))}</code></pre>
+        <button class="btn sm" id="remote-copy-fallback">Copy commands</button>
+       </details>`
+    : '';
+  const setupPanel = !hosted
+    ? `<details class="phone-setup" ${ready ? '' : 'open'}>
+        <summary>${setupSummary}</summary>
+        <div class="phone-setup-body">
+          ${setupIntro}
+          <div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span><span>${esc(status.detail)}</span></div>
+          ${status.setupCommand ? `<div class="phone-setup-command"><code>${esc(status.setupCommand)}</code><button class="btn sm" id="remote-copy-command">Copy command</button></div>` : ''}
+          <div class="phone-access-actions">
+            ${helpLink}
+            ${status.canSetup ? `<button class="btn sm primary" id="remote-setup">${esc(setupLabel)}</button>` : ''}
+            ${status.method === 'none' ? '<a class="btn sm primary" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install on this computer</a>' : ''}
+            <button class="btn sm" id="remote-refresh">Check again</button>
+            ${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}
+          </div>
+          ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. Karmax never sees your OS or Tailscale password.</p>' : ''}
+          ${fallback}
+        </div>
+       </details>`
+    : `<p>${esc(status.detail)}</p>`;
+  box.innerHTML = `${address}
+    ${setupPanel}
+    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+      <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
     <p class="phone-security">${hosted ? 'Karmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Karmax stays bound to localhost and is never made public.'}</p>`;
 
   const act = async (action, button) => {
+    const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
+    if (approvalTab) {
+      approvalTab.document.title = 'Tailscale setup';
+      approvalTab.document.body.textContent = 'Waiting for Karmax to start Tailscale…';
+    }
     button.disabled = true;
-    button.textContent = action === 'enable' ? 'Turning on…' : 'Turning off…';
+    button.textContent = action === 'setup' ? 'Starting…' : action === 'enable' ? 'Turning on…' : 'Turning off…';
+    const pollingStatus = (detail) => ({
+      ...status,
+      state: 'available',
+      setupStage: 'authorize',
+      setupInProgress: true,
+      detail,
+      canSetup: false,
+      canEnable: false,
+      canDisable: false,
+    });
+    const finishSetup = async (initial) => {
+      let next = initial;
+      let missedChecks = 0;
+      for (let attempt = 0; next.setupInProgress && attempt < 150; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        try {
+          next = await api('/api/remote-access');
+          missedChecks = 0;
+          renderPhoneAccess(next);
+        } catch {
+          missedChecks++;
+          if (missedChecks === 1) {
+            renderPhoneAccess(pollingStatus(
+              'Tailscale is reconnecting this computer. A brief interruption is normal; Karmax will keep checking.',
+            ));
+          }
+        }
+      }
+      if (next.setupInProgress) {
+        approvalTab?.close();
+        renderPhoneAccess({
+          ...status,
+          state: 'error',
+          setupStage: 'connect',
+          detail: 'Setup is taking longer than expected. Check the system prompt on this computer, then choose Check again.',
+          canSetup: true,
+          canEnable: false,
+          canDisable: false,
+        });
+        return;
+      }
+      if (next.helpUrl && approvalTab) approvalTab.location.href = next.helpUrl;
+      else approvalTab?.close();
+      renderPhoneAccess(next);
+    };
     try {
-      renderPhoneAccess(await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) }));
+      const next = await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) });
+      if (action === 'setup' && next.setupInProgress) {
+        renderPhoneAccess(next);
+        await finishSetup(next);
+      } else {
+        if (next.helpUrl && approvalTab) approvalTab.location.href = next.helpUrl;
+        else approvalTab?.close();
+        renderPhoneAccess(next);
+      }
     } catch (error) {
-      toast(error.message, true);
-      hydratePhoneAccess();
+      if (action === 'setup' && isFetchInterruption(error)) {
+        const reconnecting = pollingStatus(
+          'The connection changed while Tailscale started. This can be normal; Karmax will reconnect and keep checking.',
+        );
+        renderPhoneAccess(reconnecting);
+        await finishSetup(reconnecting);
+      } else {
+        approvalTab?.close();
+        toast(error.message, true);
+        hydratePhoneAccess();
+      }
     }
   };
+  $('#remote-setup')?.addEventListener('click', (event) => act('setup', event.currentTarget));
   $('#remote-enable')?.addEventListener('click', (event) => act('enable', event.currentTarget));
   $('#remote-disable')?.addEventListener('click', (event) => act('disable', event.currentTarget));
   $('#remote-refresh')?.addEventListener('click', hydratePhoneAccess);
+  $('#remote-copy-command')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    try {
+      await navigator.clipboard.writeText(status.setupCommand);
+      button.textContent = 'Copied';
+    } catch {
+      toast('Copy failed—select the command and copy it manually.', true);
+    }
+  });
+  $('#remote-copy-fallback')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    try {
+      await navigator.clipboard.writeText(fallbackCommands.join('\n'));
+      button.textContent = 'Copied';
+    } catch {
+      toast('Copy failed—select the commands and copy them manually.', true);
+    }
+  });
   $('#install-karmax')?.addEventListener('click', async () => {
     const note = $('#phone-install-note');
     if (installPrompt) {
@@ -8246,7 +8439,20 @@ async function hydratePhoneAccess() {
   try {
     renderPhoneAccess(await api('/api/remote-access'));
   } catch (error) {
-    box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`;
+    const disconnected = isFetchInterruption(error);
+    box.innerHTML = `<div class="phone-access-address missing">
+        <span>Access your Karmax at</span>
+        <b>${disconnected ? 'Could not reach Karmax' : 'Could not check Phone Access'}</b>
+      </div>
+      <div class="phone-setup-body">
+        <div class="phone-access-head"><span class="remote-state">Needs attention</span><span>${
+          disconnected
+            ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
+            : esc(error?.message || 'Karmax could not check Tailscale.')
+        }</span></div>
+        <div class="phone-access-actions"><button class="btn sm" id="remote-retry">Check again</button></div>
+      </div>`;
+    $('#remote-retry')?.addEventListener('click', hydratePhoneAccess);
   }
 }
 
@@ -8302,45 +8508,87 @@ function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
     <div class="section-h">Payments — budget & cards</div>
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Funding source</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this installation pays. Projects can have narrower cards and policies; karmax never stores card numbers.</p>
+      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
       <div class="pay-providers-list">Loading…</div>
-    </div>` : ''}
+      <div class="pay-balance" style="margin-top:8px"></div>
+    </div>
+    <details class="pay-cardholder" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Create Stripe Issuing cardholder</summary>
+      <div class="form-row" style="margin-top:8px"><div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select>
+        <input class="holder-name" placeholder="full or company name" />
+        <input class="holder-first" placeholder="first name (individual)" />
+        <input class="holder-last" placeholder="last name (individual)" />
+        <input class="holder-dob" type="date" title="date of birth (individual)" />
+        <input class="holder-email" type="email" placeholder="email" />
+        <input class="holder-phone" placeholder="phone" />
+        <input class="holder-line1" placeholder="address line 1" />
+        <input class="holder-city" placeholder="city" />
+        <input class="holder-state" placeholder="state/region" />
+        <input class="holder-postal" placeholder="postal code" />
+        <input class="holder-country" placeholder="country (US)" style="width:100px" />
+        <button class="btn sm" data-addholder>Create cardholder</button>
+      </div></div>
+    </details>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
     <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
     <div class="section-h" style="margin-top:14px">Cards</div>
     <div class="cards-list" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Add a ${scope} card</label>
+    <div class="form-row"><label>Add ${scope === 'global' ? 'an organization' : 'a project'} card</label>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <input class="card-label" placeholder="label (e.g. Ops)" />
         <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
+        <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
+        <select class="card-provider"><option value="mock">Local test funds</option></select>
+        <select class="card-cardholder hidden"><option value="">Choose Stripe cardholder</option></select>
         <button class="btn" data-addcard="${scope}">Add card</button>
       </div></div>
+    ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
+      <div class="section-h" style="margin-top:14px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-async function wirePaymentProviders(box) {
+async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
-  try { data = await api('/api/payments/providers'); } catch {}
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  try { data = await api(`${paymentsBase}/providers`); } catch {}
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : ''}
+        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
           <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}</div>`).join('')
+        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
+        ${p.kind === 'oauth' && (p.connected || p.connectionStatus) ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('')
     : '<span style="color:var(--ink-3)">No payment providers.</span>';
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const r = await api('/api/payments/connect', { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
-      const row = b.closest('[data-prov]');
+      const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
       if (r.status === 'awaiting_oauth' && r.url) {
-        row.insertAdjacentHTML('beforeend', `<div style="font-size:12px;margin-top:6px;flex-basis:100%">Open to authorize (karmax never sees your card data):<br><a href="${esc(r.url)}" target="_blank" rel="noopener" class="mono">${esc(r.url)}</a></div>`);
-      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box); }
+        location.assign(r.url);
+      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box, organizationId); }
       else { toast(r.detail || 'Not available', true); }
     } catch (e) { toast(e.message, true); }
   }));
+  list.querySelectorAll('[data-disconnectpay]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Disconnect ${b.dataset.disconnectpay} from this organization? Existing cards will be unusable.`)) return;
+    try {
+      await api(`${paymentsBase}/connections/${encodeURIComponent(b.dataset.disconnectpay)}`, { method: 'DELETE' });
+      toast('Payment provider disconnected');
+      wirePaymentProviders(box, organizationId);
+    } catch (e) { toast(e.message, true); }
+  }));
+  if (organizationId && data.active) {
+    try {
+      const balance = await api(`${paymentsBase}/balance?provider=${encodeURIComponent(data.active)}`);
+      const el = box.querySelector('.pay-balance');
+      if (el) el.innerHTML = `<b>Available balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
+    } catch {}
+  }
+  return data;
 }
 async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
@@ -8348,8 +8596,61 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   // Non-project cards belong to the organization (tenant boundary), not the
   // whole installation. `scope==='global'` here is the org-settings surface.
   const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
-  if (scope === 'global') await wirePaymentProviders(box);
-  const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  let providerData;
+  if (scope === 'global') providerData = await wirePaymentProviders(box, organizationId);
+  else {
+    try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
+  }
+  const providerSelect = box.querySelector('.card-provider');
+  const holderSelect = box.querySelector('.card-cardholder');
+  const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
+  providerSelect.innerHTML = usableProviders.map((p) =>
+    `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  const loadCardholders = async () => {
+    const stripe = providerSelect.value === 'stripe';
+    holderSelect.classList.toggle('hidden', !stripe);
+    if (!stripe) return;
+    try {
+      const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
+      holderSelect.innerHTML = `<option value="">Choose Stripe cardholder</option>${holders
+        .filter((h) => h.status === 'active').map((h) => `<option value="${esc(h.id)}">${esc(h.name)} · ${esc(h.type)}</option>`).join('')}`;
+    } catch (e) {
+      holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
+    }
+  };
+  providerSelect.addEventListener('change', loadCardholders);
+  await loadCardholders();
+  box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
+    const dobValue = box.querySelector('.holder-dob').value;
+    const dob = dobValue ? new Date(`${dobValue}T00:00:00Z`) : undefined;
+    try {
+      await api(`${paymentsBase}/cardholders`, { method: 'POST', body: JSON.stringify({
+        provider: 'stripe',
+        type: box.querySelector('.holder-type').value,
+        name: box.querySelector('.holder-name').value.trim(),
+        firstName: box.querySelector('.holder-first').value.trim() || undefined,
+        lastName: box.querySelector('.holder-last').value.trim() || undefined,
+        dob: dob ? { day: dob.getUTCDate(), month: dob.getUTCMonth() + 1, year: dob.getUTCFullYear() } : undefined,
+        email: box.querySelector('.holder-email').value.trim() || undefined,
+        phone: box.querySelector('.holder-phone').value.trim() || undefined,
+        address: {
+          line1: box.querySelector('.holder-line1').value.trim(),
+          city: box.querySelector('.holder-city').value.trim(),
+          state: box.querySelector('.holder-state').value.trim() || undefined,
+          postalCode: box.querySelector('.holder-postal').value.trim(),
+          country: box.querySelector('.holder-country').value.trim(),
+        },
+      }) });
+      toast('Stripe cardholder created');
+      await loadCardholders();
+    } catch (e) { toast(e.message, true); }
+  });
+  const sUrl = scope === 'global' && organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`
+    : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}
   if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
@@ -8371,13 +8672,22 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
-      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
-        <input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button></div>`).join('')
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="chip">${esc(c.provider)}</span> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope} · ${esc(c.id)}</span><div class="task-sub">${esc(c.status || 'active')} · available ${usd(c.available)} / cap ${usd(c.cap)}${c.merchantLock?.length ? ` · merchants ${c.merchantLock.map(esc).join(', ')}` : ''}</div></div>
+        ${c.provider === 'mock' && c.status !== 'canceled' ? `<input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button>` : ''}
+        ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
       const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
       if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+    }));
+    list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Revoke this card? This cannot be undone.')) return;
+      try {
+        await api(`/api/cards/${b.dataset.revoke}${orgQ ? `?${orgQ}` : ''}`, { method: 'DELETE' });
+        toast('Card revoked');
+        renderCards();
+      } catch (e) { toast(e.message, true); }
     }));
   };
   await renderCards();
@@ -8385,13 +8695,48 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     const label = box.querySelector('.card-label').value.trim() || 'Card';
     const cap = box.querySelector('.card-cap').value;
     try {
-      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ scope: scope === 'project' ? 'project' : 'organization', projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
+        scope: scope === 'project' ? 'project' : 'organization',
+        projectId: scope === 'project' ? projectId : undefined,
+        label,
+        cap: Math.round(Number(cap || 0) * 100),
+        merchantLock: box.querySelector('.card-merchants').value.split(',').map((value) => value.trim()).filter(Boolean),
+        provider: providerSelect.value,
+        cardholderId: providerSelect.value === 'stripe' ? holderSelect.value : undefined,
+      }) });
       box.querySelector('.card-label').value = '';
       box.querySelector('.card-cap').value = '';
+      box.querySelector('.card-merchants').value = '';
       toast('Card added');
       renderCards();
     } catch (e) { toast(e.message, true); }
   });
+  if (scope === 'global' && organizationId) {
+    const renderLedger = async () => {
+      let requests = [], transactions = [];
+      try { [requests, transactions] = await Promise.all([
+        api(`${paymentsBase}/requests`), api(`${paymentsBase}/transactions`),
+      ]); } catch {}
+      const pending = requests.filter((r) => ['pending_approval', 'needs_funding', 'authorized', 'consumed'].includes(r.status));
+      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map((r) =>
+        `<div class="queue-item"><div style="flex:1"><b>${usd(r.amount)}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
+          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`).join('')
+        : '<span style="color:var(--ink-3)">No pending requests.</span>';
+      box.querySelector('.pay-transactions').innerHTML = transactions.length ? transactions.slice(0, 50).map((t) =>
+        `<div class="queue-item"><div style="flex:1"><b>${usd(t.amount)}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
+        : '<span style="color:var(--ink-3)">No payment activity.</span>';
+      box.querySelectorAll('[data-payapprove],[data-paydeny]').forEach((b) => b.addEventListener('click', async () => {
+        const id = b.dataset.payapprove || b.dataset.paydeny;
+        const op = b.dataset.payapprove ? 'approve' : 'deny';
+        try {
+          const r = await api(`${paymentsBase}/requests/${encodeURIComponent(id)}/${op}`, { method: 'POST' });
+          toast(r.status === 'granted' ? 'Spend approved' : r.reason || 'Request updated', r.status === 'denied');
+          renderLedger();
+        } catch (e) { toast(e.message, true); }
+      }));
+    };
+    await renderLedger();
+  }
 }
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
@@ -8406,6 +8751,71 @@ const VAULT_SECRET_LABELS = {
 const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets it as an environment variable, but never sees the secret text itself. “ask” makes it request your approval each time.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
 function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
+
+function credentialRequestTaskLink(request) {
+  const task = request.task || taskRecord(request.taskId);
+  if (!task) return `<span class="mono">${esc(request.taskId)}</span>`;
+  const project = projectById(task.projectId);
+  const key = task.num != null ? task.num : task.id;
+  const label = `${task.num != null ? `#${task.num} · ` : ''}${task.title}`;
+  return project
+    ? `<a data-spa href="${projectRoute(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
+    : `<span>${esc(label)}</span>`;
+}
+
+function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
+  const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const pendingHtml = pending.length
+    ? pending.map((request) => `<div class="approval-request" data-vreq="${esc(request.id)}">
+        <div class="approval-request-main">
+          <div class="approval-request-title">${request.itemId
+            ? esc(itemLabel(request.itemId))
+            : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
+            ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+          </div>
+          <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
+          ${request.kind === 'reset' ? '<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; karmax will resume the agent automatically.</div>' : ''}
+        </div>
+        <div class="approval-request-actions">
+          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
+          <button class="btn sm" data-vreq-act="once">Once</button>
+          <button class="btn sm" data-vreq-act="task">This task</button>
+          <button class="btn sm" data-vreq-act="always">Always</button>
+          <button class="btn sm" data-vreq-act="deny">Deny</button>
+        </div>
+      </div>`).join('')
+    : '<div class="approval-empty">No pending approval requests.</div>';
+  const history = recent.length
+    ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+        <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || '?')}</span>
+        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+    : '';
+  return pendingHtml + history;
+}
+
+function wireCredentialRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((button) => button.addEventListener('click', async () => {
+    const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+    button.disabled = true;
+    try {
+      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+        method: 'POST',
+        body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
+      });
+      const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
+      toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+        : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
+      await onResolved?.(result);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  })));
+}
 
 function passwordsCard() {
   return `<div class="card" id="vault-card">
@@ -8441,7 +8851,7 @@ function passwordsCard() {
 function vaultRequestsCard() {
   return `<div class="card" id="vault-requests-card">
     <div class="section-h">Credential access requests</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted (or one that isn't in the vault yet — add it above, then approve, or tell the agent to create the account itself). <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet. Add and bind a missing item before approving. <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto. Every decision resumes the task automatically.</p>
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
@@ -8660,29 +9070,8 @@ async function wireVaultCards(organizationId) {
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
-    const pending = requests.filter((r) => r.status === 'pending');
-    const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
-    const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
-    rbox.innerHTML = (pending.length
-      ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
-          <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
-            ${r.kind === 'reset' ? '<span class="chip" style="color:var(--warn,#e0b15a)">reported invalid</span>' : `<span class="chip">${esc(r.mode)}</span>`}
-            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}${r.kind === 'reset' ? '<br>The stored secret failed. Fix it (Update secret in the vault above, or send the task a follow-up with the reset code), then grant to let the agent retry.' : ''}</div></div>
-          ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
-          <button class="btn sm" data-vreq-act="once">Once</button>
-          <button class="btn sm" data-vreq-act="task">This task</button>
-          <button class="btn sm" data-vreq-act="always">Always</button>
-          <button class="btn sm" data-vreq-act="deny">Deny</button></div>`).join('')
-      : '<span style="color:var(--ink-3)">No pending requests.</span>')
-      + (recent.length ? `<div class="task-sub" style="color:var(--ink-3);margin-top:8px">${recent.map((r) => `${r.status} · ${r.itemId ? esc(itemLabel(r.itemId)) : esc(r.domain || '?')} (${esc(r.resolution?.action || '')})`).join('<br>')}</div>` : '');
-    rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
-      const itemId = row.querySelector('.vreq-bind')?.value || undefined;
-      try {
-        await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
-        toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
-        renderRequests();
-      } catch (e) { toast(e.message, true); }
-    })));
+    rbox.innerHTML = credentialRequestRows(requests, items);
+    wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
   await renderItems();
   await renderConnectors();
@@ -9166,7 +9555,8 @@ async function openInboxItem(item) {
   const project = projectById(item.task.projectId); if (!project) return;
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
-  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
+  const tab = item.kind === 'approval-requested' ? '/approvals' : '';
+  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user
@@ -9315,7 +9705,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Phone Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>

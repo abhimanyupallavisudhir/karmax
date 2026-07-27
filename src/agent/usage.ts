@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { scrubbedEnv } from '../autonomy/config-homes.js';
+import { hasClaudeNativeCredential, scrubbedEnv } from '../autonomy/config-homes.js';
 import { trackProcess } from '../util/processes.js';
 import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
@@ -270,7 +270,7 @@ export async function probeClaudeUsage(
   const cred = claudeCredentialPath(opts.configHome);
   // Only a full-login `.credentials.json` yields usage. setup-token homes (only
   // karmax-oauth.json) or logged-out homes are reported unavailable, not probed.
-  if (!fs.existsSync(cred)) {
+  if (!hasClaudeNativeCredential(path.dirname(cred))) {
     return { ok: false, at: now, reason: opts.configHome ? 'setup-token' : 'logged-out' };
   }
   // Isolate: run against a throwaway dir holding only a copy of the credential, so
