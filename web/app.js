@@ -464,10 +464,10 @@ function effortLevelsFor(provider, model) {
   const advertised = S.modelCatalog?.[provider]?.find((x) => x.id === model)?.effort;
   if (advertised) return advertised;
   if (provider === 'claude') {
-    if (!/opus-4-(5|6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
+    if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
-    if (/opus-4-(7|8)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
-    if (/opus-4-(6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
+    if (/opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
+    if (/opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
