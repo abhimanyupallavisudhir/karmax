@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { hostLocal } from '../config/deployment.js';
 import { CredentialBroker } from './broker.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
 import { hostOf, passEntryMetadata } from './pass-path.js';
@@ -565,11 +566,17 @@ export class Connectors {
 }
 
 /** The standard registry (Bitwarden + 1Password + pass), one construction shared
- *  by every gateway call site so the wiring cannot drift. */
-export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined, organizationId: string): Connectors {
+ *  by every gateway call site so the wiring cannot drift.
+ *
+ *  Bitwarden and 1Password authenticate with a token the tenant supplies, so they
+ *  travel anywhere. `pass` has no such credential — it reads the *host's*
+ *  `~/.password-store` through the host's gpg-agent — so it is offered only while
+ *  the browser and the host are the same machine. */
+export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined,
+  organizationId: string, opts: { hostLocal?: boolean } = {}): Connectors {
   const connectors = new Connectors(store, items, broker, organizationId);
   connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
   connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
-  connectors.register(new PassConnector());
+  if (opts.hostLocal ?? hostLocal()) connectors.register(new PassConnector());
   return connectors;
 }
