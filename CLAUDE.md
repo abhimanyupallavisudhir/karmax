@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-karmax is an agent-orchestration platform centered on a todo list, built on Temporal for durable execution, TypeScript end-to-end. **The karmax spec — the `SPEC` page in the project wiki (open the Wiki tab, or `read_wiki`) — is the source of truth** for design decisions and rationale; the `PLAN*` wiki pages are feature design plans layered on top of it. Runs on Node ≥ 22 (uses built-in `node:sqlite`) and needs the Temporal CLI at `~/.temporalio/bin/temporal` (or `TEMPORAL_CLI`).
+karmax is an agent-orchestration platform centered on a todo list, built on Temporal for durable execution, TypeScript end-to-end. **The karmax spec — the `SPEC` page in the project wiki (open the Wiki tab, or `read_wiki`) — is the source of truth** for design decisions and rationale; the `PLAN*` wiki pages are feature design plans layered on top of it. Both live **only** in the wiki — there are deliberately no `SPEC.md`/`PLAN-*.md` copies in the repo, because duplicates drift (they did, and contradicted each other). Edit the wiki page; never reintroduce a repo copy. Runs on Node ≥ 22 (uses built-in `node:sqlite`) and needs the Temporal CLI at `~/.temporalio/bin/temporal` (or `TEMPORAL_CLI`).
 
 ## Philosophy
 
