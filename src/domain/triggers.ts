@@ -101,6 +101,11 @@ export function validateTriggers(triggers: TaskTrigger[]): string[] {
     } else if (t.kind === 'schedule') {
       if (!t.cron && t.at === undefined) errs.push('schedule trigger needs a cron expression or an `at` time');
       if (t.cron && !parseCron(t.cron)) errs.push(`invalid cron expression: "${t.cron}"`);
+      // A parseable-but-impossible date (Feb 30) would otherwise be accepted and
+      // then never fire, leaving a task permanently "armed" with no next run.
+      // Reject it loudly at the point the user types it instead.
+      else if (t.cron && nextCronFire(t.cron, 0) === undefined)
+        errs.push(`cron expression never occurs: "${t.cron}"`);
     } else if (t.kind === 'event') {
       if (!t.type) errs.push('event trigger needs an event `type`');
     }
@@ -255,7 +260,13 @@ export function nextCronFire(expr: string, fromMs: number): number | undefined {
   if (!f) return undefined;
   // Start at the next whole minute after `fromMs`.
   const d = new Date(Math.floor(fromMs / 60000) * 60000 + 60000);
-  const limit = fromMs + 366 * 24 * 3600 * 1000;
+  // Horizon must cover the largest legal gap between two cron fires, which is
+  // Feb 29 across a century non-leap year (2096-02-29 → 2104-02-29, ~8 years).
+  // A 366-day horizon silently returned undefined for every `* * 29 2 *`, and
+  // the scheduler's undefined branch arms no timer at all — the task then sits
+  // "armed" forever and never fires. The scan is cheap: the loop steps by
+  // month/day/hour, so the worst case is a few thousand day-steps.
+  const limit = fromMs + 8 * 366 * 24 * 3600 * 1000;
   while (d.getTime() <= limit) {
     const month = d.getUTCMonth() + 1;
     if (!f.month.has(month)) {

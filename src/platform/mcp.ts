@@ -432,7 +432,15 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'platform_request',
     {
       description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization.',
-      inputSchema: { method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']), path: z.string().startsWith('/api/'), body: z.unknown().optional() },
+      // `body` MUST serialize to a non-empty JSON Schema. `z.unknown()` emits `{}`,
+      // which MCP clients drop at the tool-call boundary — every write through this
+      // escape hatch then silently no-ops (the request arrives as `{}`). Keep this a
+      // concrete object schema; see tests/mcp.test.ts "publishes a usable body schema".
+      inputSchema: {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+        path: z.string().startsWith('/api/'),
+        body: z.record(z.string(), z.unknown()).optional().describe('JSON request body for POST/PUT/PATCH.'),
+      },
     },
     async (a) => wrap(() => ops.platformRequest(a.method, a.path, a.body)),
   );

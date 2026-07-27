@@ -65,6 +65,24 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
   });
 
+  it('publishes a usable body schema for platform_request', async () => {
+    // Regression: `body` was declared `z.unknown().optional()`, which serializes
+    // to an empty JSON Schema `{}`. MCP clients drop an argument with no declared
+    // shape, so every write through the escape hatch silently no-opped — the
+    // handler received `{}` and POSTs/PATCHes returned unchanged rows. Assert the
+    // *published* schema (what a real client reads), not just handler forwarding:
+    // the previous test drove `apiOps` directly and so never crossed the boundary
+    // where the drop happened.
+    const { tools } = await client.listTools();
+    const schema: any = tools.find((tool) => tool.name === 'platform_request')!.inputSchema;
+    expect(schema.properties.body).toBeTruthy();
+    expect(Object.keys(schema.properties.body).length).toBeGreaterThan(0);
+    expect(schema.properties.body.type).toBe('object');
+    // Sibling args must stay declared too.
+    expect(schema.properties.path.type).toBe('string');
+    expect(schema.properties.method.enum).toContain('POST');
+  });
+
   it('does not expose direct cross-world filesystem inspection', async () => {
     const names = (await client.listTools()).tools.map((tool) => tool.name);
     expect(names).not.toContain('list_world_files');

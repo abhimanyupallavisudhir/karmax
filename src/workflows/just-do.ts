@@ -88,6 +88,8 @@ async function justDoImpl(
   let agentTurn: TaskView['agentTurn'];
   let seen = 0;
   const pendingCollaborations = new Set<string>();
+  /** Requests already settled — guards against a settle that beats its request. */
+  const settledCollaborations = new Set<string>();
   const base = input.base ?? input.project.defaultBase ?? 'main';
   // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
@@ -172,10 +174,14 @@ async function justDoImpl(
     if (!msgs.some((candidate) => candidate.id === m.id))
       msgs.push({ ...m, ts: m.ts || msgs.length });
   });
+  // Order-tolerant join set — see the matching handler in software-dev.ts: the
+  // settle can beat the request, and a bare delete-then-add would park the task
+  // on an id that nothing ever removes.
   setHandler(collaborationRequestedSignal, (requestId) => {
-    pendingCollaborations.add(requestId);
+    if (!settledCollaborations.has(requestId)) pendingCollaborations.add(requestId);
   });
   setHandler(collaborationSettledSignal, (requestId, message) => {
+    settledCollaborations.add(requestId);
     pendingCollaborations.delete(requestId);
     if (!msgs.some((candidate) => candidate.id === message.id))
       msgs.push({ ...message, ts: message.ts || msgs.length });

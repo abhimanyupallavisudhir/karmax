@@ -303,6 +303,8 @@ async function softwareDevImpl(
   // agent keeps working for the rest of its current turn; if it finishes before
   // the target publishes, the workflow parks here and wakes on settlement.
   const pendingCollaborations = new Set<string>();
+  /** Requests already settled — guards against a settle that beats its request. */
+  const settledCollaborations = new Set<string>();
   let pointOfNoReturnPassed = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
@@ -618,10 +620,18 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'followUp', role };
   });
+  // The "requested" and "settled" signals are sent by two independent code paths
+  // over two concurrent RPCs, so they can arrive in either order: a target that
+  // publishes while our request signal is still in flight settles it first. A
+  // bare delete-then-add would then leave an id in `pending` that nothing ever
+  // removes, and the requester parks on it forever (no timeout, and the durable
+  // row is already notified so no recovery path re-delivers it). Remember what
+  // has settled so the join-set is order-tolerant.
   setHandler(collaborationRequestedSignal, (requestId) => {
-    pendingCollaborations.add(requestId);
+    if (!settledCollaborations.has(requestId)) pendingCollaborations.add(requestId);
   });
   setHandler(collaborationSettledSignal, (requestId, message) => {
+    settledCollaborations.add(requestId);
     pendingCollaborations.delete(requestId);
     if (!msgs.some((candidate) => candidate.id === message.id))
       msgs.push({ ...message, ts: message.ts || msgs.length });
