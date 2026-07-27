@@ -219,6 +219,9 @@ async function resolveProjectTaskKey(projectId, key) {
 }
 
 async function applyRoute() {
+  const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
+  const routePath = location.pathname;
+  const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(location.pathname);
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
@@ -232,9 +235,11 @@ async function applyRoute() {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
         await loadCollaboration().catch(() => {});
+        if (!routeIsCurrent()) return;
       }
     }
     await loadOrganizationRuntimeCatalog();
+    if (!routeIsCurrent()) return;
     // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
     // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
     // redirect when the canonical path actually differs, so an unresolvable slug
@@ -274,6 +279,7 @@ async function applyRoute() {
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
   await loadOrganizationRuntimeCatalog();
+  if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -286,19 +292,28 @@ async function applyRoute() {
     S.searchResult = null;
     S.cursorId = null;
     await loadTasks().catch(() => {});
+    if (!routeIsCurrent()) return;
   }
-  else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  else if (!S.tasks?.length) {
+    await loadTasks().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
   let taskId = null;
   if (r.taskKey) {
     taskId = await resolveProjectTaskKey(pid, r.taskKey);
+    if (!routeIsCurrent()) return;
     if (!taskId) toast(`Task #${r.taskKey} not found`, true);
   }
   S.tab = tab;
   if (!taskId) closeTaskDom();
-  if (tab === 'tasks' && !taskId) await runSearch().catch(() => {});
+  if (tab === 'tasks' && !taskId) {
+    await runSearch().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   renderRail();
   if (taskId) {
     if (S.selected !== taskId) return openTask(taskId, r.taskTab);
@@ -1644,16 +1659,19 @@ async function loadProjects() {
 }
 
 async function loadOrganizationRuntimeCatalog() {
-  if (!S.organizationId || S.catalogOrganizationId === S.organizationId) return;
-  const query = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const organizationId = S.organizationId;
+  if (!organizationId || S.catalogOrganizationId === organizationId) return;
+  const epoch = S.catalogLoadEpoch = (S.catalogLoadEpoch || 0) + 1;
+  const query = `?organizationId=${encodeURIComponent(organizationId)}`;
   try {
     const [schema, models] = await Promise.all([
       api(`/api/schema${query}`),
       api(`/api/models${query}`),
     ]);
+    if (S.catalogLoadEpoch !== epoch || S.organizationId !== organizationId) return;
     S.schema = schema;
     S.modelCatalog = models.providers;
-    S.catalogOrganizationId = S.organizationId;
+    S.catalogOrganizationId = organizationId;
   } catch {
     // Keep the last usable built-in catalog; task creation remains server-validated.
   }
@@ -1665,15 +1683,18 @@ async function loadOrganizations() {
 }
 
 async function loadCollaboration() {
-  if (!S.organizationId) return;
-  const q = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const organizationId = S.organizationId;
+  if (!organizationId) return;
+  const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
+  const q = `?organizationId=${encodeURIComponent(organizationId)}`;
   const [members, teams, users, inbox, prefs] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/members`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/teams`).catch(() => []),
+    api(`/api/organizations/${organizationId}/members`).catch(() => []),
+    api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/inbox${q}`).catch(() => []),
     api(`/api/inbox/preferences${q}`).catch(() => null),
   ]);
+  if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
@@ -1683,16 +1704,20 @@ async function loadCollaboration() {
 }
 
 async function loadTasks() {
-  if (!S.projectId) return;
+  const projectId = S.projectId;
+  if (!projectId) return false;
+  const epoch = S.taskLoadEpoch = (S.taskLoadEpoch || 0) + 1;
   // Always fetch the full set incl. archived; the task list decides visibility via the
   // query (default -is:archived). S.tasks is the shared pool for the task page, counts, etc.
-  const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  const fetched = await api(`/api/projects/${projectId}/tasks?includeArchived=1`);
+  if (S.taskLoadEpoch !== epoch || S.projectId !== projectId) return false;
   // Drop any draft we just deleted: a list request issued before the DELETE landed
   // can still return it and clobber the optimistic removal. Once a fresh fetch no
   // longer contains a tombstoned id, the server has caught up — retire it so the
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+  return true;
 }
 
 // ── task organization: tags, saved views, query search ──────────────────────
@@ -1700,17 +1725,20 @@ async function loadTasks() {
 // tokens + free text), which the server evaluates via /search into `S.searchResult`.
 // The field registry (`S.fields`) drives the filter/sort/group menus.
 async function loadOrg() {
-  if (!S.projectId) return;
+  if (!S.projectId) return false;
   const pid = S.projectId;
+  const epoch = S.orgLoadEpoch = (S.orgLoadEpoch || 0) + 1;
   const [tags, views, fields] = await Promise.all([
     api(`/api/projects/${pid}/tags`).catch(() => []),
     api(`/api/projects/${pid}/views`).catch(() => []),
     S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields?projectId=${encodeURIComponent(pid)}`).catch(() => []),
   ]);
+  if (S.orgLoadEpoch !== epoch || S.projectId !== pid) return false;
   S.tags = tags || [];
   S.views = views || [];
   S.fields = fields || [];
   S.orgProjectId = pid;
+  return true;
 }
 
 // The map id→tag for quick lookups + hierarchy path rendering.
@@ -1729,10 +1757,13 @@ const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
 async function runSearch() {
-  if (!S.projectId) return;
+  const projectId = S.projectId;
+  if (!projectId) return false;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   try {
-    const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(q)}`);
+    const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
+    if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
     const live = new Map(S.tasks.map((t) => [t.id, t]));
     const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
@@ -1743,7 +1774,11 @@ async function runSearch() {
     }));
     if (r.groups) r.groups = overlayGroups(r.groups);
     S.searchResult = r;
-  } catch { S.searchResult = null; }
+    return true;
+  } catch {
+    if (S.searchEpoch === epoch && S.projectId === projectId) S.searchResult = null;
+    return false;
+  }
 }
 
 let searchDebounce = null;
@@ -1908,19 +1943,28 @@ function connectWs() {
 }
 
 let taskRefreshPromise = null;
+let taskRefreshQueued = false;
 async function refreshTasks() {
   // Navigation, mutations, and a structural websocket event can converge here.
   // Share one in-flight refresh so slow hosts cannot accumulate duplicate list
-  // scans behind the event loop.
-  if (taskRefreshPromise) return taskRefreshPromise;
+  // scans behind the event loop. A request arriving while that read is in flight
+  // still queues one follow-up pass: it may have been triggered by a mutation,
+  // and returning only the pre-mutation snapshot leaves the UI stale until reload.
+  if (taskRefreshPromise) {
+    taskRefreshQueued = true;
+    return taskRefreshPromise;
+  }
   taskRefreshPromise = (async () => {
-    try {
-      await loadTasks();
-      if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-      if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-      renderRail();
-      if (S.tab === 'queue' && !S.selected) seedQueue();
-    } catch {}
+    do {
+      taskRefreshQueued = false;
+      try {
+        await loadTasks();
+        if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
+        if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
+        renderRail();
+        if (S.tab === 'queue' && !S.selected) seedQueue();
+      } catch {}
+    } while (taskRefreshQueued);
   })();
   try {
     await taskRefreshPromise;
@@ -4162,6 +4206,7 @@ async function refreshTask() {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
+    const epoch = S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
@@ -4173,6 +4218,9 @@ async function refreshTask() {
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
+    // The user may have opened another task while this websocket-driven refresh
+    // was in flight. Never pair task A's response with task B's selected page.
+    if (S.selected !== id || S.taskViewRefreshEpoch !== epoch) return;
     if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
@@ -5753,8 +5801,15 @@ function forkCommandFor(sess, worldPath) {
 // Credential-policy editor (SPEC §7/§9): order credentials by precedence and
 // enable/disable each, at a given scope (global/project/task). Lower scopes override
 // higher ones; API keys are off by default when a subscription exists.
+const asyncElementRenderEpoch = new WeakMap();
+function beginAsyncElementRender(element) {
+  const epoch = (asyncElementRenderEpoch.get(element) || 0) + 1;
+  asyncElementRenderEpoch.set(element, epoch);
+  return () => asyncElementRenderEpoch.get(element) === epoch;
+}
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
+  const renderIsCurrent = beginAsyncElementRender(el);
   const organizationId = opts.organizationId || projectById(opts.projectId)?.organizationId || S.organizationId || 'org_personal';
   const organizationBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
   const q = new URLSearchParams();
@@ -5766,7 +5821,15 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       api(`${organizationBase}/credentials?${q.toString()}`),
       api(`${organizationBase}/accounts`).catch(() => ({ logins: [] })),
     ]);
-  } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
+  } catch {
+    if (renderIsCurrent())
+      el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>';
+    return;
+  }
+  // Initial page hydration and a post-connect/register hydration can overlap.
+  // Only the newest response may paint this element, otherwise the older empty
+  // snapshot erases the newly-added login/key until a full page reload.
+  if (!renderIsCurrent()) return;
   // Effective policy for this scope. Normally the server computes it (global→project→
   // task overlay). In `local` mode — the NEW-task form, which has no taskId yet — we
   // resolve a client-side draft policy over the inherited project/global base and apply
@@ -6273,19 +6336,24 @@ function summarize(p) {
 // the merge stage, so the view reflects reorders immediately (the per-task polled
 // position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
 async function seedQueue() {
+  const projectId = S.projectId;
+  const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
   const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
   const orders = {};
   await Promise.all(
     domains.map(async (d) => {
       try {
-        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(S.projectId)}`);
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(projectId)}`);
         orders[d] = { queue: v.queue || [], current: v.current };
       } catch {}
     }),
   );
-  try { S.agentQueue = await api('/api/agent-queue'); } catch {}
+  let agentQueue = S.agentQueue;
+  try { agentQueue = await api('/api/agent-queue'); } catch {}
+  if (S.queueLoadEpoch !== epoch || S.projectId !== projectId) return;
   S.queueOrders = orders;
+  S.agentQueue = agentQueue;
   if (S.tab === 'queue') renderMain();
 }
 
@@ -6508,7 +6576,14 @@ function wireQueueDrag(list) {
 
 // ── activity ─────────────────────────────────────────────────────────────────
 async function seedActivity() {
-  try { S.activity = (await api(`/api/activity?since=0&projectId=${encodeURIComponent(S.projectId)}`)).reverse(); renderMain(); } catch {}
+  const projectId = S.projectId;
+  const epoch = S.activityLoadEpoch = (S.activityLoadEpoch || 0) + 1;
+  try {
+    const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
+    if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
+    S.activity = activity.reverse();
+    renderMain();
+  } catch {}
 }
 function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
@@ -6551,8 +6626,10 @@ function hostDiagHtml(diag) {
 // terminates (no reschedule) once the tab changes or the element is gone.
 async function refreshHostDiag() {
   if (S.tab !== 'dashboard' || !$('#host-diag')) return;
+  const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
   try { diag = await api('/api/diagnostics'); } catch {}
+  if (S.hostDiagEpoch !== epoch) return;
   const el = $('#host-diag');
   if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
   if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
@@ -6651,8 +6728,10 @@ function wireProcPanel(el) {
 async function refreshProcPanel(now = false) {
   if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
+  const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
   try { sample = await api('/api/processes'); } catch {}
+  if (S.procLoadEpoch !== epoch) return;
   const el = $('#proc-panel');
   if (el && S.tab === 'dashboard') {
     el.innerHTML = procPanelHtml(sample);
@@ -6664,6 +6743,7 @@ async function refreshProcPanel(now = false) {
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const organizationId = S.organizationId || 'org_personal';
     const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
@@ -6673,6 +6753,7 @@ async function renderDashboard() {
       api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
       api('/api/diagnostics').catch(() => null),
     ]);
+    if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
     const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
     const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
@@ -6767,7 +6848,9 @@ async function renderDashboard() {
     clearTimeout(S.hostDiagTimer);
     S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
     refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
-  } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  } catch (e) {
+    if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
 }
 
 // Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
@@ -7935,6 +8018,9 @@ async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
   if (!accessBox || !repositoryBox) return;
+  const accessIsCurrent = beginAsyncElementRender(accessBox);
+  const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
+  const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
     const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
@@ -7942,6 +8028,7 @@ async function hydrateProjectAccess(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
     ]);
+    if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
     const userName = (id) => userRecord(id)?.name || userRecord(id)?.email?.split('@')[0] || 'Unnamed member';
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
@@ -7984,11 +8071,14 @@ async function hydrateProjectAccess(proj) {
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
-  } catch (error) { accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
+  } catch (error) {
+    if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+  }
 }
 async function hydrateWorkflowPins(projectId) {
   const box = $('#wf-pins-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let list = [];
   let pins = {};
   const organizationId = projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
@@ -7996,7 +8086,11 @@ async function hydrateWorkflowPins(projectId) {
     api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`),
     api(`/api/projects/${projectId}/workflow-pins`),
   ]); }
-  catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>'; return; }
+  catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
     const opts = [`<option value="latest" ${pinned === 'latest' ? 'selected' : ''}>latest (v${esc(w.latest)})</option>`]
@@ -8089,12 +8183,14 @@ function wireSettingsView(proj) {
 }
 async function hydrateExecutionProviders(proj) {
   const box = $('#project-execution'); if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [policy, connections, pools] = await Promise.all([
       api(`/api/projects/${encodeURIComponent(proj.id)}/execution-policy`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
     ]);
+    if (!renderIsCurrent()) return;
     S.worldProviderConnections = connections;
     // The Agent environment (worktree / container / E2B / Daytona) now lives in
     // Task defaults — and can be overridden per task. Compute keeps the runner
@@ -8133,7 +8229,9 @@ async function hydrateExecutionProviders(proj) {
         await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
+  } catch (error) {
+    if (renderIsCurrent()) toast(`Could not load compute providers: ${error.message}`, true);
+  }
 }
 
 // ── organization defaults (legacy APIs still call this global scope) ─────────
@@ -8443,9 +8541,12 @@ function renderPhoneAccess(status) {
 async function hydratePhoneAccess() {
   const box = $('#phone-access-status');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
-    renderPhoneAccess(await api('/api/remote-access'));
+    const status = await api('/api/remote-access');
+    if (renderIsCurrent()) renderPhoneAccess(status);
   } catch (error) {
+    if (!renderIsCurrent()) return;
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
         <span>Access your Karmax at</span>
@@ -8466,9 +8567,14 @@ async function hydratePhoneAccess() {
 async function hydrateGitProfiles(organizationId = S.organizationId) {
   const box = $('#git-profiles-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let data = { profiles: [], defaultProfile: null };
   const base = `/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`;
-  try { data = await api(base); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  try { data = await api(base); } catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
     box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
       organizationId === 'org_personal'
@@ -8499,8 +8605,13 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
 async function hydrateWorkflows(organizationId = S.organizationId) {
   const box = $('#workflows-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let list = [];
-  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
+  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
   box.innerHTML = list.map((w) => `<div class="queue-item">
       <div style="flex:1"><b>${esc(w.name)}</b>
@@ -9164,11 +9275,13 @@ function profileRow(p, scope) {
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
-  let profiles = [];
-  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
-  profiles = profiles.filter((p) => p.role !== 'confirm');
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
+  const renderIsCurrent = beginAsyncElementRender(list);
+  let profiles = [];
+  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  if (!renderIsCurrent()) return;
+  profiles = profiles.filter((p) => p.role !== 'confirm');
   const doP = profiles.find((p) => p.role === 'do');
   const mergeP = profiles.find((p) => p.role === 'merge');
   const rest = profiles.filter((p) => p !== doP && p !== mergeP);
@@ -9236,6 +9349,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
   if (!field) { box.innerHTML = ''; return; }
   let own = {};
@@ -9246,6 +9360,7 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     own = d[scope].own;
     inherited = d[scope].inherited;
   } catch {}
+  if (!renderIsCurrent()) return;
   box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
     <button class="btn primary sm" data-save-review-route>Save review route</button>`;
   wireAgentFields(box);
@@ -9345,9 +9460,11 @@ function wireCapabilityChecklist(row) {
 async function hydrateAuthorization(scope, projectId) {
   const box = $(`#authorization-${scope}`);
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
     const data = await api(`/api/authorization/profiles${suffix}`);
+    if (!renderIsCurrent()) return;
     const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
     box.innerHTML = `<p class="task-sub">These profiles limit what task agents may do. Human membership and project access are managed in People and each project's Access section.</p>
       <div class="form-row"><label>Default for new task agents</label><select class="authz-default">${options}</select></div>
@@ -9382,7 +9499,9 @@ async function hydrateAuthorization(scope, projectId) {
         hydrateAuthorization(scope, projectId);
       } catch (e) { toast(e.message, true); }
     }));
-  } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
+  } catch (e) {
+    if (renderIsCurrent()) box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`;
+  }
 }
 
 function wireGlobalSettings(organizationId) {
@@ -9736,6 +9855,11 @@ function organizationView() {
 
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
+  const organizationId = S.organizationId;
+  const epoch = S.organizationViewEpoch = (S.organizationViewEpoch || 0) + 1;
+  const renderIsCurrent = () => S.organizationViewEpoch === epoch
+    && S.organizationId === organizationId
+    && !!$('#org-members');
   const gitAccounts = $('#git-accounts-card');
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
@@ -9744,6 +9868,7 @@ async function hydrateOrganizationView() {
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
+  if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
@@ -9754,16 +9879,17 @@ async function hydrateOrganizationView() {
     return `<div class="member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; permissions still come from the selected profile">protected owner</span>' : ''}<select class="q-sel org-member-profile">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
   const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
-    api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/world-providers`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
-    api(`/api/organizations/${S.organizationId}/usage`).catch(() => null),
-    api(`/api/organizations/${S.organizationId}/identity-policy`).catch(() => null),
-    api(`/api/organizations/${S.organizationId}/invitations`).catch(() => []),
-    Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+    api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
+    api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
+    api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
+    api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
+    api(`/api/organizations/${organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
+    api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
+    Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
+  if (!renderIsCurrent()) return;
   if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.profileId || 'developer')}</span></div>`).join('')}`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
