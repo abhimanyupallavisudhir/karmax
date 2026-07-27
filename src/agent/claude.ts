@@ -364,11 +364,10 @@ export class ClaudeAdapter implements AgentAdapter {
     const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
 
     // Poll the workflow for mid-turn follow-ups and inject them into the live session
-    // (SPEC §5.6). With no live channel there's nothing to poll — close the input
-    // stream now so this turn is a single-shot on the initial message (old behaviour).
+    // (SPEC §5.6). With no live channel there's nothing to poll; the stream then just
+    // carries the initial message and closes at the turn's terminal result below.
     let followPoll: ReturnType<typeof setInterval> | undefined;
     if (ctx.pullFollowUps) followPoll = setInterval(() => { void drainFollowUps(); }, 1200);
-    else injector.close();
 
     let finalText = '';
     let session = input.session;
@@ -380,6 +379,24 @@ export class ClaudeAdapter implements AgentAdapter {
     // while a sub-agent is still running. We fold every task-lifecycle message in and
     // report the residual count so the workflow won't advance Do→Review mid-flight.
     const subagents = newSubagentTracker();
+    // Ending the input stream closes the harness's stdin, and from that instant Claude
+    // Code rejects EVERY control request with "Stream closed" (its `sendRequest` guards
+    // on `inputClosed`). That channel carries the in-process `karmax_control` MCP tools
+    // (create_review_info, signal_completion, …) and the `canUseTool` approver — so it
+    // must outlive the agent's work, not just its first idle moment. And a `result` is
+    // NOT reliably the end of the harness: while an in-harness sub-agent or backgrounded
+    // shell is still running it keeps the session alive, folds the settlement back in,
+    // and drives the agent through more exchanges. Closing there left agents working for
+    // the rest of the turn against a dead control channel — the "Stream closed" reports.
+    // So hold the stream open until a result arrives with nothing outstanding, bounded
+    // because a backgrounded shell may be a dev server the task deliberately left running.
+    const settleGraceMs = Number(process.env.KARMAX_AGENT_BG_SETTLE_MS ?? 300_000);
+    let settleDeadline: number | undefined;
+    const harnessStillWorking = (): boolean => {
+      if (!subagents.size) return false;
+      settleDeadline ??= Date.now() + settleGraceMs;
+      return Date.now() < settleDeadline;
+    };
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -508,6 +525,7 @@ export class ClaudeAdapter implements AgentAdapter {
         // the stream to its end lets any in-turn settlements clear before we report —
         // only genuinely still-running sub-agents remain (see subagents.ts).
         trackTaskMessage(subagents, message);
+        if (!subagents.size) settleDeadline = undefined; // drained ⇒ a fresh grace for the next batch
         if (message.type === 'assistant') {
           const content = (message.message?.content ?? []) as any[];
           const text = content
@@ -701,12 +719,11 @@ export class ClaudeAdapter implements AgentAdapter {
           // The agent went idle (finished responding to its current input). End the
           // turn — UNLESS a follow-up landed in the meantime and the agent hasn't
           // declared completion, in which case inject it and let the session continue
-          // in-place rather than tearing down and resuming on a fresh turn.
-          if (completionSeen) {
+          // in-place rather than tearing down and resuming on a fresh turn — or the
+          // harness still has work in flight that will drive the agent again, in which
+          // case the input stream (and with it the control channel) stays open.
+          if ((completionSeen || !(await drainFollowUps())) && !harnessStillWorking()) {
             injector.close();
-          } else {
-            const injected = await drainFollowUps();
-            if (!injected) injector.close();
           }
         }
       }
