@@ -33,6 +33,23 @@ function gitAsync(root: string, args: string[], env?: NodeJS.ProcessEnv): Promis
   });
 }
 
+function githubSshOverHttpsRemote(remote: string): string | undefined {
+  const match = /^git@github\.com:([^\s]+)$/.exec(remote);
+  return match ? `ssh://git@ssh.github.com:443/${match[1]}` : undefined;
+}
+
+function sshConnectivityFailure(error: unknown, port: number): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return message.includes(`port ${port}`)
+    && /timed out|timeout|refused|unreachable|no route to host|connection reset/.test(message);
+}
+
+function setRemote(root: string, remote: string): void {
+  let exists = true;
+  try { git(root, ['remote', 'get-url', 'origin']); } catch { exists = false; }
+  git(root, exists ? ['remote', 'set-url', 'origin', remote] : ['remote', 'add', 'origin', remote]);
+}
+
 /** Existing project wiki folders are migrated in place: initializing Git does
  * not rewrite any page, and the first commit simply establishes their baseline. */
 export function ensureProjectWikiRepository(contentDir: string, projectId: string): string {
@@ -96,15 +113,51 @@ export function projectWikiBranchView(contentDir: string, projectId: string, ref
 }
 
 export async function setProjectWikiRemote(root: string, remote: string, sshKey: string): Promise<void> {
-  try { git(root, ['remote', 'set-url', 'origin', remote]); }
-  catch { git(root, ['remote', 'add', 'origin', remote]); }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-key-'));
   const key = path.join(dir, 'id');
   try {
     fs.writeFileSync(key, sshKey, { mode: 0o600 });
-    await gitAsync(root, ['push', '-u', 'origin', `${PROJECT_WIKI_BRANCH}:${PROJECT_WIKI_BRANCH}`], {
-      GIT_SSH_COMMAND: `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1`,
-    });
+    const push = async (url: string) => {
+      setRemote(root, url);
+      await gitAsync(root, ['push', '-u', 'origin', `${PROJECT_WIKI_BRANCH}:${PROJECT_WIKI_BRANCH}`], {
+        GIT_SSH_COMMAND: `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1`,
+      });
+    };
+    const alternate = githubSshOverHttpsRemote(remote);
+    let current: string | undefined;
+    try { current = git(root, ['remote', 'get-url', 'origin']); } catch { /* no origin yet */ }
+
+    // GitHub exposes its SSH service on ssh.github.com:443 specifically for
+    // networks whose firewalls block the normal github.com:22 endpoint. Once
+    // that fallback succeeds, leave it as origin and prefer it on later boots
+    // so startup does not repeatedly wait for a known-blocked port 22.
+    if (alternate && current === alternate) {
+      try {
+        await push(alternate);
+        return;
+      } catch (alternateError) {
+        if (!sshConnectivityFailure(alternateError, 443)) throw alternateError;
+        try {
+          await push(remote);
+          return;
+        } catch (standardError) {
+          throw new AggregateError([alternateError, standardError],
+            'Could not push the project wiki to GitHub over SSH ports 443 or 22');
+        }
+      }
+    }
+
+    try {
+      await push(remote);
+    } catch (standardError) {
+      if (!alternate || !sshConnectivityFailure(standardError, 22)) throw standardError;
+      try {
+        await push(alternate);
+      } catch (alternateError) {
+        throw new AggregateError([standardError, alternateError],
+          'Could not push the project wiki to GitHub over SSH ports 22 or 443');
+      }
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -7,7 +7,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, repositoryKeyHandle } from '../src/integrations/github-app.js';
-import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
+import { ensureProjectWikiRepository, setProjectWikiRemote } from '../src/wiki/repository.js';
 import { paths } from '../src/config/paths.js';
 import { Gateway } from '../src/gateway/server.js';
 
@@ -82,5 +82,55 @@ describe('project wiki remote provisioning', () => {
 
     (gateway as any).fanout.close();
     store.close();
+  });
+
+  it('falls back to GitHub SSH over port 443 and remembers the working endpoint', async () => {
+    const root = ensureProjectWikiRepository(paths().content, 'fallback');
+    const bare = path.join(home, 'remote.git');
+    const bin = path.join(home, 'bin');
+    const log = path.join(home, 'ssh.log');
+    const ssh = path.join(bin, 'ssh');
+    fs.mkdirSync(bin);
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    fs.writeFileSync(ssh, `#!/bin/sh
+printf '%s\n' "$*" >> "$KARMAX_TEST_SSH_LOG"
+case "$*" in
+  *ssh.github.com*) exec git-receive-pack "$KARMAX_TEST_SSH_REMOTE" ;;
+esac
+echo "ssh: connect to host github.com port 22: Connection timed out" >&2
+exit 255
+`, { mode: 0o700 });
+
+    const previous = {
+      path: process.env.PATH,
+      log: process.env.KARMAX_TEST_SSH_LOG,
+      remote: process.env.KARMAX_TEST_SSH_REMOTE,
+    };
+    process.env.PATH = `${bin}:${previous.path ?? ''}`;
+    process.env.KARMAX_TEST_SSH_LOG = log;
+    process.env.KARMAX_TEST_SSH_REMOTE = bare;
+    try {
+      await setProjectWikiRemote(root, 'git@github.com:acme/wiki.git', 'FAKE-PRIVATE-KEY');
+      expect(execFileSync('git', ['-C', root, 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim())
+        .toBe('ssh://git@ssh.github.com:443/acme/wiki.git');
+      const firstAttempts = fs.readFileSync(log, 'utf8');
+      expect(firstAttempts).toContain('git@github.com');
+      expect(firstAttempts).toContain('ssh.github.com');
+      expect(execFileSync('git', ['--git-dir', bare, 'rev-parse', 'refs/heads/main'],
+        { encoding: 'utf8' }).trim()).toMatch(/^[0-9a-f]{40}$/);
+
+      fs.writeFileSync(log, '');
+      await setProjectWikiRemote(root, 'git@github.com:acme/wiki.git', 'FAKE-PRIVATE-KEY');
+      const laterAttempts = fs.readFileSync(log, 'utf8');
+      expect(laterAttempts).toContain('ssh.github.com');
+      expect(laterAttempts).not.toContain('git@github.com');
+    } finally {
+      if (previous.path === undefined) delete process.env.PATH;
+      else process.env.PATH = previous.path;
+      if (previous.log === undefined) delete process.env.KARMAX_TEST_SSH_LOG;
+      else process.env.KARMAX_TEST_SSH_LOG = previous.log;
+      if (previous.remote === undefined) delete process.env.KARMAX_TEST_SSH_REMOTE;
+      else process.env.KARMAX_TEST_SSH_REMOTE = previous.remote;
+    }
   });
 });
