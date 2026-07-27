@@ -99,6 +99,26 @@ describe('listWiki / readWikiPage', () => {
     expect(() => listWiki('/nowhere', '../escape')).toThrow();
     expect(safeWikiPath('a//b/')).toBe('a/b');
   });
+
+  it('converts an entry between skill and memory in place, keeping attached files', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'notes', '---\ndescription: d\n---\nBody.', 'skill');
+      fs.writeFileSync(path.join(root, 'notes', 'extra.txt'), 'attached');
+      expect(fs.existsSync(path.join(root, 'notes', 'SKILL.md'))).toBe(true);
+      // Passing the other kind swaps the file (SKILL.md → MEMORY.md) in place.
+      const asMemory = writeWikiPage(root, 'notes', '---\ndescription: d\n---\nBody.', 'memory');
+      expect(asMemory.kind).toBe('memory');
+      expect(fs.existsSync(path.join(root, 'notes', 'MEMORY.md'))).toBe(true);
+      expect(fs.existsSync(path.join(root, 'notes', 'SKILL.md'))).toBe(false);
+      expect(fs.existsSync(path.join(root, 'notes', 'extra.txt'))).toBe(true); // attached files stay
+      // Omitting the kind on a later write keeps the current file (no accidental flip).
+      expect(writeWikiPage(root, 'notes', '---\ndescription: d2\n---\nBody2.').kind).toBe('memory');
+      // And converting back to a skill removes the MEMORY.md.
+      expect(writeWikiPage(root, 'notes', 'Body3.', 'skill').kind).toBe('skill');
+      expect(fs.existsSync(path.join(root, 'notes', 'MEMORY.md'))).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 describe('labels / importance frontmatter', () => {
@@ -128,8 +148,8 @@ describe('labels / importance frontmatter', () => {
       // Every entry is always indexed — the `default` ones included, tagged {default}.
       const toc = renderWikiToc(tree, { scope: 'project', id: 'p1' });
       expect(toc).toContain('indexed-skill');
-      expect(toc).toContain('tone] {default}');
-      expect(toc).toContain('style] {default}');
+      expect(toc).toContain('[tone](tone) {default}');
+      expect(toc).toContain('[style](style) {default}');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -281,10 +301,10 @@ describe('renderWikiToc', () => {
     try {
       seedWiki(root);
       const toc = renderWikiToc(listWiki(root), { scope: 'project', id: 'p1' });
-      expect(toc).toContain('- Deploy checklist [deploy-checklist] — Steps before shipping');
-      expect(toc).toContain('- flaky-ci (memory) [flaky-ci] — The e2e suite is flaky on Fridays');
+      expect(toc).toContain('- [Deploy checklist](deploy-checklist) — Steps before shipping');
+      expect(toc).toContain('- [flaky-ci](flaky-ci) (memory) — The e2e suite is flaky on Fridays');
       expect(toc).toContain('- guides/');
-      expect(toc).toContain('  - E2E runbook [guides/e2e-runbook] — How to run e2e');
+      expect(toc).toContain('  - [E2E runbook](guides/e2e-runbook) — How to run e2e');
       expect(toc).not.toContain('[more…]');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -346,8 +366,8 @@ describe('buildWikiPromptContext', () => {
       expect(builtinAt).toBe(0);
       expect(orgAt).toBeGreaterThan(builtinAt);
       expect(projAt).toBeGreaterThan(orgAt);
-      expect(ctx).toContain('org-skill] — org one');
-      expect(ctx).toContain('proj-skill] — proj one');
+      expect(ctx).toContain('[org-skill](org-skill) — org one');
+      expect(ctx).toContain('[proj-skill](proj-skill) — proj one');
       // A `default` entry is inlined in full, so it is NOT also listed in the TOC.
       expect(ctx).not.toContain('org-rules]');
       expect(ctx).toContain('read_wiki(scope, id, path?)');
@@ -393,7 +413,7 @@ describe('buildWikiPromptContext', () => {
       // Cleared context field ([]) ⇒ opt out: the body leaves the prompt, back into the TOC.
       const optOut = buildWikiPromptContext({ ...base, contextTokens: [] });
       expect(optOut).not.toContain('Always rule.');
-      expect(optOut).toContain('house-rules] {default}');
+      expect(optOut).toContain('[house-rules](house-rules) {default}');
       // The built-in working instructions are delivered regardless of the field.
       expect(optOut).toContain('# How to work');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
@@ -419,7 +439,7 @@ describe('buildWikiPromptContext', () => {
       writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\nname: How to work\ndescription: house rules\n---\nHouse variant.');
       const indexed = buildWikiPromptContext({ contentDir, organizationId: 'org1', projectId: 'p1' });
       expect(indexed).not.toContain('House variant.');
-      expect(indexed).toContain('How to work [@builtin/how-to-work] — house rules');
+      expect(indexed).toContain('[How to work](@builtin/how-to-work) — house rules');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
 });
