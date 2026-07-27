@@ -2631,7 +2631,8 @@ export class KarmaxApi {
   }
 
   /** Create (`create` guards against overwriting), update, or — via `prevPath`
-   *  — rename an entry. `kind` picks SKILL.md vs MEMORY.md at creation only. */
+   *  — rename an entry. `kind` picks SKILL.md vs MEMORY.md; passing one that
+   *  differs from an existing entry's converts it (skill ⇄ memory) in place. */
   saveWikiPage(
     token: string,
     scope: WikiScope,
@@ -2659,7 +2660,7 @@ export class KarmaxApi {
         });
     }
     if (previousPath && previousPath !== nextPath) moveWikiPage(root, previousPath, nextPath);
-    const page = writeWikiPage(root, args.path, args.content, args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+    const page = writeWikiPage(root, args.path, args.content, args.kind, { create: args.create });
     if (scope === 'project') commitProjectWiki(root, `wiki: update ${page.path}`);
     else this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
       operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
@@ -2752,8 +2753,7 @@ export class KarmaxApi {
     try {
       if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path))
         moveWikiPage(remote.root, args.prevPath, args.path);
-      const page = writeWikiPage(remote.root, args.path, args.content,
-        args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+      const page = writeWikiPage(remote.root, args.path, args.content, args.kind, { create: args.create });
       await remote.flush(`wiki: update ${page.path}`);
       return page;
     } finally { await remote.release(); }
