@@ -129,7 +129,7 @@ export interface InboxItem {
   userId: string;
   eventSeq: number;
   taskId: string;
-  kind: 'assigned' | 'mentioned' | 'review-requested' | 'escalated' | 'update';
+  kind: 'assigned' | 'mentioned' | 'review-requested' | 'approval-requested' | 'escalated' | 'update';
   unread: boolean;
   actionable: boolean;
   createdAt: number;
@@ -333,6 +333,23 @@ export interface WorldHandleRef {
     targetPinned?: boolean; baseSha?: string; localPath?: string }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
+}
+
+/**
+ * Every durable merge-queue lease a task world can own. Kept in the pure domain
+ * contract so deterministic workflows and the platform's out-of-band lifecycle
+ * controls use exactly the same keys when acquiring and withdrawing work.
+ */
+export function mergeQueueDomains(
+  world: WorldHandleRef | undefined,
+  target: string,
+  projectId: string,
+): string[] {
+  const domains = world?.repos?.length
+    ? world.repos.map((repo) =>
+      `${repo.localPath ?? repo.repo}:${repo.targetPinned === false ? target : (repo.target ?? target)}`)
+    : [`${world?.repo ?? projectId}:${target}`];
+  return [...new Set(domains)].sort();
 }
 
 // ─── Project / list / task records (the metadata index) ──────────────────────
@@ -685,8 +702,9 @@ export type PriorityName = (typeof PRIORITIES)[number];
 /**
  * A tag: a label ("bug", "feature-request") or a topic ("frontend", "auth"), scoped to
  * a project. Tags are hierarchical via `parentId` — selecting a parent in search matches
- * every descendant (Linear label-groups). `kind` separates the two conceptual axes so the
- * UI can present them differently: `type` = what-kind-of-work, `topic` = what-area.
+ * every descendant (Linear label-groups). `kind` separates the conceptual axes so the
+ * UI can present them differently: `type` = what-kind-of-work, `topic` = what-area,
+ * `flag` = an operational marker (e.g. no-merge).
  */
 export interface Tag {
   id: string;
@@ -698,7 +716,7 @@ export interface Tag {
   /** Presentation colour (hex or a named swatch key); optional. */
   color?: string;
   /** Which conceptual axis this tag belongs to. */
-  kind?: 'type' | 'topic';
+  kind?: 'type' | 'topic' | 'flag';
   /** Optional guidance shown at the start of this tag's task-list section. */
   description?: string;
   createdAt: number;
@@ -1011,6 +1029,8 @@ export interface DeclaredAction {
   enabled: boolean;
   danger?: boolean;
   args?: ActionArg[];
+  /** Conversations this action may address. Omitted means every agent role. */
+  roles?: AgentRole[];
 }
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
@@ -1031,6 +1051,9 @@ export interface TaskView {
   workflowSwitchable?: boolean;
   stage: Stage;
   status: TaskStatus;
+  /** Pending credential decisions projected by the gateway. The vault remains
+   * the source of truth; workflows do not persist or replay this host state. */
+  approvalRequests?: number;
   /**
    * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
    * onto the view from the task record so the UI can show/edit them at any stage,

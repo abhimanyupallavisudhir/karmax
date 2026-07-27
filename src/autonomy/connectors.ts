@@ -473,9 +473,19 @@ export class Connectors {
       const value = this.items.readSecret(item, field);
       if (value !== undefined) secrets[field] = value;
     }
-    const result = await connector.push({ externalId: item.provenance.externalId ?? '', type: item.type, label: item.label, username: item.username, domains: item.domains, fields: item.fields, secrets });
-    // Record the external id so a later re-sync updates rather than duplicates.
-    this.items.setExternalId(item.id, result.externalId);
+    const result = await connector.push({
+      externalId: item.provenance.externalIds?.[name] ?? '',
+      type: item.type,
+      label: item.label,
+      username: item.username,
+      domains: item.domains,
+      fields: item.fields,
+      secrets,
+    });
+    // Record which connector owns this external id. Agent-created items may be
+    // written to several enabled stores, and rotations must target each exact
+    // entry rather than reuse one ambiguous id.
+    this.items.setExternalId(item.id, name, result.externalId);
     return result;
   }
 
@@ -503,27 +513,54 @@ export class Connectors {
   }
 
   /**
-   * Propagate rotated secret fields of a mirrored-in item back to its source
-   * store, field-level (notes preserved). Called after a rotation when the
-   * source connector has write-back enabled; a no-op (best-effort) otherwise.
-   * Returns the fields it actually pushed. Unlike `writeBack`, this is FOR
-   * connector-sourced items — the update-existing counterpart to push-create.
+   * Propagate rotated secret fields to every external store already bound to
+   * the item. Imported items have one source binding; agent-created items may
+   * have several write-back bindings. This deliberately uses updateSecret,
+   * never push/create, so connector-specific preservation rules (for example
+   * pass notes on lines 2+) remain intact.
+   *
+   * Legacy agent-created items have one unlabelled `externalId`. Use it only
+   * when exactly one enabled update-capable connector is an unambiguous target;
+   * never risk sending the same id to several stores. Connector errors do not
+   * roll back the already-correct karmax vault.
    */
   async propagate(itemId: string, fields: VaultFieldName[]): Promise<{ connector: string; fields: VaultFieldName[] } | undefined> {
     const item = this.items.get(itemId);
-    if (!item || !item.provenance.source.startsWith('connector:') || !item.provenance.externalId) return undefined;
-    const name = item.provenance.source.slice('connector:'.length);
-    const connector = this.get(name);
-    if (!connector?.updateSecret || !this.config(name).writeBack) return undefined;
-    const pushed: VaultFieldName[] = [];
-    for (const field of fields) {
-      if (!item.fields.includes(field)) continue;
-      const value = this.items.readSecret(item, field);
-      if (value === undefined) continue;
-      await connector.updateSecret(item.provenance.externalId, field, value);
-      pushed.push(field);
+    if (!item) return undefined;
+
+    let bindings: Array<[connector: string, externalId: string]> = [];
+    if (item.provenance.source.startsWith('connector:') && item.provenance.externalId) {
+      bindings = [[item.provenance.source.slice('connector:'.length), item.provenance.externalId]];
+    } else if (item.provenance.externalIds) {
+      bindings = Object.entries(item.provenance.externalIds);
+    } else if (item.provenance.externalId) {
+      const candidates = this.names().filter((name) =>
+        Boolean(this.get(name)?.updateSecret) && Boolean(this.config(name).writeBack));
+      if (candidates.length > 1) {
+        throw new Error(`legacy write-back binding is ambiguous across enabled connectors: ${candidates.join(', ')}`);
+      }
+      if (candidates.length === 1) bindings = [[candidates[0]!, item.provenance.externalId]];
     }
-    return pushed.length ? { connector: name, fields: pushed } : undefined;
+
+    const pushedConnectors: string[] = [];
+    const pushedFields = new Set<VaultFieldName>();
+    for (const [name, externalId] of bindings) {
+      const connector = this.get(name);
+      if (!connector?.updateSecret || !this.config(name).writeBack) continue;
+      let connectorUpdated = false;
+      for (const field of fields) {
+        if (!item.fields.includes(field)) continue;
+        const value = this.items.readSecret(item, field);
+        if (value === undefined) continue;
+        await connector.updateSecret(externalId, field, value);
+        pushedFields.add(field);
+        connectorUpdated = true;
+      }
+      if (connectorUpdated) pushedConnectors.push(name);
+    }
+    return pushedConnectors.length
+      ? { connector: pushedConnectors.join(', '), fields: [...pushedFields] }
+      : undefined;
   }
 }
 

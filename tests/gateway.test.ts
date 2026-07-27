@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 
@@ -846,6 +848,72 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(third.status).toBe('needs_approval');
   });
 
+  it('projects credential approvals onto the task, notifies its human, and resumes it after resolution', async () => {
+    const repo = await h.makeRepo('gw-credential-approval');
+    const project: any = await (await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        name: 'Credential approval lifecycle',
+        config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+      }),
+    })).json();
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        workflow: 'software-dev', title: 'Use an approval-gated credential',
+        prompt: '@review waiting for a credential decision',
+      }),
+    })).json();
+    await expect.poll(async () => {
+      const view: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+      return view?.stage;
+    }, { timeout: 15_000 }).toBe('review');
+
+    const item: any = await (await fetch(`${base}/api/vault/items`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        type: 'login', label: 'Approval lifecycle login', domains: 'approval.example.com',
+        policy: { use: 'auto', reveal: 'auto' }, secrets: { password: 'secret' },
+      }),
+    })).json();
+    const minted = h.tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
+    const agentAuth = { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' };
+    const requested: any = await (await fetch(`${base}/api/vault/requests`, {
+      method: 'POST', headers: agentAuth,
+      body: JSON.stringify({ itemId: item.id, mode: 'reveal', why: 'verify the approval lifecycle' }),
+    })).json();
+    expect(requested).toMatchObject({ status: 'needs_approval', itemId: item.id });
+
+    const requests: any = await (await fetch(
+      `${base}/api/vault/requests?taskId=${task.id}&organizationId=org_personal`,
+      { headers: auth() },
+    )).json();
+    expect(requests.find((request: any) => request.id === requested.requestId)).toMatchObject({
+      task: { id: task.id, num: task.num, title: 'Use an approval-gated credential', projectId: project.id },
+    });
+    const taskView: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(taskView.approvalRequests).toBe(1);
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() })).json();
+    expect(listed.find((candidate: any) => candidate.id === task.id).lastView.approvalRequests).toBe(1);
+    const inbox = h.store.listOrganizationMemberships(project.organizationId)
+      .flatMap((membership) => h.store.listInbox(membership.userId, project.organizationId));
+    expect(inbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: task.id, kind: 'approval-requested', actionable: true, unread: true }),
+    ]));
+
+    const resolved: any = await (await fetch(`${base}/api/vault/requests/${requested.requestId}/resolve`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ action: 'task' }),
+    })).json();
+    expect(resolved).toMatchObject({ status: 'granted', resume: { resumed: true } });
+    expect(h.store.eventsSince(task.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'conversation.message',
+        payload: expect.objectContaining({ message: expect.objectContaining({ text: expect.stringContaining('Retry the blocked reveal operation now') }) }),
+      }),
+      expect.objectContaining({ type: 'credential.approval-resolved', payload: expect.objectContaining({ resumed: true }) }),
+    ]));
+    const after: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(after.approvalRequests).toBeUndefined();
+  });
+
   it('rotation rides the use-grant: a granted task updates a foreign item\'s secret, nothing else', async () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'login', label: 'Rotatable', domains: 'rot.example.com', policy: { use: 'auto', reveal: 'auto' }, secrets: { password: 'old' },
@@ -873,6 +941,80 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(reset.status).toBe('needs_approval');
     const reqs: any = await (await fetch(`${base}/api/vault/requests?status=pending`, { headers: auth() })).json();
     expect(reqs.find((r: any) => r.id === reset.requestId).kind).toBe('reset');
+  });
+
+  it('propagates an agent-created item rotation to its write-back entry without clobbering notes', async () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fake-pass-'));
+    const fakePass = path.join(fakeHome, 'pass');
+    const entryFile = path.join(fakeHome, 'entry');
+    fs.writeFileSync(fakePass, `#!/bin/sh
+case "$1" in
+  show) cat "$KARMAX_TEST_PASS_ENTRY" ;;
+  insert) cat > "$KARMAX_TEST_PASS_ENTRY" ;;
+  *) exit 1 ;;
+esac
+`);
+    fs.chmodSync(fakePass, 0o755);
+    const previousPath = process.env.PATH;
+    const previousEntry = process.env.KARMAX_TEST_PASS_ENTRY;
+    process.env.PATH = `${fakeHome}${path.delimiter}${previousPath ?? ''}`;
+    process.env.KARMAX_TEST_PASS_ENTRY = entryFile;
+    try {
+      const configured = await fetch(`${base}/api/vault/connectors/pass/config`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: true }),
+      });
+      expect(configured.status).toBe(200);
+      const agent = h.tokens.mint({
+        taskId: 'task_agent_writeback_rotation',
+        profileId: 'do',
+        principal: 'user:test',
+        ceiling: ['credential:read', 'vault:store'],
+        grantorCaps: ['credential:read', 'vault:store'],
+      });
+      const agentAuth = { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' };
+      const created: any = await (await fetch(`${base}/api/vault/store`, {
+        method: 'POST',
+        headers: agentAuth,
+        body: JSON.stringify({
+          type: 'login',
+          label: 'Agent-created pass rotation',
+          domains: ['rotation.example.com'],
+          username: 'agent@example.com',
+          secrets: { password: 'initial' },
+        }),
+      })).json();
+      expect(created.writeBack).toEqual([
+        { connector: 'pass', externalId: 'karmax/Agent-created-pass-rotation' },
+      ]);
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\n');
+
+      // Real pass entries often contain notes below line 1. Rotation must use
+      // updateSecret, not push, so those lines survive.
+      fs.writeFileSync(entryFile, 'initial\nusername: agent@example.com\nkeep this note\n');
+      const rotated: any = await (await fetch(`${base}/api/vault/store`, {
+        method: 'POST',
+        headers: agentAuth,
+        body: JSON.stringify({
+          id: created.id,
+          type: 'login',
+          label: 'Agent-created pass rotation',
+          secrets: { password: 'rotated' },
+        }),
+      })).json();
+      expect(rotated.propagated).toEqual({ connector: 'pass', fields: ['password'] });
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe(
+        'rotated\nusername: agent@example.com\nkeep this note\n',
+      );
+    } finally {
+      await fetch(`${base}/api/vault/connectors/pass/config`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: false }),
+      }).catch(() => {});
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousEntry === undefined) delete process.env.KARMAX_TEST_PASS_ENTRY;
+      else process.env.KARMAX_TEST_PASS_ENTRY = previousEntry;
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 
   it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {
@@ -954,6 +1096,56 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(mailbox.configured).toBe(true);
     expect(h.store.kvGet(`agent-mail:provider:${orgId}`)).toContain('mailbox:agentmail:');
     expect(h.store.kvGet('agent-mail:provider')).toBeUndefined();
+  });
+
+  it('configures the shared Stripe Connect application from the operator API without returning secrets', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const endpoint = `${base}/api/organizations/${orgId}/payments/stripe/platform`;
+    const before: any = await (await fetch(endpoint, { headers: auth() })).json();
+    expect(before).toMatchObject({
+      canManage: true,
+      callbackUrl: `${base}/api/payments/stripe/callback`,
+      webhookUrl: `${base}/api/payments/stripe/webhook`,
+    });
+    const organizationPaymentAdmin = h.tokens.mint({
+      taskId: 'task_payment_admin',
+      profileId: 'operator',
+      principal: 'user:organization-payment-admin',
+      organizationId: orgId,
+      ceiling: ['payment:read', 'payment:write'],
+      grantorCaps: ['payment:read', 'payment:write'],
+    });
+    const forbidden = await fetch(endpoint, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${organizationPaymentAdmin.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId: 'ca_forbidden', secretKey: 'sk_test_forbidden' }),
+    });
+    expect(forbidden.status).toBe(403);
+
+    const saved = await fetch(endpoint, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({
+        clientId: 'ca_gateway_managed',
+        secretKey: 'sk_test_gateway_managed',
+        webhookSecret: 'whsec_gateway_managed',
+      }),
+    });
+    expect(saved.status).toBe(200);
+    const status: any = await saved.json();
+    expect(status).toMatchObject({
+      configured: true, clientId: 'ca_gateway_managed', secretKeyConfigured: true,
+      webhookConfigured: true, source: 'ui',
+    });
+    expect(JSON.stringify(status)).not.toContain('sk_test_gateway_managed');
+    expect(JSON.stringify(status)).not.toContain('whsec_gateway_managed');
+    expect(JSON.stringify(h.store.exportOrganization(orgId))).not.toContain('sk_test_gateway_managed');
+
+    const providers: any = await (await fetch(`${base}/api/organizations/${orgId}/payments/providers`,
+      { headers: auth() })).json();
+    expect(providers.providers.find((provider: any) => provider.name === 'stripe'))
+      .toMatchObject({ available: true, connected: false });
   });
 
   it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {

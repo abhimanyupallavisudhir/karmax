@@ -1,6 +1,7 @@
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import crypto from 'node:crypto';
+import type { CredentialBroker } from './broker.js';
 
 /**
  * Payments (SPEC §7.6). Cards are project/global RESOURCES; an agent never owns a
@@ -168,7 +169,18 @@ export class MockPaymentProvider implements PaymentProvider {
 }
 
 const STRIPE_API_VERSION = '2025-03-31.basil';
+export const STRIPE_CLIENT_ID_KEY = 'payments:stripe:client-id';
+export const STRIPE_SECRET_KEY_HANDLE = 'platform:stripe:secret-key';
+export const STRIPE_WEBHOOK_SECRET_HANDLE = 'platform:stripe:webhook-secret';
 type FetchLike = typeof fetch;
+
+export interface StripePlatformStatus {
+  configured: boolean;
+  clientId?: string;
+  secretKeyConfigured: boolean;
+  webhookConfigured: boolean;
+  source: 'ui' | 'environment' | 'none';
+}
 
 /** Production Stripe Issuing rail. The deployment owns only the Connect
  * application credentials; every account id, balance, card, and ledger entry is
@@ -177,10 +189,53 @@ export class StripeIssuingProvider implements PaymentProvider {
   readonly name = 'stripe';
   readonly authorizationMode = 'webhook';
   constructor(private store?: Store, private fetcher: FetchLike = fetch,
-    private env: NodeJS.ProcessEnv = process.env) {}
+    private env: NodeJS.ProcessEnv = process.env, private broker?: CredentialBroker) {}
 
   private configured(): boolean {
-    return Boolean(this.store && this.env.STRIPE_CLIENT_ID && this.env.STRIPE_SECRET_KEY);
+    return Boolean(this.store && this.clientId() && this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'));
+  }
+  private clientId(): string | undefined {
+    return this.store?.kvGet(STRIPE_CLIENT_ID_KEY)?.trim() || this.env.STRIPE_CLIENT_ID?.trim() || undefined;
+  }
+  private hasSecret(handle: string, environmentName: 'STRIPE_SECRET_KEY' | 'STRIPE_WEBHOOK_SECRET'): boolean {
+    return Boolean(this.broker?.hasHandle(handle) || this.env[environmentName]);
+  }
+  private secret(handle: string, environmentName: 'STRIPE_SECRET_KEY' | 'STRIPE_WEBHOOK_SECRET'): string | undefined {
+    if (this.broker?.hasHandle(handle))
+      return this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+    return this.env[environmentName];
+  }
+  platformStatus(): StripePlatformStatus {
+    const clientId = this.clientId();
+    const uiManaged = Boolean(this.store?.kvGet(STRIPE_CLIENT_ID_KEY)
+      || this.broker?.hasHandle(STRIPE_SECRET_KEY_HANDLE)
+      || this.broker?.hasHandle(STRIPE_WEBHOOK_SECRET_HANDLE));
+    const secretKeyConfigured = this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY');
+    return {
+      configured: Boolean(this.store && clientId && secretKeyConfigured),
+      ...(clientId ? { clientId } : {}),
+      secretKeyConfigured,
+      webhookConfigured: this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET'),
+      source: uiManaged ? 'ui' : clientId || secretKeyConfigured || this.env.STRIPE_WEBHOOK_SECRET ? 'environment' : 'none',
+    };
+  }
+  configurePlatform(input: { clientId: string; secretKey?: string; webhookSecret?: string }): StripePlatformStatus {
+    const store = this.requireStore();
+    if (!this.broker) throw new Error('Karmax encrypted secret storage is unavailable');
+    const clientId = input.clientId.trim();
+    const secretKey = input.secretKey?.trim();
+    const webhookSecret = input.webhookSecret?.trim();
+    if (!/^ca_[A-Za-z0-9_]+$/.test(clientId)) throw new Error('Stripe Connect client ID must start with ca_');
+    if (secretKey && !/^sk_(?:test|live)_\S+$/.test(secretKey))
+      throw new Error('Stripe secret key must be an sk_test_… or sk_live_… key');
+    if (webhookSecret && !/^whsec_\S+$/.test(webhookSecret))
+      throw new Error('Stripe webhook signing secret must start with whsec_');
+    if (!secretKey && !this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))
+      throw new Error('Stripe secret key is required');
+    store.kvSet(STRIPE_CLIENT_ID_KEY, clientId);
+    if (secretKey) this.broker.registerHandle(STRIPE_SECRET_KEY_HANDLE, secretKey);
+    if (webhookSecret) this.broker.registerHandle(STRIPE_WEBHOOK_SECRET_HANDLE, webhookSecret);
+    return this.platformStatus();
   }
   private requireStore(): Store {
     if (!this.store) throw new Error('Stripe Issuing store is unavailable');
@@ -199,7 +254,7 @@ export class StripeIssuingProvider implements PaymentProvider {
   }
   private async request(method: string, path: string, accountId?: string,
     params?: Record<string, unknown>, idempotencyKey?: string): Promise<any> {
-    const key = this.env.STRIPE_SECRET_KEY;
+    const key = this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY');
     if (!key) throw new Error('Stripe platform secret is not configured');
     const headers: Record<string, string> = {
       authorization: `Bearer ${key}`,
@@ -232,12 +287,12 @@ export class StripeIssuingProvider implements PaymentProvider {
       connected: Boolean(connection?.status === 'ready'),
       connectionStatus: connection?.status,
       help: connection?.status === 'ready'
-        ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${this.env.STRIPE_WEBHOOK_SECRET ? '' : ' Configure STRIPE_WEBHOOK_SECRET before issuing active cards.'}`
+        ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET') ? '' : ' Add the webhook signing secret in Stripe platform setup before issuing active cards.'}`
         : connection?.status === 'attention'
           ? `Connected account ${connection.accountId} needs Stripe card_issuing capability activation before Karmax can issue cards.`
         : available
           ? 'Connect this organization’s Stripe account. The deployment Connect app identifies Karmax; it does not fund cards.'
-          : 'The deployment administrator must configure STRIPE_CLIENT_ID and STRIPE_SECRET_KEY before organizations can connect.',
+          : 'An installation administrator must complete Stripe platform setup before organizations can connect.',
     };
   }
   async connect(ctx?: PaymentConnectionContext): Promise<ConnectResult> {
@@ -251,7 +306,7 @@ export class StripeIssuingProvider implements PaymentProvider {
     const url = new URL('https://connect.stripe.com/oauth/authorize');
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', 'read_write');
-    url.searchParams.set('client_id', this.env.STRIPE_CLIENT_ID!);
+    url.searchParams.set('client_id', this.clientId()!);
     url.searchParams.set('redirect_uri', ctx.redirectUri);
     url.searchParams.set('state', state);
     return { status: 'awaiting_oauth', url: url.toString(),
@@ -262,7 +317,7 @@ export class StripeIssuingProvider implements PaymentProvider {
     const pending = this.store!.consumePaymentOAuthState(state);
     if (!pending) throw new Error('Stripe connection state is invalid, expired, or already used');
     const form = new URLSearchParams({
-      client_secret: this.env.STRIPE_SECRET_KEY!,
+      client_secret: this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY')!,
       code,
       grant_type: 'authorization_code',
     });
@@ -298,12 +353,12 @@ export class StripeIssuingProvider implements PaymentProvider {
       this.requireStore().updateCard(card.id, { status: 'canceled', available: 0 });
     }
     const form = new URLSearchParams({
-      client_id: this.env.STRIPE_CLIENT_ID!,
+      client_id: this.clientId()!,
       stripe_user_id: connection.accountId,
     });
     const response = await this.fetcher('https://connect.stripe.com/oauth/deauthorize', {
       method: 'POST',
-      headers: { authorization: `Bearer ${this.env.STRIPE_SECRET_KEY!}`,
+      headers: { authorization: `Bearer ${this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY')!}`,
         'content-type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
     });
@@ -314,7 +369,8 @@ export class StripeIssuingProvider implements PaymentProvider {
   async provisionCard(spec: CardSpec): Promise<Card> {
     if (!spec.cardholderId) throw new Error('Stripe Issuing cardholder is required');
     if (!Number.isSafeInteger(spec.cap) || spec.cap <= 0) throw new Error('card cap must be a positive number of cents');
-    if (!this.env.STRIPE_WEBHOOK_SECRET) throw new Error('STRIPE_WEBHOOK_SECRET is required before issuing active cards');
+    if (!this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET'))
+      throw new Error('A Stripe webhook signing secret is required before issuing active cards');
     const organizationId = spec.organizationId
       ?? (spec.scope === 'organization' ? spec.scopeId : spec.scope === 'project'
         ? this.requireStore().getProject(spec.scopeId!)?.organizationId : 'org_personal');
@@ -384,15 +440,25 @@ export class StripeIssuingProvider implements PaymentProvider {
   }
   async createCardholder(organizationId: string, input: PaymentCardholderInput): Promise<any> {
     const connection = this.connection(organizationId);
+    const name = input.name.trim();
+    const address = input.address;
+    if (!name) throw new Error('cardholder name is required');
+    if (name.length > 24) throw new Error('cardholder name must be 24 characters or fewer');
+    if (!address.line1.trim() || !address.city.trim() || !address.postalCode.trim())
+      throw new Error('cardholder billing street, city, and postal code are required');
+    if (!/^[A-Za-z]{2}$/.test(address.country.trim()))
+      throw new Error('cardholder billing country must be a two-letter country code');
+    if (input.type === 'individual' && (!input.firstName?.trim() || !input.lastName?.trim() || !input.dob))
+      throw new Error('individual cardholders require legal first name, last name, and date of birth');
     const p: Record<string, unknown> = {
-      type: input.type, name: input.name, status: 'active', email: input.email,
+      type: input.type, name, status: 'active', email: input.email,
       phone_number: input.phone,
-      'billing[address][line1]': input.address.line1,
-      'billing[address][line2]': input.address.line2,
-      'billing[address][city]': input.address.city,
-      'billing[address][state]': input.address.state,
-      'billing[address][postal_code]': input.address.postalCode,
-      'billing[address][country]': input.address.country.toUpperCase(),
+      'billing[address][line1]': address.line1.trim(),
+      'billing[address][line2]': address.line2?.trim(),
+      'billing[address][city]': address.city.trim(),
+      'billing[address][state]': address.state?.trim(),
+      'billing[address][postal_code]': address.postalCode.trim(),
+      'billing[address][country]': address.country.trim().toUpperCase(),
       'metadata[karmax_organization_id]': organizationId,
     };
     if (input.type === 'individual') {
@@ -415,7 +481,7 @@ export class StripeIssuingProvider implements PaymentProvider {
     return { number: remote.number, cvc: remote.cvc, expMonth: remote.exp_month, expYear: remote.exp_year };
   }
   webhookSignatureValid(raw: Buffer, signature: string | undefined, now = Date.now()): boolean {
-    const secret = this.env.STRIPE_WEBHOOK_SECRET;
+    const secret = this.secret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET');
     if (!secret || !signature) return false;
     const parts = signature.split(',').map((part) => part.split('=', 2));
     const timestamp = Number(parts.find(([key]) => key === 't')?.[1]);

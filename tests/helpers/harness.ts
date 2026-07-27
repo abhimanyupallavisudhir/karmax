@@ -78,7 +78,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
-  paymentRegistry.register(new StripeIssuingProvider(store));
+  paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
   const activityDeps = {
     store,
     worlds,

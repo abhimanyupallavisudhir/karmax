@@ -66,6 +66,63 @@ describe('Stripe Issuing organization rail', () => {
     return { raw, signature: `t=${timestamp},v1=${digest}` };
   }
 
+  it('accepts installation-admin setup from encrypted secret storage without environment variables', async () => {
+    const secrets = new Map<string, string>();
+    const broker = {
+      hasHandle: (handle: string) => secrets.has(handle),
+      registerHandle: (handle: string, value: string) => secrets.set(handle, value),
+      resolve: (handle: string) => secrets.get(handle),
+    };
+    const managed = new StripeIssuingProvider(store, fetcher as any, {}, broker as any);
+    expect(managed.platformStatus()).toMatchObject({
+      configured: false, secretKeyConfigured: false, webhookConfigured: false, source: 'none',
+    });
+    expect(managed.configurePlatform({
+      clientId: 'ca_ui_managed',
+      secretKey: 'sk_test_ui_managed',
+      webhookSecret: 'whsec_ui_managed',
+    })).toMatchObject({
+      configured: true, clientId: 'ca_ui_managed', secretKeyConfigured: true,
+      webhookConfigured: true, source: 'ui',
+    });
+    expect(JSON.stringify(store.exportOrganization(organizationId))).not.toContain('sk_test_ui_managed');
+
+    const started = await managed.connect({
+      organizationId,
+      userId: 'user_a',
+      redirectUri: 'https://karmax.example/api/payments/stripe/callback',
+    });
+    expect(new URL(started.url!).searchParams.get('client_id')).toBe('ca_ui_managed');
+    const state = new URL(started.url!).searchParams.get('state')!;
+    await managed.completeOAuth(state, 'ac_test');
+    const oauth = fetcher.mock.calls.find(([url]) => url === 'https://connect.stripe.com/oauth/token')!;
+    expect(new URLSearchParams(String(oauth[1].body)).get('client_secret')).toBe('sk_test_ui_managed');
+
+    const raw = Buffer.from('{"id":"event"}');
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = crypto.createHmac('sha256', 'whsec_ui_managed')
+      .update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
+    expect(managed.webhookSignatureValid(raw, `t=${timestamp},v1=${signature}`)).toBe(true);
+  });
+
+  it('validates UI-managed Stripe platform credentials without replacing retained secrets', () => {
+    const secrets = new Map<string, string>();
+    const broker = {
+      hasHandle: (handle: string) => secrets.has(handle),
+      registerHandle: (handle: string, value: string) => secrets.set(handle, value),
+      resolve: (handle: string) => secrets.get(handle),
+    };
+    const managed = new StripeIssuingProvider(store, fetcher as any, {}, broker as any);
+    expect(() => managed.configurePlatform({ clientId: 'not-a-client-id', secretKey: 'sk_test_ok' }))
+      .toThrow(/client ID/);
+    managed.configurePlatform({ clientId: 'ca_first', secretKey: 'sk_test_retained' });
+    managed.configurePlatform({ clientId: 'ca_updated' });
+    expect(managed.platformStatus()).toMatchObject({
+      configured: true, clientId: 'ca_updated', secretKeyConfigured: true,
+    });
+    expect([...secrets.values()]).toContain('sk_test_retained');
+  });
+
   it('stores a separate connected account and balance for the organization', async () => {
     await connect();
     expect(store.getPaymentConnection(organizationId, 'stripe')).toMatchObject({
@@ -83,6 +140,11 @@ describe('Stripe Issuing organization rail', () => {
   it('creates a tenant cardholder and virtual card with a provider-side all-time cap', async () => {
     await connect();
     expect(await stripe.listCardholders(organizationId)).toHaveLength(1);
+    await expect(stripe.createCardholder(organizationId, {
+      type: 'individual',
+      name: 'Incomplete buyer',
+      address: { line1: '1 Main', city: 'SF', postalCode: '94105', country: 'US' },
+    })).rejects.toThrow(/first name, last name, and date of birth/);
     await stripe.createCardholder(organizationId, {
       type: 'individual',
       name: 'Tenant A buyer',

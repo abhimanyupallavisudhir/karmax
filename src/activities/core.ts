@@ -19,7 +19,7 @@ import {
 } from '../agent/provider-registry.js';
 import { AgentAdapter } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
-import { acquireAgentSlot, awaitAgentResources } from './agent-slots.js';
+import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
@@ -107,7 +107,7 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   // Admission happens before a provider process exists. Temporal coordinator
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
-  if (err instanceof AgentAdmissionInfrastructureError) {
+  if (err instanceof AgentAdmissionInfrastructureError || err instanceof AgentResourcesUnavailableError) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   const { classification: cls, metadata } = classifyProviderTurnError(err, provider);
@@ -407,8 +407,43 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
-    const world = await worlds.open(await ensureRunnerLease(handle, taskId));
+    let world: World;
+    try {
+      world = await worlds.open(await ensureRunnerLease(handle, taskId));
+    } catch (e) {
+      const recovered = await recoverVanishedWorld(handle, taskId, e);
+      if (!recovered) throw e;
+      world = recovered;
+    }
     return deps.resources ? await deps.resources.prepare(world) : world;
+  }
+
+  // A remote sandbox can vanish out-of-band while a task is parked (provider GC,
+  // eviction, an incident). The parked world already carries a checkpoint (taken
+  // at park time above), so re-provision a fresh sandbox from it and carry on with
+  // the same branch/files and the same agent session — instead of surfacing a raw
+  // provider "sandbox not found" the task can never get past. Gated on
+  // probe === 'missing', so a transient open error never discards good in-sandbox
+  // state by reverting to the checkpoint. The restored world registers under the
+  // same world id, so every later openWorld() (which re-resolves currentWorld via
+  // ensureRunnerLease) transparently uses it.
+  async function recoverVanishedWorld(handle: WorldHandle, taskId: string, cause: unknown): Promise<World | undefined> {
+    if (!isRemote(handle.kind) || !deps.checkpoints) return undefined;
+    const checkpointId = handle.checkpointId ?? (store.currentWorld(handle.id) as WorldHandle | undefined)?.checkpointId;
+    if (!checkpointId) return undefined;
+    const state = await worlds.probe(handle).catch(() => undefined);
+    if (state !== 'missing') return undefined; // transient/parked → keep the original error
+    record(taskId, 'world.recovering', { checkpointId, reason: (cause instanceof Error ? cause.message : String(cause)).slice(0, 200) });
+    try {
+      const restored = await deps.checkpoints.restore(checkpointId, handle.kind);
+      const opened = await worlds.open(await ensureRunnerLease(restored, taskId));
+      store.setWorldState((store.currentWorld(restored.id) ?? restored) as WorldHandle, 'ready');
+      record(taskId, 'world.recovered', { checkpointId, generation: restored.generation });
+      return opened;
+    } catch (error) {
+      record(taskId, 'world.recover-failed', { checkpointId, detail: (error instanceof Error ? error.message : String(error)).slice(0, 300) });
+      return undefined; // fall through to the original provider error
+    }
   }
 
   /** Make the task's live project-wiki checkout host-readable for prompt
@@ -1157,6 +1192,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           stage: next.stage,
           status: next.status,
           waitingFor: next.waitingFor?.kind ?? null,
+          waitingDetail: next.waitingFor?.detail ?? null,
+          waitingProvider: next.waitingFor?.provider ?? null,
+          waitingResetAt: next.waitingFor?.earliestResetAt ?? null,
           agentTurn: next.agentTurn?.state ?? null,
           agentRole: next.agentTurn?.role ?? null,
           compatibility: 'legacy-agent-turn',
@@ -1692,8 +1730,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
           // Locally-authoritative repo: the broker landed the merge in the local
           // checkout and pushed nothing, so the policy push runs from there —
-          // exactly like a worktree world's.
-          const repoTarget = r.target ?? target;
+          // exactly like a worktree world's. Honor an in-flight (non-pinned)
+          // retarget so we push the branch the merge actually landed on, matching
+          // the origin-authoritative branch below.
+          const repoTarget = r.targetPinned === false ? target : (r.target ?? target);
           const push = await hostGit(r.localPath, ['push', 'origin', repoTarget], { env });
           if (push.code === 0) {
             pushed.push(r.name);
@@ -1745,6 +1785,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         stage: view.stage,
         status: view.status,
         waitingFor: view.waitingFor?.kind ?? null,
+        waitingDetail: view.waitingFor?.detail ?? null,
+        waitingProvider: view.waitingFor?.provider ?? null,
+        waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
         agentTurn: view.agentTurn?.state ?? null,
         agentRole: view.agentTurn?.role ?? null,
       });

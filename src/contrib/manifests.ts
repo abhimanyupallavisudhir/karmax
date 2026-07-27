@@ -331,7 +331,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.6.0',
+    version: '1.7.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -434,7 +434,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.6.0',
+    version: '1.7.0',
     description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -535,6 +535,7 @@ export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
           { ...m, version: '1.3.0' },
           { ...m, version: '1.4.0' },
           { ...m, version: '1.5.0' },
+          { ...m, version: '1.6.0' },
         ]
       : [{ ...m, version: '1.2.0' }]),
   ]);
@@ -551,7 +552,7 @@ export function manifest(name: string): WorkflowManifest | undefined {
  * meaningful choices rather than raw noise.
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
-  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', agentTurn: 'waiting-slot | running | null' } },
+  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', waitingDetail: 'string | null', waitingProvider: 'string | null', waitingResetAt: 'number | null', agentTurn: 'waiting-slot | running | null' } },
   { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },

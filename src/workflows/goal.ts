@@ -6,6 +6,7 @@ import {
   softwareDevV1_4,
   softwareDevV1_5,
   softwareDevV1_6,
+  softwareDevV1_7,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -44,6 +45,11 @@ export async function goalV1_5(input: TaskInput): Promise<{ stage: Stage; sha?: 
 /** Resumable lifecycle transitions plus acknowledged provider cancellation. */
 export async function goalV1_6(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_6({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Human holds resume from the action that supplies their input. */
+export async function goalV1_7(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_7({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

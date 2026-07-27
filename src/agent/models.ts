@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { client, methods, ndJsonStream, PROTOCOL_VERSION, type SessionConfigOption } from '@agentclientprotocol/sdk';
 import { CodexAppServerClient } from './codex-app-server-client.js';
-import { scrubbedEnv } from '../autonomy/config-homes.js';
+import { capturedToken, claudeAccessToken, scrubbedEnv, tokenToInject } from '../autonomy/config-homes.js';
 import { withTimeout } from '../util/timeout.js';
 import type { Provider } from '../domain/types.js';
 import type { AcpProvider } from './provider-registry.js';
@@ -18,30 +18,93 @@ export interface AvailableModel {
 
 export type ModelCatalog = Record<Provider, AvailableModel[]>;
 
-/** Ask Claude Code for the picker entries available to this login. No model turn is
- * made: the streaming input is deliberately left idle while we read the SDK's
- * initialization metadata, then the session is closed. */
+/** Ask Anthropic's account-aware models endpoint for exact model ids. Claude
+ * Code's SDK picker is deliberately a short alias list (`opus[1m]`, `sonnet`,
+ * etc.), so supportedModels() alone can omit a newly available exact model even
+ * while the connected account can already run it. */
+export async function claudeApiModels(
+  configHome?: string,
+  timeoutMs = 10_000,
+  request: typeof fetch = fetch,
+): Promise<AvailableModel[]> {
+  const oauthToken = configHome
+    ? claudeAccessToken(configHome) ?? capturedToken(configHome)
+    : undefined;
+  const apiKey = configHome ? undefined : process.env.ANTHROPIC_API_KEY;
+  if (!oauthToken && !apiKey) return [];
+
+  const baseUrl = process.env.KARMAX_ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com';
+  const response = await request(`${baseUrl.replace(/\/+$/, '')}/v1/models?limit=1000`, {
+    method: 'GET',
+    headers: {
+      ...(oauthToken ? { authorization: `Bearer ${oauthToken}`, 'anthropic-beta': 'oauth-2025-04-20' } : {}),
+      ...(apiKey ? { 'x-api-key': apiKey } : {}),
+      'anthropic-version': '2023-06-01',
+      'user-agent': 'karmax-model-picker/1.0',
+    },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) throw new Error(`Anthropic models API ${response.status}`);
+  const body = await response.json() as { data?: Array<{ id?: unknown; display_name?: unknown }> };
+  if (!Array.isArray(body.data)) throw new Error('Anthropic models API returned no model list');
+  return body.data.flatMap((model) => {
+    if (typeof model.id !== 'string' || !model.id) return [];
+    return [{
+      id: model.id,
+      ...(typeof model.display_name === 'string' && model.display_name ? { displayName: model.display_name } : {}),
+    }];
+  });
+}
+
+/** Ask both Claude Code and Anthropic for the models available to this login. No
+ * model turn is made: the SDK streaming input stays idle while initialization
+ * metadata is read, then the exact REST catalog fills in models omitted by the
+ * CLI's alias-oriented picker. */
 export async function claudeModels(configHome?: string, timeoutMs = 10_000): Promise<AvailableModel[]> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   async function* idleInput(): AsyncGenerator<never, void, unknown> {
     await new Promise<void>(() => undefined);
   }
+  const injectedToken = configHome ? tokenToInject(configHome) : undefined;
   const env = configHome
-    ? scrubbedEnv({ provider: 'claude', configHome })
+    ? scrubbedEnv({
+        provider: 'claude',
+        configHome,
+        extra: injectedToken ? { CLAUDE_CODE_OAUTH_TOKEN: injectedToken } : undefined,
+      })
     : { ...(process.env as Record<string, string>) };
   const session = query({ prompt: idleInput(), options: { cwd: process.cwd(), env } });
+  let sdkModels: AvailableModel[] = [];
+  let sdkError: unknown;
   try {
     const models = await withTimeout(session.supportedModels(), timeoutMs);
-    return models.map((m) => ({
+    sdkModels = models.map((m) => ({
       id: m.value,
       displayName: m.displayName,
       description: m.description,
       ...(m.supportedEffortLevels?.length ? { effort: [...m.supportedEffortLevels] } : {}),
       ...(m.value === 'default' ? { isDefault: true } : {}),
     }));
+  } catch (error) {
+    sdkError = error;
   } finally {
     session.close();
   }
+
+  let apiModels: AvailableModel[] = [];
+  let apiError: unknown;
+  try {
+    // Run after SDK initialization so Claude Code has had a chance to refresh an
+    // expired access token in the isolated config home.
+    apiModels = await claudeApiModels(configHome, timeoutMs);
+  } catch (error) {
+    apiError = error;
+  }
+  const defaults = sdkModels.filter((model) => model.isDefault);
+  const aliases = sdkModels.filter((model) => !model.isDefault);
+  const merged = mergeModels([defaults, apiModels, aliases]);
+  if (merged.length) return merged;
+  throw sdkError ?? apiError ?? new Error('Claude returned no available models');
 }
 
 /** Ask Codex app-server for its native model picker. This is account-aware and is

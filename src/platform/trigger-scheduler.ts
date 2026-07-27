@@ -170,7 +170,11 @@ export class TriggerScheduler {
       const status = group
         ? principal?.lastView?.status ?? (principal?.id === ev.taskId ? (ev.payload as { status?: string })?.status : undefined)
         : (ev.payload as { status?: string })?.status;
-      if (status && statusSatisfiesDependency(trig.on, status)) {
+      if (status && statusSatisfiesDependency(trig.on, status) && !entry.satisfiedDeps.has(dep)) {
+        // Only the NEW satisfaction advances the entry. A finishing task emits
+        // several lifecycle views with a terminal status; without this guard a
+        // repeatable series (which never sets `fired`) would re-spawn a run on
+        // each duplicate event.
         entry.satisfiedDeps.add(dep); // dependencyMet keys by the declared id
         advanced = true;
       }

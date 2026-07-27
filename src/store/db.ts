@@ -2317,6 +2317,17 @@ export class Store {
     const task = this.getTaskShallow(ev.taskId);
     const project = task && this.getProject(task.projectId);
     if (!task || !project?.organizationId) return;
+    if (ev.type === 'credential.approval-resolved') {
+      const requestId = String(ev.payload.requestId ?? '');
+      if (requestId) {
+        this.db.prepare(`UPDATE inbox SET unread=0, actionable=0, readAt=?
+          WHERE taskId=? AND kind='approval-requested' AND eventSeq IN (
+            SELECT seq FROM events WHERE taskId=? AND type='credential.approval-requested'
+              AND json_extract(payload, '$.requestId')=?
+          )`).run(ev.ts, task.id, task.id, requestId);
+      }
+      return;
+    }
     let kind: InboxItem['kind'] | undefined;
     let actionable = false;
     let users: string[] = [];
@@ -2327,6 +2338,13 @@ export class Store {
       kind = 'mentioned';
       const mentioned = ev.payload.principal as PrincipalRef | undefined;
       if (mentioned) users = this.expandPrincipal(mentioned, task.projectId);
+    } else if (ev.type === 'credential.approval-requested') {
+      kind = 'approval-requested'; actionable = true;
+      users = this.humanAudience(task.id, ['@creator']);
+      // The creator is the natural first audience, while organization owners
+      // remain a deterministic resolver for automated/delegated tasks.
+      for (const member of this.listOrganizationMemberships(project.organizationId))
+        if (member.role === 'owner') users.push(member.userId);
     } else if (ev.type.includes('review') || (ev.type === 'view.updated' && (ev.payload.status === 'waiting' || ev.payload.stage === 'review'))) {
       kind = 'review-requested'; actionable = true; users = this.reviewAudience(task);
     } else if (ev.type.includes('escalat') || ev.payload.waitingFor === 'human') {
@@ -2437,7 +2455,7 @@ export class Store {
     return r ? rowToTag(r) : undefined;
   }
 
-  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
+  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Tag {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
@@ -2463,7 +2481,7 @@ export class Store {
   }
 
   /** Create-or-reuse a single tag under an explicit parent (no path parsing). */
-  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
+  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Tag {
     const name = input.name.trim();
     if (!name) throw new Error('tag name required');
     if (input.parentId) {
@@ -2499,7 +2517,7 @@ export class Store {
     return t;
   }
 
-  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null; description?: string | null }): Tag | undefined {
+  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | 'flag' | null; description?: string | null }): Tag | undefined {
     const cur = this.getTag(id);
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;

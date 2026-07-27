@@ -17,7 +17,9 @@ export class Vault {
   private key: Buffer;
 
   constructor(dir: string) {
-    fs.mkdirSync(dir, { recursive: true });
+    // The vault holds encrypted secrets and its key; keep the directory private
+    // (0700) so the 0600 files inside aren't reachable via a traversable dir.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     this.keyPath = path.join(dir, 'vault.key');
     this.dbPath = path.join(dir, 'secrets.json');
     this.key = this.loadOrCreateKey();

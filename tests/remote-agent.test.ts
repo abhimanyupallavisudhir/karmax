@@ -55,11 +55,11 @@ describe('remote subscription agents', () => {
     expect(remoteAgentEnv('claude', '/workspace/.karmax-injection/agent/claude', {
       PATH: '/host/bin', HOME: '/host/home', OPENAI_API_KEY: 'wrong-account',
       CLAUDE_CODE_OAUTH_TOKEN: 'subscription', KARMAX_TOKEN: 'turn-token',
-      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.191',
+      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.220',
     })).toEqual({
       CLAUDE_CONFIG_DIR: '/workspace/.karmax-injection/agent/claude',
       CLAUDE_CODE_OAUTH_TOKEN: 'subscription', KARMAX_TOKEN: 'turn-token',
-      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.191',
+      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.220',
     });
     expect(remoteAgentEnv('claude', '/workspace/.karmax-injection/agent/claude', {
       KARMAX_TOKEN: 'turn-token', DATABASE_URL: 'postgres://task-db',
@@ -69,9 +69,9 @@ describe('remote subscription agents', () => {
       KARMAX_TOKEN: 'turn-token',
       DATABASE_URL: 'postgres://task-db',
     });
-    expect(installedClaudeCodeVersion()).toBe('2.1.191');
+    expect(installedClaudeCodeVersion()).toBe('2.1.220');
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
-      .toEqual(expect.arrayContaining(['@anthropic-ai/claude-code@2.1.191', '--print', '--resume', 's']));
+      .toEqual(expect.arrayContaining(['@anthropic-ai/claude-code@2.1.220', '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
       .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
   });

@@ -23,6 +23,7 @@ import {
   UPD_SET_ACCOUNT_AVAILABILITY,
   QRY_ACCOUNTS,
   QRY_ACCOUNT_LEASE,
+  QRY_ACCOUNT_TASK_LEASES,
 } from './names.js';
 
 /**
@@ -126,6 +127,7 @@ export const accountLeaseQuery = defineQuery<
   { waiting: boolean },
   [{ taskId: string; turnId: string }]
 >(QRY_ACCOUNT_LEASE);
+export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
 
 // A long backstop poll so the park loop periodically re-checks even absent a
 // signal; refresh timing itself is driven by each account's `resetAt`.
@@ -293,6 +295,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   setHandler(accountLeaseQuery, ({ taskId, turnId }) => ({
     waiting: queue.some((req) => req.taskId === taskId && req.turnId === turnId),
   }));
+  setHandler(accountTaskLeasesQuery, (taskId) =>
+    queue.filter((req) => req.taskId === taskId).map((req) => req.turnId));
 
   for (;;) {
     refreshDue();

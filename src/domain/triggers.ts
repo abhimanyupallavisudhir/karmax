@@ -232,7 +232,10 @@ function parseField(field: string, min: number, max: number): Set<number> | unde
         lo = Number(range.slice(0, dash));
         hi = Number(range.slice(dash + 1));
       } else {
-        lo = hi = Number(range);
+        lo = Number(range);
+        // A bare number with a step (`5/15`) means "from 5 to the max, every
+        // step" in standard cron — not just the single value 5.
+        hi = slash >= 0 ? max : lo;
       }
       if (!Number.isInteger(lo) || !Number.isInteger(hi)) return undefined;
       if (lo < min || hi > max || lo > hi) return undefined;

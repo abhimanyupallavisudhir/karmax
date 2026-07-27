@@ -21,9 +21,11 @@ const context = vm.createContext({
   esc: (value: unknown) => String(value),
   pipeline: () => '',
   liveRoleFor: () => 'do',
+  S: { tasks: [] },
 });
 vm.runInContext(
   [
+    extractFunction('patchTaskListFromEvent'),
     extractFunction('waitingProviderLabel'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
@@ -43,6 +45,7 @@ const conversationPresence = context.conversationPresence as (
   view: Record<string, any>,
   turn: Record<string, any>,
 ) => { label: string; tone: string };
+const patchTaskListFromEvent = context.patchTaskListFromEvent as (event: Record<string, any>) => boolean;
 
 describe('waiting labels in task summaries', () => {
   it('shows the wait reason instead of the pipeline stage', () => {
@@ -55,6 +58,9 @@ describe('waiting labels in task summaries', () => {
   });
 
   it('normalizes both complete wait details and noun-phrase details', () => {
+    expect(waitingText({
+      kind: 'agentSlot',
+    })).toBe('Starting agent');
     expect(waitingText({
       kind: 'agentSlot',
       detail: 'Starting agent',
@@ -107,5 +113,33 @@ describe('waiting labels in task summaries', () => {
       },
       { role: 'do' },
     ).label).toBe('Waiting for host capacity to start agent');
+  });
+
+  it('keeps authoritative wait details in compact live task updates', () => {
+    context.S.tasks = [{
+      id: 'task-1',
+      lastView: { stage: 'do', status: 'active' },
+    }];
+    expect(patchTaskListFromEvent({
+      taskId: 'task-1',
+      type: 'view.updated',
+      payload: {
+        stage: 'do',
+        status: 'waiting',
+        waitingFor: 'agentSlot',
+        waitingDetail: 'Starting agent',
+        waitingProvider: 'codex',
+        waitingResetAt: null,
+        agentTurn: null,
+      },
+    })).toBe(true);
+
+    const view = context.S.tasks[0].lastView;
+    expect(view.waitingFor).toEqual({
+      kind: 'agentSlot',
+      detail: 'Starting agent',
+      provider: 'codex',
+    });
+    expect(stageLabel(view)).toBe('Starting agent');
   });
 });

@@ -332,6 +332,21 @@ export function tokenToInject(home: string): string | undefined {
 
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_.-]/g, '-');
 
+/** Read Claude's current native OAuth access token. This is intentionally narrower
+ * than hasClaudeNativeCredential(): a refresh-token-only home remains logged in,
+ * but cannot make a provider metadata request until Claude Code refreshes it. */
+export function claudeAccessToken(home: string): string | undefined {
+  for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
+    try {
+      const value = JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth?.accessToken;
+      if (typeof value === 'string' && value.length > 0) return value;
+    } catch {
+      /* try the other native credential location */
+    }
+  }
+  return undefined;
+}
+
 /** Claude leaves a structurally valid but empty `.credentials.json` behind after
  * logout. File existence alone therefore makes a logged-out account look connected
  * and prevents Connect from launching OAuth again. A refresh token remains useful

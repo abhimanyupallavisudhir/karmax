@@ -294,6 +294,10 @@ export class WorktreeProvider implements WorldProvider {
           const dst = path.join(root, e);
           if (fs.statSync(src).isFile()) {
             fs.copyFileSync(src, dst);
+            // Copied gitignored files (canonically `.env` secrets) must not become
+            // committable in the worktree — exclude them so `git add -A` can't
+            // stage them, matching the node_modules and resource-attachment paths.
+            await this.ensureIgnored(root, `/${e}`);
             copied.add(e);
           }
         }

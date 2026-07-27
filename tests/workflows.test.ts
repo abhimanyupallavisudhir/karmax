@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
@@ -159,6 +161,69 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await view(handle)).state.humanPauseOrigin).toBeUndefined();
     await handle.signal('cancel');
     expect((await handle.result()).stage).toBe('cancelled');
+  });
+
+  it('software-dev v1.7: a follow-up releases a Review-origin hold and returns to Do', async () => {
+    const repo = await h.makeRepo('stage-human-followup');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.7.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'Paused review',
+        recovery: {
+          messages: [{ id: 'm0', role: 'user', text: 'Previous work was reviewed.', ts: 0 }],
+          seen: 1,
+          target: 'main',
+          resumeStage: 'review',
+          pausedForHuman: true,
+        },
+      })],
+    });
+
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).waitingFor?.kind}`, { timeout: 15_000 })
+      .toBe('review/human');
+    await handle.signal('followUp', {
+      id: 'revision',
+      role: 'user',
+      text: '@write revised.txt :: resumed from review feedback',
+      ts: 1,
+    }, 'do');
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return current.stage === 'review'
+        && current.messages.some((message: any) => message.role === 'agent' && /wrote revised/.test(message.text));
+    }, { timeout: 20_000 }).toBe(true);
+    expect((await view(handle)).state.humanPauseOrigin).toBeUndefined();
+    expect(fs.readFileSync(path.join((await view(handle)).worldPath, 'revised.txt'), 'utf8'))
+      .toContain('resumed from review feedback');
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
+  it('software-dev v1.7: Confirm releases a Review-origin hold and approves it once', async () => {
+    const repo = await h.makeRepo('stage-human-confirm');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.7.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'Paused approval',
+        recovery: {
+          messages: [{ id: 'm0', role: 'user', text: 'The preserved work is approved.', ts: 0 }],
+          seen: 1,
+          target: 'main',
+          resumeStage: 'review',
+          pausedForHuman: true,
+        },
+      })],
+    });
+
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).waitingFor?.kind}`, { timeout: 15_000 })
+      .toBe('review/human');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
   });
 
   it('goal: a clean partial return triggers another turn until explicit completion', async () => {

@@ -27,9 +27,27 @@ function ok(condition, message) {
 }
 
 global.S = {
-  tasks: [{ id: '308', lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'agentSlot' } } }],
+  tasks: [{ id: '308', lastView: { stage: 'do', status: 'active' } }],
 };
 eval(extractFn('patchTaskListFromEvent'));
+ok(
+  patchTaskListFromEvent({
+    taskId: '308',
+    type: 'view.updated',
+    payload: {
+      stage: 'do',
+      status: 'waiting',
+      waitingFor: 'agentSlot',
+      waitingDetail: 'Starting agent',
+      waitingProvider: 'codex',
+      waitingResetAt: null,
+      agentTurn: null,
+    },
+  }),
+  'view.updated applies a compact startup transition',
+);
+ok(S.tasks[0].lastView.waitingFor.detail === 'Starting agent',
+  'compact startup transitions retain their authoritative wait detail');
 ok(
   patchTaskListFromEvent({
     taskId: '308',
@@ -51,7 +69,8 @@ ok(open.includes('/events?since=0&limit=300'), 'initial task history is bounded'
 ok(open.indexOf('renderTaskPage();') < open.indexOf('await details'), 'the compact task view paints before secondary resources finish');
 
 const refresh = extractFn('refreshTasks');
-ok(refresh.includes('if (taskRefreshPromise) return taskRefreshPromise'), 'full task refreshes are single-flight');
+ok(refresh.includes('if (taskRefreshPromise)') && refresh.includes('taskRefreshQueued = true'),
+  'full task refreshes are single-flight and queue a post-mutation follow-up pass');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

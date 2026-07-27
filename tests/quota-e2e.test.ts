@@ -46,6 +46,9 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
 
     await expect.poll(async () => (await handle.query('view') as any).stage, { timeout: 30_000 }).toBe('review');
     expect(transitions.some((p) => p.waitingFor === 'agentSlot')).toBe(true);
+    expect(transitions.some((p) =>
+      p.waitingFor === 'agentSlot' && p.waitingDetail === 'Starting agent',
+    )).toBe(true);
     expect(transitions.some((p) => p.waitingFor === 'account')).toBe(false);
     stopListening();
 
