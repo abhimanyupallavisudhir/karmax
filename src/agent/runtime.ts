@@ -12,14 +12,17 @@ export interface RunTurnDeps {
   onActivity?: (activity: AgentActivity) => void;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
-    request(ctx: { projectId: string; taskId: string; organizationId?: string }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
+    request(ctx: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
       status: 'granted' | 'needs_approval' | 'needs_funding' | 'denied';
       reason?: string;
       transactionId?: string;
       shortfall?: number;
+      requestId?: string;
+      cardId?: string;
+      fundingUrl?: string;
     }>;
   };
-  spendCtx?: { projectId: string; taskId: string; organizationId?: string };
+  spendCtx?: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] };
   onSpend?: (req: any, outcome: any) => void;
   /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
   signal?: AbortSignal;
@@ -31,6 +34,11 @@ export interface RunTurnDeps {
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
   platformRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
+  fillPaymentCard?: (args: {
+    requestId: string;
+    cdpUrl: string;
+    selectors: { number: string; cvc: string; expiry?: string; expMonth?: string; expYear?: string };
+  }) => Promise<{ filled: true; origin: string }>;
 }
 
 export const KARMAX_RUNTIME_PROTOCOL = 1 as const;
@@ -113,7 +121,18 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
             : outcome.status === 'needs_approval'
               ? `Approval needed to spend ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''} (${outcome.reason}). ${args.why ?? ''}`
               : `Spend denied: ${outcome.reason}.`;
-        reviewInfo = { ...reviewInfo, summary: note };
+        const actions = outcome.requestId && (outcome.status === 'needs_approval' || outcome.status === 'needs_funding')
+          ? [
+              { kind: 'payment' as const, label: outcome.status === 'needs_funding' ? 'Retry after funding' : 'Approve spend',
+                requestId: outcome.requestId, operation: 'approve' as const },
+              { kind: 'payment' as const, label: 'Deny spend', requestId: outcome.requestId, operation: 'deny' as const },
+              ...(outcome.fundingUrl
+                ? [{ kind: 'open' as const, label: 'Fund in Stripe', target: outcome.fundingUrl }]
+                : []),
+            ]
+          : [];
+        reviewInfo = { ...reviewInfo, summary: note,
+          actions: [...(reviewInfo?.actions ?? []), ...actions] };
       }
       return outcome;
     },
@@ -121,6 +140,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (!deps.platformRequest) throw new Error('karmax gateway is unavailable to this turn');
       return deps.platformRequest(method, path, body);
     },
+    fillPaymentCard: deps.fillPaymentCard,
     emit(text) {
       deps.onEmit?.(text);
     },
@@ -133,10 +153,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     pullFollowUps: deps.pullFollowUps,
   };
 
-  // Liveness: beat every 10s for the turn's whole duration. Adapters also beat on
-  // activity (to pick up pending cancellations quickly), but only this interval
+  // Liveness + cancellation delivery: beat every second for the turn's whole
+  // duration. Adapters also heartbeat on activity, but only this interval
   // guarantees a long silent stretch — a big tool run, a slow first token — can't
-  // trip the activity's heartbeat timeout.
+  // delay cancellation. The Worker caps heartbeat throttling at the same interval.
   const hb = deps.heartbeat
     ? setInterval(() => {
         try {
@@ -144,7 +164,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
         } catch {
           /* never let a heartbeat failure kill the turn */
         }
-      }, 10_000)
+      }, 1_000)
     : undefined;
   let turn;
   deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' });

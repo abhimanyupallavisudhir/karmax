@@ -76,9 +76,9 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
 
   const tokens = new TokenAuthority(store);
   const payments = new MockPaymentProvider(store);
-  const paymentRegistry = new PaymentRegistry();
+  const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
-  paymentRegistry.register(new StripeIssuingProvider());
+  paymentRegistry.register(new StripeIssuingProvider(store));
   const activityDeps = {
     store,
     worlds,
@@ -88,6 +88,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     client,
     tokens,
     payments,
+    paymentRegistry,
     contentDir,
     taskQueue: TASK_QUEUE,
     broker,

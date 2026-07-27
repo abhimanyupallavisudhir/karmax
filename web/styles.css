@@ -735,13 +735,34 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 
 /* ── queue / dashboard / settings ──────────────────────────── */
 .card { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 16px; margin-bottom: 12px; }
+.phone-access-address { display:grid; gap:4px; margin-bottom:14px; }
+.phone-access-address > span { color:var(--ink-3); font-size:11px; font-weight:650; letter-spacing:.04em; text-transform:uppercase; }
+.phone-access-address > b { color:var(--ink-2); font-size:16px; }
+.phone-access-address.missing > b { color:var(--working); }
+.phone-access-address.conflict > b { color:var(--working); }
 .phone-access-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.phone-access-head > span:last-child { color:var(--ink-2); font-size:12px; }
 .remote-state { display:inline-flex; padding:3px 9px; border-radius:999px; background:var(--working-weak); color:var(--working); font-size:11px; font-weight:700; }
 .remote-state.ready { background:var(--merged-weak); color:var(--merged); }
 .phone-access-url { overflow-wrap:anywhere; font-size:12px; }
+.phone-setup { border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); }
+.phone-setup > summary { padding:11px 12px; cursor:pointer; color:var(--ink-2); font-size:12px; font-weight:650; user-select:none; }
+.phone-setup[open] > summary { border-bottom:1px solid var(--line); }
+.phone-setup-body { padding:12px; }
+.phone-setup-body > p:first-child { margin:0 0 12px; color:var(--ink-2); font-size:12px; }
+.phone-system-prompt { margin:8px 0 0; }
 .phone-steps { margin:10px 0 14px; padding-left:22px; color:var(--ink-2); }
 .phone-steps li + li { margin-top:5px; }
 .phone-access-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.phone-setup-command { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:10px 0; padding:9px 10px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); }
+.phone-setup-command code { flex:1; min-width:220px; overflow-wrap:anywhere; font-family:var(--font-mono); font-size:12px; }
+.phone-terminal-fallback { margin-top:12px; padding-top:10px; border-top:1px dashed var(--line); }
+.phone-terminal-fallback > summary { width:max-content; max-width:100%; cursor:pointer; color:var(--ink-3); font-size:11px; }
+.phone-terminal-fallback pre { margin:9px 0 7px; padding:9px 10px; overflow-x:auto; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface); font-size:11px; line-height:1.55; }
+.phone-troubleshooting { margin-top:14px; padding-top:12px; border-top:1px solid var(--line); color:var(--ink-2); font-size:12px; }
+.phone-troubleshooting summary { width:max-content; cursor:pointer; color:var(--ink-2); font-weight:650; }
+.phone-troubleshooting ol { margin:9px 0 0; padding-left:22px; }
+.phone-troubleshooting li + li { margin-top:5px; }
 .phone-security { margin:14px 0 0; padding-top:12px; border-top:1px solid var(--line); color:var(--ink-3); font-size:11px; }
 .phone-installed { color:var(--merged); font-weight:650; font-size:12px; }
 .queue-item { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); margin-bottom: 8px; }

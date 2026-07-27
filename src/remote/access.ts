@@ -1,16 +1,24 @@
 import { execFile } from 'node:child_process';
+import os from 'node:os';
 import { promisify } from 'node:util';
 
 const pexec = promisify(execFile);
 
 export type RemoteMethod = 'tailscale' | 'hosted' | 'none';
 export type RemoteState = 'ready' | 'available' | 'needs-login' | 'unavailable' | 'conflict' | 'error';
+export type RemoteSetupStage = 'install' | 'authorize' | 'login' | 'connect' | 'serve' | 'ready';
 
 export interface RemoteAccessStatus {
   method: RemoteMethod;
   state: RemoteState;
+  setupStage?: RemoteSetupStage;
+  setupInProgress?: boolean;
   url?: string;
+  helpUrl?: string;
+  setupCommand?: string;
+  fallbackCommands?: string[];
   detail: string;
+  canSetup?: boolean;
   canEnable: boolean;
   canDisable: boolean;
 }
@@ -45,6 +53,26 @@ function urlFromText(value: string): string | undefined {
   return value.match(/https:\/\/[a-z0-9.-]+\.ts\.net(?::\d+)?/i)?.[0];
 }
 
+function localProxyPort(value: string): number | undefined {
+  const raw = value.match(/https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)/i)?.[1];
+  if (!raw) return undefined;
+  const port = Number(raw);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
+}
+
+function loginUrlFromText(value: string): string | undefined {
+  return value.match(/https:\/\/login\.tailscale\.com\/a\/[^\s]+/)?.[0];
+}
+
+function commandText(error: unknown): string {
+  const result = commandError(error);
+  return `${result.stdout}\n${result.stderr}`.trim();
+}
+
+function permissionDenied(value: string): boolean {
+  return /(?:access|permission) denied|serve config denied|use ['"]?sudo|set --operator|not authorized/i.test(value);
+}
+
 function noServeConfig(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed || /(?:no serve config|not configured|no configuration)/i.test(trimmed)) return true;
@@ -58,6 +86,33 @@ function noServeConfig(value: string): boolean {
   }
 }
 
+function serveError(error: unknown): Pick<RemoteAccessStatus, 'detail' | 'helpUrl' | 'setupCommand'> {
+  const raw = commandText(error) || 'Tailscale could not enable Serve.';
+  const needsPermission = /serve config denied|use ['"]?sudo tailscale serve|set --operator/i.test(raw);
+  const needsApproval = /serve is not enabled/i.test(raw);
+  const helpUrl = needsApproval ? raw.match(/https:\/\/login\.tailscale\.com\/f\/serve\?[^\s]+/)?.[0] : undefined;
+  if (needsPermission && needsApproval) {
+    return {
+      detail: 'Tailscale needs two one-time setup steps: approve Serve for this tailnet and grant your Linux account permission. Complete both below, then try again.',
+      ...(helpUrl ? { helpUrl } : {}),
+      setupCommand: 'sudo tailscale set --operator=$USER',
+    };
+  }
+  if (needsPermission) {
+    return {
+      detail: 'Tailscale needs one-time permission for your Linux account. Run this command in a terminal, then try again.',
+      setupCommand: 'sudo tailscale set --operator=$USER',
+    };
+  }
+  if (needsApproval) {
+    return {
+      detail: 'Tailscale Serve must be approved once for this tailnet. Continue in Tailscale, then try again.',
+      ...(helpUrl ? { helpUrl } : {}),
+    };
+  }
+  return { detail: raw };
+}
+
 /**
  * Owns the one safe local remote-access path: Tailscale Serve proxies the
  * loopback-only gateway over private HTTPS. It never opens Karmax on the LAN
@@ -65,17 +120,60 @@ function noServeConfig(value: string): boolean {
  */
 export class RemoteAccessController {
   private readonly run: Run;
+  private readonly elevate?: Run;
+  private readonly platform: NodeJS.Platform;
+  private readonly username: string;
+  private setupInFlight?: Promise<RemoteAccessStatus>;
+  private setupOutcome?: RemoteAccessStatus;
 
   constructor(private readonly options: {
     port: () => number;
     hosted?: boolean;
     publicUrl?: string;
     run?: Run;
+    elevate?: Run;
+    platform?: NodeJS.Platform;
+    username?: string;
   }) {
+    this.platform = options.platform ?? process.platform;
+    this.username = options.username ?? os.userInfo().username;
     this.run = options.run ?? (async (args) => {
       const result = await pexec('tailscale', args, { timeout: 20_000 });
       return { stdout: result.stdout, stderr: result.stderr };
     });
+    this.elevate = options.elevate ?? (this.platform === 'linux' ? async (args) => {
+      const result = await pexec('pkexec', ['tailscale', ...args], { timeout: 120_000 });
+      return { stdout: result.stdout, stderr: result.stderr };
+    } : undefined);
+  }
+
+  private local(status: RemoteAccessStatus): RemoteAccessStatus {
+    // A conflicting route belongs to another local service. Suggesting the
+    // normal fallback `serve` command here would invite the user to overwrite
+    // that service, contradicting the controller's non-destructive behavior.
+    if (status.state === 'conflict') return status;
+    const target = `http://127.0.0.1:${this.options.port()}`;
+    const restart = status.setupStage === 'connect' ? ['sudo systemctl restart tailscaled'] : [];
+    return {
+      ...status,
+      fallbackCommands: [
+        ...restart,
+        'sudo tailscale up',
+        `sudo tailscale serve --bg --yes ${target}`,
+      ],
+    };
+  }
+
+  private async authorizeOperator(): Promise<void> {
+    if (this.platform !== 'linux') return;
+    const args = ['set', `--operator=${this.username}`];
+    try {
+      await this.run(args);
+      return;
+    } catch (error) {
+      if (!permissionDenied(commandText(error)) || !this.elevate) throw error;
+    }
+    await this.elevate(args);
   }
 
   async status(): Promise<RemoteAccessStatus> {
@@ -83,8 +181,10 @@ export class RemoteAccessController {
       return {
         method: 'hosted',
         state: 'ready',
+        setupStage: 'ready',
         ...(this.options.publicUrl ? { url: this.options.publicUrl } : {}),
         detail: 'This hosted installation already uses authenticated HTTPS.',
+        canSetup: false,
         canEnable: false,
         canDisable: false,
       };
@@ -97,25 +197,40 @@ export class RemoteAccessController {
     } catch (error) {
       const result = commandError(error);
       const missing = /(?:ENOENT|not found|not recognized)/i.test(`${result.stderr}\n${result.stdout}`);
-      return {
+      return this.local({
         method: missing ? 'none' : 'tailscale',
         state: missing ? 'unavailable' : 'needs-login',
+        setupStage: missing ? 'install' : 'login',
         detail: missing
           ? 'Install Tailscale on this computer to turn on private phone access.'
-          : 'Tailscale is installed but this computer is not connected. Run “tailscale up”, then try again.',
+          : 'Tailscale is installed but this computer is not connected.',
+        canSetup: !missing,
         canEnable: false,
         canDisable: false,
-      };
+      });
     }
 
     if (node.BackendState !== 'Running') {
-      return {
+      return this.local({
         method: 'tailscale',
         state: 'needs-login',
-        detail: 'Tailscale is installed but this computer is not connected. Run “tailscale up”, then try again.',
+        setupStage: 'login',
+        detail: 'Tailscale is installed but this computer is not connected.',
+        canSetup: true,
         canEnable: false,
         canDisable: false,
-      };
+      });
+    }
+    if (node.Self?.Online === false) {
+      return this.local({
+        method: 'tailscale',
+        state: 'error',
+        setupStage: 'connect',
+        detail: 'Tailscale is running, but this computer is offline in the tailnet. Restart Tailscale on this computer, then check again.',
+        canSetup: true,
+        canEnable: false,
+        canDisable: false,
+      });
     }
 
     const dnsName = cleanDnsName(node.Self?.DNSName);
@@ -137,31 +252,182 @@ export class RemoteAccessController {
     const url = urlFromText(text) ?? (dnsName ? `https://${dnsName}` : undefined);
 
     if (active) {
-      return {
+      return this.local({
         method: 'tailscale',
         state: 'ready',
+        setupStage: 'ready',
         ...(url ? { url } : {}),
         detail: 'Private HTTPS access is on. Only devices allowed by your tailnet can connect.',
+        canSetup: false,
         canEnable: false,
         canDisable: true,
-      };
+      });
     }
     if (!noServeConfig(text)) {
-      return {
+      const servedPort = localProxyPort(text);
+      return this.local({
         method: 'tailscale',
         state: 'conflict',
-        detail: 'Tailscale Serve is already routing this device to another app. Karmax left that configuration untouched.',
+        setupStage: 'serve',
+        ...(url ? { url } : {}),
+        detail: servedPort
+          ? `Tailscale already routes this phone address to another local service on port ${servedPort}. If that is your main Karmax, keep using the address above. To expose this Karmax instead, turn off Phone Access in the other instance first.`
+          : 'Tailscale already routes this phone address to another local service. Karmax left that configuration untouched.',
+        canSetup: false,
         canEnable: false,
         canDisable: false,
-      };
+      });
     }
-    return {
+    return this.local({
       method: 'tailscale',
       state: 'available',
+      setupStage: 'serve',
       detail: 'Tailscale is connected and ready to provide private HTTPS access.',
+      canSetup: true,
       canEnable: true,
       canDisable: false,
-    };
+    });
+  }
+
+  /**
+   * Advance the guided setup by one external-consent boundary. Karmax may
+   * invoke the desktop's native authorization prompt, but never reads an OS or
+   * Tailscale password. Login and Serve consent remain Tailscale-owned pages.
+   */
+  async setup(): Promise<RemoteAccessStatus> {
+    return this.startSetup();
+  }
+
+  /**
+   * Start setup without tying its lifetime to an HTTP request. `tailscale up`
+   * may briefly replace the route carrying that request, and native
+   * authorization may take a while. The gateway acknowledges the operation
+   * immediately and polls `setupStatus()` for its outcome.
+   */
+  startSetup(): Promise<RemoteAccessStatus> {
+    if (this.setupInFlight) return this.setupInFlight;
+    this.setupOutcome = undefined;
+    const pending = this.advanceSetup();
+    this.setupInFlight = pending;
+    void pending.then(
+      (outcome) => { this.setupOutcome = outcome; },
+      (error) => {
+        const raw = commandText(error);
+        this.setupOutcome = this.local({
+          method: 'tailscale',
+          state: 'error',
+          setupStage: 'authorize',
+          detail: raw || 'Karmax could not finish Tailscale setup.',
+          canSetup: true,
+          canEnable: false,
+          canDisable: false,
+        });
+      },
+    ).finally(() => {
+      if (this.setupInFlight === pending) this.setupInFlight = undefined;
+    });
+    return pending;
+  }
+
+  beginSetup(): RemoteAccessStatus {
+    void this.startSetup();
+    return this.setupProgress();
+  }
+
+  async setupStatus(): Promise<RemoteAccessStatus> {
+    if (this.setupInFlight) return this.setupProgress();
+    if (this.setupOutcome) {
+      const outcome = this.setupOutcome;
+      this.setupOutcome = undefined;
+      return outcome;
+    }
+    return this.status();
+  }
+
+  private setupProgress(): RemoteAccessStatus {
+    return this.local({
+      method: 'tailscale',
+      state: 'available',
+      setupStage: 'authorize',
+      setupInProgress: true,
+      detail: 'Setting up Tailscale on this computer. Approve the system prompt if one appears; this page will continue automatically.',
+      canSetup: false,
+      canEnable: false,
+      canDisable: false,
+    });
+  }
+
+  private async advanceSetup(): Promise<RemoteAccessStatus> {
+    let current = await this.status();
+    if (current.method === 'hosted' || current.state === 'ready' || current.state === 'unavailable' || current.state === 'conflict') {
+      return current;
+    }
+
+    try {
+      await this.authorizeOperator();
+    } catch (error) {
+      const raw = commandText(error);
+      return this.local({
+        method: 'tailscale',
+        state: 'error',
+        setupStage: 'authorize',
+        detail: permissionDenied(raw)
+          ? 'System authorization was not completed. Approve the prompt on this computer, or use the terminal fallback below.'
+          : (raw || 'Karmax could not authorize Tailscale on this computer.'),
+        canSetup: true,
+        canEnable: false,
+        canDisable: false,
+      });
+    }
+
+    if (current.setupStage === 'login' || current.setupStage === 'connect') {
+      try {
+        await this.run(['up', '--timeout=4s']);
+      } catch (error) {
+        const raw = commandText(error);
+        const helpUrl = loginUrlFromText(raw);
+        current = await this.status();
+        if (current.setupStage !== 'serve' && current.state !== 'ready') {
+          return this.local({
+            method: 'tailscale',
+            state: helpUrl ? 'needs-login' : 'error',
+            setupStage: 'login',
+            ...(helpUrl ? { helpUrl } : {}),
+            detail: helpUrl
+              ? 'Finish signing in with Tailscale, then return here and continue setup.'
+              : (raw || 'Tailscale could not connect this computer.'),
+            canSetup: true,
+            canEnable: false,
+            canDisable: false,
+          });
+        }
+      }
+      current = await this.status();
+      if (current.state === 'ready' || current.state === 'conflict') return current;
+      if (current.setupStage !== 'serve') return current;
+    }
+
+    const target = `http://127.0.0.1:${this.options.port()}`;
+    try {
+      await this.run(['serve', '--bg', '--yes', target]);
+    } catch (error) {
+      const raw = commandText(error);
+      const problem = serveError(error);
+      return this.local({
+        method: 'tailscale',
+        state: 'error',
+        setupStage: 'serve',
+        ...problem,
+        detail: problem.helpUrl
+          ? 'Approve private HTTPS access in Tailscale, then return here and continue setup.'
+          : problem.detail,
+        canSetup: true,
+        canEnable: true,
+        canDisable: false,
+        ...(loginUrlFromText(raw) ? { helpUrl: loginUrlFromText(raw) } : {}),
+      });
+    }
+    return this.status();
   }
 
   async enable(): Promise<RemoteAccessStatus> {
@@ -172,11 +438,10 @@ export class RemoteAccessController {
     try {
       await this.run(['serve', '--bg', target]);
     } catch (error) {
-      const result = commandError(error);
       return {
         method: 'tailscale',
         state: 'error',
-        detail: (result.stderr || result.stdout || 'Tailscale could not enable Serve.').trim(),
+        ...serveError(error),
         canEnable: true,
         canDisable: false,
       };
@@ -204,7 +469,7 @@ export class RemoteAccessController {
 }
 
 /**
- * Compact startup guidance. Setup itself is available in Settings → Advanced;
+ * Compact startup guidance. Setup itself is available in Settings → Phone Access;
  * this remains useful before the first browser session.
  */
 export async function remoteAccessPlan(port: number, opts: {
@@ -225,7 +490,7 @@ export async function remoteAccessPlan(port: number, opts: {
       method: 'tailscale',
       command: `tailscale serve --bg http://127.0.0.1:${port}`,
       guidance:
-        `Phone access: open Settings → Access, or run:\n` +
+        `Phone access: open Settings → Phone Access, or run:\n` +
         `  tailscale serve --bg http://127.0.0.1:${port}\n` +
         `  Karmax stays on localhost and is shared privately over HTTPS.${authNote}`,
     };
@@ -234,6 +499,6 @@ export async function remoteAccessPlan(port: number, opts: {
     method: 'none',
     guidance:
       `Phone access: install Tailscale, connect this computer and your phone to the same tailnet,\n` +
-      `  then open Settings → Access. https://tailscale.com/download${authNote}`,
+      `  then open Settings → Phone Access. https://tailscale.com/download${authNote}`,
   };
 }

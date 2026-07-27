@@ -1021,13 +1021,23 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {
     const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
     const orgId = orgs[0]?.id;
+    const other = h.store.createOrganization({ name: 'Other payments org' });
     const made: any = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { method: 'POST', headers: auth(), body: JSON.stringify({ scope: 'organization', label: 'Org card', cap: 100000 }) })).json();
     expect(made.scope).toBe('organization');
     expect(made.scopeId).toBe(orgId);
     const mine: any = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).json();
     expect(mine.map((c: any) => c.id)).toContain(made.id);
     // a different org's card listing does not include it
-    const others: any = await (await fetch(`${base}/api/cards?organizationId=org_elsewhere`, { headers: auth() })).json();
+    const others: any = await (await fetch(`${base}/api/cards?organizationId=${other.id}`, { headers: auth() })).json();
     expect(others.map((c: any) => c.id)).not.toContain(made.id);
+    const crossFund = await fetch(`${base}/api/cards/${made.id}/fund?organizationId=${other.id}`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ amount: 100 }),
+    });
+    expect(crossFund.status).toBe(404);
+    expect(h.store.getCard(made.id).available).toBe(0);
+    const invalidFund = await fetch(`${base}/api/cards/${made.id}/fund?organizationId=${orgId}`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ amount: -100 }),
+    });
+    expect(invalidFund.status).toBe(400);
   });
 });

@@ -10,18 +10,17 @@ describe('payment providers — the connect surface (SPEC §7.6, task 1g)', () =
     const list = reg.list();
     const mock = list.find((p) => p.name === 'mock')!;
     const stripe = list.find((p) => p.name === 'stripe')!;
-    expect(mock).toMatchObject({ kind: 'local', connected: true });
-    expect(stripe).toMatchObject({ kind: 'oauth' });
+    expect(mock).toMatchObject({ kind: 'local', available: true, connected: true });
+    expect(stripe).toMatchObject({ kind: 'oauth', available: false, connected: false });
   });
-  it('mock connects trivially; Stripe reports unavailable until configured', async () => {
+  it('mock connects trivially; Stripe stays unavailable until the real rail exists', async () => {
     const prevId = process.env.STRIPE_CLIENT_ID;
-    delete process.env.STRIPE_CLIENT_ID;
     expect((await new MockPaymentProvider(new Store(':memory:')).connect()).status).toBe('connected');
     expect((await new StripeIssuingProvider().connect()).status).toBe('unavailable');
     process.env.STRIPE_CLIENT_ID = 'ca_test123';
     const r = await new StripeIssuingProvider().connect();
-    expect(r.status).toBe('awaiting_oauth');
-    expect(r.url).toContain('connect.stripe.com');
+    expect(r.status).toBe('unavailable');
+    expect(r.detail).toContain('each organization');
     if (prevId === undefined) delete process.env.STRIPE_CLIENT_ID; else process.env.STRIPE_CLIENT_ID = prevId;
   });
 });
@@ -47,6 +46,9 @@ describe('evaluateSpend (four outcomes; SPEC §7.6)', () => {
   });
   it('denied on a disallowed merchant', () => {
     expect(evaluateSpend({ ...base, merchant: 'evil.com', merchantLock: ['good.com'] }).status).toBe('denied');
+  });
+  it('denied when a merchant-locked card request omits the merchant', () => {
+    expect(evaluateSpend({ ...base, merchantLock: ['good.com'] }).status).toBe('denied');
   });
 });
 
@@ -88,6 +90,9 @@ describe('BudgetService over the mock rail', () => {
     r = await budget.settleApproved({ projectId, taskId: 't2' }, { amount: 4000, cardId: card.id });
     expect(r.status).toBe('granted');
     expect((await provider.getCard(card.id))!.available).toBe(0);
+    const retry = await budget.request({ projectId, taskId: 't2' }, { amount: 4000, cardId: card.id });
+    expect(retry).toMatchObject({ status: 'granted', requestId: r.requestId, transactionId: r.transactionId });
+    expect((await provider.getCard(card.id))!.available).toBe(0);
   });
 
   it('needs_approval over the configured allowance', async () => {
@@ -96,5 +101,71 @@ describe('BudgetService over the mock rail', () => {
     store.setSettings(projectId, 'payments', { allowance: 1000 });
     const r = await budget.request({ projectId, taskId: 't3' }, { amount: 5000 });
     expect(r.status).toBe('needs_approval');
+  });
+
+  it('does not let an explicit card id escape the project organization', async () => {
+    const other = store.createOrganization({ name: 'Other' });
+    const otherProject = store.createProject('Other project', {}, other.id);
+    const card = await provider.provisionCard({ scope: 'project', scopeId: otherProject.id, label: 'Other card', cap: 100000 });
+    await provider.fund(card.id, 100000);
+    const r = await budget.request({ projectId, taskId: 't4' }, { amount: 100, cardId: card.id });
+    expect(r.status).toBe('needs_funding');
+    expect(r.reason).toContain('not available');
+    expect((await provider.getCard(card.id))!.available).toBe(100000);
+  });
+
+  it('uses the owning organization payment policy, not installation-global policy', async () => {
+    const other = store.createOrganization({ name: 'Other' });
+    const otherProject = store.createProject('Other project', {}, other.id);
+    const card = await provider.provisionCard({ scope: 'project', scopeId: otherProject.id, label: 'Other card', cap: 100000 });
+    await provider.fund(card.id, 100000);
+    store.setSettings('global', 'payments', { allowance: 1 });
+    store.setSettings(`organization:${other.id}`, 'payments', { allowance: 1000 });
+    const r = await budget.request({ projectId: otherProject.id, organizationId: other.id, taskId: 't5' }, { amount: 100 });
+    expect(r.status).toBe('granted');
+  });
+
+  it('selects only cards attenuated by use-card capabilities', async () => {
+    const first = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'First', cap: 100000 });
+    const permitted = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Permitted', cap: 100000 });
+    await provider.fund(first.id, 1000);
+    await provider.fund(permitted.id, 1000);
+    const r = await budget.request(
+      { projectId, taskId: 'card-cap', capabilities: [`use-card:${permitted.id}`] },
+      { amount: 250, why: 'capability routing' },
+    );
+    expect(r).toMatchObject({ status: 'granted', cardId: permitted.id });
+    expect((await provider.getCard(first.id))!.available).toBe(1000);
+    expect((await provider.getCard(permitted.id))!.available).toBe(750);
+  });
+
+  it('enforces the card hard cap cumulatively, not once per purchase', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Capped', cap: 500 });
+    await provider.fund(card.id, 2000);
+    expect((await budget.request({ projectId, taskId: 'cap-a' },
+      { amount: 300, cardId: card.id, why: 'first' })).status).toBe('granted');
+    const second = await budget.request({ projectId, taskId: 'cap-b' },
+      { amount: 300, cardId: card.id, why: 'second' });
+    expect(second).toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
+    expect((await provider.getCard(card.id))!.available).toBe(1700);
+  });
+
+  it('exports and deletes both organization and project cards with their tenant', async () => {
+    const other = store.createOrganization({ name: 'Other' });
+    const otherProject = store.createProject('Other project', {}, other.id);
+    const organizationCard = await provider.provisionCard({ scope: 'organization', scopeId: other.id, label: 'Shared', cap: 1000 });
+    const projectCard = await provider.provisionCard({ scope: 'project', scopeId: otherProject.id, label: 'Project', cap: 1000 });
+    const exported = store.exportOrganization(other.id) as any;
+    expect(exported.tables.cards.map((card: any) => card.id).sort()).toEqual([organizationCard.id, projectCard.id].sort());
+    store.deleteOrganization(other.id);
+    expect(store.getCard(organizationCard.id)).toBeUndefined();
+    expect(store.getCard(projectCard.id)).toBeUndefined();
+  });
+
+  it('rejects zero, fractional, and negative local funding', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 1000 });
+    await expect(provider.fund(card.id, 0)).rejects.toThrow(/positive/);
+    await expect(provider.fund(card.id, -1)).rejects.toThrow(/positive/);
+    await expect(provider.fund(card.id, 1.5)).rejects.toThrow(/positive/);
   });
 });

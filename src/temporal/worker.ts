@@ -48,6 +48,11 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     maxCachedWorkflows: num(process.env.KARMAX_MAX_CACHED_WORKFLOWS, 20),
     maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
     maxConcurrentActivityTaskExecutions: num(process.env.KARMAX_MAX_ACT, 8),
+    // Agent activities heartbeat once a second so Temporal can deliver a pending
+    // cancellation to their AbortSignal promptly. The SDK otherwise throttles
+    // heartbeats for these 2-minute-timeout activities for up to 60 seconds,
+    // leaving a cancelled provider subprocess alive long after its task closed.
+    maxHeartbeatThrottleInterval: '1 second',
     // Share ONE V8 context across all cached workflows instead of one isolate per
     // workflow. With up to `maxCachedWorkflows` (20) sticky executions, per-isolate
     // heap dominates the worker's RAM; a shared context is the single biggest memory
