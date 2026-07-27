@@ -1,13 +1,16 @@
 # Hosting readiness — env vars & the path to a multi-tenant SaaS
 
 Your instinct is right: **env vars can't carry per-user config in a hosted app.**
-But not every env var is a problem — the fix is to sort them into two buckets and
-only migrate the ones that are actually per-tenant.
+But not every env var is a problem — the fix is to separate infrastructure
+bootstrap from settings an operator reasonably expects to manage in the product.
 
 ## The distinction
 
-- **Operator config** — set **once** by whoever runs the karmax deployment. Env
-  vars (or a secrets manager) are the correct home for these even when hosted.
+- **Operator config** — set **once** by whoever runs the karmax deployment.
+  Infrastructure roots (vault master key, database, network) belong in deployment
+  secrets. Application integrations such as Stripe and GitHub should be
+  manageable in the UI, backed by the encrypted vault, with env vars only as an
+  optional bootstrap path.
 - **Per-tenant config** — differs per user/workspace. These **must** live in the
   DB/vault keyed by tenant, never in process env, or one tenant's setting leaks to
   all of them.
@@ -22,7 +25,7 @@ only migrate the ones that are actually per-tenant.
 | `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | ✅ fine as platform defaults; already overridable per-tenant via profiles |
 | `KARMAX_CLAUDE_LOGIN_ARGS`, `KARMAX_CODEX_LOGIN_ARGS` | operator/test | ✅ fine — how the login CLI is invoked |
 | `KARMAX_TOKEN`, `CLAUDE_CONFIG_DIR` | runtime | ✅ not user config — injected per agent spawn |
-| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | **operator** | ✅ these identify the deployment's Connect application and authenticate its webhook; they are never a funding source. Each organization connects a distinct Stripe account whose id, Issuing balance, cardholders, cards, requests, and ledger are stored under that organization. |
+| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | **optional bootstrap** | The installation administrator normally enters these under **Organization settings → Payments → Stripe platform setup**; secrets are encrypted in the Karmax vault. Environment variables remain an optional first-boot/managed-secret fallback. They identify the deployment's Connect application and webhook, never a funding source. |
 | `STRIPE_API_VERSION` | operator | Optional Stripe API-version override. The default is the direct real-time authorization version used by the webhook response contract. |
 | `KARMAX_SAFE_MODE` | operator/global | ✅ fine (also a UI toggle); becomes per-workspace when workspaces exist |
 | `KARMAX_PASSWORD` | operator (single-tenant) | ⚠️ becomes **per-user auth** in hosted — replace with a real accounts/auth system |
@@ -67,15 +70,20 @@ single-user ambient-login setup).
 4. **Resource isolation** — worktrees/containers, token/budget coordinators, and
    task queues partitioned or fair-shared per workspace.
 
-None of these are env-var problems; they're the standard single-tenant → SaaS
-migration. The env audit above confirms only the **credential fallback** and
-**KARMAX_PASSWORD** are env-vars that block hosting — everything else is either
-correct operator config or already per-tenant in the DB/vault.
+The remaining items are broader tenancy concerns rather than reasons to require
+shell access for application setup. The credential fallback and
+`KARMAX_PASSWORD` still need the hosted treatment described above; Stripe and
+GitHub application setup are already UI-managed and vault-backed.
 
 ## Stripe deployment setup
 
-Create one Stripe Connect application for the Karmax deployment and configure its
-OAuth redirect to:
+Open **Organization settings → Payments → Stripe platform setup** as an installation
+administrator. Create one Stripe Connect application for the Karmax deployment,
+then paste its client ID, platform secret key, and webhook signing secret into the
+form. Karmax stores the secret values in its encrypted vault and shows the exact
+OAuth callback and webhook URLs to register in Stripe.
+
+The OAuth redirect is:
 
 `https://<karmax-origin>/api/payments/stripe/callback`
 
@@ -83,15 +91,23 @@ Create a Connect webhook endpoint at:
 
 `https://<karmax-origin>/api/payments/stripe/webhook`
 
-Subscribe it to Issuing authorization, card, transaction, and dispute events plus
-`account.application.deauthorized`. Direct real-time authorization requests must
-be delivered to that endpoint. Set its signing secret as
-`STRIPE_WEBHOOK_SECRET`; Karmax refuses to issue an active Stripe card without it.
+Subscribe the webhook to Issuing authorization, card, transaction, and dispute
+events plus `account.application.deauthorized`. Direct real-time authorization
+requests must be delivered to that endpoint. Karmax refuses to issue an active
+Stripe card until the webhook signing secret is saved.
+
+`STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, and `STRIPE_WEBHOOK_SECRET` are retained
+only as an optional deployment bootstrap path. UI-managed values take precedence.
 The public origin comes from `KARMAX_PUBLIC_URL` or trusted forwarded headers.
 
 Every organization then uses its own Connect button. Its connected account and
 Issuing balance remain separate; Local test funds remain the non-money-moving
 development rail.
+
+Stripe requires every Issuing card to reference a Cardholder. This is a real
+Stripe compliance record for the individual or company legally authorized to use
+the card, not a cosmetic Karmax label or a funding source. Use accurate identity
+and billing details; Stripe may place verification requirements on the record.
 
 Karmax's agent checkout flow retrieves virtual-card PAN/CVC through Stripe's
 explicit `expand[]=number&expand[]=cvc` API and immediately types them into the

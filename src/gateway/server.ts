@@ -3010,6 +3010,38 @@ export class Gateway {
 
       // Payment rails (SPEC §7.6), resolved in the caller's organization. Local
       // needs no connection; incomplete external rails are reported honestly.
+      const stripePlatform = p.match(/^\/api\/organizations\/([^/]+)\/payments\/stripe\/platform$/);
+      if (stripePlatform) {
+        const provider = this.deps.paymentRegistry?.get('stripe') as any;
+        if (!provider || typeof provider.platformStatus !== 'function')
+          return this.json(res, 503, { error: 'Stripe Issuing is unavailable' });
+        const publicUrl = this.publicUrl(req);
+        if (method === 'GET') return this.json(res, 200, {
+          ...provider.platformStatus(),
+          canManage: this.deps.tokens.check(token, 'user:write').ok,
+          callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
+          webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
+        });
+        if (method === 'PUT') {
+          if (!this.deps.tokens.check(token, 'user:write').ok)
+            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared Stripe Connect application' });
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, {
+              ...provider.configurePlatform({
+                clientId: String(b.clientId ?? ''),
+                secretKey: b.secretKey ? String(b.secretKey) : undefined,
+                webhookSecret: b.webhookSecret ? String(b.webhookSecret) : undefined,
+              }),
+              canManage: true,
+              callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
+              webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
+            });
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }
       const organizationPayments = p.match(/^\/api\/organizations\/([^/]+)\/payments\/(providers|connect)$/);
       if ((p === '/api/payments/providers' || organizationPayments?.[2] === 'providers') && method === 'GET') {
         const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
@@ -4145,7 +4177,7 @@ export class Gateway {
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
       claude: claude.length ? claude : [
-        { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
+        { id: 'default' }, { id: 'opus[1m]' }, { id: 'claude-fable-5[1m]' }, { id: 'sonnet' }, { id: 'haiku' },
       ],
       codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
       opencode: opencode.length ? opencode : [

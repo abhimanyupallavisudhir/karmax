@@ -1094,6 +1094,56 @@ esac
     expect(h.store.kvGet('agent-mail:provider')).toBeUndefined();
   });
 
+  it('configures the shared Stripe Connect application from the operator API without returning secrets', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const endpoint = `${base}/api/organizations/${orgId}/payments/stripe/platform`;
+    const before: any = await (await fetch(endpoint, { headers: auth() })).json();
+    expect(before).toMatchObject({
+      canManage: true,
+      callbackUrl: `${base}/api/payments/stripe/callback`,
+      webhookUrl: `${base}/api/payments/stripe/webhook`,
+    });
+    const organizationPaymentAdmin = h.tokens.mint({
+      taskId: 'task_payment_admin',
+      profileId: 'operator',
+      principal: 'user:organization-payment-admin',
+      organizationId: orgId,
+      ceiling: ['payment:read', 'payment:write'],
+      grantorCaps: ['payment:read', 'payment:write'],
+    });
+    const forbidden = await fetch(endpoint, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${organizationPaymentAdmin.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId: 'ca_forbidden', secretKey: 'sk_test_forbidden' }),
+    });
+    expect(forbidden.status).toBe(403);
+
+    const saved = await fetch(endpoint, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({
+        clientId: 'ca_gateway_managed',
+        secretKey: 'sk_test_gateway_managed',
+        webhookSecret: 'whsec_gateway_managed',
+      }),
+    });
+    expect(saved.status).toBe(200);
+    const status: any = await saved.json();
+    expect(status).toMatchObject({
+      configured: true, clientId: 'ca_gateway_managed', secretKeyConfigured: true,
+      webhookConfigured: true, source: 'ui',
+    });
+    expect(JSON.stringify(status)).not.toContain('sk_test_gateway_managed');
+    expect(JSON.stringify(status)).not.toContain('whsec_gateway_managed');
+    expect(JSON.stringify(h.store.exportOrganization(orgId))).not.toContain('sk_test_gateway_managed');
+
+    const providers: any = await (await fetch(`${base}/api/organizations/${orgId}/payments/providers`,
+      { headers: auth() })).json();
+    expect(providers.providers.find((provider: any) => provider.name === 'stripe'))
+      .toMatchObject({ available: true, connected: false });
+  });
+
   it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {
     const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
     const orgId = orgs[0]?.id;
