@@ -62,7 +62,9 @@ eval(extractFn('organizationBySlug'));
 eval(extractFn('currentOrg'));
 eval(extractFn('orgBase'));
 eval(extractFn('parseRoute'));
+eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
+eval(extractFn('encodeQuery'));
 eval(extractFn('globalRoute'));
 eval(extractFn('taskRecord'));
 eval(extractFn('taskUrl'));
@@ -92,16 +94,16 @@ eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organizati
 eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox' }, 'parse /<org>/inbox');
 eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: null }, 'parse bare /<org> as org home');
 eq(parseRoute('/acme/website-redesign'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: '' },
   'parse /<org>/<project> as the tasks tab');
 eq(parseRoute('/acme/website-redesign/queue'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: '' },
   'parse a project tab');
 eq(parseRoute('/acme/website-redesign/tasks/42'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '' },
   'parse a task permalink');
 eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: '' },
   'parse a task permalink pinned to a tab');
 
 // ── Wiki routes (org-level bottom-left link + project tab) ────────────────────
@@ -109,7 +111,7 @@ eq(globalRoute('orgwiki'), '/acme/wiki', 'internal tab "orgwiki" → URL segment
 eq(parseRoute('/acme/wiki'), { name: 'global', org: 'acme', tab: 'orgwiki' }, 'parse /<org>/wiki as the organization wiki');
 eq(projectRoute('P1', 'wiki'), '/acme/website-redesign/wiki', 'project wiki route');
 eq(parseRoute('/acme/website-redesign/wiki'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null, q: '' },
   'parse a project wiki tab');
 
 // ── Round-trip: build → parse → resolve ───────────────────────────────────────
@@ -127,7 +129,7 @@ eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: t
 eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
 eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', legacy: true }, 'legacy /inbox');
 eq(parseRoute('/projects/website-redesign/tasks/42'),
-  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, legacy: true },
+  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '', legacy: true },
   'legacy /projects/:name/tasks/:num');
 eq(parseRoute('/invite'), { name: 'invite' }, 'invite stays a top-level route');
 eq(parseRoute('/'), { name: 'home' }, 'root is home');

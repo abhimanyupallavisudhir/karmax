@@ -62,7 +62,9 @@ single-user ambient-login setup).
    workspace.
 2. **Per-tenant credential isolation** — the fallback gate above; config homes and
    vault entries already key by account, so extend that to workspace.
-3. **Per-tenant Stripe** — implemented as a platform Connect app (operator) plus
+3. **Per-tenant Stripe (only if you offer Issuing)** — the `vault-card` rail is
+   already per-tenant, since each card is an org-scoped vault handle. Issuing is
+   implemented as a platform Connect app (operator) plus
    organization-owned connected accounts and Issuing balances. OAuth state,
    account ids, cardholders, cards, reservations, authorization decisions, and
    transaction/dispute reconciliation are tenant-scoped. The operator key is
@@ -75,7 +77,36 @@ shell access for application setup. The credential fallback and
 `KARMAX_PASSWORD` still need the hosted treatment described above; Stripe and
 GitHub application setup are already UI-managed and vault-backed.
 
-## Stripe deployment setup
+## Payment rails
+
+Karmax has three rails, in increasing order of setup cost. **Only the first two
+move real money, and only the first works everywhere.**
+
+| Rail | Who can use it | Setup | Enforcement |
+|---|---|---|---|
+| **Your own virtual card** (`vault-card`) | anyone, any country | none — paste a card | the human's own issuer declines |
+| Stripe Issuing (`stripe`) | registered businesses in US/UK/EEA | Connect app + webhook + cardholder | per-card spending controls |
+| Local test funds (`mock`) | development only | none | simulated; no money moves |
+
+**The default rail is `vault-card`, and it is the one to reach for.** The human
+creates a virtual card with a spending limit in their own banking app — Revolut,
+Wise, Monzo, most EU banks, a prepaid card — and registers it under
+**Payments → Cards**. Karmax encrypts the number in the vault, types it into
+checkout through the origin-checked secure fill, and never shows it to an agent.
+The issuer enforces the limit and declines when it runs out; "topping up" is the
+human raising that limit.
+
+The trade is deliberate and worth stating plainly: karmax cannot read the real
+balance, so the limit recorded against the card is the human's *declared* figure.
+It drives fast failure, the review threshold, and the audit trail — but the
+authoritative answer is always the issuer's decline, never karmax's arithmetic.
+Size the card to the blast radius you are willing to accept.
+
+Stripe Issuing remains for organizations that are already registered businesses
+and want karmax to mint a separate capped, merchant-locked card per agent or per
+task. It is a considerably heavier lift — see below — and it is not required.
+
+## Stripe Issuing deployment setup (optional)
 
 Open **Organization settings → Payments → Stripe platform setup** as an installation
 administrator. Create one Stripe Connect application for the Karmax deployment,
