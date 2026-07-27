@@ -4211,6 +4211,29 @@ export class Gateway {
     if (!this.deps.githubApp) return;
     if ((this.wikiRemoteRetryAfter.get(project.id) ?? 0) > Date.now()) return;
     const githubApp = this.deps.githubApp;
+    // Already provisioned in a previous run: the durable repository record and
+    // its isolated deploy keys exist. Wiring (and re-pushing) the local remote
+    // needs only the repository's write deploy key — never the operator's user
+    // OAuth token. Re-running GitHub provisioning on every boot re-hit the REST
+    // API with a possibly-expired operator token, producing a recurring "Bad
+    // credentials" 401 for wikis that were already fully set up.
+    if (current?.private && this.deps.store.repositoryDeployKeys(current.id)) {
+      if (this.wikiRemotesProvisioning.has(project.id)) return;
+      this.wikiRemotesProvisioning.add(project.id);
+      void (async () => {
+        try {
+          await setProjectWikiRemote(root, current.sshUrl, githubApp.repositorySshKey(current.id, 'write'));
+          this.wikiRemotesReady.add(project.id);
+          this.wikiRemoteRetryAfter.delete(project.id);
+        } catch (error) {
+          this.wikiRemoteRetryAfter.set(project.id, Date.now() + 5 * 60_000);
+          console.warn(`[karmax] could not sync wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+        } finally {
+          this.wikiRemotesProvisioning.delete(project.id);
+        }
+      })();
+      return;
+    }
     const organizationId = project.organizationId ?? 'org_personal';
     const candidates = [...new Set([
       ...(userId ? [userId] : []),

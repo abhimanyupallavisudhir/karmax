@@ -6,7 +6,7 @@ import path from 'node:path';
 import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE } from '../src/integrations/github-app.js';
+import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 
 describe('GitHub App integration', () => {
   it('bootstraps itself through an App manifest, authorizes a user, and creates plus enrolls a repository', async () => {
@@ -129,6 +129,90 @@ describe('GitHub App integration', () => {
       { name: 'public-wiki', private: true })).rejects.toThrow('must be private');
     await expect(service.createRepository(connection.id, 'owner',
       { name: 'all-repos-wiki', private: true })).resolves.toMatchObject({ providerId: '79' });
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('self-heals a user token GitHub invalidated before its recorded expiry', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-selfheal-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    // A token whose recorded expiry is hours away — karmax's own clock trusts it —
+    // but which GitHub has already invalidated (revoked / secret rotation / a
+    // refresh chain consumed by a concurrent instance). Its refresh token is live.
+    const handle = 'github-app:user:owner:authorization';
+    broker.registerHandle(handle, JSON.stringify({ accessToken: 'dead-token',
+      expiresAt: Date.now() + 7 * 3600_000, refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    let keyId = 800;
+    let refreshes = 0;
+    const payload = { id: 77, name: 'project-wiki', private: true,
+      ssh_url: 'git@github.com:acme/project-wiki.git', default_branch: 'main', owner: { login: 'acme' } };
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const auth = String((init.headers as Record<string, string> | undefined)?.authorization ?? '');
+      if (url.pathname === '/login/oauth/access_token') {
+        refreshes++;
+        return Response.json({ access_token: 'fresh-token', expires_in: 28_800,
+          refresh_token: 'refresh-2', refresh_token_expires_in: 15_552_000 });
+      }
+      // The dead token is rejected on every user-token endpoint until refreshed.
+      if (auth === 'Bearer dead-token') return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
+      if (url.pathname === '/repos/acme/project-wiki' && init.method !== 'POST') return Response.json(payload);
+      if (url.pathname === '/user/installations/42/repositories/77' && init.method === 'PUT')
+        return new Response(null, { status: 204 });
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/repos/acme/project-wiki/keys' && init.method === 'POST') return Response.json({ id: ++keyId });
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { appId: '123', clientId: 'Iv1.client',
+      fetch: fakeFetch as typeof fetch, keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId}` }) });
+
+    // Provisioning must recover instead of surfacing GitHub's "Bad credentials" 401.
+    const repository = await service.ensureRepository(connection.id, 'owner',
+      { name: 'project-wiki', private: true, autoInit: false });
+    expect(repository).toMatchObject({ providerId: '77', name: 'project-wiki', private: true });
+    expect(refreshes).toBe(1);
+    // The refreshed access + refresh tokens are persisted so the next call reuses them.
+    const stored = JSON.parse(broker.resolve(handle, { caps: [`use-credential:${handle}`] }));
+    expect(stored).toMatchObject({ accessToken: 'fresh-token', refreshToken: 'refresh-2' });
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('clears a revoked user token so the operator is told to reconnect', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-revoked-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const handle = 'github-app:user:owner:authorization';
+    broker.registerHandle(handle, JSON.stringify({ accessToken: 'dead-token',
+      expiresAt: Date.now() + 7 * 3600_000, refreshToken: 'dead-refresh', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      // The refresh token is dead too — GitHub returns an OAuth error, no token.
+      if (url.pathname === '/login/oauth/access_token')
+        return Response.json({ error: 'bad_refresh_token', error_description: 'The refresh token passed is incorrect or expired.' });
+      return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401 });
+    };
+    const service = new GitHubAppService(store, broker, { appId: '123', clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+
+    expect(service.status('owner').userAuthorized).toBe(true);
+    await expect(service.ensureRepository(connection.id, 'owner', { name: 'project-wiki', private: true }))
+      .rejects.toThrow(/reconnect/i);
+    // The dead credential is cleared so the UI stops showing GitHub as connected
+    // and the operator is prompted to reconnect instead of a silent 401 storm.
+    expect(service.status('owner').userAuthorized).toBe(false);
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
