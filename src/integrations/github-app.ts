@@ -298,15 +298,14 @@ export class GitHubAppService {
     const connection = this.store.getGitConnection(connectionId);
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
-    const userToken = await this.userToken(userId);
     const pathname = connection.accountType === 'Organization'
       ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
       : '/user/repos';
-    const created = await this.request<GitHubRepositoryPayload>(pathname, userToken, {
+    const created = await this.userRequest<GitHubRepositoryPayload>(userId, pathname, {
       method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
         private: input.private !== false, auto_init: input.autoInit !== false }),
     });
-    return this.enrollRepository(connection, userToken, created, input.defaultBranch);
+    return this.enrollRepository(connection, userId, created, input.defaultBranch);
   }
 
   /** Idempotently provision a platform-owned repository. A previous attempt can
@@ -319,11 +318,10 @@ export class GitHubAppService {
     const connection = this.store.getGitConnection(connectionId);
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
-    const userToken = await this.userToken(userId);
     let repository: GitHubRepositoryPayload;
     try {
-      repository = await this.request<GitHubRepositoryPayload>(
-        `/repos/${encodeURIComponent(connection.accountLogin)}/${encodeURIComponent(name)}`, userToken,
+      repository = await this.userRequest<GitHubRepositoryPayload>(userId,
+        `/repos/${encodeURIComponent(connection.accountLogin)}/${encodeURIComponent(name)}`,
       );
       if (repository.archived) throw new Error(`existing GitHub repository ${connection.accountLogin}/${name} is archived`);
       if (input.private !== false && !repository.private)
@@ -333,12 +331,12 @@ export class GitHubAppService {
       const pathname = connection.accountType === 'Organization'
         ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
         : '/user/repos';
-      repository = await this.request<GitHubRepositoryPayload>(pathname, userToken, {
+      repository = await this.userRequest<GitHubRepositoryPayload>(userId, pathname, {
         method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
           private: input.private !== false, auto_init: input.autoInit !== false }),
       });
     }
-    return this.enrollRepository(connection, userToken, repository, input.defaultBranch);
+    return this.enrollRepository(connection, userId, repository, input.defaultBranch);
   }
 
   private repositoryName(input: string): string {
@@ -348,7 +346,7 @@ export class GitHubAppService {
     return name;
   }
 
-  private async enrollRepository(connection: GitConnection, userToken: string,
+  private async enrollRepository(connection: GitConnection, userId: string,
     created: GitHubRepositoryPayload, defaultBranch?: string): Promise<Repository> {
     // Installation may have been limited to selected repositories. User
     // authorization lets Karmax enroll the repository without sending the
@@ -356,8 +354,9 @@ export class GitHubAppService {
     // installations; installations covering every repository may reject it,
     // but their installation token can already see the repository.
     try {
-      await this.request(`/user/installations/${encodeURIComponent(connection.installationId)}/repositories/${encodeURIComponent(String(created.id))}`,
-        userToken, { method: 'PUT' });
+      await this.userRequest(userId,
+        `/user/installations/${encodeURIComponent(connection.installationId)}/repositories/${encodeURIComponent(String(created.id))}`,
+        { method: 'PUT' });
     } catch (error) {
       this.tokenCache.delete(connection.id);
       const installationToken = await this.installationToken(connection);
@@ -500,23 +499,49 @@ export class GitHubAppService {
     }));
   }
 
-  private async userToken(userId: string): Promise<string> {
+  /** Resolve the operator's user token, refreshing when the recorded expiry is
+   * near. `forceRefresh` ignores that clock: it is the recovery path for a token
+   * GitHub invalidated *before* its recorded expiry (revocation, client-secret
+   * rotation, or a single-use refresh chain consumed by a concurrent instance).
+   * A dead credential is cleared so `status().userAuthorized` flips to false and
+   * the operator is told to reconnect, rather than 401ing against it forever. */
+  private async userToken(userId: string, opts: { forceRefresh?: boolean } = {}): Promise<string> {
     const handle = githubUserTokenHandle(userId);
     if (!this.broker.hasHandle(handle)) throw new Error('Authorize your GitHub account before creating repositories');
     const stored = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as {
       accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
     };
-    if (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000) return stored.accessToken;
-    if (!stored.refreshToken || (stored.refreshExpiresAt && stored.refreshExpiresAt <= Date.now()))
+    if (!opts.forceRefresh && (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000)) return stored.accessToken;
+    if (!stored.refreshToken || (stored.refreshExpiresAt && stored.refreshExpiresAt <= Date.now())) {
+      this.broker.deleteHandle(handle);
       throw new Error('GitHub authorization expired; reconnect GitHub from Organization settings');
+    }
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
     const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] });
     const value = await this.oauthToken({ client_id: this.options.clientId, client_secret: clientSecret,
       grant_type: 'refresh_token', refresh_token: stored.refreshToken });
-    if (!value.access_token) throw new Error(value.error_description || value.error || 'GitHub token refresh failed');
+    if (!value.access_token) {
+      // The refresh token itself is dead — GitHub returns an OAuth error body
+      // (HTTP 200) rather than a token. Clearing here forces a clean reconnect.
+      this.broker.deleteHandle(handle);
+      const reason = value.error_description || value.error;
+      throw new Error(`GitHub authorization expired; reconnect GitHub from Organization settings${reason ? ` (${reason})` : ''}`);
+    }
     this.saveUserToken(userId, value);
     return String(value.access_token);
+  }
+
+  /** A user-token GitHub request that self-heals a server-side invalidation: on a
+   * 401 it forces a token refresh once and retries, so a token karmax's own clock
+   * still trusts (but GitHub has revoked) recovers instead of failing the caller. */
+  private async userRequest<T = unknown>(userId: string, pathname: string, init: RequestInit = {}): Promise<T> {
+    try {
+      return await this.request<T>(pathname, await this.userToken(userId), init);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('GitHub API 401')) throw error;
+      return await this.request<T>(pathname, await this.userToken(userId, { forceRefresh: true }), init);
+    }
   }
 
   private async oauthToken(input: Record<string, string>): Promise<any> {
