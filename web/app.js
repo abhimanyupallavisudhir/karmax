@@ -2075,12 +2075,37 @@ function wireVerificationBanner() {
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
 }
 
+// Mirrors BRAND_ICONS in src/domain/brand.ts — each id is a directory under web/brand/.
+const BRAND_ICON_CHOICES = [
+  { id: 'diamond', label: 'Diamond' },
+  { id: 'knot', label: 'Knot' },
+  { id: 'check', label: 'Check' },
+  { id: 'clover', label: 'Clover' },
+];
+
+// The gateway resolves /brand/* against the instance-wide icon setting, so the
+// mark carries no client state — which is also what lets it render on the
+// pre-auth login screens. The counter only busts the HTTP cache after a switch.
+let brandVersion = 0;
+function brandMark() {
+  return `<img class="mark" src="/brand/icon-192.png${brandVersion ? `?v=${brandVersion}` : ''}" alt="" />`;
+}
+
+/** Re-point the favicon and every on-screen mark so a switch shows up at once,
+ * without a reload — the URLs are unchanged, so only the cache needs busting. */
+function refreshBrandAssets() {
+  brandVersion++;
+  const bust = (el, attr) => { el[attr] = `${String(el[attr]).split('?')[0]}?v=${brandVersion}`; };
+  document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]').forEach((l) => bust(l, 'href'));
+  document.querySelectorAll('.brand .mark').forEach((m) => bust(m, 'src'));
+}
+
 function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
-      <div class="brand"><span class="mark">◇</span> karmax</div>
+      <div class="brand">${brandMark()} karmax</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
         <option value="__new">＋ New organization</option>
@@ -4021,10 +4046,9 @@ async function openTaskForm(workflow, draft, seedText) {
 
 // ── task page ─────────────────────────────────────────────────────────────────
 // A task opens as a PAGE of its own (route /<org>/<project>/tasks/:num), rendered
-// into #main with four tabs — Overview (pipeline, review, widgets, sub-tasks,
-// notes), Check-in (agent conversations + the ephemeral terminal), Parameters
-// (priority/tags, workflow params, credentials) and Advanced (event log,
-// structured state). The workflow still owns everything shown — actions, stages,
+// into #main with tabs — Overview (pipeline, review, widgets, sub-tasks,
+// notes), Check-in (agent conversations + the ephemeral terminal) and Parameters
+// (priority/tags, workflow params, credentials). The workflow still owns everything shown — actions, stages,
 // params, widgets and transcripts all come off the declared view; the host only
 // lays them out. Declared actions (Confirm/Cancel/…) live in a footer bar that
 // stays visible on every tab.
@@ -4033,7 +4057,6 @@ const TASK_TABS = [
   { key: 'checkin', label: 'Check-in' },
   { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
-  { key: 'advanced', label: 'Advanced' },
 ];
 
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
@@ -8447,10 +8470,54 @@ async function hydrateExecutionProviders(proj) {
 }
 
 // ── organization defaults (legacy APIs still call this global scope) ─────────
+/** The brand icon is instance-wide, like host capacity: it is the same mark for
+ * everyone, including on the sign-in screen before any organization is known. */
+function appearanceCard() {
+  return `<div class="card" id="appearance-card">
+      <div class="section-h">Icon <span class="chip">whole instance</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The mark in the top bar and on the sign-in screen, the browser favicon, and the installed app icon.</p>
+      <div class="brand-picker" id="brand-picker">
+        ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
+          <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
+        </button>`).join('')}
+      </div>
+    </div>`;
+}
+
+async function wireAppearanceCard() {
+  const picker = $('#brand-picker');
+  if (!picker) return;
+  const mark = (id) => picker.querySelectorAll('.brand-option').forEach((b) =>
+    b.setAttribute('aria-pressed', String(b.dataset.icon === id)));
+  let current = 'diamond';
+  // The mark is instance-wide, so only the operator (settings:*) may change it —
+  // below that the read fails and the card hides entirely, as outbound email does.
+  try { current = (await api('/api/settings/global/appearance')).icon || 'diamond'; }
+  catch { $('#appearance-card').style.display = 'none'; return; }
+  mark(current);
+  picker.querySelectorAll('.brand-option').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const icon = b.dataset.icon;
+      if (icon === current) return;
+      const previous = current;
+      current = icon;
+      mark(icon);
+      try {
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { icon } }) });
+        refreshBrandAssets();
+      } catch (e) {
+        current = previous;
+        mark(previous);
+        toast(e.message, true);
+      }
+    }));
+}
+
 function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
+    ${appearanceCard()}
     ${profilesCard('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
@@ -8836,49 +8903,71 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Payments — budget & cards</div>
-    ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
-      <div class="pay-stripe-platform" style="margin-bottom:10px"></div>
-      <div class="pay-providers-list">Loading…</div>
-      <div class="pay-balance" style="margin-top:8px"></div>
+    <div class="section-h">Payments</div>
+    <p class="task-sub" style="margin-top:0">Agents can make payments with a virtual card.</p>
+    <div class="cards-list" style="margin-bottom:10px"></div>
+    <div class="settings-grid">
+      <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
+      <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
+      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
+      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" placeholder="MM/YY" /></label>
+      <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
+      <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
+      <label class="form-row">City<input class="card-city" /></label>
+      <label class="form-row">Postal code<input class="card-postal" /></label>
+      <label class="form-row">Country<input class="card-country" placeholder="GB" maxlength="2" /></label>
+      <label class="form-row">Restrict to merchants<input class="card-merchants" placeholder="optional, comma-separated domains" /></label>
     </div>
-    <details class="pay-cardholder hidden" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Stripe cardholder — required before issuing a card</summary>
-      <p class="task-sub">This is Stripe’s compliance record for the real person or company legally authorized to use the card. It is not a Karmax user, a label, or a funding source. Use accurate identity and billing details; Stripe may require verification.</p>
-      <div class="settings-grid">
-        <label class="form-row">Cardholder type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
-        <label class="form-row">Name shown in Stripe<input class="holder-name" placeholder="Full legal or company name" /></label>
-        <label class="form-row">First name (individual)<input class="holder-first" /></label>
-        <label class="form-row">Last name (individual)<input class="holder-last" /></label>
-        <label class="form-row">Date of birth (individual)<input class="holder-dob" type="date" /></label>
-        <label class="form-row">Email<input class="holder-email" type="email" /></label>
-        <label class="form-row">Phone<input class="holder-phone" /></label>
-        <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
-        <label class="form-row">City<input class="holder-city" /></label>
-        <label class="form-row">State or region<input class="holder-state" /></label>
-        <label class="form-row">Postal code<input class="holder-postal" /></label>
-        <label class="form-row">Country code<input class="holder-country" placeholder="US" maxlength="2" /></label>
+    <button class="btn primary" data-addcard="${scope}">Add card</button>
+    <details class="pay-stripe" style="margin-top:16px">
+      <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
+      <p class="task-sub">For registered businesses. Lets Karmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
+      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
+      <div class="pay-providers-list"></div>
+      <div class="pay-balance" style="margin:8px 0"></div>
+      <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
+        <p class="task-sub">Stripe’s compliance record for the person or company legally authorized to use the card. Stripe may require verification.</p>
+        <div class="settings-grid">
+          <label class="form-row">Type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
+          <label class="form-row">Name<input class="holder-name" placeholder="Full legal or company name" /></label>
+          <label class="form-row">First name<input class="holder-first" /></label>
+          <label class="form-row">Last name<input class="holder-last" /></label>
+          <label class="form-row">Date of birth<input class="holder-dob" type="date" /></label>
+          <label class="form-row">Email<input class="holder-email" type="email" /></label>
+          <label class="form-row">Phone<input class="holder-phone" /></label>
+          <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
+          <label class="form-row">City<input class="holder-city" /></label>
+          <label class="form-row">State or region<input class="holder-state" /></label>
+          <label class="form-row">Postal code<input class="holder-postal" /></label>
+          <label class="form-row">Country<input class="holder-country" placeholder="US" maxlength="2" /></label>
+        </div>
+        <button class="btn sm" data-addholder>Create cardholder</button>
+      </details>` : '<p class="task-sub">Set up Stripe Issuing in organization settings.</p>'}
+      <div class="stripe-issue hidden" style="margin-top:10px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input class="sc-label" placeholder="Name" />
+          <input class="sc-cap" type="number" step="0.01" placeholder="cap USD" style="width:120px" />
+          <select class="card-cardholder"><option value="">Choose cardholder</option></select>
+          <button class="btn sm" data-issuecard="${scope}">Issue card</button>
+        </div>
       </div>
-      <button class="btn sm" data-addholder>Create required Stripe record</button>
-    </details>` : ''}
-    <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
-    <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
-    <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
-    <div class="section-h" style="margin-top:14px">Cards</div>
-    <div class="cards-list" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Add ${scope === 'global' ? 'an organization' : 'a project'} card</label>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <input class="card-label" placeholder="label (e.g. Ops)" />
-        <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
-        <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
-        <select class="card-provider"><option value="mock">Local test funds</option></select>
-        <select class="card-cardholder hidden"><option value="">Choose required Stripe cardholder</option></select>
-        <button class="btn" data-addcard="${scope}">Add card</button>
-      </div></div>
-    ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
-      <div class="section-h" style="margin-top:14px">Payment activity</div><div class="pay-transactions"></div>` : ''}
+    </details>
+    <div class="section-h" style="margin-top:16px">Spend limits</div>
+    <div class="settings-grid">
+      <label class="form-row">Allowance per task (USD)<input class="pay-allow" type="number" step="0.01" placeholder="unlimited" /></label>
+      <label class="form-row">Approval threshold (USD)<input class="pay-thresh" type="number" step="0.01" placeholder="never" /></label>
+    </div>
+    <button class="btn sm" data-savepolicy="${scope}">Save spend limits</button>
+    ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
+      <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
+}
+/** "MM/YY", "MM/YYYY", or "MMYY" → {expMonth, expYear}; null when unparseable. */
+function parseExpiry(raw) {
+  const m = String(raw || '').trim().match(/^(\d{1,2})\s*[/\-\s]?\s*(\d{2}|\d{4})$/);
+  if (!m) return null;
+  const year = Number(m[2]);
+  return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
 async function wirePaymentProviders(box, organizationId) {
@@ -8927,13 +9016,14 @@ async function wirePaymentProviders(box, organizationId) {
       } catch (e) { toast(e.message, true); }
     });
   }
-  list.innerHTML = data.providers.length
-    ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
-          <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
-        ${p.kind === 'oauth' && (p.connected || p.connectionStatus) ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('')
-    : '<span style="color:var(--ink-3)">No payment providers.</span>';
+  // Only OAuth rails need a connect surface; the vault-card rail needs nothing
+  // and the mock rail is a development fixture, not a user-facing choice.
+  const connectable = data.providers.filter((p) => p.kind === 'oauth');
+  list.innerHTML = connectable.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
+      <div style="flex:1">${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : '<span class="chip">not connected</span>'}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
+      ${p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
+      ${p.connected || p.connectionStatus ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('');
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
       const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
@@ -8951,11 +9041,13 @@ async function wirePaymentProviders(box, organizationId) {
       wirePaymentProviders(box, organizationId);
     } catch (e) { toast(e.message, true); }
   }));
-  if (organizationId && data.active) {
+  // Only a rail with a balance karmax can read has one worth showing.
+  const el = box.querySelector('.pay-balance');
+  if (el) el.innerHTML = '';
+  if (organizationId && connectable.some((p) => p.name === 'stripe' && p.connected)) {
     try {
-      const balance = await api(`${paymentsBase}/balance?provider=${encodeURIComponent(data.active)}`);
-      const el = box.querySelector('.pay-balance');
-      if (el) el.innerHTML = `<b>Available balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
+      const balance = await api(`${paymentsBase}/balance?provider=stripe`);
+      if (el) el.innerHTML = `<b>Issuing balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
     } catch {}
   }
   return data;
@@ -8974,20 +9066,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   else {
     try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
   }
-  const providerSelect = box.querySelector('.card-provider');
   const holderSelect = box.querySelector('.card-cardholder');
-  const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
-  const stripeConnected = usableProviders.some((p) => p.name === 'stripe');
+  const stripeConnected = (providerData?.providers || []).some((p) => p.name === 'stripe' && p.connected);
   box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
-  providerSelect.innerHTML = usableProviders.map((p) =>
-    `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  box.querySelector('.stripe-issue')?.classList.toggle('hidden', !stripeConnected);
   const loadCardholders = async () => {
-    const stripe = providerSelect.value === 'stripe';
-    holderSelect.classList.toggle('hidden', !stripe);
-    if (!stripe) return;
+    if (!stripeConnected || !holderSelect) return;
     try {
       const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose required Stripe cardholder</option>${holders.map((h) => {
+      holderSelect.innerHTML = `<option value="">Choose cardholder</option>${holders.map((h) => {
         const requirements = h.requirements?.past_due || [];
         const ready = h.status === 'active' && requirements.length === 0;
         return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
@@ -8996,7 +9083,6 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
       holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
     }
   };
-  providerSelect.addEventListener('change', loadCardholders);
   await loadCardholders();
   box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
     const dobValue = box.querySelector('.holder-dob').value;
@@ -9047,14 +9133,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
-      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="chip">${esc(c.provider)}</span> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope} · ${esc(c.id)}</span><div class="task-sub">${esc(c.status || 'active')} · available ${usd(c.available)} / cap ${usd(c.cap)}${c.merchantLock?.length ? ` · merchants ${c.merchantLock.map(esc).join(', ')}` : ''}</div></div>
-        ${c.provider === 'mock' && c.status !== 'canceled' ? `<input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button>` : ''}
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
+          <div class="task-sub">${usd(c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
+        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
-      : '<span style="color:var(--ink-3)">No cards.</span>';
+      : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
-      if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — Karmax only mirrors the figure.');
+      if (!amt || !Number(amt)) return;
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
     list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Revoke this card? This cannot be undone.')) return;
@@ -9066,23 +9153,48 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     }));
   };
   await renderCards();
-  box.querySelector(`[data-addcard]`).addEventListener('click', async () => {
-    const label = box.querySelector('.card-label').value.trim() || 'Card';
-    const cap = box.querySelector('.card-cap').value;
+  const field = (name) => box.querySelector(name).value.trim();
+  const addCard = (body) => api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
+    scope: scope === 'project' ? 'project' : 'organization',
+    projectId: scope === 'project' ? projectId : undefined,
+    ...body,
+  }) });
+  box.querySelector('[data-addcard]').addEventListener('click', async () => {
+    const expiry = parseExpiry(field('.card-expiry'));
+    if (!expiry) return toast('Expiry must look like MM/YY', true);
     try {
-      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
-        scope: scope === 'project' ? 'project' : 'organization',
-        projectId: scope === 'project' ? projectId : undefined,
-        label,
-        cap: Math.round(Number(cap || 0) * 100),
-        merchantLock: box.querySelector('.card-merchants').value.split(',').map((value) => value.trim()).filter(Boolean),
-        provider: providerSelect.value,
-        cardholderId: providerSelect.value === 'stripe' ? holderSelect.value : undefined,
-      }) });
-      box.querySelector('.card-label').value = '';
-      box.querySelector('.card-cap').value = '';
-      box.querySelector('.card-merchants').value = '';
+      await addCard({
+        provider: 'vault-card',
+        label: field('.card-label') || 'Card',
+        cap: Math.round(Number(field('.card-cap') || 0) * 100),
+        merchantLock: field('.card-merchants').split(',').map((value) => value.trim()).filter(Boolean),
+        details: {
+          number: field('.card-number'),
+          cvc: field('.card-cvc'),
+          ...expiry,
+          billing: { line1: field('.card-line1'), city: field('.card-city'),
+            postalCode: field('.card-postal'), country: field('.card-country') },
+        },
+      });
+      // Clear the secret half from the DOM as soon as it has been vaulted.
+      for (const name of ['.card-label', '.card-cap', '.card-merchants', '.card-number', '.card-expiry',
+        '.card-cvc', '.card-line1', '.card-city', '.card-postal', '.card-country'])
+        box.querySelector(name).value = '';
       toast('Card added');
+      renderCards();
+    } catch (e) { toast(e.message, true); }
+  });
+  box.querySelector('[data-issuecard]')?.addEventListener('click', async () => {
+    try {
+      await addCard({
+        provider: 'stripe',
+        label: field('.sc-label') || 'Card',
+        cap: Math.round(Number(field('.sc-cap') || 0) * 100),
+        cardholderId: holderSelect.value,
+      });
+      box.querySelector('.sc-label').value = '';
+      box.querySelector('.sc-cap').value = '';
+      toast('Card issued');
       renderCards();
     } catch (e) { toast(e.message, true); }
   });
@@ -9839,6 +9951,7 @@ async function hydrateAuthorization(scope, projectId) {
 
 function wireGlobalSettings(organizationId) {
   hydratePhoneAccess();
+  wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
@@ -10212,7 +10325,9 @@ async function hydrateOrganizationView() {
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
   if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
-  for (const card of [$('#main [data-wf="agent-queue"]'), $('#resilience-card')])
+  // Instance-wide cards render inside globalSettingsView but belong under
+  // Advanced, not among the task defaults. Moving the node keeps its listeners.
+  for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
@@ -11015,7 +11130,7 @@ function openHelp() {
 // ── login ────────────────────────────────────────────────────────────────────
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:18px"><span class="mark">◇</span> karmax</div>
+    <div class="brand" style="margin-bottom:18px">${brandMark()} karmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a karmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
@@ -11051,7 +11166,7 @@ function renderLogin() {
 // whether an address has an account.
 function renderForgotPassword() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Reset password</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Reset password</div>
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
     <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
     <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
@@ -11079,7 +11194,7 @@ function renderForgotPassword() {
 // password via Better Auth, then returns to sign in.
 function renderResetPassword(token) {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Choose a new password</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Choose a new password</div>
     ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
       : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
@@ -11112,7 +11227,7 @@ function renderResetPassword(token) {
 
 function renderSignup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Create account</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
     ${S.pendingInvite
       ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
       : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
@@ -11147,7 +11262,7 @@ function renderSignup() {
 
 function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Account created</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your account is active, but you don't have access to any project yet.</p>
     <p class="task-sub">Ask a karmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
@@ -11173,7 +11288,7 @@ function renderAccessPending() {
 
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Set up karmax</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up karmax</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>

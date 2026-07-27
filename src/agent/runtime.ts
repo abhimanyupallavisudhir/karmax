@@ -37,7 +37,7 @@ export interface RunTurnDeps {
   fillPaymentCard?: (args: {
     requestId: string;
     cdpUrl: string;
-    selectors: { number: string; cvc: string; expiry?: string; expMonth?: string; expYear?: string };
+    selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }) => Promise<{ filled: true; origin: string }>;
 }
 
