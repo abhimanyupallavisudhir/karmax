@@ -3705,7 +3705,7 @@ async function openTaskForm(workflow, draft, seedText) {
               </button>
             </div>
             <div class="form-row" data-row="__creds">
-              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
+              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Agent logins</label></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
@@ -4095,7 +4095,7 @@ async function renderSeriesPage(rec) {
             <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
           </div>
           <details class="advanced" style="margin-top:10px">
-            <summary>Credentials — precedence &amp; enable/disable</summary>
+            <summary>Agent logins — precedence &amp; enable/disable</summary>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
@@ -5847,7 +5847,7 @@ function parametersTab(v) {
   return `
     ${paramsSection(v)}
     ${authorizationSection(v)}
-    <div class="section-h">Credentials</div>
+    <div class="section-h">Agent logins</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
     <div id="cred-editor-task">Loading…</div>`;
 }
