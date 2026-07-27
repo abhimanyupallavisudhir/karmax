@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
@@ -263,11 +264,10 @@ function readJson(file: string): any {
  *  karmax token file we write when a `setup-token` flow prints a token. */
 export function isLoggedIn(provider: string, home: string): boolean {
   if (isAcpProvider(provider) && hasAcpHomeLogin(provider, home)) return true;
-  const candidates = provider === 'codex'
-    ? ['auth.json', KARMAX_TOKEN_FILE]
-    : provider === 'claude'
-      ? ['.credentials.json', '.claude/.credentials.json', KARMAX_TOKEN_FILE]
-      : [KARMAX_TOKEN_FILE];
+  if (provider === 'claude') {
+    return hasClaudeNativeCredential(home) || !!capturedToken(home);
+  }
+  const candidates = provider === 'codex' ? ['auth.json', KARMAX_TOKEN_FILE] : [KARMAX_TOKEN_FILE];
   return candidates.some((f) => fs.existsSync(path.join(home, f)));
 }
 
@@ -302,11 +302,10 @@ export function capturedToken(home: string): string | undefined {
  *  `connect` re-runs login to upgrade it to a full, usage-pollable credential (#6). */
 export function isFullyAuthed(provider: string, home: string): boolean {
   if (isAcpProvider(provider)) return hasAcpHomeLogin(provider, home);
+  if (provider === 'claude') return hasClaudeNativeCredential(home);
   const native = provider === 'codex'
     ? ['auth.json']
-    : provider === 'claude'
-      ? ['.credentials.json', '.claude/.credentials.json']
-      : [];
+    : [];
   return native.some((f) => fs.existsSync(path.join(home, f)));
 }
 
@@ -315,14 +314,39 @@ export function isFullyAuthed(provider: string, home: string): boolean {
  *  (can't read usage, RESOLVE-PLAN #6) and would shadow the full login, so prefer
  *  the native credential (the Agent SDK reads it directly). */
 export function tokenToInject(home: string): string | undefined {
-  return fs.existsSync(path.join(home, '.credentials.json')) ? undefined : capturedToken(home);
+  return hasClaudeNativeCredential(home) ? undefined : capturedToken(home);
 }
 
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_.-]/g, '-');
 
+/** Claude leaves a structurally valid but empty `.credentials.json` behind after
+ * logout. File existence alone therefore makes a logged-out account look connected
+ * and prevents Connect from launching OAuth again. A refresh token remains useful
+ * after an access token expires, so either non-empty token is sufficient here. */
+export function hasClaudeNativeCredential(home: string): boolean {
+  for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
+    try {
+      const oauth = JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth;
+      if (
+        (typeof oauth?.accessToken === 'string' && oauth.accessToken.length > 0)
+        || (typeof oauth?.refreshToken === 'string' && oauth.refreshToken.length > 0)
+      ) return true;
+    } catch {
+      /* missing, malformed, or logged-out placeholder */
+    }
+  }
+  return false;
+}
+
 /** Build a clean, isolated environment for an agent spawn (SPEC §7.3 gotcha). */
 export function scrubbedEnv(opts: { provider: Provider; configHome?: string; extra?: Record<string, string> }): Record<string, string> {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  // Native user installs (notably Claude Code's installer) live here. Service
+  // managers often start karmax with only system + Node paths, which otherwise
+  // makes a working CLI invisible to login, model, and usage subprocesses.
+  const userBin = path.join(os.homedir(), '.local', 'bin');
+  const pathEntries = (env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  env.PATH = [userBin, ...pathEntries.filter((entry) => entry !== userBin)].join(path.delimiter);
   // Never let one profile's keys leak into another's process.
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;

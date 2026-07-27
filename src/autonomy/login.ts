@@ -106,6 +106,15 @@ export class LoginManager {
     persistTokenWhenPrinted(child, configHome);
     const prompt = await captureLoginPrompt(child, opts.urlTimeoutMs ?? 8000);
     child.unref(); // let it keep running while the user completes OAuth
+    if (prompt.error) {
+      return {
+        provider,
+        account,
+        configHome,
+        status: 'failed',
+        detail: `could not launch ${spec.cmd}: ${prompt.error.message}`,
+      };
+    }
     if (prompt.url) {
       return {
         provider,
@@ -158,15 +167,20 @@ function persistTokenWhenPrinted(child: ChildProcess, home: string): void {
 function captureLoginPrompt(
   child: ChildProcess,
   timeoutMs: number,
-): Promise<{ url?: string; verificationCode?: string }> {
+): Promise<{ url?: string; verificationCode?: string; error?: Error }> {
   return new Promise((resolve) => {
     let buf = '';
     let done = false;
+    let spawnError: Error | undefined;
     let settleTimer: NodeJS.Timeout | undefined;
     const result = () => {
       const url = buf.match(/https?:\/\/[^\s'"]+/)?.[0];
       const verificationCode = buf.match(/(?:enter|user(?:_| )?)\s*code\s*[:=]\s*([A-Z0-9][A-Z0-9-]{3,})/i)?.[1];
-      return { ...(url ? { url } : {}), ...(verificationCode ? { verificationCode } : {}) };
+      return {
+        ...(url ? { url } : {}),
+        ...(verificationCode ? { verificationCode } : {}),
+        ...(spawnError ? { error: spawnError } : {}),
+      };
     };
     const finish = () => {
       if (done) return;
@@ -185,7 +199,10 @@ function captureLoginPrompt(
     };
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
-    child.once('error', finish);
+    child.once('error', (error) => {
+      spawnError = error;
+      finish();
+    });
     child.once('exit', () => setTimeout(finish, 50));
     setTimeout(finish, timeoutMs).unref();
   });

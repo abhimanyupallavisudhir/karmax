@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity } from './activity.js';
-import { platformMcpSpec } from '../autonomy/config-homes.js';
+import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-homes.js';
 import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 
@@ -42,7 +42,7 @@ export class ClaudeAdapter implements AgentAdapter {
   static hasAmbientLogin(): boolean {
     try {
       const dir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
-      return fs.existsSync(path.join(dir, '.credentials.json'));
+      return hasClaudeNativeCredential(dir);
     } catch {
       return false;
     }

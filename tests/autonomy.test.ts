@@ -22,6 +22,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     const env = scrubbedEnv({ provider: 'claude', configHome: home });
     expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // never leaks across profiles
     expect(env.CLAUDE_CONFIG_DIR).toBe(home);
+    expect(env.PATH?.split(path.delimiter)[0]).toBe(path.join(os.homedir(), '.local', 'bin'));
     delete process.env.ANTHROPIC_API_KEY;
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -181,7 +182,9 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login2-'));
     const homes = new ConfigHomeManager(dir);
     const home = homes.ensure('claude', 'work');
-    fs.writeFileSync(path.join(home, '.credentials.json'), '{}');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 60_000 },
+    }));
     expect(isLoggedIn('claude', home)).toBe(true);
     let launched = false;
     const login = new LoginManager(homes, () => {
@@ -202,6 +205,36 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     const home = homes.ensure('codex', 'acme');
     fs.writeFileSync(path.join(home, 'auth.json'), '{}');
     expect(login.status('codex', 'acme').loggedIn).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not treat Claude logout placeholders as authenticated', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-empty-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'work');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 },
+    }));
+    expect(isLoggedIn('claude', home)).toBe(false);
+    expect(isFullyAuthed('claude', home)).toBe(false);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports a missing login executable directly instead of a URL timeout', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-missing-'));
+    const homes = new ConfigHomeManager(dir);
+    const login = new LoginManager(homes, () => ({
+      cmd: `karmax-missing-login-${Date.now()}`,
+      args: [],
+      env: { ...process.env } as Record<string, string>,
+    }));
+    const started = Date.now();
+    const result = await login.connect('claude', 'work', { urlTimeoutMs: 10_000 });
+    expect(result).toEqual(expect.objectContaining({
+      status: 'failed',
+      detail: expect.stringMatching(/^could not launch karmax-missing-login-.*ENOENT/),
+    }));
+    expect(Date.now() - started).toBeLessThan(2_000);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -235,7 +268,9 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     expect(isFullyAuthed('claude', home)).toBe(false);  // but not usage-pollable → re-login upgrades
     expect(tokenToInject(home)).toBe('sk-ant-oat01-XYZ'); // inject the setup-token (no native cred yet)
     // after a full login writes .credentials.json, prefer the native credential:
-    fs.writeFileSync(path.join(home, '.credentials.json'), '{}');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'access', refreshToken: 'refresh' },
+    }));
     expect(isFullyAuthed('claude', home)).toBe(true);
     expect(tokenToInject(home)).toBeUndefined();         // native cred shadows the restricted setup-token
     fs.rmSync(dir, { recursive: true, force: true });
@@ -261,7 +296,9 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mgmt-'));
     const homes = new ConfigHomeManager(dir);
     const home = homes.ensure('claude', 'old');
-    fs.writeFileSync(path.join(home, '.credentials.json'), '{}');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'access', refreshToken: 'refresh' },
+    }));
     const moved = homes.rename('claude', 'old', 'new');
     expect(fs.existsSync(path.join(moved, '.credentials.json'))).toBe(true); // creds carried over
     expect(homes.list().map((h) => h.account)).toContain('new');
