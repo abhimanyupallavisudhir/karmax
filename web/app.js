@@ -4035,10 +4035,9 @@ async function openTaskForm(workflow, draft, seedText) {
 
 // ── task page ─────────────────────────────────────────────────────────────────
 // A task opens as a PAGE of its own (route /<org>/<project>/tasks/:num), rendered
-// into #main with four tabs — Overview (pipeline, review, widgets, sub-tasks,
-// notes), Check-in (agent conversations + the ephemeral terminal), Parameters
-// (priority/tags, workflow params, credentials) and Advanced (event log,
-// structured state). The workflow still owns everything shown — actions, stages,
+// into #main with tabs — Overview (pipeline, review, widgets, sub-tasks,
+// notes), Check-in (agent conversations + the ephemeral terminal) and Parameters
+// (priority/tags, workflow params, credentials). The workflow still owns everything shown — actions, stages,
 // params, widgets and transcripts all come off the declared view; the host only
 // lays them out. Declared actions (Confirm/Cancel/…) live in a footer bar that
 // stays visible on every tab.
@@ -4047,7 +4046,6 @@ const TASK_TABS = [
   { key: 'checkin', label: 'Check-in' },
   { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
-  { key: 'advanced', label: 'Advanced' },
 ];
 
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
