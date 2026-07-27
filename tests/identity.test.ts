@@ -16,7 +16,9 @@ describe('Better Auth identity boundary', () => {
       setupRequired: true,
       visibleProjects: ['Allowed'],
       usersDenied: 403,
-      signupNoAccess: true,
+      signupEntersApp: true,
+      signupHasPersonalWorkspace: true,
+      signupDashboardOk: true,
       signupAccountVisible: true,
       loggedOut: true,
     });

@@ -48,8 +48,9 @@ to:
    writes are performed by Karmax's trusted Git broker.
 5. Add an Anthropic/OpenAI API key under agent credentials if the deployment
    does not use another connected login.
-6. If the deployment has Stripe Connect credentials, connect the organization's
-   own Stripe account under Payments, create its Issuing cardholder, and issue
+6. In Payments, an installation administrator configures the shared Stripe
+   Connect application in the UI. Each organization then connects its own Stripe
+   account, creates the required Stripe compliance Cardholder record, and issues
    project or organization cards. Funds always come from that organization's
    connected-account Issuing balance.
 

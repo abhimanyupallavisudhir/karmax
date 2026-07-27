@@ -807,6 +807,27 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .profile-row-label { color: var(--ink-3); font-size: 13px; }
 .profile-row-value { font-weight: 600; text-align: right; word-break: break-word; }
+.verify-banner {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 16px; font-size: 13px;
+  background: var(--working-weak, #fdf6e3); color: var(--ink-1);
+  border-bottom: 1px solid var(--line);
+}
+.verify-banner .btn { flex: 0 0 auto; }
+.verify-dismiss {
+  margin-left: auto; background: none; border: none; cursor: pointer;
+  color: var(--ink-3); font-size: 14px; padding: 4px 6px; line-height: 1;
+}
+.verify-dismiss:hover { color: var(--ink-1); }
+.profile-orgs { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.profile-org {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  color: var(--ink-1); text-decoration: none;
+}
+.profile-org:hover { border-color: var(--accent); background: var(--accent-weak); }
+.profile-org-mark { color: var(--ink-3); }
+.profile-org-name { font-weight: 600; flex: 1; }
 
 /* confirm layers (SPEC §5.2): one bordered row per Review gate, played in order */
 .cf-layer { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: var(--surface); }
@@ -842,6 +863,16 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .combo-menu[hidden] { display: none; }
 .combo-opt { padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .combo-opt.active { background: var(--accent-weak); }
+.combo-opt-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.combo-opt-head span { min-width: 0; font-weight: 550; }
+.combo-opt-head code {
+  flex: none; color: var(--ink-3); font-size: 10px; font-weight: 400;
+  background: none; padding: 0;
+}
+.combo-opt-description {
+  margin-top: 2px; color: var(--ink-3); font-size: 11px; line-height: 1.35;
+  white-space: normal;
+}
 .combo-empty { padding: 7px 10px; font-size: 12px; color: var(--ink-3); }
 
 /* empty states */

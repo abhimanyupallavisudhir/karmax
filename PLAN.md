@@ -190,8 +190,9 @@ input — one model, not two.
       provider routing per card; signed direct real-time authorization decisions;
       and ledger reconciliation. Secure checkout fill resolves PAN/CVC only in
       the trusted activity and types them over origin-checked loopback CDP, never
-      through model context or SQLite. Stripe appears connectable only when the
-      deployment app keys are configured; active cards additionally require the
+      through model context or SQLite. An installation administrator configures
+      the shared Connect application in the UI (encrypted vault; environment
+      fallback remains for bootstrap); active cards additionally require the
       webhook signing secret.
       (c)-3 = agent account registration + MFA via broker + browser MCP (large).
 

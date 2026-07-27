@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 
@@ -937,6 +939,80 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(reqs.find((r: any) => r.id === reset.requestId).kind).toBe('reset');
   });
 
+  it('propagates an agent-created item rotation to its write-back entry without clobbering notes', async () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fake-pass-'));
+    const fakePass = path.join(fakeHome, 'pass');
+    const entryFile = path.join(fakeHome, 'entry');
+    fs.writeFileSync(fakePass, `#!/bin/sh
+case "$1" in
+  show) cat "$KARMAX_TEST_PASS_ENTRY" ;;
+  insert) cat > "$KARMAX_TEST_PASS_ENTRY" ;;
+  *) exit 1 ;;
+esac
+`);
+    fs.chmodSync(fakePass, 0o755);
+    const previousPath = process.env.PATH;
+    const previousEntry = process.env.KARMAX_TEST_PASS_ENTRY;
+    process.env.PATH = `${fakeHome}${path.delimiter}${previousPath ?? ''}`;
+    process.env.KARMAX_TEST_PASS_ENTRY = entryFile;
+    try {
+      const configured = await fetch(`${base}/api/vault/connectors/pass/config`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: true }),
+      });
+      expect(configured.status).toBe(200);
+      const agent = h.tokens.mint({
+        taskId: 'task_agent_writeback_rotation',
+        profileId: 'do',
+        principal: 'user:test',
+        ceiling: ['credential:read', 'vault:store'],
+        grantorCaps: ['credential:read', 'vault:store'],
+      });
+      const agentAuth = { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' };
+      const created: any = await (await fetch(`${base}/api/vault/store`, {
+        method: 'POST',
+        headers: agentAuth,
+        body: JSON.stringify({
+          type: 'login',
+          label: 'Agent-created pass rotation',
+          domains: ['rotation.example.com'],
+          username: 'agent@example.com',
+          secrets: { password: 'initial' },
+        }),
+      })).json();
+      expect(created.writeBack).toEqual([
+        { connector: 'pass', externalId: 'karmax/Agent-created-pass-rotation' },
+      ]);
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\n');
+
+      // Real pass entries often contain notes below line 1. Rotation must use
+      // updateSecret, not push, so those lines survive.
+      fs.writeFileSync(entryFile, 'initial\nusername: agent@example.com\nkeep this note\n');
+      const rotated: any = await (await fetch(`${base}/api/vault/store`, {
+        method: 'POST',
+        headers: agentAuth,
+        body: JSON.stringify({
+          id: created.id,
+          type: 'login',
+          label: 'Agent-created pass rotation',
+          secrets: { password: 'rotated' },
+        }),
+      })).json();
+      expect(rotated.propagated).toEqual({ connector: 'pass', fields: ['password'] });
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe(
+        'rotated\nusername: agent@example.com\nkeep this note\n',
+      );
+    } finally {
+      await fetch(`${base}/api/vault/connectors/pass/config`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: false }),
+      }).catch(() => {});
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousEntry === undefined) delete process.env.KARMAX_TEST_PASS_ENTRY;
+      else process.env.KARMAX_TEST_PASS_ENTRY = previousEntry;
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
   it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {
     const conns: any = await (await fetch(`${base}/api/vault/connectors`, { headers: auth() })).json();
     expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass']);
@@ -1016,6 +1092,56 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(mailbox.configured).toBe(true);
     expect(h.store.kvGet(`agent-mail:provider:${orgId}`)).toContain('mailbox:agentmail:');
     expect(h.store.kvGet('agent-mail:provider')).toBeUndefined();
+  });
+
+  it('configures the shared Stripe Connect application from the operator API without returning secrets', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const endpoint = `${base}/api/organizations/${orgId}/payments/stripe/platform`;
+    const before: any = await (await fetch(endpoint, { headers: auth() })).json();
+    expect(before).toMatchObject({
+      canManage: true,
+      callbackUrl: `${base}/api/payments/stripe/callback`,
+      webhookUrl: `${base}/api/payments/stripe/webhook`,
+    });
+    const organizationPaymentAdmin = h.tokens.mint({
+      taskId: 'task_payment_admin',
+      profileId: 'operator',
+      principal: 'user:organization-payment-admin',
+      organizationId: orgId,
+      ceiling: ['payment:read', 'payment:write'],
+      grantorCaps: ['payment:read', 'payment:write'],
+    });
+    const forbidden = await fetch(endpoint, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${organizationPaymentAdmin.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId: 'ca_forbidden', secretKey: 'sk_test_forbidden' }),
+    });
+    expect(forbidden.status).toBe(403);
+
+    const saved = await fetch(endpoint, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({
+        clientId: 'ca_gateway_managed',
+        secretKey: 'sk_test_gateway_managed',
+        webhookSecret: 'whsec_gateway_managed',
+      }),
+    });
+    expect(saved.status).toBe(200);
+    const status: any = await saved.json();
+    expect(status).toMatchObject({
+      configured: true, clientId: 'ca_gateway_managed', secretKeyConfigured: true,
+      webhookConfigured: true, source: 'ui',
+    });
+    expect(JSON.stringify(status)).not.toContain('sk_test_gateway_managed');
+    expect(JSON.stringify(status)).not.toContain('whsec_gateway_managed');
+    expect(JSON.stringify(h.store.exportOrganization(orgId))).not.toContain('sk_test_gateway_managed');
+
+    const providers: any = await (await fetch(`${base}/api/organizations/${orgId}/payments/providers`,
+      { headers: auth() })).json();
+    expect(providers.providers.find((provider: any) => provider.name === 'stripe'))
+      .toMatchObject({ available: true, connected: false });
   });
 
   it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {

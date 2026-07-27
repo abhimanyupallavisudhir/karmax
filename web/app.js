@@ -219,6 +219,9 @@ async function resolveProjectTaskKey(projectId, key) {
 }
 
 async function applyRoute() {
+  const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
+  const routePath = location.pathname;
+  const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(location.pathname);
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
@@ -232,9 +235,11 @@ async function applyRoute() {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
         await loadCollaboration().catch(() => {});
+        if (!routeIsCurrent()) return;
       }
     }
     await loadOrganizationRuntimeCatalog();
+    if (!routeIsCurrent()) return;
     // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
     // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
     // redirect when the canonical path actually differs, so an unresolvable slug
@@ -252,9 +257,12 @@ async function applyRoute() {
     closeTaskDom();
     S.tab = r.tab;
     renderRail();
+    // renderMain() already dispatches per-tab hydration (renderDashboard,
+    // hydrateOrganizationView, …). Calling them again here double-ran hydration
+    // on the same DOM, stacking a second click listener on static buttons like
+    // "Invite" — which sent every invitation (and its email) twice and rendered
+    // the pending list twice. One dispatch only.
     renderMain();
-    if (r.tab === 'dashboard') renderDashboard();
-    if (r.tab === 'organization') hydrateOrganizationView();
     return;
   }
   // project / task routes → resolve the org + project (by name-slug) + optional open task
@@ -274,6 +282,7 @@ async function applyRoute() {
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
   await loadOrganizationRuntimeCatalog();
+  if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -286,19 +295,28 @@ async function applyRoute() {
     S.searchResult = null;
     S.cursorId = null;
     await loadTasks().catch(() => {});
+    if (!routeIsCurrent()) return;
   }
-  else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  else if (!S.tasks?.length) {
+    await loadTasks().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
   let taskId = null;
   if (r.taskKey) {
     taskId = await resolveProjectTaskKey(pid, r.taskKey);
+    if (!routeIsCurrent()) return;
     if (!taskId) toast(`Task #${r.taskKey} not found`, true);
   }
   S.tab = tab;
   if (!taskId) closeTaskDom();
-  if (tab === 'tasks' && !taskId) await runSearch().catch(() => {});
+  if (tab === 'tasks' && !taskId) {
+    await runSearch().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   renderRail();
   if (taskId) {
     if (S.selected !== taskId) return openTask(taskId, r.taskTab);
@@ -424,7 +442,7 @@ const NODES = [
 // Provider → model choices for the agent field (free-text also allowed).
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'];
 const MODELS = {
-  claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
+  claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
@@ -433,7 +451,10 @@ const MODELS = {
 };
 function modelOptions(provider) {
   const live = S.modelCatalog?.[provider];
-  return live?.length ? live.map((m) => m.id) : (MODELS[provider] || MODELS.claude);
+  // Keep the provider metadata intact: Claude's stable selectable id can be an
+  // alias such as `opus[1m]`, while its description is what identifies the
+  // concrete model currently behind that alias (for example Opus 5).
+  return live?.length ? live : (MODELS[provider] || MODELS.claude);
 }
 // Which reasoning-effort levels a given model actually accepts (mirrors the
 // server's src/agent/effort.ts gating). Empty = the model has no effort control.
@@ -808,6 +829,16 @@ function collectForm(root, fields) {
 // A lightweight combobox: a real dropdown that opens on focus and on the caret,
 // filters as you type, and still accepts free text. Replaces <datalist>, whose
 // popup is unreliable (won't open on the caret, flaky while typing).
+function normalizeComboOption(option) {
+  if (typeof option === 'string') return { value: option, label: option, description: '' };
+  const value = String(option?.value ?? option?.id ?? '');
+  return {
+    value,
+    label: String(option?.label ?? option?.displayName ?? value),
+    description: String(option?.description ?? ''),
+  };
+}
+
 function wireCombo(combo, getOptions, onChange) {
   const input = combo.querySelector('input');
   const menu = combo.querySelector('.combo-menu');
@@ -826,9 +857,14 @@ function wireCombo(combo, getOptions, onChange) {
   };
   const draw = () => {
     const q = input.value.trim().toLowerCase();
-    const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
+    const opts = (getOptions() || [])
+      .map(normalizeComboOption)
+      .filter((o) => o.value && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
     menu.innerHTML = opts.length
-      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
+      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o.value)}">
+          <div class="combo-opt-head"><span>${esc(o.label)}</span>${o.label !== o.value ? `<code>${esc(o.value)}</code>` : ''}</div>
+          ${o.description ? `<div class="combo-opt-description">${esc(o.description)}</div>` : ''}
+        </div>`).join('')
       : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
     active = -1; // filtering changes the list; start with nothing highlighted
   };
@@ -1581,9 +1617,27 @@ function toast(msg, err = false, action) {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  // The emailed password-reset link lands here unauthenticated; handle it before
+  // any session/setup gating so a signed-out user can actually reset.
+  if (location.pathname === '/reset-password') {
+    return renderResetPassword(new URLSearchParams(location.search).get('token') || '');
+  }
+  // Better Auth redirects the confirmation link back here with ?verified=1 after
+  // marking the address verified. Note it, strip it from the URL, and surface it
+  // (a toast in-app, or a line on the sign-in card if the link was opened while
+  // signed out).
+  if (new URLSearchParams(location.search).get('verified') === '1') {
+    S.justVerified = true;
+    history.replaceState({ kx: 1 }, '', location.pathname);
+  }
   const session = await (await fetch('/api/session')).json();
   S.sso = session.sso || null;
   if (session.setupRequired) return renderSetup();
+  // An invite link opened while signed out: keep the token in the URL (boot
+  // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
+  // card that a pending invitation is waiting, so a brand-new invitee knows to
+  // create an account — with the address the invite was sent to.
+  S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
   if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
@@ -1625,6 +1679,7 @@ async function boot() {
   } catch {}
   connectWs();
   renderShell();
+  if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
   bindKeys();
   installLinkRouter();
   installTagRouter();
@@ -1646,16 +1701,19 @@ async function loadProjects() {
 }
 
 async function loadOrganizationRuntimeCatalog() {
-  if (!S.organizationId || S.catalogOrganizationId === S.organizationId) return;
-  const query = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const organizationId = S.organizationId;
+  if (!organizationId || S.catalogOrganizationId === organizationId) return;
+  const epoch = S.catalogLoadEpoch = (S.catalogLoadEpoch || 0) + 1;
+  const query = `?organizationId=${encodeURIComponent(organizationId)}`;
   try {
     const [schema, models] = await Promise.all([
       api(`/api/schema${query}`),
       api(`/api/models${query}`),
     ]);
+    if (S.catalogLoadEpoch !== epoch || S.organizationId !== organizationId) return;
     S.schema = schema;
     S.modelCatalog = models.providers;
-    S.catalogOrganizationId = S.organizationId;
+    S.catalogOrganizationId = organizationId;
   } catch {
     // Keep the last usable built-in catalog; task creation remains server-validated.
   }
@@ -1667,15 +1725,18 @@ async function loadOrganizations() {
 }
 
 async function loadCollaboration() {
-  if (!S.organizationId) return;
-  const q = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const organizationId = S.organizationId;
+  if (!organizationId) return;
+  const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
+  const q = `?organizationId=${encodeURIComponent(organizationId)}`;
   const [members, teams, users, inbox, prefs] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/members`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/teams`).catch(() => []),
+    api(`/api/organizations/${organizationId}/members`).catch(() => []),
+    api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/inbox${q}`).catch(() => []),
     api(`/api/inbox/preferences${q}`).catch(() => null),
   ]);
+  if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
@@ -1685,16 +1746,20 @@ async function loadCollaboration() {
 }
 
 async function loadTasks() {
-  if (!S.projectId) return;
+  const projectId = S.projectId;
+  if (!projectId) return false;
+  const epoch = S.taskLoadEpoch = (S.taskLoadEpoch || 0) + 1;
   // Always fetch the full set incl. archived; the task list decides visibility via the
   // query (default -is:archived). S.tasks is the shared pool for the task page, counts, etc.
-  const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  const fetched = await api(`/api/projects/${projectId}/tasks?includeArchived=1`);
+  if (S.taskLoadEpoch !== epoch || S.projectId !== projectId) return false;
   // Drop any draft we just deleted: a list request issued before the DELETE landed
   // can still return it and clobber the optimistic removal. Once a fresh fetch no
   // longer contains a tombstoned id, the server has caught up — retire it so the
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+  return true;
 }
 
 // ── task organization: tags, saved views, query search ──────────────────────
@@ -1702,17 +1767,20 @@ async function loadTasks() {
 // tokens + free text), which the server evaluates via /search into `S.searchResult`.
 // The field registry (`S.fields`) drives the filter/sort/group menus.
 async function loadOrg() {
-  if (!S.projectId) return;
+  if (!S.projectId) return false;
   const pid = S.projectId;
+  const epoch = S.orgLoadEpoch = (S.orgLoadEpoch || 0) + 1;
   const [tags, views, fields] = await Promise.all([
     api(`/api/projects/${pid}/tags`).catch(() => []),
     api(`/api/projects/${pid}/views`).catch(() => []),
     S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields?projectId=${encodeURIComponent(pid)}`).catch(() => []),
   ]);
+  if (S.orgLoadEpoch !== epoch || S.projectId !== pid) return false;
   S.tags = tags || [];
   S.views = views || [];
   S.fields = fields || [];
   S.orgProjectId = pid;
+  return true;
 }
 
 // The map id→tag for quick lookups + hierarchy path rendering.
@@ -1731,10 +1799,13 @@ const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
 async function runSearch() {
-  if (!S.projectId) return;
+  const projectId = S.projectId;
+  if (!projectId) return false;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   try {
-    const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(q)}`);
+    const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
+    if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
     const live = new Map(S.tasks.map((t) => [t.id, t]));
     const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
@@ -1745,7 +1816,11 @@ async function runSearch() {
     }));
     if (r.groups) r.groups = overlayGroups(r.groups);
     S.searchResult = r;
-  } catch { S.searchResult = null; }
+    return true;
+  } catch {
+    if (S.searchEpoch === epoch && S.projectId === projectId) S.searchResult = null;
+    return false;
+  }
 }
 
 let searchDebounce = null;
@@ -1910,19 +1985,28 @@ function connectWs() {
 }
 
 let taskRefreshPromise = null;
+let taskRefreshQueued = false;
 async function refreshTasks() {
   // Navigation, mutations, and a structural websocket event can converge here.
   // Share one in-flight refresh so slow hosts cannot accumulate duplicate list
-  // scans behind the event loop.
-  if (taskRefreshPromise) return taskRefreshPromise;
+  // scans behind the event loop. A request arriving while that read is in flight
+  // still queues one follow-up pass: it may have been triggered by a mutation,
+  // and returning only the pre-mutation snapshot leaves the UI stale until reload.
+  if (taskRefreshPromise) {
+    taskRefreshQueued = true;
+    return taskRefreshPromise;
+  }
   taskRefreshPromise = (async () => {
-    try {
-      await loadTasks();
-      if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-      if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-      renderRail();
-      if (S.tab === 'queue' && !S.selected) seedQueue();
-    } catch {}
+    do {
+      taskRefreshQueued = false;
+      try {
+        await loadTasks();
+        if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
+        if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
+        renderRail();
+        if (S.tab === 'queue' && !S.selected) seedQueue();
+      } catch {}
+    } while (taskRefreshQueued);
   })();
   try {
     await taskRefreshPromise;
@@ -1932,6 +2016,33 @@ async function refreshTasks() {
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
+// A dismissible banner while the signed-in user's email is unconfirmed. Better
+// Auth exposes `emailVerified` on the session user; only shown for real identity
+// accounts (not legacy single-user 'me') that have an address and outbound email
+// to actually resend through.
+function verificationBanner() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  if (!u || u.emailVerified !== false || !u.email || S.verifyBannerDismissed) return '';
+  return `<div class="verify-banner" id="verify-banner">
+    <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
+    <button class="btn sm" id="verify-resend">Resend link</button>
+    <button class="verify-dismiss" id="verify-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
+  </div>`;
+}
+
+function wireVerificationBanner() {
+  $('#verify-resend')?.addEventListener('click', async () => {
+    const btn = $('#verify-resend'); btn.disabled = true;
+    try {
+      const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
+      toast(res.ok ? 'Confirmation email sent — check your inbox.' : 'Could not send — ask an operator to set up outbound email.', !res.ok);
+    } catch { toast('Could not send confirmation email', true); }
+    btn.disabled = false;
+  });
+  $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
+}
+
 function renderShell() {
   const app = $('#app');
   app.innerHTML = `
@@ -1951,6 +2062,7 @@ function renderShell() {
       <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
+    ${verificationBanner()}
     <div class="body">
       <div class="rail" id="rail"></div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
@@ -1961,6 +2073,7 @@ function renderShell() {
   $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#topbar-help').addEventListener('click', openHelp);
+  wireVerificationBanner();
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
     $('#rail-scrim')?.classList.remove('visible');
@@ -4164,6 +4277,7 @@ async function refreshTask() {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
+    const epoch = S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
@@ -4175,6 +4289,9 @@ async function refreshTask() {
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
+    // The user may have opened another task while this websocket-driven refresh
+    // was in flight. Never pair task A's response with task B's selected page.
+    if (S.selected !== id || S.taskViewRefreshEpoch !== epoch) return;
     if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
@@ -5335,6 +5452,7 @@ function conversationEntries(t) {
       type: 'activity',
       activity: { ...(prior?.activity || {}), ...activity },
       ts: prior?.ts || event.ts,
+      sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,
     });
   }
@@ -5347,9 +5465,19 @@ function conversationEntries(t) {
       .filter((entry) => entry.activity.kind === 'message')
       .map((entry) => String(entry.activity.title || '').trim()),
   );
+  // User messages carry real epoch-ms timestamps; agent/system replies are stamped
+  // by the deterministic workflow with a per-array sequence number (it has no wall
+  // clock). Carry the last real timestamp forward so a sequence-numbered reply sorts
+  // right after the message it answers, instead of being flung to the top of the
+  // timeline by its tiny `ts`.
+  let carriedTs = 0;
   const messages = (t.messages || [])
     .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
-    .map((message, index) => ({ type: 'message', message, ts: message.ts, order: index }));
+    .map((message, index) => {
+      const real = Number(message.ts) > 100000000000;
+      if (real) carriedTs = Number(message.ts);
+      return { type: 'message', message, ts: message.ts, sortTs: real ? Number(message.ts) : carriedTs, order: index };
+    });
   // Follow-ups are journaled as soon as Temporal accepts their signal, while the
   // workflow's cached transcript may not be republished until the turn ends.
   // Merge those durable events into the presentation timeline, keyed by message
@@ -5361,14 +5489,10 @@ function conversationEntries(t) {
     if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
     const message = event.payload?.message;
     if (!message?.id || storedIds.has(message.id)) continue;
-    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, order: event.seq ?? event.ts });
+    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts });
   }
   const combined = [...messages, ...posted.values(), ...activities.values()];
-  return combined.sort((a, b) => {
-    const at = Number(a.ts) > 100000000000 ? Number(a.ts) : -1000000000000 + Number(a.order || 0);
-    const bt = Number(b.ts) > 100000000000 ? Number(b.ts) : -1000000000000 + Number(b.order || 0);
-    return at - bt || Number(a.order || 0) - Number(b.order || 0);
-  });
+  return combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
 }
 
 function conversationTime(ts) {
@@ -5748,8 +5872,15 @@ function forkCommandFor(sess, worldPath) {
 // Credential-policy editor (SPEC §7/§9): order credentials by precedence and
 // enable/disable each, at a given scope (global/project/task). Lower scopes override
 // higher ones; API keys are off by default when a subscription exists.
+const asyncElementRenderEpoch = new WeakMap();
+function beginAsyncElementRender(element) {
+  const epoch = (asyncElementRenderEpoch.get(element) || 0) + 1;
+  asyncElementRenderEpoch.set(element, epoch);
+  return () => asyncElementRenderEpoch.get(element) === epoch;
+}
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
+  const renderIsCurrent = beginAsyncElementRender(el);
   const organizationId = opts.organizationId || projectById(opts.projectId)?.organizationId || S.organizationId || 'org_personal';
   const organizationBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
   const q = new URLSearchParams();
@@ -5761,7 +5892,15 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       api(`${organizationBase}/credentials?${q.toString()}`),
       api(`${organizationBase}/accounts`).catch(() => ({ logins: [] })),
     ]);
-  } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
+  } catch {
+    if (renderIsCurrent())
+      el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>';
+    return;
+  }
+  // Initial page hydration and a post-connect/register hydration can overlap.
+  // Only the newest response may paint this element, otherwise the older empty
+  // snapshot erases the newly-added login/key until a full page reload.
+  if (!renderIsCurrent()) return;
   // Effective policy for this scope. Normally the server computes it (global→project→
   // task overlay). In `local` mode — the NEW-task form, which has no taskId yet — we
   // resolve a client-side draft policy over the inherited project/global base and apply
@@ -6271,19 +6410,24 @@ function summarize(p) {
 // the merge stage, so the view reflects reorders immediately (the per-task polled
 // position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
 async function seedQueue() {
+  const projectId = S.projectId;
+  const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
   const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
   const orders = {};
   await Promise.all(
     domains.map(async (d) => {
       try {
-        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(S.projectId)}`);
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(projectId)}`);
         orders[d] = { queue: v.queue || [], current: v.current };
       } catch {}
     }),
   );
-  try { S.agentQueue = await api('/api/agent-queue'); } catch {}
+  let agentQueue = S.agentQueue;
+  try { agentQueue = await api('/api/agent-queue'); } catch {}
+  if (S.queueLoadEpoch !== epoch || S.projectId !== projectId) return;
   S.queueOrders = orders;
+  S.agentQueue = agentQueue;
   if (S.tab === 'queue') renderMain();
 }
 
@@ -6506,7 +6650,14 @@ function wireQueueDrag(list) {
 
 // ── activity ─────────────────────────────────────────────────────────────────
 async function seedActivity() {
-  try { S.activity = (await api(`/api/activity?since=0&projectId=${encodeURIComponent(S.projectId)}`)).reverse(); renderMain(); } catch {}
+  const projectId = S.projectId;
+  const epoch = S.activityLoadEpoch = (S.activityLoadEpoch || 0) + 1;
+  try {
+    const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
+    if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
+    S.activity = activity.reverse();
+    renderMain();
+  } catch {}
 }
 function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
@@ -6549,8 +6700,10 @@ function hostDiagHtml(diag) {
 // terminates (no reschedule) once the tab changes or the element is gone.
 async function refreshHostDiag() {
   if (S.tab !== 'dashboard' || !$('#host-diag')) return;
+  const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
   try { diag = await api('/api/diagnostics'); } catch {}
+  if (S.hostDiagEpoch !== epoch) return;
   const el = $('#host-diag');
   if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
   if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
@@ -6649,8 +6802,10 @@ function wireProcPanel(el) {
 async function refreshProcPanel(now = false) {
   if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
+  const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
   try { sample = await api('/api/processes'); } catch {}
+  if (S.procLoadEpoch !== epoch) return;
   const el = $('#proc-panel');
   if (el && S.tab === 'dashboard') {
     el.innerHTML = procPanelHtml(sample);
@@ -6662,15 +6817,23 @@ async function refreshProcPanel(now = false) {
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const organizationId = S.organizationId || 'org_personal';
     const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
+    // The dashboard is org-scoped (counts for THIS organization). Host panels
+    // (diagnostics, processes, agent-account leasing) are operator-only; a
+    // non-operator's /api/diagnostics returns null and those panels are hidden,
+    // so a regular member — e.g. a fresh personal workspace — sees a clean
+    // overview instead of a "missing capability diagnostic:read" error.
     const [d, u, credentialData, diag] = await Promise.all([
-      api('/api/dashboard'),
+      api(`/api/dashboard?organizationId=${encodeURIComponent(organizationId)}`),
       api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
       api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
       api('/api/diagnostics').catch(() => null),
     ]);
+    if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
+    const isOperator = !!diag; // /api/diagnostics needs diagnostic:read
     const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
     const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
@@ -6682,6 +6845,8 @@ async function renderDashboard() {
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
       </div>
+      ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use <b>＋ New project</b> in the sidebar to create your first one.</div>` : ''}
+      ${!isOperator ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
       <div class="section-h">Processes — everything karmax is running</div>
@@ -6717,7 +6882,7 @@ async function renderDashboard() {
               </div>
             </div>`;
           }).join('')
-        : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
+        : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`}`;
     const recheck = async (btn, body) => {
       const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
       try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
@@ -6762,10 +6927,15 @@ async function renderDashboard() {
     }));
     // Keep the host panel live without re-rendering (and disrupting focus on) the
     // accounts section; single pending timer (cleared here and inside the loop).
+    // Operator-only panels — skip the polling entirely for members who can't see them.
     clearTimeout(S.hostDiagTimer);
-    S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
-    refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
-  } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+    if (isOperator) {
+      S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
+      refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
+    }
+  } catch (e) {
+    if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
 }
 
 // Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
@@ -7933,6 +8103,9 @@ async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
   if (!accessBox || !repositoryBox) return;
+  const accessIsCurrent = beginAsyncElementRender(accessBox);
+  const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
+  const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
     const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
@@ -7940,6 +8113,7 @@ async function hydrateProjectAccess(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
     ]);
+    if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
     const userName = (id) => userRecord(id)?.name || userRecord(id)?.email?.split('@')[0] || 'Unnamed member';
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
@@ -7982,11 +8156,14 @@ async function hydrateProjectAccess(proj) {
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
-  } catch (error) { accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
+  } catch (error) {
+    if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+  }
 }
 async function hydrateWorkflowPins(projectId) {
   const box = $('#wf-pins-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let list = [];
   let pins = {};
   const organizationId = projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
@@ -7994,7 +8171,11 @@ async function hydrateWorkflowPins(projectId) {
     api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`),
     api(`/api/projects/${projectId}/workflow-pins`),
   ]); }
-  catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>'; return; }
+  catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
     const opts = [`<option value="latest" ${pinned === 'latest' ? 'selected' : ''}>latest (v${esc(w.latest)})</option>`]
@@ -8087,12 +8268,14 @@ function wireSettingsView(proj) {
 }
 async function hydrateExecutionProviders(proj) {
   const box = $('#project-execution'); if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [policy, connections, pools] = await Promise.all([
       api(`/api/projects/${encodeURIComponent(proj.id)}/execution-policy`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
     ]);
+    if (!renderIsCurrent()) return;
     S.worldProviderConnections = connections;
     // The Agent environment (worktree / container / E2B / Daytona) now lives in
     // Task defaults — and can be overridden per task. Compute keeps the runner
@@ -8131,7 +8314,9 @@ async function hydrateExecutionProviders(proj) {
         await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
+  } catch (error) {
+    if (renderIsCurrent()) toast(`Could not load compute providers: ${error.message}`, true);
+  }
 }
 
 // ── organization defaults (legacy APIs still call this global scope) ─────────
@@ -8441,9 +8626,12 @@ function renderPhoneAccess(status) {
 async function hydratePhoneAccess() {
   const box = $('#phone-access-status');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
-    renderPhoneAccess(await api('/api/remote-access'));
+    const status = await api('/api/remote-access');
+    if (renderIsCurrent()) renderPhoneAccess(status);
   } catch (error) {
+    if (!renderIsCurrent()) return;
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
         <span>Access your Karmax at</span>
@@ -8464,9 +8652,14 @@ async function hydratePhoneAccess() {
 async function hydrateGitProfiles(organizationId = S.organizationId) {
   const box = $('#git-profiles-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let data = { profiles: [], defaultProfile: null };
   const base = `/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`;
-  try { data = await api(base); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  try { data = await api(base); } catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
     box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
       organizationId === 'org_personal'
@@ -8497,8 +8690,13 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
 async function hydrateWorkflows(organizationId = S.organizationId) {
   const box = $('#workflows-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let list = [];
-  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
+  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
   box.innerHTML = list.map((w) => `<div class="queue-item">
       <div style="flex:1"><b>${esc(w.name)}</b>
@@ -8515,25 +8713,27 @@ function paymentsCard(scope) {
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
       <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
       <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
+      <div class="pay-stripe-platform" style="margin-bottom:10px"></div>
       <div class="pay-providers-list">Loading…</div>
       <div class="pay-balance" style="margin-top:8px"></div>
     </div>
-    <details class="pay-cardholder" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Create Stripe Issuing cardholder</summary>
-      <div class="form-row" style="margin-top:8px"><div style="display:flex;gap:8px;flex-wrap:wrap">
-        <select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select>
-        <input class="holder-name" placeholder="full or company name" />
-        <input class="holder-first" placeholder="first name (individual)" />
-        <input class="holder-last" placeholder="last name (individual)" />
-        <input class="holder-dob" type="date" title="date of birth (individual)" />
-        <input class="holder-email" type="email" placeholder="email" />
-        <input class="holder-phone" placeholder="phone" />
-        <input class="holder-line1" placeholder="address line 1" />
-        <input class="holder-city" placeholder="city" />
-        <input class="holder-state" placeholder="state/region" />
-        <input class="holder-postal" placeholder="postal code" />
-        <input class="holder-country" placeholder="country (US)" style="width:100px" />
-        <button class="btn sm" data-addholder>Create cardholder</button>
-      </div></div>
+    <details class="pay-cardholder hidden" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Stripe cardholder — required before issuing a card</summary>
+      <p class="task-sub">This is Stripe’s compliance record for the real person or company legally authorized to use the card. It is not a Karmax user, a label, or a funding source. Use accurate identity and billing details; Stripe may require verification.</p>
+      <div class="settings-grid">
+        <label class="form-row">Cardholder type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
+        <label class="form-row">Name shown in Stripe<input class="holder-name" placeholder="Full legal or company name" /></label>
+        <label class="form-row">First name (individual)<input class="holder-first" /></label>
+        <label class="form-row">Last name (individual)<input class="holder-last" /></label>
+        <label class="form-row">Date of birth (individual)<input class="holder-dob" type="date" /></label>
+        <label class="form-row">Email<input class="holder-email" type="email" /></label>
+        <label class="form-row">Phone<input class="holder-phone" /></label>
+        <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
+        <label class="form-row">City<input class="holder-city" /></label>
+        <label class="form-row">State or region<input class="holder-state" /></label>
+        <label class="form-row">Postal code<input class="holder-postal" /></label>
+        <label class="form-row">Country code<input class="holder-country" placeholder="US" maxlength="2" /></label>
+      </div>
+      <button class="btn sm" data-addholder>Create required Stripe record</button>
     </details>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
@@ -8546,7 +8746,7 @@ function paymentsCard(scope) {
         <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
         <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
         <select class="card-provider"><option value="mock">Local test funds</option></select>
-        <select class="card-cardholder hidden"><option value="">Choose Stripe cardholder</option></select>
+        <select class="card-cardholder hidden"><option value="">Choose required Stripe cardholder</option></select>
         <button class="btn" data-addcard="${scope}">Add card</button>
       </div></div>
     ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
@@ -8558,10 +8758,48 @@ async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
+  let platform;
   const paymentsBase = organizationId
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
   try { data = await api(`${paymentsBase}/providers`); } catch {}
+  if (organizationId) {
+    try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
+  }
+  const platformBox = box.querySelector('.pay-stripe-platform');
+  if (platformBox && platform) {
+    const status = platform.configured
+      ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
+      : '<span class="chip">setup required</span>';
+    const webhook = platform.webhookConfigured
+      ? '<span class="chip" style="color:var(--ok,#4ec9a3)">webhook ready</span>'
+      : '<span class="chip">webhook secret missing</span>';
+    platformBox.innerHTML = `<details ${platform.configured && platform.webhookConfigured ? '' : 'open'}>
+      <summary style="cursor:pointer;font-weight:600">Stripe platform setup ${status} ${webhook}</summary>
+      <p class="task-sub">One Stripe Connect application identifies this Karmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
+      <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
+      <div class="settings-grid">
+        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
+        <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
+      </div>
+      ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
+      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in Karmax’s encrypted vault and makes them take precedence.</p>' : ''}
+    </details>`;
+    platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
+      try {
+        await api(`${paymentsBase}/stripe/platform`, { method: 'PUT', body: JSON.stringify({
+          clientId: platformBox.querySelector('.stripe-platform-client').value,
+          secretKey: platformBox.querySelector('.stripe-platform-secret').value || undefined,
+          webhookSecret: platformBox.querySelector('.stripe-platform-webhook-secret').value || undefined,
+        }) });
+        toast('Stripe platform setup saved securely');
+        await wirePaymentProviders(box, organizationId);
+      } catch (e) { toast(e.message, true); }
+    });
+  }
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
         <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
@@ -8612,6 +8850,8 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   const providerSelect = box.querySelector('.card-provider');
   const holderSelect = box.querySelector('.card-cardholder');
   const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
+  const stripeConnected = usableProviders.some((p) => p.name === 'stripe');
+  box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
   providerSelect.innerHTML = usableProviders.map((p) =>
     `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
   const loadCardholders = async () => {
@@ -8620,8 +8860,11 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (!stripe) return;
     try {
       const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose Stripe cardholder</option>${holders
-        .filter((h) => h.status === 'active').map((h) => `<option value="${esc(h.id)}">${esc(h.name)} · ${esc(h.type)}</option>`).join('')}`;
+      holderSelect.innerHTML = `<option value="">Choose required Stripe cardholder</option>${holders.map((h) => {
+        const requirements = h.requirements?.past_due || [];
+        const ready = h.status === 'active' && requirements.length === 0;
+        return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
+      }).join('')}`;
     } catch (e) {
       holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
     }
@@ -9132,6 +9375,82 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
+// ── installation-wide OUTBOUND email (operator-only; server enforces settings:write)
+function outboundEmailCard() {
+  return `<div class="card" id="outbound-email-card">
+    <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let karmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
+    <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
+    <div class="form-row"><label>Provider</label><select id="oe-provider">
+      <option value="resend">Resend — one API key (simplest)</option>
+      <option value="smtp">SMTP server — any provider or relay</option>
+    </select></div>
+    <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
+    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="karmax &lt;noreply@yourdomain.com&gt;"></div>
+    <div id="oe-smtp" style="display:none">
+      <div class="form-row"><label>SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
+      <div class="inline-form" style="align-items:center">
+        <input id="oe-port" placeholder="port (587, or 465 for TLS)" style="max-width:220px">
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)"><input type="checkbox" id="oe-secure"> Implicit TLS (port 465)</label>
+      </div>
+      <div class="form-row"><label>Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
+    </div>
+    <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
+    <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
+    <div id="oe-result" class="task-sub" style="margin-top:6px"></div>
+  </div>`;
+}
+async function wireOutboundEmailCard() {
+  const card = $('#outbound-email-card');
+  if (!card) return;
+  let data;
+  try { data = await api('/api/email'); }
+  catch { card.style.display = 'none'; return; } // no settings:write → hide entirely
+  const providerSel = $('#oe-provider');
+  const helpEl = $('#oe-help');
+  const applyProvider = () => {
+    const name = providerSel.value;
+    const info = (data.providers || []).find((p) => p.name === name);
+    $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
+    $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
+    $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
+    const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+    helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
+  };
+  if (data.provider) providerSel.value = data.provider;
+  if (data.from) $('#oe-from').value = data.from;
+  $('#oe-status').innerHTML = data.configured
+    ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
+    : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
+  applyProvider();
+  providerSel.addEventListener('change', applyProvider);
+  $('#oe-connect').addEventListener('click', async () => {
+    const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
+    if (providerSel.value === 'smtp') {
+      body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
+      body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
+    }
+    const btn = $('#oe-connect'); btn.disabled = true;
+    try {
+      const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
+      $('#oe-secret').value = '';
+      $('#oe-result').style.color = 'var(--ink-2)';
+      $('#oe-result').textContent = result.detail || 'Connected';
+      toast('Outbound email connected');
+      await wireOutboundEmailCard();
+    } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
+    finally { btn.disabled = false; }
+  });
+  $('#oe-test').addEventListener('click', async () => {
+    const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+    if (!to) return;
+    const btn = $('#oe-test'); btn.disabled = true;
+    try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
+    catch (e) { toast(e.message, true); }
+    finally { btn.disabled = false; }
+  });
+}
+
 function profileRow(p, scope) {
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
@@ -9162,11 +9481,13 @@ function profileRow(p, scope) {
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
-  let profiles = [];
-  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
-  profiles = profiles.filter((p) => p.role !== 'confirm');
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
+  const renderIsCurrent = beginAsyncElementRender(list);
+  let profiles = [];
+  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  if (!renderIsCurrent()) return;
+  profiles = profiles.filter((p) => p.role !== 'confirm');
   const doP = profiles.find((p) => p.role === 'do');
   const mergeP = profiles.find((p) => p.role === 'merge');
   const rest = profiles.filter((p) => p !== doP && p !== mergeP);
@@ -9234,6 +9555,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
   if (!field) { box.innerHTML = ''; return; }
   let own = {};
@@ -9244,6 +9566,7 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     own = d[scope].own;
     inherited = d[scope].inherited;
   } catch {}
+  if (!renderIsCurrent()) return;
   box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
     <button class="btn primary sm" data-save-review-route>Save review route</button>`;
   wireAgentFields(box);
@@ -9343,9 +9666,11 @@ function wireCapabilityChecklist(row) {
 async function hydrateAuthorization(scope, projectId) {
   const box = $(`#authorization-${scope}`);
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
     const data = await api(`/api/authorization/profiles${suffix}`);
+    if (!renderIsCurrent()) return;
     const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
     box.innerHTML = `<p class="task-sub">These profiles limit what task agents may do. Human membership and project access are managed in People and each project's Access section.</p>
       <div class="form-row"><label>Default for new task agents</label><select class="authz-default">${options}</select></div>
@@ -9380,7 +9705,9 @@ async function hydrateAuthorization(scope, projectId) {
         hydrateAuthorization(scope, projectId);
       } catch (e) { toast(e.message, true); }
     }));
-  } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
+  } catch (e) {
+    if (renderIsCurrent()) box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`;
+  }
 }
 
 function wireGlobalSettings(organizationId) {
@@ -9397,6 +9724,7 @@ function wireGlobalSettings(organizationId) {
   wireVaultCards(organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
+  wireOutboundEmailCard();
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
     const userName = $('#gitp-username').value.trim();
@@ -9579,10 +9907,19 @@ function profileView() {
   const name = userDisplayName();
   const email = u?.email || '';
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
-  const orgCount = (S.organizations || []).length;
+  const orgs = S.organizations || [];
   const row = (label, value) => value
     ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
     : '';
+  // Every organization the user belongs to (owns or was added to), each linking
+  // to its dashboard. Role comes from the membership loaded alongside the org.
+  const orgList = orgs.length
+    ? orgs.map((o) => `<a class="profile-org" data-spa href="${globalRoute('dashboard', o)}">
+        <span class="profile-org-mark">◇</span>
+        <span class="profile-org-name">${esc(o.name)}</span>
+        ${o.kind === 'personal' ? '<span class="chip">personal</span>' : ''}
+      </a>`).join('')
+    : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
     <div class="card profile-card">
@@ -9597,8 +9934,12 @@ function profileView() {
         ${row('Name', u?.name || '')}
         ${row('Email', email)}
         ${row('Account', u?.id || '')}
-        ${row('Organizations', orgCount ? String(orgCount) : '')}
       </div>
+    </div>
+    <div class="card">
+      <div class="section-h">Organizations</div>
+      <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
+      <div class="profile-orgs">${orgList}</div>
     </div>
     <div class="card">
       <div class="section-h">Appearance</div>
@@ -9717,6 +10058,7 @@ function organizationView() {
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div><div id="org-authorization-slot"></div></div>
+    ${outboundEmailCard()}
 
     <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>The GitHub connection and commit identities your projects share</small></div></div>
     <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
@@ -9734,6 +10076,11 @@ function organizationView() {
 
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
+  const organizationId = S.organizationId;
+  const epoch = S.organizationViewEpoch = (S.organizationViewEpoch || 0) + 1;
+  const renderIsCurrent = () => S.organizationViewEpoch === epoch
+    && S.organizationId === organizationId
+    && !!$('#org-members');
   const gitAccounts = $('#git-accounts-card');
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
@@ -9742,6 +10089,7 @@ async function hydrateOrganizationView() {
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
+  if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
@@ -9752,16 +10100,17 @@ async function hydrateOrganizationView() {
     return `<div class="member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; permissions still come from the selected profile">protected owner</span>' : ''}<select class="q-sel org-member-profile">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
   const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
-    api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/world-providers`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
-    api(`/api/organizations/${S.organizationId}/usage`).catch(() => null),
-    api(`/api/organizations/${S.organizationId}/identity-policy`).catch(() => null),
-    api(`/api/organizations/${S.organizationId}/invitations`).catch(() => []),
-    Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+    api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
+    api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
+    api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
+    api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
+    api(`/api/organizations/${organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
+    api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
+    Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
+  if (!renderIsCurrent()) return;
   if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.profileId || 'developer')}</span></div>`).join('')}`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
@@ -9817,7 +10166,7 @@ async function hydrateOrganizationView() {
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
     <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
     <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-  $('#invite-member')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email: $('#invite-email').value, profileId: $('#invite-profile').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#invite-member')?.addEventListener('click', async () => { try { const email = $('#invite-email').value; const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, profileId: $('#invite-profile').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#setup-github-app')?.addEventListener('click', async () => {
     try {
@@ -10540,11 +10889,14 @@ function openHelp() {
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:18px"><span class="mark">◇</span> karmax</div>
+    ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
+    ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a karmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
+    <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
@@ -10563,13 +10915,80 @@ function renderLogin() {
     } catch (error) { $('#login-err').textContent = error.message; }
   });
   $('#signup-open').addEventListener('click', renderSignup);
+  $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+// Request a password-reset email. Better Auth mails a link back to /reset-password
+// (renderResetPassword); the response is intentionally uniform so we never reveal
+// whether an address has an account.
+function renderForgotPassword() {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Reset password</div>
+    <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
+    <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
+    <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
+    <button class="btn" id="forgot-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <div id="forgot-msg" style="font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  const go = async () => {
+    const email = $('#forgot-email').value.trim();
+    if (!email) return;
+    $('#forgot-btn').disabled = true;
+    try {
+      await fetch('/api/auth/request-password-reset', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, redirectTo: `${location.origin}/reset-password` }) });
+    } catch {}
+    $('#forgot-msg').style.color = 'var(--ink-2)';
+    $('#forgot-msg').textContent = 'If an account exists for that address, a reset link is on its way. Check your email.';
+    $('#forgot-btn').disabled = false;
+  };
+  $('#forgot-btn').addEventListener('click', go);
+  $('#forgot-back').addEventListener('click', renderLogin);
+  $('#forgot-email').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+// Landing page for the emailed reset link (/reset-password?token=…). Sets a new
+// password via Better Auth, then returns to sign in.
+function renderResetPassword(token) {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Choose a new password</div>
+    ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
+    <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
+      : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
+    <button class="btn" id="reset-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <div id="reset-msg" style="font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  const go = async () => {
+    const newPassword = $('#reset-pw').value;
+    if (!newPassword || newPassword.length < 10) { $('#reset-msg').style.color = 'var(--danger)'; $('#reset-msg').textContent = 'Password must be at least 10 characters.'; return; }
+    $('#reset-btn').disabled = true;
+    try {
+      const res = await fetch('/api/auth/reset-password', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ newPassword, token }) });
+      if (res.ok) {
+        $('#reset-msg').style.color = 'var(--ink-2)';
+        $('#reset-msg').textContent = 'Password updated. Redirecting to sign in…';
+        setTimeout(() => { history.replaceState({ kx: 1 }, '', '/'); renderLogin(); }, 1200);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        $('#reset-msg').style.color = 'var(--danger)';
+        $('#reset-msg').textContent = err.message || err.error || 'Could not reset password. The link may have expired.';
+        $('#reset-btn').disabled = false;
+      }
+    } catch { $('#reset-msg').style.color = 'var(--danger)'; $('#reset-msg').textContent = 'Could not reset password.'; $('#reset-btn').disabled = false; }
+  };
+  $('#reset-btn')?.addEventListener('click', go);
+  $('#reset-back').addEventListener('click', () => { history.replaceState({ kx: 1 }, '', '/'); renderLogin(); });
+  $('#reset-pw')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
 function renderSignup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Create account</div>
-    <p class="task-sub">Your account starts with no project access. An administrator can grant the right profile after you join.</p>
+    ${S.pendingInvite
+      ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
+      : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
     <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
@@ -10581,8 +11000,18 @@ function renderSignup() {
     const res = await fetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
       name: $('#signup-name').value, email: $('#signup-email').value, password: $('#signup-pw').value,
     }) });
-    if (res.ok) boot();
-    else $('#signup-err').textContent = (await res.json().catch(() => ({}))).error || 'Could not create account';
+    if (res.ok) return boot();
+    const body = await res.json().catch(() => ({}));
+    // Surface the real reason (Better Auth returns `.message`, e.g. "User already
+    // exists") rather than a blanket "Could not create account".
+    const reason = body.error || body.message || 'Could not create account';
+    const el = $('#signup-err');
+    if (/already exists/i.test(reason)) {
+      el.innerHTML = `An account with that email already exists. <a href="#" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
+      $('#signup-to-login')?.addEventListener('click', (e) => { e.preventDefault(); renderLogin(); });
+    } else {
+      el.textContent = reason;
+    }
   };
   $('#signup-btn').addEventListener('click', go);
   $('#signup-back').addEventListener('click', renderLogin);

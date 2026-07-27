@@ -90,6 +90,11 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/organizations/:organizationId/agent-mail/connect (connect this organization mailbox; body {provider, domain?|apiKey?})',
     'POST /api/agent-mail/ingest?secret= (inbound mail webhook; minted-secret URL shown to the operator; accepts karmax/Postmark/CloudMailin/Mailgun/SendGrid payloads and raw MIME, routed to the recipient organization)',
   ],
+  outboundEmail: [
+    'GET /api/email (installation-wide outbound sender: active provider, from, configured, provider catalogue)',
+    'POST /api/email/connect (connect the sender; body {provider: smtp|resend, from, secret, host?, port?, secure?, user?})',
+    'POST /api/email/test (send a test email; body {to?})',
+  ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',
     'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',
