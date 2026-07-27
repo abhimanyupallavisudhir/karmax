@@ -64,6 +64,7 @@ export interface GatewayDeps {
   staticDir: string;
   agentInfo: { provider: Provider; reason: string };
   broker?: import('../autonomy/broker.js').CredentialBroker;
+  email?: import('../autonomy/email.js').EmailService;
   payments?: import('../autonomy/payments.js').PaymentProvider;
   paymentRegistry?: import('../autonomy/payments.js').PaymentRegistry;
   login?: import('../autonomy/login.js').LoginManager;
@@ -98,7 +99,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/resource-drivers') return 'workflow:read';
   if (p.startsWith('/api/resource-uploads/')) return 'project:settings:write';
   if (p === '/api/logout') return 'none';
-  if (p === '/api/dashboard') return 'diagnostic:read';
+  // The dashboard is the current organization's overview (scoped in the handler);
+  // any member with organization:read may see it. Host/diagnostic panels are
+  // fetched separately and gated by diagnostic:read on their own routes.
+  if (p === '/api/dashboard') return 'organization:read';
   if (p === '/api/remote-access') return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
   if (p === '/api/metrics') return 'diagnostic:read';
@@ -156,6 +160,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
+  // Installation-wide outbound email is operator configuration (settings:write),
+  // like the mailbox provider. The connected secret never leaves the vault.
+  if (p === '/api/email' || p.startsWith('/api/email/')) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/defaults/')) return 'task:read';
@@ -921,8 +928,9 @@ export class Gateway {
     }
     if (p === '/api/signup' && method === 'POST' && this.deps.identity) {
       // The first account must still go through /setup so it becomes the one
-      // explicit trust root. Later signups create authenticated, no-access
-      // identities that an administrator can grant into projects.
+      // explicit trust root. Later self-signups each land in their own personal
+      // workspace organization (provisioned below) — a usable app immediately,
+      // and they can still be invited into other organizations.
       if (!this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'set up the first administrator before signing up' });
       const b = await this.body(req);
       try {
@@ -930,6 +938,19 @@ export class Gateway {
           { name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') },
           requestHeaders(req.headers),
         );
+        if (!response.ok) {
+          // Better Auth reports the real reason as `.message` (e.g. "User already
+          // exists"). Surface it verbatim instead of the client's generic
+          // fallback, so a duplicate email or weak password reads clearly.
+          const detail = (await response.clone().json().catch(() => ({}))) as any;
+          return this.json(res, response.status === 422 ? 409 : (response.status || 400),
+            { error: detail?.message ?? 'could not create account' });
+        }
+        // A fresh identity gets its own personal-workspace organization so it
+        // lands in a usable app immediately — no "no access yet" waiting room.
+        const created = (await response.clone().json().catch(() => ({}))) as any;
+        const userId = created?.user?.id ? String(created.user.id) : undefined;
+        if (userId) this.provisionPersonalWorkspace(userId, String(created?.user?.name ?? b.name ?? ''));
         return this.sendWebResponse(res, response);
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     }
@@ -1013,8 +1034,13 @@ export class Gateway {
       // enter it when at least one project grant permits discovery; the response
       // below is filtered project-by-project. No other unscoped route gets this
       // exception.
-      const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId &&
-        this.deps.store.listProjects().some((project) => allows(this.deps.authorization?.capabilities(`user:${session.userId}`, project.id) ?? [], required));
+      const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId && (
+        // A member of any organization may enter (even before any project exists)
+        // — the response is filtered project-by-project, so an empty org just
+        // yields an empty list and the app lands on that org's dashboard rather
+        // than the "no access" waiting room.
+        this.deps.store.listOrganizations(session.userId).length > 0 ||
+        this.deps.store.listProjects().some((project) => allows(this.deps.authorization?.capabilities(`user:${session.userId}`, project.id) ?? [], required)));
       const organizationCollectionAllowed = !checked.ok && p === '/api/organizations' && !!session.userId && (
         method === 'POST' || this.deps.store.listOrganizations(session.userId).some((organization) =>
           allows(this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id) ?? [], required))
@@ -1072,12 +1098,17 @@ export class Gateway {
       if (p === '/api/invitations/accept' && method === 'POST') {
         if (!session.userId || !session.email) return this.json(res, 400, { error: 'a verified account is required' });
         const b = await this.body(req);
-        const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
-        this.deps.authorization?.grant(`user:${session.userId}`, {
-          principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
-          profileId: membership.profileId ?? 'developer',
-        });
-        return this.json(res, 200, membership);
+        try {
+          const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
+          this.deps.authorization?.grant(`user:${session.userId}`, {
+            principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
+            profileId: membership.profileId ?? 'developer',
+          });
+          return this.json(res, 200, membership);
+        } catch (e) {
+          // Expired / already-used / wrong-email are user-facing, not 500s.
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
@@ -1192,8 +1223,29 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listOrganizationInvitations(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` }));
+          const result = store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
+            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` });
+          // Auto-deliver the invite when outbound email is configured; the copyable
+          // link is still returned as a fallback (and for email-less installs).
+          let emailed = false;
+          if (this.deps.email?.configured() && result.invitation.email) {
+            const link = `${this.publicUrl(req)}/invite?token=${encodeURIComponent(result.token)}`;
+            const organization = store.getOrganization(organizationId);
+            const orgName = organization?.name ?? 'a karmax organization';
+            const { emailHtml } = await import('../auth/identity.js');
+            try {
+              await this.deps.email.send({
+                to: result.invitation.email,
+                subject: `You've been invited to ${orgName} on karmax`,
+                text: `You've been invited to join ${orgName} on karmax.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
+                html: emailHtml(`You've been invited to ${orgName}`,
+                  `You've been invited to join ${orgName} on karmax. Accept the invitation to get started.`,
+                  'Accept invitation', link, `This is a one-time link. If you weren't expecting this, you can ignore it.`),
+              });
+              emailed = true;
+            } catch (e) { console.error('[invite] email send failed:', e instanceof Error ? e.message : e); }
+          }
+          return this.json(res, 200, { ...result, emailed });
         }
       }
       const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
@@ -3515,6 +3567,50 @@ export class Gateway {
         }
       }
 
+      // ── outbound email (installation-wide) — the operator connects ONE sender
+      // (settings:write) and every organization's user mail (confirmation, reset,
+      // invites) flows through it. The secret lives in the vault, never echoed.
+      if (p === '/api/email' && method === 'GET') {
+        const { describeOutboundProviders } = await import('../autonomy/email.js');
+        const config = this.outboundEmailConfig();
+        return this.json(res, 200, {
+          provider: config.provider, from: config.from,
+          configured: this.deps.email?.configured() ?? false,
+          providers: describeOutboundProviders(config),
+        });
+      }
+      if (p === '/api/email/connect' && method === 'POST') {
+        const { connectOutboundEmail } = await import('../autonomy/email.js');
+        const b = await this.body(req);
+        const result = connectOutboundEmail({
+          provider: b.provider ? String(b.provider) : undefined,
+          from: b.from ? String(b.from) : undefined,
+          host: b.host ? String(b.host) : undefined,
+          port: b.port ? Number(b.port) : undefined,
+          secure: b.secure === undefined ? undefined : b.secure !== false,
+          user: b.user ? String(b.user) : undefined,
+          secret: b.secret ? String(b.secret) : undefined,
+        });
+        if (result.status === 'connected' && result.config) {
+          const handle = 'email:outbound:auth';
+          if (b.secret && this.deps.broker) this.deps.broker.registerHandle(handle, String(b.secret));
+          // REPLACE, not merge, so switching providers can't leave a stale field.
+          this.setOutboundEmailConfig({ ...result.config, secretHandle: handle });
+        }
+        return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
+      }
+      if (p === '/api/email/test' && method === 'POST') {
+        if (!this.deps.email?.configured()) return this.json(res, 400, { error: 'connect an email provider first' });
+        const b = await this.body(req);
+        const to = String(b.to ?? session.email ?? '').trim();
+        if (!to) return this.json(res, 400, { error: 'no recipient — pass { to } or sign in with an email' });
+        try {
+          await this.deps.email.send({ to, subject: 'karmax test email',
+            text: 'This is a test email from karmax. Outbound email is working.' });
+          return this.json(res, 200, { ok: true, to });
+        } catch (e) { return this.json(res, 502, { error: e instanceof Error ? e.message : String(e) }); }
+      }
+
       // cards (payment resources; SPEC §7.6) — organization-scoped so a tenant
       // never spends from another's card. A project card narrows within its org.
       if (p === '/api/cards' && method === 'GET') {
@@ -4040,7 +4136,14 @@ export class Gateway {
 
       // dashboard
       if (p === '/api/dashboard' && method === 'GET') {
-        return this.json(res, 200, await this.dashboard());
+        const dashOrg = requestedScope.organizationId ?? authRecord?.organizationId;
+        // Host-wide agent-account leasing is operator data; include it only for a
+        // caller who holds diagnostic:read (global operator), never for an ordinary
+        // organization member viewing their own overview.
+        const caps = authRecord?.caps ?? (session.userId
+          ? this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, dashOrg) ?? []
+          : []);
+        return this.json(res, 200, await this.dashboard(dashOrg, allows(caps, 'diagnostic:read')));
       }
 
       // safe mode toggle
@@ -4306,14 +4409,19 @@ export class Gateway {
     return out;
   }
 
-  private async dashboard() {
+  private async dashboard(organizationId?: string, includeHost = true) {
     let accounts: unknown = { accounts: [], waiting: 0 };
-    try {
-      accounts = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000);
-    } catch {
-      /* coordinator not running or wedged — show empty rather than hang */
+    if (includeHost) {
+      try {
+        accounts = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000);
+      } catch {
+        /* coordinator not running or wedged — show empty rather than hang */
+      }
     }
-    const projects = this.deps.store.listProjects();
+    // Scope to the caller's organization so a member sees their own overview, not
+    // a host-wide count across every tenant.
+    const projects = this.deps.store.listProjects()
+      .filter((pr) => !organizationId || (pr.organizationId ?? 'org_personal') === organizationId);
     const allTasks = projects.flatMap((pr) => this.deps.store.listTasks(pr.id));
     const byStage: Record<string, number> = {};
     for (const t of allTasks) {
@@ -4778,6 +4886,28 @@ export class Gateway {
     return this.auth(req, projectId);
   }
   /** Organization-scoped mailbox provider config (agent-mail §8). */
+  /** Give a freshly self-registered user their own personal-workspace org (owner
+   *  grant), so signup lands in a real workspace instead of the access-pending
+   *  waiting room. Best-effort: a failure here never fails the signup itself. */
+  private provisionPersonalWorkspace(userId: string, name: string): void {
+    try {
+      if (this.deps.store.listOrganizations(userId).length) return; // already has one
+      const label = (name || '').trim();
+      const organization = this.deps.store.createOrganization({
+        name: label ? `${label}'s workspace` : 'Personal workspace', kind: 'personal', ownerUserId: userId });
+      this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
+    } catch (e) {
+      console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);
+    }
+  }
+
+  /** Installation-wide outbound email config (single row; operator-managed). */
+  private outboundEmailConfig(): import('../autonomy/email.js').OutboundEmailConfig {
+    try { return JSON.parse(this.deps.store.kvGet('email:outbound') ?? '{}'); } catch { return {}; }
+  }
+  private setOutboundEmailConfig(config: import('../autonomy/email.js').OutboundEmailConfig): void {
+    this.deps.store.kvSet('email:outbound', JSON.stringify(config));
+  }
   private mailboxConfig(organizationId: string): import('../autonomy/mailbox.js').MailboxConfig {
     try {
       return JSON.parse(this.deps.store.kvGet(`agent-mail:provider:${organizationId}`) ?? '{}');

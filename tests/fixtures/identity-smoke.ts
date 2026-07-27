@@ -59,9 +59,21 @@ const signupResponse = await json('/api/signup', {
 });
 const signupCookie = signupResponse.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
 if (!signupResponse.ok || !signupCookie) throw new Error(`self signup failed: ${await signupResponse.text()}`);
-// Signup proves identity only. It must not confer global or project access.
+// Self-signup now lands the user in their own personal-workspace organization —
+// no "no access yet" waiting room. Projects is reachable (empty until they make
+// one) and the user owns exactly one personal org.
 const signupProjects = await json('/api/projects', { headers: { cookie: signupCookie } });
-const signupNoAccess = signupProjects.status === 403;
+const signupProjectsList = signupProjects.ok ? (await signupProjects.json()) as any[] : null;
+const signupEntersApp = signupProjects.status === 200 && Array.isArray(signupProjectsList) && signupProjectsList.length === 0;
+const signupOrgs = await (await json('/api/organizations', { headers: { cookie: signupCookie } })).json() as any[];
+const signupHasPersonalWorkspace = signupOrgs.length === 1 && signupOrgs[0].kind === 'personal';
+// The org dashboard must be viewable by its own (non-operator) owner: it needs
+// only organization:read, and host/diagnostic data is gated separately. This is
+// the "missing capability diagnostic:read" landing bug.
+const signupDashboard = signupOrgs[0]
+  ? await json(`/api/dashboard?organizationId=${encodeURIComponent(signupOrgs[0].id)}`, { headers: { cookie: signupCookie } })
+  : { status: 0 };
+const signupDashboardOk = signupDashboard.status === 200;
 const upload = await fetch(`${base}/api/attachments?projectId=${encodeURIComponent(project.id)}`, {
   method: 'POST', headers: { ...rootHeaders, 'content-type': 'image/png' },
   body: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -95,7 +107,9 @@ process.stdout.write(JSON.stringify({
   setupRequired: setupBefore.setupRequired,
   visibleProjects: visibleProjects.map((p) => p.name),
   usersDenied,
-  signupNoAccess,
-  signupAccountVisible: rootUsers.some((u) => u.email === 'waiting@example.com' && (u.grants ?? []).length === 0),
+  signupEntersApp,
+  signupHasPersonalWorkspace,
+  signupDashboardOk,
+  signupAccountVisible: rootUsers.some((u) => u.email === 'waiting@example.com'),
   loggedOut: !loggedOut.authenticated,
 }));
