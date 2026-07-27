@@ -2427,7 +2427,7 @@ export class Store {
     return r ? rowToTag(r) : undefined;
   }
 
-  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
+  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Tag {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
@@ -2453,7 +2453,7 @@ export class Store {
   }
 
   /** Create-or-reuse a single tag under an explicit parent (no path parsing). */
-  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
+  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Tag {
     const name = input.name.trim();
     if (!name) throw new Error('tag name required');
     if (input.parentId) {
@@ -2489,7 +2489,7 @@ export class Store {
     return t;
   }
 
-  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null; description?: string | null }): Tag | undefined {
+  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | 'flag' | null; description?: string | null }): Tag | undefined {
     const cur = this.getTag(id);
     if (!cur) return undefined;
     const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
