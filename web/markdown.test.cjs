@@ -84,6 +84,13 @@ ok(/<a href="https:\/\/a.com"[^>]*>x<\/a>/.test(renderMarkdown('[x](https://a.co
 ok(/see <a href="http:\/\/x.com"[^>]*>http:\/\/x.com<\/a> now/.test(renderMarkdown('see http://x.com now', {})), 'bare url autolinked');
 ok(renderMarkdown('go to https://x.com.', {}).includes('>https://x.com</a>.'), 'trailing period left outside autolink');
 ok((renderMarkdown('[s](https://x.com)', {}).match(/<a /g) || []).length === 1, 'a markdown link is not autolinked again');
+// Scheme-less relative links (e.g. wiki page paths) are kept as local links: the
+// target rides along in data-md-local so an in-app resolver can route it, while
+// the href stays inert. A scheme (javascript:/data:) is still neutralised above.
+ok(/<a href="#" data-md-local="guides\/e2e-runbook">run<\/a>/.test(renderMarkdown('[run](guides/e2e-runbook)', {})), 'relative wiki link kept as a local link');
+ok(!renderMarkdown('[run](guides/e2e-runbook)', {}).includes('target="_blank"'), 'a local link does not open a new tab');
+ok(renderMarkdown('[x](data:text/html,x)', {}).includes('href="#"') && !renderMarkdown('[x](data:text/html,x)', {}).includes('data-md-local'), 'data: link neutralised, not treated as local');
+ok(renderMarkdown('[top](#section)', {}).includes('href="#section"'), 'in-page anchor link kept as-is');
 
 // Bold+italic nests correctly, and backslash escapes suppress formatting.
 ok(renderMarkdown('***wow***', {}).includes('<strong><em>wow</em></strong>'), 'triple markers are bold+italic, well nested');

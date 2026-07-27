@@ -320,13 +320,15 @@ export function readWikiPage(root: string, rel: string): WikiPage | undefined {
 /**
  * Create or overwrite a skill/memory page. Section folders are made on demand.
  * `create: true` refuses to overwrite an existing entry (the UI's new-entry
- * guard); `kind` applies only at creation — an existing page keeps its file.
+ * guard). `kind` picks SKILL.md vs MEMORY.md: an omitted `kind` keeps an
+ * existing entry's file, but passing one that differs converts the entry in
+ * place (the old SKILL.md/MEMORY.md is swapped out; attached files stay put).
  */
 export function writeWikiPage(
   root: string,
   rel: string,
   content: string,
-  kind: 'skill' | 'memory' = 'skill',
+  kind?: 'skill' | 'memory',
   opts: { create?: boolean } = {},
 ): WikiPage {
   const safe = writableWikiPath(rel);
@@ -337,7 +339,8 @@ export function writeWikiPage(
   if (opts.create && (existing || BUILTIN_WIKI_ENTRIES.some((b) => b.path === safe)))
     throw new Error(`an entry already exists at "${safe}"`);
   fs.mkdirSync(dir, { recursive: true });
-  const file = existing?.file ?? (kind === 'memory' ? 'MEMORY.md' : 'SKILL.md');
+  const file = (kind ? (kind === 'memory' ? 'MEMORY.md' : 'SKILL.md') : existing?.file) ?? 'SKILL.md';
+  if (existing && existing.file !== file) fs.rmSync(path.join(dir, existing.file));
   fs.writeFileSync(path.join(dir, file), content);
   return readWikiPage(root, safe)!;
 }
@@ -620,7 +623,9 @@ function renderEntries(entries: WikiEntry[], depth: number, opts: { fold: boolea
   for (const e of shown) {
     const tag = e.kind === 'memory' ? ' (memory)' : '';
     const labels = e.labels?.length ? ` {${e.labels.join(', ')}}` : '';
-    lines.push(`${pad}- ${e.name}${tag} [${e.path}]${labels}${e.description ? ` — ${e.description}` : ''}`);
+    // The entry is a Markdown link to its own path: agents still read the path
+    // verbatim, and the wiki UI renders it as a click-through to the page.
+    lines.push(`${pad}- [${e.name}](${e.path})${tag}${labels}${e.description ? ` — ${e.description}` : ''}`);
   }
   if (shown.length < leaves.length) {
     const parent = leaves[0]!.path.split('/').slice(0, -1).join('/');

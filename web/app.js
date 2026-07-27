@@ -464,10 +464,10 @@ function effortLevelsFor(provider, model) {
   const advertised = S.modelCatalog?.[provider]?.find((x) => x.id === model)?.effort;
   if (advertised) return advertised;
   if (provider === 'claude') {
-    if (!/opus-4-(5|6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
+    if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
-    if (/opus-4-(7|8)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
-    if (/opus-4-(6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
+    if (/opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
+    if (/opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
@@ -1542,9 +1542,16 @@ function mdInline(t) {
   x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
   // Inline links [text](url "optional title") — safe schemes only; the title is
   // dropped. Runs before autolinking so a bare URL inside a link is left alone.
+  // A scheme-less relative target (no ":" — so `javascript:`/`data:` are
+  // neutralised) is kept as a local link: its target rides along in
+  // data-md-local so an in-app resolver (e.g. the wiki view) can route it to a
+  // page, while it stays inert (href="#") everywhere else.
   x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
-    const safe = /^(https?:|mailto:|\/)/i.test(href) ? href : '#';
-    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+    if (/^(https?:|mailto:|\/)/i.test(href))
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+    if (href[0] === '#') return `<a href="${href}">${txt}</a>`;
+    if (!/:/.test(href)) return `<a href="#" data-md-local="${href}">${txt}</a>`;
+    return `<a href="#" target="_blank" rel="noopener noreferrer">${txt}</a>`;
   });
   // Autolink bare http(s) URLs not already part of a link/attribute (only when
   // preceded by start-of-string, whitespace or an opening paren). Trailing
@@ -7520,6 +7527,19 @@ function wireWikiPathEditor(el, warnEl, kindOf) {
   restyle();
 }
 
+// Local Markdown links inside rendered wiki content (data-md-local, emitted by
+// mdInline for scheme-less targets) address other wiki pages by path — route
+// them through the wiki view rather than leaving them inert.
+function wireWikiLocalLinks(root, proj) {
+  root?.querySelectorAll('a[data-md-local]').forEach((a) => a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    const path = (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+    S.wikiEditing = null;
+    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
+    wireWikiView(proj);
+  }));
+}
+
 // ── panes ────────────────────────────────────────────────────────────────────
 // Index: exactly what agents receive each turn — every unconditional entry in
 // full, then the rendered table of contents (importance order, [more…] folds).
@@ -7535,6 +7555,7 @@ function renderWikiHome(info, proj, pane, data) {
       <div class="msg-text md wiki-md">${renderMessageBody(data.tocText)}</div>
     </div>` : '');
   typesetMath(pane);
+  wireWikiLocalLinks(pane, proj);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
       const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
@@ -7564,6 +7585,7 @@ function renderWikiPage(info, proj, pane, page) {
       <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? '<span class="task-sub">Read-only branch view</span>' : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
     </div>`;
   typesetMath(pane);
+  wireWikiLocalLinks(pane, proj);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
     const q = page.builtin
       ? `Restore the built-in default for “${page.name}”? Your customized text is discarded.`
@@ -7596,16 +7618,16 @@ function renderWikiEditor(info, proj, pane, page) {
   pane.innerHTML = `
     <div class="wiki-title-row">
       <div class="wiki-path-edit" id="wiki-path" contenteditable="${page?.builtin ? 'false' : 'true'}" spellcheck="false"></div>
-      ${isNew
-        ? `<select id="wiki-kind"><option value="skill">Skill</option><option value="memory">Memory</option></select>`
-        : `<span class="chip">${page.kind}</span>${page.builtin ? '<span class="chip">built-in</span>' : ''}`}
+      ${page?.builtin
+        ? `<span class="chip">${page.kind}</span><span class="chip">built-in</span>`
+        : `<select id="wiki-kind"><option value="skill" ${(page?.kind ?? 'skill') === 'skill' ? 'selected' : ''}>Skill</option><option value="memory" ${page?.kind === 'memory' ? 'selected' : ''}>Memory</option></select>`}
     </div>
     <div class="wiki-warn" id="wiki-path-warn" hidden></div>
     <div class="card wiki-editor">
       <div class="wiki-fields" id="wiki-form">
         <label>Name<input id="wf-name" value="${esc(fields.name || '')}" placeholder="defaults to the folder name"></label>
         <label>Description<input id="wf-desc" value="${esc(fields.description || '')}" placeholder="one line for the table of contents"></label>
-        <label title="Comma-separated. Every entry is always in the table of contents; a task inlines an entry in full by tagging its label with @proj:tag:… (or @org:tag:…). Add “default” to inline it into every task.">Labels<input id="wf-labels" value="${esc(fields.labels || '')}" placeholder="e.g. default, security"></label>
+        <label title="Comma-separated. Every entry is always in the table of contents; a task inlines an entry in full by tagging its label with @proj:tag:… (or @org:tag:…). Add “default” to inline it into every task.">Labels (add “default” to include with every task)<input id="wf-labels" value="${esc(fields.labels || '')}" placeholder="e.g. default, security"></label>
         <label>Importance<input id="wf-importance" type="number" step="any" value="${esc(fields.importance ?? '')}" placeholder="0"></label>
       </div>
       <div class="wiki-body-bar">
@@ -7621,7 +7643,7 @@ function renderWikiEditor(info, proj, pane, page) {
     </div>`;
   const pathEl = $('#wiki-path');
   pathEl.textContent = page?.path ?? '';
-  const kindOf = () => (isNew ? $('#wiki-kind').value : page.kind);
+  const kindOf = () => ($('#wiki-kind')?.value ?? page.kind);
   wireWikiPathEditor(pathEl, $('#wiki-path-warn'), kindOf);
   $('#wiki-kind')?.addEventListener('change', () => pathEl.dispatchEvent(new Event('input')));
   if (isNew) pathEl.focus();

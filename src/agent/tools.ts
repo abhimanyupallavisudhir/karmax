@@ -216,7 +216,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_credential',
     description:
-      'Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: karmax resolves it and types it over CDP, verifying the page origin matches the credential\'s domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). Requires the browser to expose a DevTools endpoint (launch Chrome with --remote-debugging-port=9222).',
+      'Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: karmax resolves it and types it over CDP, verifying the page origin matches the credential\'s domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). The karmax browser MCP already runs a Chrome that exposes the DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {
@@ -232,7 +232,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'get_credential',
     description:
-      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, needs_approval/denied per the item\'s reveal policy, or not_in_vault.',
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
+import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
@@ -222,8 +223,20 @@ export const PLAYWRIGHT_VERSION = '1.61.1';
 /** Resolve a baseline spec to concrete stdio MCP server commands. */
 export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
   const out: Record<string, McpServerSpec> = {};
-  if (spec.browser === 'chrome-devtools') out['chrome-devtools'] = { command: 'npx', args: ['-y', `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`] };
-  else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
+  if (spec.browser === 'chrome-devtools') {
+    // Run chrome-devtools-mcp through karmax's launcher so it drives a Chrome
+    // that also exposes a loopback DevTools port — the same port host-side
+    // fill_credential types into (PLAN-passwords.md §5B). Bare
+    // `chrome-devtools-mcp` uses a pipe with no HTTP endpoint, so the fill
+    // could never reach the agent's browser. The launcher falls back to plain
+    // pipe mode if Chrome is unavailable, so browser tools never regress.
+    const launcher = fileURLToPath(new URL('./chrome-cdp-launcher.mjs', import.meta.url));
+    out['chrome-devtools'] = {
+      command: process.execPath,
+      args: [launcher],
+      env: { KARMAX_CDP_MCP_VERSION: CHROME_DEVTOOLS_MCP_VERSION, KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT) },
+    };
+  } else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
   if (spec.platform) out['karmax'] = spec.platform;
   return out;
 }
@@ -318,6 +331,21 @@ export function tokenToInject(home: string): string | undefined {
 }
 
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_.-]/g, '-');
+
+/** Read Claude's current native OAuth access token. This is intentionally narrower
+ * than hasClaudeNativeCredential(): a refresh-token-only home remains logged in,
+ * but cannot make a provider metadata request until Claude Code refreshes it. */
+export function claudeAccessToken(home: string): string | undefined {
+  for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
+    try {
+      const value = JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth?.accessToken;
+      if (typeof value === 'string' && value.length > 0) return value;
+    } catch {
+      /* try the other native credential location */
+    }
+  }
+  return undefined;
+}
 
 /** Claude leaves a structurally valid but empty `.credentials.json` behind after
  * logout. File existence alone therefore makes a logged-out account look connected
