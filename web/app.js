@@ -5381,6 +5381,7 @@ function conversationEntries(t) {
       type: 'activity',
       activity: { ...(prior?.activity || {}), ...activity },
       ts: prior?.ts || event.ts,
+      sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,
     });
   }
@@ -5393,9 +5394,19 @@ function conversationEntries(t) {
       .filter((entry) => entry.activity.kind === 'message')
       .map((entry) => String(entry.activity.title || '').trim()),
   );
+  // User messages carry real epoch-ms timestamps; agent/system replies are stamped
+  // by the deterministic workflow with a per-array sequence number (it has no wall
+  // clock). Carry the last real timestamp forward so a sequence-numbered reply sorts
+  // right after the message it answers, instead of being flung to the top of the
+  // timeline by its tiny `ts`.
+  let carriedTs = 0;
   const messages = (t.messages || [])
     .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
-    .map((message, index) => ({ type: 'message', message, ts: message.ts, order: index }));
+    .map((message, index) => {
+      const real = Number(message.ts) > 100000000000;
+      if (real) carriedTs = Number(message.ts);
+      return { type: 'message', message, ts: message.ts, sortTs: real ? Number(message.ts) : carriedTs, order: index };
+    });
   // Follow-ups are journaled as soon as Temporal accepts their signal, while the
   // workflow's cached transcript may not be republished until the turn ends.
   // Merge those durable events into the presentation timeline, keyed by message
@@ -5407,14 +5418,10 @@ function conversationEntries(t) {
     if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
     const message = event.payload?.message;
     if (!message?.id || storedIds.has(message.id)) continue;
-    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, order: event.seq ?? event.ts });
+    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts });
   }
   const combined = [...messages, ...posted.values(), ...activities.values()];
-  return combined.sort((a, b) => {
-    const at = Number(a.ts) > 100000000000 ? Number(a.ts) : -1000000000000 + Number(a.order || 0);
-    const bt = Number(b.ts) > 100000000000 ? Number(b.ts) : -1000000000000 + Number(b.order || 0);
-    return at - bt || Number(a.order || 0) - Number(b.order || 0);
-  });
+  return combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
 }
 
 function conversationTime(ts) {
