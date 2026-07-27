@@ -52,6 +52,8 @@ export const UPD_SET_ACCOUNT_AVAILABILITY = 'setAccountAvailabilitySync';
 export const QRY_ACCOUNTS = 'accounts';
 /** Acknowledges whether one exact lease request is still parked after enqueue. */
 export const QRY_ACCOUNT_LEASE = 'accountLease';
+/** Finds every parked credential request owned by a task for out-of-band stop/drain. */
+export const QRY_ACCOUNT_TASK_LEASES = 'accountTaskLeases';
 
 export const SIG_REQUEST_SPEND = 'requestSpend';
 export const SIG_APPROVE_SPEND = 'approveSpend';

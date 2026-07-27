@@ -5239,8 +5239,9 @@ function conversationPane(v, t) {
   const agentName = esc(t.label || t.role);
   const presence = conversationPresence(v, t);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
+  const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
-  const fu = followUp
+  const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
           <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type @ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
