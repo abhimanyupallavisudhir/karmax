@@ -95,6 +95,16 @@ describe('organization and collaboration domain', () => {
     expect(inbox).toHaveLength(1);
     expect(inbox[0]).toMatchObject({ kind: 'review-requested', actionable: true, unread: true });
     expect(store.markInbox('reviewer', inbox[0]!.id, false)?.unread).toBe(false);
+
+    store.appendEvent({ taskId: task.id, type: 'credential.approval-requested', ts: Date.now(),
+      payload: { requestId: 'vreq_1', status: 'approval-needed' } });
+    expect(store.listInbox('owner', organization.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: task.id, kind: 'approval-requested', actionable: true, unread: true }),
+    ]));
+    store.appendEvent({ taskId: task.id, type: 'credential.approval-resolved', ts: Date.now(),
+      payload: { requestId: 'vreq_1', action: 'task', resumed: true } });
+    expect(store.listInbox('owner', organization.id).find((item) => item.kind === 'approval-requested'))
+      .toMatchObject({ actionable: false, unread: false });
   });
 
   it('stores only an invitation hash and enforces email, expiry, and single use', () => {

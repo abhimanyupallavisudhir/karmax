@@ -200,7 +200,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_credential',
     description:
-      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human — stop and report, they will grant/add it and you can retry), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human will fix the item or send you the reset code.',
+      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
     parameters: {
       type: 'object',
       properties: {

@@ -403,6 +403,18 @@ Implementation notes (phases 4–5):
      is already correct regardless. `push` (create-new) and `updateSecret`
      (edit-existing) stay distinct so write-back can never clobber notes.
 
+9. **Task-native approval lifecycle** ✅ — credential access/reset requests are
+   projected onto their owning task as an **Approval Requests** tab and an
+   `approval needed` task/list label, while the Credentials settings page
+   remains the organization-wide view. Request rows use the task's stable human
+   number/title and link back to that tab. A new request emits an actionable
+   creator/owner inbox notification; resolving it clears that notification and
+   durably sends the decision back to the task so the workflow retries or
+   continues without a mechanical “tell the agent” step. Credentials created
+   by a task are covered for that task immediately, while the item's independent
+   blind-use/plaintext-reveal policy still applies (so `reveal: ask` continues
+   to require approval).
+
 Implementation notes:
 - Existing installs preserve customized profiles, while exact known historical
   built-in authorization profiles migrate to the current defaults. This gives

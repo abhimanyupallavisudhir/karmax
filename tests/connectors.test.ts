@@ -285,15 +285,20 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(result?.externalId).toBe('karmax/new');
     expect(pushed[0].secrets.password).toBe('genpw');
     expect(items.get(created.id)!.provenance.externalId).toBe('karmax/new');
+    expect(items.get(created.id)!.provenance.externalIds).toEqual({ pass: 'karmax/new' });
   });
 
-  it('automatically applies enabled connector write-back to a created item', async () => {
+  it('automatically applies enabled connector write-back and propagates later rotations', async () => {
     const { items, store, broker } = makeVault();
     const pushed: any[] = [];
+    const updated: any[] = [];
     const connector = new PassConnector(scriptedExec({}));
     (connector as any).push = async (item: any) => {
       pushed.push(item);
       return { externalId: 'karmax/automatic' };
+    };
+    (connector as any).updateSecret = async (externalId: string, field: string, value: string) => {
+      updated.push({ externalId, field, value });
     };
     const connectors = new Connectors(store, items, broker);
     connectors.register(connector);
@@ -308,5 +313,96 @@ describe('Connectors sync into the vault (§9)', () => {
     ]);
     expect(pushed).toHaveLength(1);
     expect(pushed[0].secrets.password).toBe('generated');
+    expect(items.get(created.id)!.provenance.externalIds).toEqual({ pass: 'karmax/automatic' });
+
+    items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } });
+    expect(await connectors.propagate(created.id, ['password'])).toEqual({
+      connector: 'pass',
+      fields: ['password'],
+    });
+    expect(updated).toEqual([
+      { externalId: 'karmax/automatic', field: 'password', value: 'rotated' },
+    ]);
+  });
+
+  it('keeps distinct write-back bindings when several connectors are enabled', async () => {
+    const { items, store, broker } = makeVault();
+    const updated: any[] = [];
+    const fake = (name: string, externalId: string) => ({
+      name,
+      label: name,
+      describe: async () => ({ name, label: name, available: true, canPush: true, detail: 'test' }),
+      list: async () => [],
+      pull: async () => [],
+      push: async () => ({ externalId }),
+      updateSecret: async (id: string, field: string, value: string) => {
+        updated.push({ connector: name, externalId: id, field, value });
+      },
+    });
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(fake('alpha', 'alpha/item') as any);
+    connectors.register(fake('beta', 'beta/item') as any);
+    connectors.setConfig('alpha', { writeBack: true });
+    connectors.setConfig('beta', { writeBack: true });
+    const created = items.save({
+      type: 'login', label: 'multi', secrets: { password: 'generated' },
+      provenance: { source: 'task:t1', taskId: 't1' },
+    });
+
+    expect(await connectors.writeBackCreated(created.id)).toEqual([
+      { connector: 'alpha', externalId: 'alpha/item' },
+      { connector: 'beta', externalId: 'beta/item' },
+    ]);
+    expect(items.get(created.id)!.provenance.externalIds).toEqual({
+      alpha: 'alpha/item',
+      beta: 'beta/item',
+    });
+
+    items.save({ id: created.id, type: 'login', secrets: { password: 'rotated' } });
+    expect(await connectors.propagate(created.id, ['password'])).toEqual({
+      connector: 'alpha, beta',
+      fields: ['password'],
+    });
+    expect(updated).toEqual([
+      { connector: 'alpha', externalId: 'alpha/item', field: 'password', value: 'rotated' },
+      { connector: 'beta', externalId: 'beta/item', field: 'password', value: 'rotated' },
+    ]);
+  });
+
+  it('uses a legacy unlabelled write-back id only when the target is unambiguous', async () => {
+    const { items, store, broker } = makeVault();
+    const updated: any[] = [];
+    const fake = (name: string) => ({
+      name,
+      label: name,
+      describe: async () => ({ name, label: name, available: true, canPush: true, detail: 'test' }),
+      list: async () => [],
+      pull: async () => [],
+      updateSecret: async (externalId: string, field: string, value: string) => {
+        updated.push({ connector: name, externalId, field, value });
+      },
+    });
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(fake('alpha') as any);
+    connectors.register(fake('beta') as any);
+    const created = items.save({
+      type: 'login', label: 'legacy', secrets: { password: 'rotated' },
+      provenance: { source: 'task:t1', taskId: 't1' },
+    });
+    items.setExternalId(created.id, 'legacy/item');
+    connectors.setConfig('alpha', { writeBack: true });
+
+    expect(await connectors.propagate(created.id, ['password'])).toEqual({
+      connector: 'alpha',
+      fields: ['password'],
+    });
+    expect(updated).toEqual([
+      { connector: 'alpha', externalId: 'legacy/item', field: 'password', value: 'rotated' },
+    ]);
+
+    connectors.setConfig('beta', { writeBack: true });
+    await expect(connectors.propagate(created.id, ['password'])).rejects.toThrow(
+      /legacy write-back binding is ambiguous across enabled connectors: alpha, beta/,
+    );
   });
 });

@@ -56,9 +56,11 @@ const S = {
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  taskTab: null, // open tab on the task page ('overview'|'checkin'|'parameters'|'advanced'; null → auto)
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
+  approvalRequests: [], // credential decisions for the selected task
+  approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
@@ -217,6 +219,9 @@ async function resolveProjectTaskKey(projectId, key) {
 }
 
 async function applyRoute() {
+  const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
+  const routePath = location.pathname;
+  const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(location.pathname);
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
@@ -230,9 +235,11 @@ async function applyRoute() {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
         await loadCollaboration().catch(() => {});
+        if (!routeIsCurrent()) return;
       }
     }
     await loadOrganizationRuntimeCatalog();
+    if (!routeIsCurrent()) return;
     // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
     // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
     // redirect when the canonical path actually differs, so an unresolvable slug
@@ -275,6 +282,7 @@ async function applyRoute() {
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
   await loadOrganizationRuntimeCatalog();
+  if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -287,19 +295,28 @@ async function applyRoute() {
     S.searchResult = null;
     S.cursorId = null;
     await loadTasks().catch(() => {});
+    if (!routeIsCurrent()) return;
   }
-  else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  else if (!S.tasks?.length) {
+    await loadTasks().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
   let taskId = null;
   if (r.taskKey) {
     taskId = await resolveProjectTaskKey(pid, r.taskKey);
+    if (!routeIsCurrent()) return;
     if (!taskId) toast(`Task #${r.taskKey} not found`, true);
   }
   S.tab = tab;
   if (!taskId) closeTaskDom();
-  if (tab === 'tasks' && !taskId) await runSearch().catch(() => {});
+  if (tab === 'tasks' && !taskId) {
+    await runSearch().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   renderRail();
   if (taskId) {
     if (S.selected !== taskId) return openTask(taskId, r.taskTab);
@@ -425,14 +442,17 @@ const NODES = [
 // Provider → model choices for the agent field (free-text also allowed).
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 const MODELS = {
-  claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
+  claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   mock: ['mock'],
 };
 function modelOptions(provider) {
   const live = S.modelCatalog?.[provider];
-  return live?.length ? live.map((m) => m.id) : (MODELS[provider] || MODELS.claude);
+  // Keep the provider metadata intact: Claude's stable selectable id can be an
+  // alias such as `opus[1m]`, while its description is what identifies the
+  // concrete model currently behind that alias (for example Opus 5).
+  return live?.length ? live : (MODELS[provider] || MODELS.claude);
 }
 // Which reasoning-effort levels a given model actually accepts (mirrors the
 // server's src/agent/effort.ts gating). Empty = the model has no effort control.
@@ -807,6 +827,16 @@ function collectForm(root, fields) {
 // A lightweight combobox: a real dropdown that opens on focus and on the caret,
 // filters as you type, and still accepts free text. Replaces <datalist>, whose
 // popup is unreliable (won't open on the caret, flaky while typing).
+function normalizeComboOption(option) {
+  if (typeof option === 'string') return { value: option, label: option, description: '' };
+  const value = String(option?.value ?? option?.id ?? '');
+  return {
+    value,
+    label: String(option?.label ?? option?.displayName ?? value),
+    description: String(option?.description ?? ''),
+  };
+}
+
 function wireCombo(combo, getOptions, onChange) {
   const input = combo.querySelector('input');
   const menu = combo.querySelector('.combo-menu');
@@ -825,9 +855,14 @@ function wireCombo(combo, getOptions, onChange) {
   };
   const draw = () => {
     const q = input.value.trim().toLowerCase();
-    const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
+    const opts = (getOptions() || [])
+      .map(normalizeComboOption)
+      .filter((o) => o.value && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
     menu.innerHTML = opts.length
-      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
+      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o.value)}">
+          <div class="combo-opt-head"><span>${esc(o.label)}</span>${o.label !== o.value ? `<code>${esc(o.value)}</code>` : ''}</div>
+          ${o.description ? `<div class="combo-opt-description">${esc(o.description)}</div>` : ''}
+        </div>`).join('')
       : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
     active = -1; // filtering changes the list; start with nothing highlighted
   };
@@ -1664,16 +1699,19 @@ async function loadProjects() {
 }
 
 async function loadOrganizationRuntimeCatalog() {
-  if (!S.organizationId || S.catalogOrganizationId === S.organizationId) return;
-  const query = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const organizationId = S.organizationId;
+  if (!organizationId || S.catalogOrganizationId === organizationId) return;
+  const epoch = S.catalogLoadEpoch = (S.catalogLoadEpoch || 0) + 1;
+  const query = `?organizationId=${encodeURIComponent(organizationId)}`;
   try {
     const [schema, models] = await Promise.all([
       api(`/api/schema${query}`),
       api(`/api/models${query}`),
     ]);
+    if (S.catalogLoadEpoch !== epoch || S.organizationId !== organizationId) return;
     S.schema = schema;
     S.modelCatalog = models.providers;
-    S.catalogOrganizationId = S.organizationId;
+    S.catalogOrganizationId = organizationId;
   } catch {
     // Keep the last usable built-in catalog; task creation remains server-validated.
   }
@@ -1685,15 +1723,18 @@ async function loadOrganizations() {
 }
 
 async function loadCollaboration() {
-  if (!S.organizationId) return;
-  const q = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const organizationId = S.organizationId;
+  if (!organizationId) return;
+  const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
+  const q = `?organizationId=${encodeURIComponent(organizationId)}`;
   const [members, teams, users, inbox, prefs] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/members`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/teams`).catch(() => []),
+    api(`/api/organizations/${organizationId}/members`).catch(() => []),
+    api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/inbox${q}`).catch(() => []),
     api(`/api/inbox/preferences${q}`).catch(() => null),
   ]);
+  if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
@@ -1703,16 +1744,20 @@ async function loadCollaboration() {
 }
 
 async function loadTasks() {
-  if (!S.projectId) return;
+  const projectId = S.projectId;
+  if (!projectId) return false;
+  const epoch = S.taskLoadEpoch = (S.taskLoadEpoch || 0) + 1;
   // Always fetch the full set incl. archived; the task list decides visibility via the
   // query (default -is:archived). S.tasks is the shared pool for the task page, counts, etc.
-  const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  const fetched = await api(`/api/projects/${projectId}/tasks?includeArchived=1`);
+  if (S.taskLoadEpoch !== epoch || S.projectId !== projectId) return false;
   // Drop any draft we just deleted: a list request issued before the DELETE landed
   // can still return it and clobber the optimistic removal. Once a fresh fetch no
   // longer contains a tombstoned id, the server has caught up — retire it so the
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+  return true;
 }
 
 // ── task organization: tags, saved views, query search ──────────────────────
@@ -1720,17 +1765,20 @@ async function loadTasks() {
 // tokens + free text), which the server evaluates via /search into `S.searchResult`.
 // The field registry (`S.fields`) drives the filter/sort/group menus.
 async function loadOrg() {
-  if (!S.projectId) return;
+  if (!S.projectId) return false;
   const pid = S.projectId;
+  const epoch = S.orgLoadEpoch = (S.orgLoadEpoch || 0) + 1;
   const [tags, views, fields] = await Promise.all([
     api(`/api/projects/${pid}/tags`).catch(() => []),
     api(`/api/projects/${pid}/views`).catch(() => []),
     S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields?projectId=${encodeURIComponent(pid)}`).catch(() => []),
   ]);
+  if (S.orgLoadEpoch !== epoch || S.projectId !== pid) return false;
   S.tags = tags || [];
   S.views = views || [];
   S.fields = fields || [];
   S.orgProjectId = pid;
+  return true;
 }
 
 // The map id→tag for quick lookups + hierarchy path rendering.
@@ -1749,10 +1797,13 @@ const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
 async function runSearch() {
-  if (!S.projectId) return;
+  const projectId = S.projectId;
+  if (!projectId) return false;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   try {
-    const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(q)}`);
+    const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
+    if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
     const live = new Map(S.tasks.map((t) => [t.id, t]));
     const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
@@ -1763,7 +1814,11 @@ async function runSearch() {
     }));
     if (r.groups) r.groups = overlayGroups(r.groups);
     S.searchResult = r;
-  } catch { S.searchResult = null; }
+    return true;
+  } catch {
+    if (S.searchEpoch === epoch && S.projectId === projectId) S.searchResult = null;
+    return false;
+  }
 }
 
 let searchDebounce = null;
@@ -1837,6 +1892,8 @@ const LIST_RELOAD_EVENTS = new Set([
   'task.deleted',
   'task.tags-changed',
   'task.responsibility-changed',
+  'credential.approval-requested',
+  'credential.approval-resolved',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -1898,7 +1955,8 @@ function connectWs() {
         if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
-      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
+      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
+        || ev.type === 'credential.approval-requested' || ev.type === 'credential.approval-resolved') {
         S.liveOutput = '';
         refreshTask();
       } else if (ev.type === 'session.started') {
@@ -1918,26 +1976,35 @@ function connectWs() {
     // Collaboration state changes only for collaboration events. Reloading five
     // organization endpoints for every workflow view transition multiplied the
     // websocket refresh storm without changing any of that data.
-    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
 let taskRefreshPromise = null;
+let taskRefreshQueued = false;
 async function refreshTasks() {
   // Navigation, mutations, and a structural websocket event can converge here.
   // Share one in-flight refresh so slow hosts cannot accumulate duplicate list
-  // scans behind the event loop.
-  if (taskRefreshPromise) return taskRefreshPromise;
+  // scans behind the event loop. A request arriving while that read is in flight
+  // still queues one follow-up pass: it may have been triggered by a mutation,
+  // and returning only the pre-mutation snapshot leaves the UI stale until reload.
+  if (taskRefreshPromise) {
+    taskRefreshQueued = true;
+    return taskRefreshPromise;
+  }
   taskRefreshPromise = (async () => {
-    try {
-      await loadTasks();
-      if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-      if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-      renderRail();
-      if (S.tab === 'queue' && !S.selected) seedQueue();
-    } catch {}
+    do {
+      taskRefreshQueued = false;
+      try {
+        await loadTasks();
+        if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
+        if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
+        renderRail();
+        if (S.tab === 'queue' && !S.selected) seedQueue();
+      } catch {}
+    } while (taskRefreshQueued);
   })();
   try {
     await taskRefreshPromise;
@@ -2524,7 +2591,7 @@ function runSubRow(r) {
     <div class="task-row run-row" data-id="${r.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span></div>
+        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
       <div class="task-right">${pipeline(v)}</div>
@@ -2580,6 +2647,7 @@ function taskRow(t, { showTags = true } = {}) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
+          ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
@@ -3930,6 +3998,7 @@ async function openTaskForm(workflow, draft, seedText) {
 const TASK_TABS = [
   { key: 'overview', label: 'Overview' },
   { key: 'checkin', label: 'Check-in' },
+  { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
   { key: 'advanced', label: 'Advanced' },
 ];
@@ -3939,6 +4008,7 @@ const TASK_TABS = [
 // the conversation that led here is the thing to read, so open Check-in on the
 // stage's agent. Otherwise Overview.
 function defaultTaskTab(v) {
+  if (v.approvalRequests) return 'approvals';
   return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
 }
 
@@ -4140,11 +4210,15 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.widgets = [];
   S.paramDefaults = {};
   S.attemptGroup = null;
+  S.approvalRequests = [];
+  S.approvalItems = [];
   try {
     // Start secondary resources in parallel, but let the compact task projection
     // paint as soon as it arrives. A large event history or a slow session lookup
     // must never hold the entire task page hostage.
     const draft = !!rec?.params?.draft;
+    const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+    const approvalQuery = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
     const details = Promise.all([
       // The websocket keeps this window current. Older history remains durable,
       // but opening a task should have a fixed memory and response-size budget.
@@ -4152,6 +4226,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
+      draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
+      draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId) return;
@@ -4162,7 +4238,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, approvalItems] = await details;
     if (S.selected !== taskId) return;
     // Events may have arrived over the websocket while the bounded durable window
     // was loading. Preserve those instead of replacing them with the older response.
@@ -4174,6 +4250,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    S.approvalRequests = approvalRequests;
+    S.approvalItems = approvalItems;
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
   // Param defaults only feed the Parameters tab, and resolving them costs a git
@@ -4197,12 +4275,21 @@ async function refreshTask() {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
-    const [view, widgets, sessions, attempts] = await Promise.all([
+    const epoch = S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
+    const rec = taskRecord(id);
+    const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+    const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const [view, widgets, sessions, attempts, approvalRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
+      api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
+      api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
+    // The user may have opened another task while this websocket-driven refresh
+    // was in flight. Never pair task A's response with task B's selected page.
+    if (S.selected !== id || S.taskViewRefreshEpoch !== epoch) return;
     if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
@@ -4211,6 +4298,8 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    S.approvalRequests = approvalRequests;
+    S.approvalItems = approvalItems;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -4431,6 +4520,7 @@ function renderTaskPage() {
           <h2>${esc(v.title)}</h2>
           ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
+          ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
         <div class="meta">
           <span>${v.workflowOptions?.length > 1
@@ -4446,7 +4536,7 @@ function renderTaskPage() {
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
-          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}</a>`).join('')}
+          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
         </div>
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -4476,6 +4566,8 @@ function renderTaskPage() {
     wireFollowups(v);
     wireTerminal(v.taskId);
     wireWorldFileLinks(v);
+  } else if (tab === 'approvals') {
+    wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
@@ -4615,9 +4707,30 @@ function cycleTaskTab(delta) {
 
 function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
+  if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
   if (tab === 'advanced') return advancedTab(v);
   return overviewTab(v);
+}
+
+function approvalRequestsTab(v) {
+  const pending = S.approvalRequests.filter((request) => request.status === 'pending').length;
+  return `<div class="task-approvals" id="task-approval-requests">
+    <div class="approval-page-head">
+      <div><div class="section-h">Approval Requests</div>
+        <p class="task-sub">Credential decisions raised by this task. Approving or denying one automatically resumes the agent.</p></div>
+      ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
+    </div>
+    <div class="approval-list">${credentialRequestRows(S.approvalRequests, S.approvalItems, { historyLimit: 20 })}</div>
+  </div>`;
+}
+
+function wireTaskApprovalRequests(v) {
+  const rec = taskRecord(v.taskId);
+  const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+  });
 }
 
 // Whether renderTaskPage should hand keyboard focus to the scrollable page body.
@@ -5297,8 +5410,9 @@ function conversationPane(v, t) {
   const agentName = esc(t.label || t.role);
   const presence = conversationPresence(v, t);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
+  const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
-  const fu = followUp
+  const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
           <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type @ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
@@ -5336,6 +5450,7 @@ function conversationEntries(t) {
       type: 'activity',
       activity: { ...(prior?.activity || {}), ...activity },
       ts: prior?.ts || event.ts,
+      sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,
     });
   }
@@ -5348,9 +5463,19 @@ function conversationEntries(t) {
       .filter((entry) => entry.activity.kind === 'message')
       .map((entry) => String(entry.activity.title || '').trim()),
   );
+  // User messages carry real epoch-ms timestamps; agent/system replies are stamped
+  // by the deterministic workflow with a per-array sequence number (it has no wall
+  // clock). Carry the last real timestamp forward so a sequence-numbered reply sorts
+  // right after the message it answers, instead of being flung to the top of the
+  // timeline by its tiny `ts`.
+  let carriedTs = 0;
   const messages = (t.messages || [])
     .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
-    .map((message, index) => ({ type: 'message', message, ts: message.ts, order: index }));
+    .map((message, index) => {
+      const real = Number(message.ts) > 100000000000;
+      if (real) carriedTs = Number(message.ts);
+      return { type: 'message', message, ts: message.ts, sortTs: real ? Number(message.ts) : carriedTs, order: index };
+    });
   // Follow-ups are journaled as soon as Temporal accepts their signal, while the
   // workflow's cached transcript may not be republished until the turn ends.
   // Merge those durable events into the presentation timeline, keyed by message
@@ -5362,14 +5487,10 @@ function conversationEntries(t) {
     if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
     const message = event.payload?.message;
     if (!message?.id || storedIds.has(message.id)) continue;
-    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, order: event.seq ?? event.ts });
+    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts });
   }
   const combined = [...messages, ...posted.values(), ...activities.values()];
-  return combined.sort((a, b) => {
-    const at = Number(a.ts) > 100000000000 ? Number(a.ts) : -1000000000000 + Number(a.order || 0);
-    const bt = Number(b.ts) > 100000000000 ? Number(b.ts) : -1000000000000 + Number(b.order || 0);
-    return at - bt || Number(a.order || 0) - Number(b.order || 0);
-  });
+  return combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
 }
 
 function conversationTime(ts) {
@@ -5749,8 +5870,15 @@ function forkCommandFor(sess, worldPath) {
 // Credential-policy editor (SPEC §7/§9): order credentials by precedence and
 // enable/disable each, at a given scope (global/project/task). Lower scopes override
 // higher ones; API keys are off by default when a subscription exists.
+const asyncElementRenderEpoch = new WeakMap();
+function beginAsyncElementRender(element) {
+  const epoch = (asyncElementRenderEpoch.get(element) || 0) + 1;
+  asyncElementRenderEpoch.set(element, epoch);
+  return () => asyncElementRenderEpoch.get(element) === epoch;
+}
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
+  const renderIsCurrent = beginAsyncElementRender(el);
   const organizationId = opts.organizationId || projectById(opts.projectId)?.organizationId || S.organizationId || 'org_personal';
   const organizationBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
   const q = new URLSearchParams();
@@ -5762,7 +5890,15 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       api(`${organizationBase}/credentials?${q.toString()}`),
       api(`${organizationBase}/accounts`).catch(() => ({ logins: [] })),
     ]);
-  } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
+  } catch {
+    if (renderIsCurrent())
+      el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>';
+    return;
+  }
+  // Initial page hydration and a post-connect/register hydration can overlap.
+  // Only the newest response may paint this element, otherwise the older empty
+  // snapshot erases the newly-added login/key until a full page reload.
+  if (!renderIsCurrent()) return;
   // Effective policy for this scope. Normally the server computes it (global→project→
   // task overlay). In `local` mode — the NEW-task form, which has no taskId yet — we
   // resolve a client-side draft policy over the inherited project/global base and apply
@@ -6269,19 +6405,24 @@ function summarize(p) {
 // the merge stage, so the view reflects reorders immediately (the per-task polled
 // position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
 async function seedQueue() {
+  const projectId = S.projectId;
+  const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
   const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
   const orders = {};
   await Promise.all(
     domains.map(async (d) => {
       try {
-        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(S.projectId)}`);
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(projectId)}`);
         orders[d] = { queue: v.queue || [], current: v.current };
       } catch {}
     }),
   );
-  try { S.agentQueue = await api('/api/agent-queue'); } catch {}
+  let agentQueue = S.agentQueue;
+  try { agentQueue = await api('/api/agent-queue'); } catch {}
+  if (S.queueLoadEpoch !== epoch || S.projectId !== projectId) return;
   S.queueOrders = orders;
+  S.agentQueue = agentQueue;
   if (S.tab === 'queue') renderMain();
 }
 
@@ -6504,7 +6645,14 @@ function wireQueueDrag(list) {
 
 // ── activity ─────────────────────────────────────────────────────────────────
 async function seedActivity() {
-  try { S.activity = (await api(`/api/activity?since=0&projectId=${encodeURIComponent(S.projectId)}`)).reverse(); renderMain(); } catch {}
+  const projectId = S.projectId;
+  const epoch = S.activityLoadEpoch = (S.activityLoadEpoch || 0) + 1;
+  try {
+    const activity = await api(`/api/activity?since=0&projectId=${encodeURIComponent(projectId)}`);
+    if (S.activityLoadEpoch !== epoch || S.projectId !== projectId) return;
+    S.activity = activity.reverse();
+    renderMain();
+  } catch {}
 }
 function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
@@ -6547,8 +6695,10 @@ function hostDiagHtml(diag) {
 // terminates (no reschedule) once the tab changes or the element is gone.
 async function refreshHostDiag() {
   if (S.tab !== 'dashboard' || !$('#host-diag')) return;
+  const epoch = S.hostDiagEpoch = (S.hostDiagEpoch || 0) + 1;
   let diag = null;
   try { diag = await api('/api/diagnostics'); } catch {}
+  if (S.hostDiagEpoch !== epoch) return;
   const el = $('#host-diag');
   if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
   if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
@@ -6647,8 +6797,10 @@ function wireProcPanel(el) {
 async function refreshProcPanel(now = false) {
   if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
   clearTimeout(S.procTimer);
+  const epoch = S.procLoadEpoch = (S.procLoadEpoch || 0) + 1;
   let sample = null;
   try { sample = await api('/api/processes'); } catch {}
+  if (S.procLoadEpoch !== epoch) return;
   const el = $('#proc-panel');
   if (el && S.tab === 'dashboard') {
     el.innerHTML = procPanelHtml(sample);
@@ -6660,6 +6812,7 @@ async function refreshProcPanel(now = false) {
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const organizationId = S.organizationId || 'org_personal';
     const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
@@ -6674,6 +6827,7 @@ async function renderDashboard() {
       api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
       api('/api/diagnostics').catch(() => null),
     ]);
+    if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
     const isOperator = !!diag; // /api/diagnostics needs diagnostic:read
     const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
     const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
@@ -6774,7 +6928,9 @@ async function renderDashboard() {
       S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
       refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
     }
-  } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  } catch (e) {
+    if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
 }
 
 // Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
@@ -7942,6 +8098,9 @@ async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
   if (!accessBox || !repositoryBox) return;
+  const accessIsCurrent = beginAsyncElementRender(accessBox);
+  const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
+  const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
     const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
@@ -7949,6 +8108,7 @@ async function hydrateProjectAccess(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
     ]);
+    if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
     const userName = (id) => userRecord(id)?.name || userRecord(id)?.email?.split('@')[0] || 'Unnamed member';
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
@@ -7991,11 +8151,14 @@ async function hydrateProjectAccess(proj) {
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
-  } catch (error) { accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
+  } catch (error) {
+    if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
+  }
 }
 async function hydrateWorkflowPins(projectId) {
   const box = $('#wf-pins-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let list = [];
   let pins = {};
   const organizationId = projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
@@ -8003,7 +8166,11 @@ async function hydrateWorkflowPins(projectId) {
     api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`),
     api(`/api/projects/${projectId}/workflow-pins`),
   ]); }
-  catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>'; return; }
+  catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
     const opts = [`<option value="latest" ${pinned === 'latest' ? 'selected' : ''}>latest (v${esc(w.latest)})</option>`]
@@ -8096,12 +8263,14 @@ function wireSettingsView(proj) {
 }
 async function hydrateExecutionProviders(proj) {
   const box = $('#project-execution'); if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const [policy, connections, pools] = await Promise.all([
       api(`/api/projects/${encodeURIComponent(proj.id)}/execution-policy`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
     ]);
+    if (!renderIsCurrent()) return;
     S.worldProviderConnections = connections;
     // The Agent environment (worktree / container / E2B / Daytona) now lives in
     // Task defaults — and can be overridden per task. Compute keeps the runner
@@ -8140,7 +8309,9 @@ async function hydrateExecutionProviders(proj) {
         await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
+  } catch (error) {
+    if (renderIsCurrent()) toast(`Could not load compute providers: ${error.message}`, true);
+  }
 }
 
 // ── organization defaults (legacy APIs still call this global scope) ─────────
@@ -8450,9 +8621,12 @@ function renderPhoneAccess(status) {
 async function hydratePhoneAccess() {
   const box = $('#phone-access-status');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
-    renderPhoneAccess(await api('/api/remote-access'));
+    const status = await api('/api/remote-access');
+    if (renderIsCurrent()) renderPhoneAccess(status);
   } catch (error) {
+    if (!renderIsCurrent()) return;
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
         <span>Access your Karmax at</span>
@@ -8473,9 +8647,14 @@ async function hydratePhoneAccess() {
 async function hydrateGitProfiles(organizationId = S.organizationId) {
   const box = $('#git-profiles-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let data = { profiles: [], defaultProfile: null };
   const base = `/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`;
-  try { data = await api(base); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  try { data = await api(base); } catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
     box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
       organizationId === 'org_personal'
@@ -8506,8 +8685,13 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
 async function hydrateWorkflows(organizationId = S.organizationId) {
   const box = $('#workflows-list');
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   let list = [];
-  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
+  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch {
+    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>';
+    return;
+  }
+  if (!renderIsCurrent()) return;
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
   box.innerHTML = list.map((w) => `<div class="queue-item">
       <div style="flex:1"><b>${esc(w.name)}</b>
@@ -8524,25 +8708,27 @@ function paymentsCard(scope) {
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
       <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
       <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
+      <div class="pay-stripe-platform" style="margin-bottom:10px"></div>
       <div class="pay-providers-list">Loading…</div>
       <div class="pay-balance" style="margin-top:8px"></div>
     </div>
-    <details class="pay-cardholder" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Create Stripe Issuing cardholder</summary>
-      <div class="form-row" style="margin-top:8px"><div style="display:flex;gap:8px;flex-wrap:wrap">
-        <select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select>
-        <input class="holder-name" placeholder="full or company name" />
-        <input class="holder-first" placeholder="first name (individual)" />
-        <input class="holder-last" placeholder="last name (individual)" />
-        <input class="holder-dob" type="date" title="date of birth (individual)" />
-        <input class="holder-email" type="email" placeholder="email" />
-        <input class="holder-phone" placeholder="phone" />
-        <input class="holder-line1" placeholder="address line 1" />
-        <input class="holder-city" placeholder="city" />
-        <input class="holder-state" placeholder="state/region" />
-        <input class="holder-postal" placeholder="postal code" />
-        <input class="holder-country" placeholder="country (US)" style="width:100px" />
-        <button class="btn sm" data-addholder>Create cardholder</button>
-      </div></div>
+    <details class="pay-cardholder hidden" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Stripe cardholder — required before issuing a card</summary>
+      <p class="task-sub">This is Stripe’s compliance record for the real person or company legally authorized to use the card. It is not a Karmax user, a label, or a funding source. Use accurate identity and billing details; Stripe may require verification.</p>
+      <div class="settings-grid">
+        <label class="form-row">Cardholder type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
+        <label class="form-row">Name shown in Stripe<input class="holder-name" placeholder="Full legal or company name" /></label>
+        <label class="form-row">First name (individual)<input class="holder-first" /></label>
+        <label class="form-row">Last name (individual)<input class="holder-last" /></label>
+        <label class="form-row">Date of birth (individual)<input class="holder-dob" type="date" /></label>
+        <label class="form-row">Email<input class="holder-email" type="email" /></label>
+        <label class="form-row">Phone<input class="holder-phone" /></label>
+        <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
+        <label class="form-row">City<input class="holder-city" /></label>
+        <label class="form-row">State or region<input class="holder-state" /></label>
+        <label class="form-row">Postal code<input class="holder-postal" /></label>
+        <label class="form-row">Country code<input class="holder-country" placeholder="US" maxlength="2" /></label>
+      </div>
+      <button class="btn sm" data-addholder>Create required Stripe record</button>
     </details>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
@@ -8555,7 +8741,7 @@ function paymentsCard(scope) {
         <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
         <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
         <select class="card-provider"><option value="mock">Local test funds</option></select>
-        <select class="card-cardholder hidden"><option value="">Choose Stripe cardholder</option></select>
+        <select class="card-cardholder hidden"><option value="">Choose required Stripe cardholder</option></select>
         <button class="btn" data-addcard="${scope}">Add card</button>
       </div></div>
     ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
@@ -8567,10 +8753,48 @@ async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
+  let platform;
   const paymentsBase = organizationId
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
   try { data = await api(`${paymentsBase}/providers`); } catch {}
+  if (organizationId) {
+    try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
+  }
+  const platformBox = box.querySelector('.pay-stripe-platform');
+  if (platformBox && platform) {
+    const status = platform.configured
+      ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
+      : '<span class="chip">setup required</span>';
+    const webhook = platform.webhookConfigured
+      ? '<span class="chip" style="color:var(--ok,#4ec9a3)">webhook ready</span>'
+      : '<span class="chip">webhook secret missing</span>';
+    platformBox.innerHTML = `<details ${platform.configured && platform.webhookConfigured ? '' : 'open'}>
+      <summary style="cursor:pointer;font-weight:600">Stripe platform setup ${status} ${webhook}</summary>
+      <p class="task-sub">One Stripe Connect application identifies this Karmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
+      <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
+      <div class="settings-grid">
+        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
+        <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
+      </div>
+      ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
+      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in Karmax’s encrypted vault and makes them take precedence.</p>' : ''}
+    </details>`;
+    platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
+      try {
+        await api(`${paymentsBase}/stripe/platform`, { method: 'PUT', body: JSON.stringify({
+          clientId: platformBox.querySelector('.stripe-platform-client').value,
+          secretKey: platformBox.querySelector('.stripe-platform-secret').value || undefined,
+          webhookSecret: platformBox.querySelector('.stripe-platform-webhook-secret').value || undefined,
+        }) });
+        toast('Stripe platform setup saved securely');
+        await wirePaymentProviders(box, organizationId);
+      } catch (e) { toast(e.message, true); }
+    });
+  }
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
         <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
@@ -8621,6 +8845,8 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   const providerSelect = box.querySelector('.card-provider');
   const holderSelect = box.querySelector('.card-cardholder');
   const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
+  const stripeConnected = usableProviders.some((p) => p.name === 'stripe');
+  box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
   providerSelect.innerHTML = usableProviders.map((p) =>
     `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
   const loadCardholders = async () => {
@@ -8629,8 +8855,11 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (!stripe) return;
     try {
       const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose Stripe cardholder</option>${holders
-        .filter((h) => h.status === 'active').map((h) => `<option value="${esc(h.id)}">${esc(h.name)} · ${esc(h.type)}</option>`).join('')}`;
+      holderSelect.innerHTML = `<option value="">Choose required Stripe cardholder</option>${holders.map((h) => {
+        const requirements = h.requirements?.past_due || [];
+        const ready = h.status === 'active' && requirements.length === 0;
+        return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
+      }).join('')}`;
     } catch (e) {
       holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
     }
@@ -8766,6 +8995,71 @@ const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets 
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
 function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
 
+function credentialRequestTaskLink(request) {
+  const task = request.task || taskRecord(request.taskId);
+  if (!task) return `<span class="mono">${esc(request.taskId)}</span>`;
+  const project = projectById(task.projectId);
+  const key = task.num != null ? task.num : task.id;
+  const label = `${task.num != null ? `#${task.num} · ` : ''}${task.title}`;
+  return project
+    ? `<a data-spa href="${projectRoute(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
+    : `<span>${esc(label)}</span>`;
+}
+
+function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
+  const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const pendingHtml = pending.length
+    ? pending.map((request) => `<div class="approval-request" data-vreq="${esc(request.id)}">
+        <div class="approval-request-main">
+          <div class="approval-request-title">${request.itemId
+            ? esc(itemLabel(request.itemId))
+            : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
+            ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+          </div>
+          <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
+          ${request.kind === 'reset' ? '<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; karmax will resume the agent automatically.</div>' : ''}
+        </div>
+        <div class="approval-request-actions">
+          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
+          <button class="btn sm" data-vreq-act="once">Once</button>
+          <button class="btn sm" data-vreq-act="task">This task</button>
+          <button class="btn sm" data-vreq-act="always">Always</button>
+          <button class="btn sm" data-vreq-act="deny">Deny</button>
+        </div>
+      </div>`).join('')
+    : '<div class="approval-empty">No pending approval requests.</div>';
+  const history = recent.length
+    ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+        <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || '?')}</span>
+        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+    : '';
+  return pendingHtml + history;
+}
+
+function wireCredentialRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((button) => button.addEventListener('click', async () => {
+    const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+    button.disabled = true;
+    try {
+      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+        method: 'POST',
+        body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
+      });
+      const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
+      toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+        : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
+      await onResolved?.(result);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  })));
+}
+
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
@@ -8800,7 +9094,7 @@ function passwordsCard() {
 function vaultRequestsCard() {
   return `<div class="card" id="vault-requests-card">
     <div class="section-h">Credential access requests</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted (or one that isn't in the vault yet — add it above, then approve, or tell the agent to create the account itself). <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet. Add and bind a missing item before approving. <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto. Every decision resumes the task automatically.</p>
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
@@ -9019,29 +9313,8 @@ async function wireVaultCards(organizationId) {
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
-    const pending = requests.filter((r) => r.status === 'pending');
-    const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
-    const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
-    rbox.innerHTML = (pending.length
-      ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
-          <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
-            ${r.kind === 'reset' ? '<span class="chip" style="color:var(--warn,#e0b15a)">reported invalid</span>' : `<span class="chip">${esc(r.mode)}</span>`}
-            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}${r.kind === 'reset' ? '<br>The stored secret failed. Fix it (Update secret in the vault above, or send the task a follow-up with the reset code), then grant to let the agent retry.' : ''}</div></div>
-          ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
-          <button class="btn sm" data-vreq-act="once">Once</button>
-          <button class="btn sm" data-vreq-act="task">This task</button>
-          <button class="btn sm" data-vreq-act="always">Always</button>
-          <button class="btn sm" data-vreq-act="deny">Deny</button></div>`).join('')
-      : '<span style="color:var(--ink-3)">No pending requests.</span>')
-      + (recent.length ? `<div class="task-sub" style="color:var(--ink-3);margin-top:8px">${recent.map((r) => `${r.status} · ${r.itemId ? esc(itemLabel(r.itemId)) : esc(r.domain || '?')} (${esc(r.resolution?.action || '')})`).join('<br>')}</div>` : '');
-    rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
-      const itemId = row.querySelector('.vreq-bind')?.value || undefined;
-      try {
-        await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
-        toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
-        renderRequests();
-      } catch (e) { toast(e.message, true); }
-    })));
+    rbox.innerHTML = credentialRequestRows(requests, items);
+    wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
   await renderItems();
   await renderConnectors();
@@ -9203,11 +9476,13 @@ function profileRow(p, scope) {
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
-  let profiles = [];
-  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
-  profiles = profiles.filter((p) => p.role !== 'confirm');
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
+  const renderIsCurrent = beginAsyncElementRender(list);
+  let profiles = [];
+  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  if (!renderIsCurrent()) return;
+  profiles = profiles.filter((p) => p.role !== 'confirm');
   const doP = profiles.find((p) => p.role === 'do');
   const mergeP = profiles.find((p) => p.role === 'merge');
   const rest = profiles.filter((p) => p !== doP && p !== mergeP);
@@ -9275,6 +9550,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
   if (!field) { box.innerHTML = ''; return; }
   let own = {};
@@ -9285,6 +9561,7 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
     own = d[scope].own;
     inherited = d[scope].inherited;
   } catch {}
+  if (!renderIsCurrent()) return;
   box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
     <button class="btn primary sm" data-save-review-route>Save review route</button>`;
   wireAgentFields(box);
@@ -9384,9 +9661,11 @@ function wireCapabilityChecklist(row) {
 async function hydrateAuthorization(scope, projectId) {
   const box = $(`#authorization-${scope}`);
   if (!box) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
     const data = await api(`/api/authorization/profiles${suffix}`);
+    if (!renderIsCurrent()) return;
     const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
     box.innerHTML = `<p class="task-sub">These profiles limit what task agents may do. Human membership and project access are managed in People and each project's Access section.</p>
       <div class="form-row"><label>Default for new task agents</label><select class="authz-default">${options}</select></div>
@@ -9421,7 +9700,9 @@ async function hydrateAuthorization(scope, projectId) {
         hydrateAuthorization(scope, projectId);
       } catch (e) { toast(e.message, true); }
     }));
-  } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
+  } catch (e) {
+    if (renderIsCurrent()) box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`;
+  }
 }
 
 function wireGlobalSettings(organizationId) {
@@ -9602,7 +9883,8 @@ async function openInboxItem(item) {
   const project = projectById(item.task.projectId); if (!project) return;
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
-  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
+  const tab = item.kind === 'approval-requested' ? '/approvals' : '';
+  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user
@@ -9789,6 +10071,11 @@ function organizationView() {
 
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
+  const organizationId = S.organizationId;
+  const epoch = S.organizationViewEpoch = (S.organizationViewEpoch || 0) + 1;
+  const renderIsCurrent = () => S.organizationViewEpoch === epoch
+    && S.organizationId === organizationId
+    && !!$('#org-members');
   const gitAccounts = $('#git-accounts-card');
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
@@ -9797,6 +10084,7 @@ async function hydrateOrganizationView() {
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
+  if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
@@ -9807,16 +10095,17 @@ async function hydrateOrganizationView() {
     return `<div class="member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; permissions still come from the selected profile">protected owner</span>' : ''}<select class="q-sel org-member-profile">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
   const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
-    api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/world-providers`).catch(() => []),
-    api(`/api/organizations/${S.organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
-    api(`/api/organizations/${S.organizationId}/usage`).catch(() => null),
-    api(`/api/organizations/${S.organizationId}/identity-policy`).catch(() => null),
-    api(`/api/organizations/${S.organizationId}/invitations`).catch(() => []),
-    Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+    api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
+    api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
+    api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
+    api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
+    api(`/api/organizations/${organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
+    api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
+    Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
+  if (!renderIsCurrent()) return;
   if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.profileId || 'developer')}</span></div>`).join('')}`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';

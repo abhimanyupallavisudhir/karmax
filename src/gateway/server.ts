@@ -49,6 +49,8 @@ import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repos
 import { worldWorkingRelativePath } from '../world/types.js';
 import { enumerateCredentials } from '../platform/credentials.js';
 import { gatherCredentialSources } from '../platform/credential-sources.js';
+import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
+import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -395,6 +397,33 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
+  }
+
+  private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
+    const task = this.deps.store.getTask(taskId);
+    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
+    if (!organizationId) return [];
+    return new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
+      .requests({ taskId, status: 'pending' });
+  }
+
+  private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
+    if (!view) return view;
+    const count = this.pendingCredentialRequests(taskId).length;
+    return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
+  }
+
+  private credentialRequestView(request: CredentialAccessRequest, organizationId: string): CredentialAccessRequest {
+    const task = this.deps.store.getTask(request.taskId);
+    const project = task && this.deps.store.getProject(task.projectId);
+    if (!task || project?.organizationId !== organizationId) return request;
+    return { ...request, task: { id: task.id, ...(task.num != null ? { num: task.num } : {}),
+      title: task.title, projectId: task.projectId } };
+  }
+
+  private emitTaskEvent(event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }): void {
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus.emit({ ...event, seq });
   }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
@@ -2158,7 +2187,10 @@ export class Gateway {
           // rows computed attempt/stage metadata independently and turned one list
           // request into thousands of synchronous SQLite reads. Drawer-only fields
           // (including stageTransitions) are resolved by the single-task endpoint.
-          const listed = page.map((t) => ({ ...t, lastView: trimListView(t.lastView) }));
+          const listed = page.map((t) => ({
+            ...t,
+            lastView: trimListView(this.withApprovalRequests(t.lastView, t.id)),
+          }));
           if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
           return this.json(res, 200, listed);
         }
@@ -2316,7 +2348,8 @@ export class Gateway {
         if (!view) return this.json(res, 200, null);
         // Mirror the record's sequential number onto the view (the workflow only
         // knows the opaque id) so the drawer can show `#num` + a permalink.
-        return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
+        const projected = this.withApprovalRequests(view, viewMatch[1]!)!;
+        return this.json(res, 200, rec?.num != null ? { ...projected, num: rec.num } : projected);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -2329,7 +2362,14 @@ export class Gateway {
       }
       const attemptsMatch = p.match(/^\/api\/tasks\/([^/]+)\/attempts$/);
       if (attemptsMatch && method === 'GET') {
-        return this.json(res, 200, api.attemptGroup(token, attemptsMatch[1]!) ?? null);
+        const group = api.attemptGroup(token, attemptsMatch[1]!);
+        return this.json(res, 200, group ? {
+          ...group,
+          attempts: group.attempts.map((attempt) => ({
+            ...attempt,
+            lastView: this.withApprovalRequests(attempt.lastView, attempt.id),
+          })),
+        } : null);
       }
       if (attemptsMatch && method === 'POST') {
         try {
@@ -3022,6 +3062,38 @@ export class Gateway {
 
       // Payment rails (SPEC §7.6), resolved in the caller's organization. Local
       // needs no connection; incomplete external rails are reported honestly.
+      const stripePlatform = p.match(/^\/api\/organizations\/([^/]+)\/payments\/stripe\/platform$/);
+      if (stripePlatform) {
+        const provider = this.deps.paymentRegistry?.get('stripe') as any;
+        if (!provider || typeof provider.platformStatus !== 'function')
+          return this.json(res, 503, { error: 'Stripe Issuing is unavailable' });
+        const publicUrl = this.publicUrl(req);
+        if (method === 'GET') return this.json(res, 200, {
+          ...provider.platformStatus(),
+          canManage: this.deps.tokens.check(token, 'user:write').ok,
+          callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
+          webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
+        });
+        if (method === 'PUT') {
+          if (!this.deps.tokens.check(token, 'user:write').ok)
+            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared Stripe Connect application' });
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, {
+              ...provider.configurePlatform({
+                clientId: String(b.clientId ?? ''),
+                secretKey: b.secretKey ? String(b.secretKey) : undefined,
+                webhookSecret: b.webhookSecret ? String(b.webhookSecret) : undefined,
+              }),
+              canManage: true,
+              callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
+              webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
+            });
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }
       const organizationPayments = p.match(/^\/api\/organizations\/([^/]+)\/payments\/(providers|connect)$/);
       if ((p === '/api/payments/providers' || organizationPayments?.[2] === 'providers') && method === 'GET') {
         const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
@@ -3130,7 +3202,6 @@ export class Gateway {
 
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
       if (p.startsWith('/api/vault')) {
-        const { VaultItems, ITEM_FIELDS } = await import('../autonomy/vault-items.js');
         // Bind to the caller's own organization (tenant boundary). The token org
         // is authoritative and cannot be spoofed — auth() validated it against
         // membership; the query-param org only ever narrows within it.
@@ -3160,10 +3231,11 @@ export class Gateway {
             secrets: b.secrets,
             provenance: { source: 'manual' },
           });
-          // A human rotating a mirrored item's secret propagates to the source
-          // store too (field-level, notes preserved) when write-back is on.
+          // A human rotating a secret propagates to its imported source or
+          // agent-created write-back targets (field-level, notes preserved)
+          // when the corresponding connector's write-back is on.
           let propagated;
-          if (b.id && b.secrets && Object.keys(b.secrets).length && saved.provenance.source.startsWith('connector:')) {
+          if (b.id && b.secrets && Object.keys(b.secrets).length) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
               propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
@@ -3219,10 +3291,11 @@ export class Gateway {
             store.appendAudit({ principalId: `task:${callerTaskId}`, action: 'vault.rotated',
               detail: { itemId: prior!.id, label: prior!.label, fields: secretFields } });
           }
-          // Best-effort propagation of rotated fields back to the item's source
-          // store (§9 updateSecret) — the vault is already correct either way.
+          // Best-effort propagation of rotated fields back to imported sources
+          // and agent-created write-back targets (§9 updateSecret) — the vault
+          // is already correct either way.
           let propagated;
-          if (prior && saved.provenance.source.startsWith('connector:') && b.secrets) {
+          if (prior && b.secrets) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
               propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
@@ -3295,13 +3368,14 @@ export class Gateway {
           return this.json(res, 200, vault.requests({
             taskId: url.searchParams.get('taskId') ?? undefined,
             status: (url.searchParams.get('status') as any) ?? undefined,
-          }));
+          }).map((request) => this.credentialRequestView(request, organizationId)));
         }
         // The pull model (§7): an agent escalates for an item it lacks.
         if (p === '/api/vault/requests' && method === 'POST') {
           const b = await this.body(req);
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
-          return this.json(res, 200, vault.request({
+          const priorPending = new Set(vault.requests({ taskId: callerTaskId, status: 'pending' }).map((request) => request.id));
+          const decision = vault.request({
             taskId: callerTaskId,
             projectId: authRecord?.projectId,
             caps,
@@ -3311,7 +3385,26 @@ export class Gateway {
             mode: b.mode,
             kind: b.kind === 'reset' ? 'reset' : undefined,
             why: b.why ? String(b.why) : undefined,
-          }));
+          });
+          if (decision.requestId && !priorPending.has(decision.requestId)) {
+            const task = store.getTask(callerTaskId);
+            const taskOrganization = task && store.getProject(task.projectId)?.organizationId;
+            if (task && taskOrganization === organizationId) this.emitTaskEvent({
+              taskId: task.id,
+              type: 'credential.approval-requested',
+              ts: Date.now(),
+              payload: {
+                requestId: decision.requestId,
+                status: 'approval-needed',
+                mode: b.mode === 'reveal' ? 'reveal' : 'use',
+                kind: b.kind === 'reset' ? 'reset' : 'access',
+                ...(decision.itemId ? { itemId: decision.itemId } : {}),
+                ...(b.domain ? { domain: String(b.domain) } : {}),
+                ...(b.why ? { why: String(b.why) } : {}),
+              },
+            });
+          }
+          return this.json(res, 200, decision);
         }
         const vres = p.match(/^\/api\/vault\/requests\/([^/]+)\/resolve$/);
         if (vres && method === 'POST') {
@@ -3319,7 +3412,23 @@ export class Gateway {
           const action = String(b.action ?? '');
           if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
           try {
-            return this.json(res, 200, vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
+            const resolved = vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined });
+            const item = resolved.itemId ? vault.get(resolved.itemId) : undefined;
+            const label = item?.label ?? resolved.domain ?? 'credential';
+            const message = action === 'deny'
+              ? `[Karmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
+              : `[Karmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
+            const resume = await api.resumeAfterCredentialDecision(resolved.taskId, message);
+            const task = store.getTask(resolved.taskId);
+            if (task && store.getProject(task.projectId)?.organizationId === organizationId) {
+              this.emitTaskEvent({
+                taskId: resolved.taskId,
+                type: 'credential.approval-resolved',
+                ts: Date.now(),
+                payload: { requestId: resolved.id, itemId: resolved.itemId, action, resumed: resume.resumed },
+              });
+            }
+            return this.json(res, 200, { ...this.credentialRequestView(resolved, organizationId), resume });
           } catch (e) {
             return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
           }
@@ -4171,7 +4280,7 @@ export class Gateway {
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
       claude: claude.length ? claude : [
-        { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
+        { id: 'default' }, { id: 'opus[1m]' }, { id: 'claude-fable-5[1m]' }, { id: 'sonnet' }, { id: 'haiku' },
       ],
       codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
       opencode: opencode.length ? opencode : [

@@ -196,7 +196,7 @@ async function main() {
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
-  paymentRegistry.register(new StripeIssuingProvider(store));
+  paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
   const configHomes = new ConfigHomeManager();

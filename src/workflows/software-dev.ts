@@ -37,7 +37,7 @@ import {
   ParentResponse,
   SubTaskResponse,
 } from './contract.js';
-import { releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
@@ -170,27 +170,6 @@ const DEFAULT_SUBAGENT_WAIT_MS = 10_000;
 const MAX_SHELL_NUDGES = 3;
 
 /**
- * The merge-queue serialization domains for a task — one `<repo>:<target>` per
- * repo the world touches, returned in a GLOBAL total order (sorted, deduped).
- *
- * Acquiring the per-repo slots in this order is what keeps concurrent multi-repo
- * merges deadlock-free (SPEC §6.1, lock ordering). Because every task requests
- * shared repos in the same sequence, a task only ever waits for a domain ordered
- * after everything it already holds — so the "waits-for" graph can't cycle. (A
- * scratch or single-repo world yields one domain, exactly as before.)
- */
-function mergeDomains(world: WorldHandleLike | undefined, target: string, projectId: string): string[] {
-  // Key on the AUTHORITATIVE repo: a cloud world provisioned from a local
-  // checkout (`localPath`) lands its merge in that checkout, so it must
-  // serialize with worktree worlds of the same repo — not under its SSH URL.
-  const domains = world?.repos?.length
-    ? world.repos.map((repo) =>
-      `${repo.localPath ?? repo.repo}:${repo.targetPinned === false ? target : (repo.target ?? target)}`)
-    : [`${world?.repo ?? projectId}:${target}`];
-  return [...new Set(domains)].sort();
-}
-
-/**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
  * code triggers a workflow-TASK failure that Temporal retries forever; we never
  * do that. Cancellation is caught and routed to a graceful `abort()`.
@@ -236,6 +215,11 @@ export async function softwareDevV1_6(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.6.0');
 }
 
+/** Human holds wake on the action that supplies their input. */
+export async function softwareDevV1_7(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.7.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
@@ -244,14 +228,17 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
 
 async function softwareDevImpl(
   input: SoftwareDevInput,
-  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0',
+  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0',
 ): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
   const providerTerminalCompletion =
-    ['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0'].includes(behaviorVersion);
-  const modeSwitching = ['1.3.0', '1.4.0', '1.5.0', '1.6.0'].includes(behaviorVersion);
-  const durableAgentAdmission = ['1.4.0', '1.5.0', '1.6.0'].includes(behaviorVersion);
-  const agentTurns = behaviorVersion === '1.6.0' ? cancellationAwareTurns : turns;
+    ['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0'].includes(behaviorVersion);
+  const modeSwitching = ['1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0'].includes(behaviorVersion);
+  const durableAgentAdmission = ['1.4.0', '1.5.0', '1.6.0', '1.7.0'].includes(behaviorVersion);
+  const responsiveHumanHold = behaviorVersion === '1.7.0';
+  const agentTurns = behaviorVersion === '1.6.0' || behaviorVersion === '1.7.0'
+    ? cancellationAwareTurns
+    : turns;
   const taskId = input.taskId;
   const recovery = input.recovery;
   const recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
@@ -269,6 +256,7 @@ async function softwareDevImpl(
   let cancelled = false;
   let retryRequested = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
+  let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
   let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
@@ -456,12 +444,19 @@ async function softwareDevImpl(
 
   // ── view-model ──
   function allowed(): DeclaredAction[] {
+    const pausedRole: AgentRole | undefined =
+      stage === 'do' || stage === 'review'
+        ? 'do'
+        : stage === 'merge' && mergeMsgs.length
+          ? 'merge'
+        : undefined;
     const followUp: DeclaredAction = {
       name: 'followUp',
       kind: 'signal',
       label: 'Send follow-up',
       enabled: true,
       args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
+      ...(responsiveHumanHold && humanPauseActive && pausedRole ? { roles: [pausedRole] } : {}),
     };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: !pointOfNoReturnPassed, danger: true };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true };
@@ -472,6 +467,14 @@ async function softwareDevImpl(
       enabled: paramEditable('target'),
       args: [{ name: 'branch', type: 'string', label: 'Target branch', default: target }],
     };
+    if (responsiveHumanHold && humanPauseActive) {
+      return [
+        ...(stage === 'review' ? [confirm] : []),
+        ...(pausedRole ? [followUp] : []),
+        ...(stage === 'do' || stage === 'review' ? [setTarget] : []),
+        cancel,
+      ];
+    }
     const retry: DeclaredAction = { name: 'retry', kind: 'signal', label: 'Retry', enabled: true };
     switch (stage) {
       case 'setup':
@@ -529,7 +532,7 @@ async function softwareDevImpl(
         worldReady: !!world,
         mergeGranted,
         targetLocked,
-        mergeDomain: world ? mergeDomains(world, target, input.projectId)[0] : undefined,
+        mergeDomain: world ? mergeQueueDomains(world, target, input.projectId)[0] : undefined,
         // A failed Temporal execution is terminal. Persist the full handle needed
         // for a replacement run to OPEN this world; reconstructing it through
         // createWorld would force-remove the dirty worktree and lose work.
@@ -600,6 +603,8 @@ async function softwareDevImpl(
     const target = conversationFor(role);
     if (!target.some((candidate) => candidate.id === m.id))
       target.push({ ...m, ts: m.ts || target.length });
+    if (responsiveHumanHold && humanPauseActive)
+      humanPauseWake = { kind: 'followUp', role };
   });
   setHandler(collaborationRequestedSignal, (requestId) => {
     pendingCollaborations.add(requestId);
@@ -611,6 +616,8 @@ async function softwareDevImpl(
   });
   setHandler(confirmSignal, () => {
     confirmed = true;
+    if (responsiveHumanHold && humanPauseActive)
+      humanPauseWake = { kind: 'confirm' };
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed) {
@@ -621,6 +628,8 @@ async function softwareDevImpl(
   });
   setHandler(retrySignal, () => {
     retryRequested = true;
+    if (responsiveHumanHold && humanPauseActive)
+      humanPauseWake = { kind: 'retry' };
   });
   // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
   setHandler(raiseFromChildSignal, (r) => {
@@ -630,8 +639,15 @@ async function softwareDevImpl(
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
   setHandler(parentResponseSignal, (resp) => {
-    if (resp.action === 'confirm') confirmed = true;
-    else if (resp.action === 'retry') retryRequested = true;
+    if (resp.action === 'confirm') {
+      confirmed = true;
+      if (responsiveHumanHold && humanPauseActive)
+        humanPauseWake = { kind: 'confirm' };
+    } else if (resp.action === 'retry') {
+      retryRequested = true;
+      if (responsiveHumanHold && humanPauseActive)
+        humanPauseWake = { kind: 'retry' };
+    }
     else if (resp.action === 'cancel') {
       if (!pointOfNoReturnPassed) {
         cancelled = true;
@@ -640,6 +656,8 @@ async function softwareDevImpl(
     } else if (resp.action === 'comment') {
       if (resp.text) msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text, ts: msgs.length });
       retryRequested = true; // unblocks an escalated child; at Review the new msg drives it
+      if (responsiveHumanHold && humanPauseActive)
+        humanPauseWake = { kind: 'followUp', role: 'do' };
     }
   });
   setHandler(mergeGrantedSignal, () => {
@@ -684,6 +702,8 @@ async function softwareDevImpl(
           text: 'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.',
           ts: msgs.length,
         });
+        if (responsiveHumanHold && humanPauseActive)
+          humanPauseWake = { kind: 'workflowChange', role: 'do' };
       }
       await publish();
       return { workflow };
@@ -1293,8 +1313,10 @@ async function softwareDevImpl(
       // versions keep the bare v1.1 child type so their recorded command stays
       // replay-compatible.
       const child = await startChild<typeof softwareDev>(
-        behaviorVersion === '1.6.0'
-          ? 'softwareDev@1.6.0'
+        behaviorVersion === '1.7.0'
+          ? 'softwareDev@1.7.0'
+          : behaviorVersion === '1.6.0'
+            ? 'softwareDev@1.6.0'
           : behaviorVersion === '1.5.0'
             ? 'softwareDev@1.5.0'
             : 'softwareDev',
@@ -1404,26 +1426,39 @@ async function softwareDevImpl(
   accountPool = await coord.accountPoolSize().catch(() => 0);
 
   // A platform-requested human hold is deliberately outside the pipeline. Keep
-  // the originating stage visible, but park until the platform sends Retry to
-  // resume it. The replacement history owns no agent/queue activity while held.
+  // the originating stage visible. An explicit Resume always wakes it; v1.7 also
+  // treats a follow-up / Review confirmation / autonomous Goal switch as the
+  // input the hold was waiting for. The replacement history owns no agent/queue
+  // activity while held.
+  let pauseWake: typeof humanPauseWake;
   if (recovery?.pausedForHuman) {
     stage = recoveryStage;
     status = 'waiting';
     waitingFor = { kind: 'human', audience: ['@creator'], detail: `Paused during ${recoveryStage}` };
     retryRequested = false;
     await publish();
-    await condition(() => retryRequested || cancelled);
+    if (responsiveHumanHold)
+      await condition(() => !!humanPauseWake || cancelled);
+    else
+      await condition(() => retryRequested || cancelled);
+    pauseWake = humanPauseWake;
     waitingFor = undefined;
     if (cancelled) return await abort();
     retryRequested = false;
+    humanPauseWake = undefined;
     status = 'active';
     humanPauseActive = false;
   }
 
   // Restoring a cancelled/manual-done Review returns to the decision gate without
-  // rerunning completed Do work. Confirm advances; a follow-up returns to Do.
-  let restoredReviewApproved = false;
-  if (recoveryStage === 'review') {
+  // rerunning completed Do work. The action that released a Review-origin hold
+  // keeps its normal meaning: Confirm advances, feedback returns to Do, while an
+  // explicit Resume merely restores the still-pending Review gate.
+  let restoredReviewApproved = recoveryStage === 'review' && pauseWake?.kind === 'confirm';
+  const restoredReviewBackToDo =
+    recoveryStage === 'review'
+    && (pauseWake?.kind === 'followUp' || pauseWake?.kind === 'workflowChange');
+  if (recoveryStage === 'review' && !restoredReviewApproved && !restoredReviewBackToDo) {
     stage = 'review';
     status = 'waiting';
     waitingFor = { kind: 'human', audience: ['@creator'], detail: 'Restored review' };
@@ -1772,7 +1807,7 @@ async function softwareDevImpl(
     // in the same sequence, so the wait-for graph can't form a cycle. Acquiring
     // sequentially (not all at once) also keeps the payload-less grant signal
     // unambiguous — we only ever wait on a single coordinator at a time.
-    const domains = mergeDomains(world, target, input.projectId);
+    const domains = mergeQueueDomains(world, target, input.projectId);
     const held: string[] = [];
     let acquireCancelled = false;
     for (const domain of domains) {
