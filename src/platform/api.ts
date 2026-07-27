@@ -1125,20 +1125,25 @@ export class KarmaxApi {
       .setTaskPolicies(task.id, authorization?.credentialPolicies ?? {});
   }
 
-  /** Change the job-shaped grant on work that has not started yet. The selected
-   * profile is always re-attenuated against the immediate bearer, so an agent
-   * cannot use a human principal recorded on the draft as a confused deputy. */
-  setTaskAuthorization(
+  /** Change the job-shaped grant on a task — before it starts, or in-flight while
+   * it runs (SPEC §5.5). The selected profile is always re-attenuated against the
+   * immediate bearer, so an agent cannot use a human principal recorded on the
+   * draft as a confused deputy. For a running task the change is pushed into the
+   * live workflow (which validates the lifecycle window and re-points its grant so
+   * the next turn mints from it) BEFORE it's persisted — mirroring updateParams. */
+  async setTaskAuthorization(
     token: string,
     taskId: string,
     profileId: string,
     credentialGrants?: string[],
     credentialPolicies?: VaultTaskPolicyOverrides,
-  ): TaskRecord {
+  ): Promise<TaskRecord> {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
-    if (!task.params?.draft && task.params?.triggerState !== 'armed' && !task.params?.repeatable)
-      throw new Error('authorization is frozen after a task starts');
+    // Drafts, armed triggers, and repeatable series have no running workflow — edit
+    // their stored authorization in place. Everything else routes through the live
+    // workflow update below (frozen only once it's cancelled/terminal).
+    const editInPlace = !!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable;
     const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, task.projectId, profileId, caller.caps)
@@ -1154,6 +1159,22 @@ export class KarmaxApi {
         caller.caps,
         authorization,
       );
+    if (!editInPlace) {
+      // The workflow validator is the single source of truth for the in-flight
+      // window; if it rejects (cancelled / past the point of no return / already
+      // finished) we surface that and leave the stored authorization untouched.
+      try {
+        await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateAuthorization', {
+          args: [{
+            grant: authorization.capabilities,
+            grantPrincipal: caller.principal,
+            authorizationProfile: authorization.profileId ?? profileId,
+          }],
+        });
+      } catch (e) {
+        throw new Error(unwrapCause(e));
+      }
+    }
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
       _authorization: { ...authorization, principal: caller.principal, credentialPolicies: policies },

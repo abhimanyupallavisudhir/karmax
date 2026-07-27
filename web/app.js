@@ -4592,6 +4592,7 @@ function renderTaskPage() {
     wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
+    wireTaskAuthorization(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   } else if (tab === 'advanced') {
     renderTaskEvents();
@@ -5820,9 +5821,87 @@ function parametersTab(v) {
   // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
     ${paramsSection(v)}
+    ${authorizationSection(v)}
     <div class="section-h">Credentials</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
     <div id="cred-editor-task">Loading…</div>`;
+}
+
+// Agent authorization + per-task vault grants — the same controls the task form
+// offers, editable in-flight (SPEC §5.5). The change re-points the task's live
+// grant, so it takes effect at the next agent turn. Hidden for drafts (they edit
+// in the full form) and once frozen (terminal, or past the point of no return).
+function authorizationSection(v) {
+  const rec = taskRecord(v.taskId);
+  if (rec?.params?.draft) return '';
+  if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) return '';
+  return `<div class="section-h">Authorization</div>
+    <div id="tp-auth" class="parameter-fields">
+      <div class="form-row" data-row="__authorization">
+        <div class="label-row"><label title="Applies to every agent and retry in this workflow, capped by your own permissions. Takes effect at the next agent turn.">Agent authorization</label></div>
+        <select id="tp-authorization"><option>Loading…</option></select>
+      </div>
+      <div class="form-row" data-row="__vault">
+        <button type="button" class="btn tf-vault-button" id="tp-vault-open" disabled
+          title="Choose which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Takes effect at the next agent turn.">
+          <span>Vault credentials</span>
+          <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
+        </button>
+      </div>
+      <button class="btn sm primary" id="tp-auth-save">Save authorization</button>
+    </div>`;
+}
+
+// Fill + wire the in-flight authorization controls (profiles + vault items load
+// async, like the task form). Reuses the shared vault-grant picker.
+async function wireTaskAuthorization(v) {
+  const select = document.getElementById('tp-authorization');
+  const saveBtn = document.getElementById('tp-auth-save');
+  if (!select || !saveBtn) return;
+  const rec = taskRecord(v.taskId);
+  const projectId = rec?.projectId || S.projectId;
+  const auth0 = rec?.params?._authorization || {};
+  let authorization = { profiles: [], defaultProfile: 'developer' };
+  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(projectId)}`); } catch {}
+  const selected = auth0.profileId || authorization.defaultProfile;
+  select.innerHTML = (authorization.profiles || []).map((p) =>
+    `<option value="${esc(p.id)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name)}</option>`).join('')
+    || `<option value="${esc(selected)}" selected>${esc(selected)}</option>`;
+  // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
+  const vaultGrantIds = new Set((auth0.capabilities || [])
+    .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+  let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
+  const button = document.getElementById('tp-vault-open');
+  const count = document.getElementById('tp-vault-count');
+  const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
+  let items = [];
+  try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
+  catch { button?.closest('[data-row="__vault"]')?.remove(); }
+  if (button && count) {
+    const refreshCount = () => { count.textContent = `${items.filter((i) => vaultGrantIds.has(i.id)).length} selected`; };
+    refreshCount();
+    button.disabled = false;
+    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (picked, policies) => {
+      vaultGrantIds.clear();
+      picked.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
+      refreshCount();
+    }));
+  }
+  saveBtn.addEventListener('click', async () => {
+    try {
+      await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({
+        profileId: select.value,
+        credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+        credentialPolicies: vaultCredentialPolicies,
+      }) });
+      toast('Authorization updated — applies at the next agent turn');
+      setTimeout(refreshTask, 250);
+      setTimeout(refreshTasks, 400);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
