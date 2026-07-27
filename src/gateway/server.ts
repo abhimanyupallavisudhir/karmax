@@ -109,6 +109,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
+  if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
@@ -149,6 +151,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -702,6 +705,47 @@ export class Gateway {
       }));
       return this.sendWebResponse(res, response);
     }
+    // Stripe signs this exact raw byte sequence. It cannot pass through the
+    // session gate or JSON parsing before signature verification.
+    if (p === '/api/payments/stripe/webhook' && method === 'POST') {
+      try {
+        const provider = this.deps.paymentRegistry?.get('stripe');
+        const { StripeIssuingProvider } = await import('../autonomy/payments.js');
+        if (!(provider instanceof StripeIssuingProvider))
+          return this.json(res, 503, { error: 'Stripe Issuing is unavailable' });
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const result = provider.handleWebhook(raw,
+          typeof req.headers['stripe-signature'] === 'string' ? req.headers['stripe-signature'] : undefined);
+        const body = JSON.stringify(result.body);
+        res.writeHead(result.status, {
+          'content-type': 'application/json; charset=utf-8',
+          ...(result.stripeVersion ? { 'stripe-version': result.stripeVersion } : {}),
+          'x-karmax-cell': this.deps.cellId ?? 'local',
+        });
+        return void res.end(body);
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (p === '/api/payments/stripe/callback' && method === 'GET') {
+      const code = url.searchParams.get('code') ?? '';
+      const state = url.searchParams.get('state') ?? '';
+      const oauthError = url.searchParams.get('error_description') ?? url.searchParams.get('error');
+      if (oauthError) return this.paymentCallbackPage(res, 400, `Stripe connection was not completed: ${oauthError}`);
+      if (!code || !state) return this.paymentCallbackPage(res, 400, 'The Stripe callback is incomplete.');
+      try {
+        const provider = this.deps.paymentRegistry?.get('stripe');
+        const { StripeIssuingProvider } = await import('../autonomy/payments.js');
+        if (!(provider instanceof StripeIssuingProvider)) throw new Error('Stripe Issuing is unavailable');
+        const connection = await provider.completeOAuth(state, code);
+        const destination = `${organizationSettingsPath(this.deps.store, connection.organizationId)}?payments=stripe-connected&organizationId=${encodeURIComponent(connection.organizationId)}`;
+        res.writeHead(303, { location: destination });
+        return void res.end();
+      } catch (error) {
+        return this.paymentCallbackPage(res, 502,
+          `Stripe could not be connected: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if (p === '/api/sso/start' && method === 'POST' && this.deps.identity) {
       try {
         const b = await this.body(req);
@@ -1049,6 +1093,10 @@ export class Gateway {
         const resources = store.organizationResources(organizationId);
         const projects = store.listProjects().filter((project) => project.organizationId === organizationId);
         for (const project of projects) await this.removeProjectExternalResources(project.id, 'organization deleted');
+        for (const connection of store.listPaymentConnections(organizationId)) {
+          const provider = this.deps.paymentRegistry?.get(connection.provider) as any;
+          if (provider && typeof provider.disconnect === 'function') await provider.disconnect(organizationId);
+        }
         await this.deps.githubApp?.disconnectOrganization(organizationId);
         for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
           this.deps.providerConnections?.delete(organizationId, connection.provider);
@@ -2476,6 +2524,31 @@ export class Gateway {
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const task = store.getTask(taskId);
+        if (action.kind === 'payment') {
+          const request = action.requestId ? store.getPaymentSpendRequest(action.requestId) : undefined;
+          const organizationId = task ? store.getProject(task.projectId)?.organizationId : undefined;
+          if (!request || request.taskId !== taskId || request.organizationId !== organizationId)
+            return this.json(res, 404, { error: 'spend request not found for this task' });
+          const paymentPermission = this.deps.tokens.check(token, 'payment:write',
+            { organizationId, projectId: task?.projectId, taskId });
+          if (!paymentPermission.ok)
+            return this.json(res, 403, { error: paymentPermission.reason ?? 'missing capability payment:write' });
+          if (!this.deps.paymentRegistry && !this.deps.payments)
+            return this.json(res, 503, { error: 'payments are unavailable' });
+          const { BudgetService } = await import('../autonomy/payments.js');
+          const budget = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
+          const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+          const result = action.operation === 'deny'
+            ? budget.deny(request.id, principal)
+            : await budget.approve(request.id, principal);
+          let resumed = false;
+          if (result.status === 'granted') {
+            resumed = await api.signalTask(token, taskId, 'followUp',
+              `Payment request ${request.id} is approved and ready. Continue the purchase using the same request.`)
+              .then(() => true, () => false);
+          }
+          return this.json(res, 200, { kind: 'payment', result, resumed });
+        }
         const handle = worldHandleForView(view, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
         if (action.kind === 'open') {
           const target = String(action.target ?? '');
@@ -2894,17 +2967,112 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      // payment providers (SPEC §7.6): how a user connects funding. Local (mock)
-      // needs nothing; Stripe Issuing connects via OAuth (karmax never sees card data).
-      if (p === '/api/payments/providers' && method === 'GET') {
-        const list = this.deps.paymentRegistry?.list() ?? (this.deps.payments ? [this.deps.payments.describe()] : []);
-        return this.json(res, 200, { providers: list, active: this.deps.payments?.name ?? null });
+      // Payment rails (SPEC §7.6), resolved in the caller's organization. Local
+      // needs no connection; incomplete external rails are reported honestly.
+      const organizationPayments = p.match(/^\/api\/organizations\/([^/]+)\/payments\/(providers|connect)$/);
+      if ((p === '/api/payments/providers' || organizationPayments?.[2] === 'providers') && method === 'GET') {
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const context = { organizationId };
+        const list = this.deps.paymentRegistry?.list(context)
+          ?? (this.deps.payments ? [this.deps.payments.describe(context)] : []);
+        const active = this.deps.paymentRegistry?.active(organizationId).name ?? this.deps.payments?.name ?? null;
+        return this.json(res, 200, { providers: list, active });
       }
-      if (p === '/api/payments/connect' && method === 'POST') {
+      if ((p === '/api/payments/connect' || organizationPayments?.[2] === 'connect') && method === 'POST') {
         const b = await this.body(req);
         const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
         if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
-        return this.json(res, 200, await prov.connect());
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const result = await prov.connect({
+          organizationId,
+          userId: session.userId,
+          redirectUri: `${this.publicUrl(req)}/api/payments/stripe/callback`,
+        });
+        if (result.status === 'connected') {
+          const current = store.getSettings(`organization:${organizationId}`, 'payments') ?? {};
+          store.setSettings(`organization:${organizationId}`, 'payments', { ...current, provider: prov.name });
+        }
+        return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
+      }
+      const paymentDisconnect = p.match(/^\/api\/organizations\/([^/]+)\/payments\/connections\/([^/]+)$/);
+      if (paymentDisconnect && method === 'DELETE') {
+        const organizationId = paymentDisconnect[1]!;
+        const provider = this.deps.paymentRegistry?.get(paymentDisconnect[2]!);
+        if (!provider) return this.json(res, 404, { error: 'payment provider not found' });
+        const stripe = provider as any;
+        if (typeof stripe.disconnect !== 'function') return this.json(res, 400, { error: 'this provider has no connection to remove' });
+        await stripe.disconnect(organizationId);
+        const current = store.getSettings(`organization:${organizationId}`, 'payments') ?? {};
+        store.setSettings(`organization:${organizationId}`, 'payments', { ...current, provider: 'mock' });
+        return this.json(res, 200, { ok: true });
+      }
+      const paymentBalance = p.match(/^\/api\/organizations\/([^/]+)\/payments\/balance$/);
+      if (paymentBalance && method === 'GET') {
+        const providerName = url.searchParams.get('provider')
+          ?? (store.getSettings(`organization:${paymentBalance[1]}`, 'payments') as any)?.provider
+          ?? 'mock';
+        const provider = this.deps.paymentRegistry?.get(providerName) ?? this.deps.payments;
+        if (!provider) return this.json(res, 400, { error: 'no payment provider configured' });
+        return this.json(res, 200, await provider.balance(paymentBalance[1]!));
+      }
+      const paymentCardholders = p.match(/^\/api\/organizations\/([^/]+)\/payments\/cardholders$/);
+      if (paymentCardholders && method === 'GET') {
+        const provider = this.deps.paymentRegistry?.get(url.searchParams.get('provider') ?? 'stripe');
+        if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        return this.json(res, 200, await provider.listCardholders(paymentCardholders[1]!));
+      }
+      if (paymentCardholders && method === 'POST') {
+        const b = await this.body(req);
+        const provider = this.deps.paymentRegistry?.get(String(b.provider ?? 'stripe'));
+        if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        try {
+          return this.json(res, 200, await provider.createCardholder(paymentCardholders[1]!, {
+            type: b.type === 'company' ? 'company' : 'individual',
+            name: String(b.name ?? ''),
+            email: b.email ? String(b.email) : undefined,
+            phone: b.phone ? String(b.phone) : undefined,
+            address: {
+              line1: String(b.address?.line1 ?? ''),
+              line2: b.address?.line2 ? String(b.address.line2) : undefined,
+              city: String(b.address?.city ?? ''),
+              state: b.address?.state ? String(b.address.state) : undefined,
+              postalCode: String(b.address?.postalCode ?? ''),
+              country: String(b.address?.country ?? ''),
+            },
+            firstName: b.firstName ? String(b.firstName) : undefined,
+            lastName: b.lastName ? String(b.lastName) : undefined,
+            dob: b.dob ? { day: Number(b.dob.day), month: Number(b.dob.month), year: Number(b.dob.year) } : undefined,
+          }));
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const paymentRequests = p.match(/^\/api\/organizations\/([^/]+)\/payments\/requests$/);
+      if (paymentRequests && method === 'GET')
+        return this.json(res, 200, store.listPaymentSpendRequests({ organizationId: paymentRequests[1]! }));
+      const paymentTransactions = p.match(/^\/api\/organizations\/([^/]+)\/payments\/transactions$/);
+      if (paymentTransactions && method === 'GET')
+        return this.json(res, 200, store.listPaymentTransactions(paymentTransactions[1]!));
+      const paymentResolve = p.match(/^\/api\/organizations\/([^/]+)\/payments\/requests\/([^/]+)\/(approve|deny)$/);
+      if (paymentResolve && method === 'POST') {
+        const request = store.getPaymentSpendRequest(paymentResolve[2]!);
+        if (!request || request.organizationId !== paymentResolve[1])
+          return this.json(res, 404, { error: 'spend request not found in this organization' });
+        const { BudgetService } = await import('../autonomy/payments.js');
+        if (!this.deps.paymentRegistry && !this.deps.payments)
+          return this.json(res, 503, { error: 'payments are unavailable' });
+        const budget = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
+        const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+        const result = paymentResolve[3] === 'approve'
+          ? await budget.approve(request.id, principal)
+          : budget.deny(request.id, principal);
+        let resumed = false;
+        if (result.status === 'granted') {
+          resumed = await api.signalTask(token, request.taskId, 'followUp',
+            `Payment request ${request.id} is approved and ready. Continue the purchase using the same request.`)
+            .then(() => true, () => false);
+        }
+        return this.json(res, 200, { ...result, resumed });
       }
 
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
@@ -3242,30 +3410,73 @@ export class Gateway {
       if (p === '/api/cards' && method === 'GET') {
         const pid = url.searchParams.get('projectId') ?? undefined;
         const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
+        if (pid && cardOrg && store.getProject(pid)?.organizationId !== cardOrg)
+          return this.json(res, 404, { error: 'project not found in this organization' });
         return this.json(res, 200, store.listCards(pid, cardOrg));
       }
       if (p === '/api/cards' && method === 'POST') {
-        if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
+        if (!this.deps.paymentRegistry && !this.deps.payments)
+          return this.json(res, 400, { error: 'no payment provider configured' });
         const b = await this.body(req);
         // A non-project card belongs to the caller's own organization (the old
         // installation-wide "global" card is gone in the multi-tenant model).
         const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId
           ?? (b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined) ?? 'org_personal';
-        const card = await this.deps.payments.provisionCard({
+        if (b.scope === 'project' && (!b.projectId || store.getProject(String(b.projectId))?.organizationId !== cardOrg))
+          return this.json(res, 400, { error: 'project does not belong to this organization' });
+        const provider = b.provider
+          ? this.deps.paymentRegistry?.get(String(b.provider))
+          : this.deps.paymentRegistry?.active(cardOrg) ?? this.deps.payments;
+        if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        const card = await provider.provisionCard({
           scope: b.scope === 'project' ? 'project' : 'organization',
           scopeId: b.scope === 'project' ? b.projectId : cardOrg,
           label: b.label ?? 'Card',
           cap: Number(b.cap ?? 0),
           merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
+          organizationId: cardOrg,
+          currency: b.currency ? String(b.currency) : 'usd',
+          cardholderId: b.cardholderId ? String(b.cardholderId) : undefined,
         });
         return this.json(res, 200, card);
       }
       const fundMatch = p.match(/^\/api\/cards\/([^/]+)\/fund$/);
       if (fundMatch && method === 'POST') {
-        if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
+        if (!this.deps.paymentRegistry && !this.deps.payments)
+          return this.json(res, 400, { error: 'no payment provider configured' });
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const card = store.getCard(fundMatch[1]!);
+        const belongs = card?.scope === 'organization'
+          ? card.scopeId === cardOrg
+          : card?.scope === 'project'
+            ? Boolean(card.scopeId && store.getProject(card.scopeId)?.organizationId === cardOrg)
+            : card?.scope === 'global' && cardOrg === 'org_personal';
+        if (!belongs)
+          return this.json(res, 404, { error: 'card not found in this organization' });
+        const provider = this.deps.paymentRegistry?.forCard(card) ?? this.deps.payments;
+        if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
         const b = await this.body(req);
-        await this.deps.payments.fund(fundMatch[1]!, Number(b.amount ?? 0));
-        return this.json(res, 200, store.getCard(fundMatch[1]!) ?? null);
+        try {
+          await provider.fund(fundMatch[1]!, Number(b.amount ?? 0));
+          return this.json(res, 200, store.getCard(fundMatch[1]!) ?? null);
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const cardMatch = p.match(/^\/api\/cards\/([^/]+)$/);
+      if (cardMatch && method === 'DELETE') {
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const card = store.getCard(cardMatch[1]!) as import('../autonomy/payments.js').Card | undefined;
+        const belongs = card?.scope === 'organization'
+          ? card.scopeId === cardOrg
+          : card?.scope === 'project'
+            ? Boolean(card.scopeId && store.getProject(card.scopeId)?.organizationId === cardOrg)
+            : card?.scope === 'global' && cardOrg === 'org_personal';
+        if (!card || !belongs) return this.json(res, 404, { error: 'card not found in this organization' });
+        const provider = this.deps.paymentRegistry?.forCard(card) ?? this.deps.payments;
+        if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        await provider.revoke(card.id);
+        return this.json(res, 200, store.getCard(card.id));
       }
 
       // accounts: API-key handles (broker; secrets write-only) + config-home
@@ -4334,6 +4545,14 @@ export class Gateway {
   private async removeProjectExternalResources(projectId: string, reason: string) {
     const project = this.deps.store.getProject(projectId);
     if (!project) throw new Error('project not found');
+    for (const card of this.deps.store.listCards(projectId, project.organizationId)
+      .filter((candidate) => candidate.scope === 'project' && candidate.scopeId === projectId
+        && candidate.status !== 'canceled')) {
+      const provider = this.deps.paymentRegistry?.forCard(card)
+        ?? (card.provider === this.deps.payments?.name ? this.deps.payments : undefined);
+      if (!provider) throw new Error(`payment provider "${card.provider}" is unavailable; cannot safely revoke ${card.label}`);
+      await provider.revoke(card.id);
+    }
     const resources = this.deps.store.projectResources(projectId);
     for (const task of this.deps.store.listTasks(projectId)) {
       try { await this.deps.client.workflow.getHandle(task.id).terminate(reason); }
@@ -4517,6 +4736,12 @@ export class Gateway {
     const body = `<!doctype html><meta charset="utf-8"><title>Karmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
       'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.end(body);
+  }
+  private paymentCallbackPage(res: http.ServerResponse, status: number, message: string) {
+    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8',
+      'content-length': String(Buffer.byteLength(body)), 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async body(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<any> {

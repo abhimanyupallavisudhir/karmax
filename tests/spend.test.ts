@@ -50,10 +50,22 @@ describe('request_spend through the agent loop (SPEC §7.6)', () => {
     const t = await post(`/api/projects/${projectId}/tasks`, { workflow: 'just-do', params: { prompt: '@spend 600000 :: buy something expensive' } });
     const v = await poll(t.id, 'review');
     expect(v.reviewInfo.summary).toMatch(/Funding needed/i);
+    const paymentAction = v.reviewInfo.actions.findIndex((action: any) =>
+      action.kind === 'payment' && action.operation === 'approve');
+    expect(paymentAction).toBeGreaterThanOrEqual(0);
     const events = await get(`/api/tasks/${t.id}/events?since=0`);
     expect(events.some((e: any) => e.type === 'spend.requested' && e.payload.status === 'needs_funding')).toBe(true);
     // funds unchanged (no charge on a non-granted spend)
     const cards = await get(`/api/cards?projectId=${projectId}`);
     expect(cards.find((c: any) => c.id === cardId).available).toBe(498000);
+
+    // The review action resolves the durable request, settles once, and retries
+    // the task. The retried request_spend observes that settlement instead of
+    // charging a second time.
+    await post(`/api/cards/${cardId}/fund`, { amount: 102000 });
+    const resolved = await post(`/api/tasks/${t.id}/review-action`, { index: paymentAction });
+    expect(resolved.result.status).toBe('granted');
+    const after = await get(`/api/cards?projectId=${projectId}`);
+    expect(after.find((c: any) => c.id === cardId).available).toBe(0);
   });
 });

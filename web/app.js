@@ -4875,9 +4875,10 @@ function wireTerminal(taskId) {
 // ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
 function reviewActionBtn(a, i) {
   const isRun = a.kind === 'run';
-  const icon = isRun ? (a.server ? '▶' : '⚡') : '↗';
-  const label = `${icon} ${esc(a.label || (isRun ? 'Run' : 'Open'))}`;
-  const title = isRun ? esc(a.command || '') : esc(a.target || '');
+  const isPayment = a.kind === 'payment';
+  const icon = isPayment ? (a.operation === 'deny' ? '✕' : '✓') : isRun ? (a.server ? '▶' : '⚡') : '↗';
+  const label = `${icon} ${esc(a.label || (isPayment ? 'Resolve spend' : isRun ? 'Run' : 'Open'))}`;
+  const title = isPayment ? `Payment request ${esc(a.requestId || '')}` : isRun ? esc(a.command || '') : esc(a.target || '');
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
@@ -4904,6 +4905,12 @@ function wireReviewActions(v) {
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'payment') {
+          toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
+            r.result?.status === 'denied');
+          await refreshTask(v.taskId);
+          return;
+        }
         // kind === 'run': stream output; open follow-up URLs; offer Stop.
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
@@ -8301,45 +8308,87 @@ function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
     <div class="section-h">Payments — budget & cards</div>
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Funding source</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this installation pays. Projects can have narrower cards and policies; karmax never stores card numbers.</p>
+      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
       <div class="pay-providers-list">Loading…</div>
-    </div>` : ''}
+      <div class="pay-balance" style="margin-top:8px"></div>
+    </div>
+    <details class="pay-cardholder" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Create Stripe Issuing cardholder</summary>
+      <div class="form-row" style="margin-top:8px"><div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select>
+        <input class="holder-name" placeholder="full or company name" />
+        <input class="holder-first" placeholder="first name (individual)" />
+        <input class="holder-last" placeholder="last name (individual)" />
+        <input class="holder-dob" type="date" title="date of birth (individual)" />
+        <input class="holder-email" type="email" placeholder="email" />
+        <input class="holder-phone" placeholder="phone" />
+        <input class="holder-line1" placeholder="address line 1" />
+        <input class="holder-city" placeholder="city" />
+        <input class="holder-state" placeholder="state/region" />
+        <input class="holder-postal" placeholder="postal code" />
+        <input class="holder-country" placeholder="country (US)" style="width:100px" />
+        <button class="btn sm" data-addholder>Create cardholder</button>
+      </div></div>
+    </details>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
     <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
     <div class="section-h" style="margin-top:14px">Cards</div>
     <div class="cards-list" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Add a ${scope} card</label>
+    <div class="form-row"><label>Add ${scope === 'global' ? 'an organization' : 'a project'} card</label>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <input class="card-label" placeholder="label (e.g. Ops)" />
         <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
+        <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
+        <select class="card-provider"><option value="mock">Local test funds</option></select>
+        <select class="card-cardholder hidden"><option value="">Choose Stripe cardholder</option></select>
         <button class="btn" data-addcard="${scope}">Add card</button>
       </div></div>
+    ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
+      <div class="section-h" style="margin-top:14px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-async function wirePaymentProviders(box) {
+async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
-  try { data = await api('/api/payments/providers'); } catch {}
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  try { data = await api(`${paymentsBase}/providers`); } catch {}
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : ''}
+        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
           <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}</div>`).join('')
+        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
+        ${p.kind === 'oauth' && (p.connected || p.connectionStatus) ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('')
     : '<span style="color:var(--ink-3)">No payment providers.</span>';
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const r = await api('/api/payments/connect', { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
-      const row = b.closest('[data-prov]');
+      const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
       if (r.status === 'awaiting_oauth' && r.url) {
-        row.insertAdjacentHTML('beforeend', `<div style="font-size:12px;margin-top:6px;flex-basis:100%">Open to authorize (karmax never sees your card data):<br><a href="${esc(r.url)}" target="_blank" rel="noopener" class="mono">${esc(r.url)}</a></div>`);
-      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box); }
+        location.assign(r.url);
+      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box, organizationId); }
       else { toast(r.detail || 'Not available', true); }
     } catch (e) { toast(e.message, true); }
   }));
+  list.querySelectorAll('[data-disconnectpay]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Disconnect ${b.dataset.disconnectpay} from this organization? Existing cards will be unusable.`)) return;
+    try {
+      await api(`${paymentsBase}/connections/${encodeURIComponent(b.dataset.disconnectpay)}`, { method: 'DELETE' });
+      toast('Payment provider disconnected');
+      wirePaymentProviders(box, organizationId);
+    } catch (e) { toast(e.message, true); }
+  }));
+  if (organizationId && data.active) {
+    try {
+      const balance = await api(`${paymentsBase}/balance?provider=${encodeURIComponent(data.active)}`);
+      const el = box.querySelector('.pay-balance');
+      if (el) el.innerHTML = `<b>Available balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
+    } catch {}
+  }
+  return data;
 }
 async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
@@ -8347,8 +8396,61 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   // Non-project cards belong to the organization (tenant boundary), not the
   // whole installation. `scope==='global'` here is the org-settings surface.
   const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
-  if (scope === 'global') await wirePaymentProviders(box);
-  const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  let providerData;
+  if (scope === 'global') providerData = await wirePaymentProviders(box, organizationId);
+  else {
+    try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
+  }
+  const providerSelect = box.querySelector('.card-provider');
+  const holderSelect = box.querySelector('.card-cardholder');
+  const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
+  providerSelect.innerHTML = usableProviders.map((p) =>
+    `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  const loadCardholders = async () => {
+    const stripe = providerSelect.value === 'stripe';
+    holderSelect.classList.toggle('hidden', !stripe);
+    if (!stripe) return;
+    try {
+      const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
+      holderSelect.innerHTML = `<option value="">Choose Stripe cardholder</option>${holders
+        .filter((h) => h.status === 'active').map((h) => `<option value="${esc(h.id)}">${esc(h.name)} · ${esc(h.type)}</option>`).join('')}`;
+    } catch (e) {
+      holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
+    }
+  };
+  providerSelect.addEventListener('change', loadCardholders);
+  await loadCardholders();
+  box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
+    const dobValue = box.querySelector('.holder-dob').value;
+    const dob = dobValue ? new Date(`${dobValue}T00:00:00Z`) : undefined;
+    try {
+      await api(`${paymentsBase}/cardholders`, { method: 'POST', body: JSON.stringify({
+        provider: 'stripe',
+        type: box.querySelector('.holder-type').value,
+        name: box.querySelector('.holder-name').value.trim(),
+        firstName: box.querySelector('.holder-first').value.trim() || undefined,
+        lastName: box.querySelector('.holder-last').value.trim() || undefined,
+        dob: dob ? { day: dob.getUTCDate(), month: dob.getUTCMonth() + 1, year: dob.getUTCFullYear() } : undefined,
+        email: box.querySelector('.holder-email').value.trim() || undefined,
+        phone: box.querySelector('.holder-phone').value.trim() || undefined,
+        address: {
+          line1: box.querySelector('.holder-line1').value.trim(),
+          city: box.querySelector('.holder-city').value.trim(),
+          state: box.querySelector('.holder-state').value.trim() || undefined,
+          postalCode: box.querySelector('.holder-postal').value.trim(),
+          country: box.querySelector('.holder-country').value.trim(),
+        },
+      }) });
+      toast('Stripe cardholder created');
+      await loadCardholders();
+    } catch (e) { toast(e.message, true); }
+  });
+  const sUrl = scope === 'global' && organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`
+    : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}
   if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
@@ -8370,13 +8472,22 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
-      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
-        <input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button></div>`).join('')
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="chip">${esc(c.provider)}</span> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope} · ${esc(c.id)}</span><div class="task-sub">${esc(c.status || 'active')} · available ${usd(c.available)} / cap ${usd(c.cap)}${c.merchantLock?.length ? ` · merchants ${c.merchantLock.map(esc).join(', ')}` : ''}</div></div>
+        ${c.provider === 'mock' && c.status !== 'canceled' ? `<input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button>` : ''}
+        ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
       const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
       if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+    }));
+    list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Revoke this card? This cannot be undone.')) return;
+      try {
+        await api(`/api/cards/${b.dataset.revoke}${orgQ ? `?${orgQ}` : ''}`, { method: 'DELETE' });
+        toast('Card revoked');
+        renderCards();
+      } catch (e) { toast(e.message, true); }
     }));
   };
   await renderCards();
@@ -8384,13 +8495,48 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     const label = box.querySelector('.card-label').value.trim() || 'Card';
     const cap = box.querySelector('.card-cap').value;
     try {
-      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ scope: scope === 'project' ? 'project' : 'organization', projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
+        scope: scope === 'project' ? 'project' : 'organization',
+        projectId: scope === 'project' ? projectId : undefined,
+        label,
+        cap: Math.round(Number(cap || 0) * 100),
+        merchantLock: box.querySelector('.card-merchants').value.split(',').map((value) => value.trim()).filter(Boolean),
+        provider: providerSelect.value,
+        cardholderId: providerSelect.value === 'stripe' ? holderSelect.value : undefined,
+      }) });
       box.querySelector('.card-label').value = '';
       box.querySelector('.card-cap').value = '';
+      box.querySelector('.card-merchants').value = '';
       toast('Card added');
       renderCards();
     } catch (e) { toast(e.message, true); }
   });
+  if (scope === 'global' && organizationId) {
+    const renderLedger = async () => {
+      let requests = [], transactions = [];
+      try { [requests, transactions] = await Promise.all([
+        api(`${paymentsBase}/requests`), api(`${paymentsBase}/transactions`),
+      ]); } catch {}
+      const pending = requests.filter((r) => ['pending_approval', 'needs_funding', 'authorized', 'consumed'].includes(r.status));
+      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map((r) =>
+        `<div class="queue-item"><div style="flex:1"><b>${usd(r.amount)}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
+          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`).join('')
+        : '<span style="color:var(--ink-3)">No pending requests.</span>';
+      box.querySelector('.pay-transactions').innerHTML = transactions.length ? transactions.slice(0, 50).map((t) =>
+        `<div class="queue-item"><div style="flex:1"><b>${usd(t.amount)}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
+        : '<span style="color:var(--ink-3)">No payment activity.</span>';
+      box.querySelectorAll('[data-payapprove],[data-paydeny]').forEach((b) => b.addEventListener('click', async () => {
+        const id = b.dataset.payapprove || b.dataset.paydeny;
+        const op = b.dataset.payapprove ? 'approve' : 'deny';
+        try {
+          const r = await api(`${paymentsBase}/requests/${encodeURIComponent(id)}/${op}`, { method: 'POST' });
+          toast(r.status === 'granted' ? 'Spend approved' : r.reason || 'Request updated', r.status === 'denied');
+          renderLedger();
+        } catch (e) { toast(e.message, true); }
+      }));
+    };
+    await renderLedger();
+  }
 }
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────

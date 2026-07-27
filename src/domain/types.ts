@@ -825,15 +825,17 @@ export interface AgentActivity {
 
 /**
  * A single click-to-verify affordance the reviewer can act on. Review info is a
- * list of these — NOT a prose changelog (that belongs in the conversation). Two
+ * list of these — NOT a prose changelog (that belongs in the conversation). Three
  * primitives:
  *  - `run`  — a shell command executed IN THE TASK'S WORLD (start a server, run an
  *             app or script). A long-lived one (`server: true`) streams logs and can
  *             be stopped; `openUrls` are opened once it's up.
  *  - `open` — open a produced artifact: a world-relative file (PDF, notebook, image,
  *             video) or an absolute URL. No command runs.
+ *  - `payment` — approve or deny a durable spend request. The server resolves the
+ *                request by id and enforces both task and organization ownership.
  */
-export type ReviewActionKind = 'run' | 'open';
+export type ReviewActionKind = 'run' | 'open' | 'payment';
 
 export interface ReviewAction {
   kind: ReviewActionKind;
@@ -847,6 +849,9 @@ export interface ReviewAction {
   openUrls?: string[];
   /** `open` only: world-relative file path OR an absolute URL to open. */
   target?: string;
+  /** `payment` only: durable spend request and reviewer operation. */
+  requestId?: string;
+  operation?: 'approve' | 'deny';
 }
 
 export interface ReviewInfo {
