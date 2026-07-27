@@ -921,7 +921,9 @@ export class Gateway {
         } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
       }
       if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
-      if (this.deps.password && b.password === this.deps.password) {
+      // Constant-time, like the Stripe webhook and the agent-mail ingest secret:
+      // this compares a shared secret on an unauthenticated route.
+      if (this.deps.password && timingSafeEqualStr(String(b.password ?? ''), this.deps.password)) {
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
       }

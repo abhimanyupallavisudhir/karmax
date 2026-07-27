@@ -468,6 +468,12 @@ function principalLabel(principal) {
   return `Task agent · ${principal.role}`;
 }
 
+// The workflows a human may pick when creating a task. INTENDED: `just-do` and
+// `script-exec` are deliberately absent — they are legacy workflows kept
+// resolvable so existing version-pinned tasks keep replaying, and their
+// manifests carry `selectable: false` to say so (src/contrib/manifests.ts).
+// Do not "fix" this by adding them to the picker. `workflowLabel` falls back to
+// the raw id so such a task still renders sensibly wherever one does appear.
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
