@@ -221,7 +221,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const here = path.dirname(fileURLToPath(import.meta.url));
       if (!fs.existsSync(here)) {
         throw new Error(
-          `karmax is running from a deleted directory (${here}) — an orphaned app instance, ` +
+          `krmax is running from a deleted directory (${here}) — an orphaned app instance, ` +
             `likely booted from a task world that has since merged and been removed (karmax#3). ` +
             `Kill this process (pid ${process.pid}); it is poisoning the shared task queue. ` +
             `Original error: ${String(e)}`,

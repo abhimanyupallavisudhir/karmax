@@ -2105,7 +2105,7 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
-      <div class="brand">${brandMark()} karmax</div>
+      <div class="brand">${brandMark()} krmax</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
         <option value="__new">＋ New organization</option>
@@ -5780,12 +5780,12 @@ async function openLocalCheckout(v) {
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">The task branch is the handoff boundary. Karmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    <p class="task-sub">The task branch is the handoff boundary. Krmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
-    <p class="task-sub">Karmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
+    <p class="task-sub">Krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
     <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
   </div></div>`;
   host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
@@ -5812,7 +5812,7 @@ async function materializeLocalCheckout(v, session) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+    <p class="task-sub">Krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
@@ -6850,7 +6850,7 @@ async function refreshHostDiag() {
 // typed into them), the Temporal server, git/exec helpers — grouped by owning
 // entity with live CPU% / RSS. Kill via POST /api/processes/kill (SIGTERM;
 // shift-click for SIGKILL). Protected infrastructure gets no kill button.
-const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe', app: 'karmax', untracked: 'misc' };
+const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe', app: 'krmax', untracked: 'misc' };
 
 function fmtDur(sec) {
   if (!sec || sec < 0) return '—';
@@ -6867,7 +6867,7 @@ function procPanelHtml(sample) {
   // A row is either killable (button) or protected (visible lock, so the kill
   // affordance is discoverable even on an idle instance where only protected
   // infrastructure — karmax itself + Temporal — is running).
-  const LOCK = `<span class="proc-lock" title="Protected — karmax can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
+  const LOCK = `<span class="proc-lock" title="Protected — krmax can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
   const killBtn = (pid, label, killable) =>
     killable
       ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
@@ -6910,7 +6910,7 @@ function procPanelHtml(sample) {
       <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (karmax core &amp; Temporal); everything else gets a ✕ kill button</div>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (krmax core &amp; Temporal); everything else gets a ✕ kill button</div>
   </div>`;
 }
 
@@ -6984,7 +6984,7 @@ async function renderDashboard() {
       ${!isOperator ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
-      <div class="section-h">Processes — everything karmax is running</div>
+      <div class="section-h">Processes — everything krmax is running</div>
       <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
@@ -7832,7 +7832,7 @@ function settingsView(proj) {
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
       <button type="button" data-project-jump="project-secrets"><b>Secret</b><span>A sensitive value</span></button>
-      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files Karmax versions</span></button>
+      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files Krmax versions</span></button>
       <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
     </div>
@@ -7840,7 +7840,7 @@ function settingsView(proj) {
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files Karmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files Krmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
     <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
@@ -7898,7 +7898,7 @@ async function hydrateProjectSecrets(proj) {
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
         <div class="project-form-grid">
-          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in Karmax.</small></label>
+          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in Krmax.</small></label>
           <label class="form-row"><span>Value</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"><small class="field-help">Encrypted immediately and never returned by the API.</small></label>
           <label class="form-row wide"><span>Deliver as a private file <small>(optional)</small></span><input id="project-secret-file" placeholder=".secrets/service-account.json"><small class="field-help">Leave blank to inject it as an environment variable with the name above. File secrets are mode 0600 and privately Git-excluded.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
@@ -7937,7 +7937,7 @@ async function hydrateProjectData(proj) {
   try {
     const all = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Karmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
+    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Krmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${!S.meta?.hosted && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
       ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>'}
@@ -7976,7 +7976,7 @@ async function hydrateProjectData(proj) {
         const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
-          || '<div class="project-empty">Nothing looks like project data. Karmax checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>';
+          || '<div class="project-empty">Nothing looks like project data. Krmax checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>';
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
           $('#data-add-panel').open = true;
@@ -8028,12 +8028,12 @@ async function hydrateProjectServices(proj) {
           <label class="form-row"><span>Container image</span><input id="service-image" placeholder="postgres:16"></label>
           <label class="form-row"><span>Container port</span><input id="service-port" inputmode="numeric" placeholder="5432"></label>
           <label class="form-row"><span>Give its URL to tasks as</span><input id="service-url-env" placeholder="DATABASE_URL"><small class="field-help">The environment-variable name, not the secret value.</small></label>
-          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">Karmax replaces host and port for each isolated world.</small></label>
+          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">Krmax replaces host and port for each isolated world.</small></label>
           <label class="form-row"><span>Optional seed data</span><select id="service-seed"><option value="">No seed data</option>${data.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)} · ${esc(resource.target.path)}</option>`).join('')}</select></label>
           <label class="form-row"><span>Seed destination in container</span><input id="service-seed-path" placeholder="/docker-entrypoint-initdb.d/seed.sql"></label>
         </div></div>
         <div class="service-fields" data-service-kind="external" hidden><div class="project-form-grid">
-          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. Karmax passes only an opaque credential handle to the task world.</small></label>
+          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. Krmax passes only an opaque credential handle to the task world.</small></label>
         </div></div>
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
       </details>`;
@@ -8534,7 +8534,7 @@ function globalSettingsView(embedded = false) {
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude, Codex, or explicitly supported OpenCode subscription. Each gets an isolated config home you can switch between. karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude, Codex, or explicitly supported OpenCode subscription. Each gets an isolated config home you can switch between. krmax opens the provider's own login — you complete it; krmax never types your credentials.</p>
       <div class="form-row"><label>Connect a login</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <select id="login-provider"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
@@ -8566,7 +8566,7 @@ function globalSettingsView(embedded = false) {
           <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
           <button class="btn" id="acct-add">Register</button>
         </div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — karmax never sees it elsewhere.)</div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — krmax never sees it elsewhere.)</div>
       </div>
     </div>
     <div class="card" id="git-accounts-card">
@@ -8592,7 +8592,7 @@ function globalSettingsView(embedded = false) {
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with karmax; workflows installed here are available only to this organization. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with krmax; workflows installed here are available only to this organization. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Install from a git repo</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -8608,7 +8608,7 @@ function globalSettingsView(embedded = false) {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
     </div>
-    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open Karmax securely from your phone</small></div></div>
+    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open Krmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>`;
@@ -8618,8 +8618,8 @@ function phoneInstallHelp() {
   if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
     return '<span class="phone-installed">Installed on this device ✓</span>';
   }
-  return `<button class="btn sm" id="install-karmax">Add Karmax to this phone</button>
-    <span class="task-sub" id="phone-install-note">No native Karmax app is needed.</span>`;
+  return `<button class="btn sm" id="install-karmax">Add Krmax to this phone</button>
+    <span class="task-sub" id="phone-install-note">No native Krmax app is needed.</span>`;
 }
 
 function isFetchInterruption(error) {
@@ -8639,12 +8639,12 @@ function renderPhoneAccess(status) {
     : status.state === 'conflict'
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
-    ? `<div class="phone-access-address"><span>Access your Karmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your Karmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
+    ? `<div class="phone-access-address"><span>Access your Krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Access your Krmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
   const phoneSteps = hosted
     ? '<li>Open this same HTTPS address on your phone.</li>'
     : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
-       <li>Open the private Karmax address shown here in your phone’s browser.</li>`;
+       <li>Open the private Krmax address shown here in your phone’s browser.</li>`;
   const recovery = ready && !hosted
     ? `<details class="phone-troubleshooting">
         <summary>Address won’t open?</summary>
@@ -8652,7 +8652,7 @@ function renderPhoneAccess(status) {
           <li>Disconnect Mullvad or any other VPN on both devices, then reconnect Tailscale. Android and iOS allow only one active VPN.</li>
           <li>On Android, check Tailscale → Settings → App-based split tunneling. Your browser must not bypass Tailscale.</li>
           <li>If the error mentions DNS or “name not found,” set Android Private DNS to Automatic, turn off browser Secure DNS temporarily, and reconnect Tailscale.</li>
-          <li>Keep this computer awake with Karmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
+          <li>Keep this computer awake with Krmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
         </ol>
        </details>`
     : '';
@@ -8662,9 +8662,9 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? 'Why this Karmax is not being served' : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? 'Why this Krmax is not being served' : 'Set up instructions';
   const setupIntro = status.state === 'conflict'
-    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or Karmax instance.</p>'
+    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or Krmax instance.</p>'
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
         (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
@@ -8691,22 +8691,22 @@ function renderPhoneAccess(status) {
             <button class="btn sm" id="remote-refresh">Check again</button>
             ${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}
           </div>
-          ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. Karmax never sees your OS or Tailscale password.</p>' : ''}
+          ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. Krmax never sees your OS or Tailscale password.</p>' : ''}
           ${fallback}
         </div>
        </details>`
     : `<p>${esc(status.detail)}</p>`;
   box.innerHTML = `${address}
     ${setupPanel}
-    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use Krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
       <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">${hosted ? 'Karmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Karmax stays bound to localhost and is never made public.'}</p>`;
+    <p class="phone-security">${hosted ? 'Krmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Krmax stays bound to localhost and is never made public.'}</p>`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
     if (approvalTab) {
       approvalTab.document.title = 'Tailscale setup';
-      approvalTab.document.body.textContent = 'Waiting for Karmax to start Tailscale…';
+      approvalTab.document.body.textContent = 'Waiting for Krmax to start Tailscale…';
     }
     button.disabled = true;
     button.textContent = action === 'setup' ? 'Starting…' : action === 'enable' ? 'Turning on…' : 'Turning off…';
@@ -8733,7 +8733,7 @@ function renderPhoneAccess(status) {
           missedChecks++;
           if (missedChecks === 1) {
             renderPhoneAccess(pollingStatus(
-              'Tailscale is reconnecting this computer. A brief interruption is normal; Karmax will keep checking.',
+              'Tailscale is reconnecting this computer. A brief interruption is normal; Krmax will keep checking.',
             ));
           }
         }
@@ -8768,7 +8768,7 @@ function renderPhoneAccess(status) {
     } catch (error) {
       if (action === 'setup' && isFetchInterruption(error)) {
         const reconnecting = pollingStatus(
-          'The connection changed while Tailscale started. This can be normal; Karmax will reconnect and keep checking.',
+          'The connection changed while Tailscale started. This can be normal; Krmax will reconnect and keep checking.',
         );
         renderPhoneAccess(reconnecting);
         await finishSetup(reconnecting);
@@ -8807,7 +8807,7 @@ function renderPhoneAccess(status) {
       await installPrompt.prompt();
       await installPrompt.userChoice;
       installPrompt = null;
-      if (note) note.textContent = 'Karmax can now open from your Home Screen.';
+      if (note) note.textContent = 'Krmax can now open from your Home Screen.';
       return;
     }
     const ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
@@ -8828,14 +8828,14 @@ async function hydratePhoneAccess() {
     if (!renderIsCurrent()) return;
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
-        <span>Access your Karmax at</span>
-        <b>${disconnected ? 'Could not reach Karmax' : 'Could not check Phone Access'}</b>
+        <span>Access your Krmax at</span>
+        <b>${disconnected ? 'Could not reach Krmax' : 'Could not check Phone Access'}</b>
       </div>
       <div class="phone-setup-body">
         <div class="phone-access-head"><span class="remote-state">Needs attention</span><span>${
           disconnected
             ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
-            : esc(error?.message || 'Karmax could not check Tailscale.')
+            : esc(error?.message || 'Krmax could not check Tailscale.')
         }</span></div>
         <div class="phone-access-actions"><button class="btn sm" id="remote-retry">Check again</button></div>
       </div>`;
@@ -8921,7 +8921,7 @@ function paymentsCard(scope) {
     <button class="btn primary" data-addcard="${scope}">Add card</button>
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
-      <p class="task-sub">For registered businesses. Lets Karmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
+      <p class="task-sub">For registered businesses. Lets Krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
       ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
       <div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
@@ -8992,7 +8992,7 @@ async function wirePaymentProviders(box, organizationId) {
       : '<span class="chip">webhook secret missing</span>';
     platformBox.innerHTML = `<details ${platform.configured && platform.webhookConfigured ? '' : 'open'}>
       <summary style="cursor:pointer;font-weight:600">Stripe platform setup ${status} ${webhook}</summary>
-      <p class="task-sub">One Stripe Connect application identifies this Karmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
+      <p class="task-sub">One Stripe Connect application identifies this Krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
       <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
       <div class="settings-grid">
         <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
@@ -9002,7 +9002,7 @@ async function wirePaymentProviders(box, organizationId) {
         <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
       </div>
       ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
-      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in Karmax’s encrypted vault and makes them take precedence.</p>' : ''}
+      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in Krmax’s encrypted vault and makes them take precedence.</p>' : ''}
     </details>`;
     platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
       try {
@@ -9139,7 +9139,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — Karmax only mirrors the figure.');
+      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — Krmax only mirrors the figure.');
       if (!amt || !Number(amt)) return;
       try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
@@ -9263,7 +9263,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
-          ${request.kind === 'reset' ? '<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; karmax will resume the agent automatically.</div>' : ''}
+          ${request.kind === 'reset' ? '<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; krmax will resume the agent automatically.</div>' : ''}
         </div>
         <div class="approval-request-actions">
           ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
@@ -9313,7 +9313,7 @@ function passwordsCard() {
     </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
-      ${policyTip('karmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
     <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
@@ -9618,14 +9618,14 @@ async function wireAgentMailCard(organizationId) {
 function outboundEmailCard() {
   return `<div class="card" id="outbound-email-card">
     <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let karmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let krmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
     <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
     <div class="form-row"><label>Provider</label><select id="oe-provider">
       <option value="resend">Resend — one API key (simplest)</option>
       <option value="smtp">SMTP server — any provider or relay</option>
     </select></div>
     <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
-    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="karmax &lt;noreply@yourdomain.com&gt;"></div>
+    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="krmax &lt;noreply@yourdomain.com&gt;"></div>
     <div id="oe-smtp" style="display:none">
       <div class="form-row"><label>SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
       <div class="inline-form" style="align-items:center">
@@ -10040,7 +10040,7 @@ function wireGlobalSettings(organizationId) {
       btn.disabled = false;
       if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
       else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        out.innerHTML = `Open this URL to finish signing in (karmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}`;
+        out.innerHTML = `Open this URL to finish signing in (krmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}`;
         out.style.color = 'var(--ink-1)';
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
@@ -10359,9 +10359,9 @@ async function hydrateOrganizationView() {
   $('#org-github').innerHTML = githubApp.configured ? `
     <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
-    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Karmax refreshes repository access when you ask instead of using webhooks.'}</p>
+    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Krmax refreshes repository access when you ask instead of using webhooks.'}</p>
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
+    <p class="task-sub">This creates a private GitHub App for this Krmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
@@ -11130,9 +11130,9 @@ function openHelp() {
 // ── login ────────────────────────────────────────────────────────────────────
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:18px">${brandMark()} karmax</div>
+    <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
-    ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a karmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
+    ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a krmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
@@ -11265,7 +11265,7 @@ function renderAccessPending() {
     <div class="brand" style="margin-bottom:12px">${brandMark()} Account created</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your account is active, but you don't have access to any project yet.</p>
-    <p class="task-sub">Ask a karmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
+    <p class="task-sub">Ask a krmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
     <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>
@@ -11288,7 +11288,7 @@ function renderAccessPending() {
 
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up karmax</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up krmax</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>

@@ -30,7 +30,7 @@ export interface Mailer {
 export function emailHtml(heading: string, body: string, cta: string, url: string, footer: string): string {
   const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
   return `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a">
-  <div style="font-size:20px;font-weight:600;margin-bottom:16px">◇ karmax</div>
+  <div style="font-size:20px;font-weight:600;margin-bottom:16px">◇ krmax</div>
   <h1 style="font-size:18px;margin:0 0 12px">${esc(heading)}</h1>
   <p style="font-size:14px;line-height:1.5;color:#444;margin:0 0 20px">${esc(body)}</p>
   <p style="margin:0 0 24px"><a href="${esc(url)}" style="display:inline-block;background:#1a1a1a;color:#fff;text-decoration:none;padding:10px 20px;border-radius:6px;font-size:14px;font-weight:500">${esc(cta)}</a></p>
@@ -72,7 +72,7 @@ export class IdentityService {
     this.db = new DatabaseSync(dbFile);
     this.oidcProviderId = opts.oidc?.providerId;
     this.auth = betterAuth({
-      appName: 'karmax',
+      appName: 'krmax',
       database: this.db,
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
@@ -85,10 +85,10 @@ export class IdentityService {
           if (!this.mailer?.configured()) return;
           await this.mailer.send({
             to: user.email,
-            subject: 'Reset your karmax password',
-            text: `Hi ${user.name || ''},\n\nSomeone asked to reset the password for your karmax account. Open the link below to choose a new one:\n\n${url}\n\nIf you didn't request this, you can ignore this email — your password won't change.`,
-            html: emailHtml('Reset your karmax password',
-              `Someone asked to reset the password for your karmax account. Click below to choose a new one.`,
+            subject: 'Reset your krmax password',
+            text: `Hi ${user.name || ''},\n\nSomeone asked to reset the password for your krmax account. Open the link below to choose a new one:\n\n${url}\n\nIf you didn't request this, you can ignore this email — your password won't change.`,
+            html: emailHtml('Reset your krmax password',
+              `Someone asked to reset the password for your krmax account. Click below to choose a new one.`,
               'Reset password', url,
               `If you didn't request this, you can ignore this email — your password won't change.`),
           }).catch((e) => console.error('[email] password reset send failed:', e instanceof Error ? e.message : e));
@@ -101,10 +101,10 @@ export class IdentityService {
           if (!this.mailer?.configured()) return;
           await this.mailer.send({
             to: user.email,
-            subject: 'Confirm your karmax email',
-            text: `Hi ${user.name || ''},\n\nConfirm this email address to finish setting up your karmax account:\n\n${url}\n\nIf you didn't create this account, you can ignore this email.`,
-            html: emailHtml('Confirm your karmax email',
-              `Confirm this email address to finish setting up your karmax account.`,
+            subject: 'Confirm your krmax email',
+            text: `Hi ${user.name || ''},\n\nConfirm this email address to finish setting up your krmax account:\n\n${url}\n\nIf you didn't create this account, you can ignore this email.`,
+            html: emailHtml('Confirm your krmax email',
+              `Confirm this email address to finish setting up your krmax account.`,
               'Confirm email', url,
               `If you didn't create this account, you can ignore this email.`),
           }).catch((e) => console.error('[email] verification send failed:', e instanceof Error ? e.message : e));
@@ -174,7 +174,7 @@ export class IdentityService {
 
   /** First-account setup. The route calling this is available only while empty. */
   async bootstrap(input: { name: string; email: string; password: string }, headers?: Headers): Promise<{ response: Response; user: IdentityUser }> {
-    if (this.hasUsers()) throw new Error('karmax has already been set up');
+    if (this.hasUsers()) throw new Error('krmax has already been set up');
     const response = await this.auth.api.signUpEmail({ body: input, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
     const user = this.listUsers()[0];

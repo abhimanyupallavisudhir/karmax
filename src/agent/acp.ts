@@ -465,7 +465,7 @@ export class AcpAdapter implements AgentAdapter {
           ].filter(Boolean);
           if (missing.length) {
             throw new Error(
-              `OpenCode ACP is below Karmax's parity requirement (missing ${missing.join(', ')}); update OpenCode`,
+              `OpenCode ACP is below Krmax's parity requirement (missing ${missing.join(', ')}); update OpenCode`,
             );
           }
         }

@@ -227,9 +227,9 @@ export function sampleProcesses(): ProcessSample {
     let g = groups.get(key);
     if (g) return g;
     if (key === 'self') {
-      g = { key, kind: 'app', label: 'karmax (gateway + worker)', protected: true, cpuPct: 0, rssMb: 0, procs: [] };
+      g = { key, kind: 'app', label: 'krmax (gateway + worker)', protected: true, cpuPct: 0, rssMb: 0, procs: [] };
     } else if (key === 'untracked') {
-      g = { key, kind: 'untracked', label: 'other karmax children', cpuPct: 0, rssMb: 0, procs: [] };
+      g = { key, kind: 'untracked', label: 'other krmax children', cpuPct: 0, rssMb: 0, procs: [] };
     } else {
       const t = registry.get(Number(key))!;
       g = { key, kind: t.kind, label: t.label, taskId: t.taskId, protected: t.protected, cpuPct: 0, rssMb: 0, procs: [] };
@@ -279,7 +279,7 @@ export function sampleProcesses(): ProcessSample {
  */
 export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM'): Promise<{ ok: boolean; error?: string }> {
   if (!Number.isInteger(pid) || pid <= 1) return { ok: false, error: 'invalid pid' };
-  if (pid === process.pid) return { ok: false, error: 'refusing to kill karmax itself' };
+  if (pid === process.pid) return { ok: false, error: 'refusing to kill krmax itself' };
   const entry = registry.get(pid);
   if (entry?.protected) return { ok: false, error: `${entry.label} is protected (use \`npm run reset\` to stop Temporal)` };
 
@@ -288,7 +288,7 @@ export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM
   const sample = sampleProcesses();
   if (!sample.supported) return { ok: false, error: 'process control unavailable on this platform' };
   const inScope = sample.groups.some((g) => (g.key === 'self' ? false : g.procs.some((r) => r.pid === pid)));
-  if (!inScope) return { ok: false, error: 'pid is not a karmax-managed process' };
+  if (!inScope) return { ok: false, error: 'pid is not a krmax-managed process' };
 
   try {
     if (entry?.kill) {

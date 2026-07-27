@@ -163,7 +163,7 @@ function signalKillMessage(raw: string): string {
   const diagnosis = hostMemoryTight()
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
       `Reduce Concurrent agent turns in Global settings (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
-    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a karmax ` +
+    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a krmax ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
@@ -968,7 +968,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // id (we run under this profile's provider).
             record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
             throw ApplicationFailure.create({
-              message: `Cannot resume session "${session}": no such ${profile.provider} conversation found in any connected config home. Check the id, or that it belongs to a ${profile.provider} login connected to karmax (cross-provider resume is unsupported).`,
+              message: `Cannot resume session "${session}": no such ${profile.provider} conversation found in any connected config home. Check the id, or that it belongs to a ${profile.provider} login connected to krmax (cross-provider resume is unsupported).`,
               type: 'agent-error',
               nonRetryable: true,
             });

@@ -830,7 +830,7 @@ export class Gateway {
       // response timing (matches the Stripe webhook check).
       const secretOk = !!presented && (timingSafeEqualStr(presented, minted) || (!!legacy && timingSafeEqualStr(presented, legacy)));
       if (!secretOk)
-        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL karmax shows the operator)' });
+        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL krmax shows the operator)' });
       // Providers POST different shapes/encodings; parse by content-type and
       // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
       // MIME from the Cloudflare Email Worker).
@@ -928,7 +928,7 @@ export class Gateway {
       return this.json(res, 401, { error: 'invalid password' });
     }
     if (p === '/api/setup' && method === 'POST' && this.deps.identity) {
-      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'karmax has already been set up' });
+      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'krmax has already been set up' });
       const b = await this.body(req);
       try {
         const { response, user } = await this.deps.identity.bootstrap(
@@ -1153,7 +1153,7 @@ export class Gateway {
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
         const value = store.exportOrganization(organizationExport[1]!);
-        res.setHeader('Content-Disposition', `attachment; filename="karmax-${organizationExport[1]!}-export.json"`);
+        res.setHeader('Content-Disposition', `attachment; filename="krmax-${organizationExport[1]!}-export.json"`);
         return this.json(res, 200, value);
       }
       if (organizationMatch && method === 'DELETE') {
@@ -1248,15 +1248,15 @@ export class Gateway {
           if (this.deps.email?.configured() && result.invitation.email) {
             const link = `${this.publicUrl(req)}/invite?token=${encodeURIComponent(result.token)}`;
             const organization = store.getOrganization(organizationId);
-            const orgName = organization?.name ?? 'a karmax organization';
+            const orgName = organization?.name ?? 'a krmax organization';
             const { emailHtml } = await import('../auth/identity.js');
             try {
               await this.deps.email.send({
                 to: result.invitation.email,
-                subject: `You've been invited to ${orgName} on karmax`,
-                text: `You've been invited to join ${orgName} on karmax.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
+                subject: `You've been invited to ${orgName} on krmax`,
+                text: `You've been invited to join ${orgName} on krmax.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
                 html: emailHtml(`You've been invited to ${orgName}`,
-                  `You've been invited to join ${orgName} on karmax. Accept the invitation to get started.`,
+                  `You've been invited to join ${orgName} on krmax. Accept the invitation to get started.`,
                   'Accept invitation', link, `This is a one-time link. If you weren't expecting this, you can ignore it.`),
               });
               emailed = true;
@@ -1330,7 +1330,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'user:write').ok)
-            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared GitHub App' });
+            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });
           const b = await this.body(req);
           try {
             return this.json(res, 200, this.deps.githubApp.configure({ appId: b.appId, appSlug: String(b.appSlug ?? ''),
@@ -1344,7 +1344,7 @@ export class Gateway {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!this.deps.tokens.check(token, 'user:write').ok)
-          return this.json(res, 403, { error: 'Only a Karmax installation administrator can create the shared GitHub App' });
+          return this.json(res, 403, { error: 'Only a Krmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = store.createGithubInstallState(githubManifest[1]!, session.userId);
@@ -2554,7 +2554,7 @@ export class Gateway {
       const materializeMatch = p.match(/^\/api\/tasks\/([^/]+)\/materialize-local$/);
       if (materializeMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
-        if (this.deps.hosted) return this.json(res, 409, { error: 'use the Git checkout handoff when Karmax is hosted remotely' });
+        if (this.deps.hosted) return this.json(res, 409, { error: 'use the Git checkout handoff when Krmax is hosted remotely' });
         const taskId = materializeMatch[1]!;
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
@@ -3099,7 +3099,7 @@ export class Gateway {
         });
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'user:write').ok)
-            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared Stripe Connect application' });
+            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared Stripe Connect application' });
           const b = await this.body(req);
           try {
             return this.json(res, 200, {
@@ -3442,8 +3442,8 @@ export class Gateway {
             const item = resolved.itemId ? vault.get(resolved.itemId) : undefined;
             const label = item?.label ?? resolved.domain ?? 'credential';
             const message = action === 'deny'
-              ? `[Karmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
-              : `[Karmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
+              ? `[Krmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
+              : `[Krmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
             const resume = await api.resumeAfterCredentialDecision(resolved.taskId, message);
             const task = store.getTask(resolved.taskId);
             if (task && store.getProject(task.projectId)?.organizationId === organizationId) {
@@ -3631,7 +3631,7 @@ export class Gateway {
         const to = String(b.to ?? session.email ?? '').trim();
         if (!to) return this.json(res, 400, { error: 'no recipient — pass { to } or sign in with an email' });
         try {
-          await this.deps.email.send({ to, subject: 'karmax test email',
+          await this.deps.email.send({ to, subject: 'krmax test email',
             text: 'This is a test email from karmax. Outbound email is working.' });
           return this.json(res, 200, { ok: true, to });
         } catch (e) { return this.json(res, 502, { error: e instanceof Error ? e.message : String(e) }); }
@@ -4290,7 +4290,7 @@ export class Gateway {
         // name is only for the first provisioning attempt.
         const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
         const repository = await githubApp.ensureRepository(connection.id, actor, {
-          name, description: `Karmax project wiki for ${project.name}`,
+          name, description: `Krmax project wiki for ${project.name}`,
           private: true, defaultBranch: 'main', autoInit: false,
         });
         // Link before the push so even a transient network failure keeps this
@@ -5115,13 +5115,13 @@ export class Gateway {
     res.end(body);
   }
   private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {
-    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    const body = `<!doctype html><meta charset="utf-8"><title>Krmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
       'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private paymentCallbackPage(res: http.ServerResponse, status: number, message: string) {
-    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    const body = `<!doctype html><meta charset="utf-8"><title>Krmax · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8',
       'content-length': String(Buffer.byteLength(body)), 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
@@ -5213,7 +5213,7 @@ function scimList(Resources: unknown[]) {
 }
 
 function prometheusMetrics(snapshot: Record<string, unknown>): string {
-  const lines = ['# HELP karmax_info Karmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const lines = ['# HELP karmax_info Krmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
   const scalar = (name: string, help: string, value: unknown) => {
     lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
   };
