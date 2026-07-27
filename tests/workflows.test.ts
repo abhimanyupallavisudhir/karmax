@@ -282,6 +282,34 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('done');
   });
 
+  it('accepts an in-flight authorization edit while running, freezes it once terminal', async () => {
+    const repo = await h.makeRepo('auth-inflight');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'retune authorization',
+        prompt: '@write auth.txt :: ok\n@review authorization edit',
+        grant: ['task:signal'],
+        grantPrincipal: 'user:creator',
+        authorizationProfile: 'reader',
+      })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    // Re-point the live grant: later turns mint their scoped token from this.
+    const applied = await handle.executeUpdate('updateAuthorization', {
+      args: [{ grant: ['task:signal', 'use-credential:item:cred-1'], grantPrincipal: 'user:editor', authorizationProfile: 'developer' }],
+    }) as any;
+    expect(applied).toEqual({ applied: true });
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    // Frozen once the execution has finished — no live grant to re-point.
+    await expect(handle.executeUpdate('updateAuthorization', {
+      args: [{ grant: ['task:signal'], grantPrincipal: 'user:editor', authorizationProfile: 'developer' }],
+    })).rejects.toThrow();
+  });
+
   it('merge-only: reviews and merges an existing branch (the dogfooded gate)', async () => {
     const repo = await h.makeRepo('mo');
     // build an existing feature branch with work

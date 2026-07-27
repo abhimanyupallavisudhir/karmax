@@ -2458,10 +2458,16 @@ export class Gateway {
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
-        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
-          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
-          b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
-            ? b.credentialPolicies as any : undefined));
+        try {
+          return this.json(res, 200, await api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+            Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
+            b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
+              ? b.credentialPolicies as any : undefined));
+        } catch (e) {
+          // Frozen in-flight (cancelled / past the point of no return / finished),
+          // or a stale draft edit — the workflow validator's reason is authoritative.
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
