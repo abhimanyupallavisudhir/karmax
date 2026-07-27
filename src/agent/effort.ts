@@ -18,10 +18,11 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export function claudeMessagesEffort(model: string | undefined, effort?: string): Effort | undefined {
   if (!effort || !model) return undefined;
   const m = model.toLowerCase();
-  // Models that accept the effort parameter at all (Opus 4.5+, Sonnet 4.6+, Fable/Mythos 5).
-  if (!/opus-4-(5|6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return undefined;
-  const xhighOk = /opus-4-(7|8)|sonnet-5|fable-5|mythos-5/.test(m);
-  const maxOk = /opus-4-(6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m);
+  // Models that accept the effort parameter at all (Opus 4.5+, Opus 5,
+  // Sonnet 4.6+, Fable/Mythos 5).
+  if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return undefined;
+  const xhighOk = /opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5/.test(m);
+  const maxOk = /opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m);
   let e = effort as Effort;
   if (e === 'xhigh' && !xhighOk) e = 'high';
   if (e === 'max' && !maxOk) e = 'high';
