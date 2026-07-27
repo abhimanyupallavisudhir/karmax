@@ -75,8 +75,15 @@ export async function budgetCoordinator(input: { state?: Partial<BudgetState> })
       const req = pending[i]!;
       pending = pending.filter((_, j) => j !== i);
       const s = capOf(req.scope);
-      s.spent += req.amount;
-      void notify(req.taskId, reqId, { ok: true, reason: 'approved at review gate' });
+      // Re-check the hard cap at approval time. The request-time check (below) can
+      // pass for several pending requests independently; without this, approving
+      // them all would push spent past the cap it is meant to enforce.
+      if (s.spent + req.amount > s.cap) {
+        void notify(req.taskId, reqId, { ok: false, reason: 'over budget cap (declined at approval)' });
+      } else {
+        s.spent += req.amount;
+        void notify(req.taskId, reqId, { ok: true, reason: 'approved at review gate' });
+      }
     }
   });
   setHandler(denySpendSignal, ({ reqId }) => {

@@ -51,7 +51,9 @@ const minFreeMb = () => envNonNegativeInt('KARMAX_AGENT_MIN_FREE_MB', 512);
 const maxLoadFactor = () => envFloat('KARMAX_AGENT_MAX_LOAD_FACTOR', 1.0);
 const MEM_POLL_MS = 1000;
 const SLOT_POLL_MS = 100;
-const MEM_WAIT_MAX_MS = 5 * 60 * 1000;
+// How long admission waits under pressure before backing off (retryable). Env-
+// configurable so an operator can lengthen it on a memory-constrained host.
+const memWaitMaxMs = () => envNonNegativeInt('KARMAX_AGENT_MEM_WAIT_MS', 5 * 60 * 1000);
 const HEARTBEAT_MS = 10_000;
 const PARTIAL_FILE_GRACE_MS = 5_000;
 
@@ -63,7 +65,51 @@ interface LeaseRecord {
 }
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-const freeMemMb = () => os.freemem() / (1024 * 1024);
+
+// Effective free memory in MB, cgroup-aware. On a containerized host `os.freemem()`
+// reports the whole MACHINE, not this container's limit — so an agent can be
+// admitted "with 8 GB free" and then OOM-killed because the container itself is
+// out of memory. We also read the cgroup's own headroom and take the smaller of
+// the two. Detection is memoized so hosts without a cgroup limit don't stat sysfs
+// on every poll, and any read error falls back to the host figure.
+function readCgroupInt(file: string): number | undefined {
+  try {
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    if (raw === 'max') return undefined; // cgroup v2 "unlimited"
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function detectCgroupHeadroom(): () => number | undefined {
+  const read = (limitFile: string, usageFile: string) => (): number | undefined => {
+    const limit = readCgroupInt(limitFile);
+    const usage = readCgroupInt(usageFile);
+    // Ignore an absent or effectively-unlimited limit (>= host RAM): the host
+    // figure is the real constraint there.
+    if (limit === undefined || usage === undefined || limit >= os.totalmem()) return undefined;
+    return Math.max(0, limit - usage) / (1024 * 1024);
+  };
+  if (fs.existsSync('/sys/fs/cgroup/memory.max') && fs.existsSync('/sys/fs/cgroup/memory.current')) {
+    return read('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'); // cgroup v2
+  }
+  const v1limit = '/sys/fs/cgroup/memory/memory.limit_in_bytes';
+  const v1usage = '/sys/fs/cgroup/memory/memory.usage_in_bytes';
+  if (fs.existsSync(v1limit) && fs.existsSync(v1usage)) return read(v1limit, v1usage); // cgroup v1
+  return () => undefined;
+}
+let cgroupHeadroomMb: (() => number | undefined) | undefined;
+/** The tighter of host and cgroup free memory. Pure part, factored for testing. */
+export function tighterFreeMb(hostFreeMb: number, cgroupFreeMb: number | undefined): number {
+  return cgroupFreeMb === undefined ? hostFreeMb : Math.min(hostFreeMb, cgroupFreeMb);
+}
+const freeMemMb = () => {
+  if (!cgroupHeadroomMb) cgroupHeadroomMb = detectCgroupHeadroom();
+  let cg: number | undefined;
+  try { cg = cgroupHeadroomMb(); } catch { cg = undefined; }
+  return tighterFreeMb(os.freemem() / (1024 * 1024), cg);
+};
 const coreCount = () => os.cpus().length || 1;
 const leaseRoot = () => path.join(paths().state, 'agent-slots');
 const slotsDir = () => path.join(leaseRoot(), 'held');
@@ -210,22 +256,37 @@ export function hostStats() {
   };
 }
 
+/** Thrown when the host is still under memory/load pressure after the admission
+ * wait. Classified as a retryable `agent-infra` failure so Temporal backs off and
+ * reschedules the turn, instead of forcing a model subprocess into a starved host
+ * where the OOM killer would SIGKILL it (which would just retry into the same gate). */
+export class AgentResourcesUnavailableError extends Error {
+  constructor(state: { memoryTight: boolean; loadHigh: boolean }) {
+    const why = state.memoryTight && state.loadHigh ? 'low free memory and high load'
+      : state.memoryTight ? 'low free memory' : 'high load';
+    super(`host still under ${why} after the admission wait — backing off so the turn retries when there is capacity`);
+    this.name = 'AgentResourcesUnavailableError';
+  }
+}
+
 export async function awaitAgentResources(
   onWait?: () => void,
   signal?: AbortSignal,
   onPressure?: (state: { memoryTight: boolean; loadHigh: boolean }) => void | Promise<void>,
 ): Promise<void> {
   if (minFreeMb() <= 0 && maxLoadFactor() <= 0) return;
-  const deadline = Date.now() + MEM_WAIT_MAX_MS;
+  const deadline = Date.now() + memWaitMaxMs();
   for (;;) {
     const state = pressure();
-    if (!state.backpressure || Date.now() >= deadline) break;
+    if (!state.backpressure) return; // capacity available → admit the turn
     if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('agent slot wait cancelled');
+    // Still under pressure at the deadline: back off rather than admit into a
+    // starved host (the SIGKILL that would follow just re-enters this same gate).
+    if (Date.now() >= deadline) throw new AgentResourcesUnavailableError(state);
     await onPressure?.(state);
     onWait?.();
     await delay(MEM_POLL_MS);
   }
-  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('agent slot wait cancelled');
 }
 
 function tryAcquire(rec: LeaseRecord): string | undefined {

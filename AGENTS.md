@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-karmax is an agent-orchestration platform centered on a todo list, built on Temporal for durable execution, TypeScript end-to-end. **`SPEC.md` is the source of truth** for design decisions and rationale; the `PLAN*.md` files are feature design plans layered on top of it. Runs on Node ≥ 22 (uses built-in `node:sqlite`) and needs the Temporal CLI at `~/.temporalio/bin/temporal` (or `TEMPORAL_CLI`).
+karmax is an agent-orchestration platform centered on a todo list, built on Temporal for durable execution, TypeScript end-to-end. **The karmax spec — the `SPEC` page in the project wiki (open the Wiki tab, or `read_wiki`) — is the source of truth** for design decisions and rationale; the `PLAN*` wiki pages are feature design plans layered on top of it. Runs on Node ≥ 22 (uses built-in `node:sqlite`) and needs the Temporal CLI at `~/.temporalio/bin/temporal` (or `TEMPORAL_CLI`).
 
 ## Philosophy
 
-karmax is built on three convictions (from `SPEC.md` §0):
+karmax is built on three convictions (from the spec's §0):
 
 - **Everything is a todo list.** The development environment of the AI era is a fancy todo list. Every unit of work — a coding change, a script run, a real-world action, even setting up the system itself — is a **task** on a list, assignable to a human or an agent. There is no second organizing abstraction competing with the task list.
 - **Self-healing infrastructure.** Agents do not merely run inside karmax; they can *repair and extend* it. They edit workflows, add error-resolution cases, and save skills — all through the same reviewed, versioned mechanisms a human would use. The system is designed to get more reliable through use.

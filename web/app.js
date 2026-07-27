@@ -422,11 +422,13 @@ const NODES = [
 ];
 
 // Provider → model choices for the agent field (free-text also allowed).
-const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'];
 const MODELS = {
   claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
+  kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
+  grok: ['grok-build', 'grok-code-fast-1'],
   mock: ['mock'],
 };
 function modelOptions(provider) {
@@ -4901,7 +4903,7 @@ function syncTermButton() {
     btn.disabled = false;
   } else {
     btn.classList.remove('danger');
-    btn.textContent = hasWorld ? 'Open terminal' : 'No world yet';
+    btn.textContent = hasWorld ? 'Open terminal' : 'No workspace yet';
     btn.disabled = !hasWorld;
   }
 }
@@ -5255,8 +5257,8 @@ function checkinTab(v) {
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task world' : 'No world yet'}">
-          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No world yet'}</span>
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task's workspace' : 'No workspace yet'}">
+          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
         ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
@@ -5567,11 +5569,11 @@ function terminalPane(v) {
       ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
-      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
+      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
     </div>
     <div class="ck-term">
       <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
-      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task hasn't started its workspace yet.'}</div>`}
     </div>`;
 }
 
@@ -6153,7 +6155,7 @@ function taskActions(v) {
   // The follow-up box lives inside each agent's conversation on the Check-in tab,
   // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (!acts.length) html = `<div style="color:var(--ink-3)">No actions available — task is ${esc(v.stage)}.</div>`;
+  if (!acts.length) html = `<div style="color:var(--ink-3)">Nothing to do here right now.</div>`;
   return html;
 }
 
@@ -6163,7 +6165,10 @@ function wireActions(v) {
       const act = btn.dataset.act;
       try {
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
-        toast(`${act} sent`);
+        // Button → toast vocabulary must match (Confirm → Confirmed). Fall back to
+        // the button's own label so custom actions read naturally.
+        const done = { confirm: 'Confirmed', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+        toast(done[act] || `${(btn.textContent || act).trim()} done`);
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
@@ -6295,7 +6300,7 @@ function queueRank(t) {
 
 function mergeQueuePanel() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div></div>`;
+  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -6348,7 +6353,7 @@ function agentQueuePanel() {
     }).join('');
   return rows
     ? `<div class="queue-list agent-queue-list">${rows}</div>`
-    : `<div class="card"><div class="empty"><div class="big">Agent queue is empty</div>Agent turns appear here while running or waiting for host capacity.</div></div>`;
+    : `<div class="card"><div class="empty"><div class="big">Agent queue is empty</div>Agents show up here while they're running or waiting for a free slot.</div></div>`;
 }
 
 function queuesView() {
@@ -10588,8 +10593,8 @@ function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
-    <p>Your identity is active, but it does not have access to a project yet.</p>
-    <p class="task-sub">Ask a karmax administrator to grant this account a global or project authorization profile. Signing in again will pick up the grant immediately.</p>
+    <p>Your account is active, but you don't have access to any project yet.</p>
+    <p class="task-sub">Ask a karmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
     <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>

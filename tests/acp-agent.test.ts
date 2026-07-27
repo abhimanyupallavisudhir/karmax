@@ -38,7 +38,7 @@ const finish = () => {
     sessionId: 'session-new',
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
   } });
-  send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'end_turn' } });
+  send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: process.env.STUB_STOP_REASON || 'end_turn' } });
 };
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const msg = JSON.parse(line);
@@ -70,8 +70,13 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'session-forked' } });
   else if (msg.method === 'session/set_config_option')
     send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } });
+  else if (msg.method === 'session/cancel') {
+    // Steer-driven cancellation: resolve the in-flight prompt as cancelled.
+    if (pendingPrompt) { send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'cancelled' } }); pendingPrompt = undefined; }
+  }
   else if (msg.method === 'session/prompt') {
     pendingPrompt = msg.id;
+    if (process.env.STUB_AWAIT_CANCEL) return; // run long; wait for a steer-driven session/cancel
     send({ jsonrpc: '2.0', method: 'session/update', params: {
       sessionId: msg.params.sessionId,
       update: { sessionUpdate: 'tool_call', toolCallId: 'tool-1', title: 'Edit file', kind: 'edit', status: 'pending' },
@@ -109,6 +114,8 @@ describe('generic ACP agent adapter', () => {
     delete process.env.KARMAX_KIMI_CMD;
     delete process.env.KARMAX_GROK_CMD;
     delete process.env.STUB_REQUESTS_OUT;
+    delete process.env.STUB_STOP_REASON;
+    delete process.env.STUB_AWAIT_CANCEL;
     delete process.env.KARMAX_HOME;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
     dir = undefined;
@@ -121,6 +128,7 @@ describe('generic ACP agent adapter', () => {
     provider?: 'opencode' | 'kimi' | 'grok';
     model?: string;
     modelProvider?: string;
+    pullFollowUps?: (from: number) => Promise<any[]>;
   } = {}) {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-acp-'));
     const stub = path.join(dir, 'agent.cjs');
@@ -156,6 +164,7 @@ describe('generic ACP agent adapter', () => {
       emit(text: string) { output.push(text); },
       emitActivity(activity: any) { activities.push(activity); },
       onSession() {},
+      ...(opts.pullFollowUps ? { pullFollowUps: opts.pullFollowUps } : {}),
     } as any);
     const records = fs.readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     return { turn, output, activities, records };
@@ -203,6 +212,26 @@ describe('generic ACP agent adapter', () => {
       provider: { kimi: { options: { baseURL: 'https://api.kimi.com/coding/v1' } } },
     });
   });
+
+  it('treats an ACP max_tokens stop as a resumable interruption, not a hard failure (provider parity)', async () => {
+    // A model that produced valid work but hit an output boundary should resume
+    // the session on retry, like the Claude SDK's max_output_tokens — not escalate
+    // to a human. The interruption is signalled by a transport-classified message.
+    process.env.STUB_STOP_REASON = 'max_tokens';
+    await expect(run()).rejects.toThrow(/interrupted before completion/i);
+  });
+
+  it('cancels an in-flight turn to hand a mid-turn follow-up to the next turn (cancel-to-boundary steering)', async () => {
+    // The stub runs long and never finishes on its own; a queued follow-up must
+    // gracefully cancel the prompt and return cleanly, leaving `delivered`
+    // unchanged so the workflow loops back to Do and delivers it next turn.
+    process.env.STUB_AWAIT_CANCEL = '1';
+    const followUp = { id: 'f1', role: 'user', text: 'actually, add tests too', ts: 5 };
+    const { turn, records } = await run({ pullFollowUps: async (from: number) => (from >= 1 ? [followUp] : []) });
+    expect(turn.termination).toMatchObject({ kind: 'success', status: 'end_turn' });
+    expect(turn.delivered).toBe(1); // follow-up left for the next turn, not marked delivered
+    expect(records.some((r) => r.method === 'session/cancel')).toBe(true);
+  }, 15000);
 
   it('uses advertised native resume and fork instead of transcript emulation', async () => {
     const resumed = await run({ session: 'session-old' });

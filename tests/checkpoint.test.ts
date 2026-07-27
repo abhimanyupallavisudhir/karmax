@@ -13,6 +13,8 @@ import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { ProjectEnvironment } from '../src/store/project-environment.js';
 import { ProjectServices } from '../src/store/project-services.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
+import { makeCoreActivities } from '../src/activities/core.js';
+import { ProfileResolver } from '../src/agent/profiles.js';
 
 describe('portable world checkpoints', () => {
   it('encrypts a dirty binary delta, restores it into a new generation, and fences the stale generation', async () => {
@@ -58,6 +60,69 @@ describe('portable world checkpoints', () => {
     await expect(restored.readFile('private.bin')).rejects.toThrow();
     expect(() => store.assertCurrentWorld(stale)).toThrow(/stale world generation/);
 
+    await restored.destroy();
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('re-provisions a vanished remote sandbox from its checkpoint and carries on (openWorld recovery)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-recover-'));
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
+    await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+
+    const store = new Store(':memory:');
+    const project = store.createProject('Recover', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' });
+    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+
+    // A mock REMOTE provider backed by real worktrees. `vanished` flips on to
+    // simulate the provider losing the gen-1 sandbox: open() throws and probe()
+    // reports 'missing' for it, while a restored (gen-2) world opens normally.
+    const worlds = new WorldRegistry();
+    const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
+    let vanished = false;
+    const gone = (h: { generation?: number }) => vanished && (h.generation ?? 1) < 2;
+    worlds.register({
+      kind: 'sandbox-test', parkable: true,
+      capabilities: { remote: true, pty: false, snapshots: true, ports: false, networkPolicy: false },
+      async create(spec) { const w = await worktrees.create(spec); w.handle.kind = 'sandbox-test'; return w; },
+      async open(handle) {
+        if (gone(handle)) throw new Error('sandbox vanished: 404 not found');
+        const w = await worktrees.open(handle); w.handle.kind = 'sandbox-test'; return w;
+      },
+      async probe(handle) { return gone(handle) ? 'missing' as const : 'ready' as const; },
+    });
+
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker);
+
+    const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.writeFile('tracked.txt', 'edited in the sandbox\n'); // dirty work, captured by the checkpoint
+    await checkpoints.checkpoint(world.handle); // attaches checkpointId onto the current world
+    const vanishedHandle = { ...world.handle };
+    await world.destroy();
+    vanished = true; // the provider now reports this generation as gone
+
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), checkpoints });
+
+    // commitWork -> openWorld hits the lost sandbox; recovery restores a fresh
+    // generation from the checkpoint and the activity completes as if nothing broke.
+    const result = await core.commitWork(vanishedHandle, 'after recovery');
+    expect(result.committed).toBe(true);
+    // A fresh generation was provisioned from the checkpoint...
+    expect((store.currentWorld(task.id) as { generation?: number } | undefined)?.generation).toBe(2);
+    // ...and it carries the sandbox's edited files (same work continues).
+    const restored = await worlds.open(store.currentWorld(task.id) as any);
+    expect(await restored.readFile('tracked.txt')).toBe('edited in the sandbox\n');
     await restored.destroy();
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

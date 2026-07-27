@@ -397,6 +397,7 @@ a { color: var(--accent); text-decoration: none; }
   background: var(--surface); color: var(--ink); font-weight: 550;
 }
 .btn:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 .btn.primary:hover { filter: brightness(1.07); }
 .btn.danger { color: var(--danger); border-color: var(--danger-weak); }
