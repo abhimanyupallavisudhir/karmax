@@ -212,6 +212,20 @@ describe('the pull model: requests + human resolutions (§7)', () => {
     expect(items.requests({ status: 'pending' })).toHaveLength(0);
   });
 
+  it('lets a task use its own credential while preserving the reveal policy', () => {
+    const { items } = makeService();
+    const item = items.save({
+      type: 'login',
+      label: 'account created by t1',
+      policy: { use: 'auto', reveal: 'ask' },
+      secrets: { password: 'generated' },
+      provenance: { source: 'task:t1', taskId: 't1' },
+    });
+    expect(items.access([], 't1', item, 'use').status).toBe('granted');
+    expect(items.access([], 't1', item, 'reveal').status).toBe('needs_approval');
+    expect(items.access([], 't2', item, 'use').status).toBe('needs_approval');
+  });
+
   it('a reset report always parks, even when the task is fully granted (the secret is wrong)', () => {
     const { items } = makeService();
     const item = items.save({ type: 'login', label: 'gh', secrets: { password: 'stale' } });

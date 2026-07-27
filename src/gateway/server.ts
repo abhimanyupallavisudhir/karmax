@@ -49,6 +49,8 @@ import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repos
 import { worldWorkingRelativePath } from '../world/types.js';
 import { enumerateCredentials } from '../platform/credentials.js';
 import { gatherCredentialSources } from '../platform/credential-sources.js';
+import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
+import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -383,6 +385,33 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
+  }
+
+  private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
+    const task = this.deps.store.getTask(taskId);
+    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
+    if (!organizationId) return [];
+    return new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
+      .requests({ taskId, status: 'pending' });
+  }
+
+  private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
+    if (!view) return view;
+    const count = this.pendingCredentialRequests(taskId).length;
+    return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
+  }
+
+  private credentialRequestView(request: CredentialAccessRequest, organizationId: string): CredentialAccessRequest {
+    const task = this.deps.store.getTask(request.taskId);
+    const project = task && this.deps.store.getProject(task.projectId);
+    if (!task || project?.organizationId !== organizationId) return request;
+    return { ...request, task: { id: task.id, ...(task.num != null ? { num: task.num } : {}),
+      title: task.title, projectId: task.projectId } };
+  }
+
+  private emitTaskEvent(event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }): void {
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus.emit({ ...event, seq });
   }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
@@ -2055,7 +2084,7 @@ export class Gateway {
           const enriched = await Promise.all(
             page.map(async (t) => {
               const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
-              return { ...t, lastView: trimListView(view ?? t.lastView) };
+              return { ...t, lastView: trimListView(this.withApprovalRequests(view ?? t.lastView, t.id)) };
             }),
           );
           if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
@@ -2215,7 +2244,8 @@ export class Gateway {
         if (!view) return this.json(res, 200, null);
         // Mirror the record's sequential number onto the view (the workflow only
         // knows the opaque id) so the drawer can show `#num` + a permalink.
-        return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
+        const projected = this.withApprovalRequests(view, viewMatch[1]!)!;
+        return this.json(res, 200, rec?.num != null ? { ...projected, num: rec.num } : projected);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -2228,7 +2258,14 @@ export class Gateway {
       }
       const attemptsMatch = p.match(/^\/api\/tasks\/([^/]+)\/attempts$/);
       if (attemptsMatch && method === 'GET') {
-        return this.json(res, 200, api.attemptGroup(token, attemptsMatch[1]!) ?? null);
+        const group = api.attemptGroup(token, attemptsMatch[1]!);
+        return this.json(res, 200, group ? {
+          ...group,
+          attempts: group.attempts.map((attempt) => ({
+            ...attempt,
+            lastView: this.withApprovalRequests(attempt.lastView, attempt.id),
+          })),
+        } : null);
       }
       if (attemptsMatch && method === 'POST') {
         try {
@@ -2907,7 +2944,6 @@ export class Gateway {
 
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
       if (p.startsWith('/api/vault')) {
-        const { VaultItems, ITEM_FIELDS } = await import('../autonomy/vault-items.js');
         // Bind to the caller's own organization (tenant boundary). The token org
         // is authoritative and cannot be spoofed — auth() validated it against
         // membership; the query-param org only ever narrows within it.
@@ -3072,13 +3108,14 @@ export class Gateway {
           return this.json(res, 200, vault.requests({
             taskId: url.searchParams.get('taskId') ?? undefined,
             status: (url.searchParams.get('status') as any) ?? undefined,
-          }));
+          }).map((request) => this.credentialRequestView(request, organizationId)));
         }
         // The pull model (§7): an agent escalates for an item it lacks.
         if (p === '/api/vault/requests' && method === 'POST') {
           const b = await this.body(req);
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
-          return this.json(res, 200, vault.request({
+          const priorPending = new Set(vault.requests({ taskId: callerTaskId, status: 'pending' }).map((request) => request.id));
+          const decision = vault.request({
             taskId: callerTaskId,
             projectId: authRecord?.projectId,
             caps,
@@ -3088,7 +3125,26 @@ export class Gateway {
             mode: b.mode,
             kind: b.kind === 'reset' ? 'reset' : undefined,
             why: b.why ? String(b.why) : undefined,
-          }));
+          });
+          if (decision.requestId && !priorPending.has(decision.requestId)) {
+            const task = store.getTask(callerTaskId);
+            const taskOrganization = task && store.getProject(task.projectId)?.organizationId;
+            if (task && taskOrganization === organizationId) this.emitTaskEvent({
+              taskId: task.id,
+              type: 'credential.approval-requested',
+              ts: Date.now(),
+              payload: {
+                requestId: decision.requestId,
+                status: 'approval-needed',
+                mode: b.mode === 'reveal' ? 'reveal' : 'use',
+                kind: b.kind === 'reset' ? 'reset' : 'access',
+                ...(decision.itemId ? { itemId: decision.itemId } : {}),
+                ...(b.domain ? { domain: String(b.domain) } : {}),
+                ...(b.why ? { why: String(b.why) } : {}),
+              },
+            });
+          }
+          return this.json(res, 200, decision);
         }
         const vres = p.match(/^\/api\/vault\/requests\/([^/]+)\/resolve$/);
         if (vres && method === 'POST') {
@@ -3096,7 +3152,23 @@ export class Gateway {
           const action = String(b.action ?? '');
           if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
           try {
-            return this.json(res, 200, vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
+            const resolved = vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined });
+            const item = resolved.itemId ? vault.get(resolved.itemId) : undefined;
+            const label = item?.label ?? resolved.domain ?? 'credential';
+            const message = action === 'deny'
+              ? `[Karmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
+              : `[Karmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
+            const resume = await api.resumeAfterCredentialDecision(resolved.taskId, message);
+            const task = store.getTask(resolved.taskId);
+            if (task && store.getProject(task.projectId)?.organizationId === organizationId) {
+              this.emitTaskEvent({
+                taskId: resolved.taskId,
+                type: 'credential.approval-resolved',
+                ts: Date.now(),
+                payload: { requestId: resolved.id, itemId: resolved.itemId, action, resumed: resume.resumed },
+              });
+            }
+            return this.json(res, 200, { ...this.credentialRequestView(resolved, organizationId), resume });
           } catch (e) {
             return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
           }

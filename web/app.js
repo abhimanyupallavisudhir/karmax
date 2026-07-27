@@ -56,9 +56,11 @@ const S = {
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  taskTab: null, // open tab on the task page ('overview'|'checkin'|'parameters'|'advanced'; null → auto)
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
+  approvalRequests: [], // credential decisions for the selected task
+  approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
@@ -1831,7 +1833,8 @@ function connectWs() {
         if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
-      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
+      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
+        || ev.type === 'credential.approval-requested' || ev.type === 'credential.approval-resolved') {
         S.liveOutput = '';
         refreshTask();
       } else if (ev.type === 'session.started') {
@@ -1840,7 +1843,7 @@ function connectWs() {
     }
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
-    if (S.organizationId && ['view.updated', 'task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+    if (S.organizationId && ['view.updated', 'task.responsibility-changed', 'task.mentioned', 'credential.approval-requested'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
@@ -2405,7 +2408,7 @@ function runSubRow(r) {
     <div class="task-row run-row" data-id="${r.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span></div>
+        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
       <div class="task-right">${pipeline(v)}</div>
@@ -2461,6 +2464,7 @@ function taskRow(t, { showTags = true } = {}) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
+          ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
@@ -3811,6 +3815,7 @@ async function openTaskForm(workflow, draft, seedText) {
 const TASK_TABS = [
   { key: 'overview', label: 'Overview' },
   { key: 'checkin', label: 'Check-in' },
+  { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
   { key: 'advanced', label: 'Advanced' },
 ];
@@ -3820,6 +3825,7 @@ const TASK_TABS = [
 // the conversation that led here is the thing to read, so open Check-in on the
 // stage's agent. Otherwise Overview.
 function defaultTaskTab(v) {
+  if (v.approvalRequests) return 'approvals';
   return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
 }
 
@@ -4021,24 +4027,32 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.widgets = [];
   S.paramDefaults = {};
   S.attemptGroup = null;
+  S.approvalRequests = [];
+  S.approvalItems = [];
   try {
     // Fetch the four independent resources in parallel — they used to be four serial
     // round-trips, which stacked latency (each page open paid the sum, not the max).
     // `renderTaskPage` no-ops while `S.view` is null, so assigning them together (rather
     // than one-at-a-time) also avoids rendering a half-populated page mid-fetch.
     const draft = !!rec?.params?.draft;
-    const [view, events, widgets, sessions, attempts] = await Promise.all([
+    const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+    const approvalQuery = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const [view, events, widgets, sessions, attempts, approvalRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${taskId}`),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0`),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
+      draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
+      draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
     ]);
     S.view = view;
     S.taskEvents = events;
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    S.approvalRequests = approvalRequests;
+    S.approvalItems = approvalItems;
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
@@ -4066,11 +4080,16 @@ async function refreshTask() {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
-    const [view, widgets, sessions, attempts] = await Promise.all([
+    const rec = taskRecord(id);
+    const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+    const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+    const [view, widgets, sessions, attempts, approvalRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
+      api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
+      api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
     if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
       await openTask(attempts.principalAttemptId, S.taskTab);
@@ -4080,6 +4099,8 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
+    S.approvalRequests = approvalRequests;
+    S.approvalItems = approvalItems;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -4300,6 +4321,7 @@ function renderTaskPage() {
           <h2>${esc(v.title)}</h2>
           ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
+          ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
         <div class="meta">
           <span>${v.workflowOptions?.length > 1
@@ -4315,7 +4337,7 @@ function renderTaskPage() {
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
-          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}</a>`).join('')}
+          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
         </div>
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -4345,6 +4367,8 @@ function renderTaskPage() {
     wireFollowups(v);
     wireTerminal(v.taskId);
     wireWorldFileLinks(v);
+  } else if (tab === 'approvals') {
+    wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
@@ -4484,9 +4508,30 @@ function cycleTaskTab(delta) {
 
 function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
+  if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
   if (tab === 'advanced') return advancedTab(v);
   return overviewTab(v);
+}
+
+function approvalRequestsTab(v) {
+  const pending = S.approvalRequests.filter((request) => request.status === 'pending').length;
+  return `<div class="task-approvals" id="task-approval-requests">
+    <div class="approval-page-head">
+      <div><div class="section-h">Approval Requests</div>
+        <p class="task-sub">Credential decisions raised by this task. Approving or denying one automatically resumes the agent.</p></div>
+      ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
+    </div>
+    <div class="approval-list">${credentialRequestRows(S.approvalRequests, S.approvalItems, { historyLimit: 20 })}</div>
+  </div>`;
+}
+
+function wireTaskApprovalRequests(v) {
+  const rec = taskRecord(v.taskId);
+  const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
+  wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+  });
 }
 
 // Whether renderTaskPage should hand keyboard focus to the scrollable page body.
@@ -8326,6 +8371,71 @@ const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets 
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
 function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
 
+function credentialRequestTaskLink(request) {
+  const task = request.task || taskRecord(request.taskId);
+  if (!task) return `<span class="mono">${esc(request.taskId)}</span>`;
+  const project = projectById(task.projectId);
+  const key = task.num != null ? task.num : task.id;
+  const label = `${task.num != null ? `#${task.num} · ` : ''}${task.title}`;
+  return project
+    ? `<a data-spa href="${projectRoute(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
+    : `<span>${esc(label)}</span>`;
+}
+
+function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
+  const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const pendingHtml = pending.length
+    ? pending.map((request) => `<div class="approval-request" data-vreq="${esc(request.id)}">
+        <div class="approval-request-main">
+          <div class="approval-request-title">${request.itemId
+            ? esc(itemLabel(request.itemId))
+            : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
+            ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+          </div>
+          <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
+          ${request.kind === 'reset' ? '<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; karmax will resume the agent automatically.</div>' : ''}
+        </div>
+        <div class="approval-request-actions">
+          ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
+          <button class="btn sm" data-vreq-act="once">Once</button>
+          <button class="btn sm" data-vreq-act="task">This task</button>
+          <button class="btn sm" data-vreq-act="always">Always</button>
+          <button class="btn sm" data-vreq-act="deny">Deny</button>
+        </div>
+      </div>`).join('')
+    : '<div class="approval-empty">No pending approval requests.</div>';
+  const history = recent.length
+    ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+        <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || '?')}</span>
+        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+    : '';
+  return pendingHtml + history;
+}
+
+function wireCredentialRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((button) => button.addEventListener('click', async () => {
+    const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+    button.disabled = true;
+    try {
+      const result = await api(`/api/vault/requests/${row.dataset.vreq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+        method: 'POST',
+        body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
+      });
+      const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
+      toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+        : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`, !result.resume?.resumed && !!result.resume?.reason);
+      await onResolved?.(result);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  })));
+}
+
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
@@ -8360,7 +8470,7 @@ function passwordsCard() {
 function vaultRequestsCard() {
   return `<div class="card" id="vault-requests-card">
     <div class="section-h">Credential access requests</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted (or one that isn't in the vault yet — add it above, then approve, or tell the agent to create the account itself). <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted, its policy says to ask, or it isn't in the vault yet. Add and bind a missing item before approving. <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto. Every decision resumes the task automatically.</p>
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
@@ -8579,29 +8689,8 @@ async function wireVaultCards(organizationId) {
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
-    const pending = requests.filter((r) => r.status === 'pending');
-    const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
-    const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
-    rbox.innerHTML = (pending.length
-      ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
-          <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
-            ${r.kind === 'reset' ? '<span class="chip" style="color:var(--warn,#e0b15a)">reported invalid</span>' : `<span class="chip">${esc(r.mode)}</span>`}
-            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}${r.kind === 'reset' ? '<br>The stored secret failed. Fix it (Update secret in the vault above, or send the task a follow-up with the reset code), then grant to let the agent retry.' : ''}</div></div>
-          ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
-          <button class="btn sm" data-vreq-act="once">Once</button>
-          <button class="btn sm" data-vreq-act="task">This task</button>
-          <button class="btn sm" data-vreq-act="always">Always</button>
-          <button class="btn sm" data-vreq-act="deny">Deny</button></div>`).join('')
-      : '<span style="color:var(--ink-3)">No pending requests.</span>')
-      + (recent.length ? `<div class="task-sub" style="color:var(--ink-3);margin-top:8px">${recent.map((r) => `${r.status} · ${r.itemId ? esc(itemLabel(r.itemId)) : esc(r.domain || '?')} (${esc(r.resolution?.action || '')})`).join('<br>')}</div>` : '');
-    rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
-      const itemId = row.querySelector('.vreq-bind')?.value || undefined;
-      try {
-        await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
-        toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
-        renderRequests();
-      } catch (e) { toast(e.message, true); }
-    })));
+    rbox.innerHTML = credentialRequestRows(requests, items);
+    wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
   await renderItems();
   await renderConnectors();
@@ -9085,7 +9174,8 @@ async function openInboxItem(item) {
   const project = projectById(item.task.projectId); if (!project) return;
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
-  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
+  const tab = item.kind === 'approval-requested' ? '/approvals' : '';
+  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user

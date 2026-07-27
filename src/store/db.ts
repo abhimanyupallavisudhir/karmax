@@ -2213,6 +2213,17 @@ export class Store {
     const task = this.getTaskShallow(ev.taskId);
     const project = task && this.getProject(task.projectId);
     if (!task || !project?.organizationId) return;
+    if (ev.type === 'credential.approval-resolved') {
+      const requestId = String(ev.payload.requestId ?? '');
+      if (requestId) {
+        this.db.prepare(`UPDATE inbox SET unread=0, actionable=0, readAt=?
+          WHERE taskId=? AND kind='approval-requested' AND eventSeq IN (
+            SELECT seq FROM events WHERE taskId=? AND type='credential.approval-requested'
+              AND json_extract(payload, '$.requestId')=?
+          )`).run(ev.ts, task.id, task.id, requestId);
+      }
+      return;
+    }
     let kind: InboxItem['kind'] | undefined;
     let actionable = false;
     let users: string[] = [];
@@ -2223,6 +2234,13 @@ export class Store {
       kind = 'mentioned';
       const mentioned = ev.payload.principal as PrincipalRef | undefined;
       if (mentioned) users = this.expandPrincipal(mentioned, task.projectId);
+    } else if (ev.type === 'credential.approval-requested') {
+      kind = 'approval-requested'; actionable = true;
+      users = this.humanAudience(task.id, ['@creator']);
+      // The creator is the natural first audience, while organization owners
+      // remain a deterministic resolver for automated/delegated tasks.
+      for (const member of this.listOrganizationMemberships(project.organizationId))
+        if (member.role === 'owner') users.push(member.userId);
     } else if (ev.type.includes('review') || (ev.type === 'view.updated' && (ev.payload.status === 'waiting' || ev.payload.stage === 'review'))) {
       kind = 'review-requested'; actionable = true; users = this.reviewAudience(task);
     } else if (ev.type.includes('escalat') || ev.payload.waitingFor === 'human') {
