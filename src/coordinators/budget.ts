@@ -5,6 +5,8 @@ import {
   condition,
   continueAsNew,
   getExternalWorkflowHandle,
+  workflowInfo,
+  patched,
   log,
 } from '@temporalio/workflow';
 import {
@@ -67,6 +69,12 @@ export async function budgetCoordinator(input: { state?: Partial<BudgetState> })
   }
 
   setHandler(requestSpendSignal, (req) => {
+    // Dedupe, like every other coordinator enqueue handler (merge-queue.ts,
+    // agent-queue.ts, account.ts). Temporal delivers signals AT LEAST once, so a
+    // redelivered `requestSpend` would otherwise be charged against the scope
+    // twice — a double spend on a real payment rail. `reqId` is the caller's
+    // idempotency key: already queued or already awaiting approval ⇒ ignore.
+    if (queue.some((q) => q.reqId === req.reqId) || pending.some((p) => p.reqId === req.reqId)) return;
     queue.push(req);
   });
   setHandler(approveSpendSignal, ({ reqId }) => {
@@ -102,9 +110,37 @@ export async function budgetCoordinator(input: { state?: Partial<BudgetState> })
   }));
 
   for (;;) {
-    await condition(() => queue.length > 0 || processed >= CONTINUE_AFTER);
-    if (processed >= CONTINUE_AFTER && queue.length === 0 && pending.length === 0) {
-      await continueAsNew<typeof budgetCoordinator>({ state: { scopes, pending, defaultCap, threshold, processed: 0 } });
+    // Keep the legacy branch byte-for-byte for histories created before this fix
+    // (same shape as account.ts). `patched` is deliberately evaluated on every loop
+    // iteration: it stays false while replaying marker-less history and flips true
+    // at the live edge, which is exactly what lets a coordinator already trapped in
+    // the legacy spin escape instead of deadlock-failing forever.
+    //
+    // The legacy bug: once `processed >= CONTINUE_AFTER` AND `pending.length > 0`
+    // (any spend awaiting human approval), the park predicate resolved
+    // synchronously, the continue-as-new guard refused (it needs `pending` empty),
+    // and the `while (queue.length > 0)` body was empty — an unbounded microtask
+    // loop inside ONE workflow activation. Temporal's deadlock detector then killed
+    // the coordinator permanently while it still accepted `requestSpend` signals.
+    if (!patched('budget-coordinator-rotation-v2')) {
+      await condition(() => queue.length > 0 || processed >= CONTINUE_AFTER);
+      if (processed >= CONTINUE_AFTER && queue.length === 0 && pending.length === 0) {
+        await continueAsNew<typeof budgetCoordinator>({ state: { scopes, pending, defaultCap, threshold, processed: 0 } });
+      }
+    } else {
+      // Park only ever wakes for work we can actually do, or for a rotation we will
+      // actually perform — the two must agree, or the loop spins. Spend awaiting a
+      // human decision (`pending`) holds rotation off (its reqIds are the live
+      // contract with the requesting tasks), so it must equally hold the park.
+      // Honor Temporal's own size/event-count recommendation as well as our counter.
+      const shouldRotate = () =>
+        queue.length === 0
+        && pending.length === 0
+        && (processed >= CONTINUE_AFTER || workflowInfo().continueAsNewSuggested);
+      await condition(() => queue.length > 0 || shouldRotate());
+      if (shouldRotate()) {
+        await continueAsNew<typeof budgetCoordinator>({ state: { scopes, pending, defaultCap, threshold, processed: 0 } });
+      }
     }
     while (queue.length > 0) {
       const req = queue.shift()!;

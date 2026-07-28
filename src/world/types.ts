@@ -15,6 +15,28 @@ import type { WorldHandleRef } from '../domain/types.js';
 /** Provider registry id. Kept as an alias because it is persisted in workflow state. */
 export type WorldKind = string;
 
+/** Provider ids whose worlds live on the host filesystem: no metered remote
+ * sandbox and no provider control plane to reconcile against. Exported as one
+ * list because it is consulted from modules that must not construct a provider
+ * registry (the Git broker, workflow-adjacent activities, the deterministic
+ * workflow contract). Providers also declare it via `capabilities.remote`; use
+ * that whenever a registry is already at hand. */
+export const LOCAL_WORLD_KINDS: readonly string[] = ['worktree', 'container', 'memory'];
+
+export function isRemoteWorldKind(kind: string | undefined): boolean {
+  return !!kind && !LOCAL_WORLD_KINDS.includes(kind);
+}
+
+/** Worlds whose repos are host checkouts sharing ONE git ref database with
+ * their source repository. `container` qualifies despite its distinct `kind`:
+ * `ContainerWorldProvider.create` delegates to `WorktreeProvider` and only
+ * bind-mounts the resulting host worktree, so its refs and the source repo's
+ * are literally the same files. Remote sandboxes clone over SSH and share
+ * nothing. */
+export function sharesHostRefDatabase(kind: string | undefined): boolean {
+  return kind === 'worktree' || kind === 'container';
+}
+
 /**
  * One repository checked out inside a (possibly multi-repo) world. A project may
  * configure several repos (`ProjectConfig.repos`); each becomes a `WorldRepo`
@@ -268,6 +290,17 @@ export interface World {
   destroy(): Promise<void>;
 }
 
+/** A sandbox found on a provider's control plane by karmax's own labels, with
+ * just enough to attribute and destroy it. Provider SDK objects never escape
+ * the provider module through this shape. */
+export interface ProviderSandboxRef {
+  /** Provider-side id. Diagnostic only — never persisted in a handle. */
+  sandboxId: string;
+  /** The karmax task this sandbox was created for (`karmaxTaskId` metadata). */
+  taskId?: string;
+  destroy(): Promise<void>;
+}
+
 export interface WorldProvider {
   readonly kind: WorldKind;
   readonly capabilities?: {
@@ -290,6 +323,17 @@ export interface WorldProvider {
    * in-process view; `probe` reconciles against the remote source of truth.
    * Undefined means the provider cannot say (no probe support, network error). */
   probe?(handle: WorldHandle): Promise<WorldLifecycleState | undefined>;
+  /**
+   * Enumerate the sandboxes THIS deployment owns on the provider's control
+   * plane, matched on the `karmaxHome`/`karmaxTaskId` labels written at create.
+   * The lifecycle sweep uses it to reap sandboxes whose task is terminal or
+   * gone: a terminated or lost workflow never reaches `destroyWorld`, a `ready`
+   * world is never swept (hibernation scans only `parked`), and Daytona is
+   * created with `autoDeleteInterval: -1` so the provider will never reap it
+   * either — the sandbox would bill forever. Absent (or a rejection) means the
+   * provider cannot enumerate and nothing is reaped.
+   */
+  listSandboxes?(organizationId?: string): Promise<ProviderSandboxRef[]>;
 }
 
 /** Provider-independent confinement for every file/process cwd crossing the

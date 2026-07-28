@@ -3,7 +3,15 @@
 ```bash
 npm test            # full suite (sequential, resource-capped)
 npm run typecheck
+npm run test:coverage   # same suite, instrumented (needs `npm i` once for @vitest/coverage-v8)
 ```
+
+## Coverage
+
+`npm run test:coverage` is opt-in — instrumenting a run that already boots real
+Temporal servers roughly doubles it. The config sets `all: true` deliberately: a
+module with no tests at all shows up at 0% rather than vanishing from the report,
+which is the gap worth seeing. Report lands in `coverage/index.html`.
 
 ## Why tests are heavy (and how it's kept safe)
 

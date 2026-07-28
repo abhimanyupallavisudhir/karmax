@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import {
   deleteWikiPage,
   collectDefaultPages,
   searchWiki,
+  isSafeSearchPattern,
   suggestWiki,
   renderWikiToc,
   buildWikiPromptContext,
@@ -20,6 +21,8 @@ import {
   wikiRoot,
   BUILTIN_WIKI_ENTRIES,
   resolveBuiltins,
+  estimateTokens,
+  WIKI_TOC_TOKEN_BUDGET,
 } from '../src/wiki/wiki.js';
 import { ensureProjectWikiRepository, commitProjectWiki, projectWikiBranches, projectWikiBranchView } from '../src/wiki/repository.js';
 import { execFileSync } from 'node:child_process';
@@ -347,6 +350,139 @@ describe('searchWiki (host-side grep — the cloud-world-safe path)', () => {
       expect(searchWiki(root, 'migrations')).toHaveLength(1);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
+
+  /**
+   * `search_wiki` takes its query straight from an agent, compiles it with
+   * `new RegExp` and runs it per line synchronously on the host event loop — so a
+   * catastrophic-backtracking pattern used to wedge the gateway, the worker, and
+   * every in-flight activity in the same process.
+   */
+  it('does not hang on a catastrophic-backtracking pattern', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'bait', `---\ndescription: d\n---\n${'a'.repeat(60)}b\n`);
+      const started = Date.now();
+      const hits = searchWiki(root, '(a+)+$');
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(Array.isArray(hits)).toBe(true);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('caps the query length instead of compiling unbounded agent input', () => {
+    const root = tmp();
+    try {
+      seedWiki(root);
+      expect(() => searchWiki(root, 'x'.repeat(5_000))).toThrow(/too long/i);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  /**
+   * For container worlds the world root is bind-mounted from the host, so a
+   * symlink the sandboxed agent plants inside the wiki used to resolve against
+   * the *host* filesystem — a container→host read primitive for any `*.md`. A
+   * dangling symlink additionally made the unguarded `statSync` throw, 500-ing
+   * search for the whole scope.
+   */
+  it('never follows symlinks and survives a dangling one', () => {
+    const root = tmp();
+    const outside = tmp();
+    try {
+      seedWiki(root);
+      fs.writeFileSync(path.join(outside, 'secret.md'), 'HOST-ONLY-SECRET\n');
+      fs.symlinkSync(path.join(outside, 'secret.md'), path.join(root, 'leak.md'));
+      fs.symlinkSync(outside, path.join(root, 'leak-dir'));
+      fs.symlinkSync(path.join(outside, 'gone.md'), path.join(root, 'dangling.md'));
+      const hits = searchWiki(root, 'HOST-ONLY-SECRET');
+      expect(hits).toEqual([]);
+      // The dangling symlink must not abort the walk for its siblings.
+      expect(searchWiki(root, 'migrations')).toHaveLength(1);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('deleting a section is not an unversioned recursive wipe', () => {
+  it('refuses to remove a section unless the caller opts in explicitly', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'guides/one', '---\ndescription: d\n---\nbody');
+      writeWikiPage(root, 'guides/two', '---\ndescription: d\n---\nbody');
+      expect(() => deleteWikiPage(root, 'guides')).toThrow(/section/i);
+      expect(readWikiPage(root, 'guides/one')).toBeDefined();
+      // A leaf page still deletes normally, and an explicit opt-in removes the section.
+      expect(deleteWikiPage(root, 'guides/one')).toBe(true);
+      expect(deleteWikiPage(root, 'guides', { recursive: true })).toBe(true);
+      expect(fs.existsSync(path.join(root, 'guides'))).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('built-in "How to work" override keeps every identity field', () => {
+  /**
+   * `resolveBuiltins` fell back to the bundled `name`/`description` but not
+   * `labels`/`importance`. `buildWikiPromptContext` filters on the `default`
+   * label, so a body-only override was neither inlined NOR replaced by the
+   * default: every agent in the organization silently lost the global
+   * instructions.
+   */
+  it('a body-only override still carries the default label, so it is still delivered', () => {
+    const contentDir = tmp();
+    try {
+      const root = wikiRoot(contentDir, 'organization', 'org1');
+      writeWikiPage(root, BUILTIN_WIKI_ENTRIES[0]!.path, 'Custom instructions with no frontmatter at all.');
+      const resolved = resolveBuiltins(root)[0]!;
+      expect(resolved.labels).toEqual(BUILTIN_WIKI_ENTRIES[0]!.labels);
+      expect(resolved.importance).toBe(BUILTIN_WIKI_ENTRIES[0]!.importance);
+      const prompt = buildWikiPromptContext({ contentDir, organizationId: 'org1' });
+      expect(prompt).toContain('Custom instructions with no frontmatter at all.');
+      expect(prompt).not.toContain(GLOBAL_INSTRUCTIONS);
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('`default`-page inlining is budgeted', () => {
+  /**
+   * `WIKI_TOC_TOKEN_BUDGET` governed only the TOC while every `default`-labelled
+   * body was inlined in full into every turn of every task — twenty 5k-token
+   * pages meant 100k tokens per turn, silently.
+   */
+  it('demotes overflow `default` pages to TOC lines instead of inlining them all', () => {
+    const contentDir = tmp();
+    try {
+      const root = wikiRoot(contentDir, 'organization', 'org1');
+      for (let i = 0; i < 12; i++)
+        writeWikiPage(root, `bulk/page-${String(i).padStart(2, '0')}`, `---\ndescription: d${i}\nlabels: default\nimportance: ${20 - i}\n---\n${`BODY${i} `.repeat(4_000)}`);
+      const prompt = buildWikiPromptContext({ contentDir, organizationId: 'org1' });
+      // The most important pages are inlined; the rest are still discoverable.
+      expect(prompt).toContain('BODY0');
+      expect(prompt).not.toContain('BODY11 BODY11');
+      expect(prompt).toContain('bulk/page-11');
+      expect(estimateTokens(prompt)).toBeLessThan(WIKI_TOC_TOKEN_BUDGET * 4);
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('a page may not be created on top of a section', () => {
+  it('rejects the write that would hide a whole subtree', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'guides/one', '---\ndescription: d\n---\nbody');
+      expect(() => writeWikiPage(root, 'guides', 'shadowing content')).toThrow(/section/i);
+      expect(listWiki(root).children!.some((c) => c.kind === 'section' && c.path === 'guides')).toBe(true);
+      expect(readWikiPage(root, 'guides/one')).toBeDefined();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('wiki refs are matched case-insensitively', () => {
+  it('parses @PROJ:/@Org: the way the UI keeps them', () => {
+    expect(parseWikiRefs('see @PROJ:guides/one and @Org:tag:Default')).toEqual([
+      { scope: 'project', kind: 'page', value: 'guides/one' },
+      { scope: 'organization', kind: 'label', value: 'Default' },
+    ]);
+  });
 });
 
 describe('buildWikiPromptContext', () => {
@@ -550,6 +686,56 @@ describe('project wiki git branches', () => {
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
 
+  it('commits only the pathspecs a caller names, not the whole shared root', () => {
+    const contentDir = tmp();
+    try {
+      const root = wikiRoot(contentDir, 'project', 'p1');
+      ensureProjectWikiRepository(contentDir, 'p1');
+      // Two agents edit the shared canonical root concurrently: A writes, B
+      // writes, THEN A commits. With `git add -A` that commit carried B's
+      // half-finished page under A's message and author.
+      writeWikiPage(root, 'notes/from-a', 'A');
+      writeWikiPage(root, 'notes/from-b', 'B');
+      commitProjectWiki(root, 'wiki: update notes/from-a', ['notes/from-a']);
+      const committed = execFileSync('git', ['-C', root, 'show', '--name-only', '--format=', 'HEAD'], { encoding: 'utf8' });
+      expect(committed).toContain('notes/from-a');
+      expect(committed).not.toContain('notes/from-b');
+      // B's page is still there, still uncommitted, ready for B's own commit.
+      expect(execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' })).toContain('notes/from-b');
+      commitProjectWiki(root, 'wiki: update notes/from-b', ['notes/from-b']);
+      expect(execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).trim()).toBe('');
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+
+  it('reuses an up-to-date branch view instead of deleting it under a concurrent reader', () => {
+    const contentDir = tmp();
+    try {
+      const root = wikiRoot(contentDir, 'project', 'p1');
+      writeWikiPage(root, 'notes/first', 'v1');
+      ensureProjectWikiRepository(contentDir, 'p1');
+      commitProjectWiki(root, 'wiki: v1');
+      execFileSync('git', ['-C', root, 'branch', 'karmax/task-1']);
+
+      const first = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      const marker = path.join(first, '.reader-was-here');
+      fs.writeFileSync(marker, 'reading');
+      // A second reader of the same branch used to `worktree remove --force` the
+      // directory the first was midway through reading.
+      const second = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      expect(second).toBe(first);
+      expect(fs.existsSync(marker)).toBe(true);
+      expect(readWikiPage(second, 'notes/first')!.content).toBe('v1');
+
+      // A view that is BEHIND its branch still moves forward.
+      writeWikiPage(root, 'notes/first', 'v2');
+      commitProjectWiki(root, 'wiki: v2', ['notes/first']);
+      execFileSync('git', ['-C', root, 'branch', '-f', 'karmax/task-1', 'HEAD']);
+      const third = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      expect(third).toBe(first);
+      expect(readWikiPage(third, 'notes/first')!.content).toBe('v2');
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+
   it('assembles each turn from the task branch checkout, not canonical main', () => {
     const contentDir = tmp();
     try {
@@ -738,5 +924,157 @@ describe('remote task wiki views', () => {
       store.close();
       fs.rmSync(contentDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('wiki symlink confinement', () => {
+  /**
+   * A container world's root is bind-mounted from the host, and the project wiki's
+   * canonical checkout sits on that host path — so a symlink planted by the
+   * sandboxed agent used to resolve against the HOST filesystem. `searchWiki`
+   * skipped symlinks for exactly this reason; the page read/write path did not,
+   * which made `read_wiki` an arbitrary host-file read primitive.
+   */
+  const withRoot = (fn: (root: string, outside: string) => void) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-wiki-link-'));
+    const root = path.join(base, 'wiki');
+    const outside = path.join(base, 'outside');
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'secret.key'), 'SUPER-SECRET');
+    try { fn(root, outside); } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  };
+
+  it('does not read a page whose markdown file is a symlink out of the root', () => {
+    withRoot((root, outside) => {
+      fs.mkdirSync(path.join(root, 'pwn'));
+      fs.symlinkSync(path.join(outside, 'secret.key'), path.join(root, 'pwn', 'SKILL.md'));
+      expect(readWikiPage(root, 'pwn')).toBeUndefined();
+    });
+  });
+
+  it('does not read through a symlinked section folder', () => {
+    withRoot((root, outside) => {
+      fs.writeFileSync(path.join(outside, 'SKILL.md'), '---\nname: leak\n---\nSUPER-SECRET');
+      fs.symlinkSync(outside, path.join(root, 'linked'));
+      expect(readWikiPage(root, 'linked')).toBeUndefined();
+      // …and it is not advertised in the tree either.
+      expect(JSON.stringify(listWiki(root))).not.toContain('linked');
+    });
+  });
+
+  it('does not write through a symlinked parent directory', () => {
+    withRoot((root, outside) => {
+      fs.symlinkSync(outside, path.join(root, 'linked'));
+      expect(() => writeWikiPage(root, 'linked/planted', '---\nname: x\n---\nbody', 'skill'))
+        .toThrow(/outside the wiki/);
+      expect(fs.existsSync(path.join(outside, 'planted'))).toBe(false);
+    });
+  });
+
+  it('still reads and writes ordinary pages', () => {
+    withRoot((root) => {
+      writeWikiPage(root, 'real/page', '---\nname: Real\n---\nbody text', 'skill');
+      const page = readWikiPage(root, 'real/page');
+      expect(page?.name).toBe('Real');
+      expect(page?.content).toContain('body text');
+    });
+  });
+
+  /**
+   * The confinement failed OPEN. `resolveInRoot` wrapped `realpathSync(root)` in a
+   * catch-everything whose comment claimed the only failure is "no root on disk
+   * yet", and returned the UNCHECKED absolute path — so a transient EACCES/EIO, or
+   * an ELOOP on the root itself, silently switched symlink confinement off for
+   * that call and handed the write path straight back its host-write primitive.
+   * Only ENOENT means "not created yet"; `secretFor` (src/auth/identity.ts) already
+   * scopes its catch exactly that way.
+   */
+  it('fails closed when the root realpath fails for a reason other than ENOENT', () => {
+    withRoot((root, outside) => {
+      fs.symlinkSync(outside, path.join(root, 'linked'));
+      const realpath = fs.realpathSync;
+      const spy = vi.spyOn(fs, 'realpathSync').mockImplementation(((p: any, ...rest: any[]) => {
+        if (p === root) {
+          const error: NodeJS.ErrnoException = new Error(`EACCES: permission denied, realpath '${root}'`);
+          error.code = 'EACCES';
+          throw error;
+        }
+        return (realpath as any)(p, ...rest);
+      }) as any);
+      try {
+        let thrown: unknown;
+        try {
+          writeWikiPage(root, 'linked/planted', '---\nname: x\n---\nbody', 'skill');
+        } catch (error) { thrown = error; }
+        expect(fs.existsSync(path.join(outside, 'planted'))).toBe(false); // no host write
+        expect((thrown as NodeJS.ErrnoException | undefined)?.code).toBe('EACCES'); // and the real error surfaces
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  it('still treats a wiki root that does not exist yet as nothing to escape through', () => {
+    withRoot((root) => {
+      const fresh = path.join(root, 'not-created-yet');
+      expect(readWikiPage(fresh, 'anything')).toBeUndefined();
+      writeWikiPage(fresh, 'first/page', '---\nname: First\n---\nbody', 'skill');
+      expect(readWikiPage(fresh, 'first/page')?.name).toBe('First');
+    });
+  });
+});
+
+describe('search regex safety guard', () => {
+  /**
+   * The guard rejected quantified GROUPS, backreferences, lookaround and adjacent
+   * quantifiers — but a flat SEQUENCE of unbounded quantifiers needs none of
+   * those. `a*a*a*…b` is 21 characters (far under WIKI_SEARCH_QUERY_MAX), compiles
+   * fine, passes every check, and backtracks super-polynomially against a line of
+   * `a`s with no `b`. `searchWiki` runs synchronously in the single
+   * gateway+worker process, so that wedges precisely what the guard exists to
+   * prevent.
+   */
+  it('rejects a flat sequence of unbounded quantifiers, which needs no group to blow up', () => {
+    expect(isSafeSearchPattern('a*a*a*a*a*a*a*a*a*a*b')).toBe(false);
+    expect(isSafeSearchPattern('a+a+a+a+a+a+a+a+a+a+b')).toBe(false);
+    expect(isSafeSearchPattern('\\w*\\w*\\w*\\w*\\w*\\w*\\w*!')).toBe(false);
+    expect(isSafeSearchPattern('a{1,}a{1,}a{1,}a{1,}a{1,}a{1,}b')).toBe(false);
+
+    // …and the rejection is what keeps the process responsive: the pattern falls
+    // back to a literal match, so this returns promptly instead of hanging.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-wiki-redos-'));
+    try {
+      writeWikiPage(root, 'notes/long', `---\nname: Long\n---\n${'a'.repeat(4_000)}`, 'skill');
+      const started = Date.now();
+      expect(searchWiki(root, 'a*a*a*a*a*a*a*a*a*a*b')).toEqual([]);
+      expect(Date.now() - started).toBeLessThan(2_000);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('still accepts the ordinary regexes a search box is for', () => {
+    for (const ok of [
+      'migrations',
+      'deploy.*runbook',
+      '^#+ Setup',
+      'TODO|FIXME',
+      'karmax\\s+task',
+      '[Ww]iki (page|entry)',
+      'v\\d+\\.\\d+',
+      'foo.*bar.*baz',
+    ]) expect(isSafeSearchPattern(ok)).toBe(true);
+    // Quantifiers inside a character class are literal characters, not repetition,
+    // so they must not count against the cap. (`[*+]` itself still trips the older
+    // adjacent-quantifier rule — that pre-existing conservatism is left alone.)
+    expect(isSafeSearchPattern('[*]a[+]b')).toBe(true);
+    // Escaped quantifiers are literals too.
+    expect(isSafeSearchPattern('a\\*b\\*c\\*d\\*e\\*f\\*')).toBe(true);
+    // The existing rejections must stay rejections.
+    expect(isSafeSearchPattern('(a+)+b')).toBe(false);
+    expect(isSafeSearchPattern('(a|a)*b')).toBe(false);
+    expect(isSafeSearchPattern('(a)\\1')).toBe(false);
+    expect(isSafeSearchPattern('(?=a)b')).toBe(false);
   });
 });

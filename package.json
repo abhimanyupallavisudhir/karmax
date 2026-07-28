@@ -16,6 +16,7 @@
     "worker": "tsx src/temporal/run-worker.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "reset": "tsx src/scripts/reset.ts",
     "backup": "tsx src/scripts/backup.ts",
@@ -45,6 +46,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
+    "@vitest/coverage-v8": "^4.1.10",
     "typescript": "^5.7.2",
     "vitest": "^4.1.10"
   }

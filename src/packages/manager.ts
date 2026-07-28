@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { WorkerManager } from '../temporal/worker-pool.js';
-import { WorkflowRepoLoader } from './repo.js';
+import { WorkflowRepoLoader, assertSafePackageName } from './repo.js';
 import { PackageStore } from './store.js';
 import { ExternalWorkflowRef } from './bundle.js';
 import { WORKFLOW_TYPE, qualifiedType } from '../workflows/names.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import { bundledStart, StartResolution } from '../platform/resolve-start.js';
+import { allows } from '../platform/capabilities.js';
 import { isolatedGitEnvironment } from '../world/git.js';
 
 /** One installed package, persisted so it can be reloaded at boot from disk. */
@@ -60,15 +61,42 @@ export class WorkflowManager {
     return this.cacheHome ? path.join(this.cacheHome, 'installed.json') : undefined;
   }
 
+  /**
+   * Read the install registry, dropping anything that is not a well-formed
+   * record. `restore()` feeds `r.dir` to the manifest reader, which for a
+   * `manifest.ts` runs `await import(...)` **in the host process** — so an
+   * unvalidated registry is boot-time code execution for anyone who can write
+   * `installed.json`. Every record must therefore have string fields and a `dir`
+   * confined under the cache home.
+   */
   private readRegistry(): InstalledRecord[] {
     const f = this.registryFile;
     if (!f || !fs.existsSync(f)) return [];
+    let data: unknown;
     try {
-      const data = JSON.parse(fs.readFileSync(f, 'utf8'));
-      return Array.isArray(data) ? data : [];
+      data = JSON.parse(fs.readFileSync(f, 'utf8'));
     } catch {
       return [];
     }
+    if (!Array.isArray(data)) return [];
+    return data.filter((r): r is InstalledRecord => this.validRecord(r));
+  }
+
+  private validRecord(r: unknown): boolean {
+    if (!r || typeof r !== 'object') return false;
+    const rec = r as Record<string, unknown>;
+    const str = (v: unknown) => typeof v === 'string' && v.length > 0 && v.length < 4096;
+    if (!str(rec.name) || !str(rec.version) || !str(rec.sha) || !str(rec.dir)) return false;
+    if (rec.organizationId !== undefined && !str(rec.organizationId)) return false;
+    if (!/^[0-9a-f]{7,64}$/i.test(rec.sha as string)) return false;
+    return this.underCacheHome(rec.dir as string);
+  }
+
+  /** Is `dir` inside the package cache we control? */
+  private underCacheHome(dir: string): boolean {
+    if (!this.cacheHome) return false;
+    const rel = path.relative(path.resolve(this.cacheHome), path.resolve(dir));
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
   }
 
   private writeRegistry(records: InstalledRecord[]): void {
@@ -100,13 +128,13 @@ export class WorkflowManager {
    */
   async install(spec: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
     // Peek at the name to reject built-in collisions before doing the fetch when possible.
-    if (spec.name && WORKFLOW_TYPE[spec.name]) throw new Error(`"${spec.name}" is a built-in workflow; edit it through the PR gate, not install`);
+    if (spec.name && isBuiltInWorkflowName(spec.name)) throw new Error(`"${spec.name}" is a built-in workflow; edit it through the PR gate, not install`);
     // Load + validate WITHOUT registering yet — a rejected package must not touch state.
     const pkg = await this.loader.load(spec, undefined, organizationId, {
       ...(organizationId === 'org_personal' ? {} : isolatedGitEnvironment()),
       ...(this.gitEnvironment?.(organizationId) ?? {}),
     });
-    if (WORKFLOW_TYPE[pkg.manifest.name]) throw new Error(`"${pkg.manifest.name}" is a built-in workflow; edit it through the PR gate, not install`);
+    if (isBuiltInWorkflowName(pkg.manifest.name)) throw new Error(`"${pkg.manifest.name}" is a built-in workflow; edit it through the PR gate, not install`);
     if (!pkg.workflowEntry) throw new Error(`package "${pkg.manifest.name}" ships no workflow module (workflow.ts|js|mjs)`);
     const type = externalWorkflowType(organizationId, pkg.manifest.name, pkg.manifest.version);
     // Version identity is load-bearing: a task pinned to name@version replays that
@@ -120,11 +148,25 @@ export class WorkflowManager {
       throw new Error(`${pkg.manifest.name}@${pkg.manifest.version} was already published from commit ${priorSha.slice(0, 8)}; bump the version to publish new code`);
     }
     if (priorSha === pkg.sha) return { name: pkg.manifest.name, version: pkg.manifest.version }; // no-op
-    this.storeFor(organizationId).register(pkg.manifest);
+    // The three maps ARE the bundle input, so a package that fails to compile must
+    // not be left in them: `worker.refresh` would then rebuild the same broken
+    // bundle on every subsequent install and wedge the manager permanently.
+    // Snapshot, mutate, and roll back if the roll fails.
+    const snapshot = { external: new Map(this.external), shaByType: new Map(this.shaByType), shaByPackage: new Map(this.shaByPackage) };
     this.external.set(type, { type, entryFile: pkg.workflowEntry, exportName: manifestExport(pkg.manifest) });
     this.shaByType.set(type, pkg.sha);
     this.shaByPackage.set(packageKey, pkg.sha);
-    await this.worker.refresh([...this.external.values()]);
+    try {
+      await this.worker.refresh([...this.external.values()]);
+    } catch (e) {
+      this.external = snapshot.external;
+      this.shaByType = snapshot.shaByType;
+      this.shaByPackage = snapshot.shaByPackage;
+      // Best-effort: put the worker back on the last bundle that did build.
+      await this.worker.refresh([...this.external.values()]).catch(() => {});
+      throw e;
+    }
+    this.storeFor(organizationId).register(pkg.manifest);
     this.persist(organizationId, pkg.manifest.name, pkg.manifest.version, pkg.sha, pkg.dir);
     return { name: pkg.manifest.name, version: pkg.manifest.version };
   }
@@ -140,10 +182,22 @@ export class WorkflowManager {
     let loaded = 0;
     for (const r of records) {
       try {
+        // `readRegistry` already confined `dir`, but re-assert here: `inspect`
+        // may `await import()` a `manifest.ts` in the host process.
+        if (!this.underCacheHome(r.dir)) throw new Error('snapshot outside the workflow cache');
         if (!fs.existsSync(r.dir)) throw new Error('snapshot missing');
+        // A version is "pinned by commit SHA", so the record must point at the
+        // snapshot that commit produced (`<nameDir>/<sha>`) and not at some other
+        // directory. NOTE: this does not re-hash the tree — nothing on disk
+        // records the expected content hash — so an attacker with write access to
+        // the cache can still edit a snapshot in place. Confining `dir` and
+        // matching the SHA closes the registry-rewrite path; hardening the cache
+        // contents themselves needs a stored tree digest (not yet recorded).
+        if (path.basename(r.dir) !== r.sha) throw new Error('snapshot directory does not match its pinned commit');
         const { manifest, workflowEntry } = await this.loader.inspect(r.dir);
         if (!workflowEntry) throw new Error('no workflow module');
         const organizationId = r.organizationId ?? 'org_personal';
+        if (isBuiltInWorkflowName(manifest.name)) throw new Error('shadows a built-in workflow');
         this.storeFor(organizationId).register(manifest);
         // Legacy personal installs already have running executions pinned to the
         // old unqualified package type. Keep that export forever; new records are
@@ -180,7 +234,9 @@ export class WorkflowManager {
     this.writeRegistry(records.filter((record) => record.organizationId !== organizationId));
     if (removed.length) await this.worker.refresh([...this.external.values()]);
     if (this.cacheHome) {
-      const safe = organizationId.replace(/[^a-z0-9_.-]/gi, '-');
+      // Validate rather than scrub: the old `.replace()` left dots intact, so an
+      // id of `..` would have made this recursive rmSync delete the cache root.
+      const safe = assertSafePackageName(organizationId, 'organization id');
       fs.rmSync(path.join(this.cacheHome, 'organizations', safe), { recursive: true, force: true });
     }
   }
@@ -232,6 +288,25 @@ export class WorkflowManager {
   }
 }
 
+/**
+ * Names a package may never install under.
+ *
+ * `WORKFLOW_TYPE` alone was not enough: its keys are only the five *task*
+ * workflows, so the bundled coordinator manifests (`merge-queue`, `agent-queue`,
+ * `account-coordinator`) were installable — and a second `agent-queue` manifest
+ * shadowing the built-in one drives the global "Concurrent agent turns" form.
+ * Using a Set (rather than indexing an object) also stops `constructor`,
+ * `__proto__` and friends from testing truthy through the prototype chain.
+ */
+const BUILT_IN_WORKFLOW_NAMES: ReadonlySet<string> = new Set([
+  ...Object.keys(WORKFLOW_TYPE),
+  ...MANIFESTS.map((m) => m.name),
+]);
+
+export function isBuiltInWorkflowName(name: string): boolean {
+  return BUILT_IN_WORKFLOW_NAMES.has(name);
+}
+
 /** Internal Temporal workflow types are tenant-qualified. Human-facing manifest
  * names stay unchanged within each organization. */
 export function externalWorkflowType(organizationId: string, name: string, version: string): string {
@@ -258,5 +333,28 @@ export function reloadSpecForWorkflowEdit(
   if (status !== 'done') return undefined;
   const p = task.params ?? {};
   if (!p.workflowEdit || typeof p.repo !== 'string' || !p.repo) return undefined;
+  if (!proposerMayInstall(task)) return undefined;
   return { url: p.repo, ref: typeof p.target === 'string' ? p.target : undefined };
+}
+
+/**
+ * Whether the principal who proposed this workflow edit was allowed to *install*
+ * workflow code, not merely edit it.
+ *
+ * `proposeWorkflowEdit` requires only `workflow:edit` and stores the caller's
+ * arbitrary `repo` URL on the task. The self-heal loop then feeds that URL to
+ * `install()`, which clones and bundles it into the worker — so without this
+ * check `workflow:edit` silently reaches `workflow:install`. That is a real
+ * escalation: `workflow:edit` sits inside `PROJECT_GRANT_CEILING` while
+ * `workflow:install` is deliberately outside it (src/platform/authorization.ts),
+ * and the reviewed-PR gate reviews the branch diff, never the repo URL string.
+ *
+ * The capabilities are read from the `_authorization` snapshot recorded on the
+ * task at proposal time, so revoking a grant later cannot retroactively license
+ * an install, and a task carrying no snapshot is refused rather than trusted.
+ */
+export function proposerMayInstall(task: { params?: Record<string, unknown> }): boolean {
+  const authorization = (task.params ?? {})._authorization as { capabilities?: unknown } | undefined;
+  const caps = Array.isArray(authorization?.capabilities) ? (authorization!.capabilities as string[]) : [];
+  return allows(caps, 'workflow:install');
 }

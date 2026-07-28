@@ -59,9 +59,9 @@ export class S3ObjectStore implements ObjectStore {
   private async request(method: string, key: string, body: Buffer = Buffer.alloc(0), contentType?: string): Promise<Response> {
     if (!key || key.includes('..')) throw new Error('invalid object key');
     const base = new URL(this.options.endpoint.replace(/\/$/, '') + '/');
-    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+    const encodedKey = key.split('/').map(uriEncode).join('/');
     const prefix = base.pathname.replace(/\/$/, '');
-    base.pathname = `${prefix}/${encodeURIComponent(this.options.bucket)}/${encodedKey}`;
+    base.pathname = `${prefix}/${uriEncode(this.options.bucket)}/${encodedKey}`;
     const now = new Date();
     const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
     const date = amzDate.slice(0, 8);
@@ -84,6 +84,18 @@ export class S3ObjectStore implements ObjectStore {
     if (!response.ok) throw new Error(`object store ${method} failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
     return response;
   }
+}
+
+/**
+ * RFC 3986 percent-encoding, as SigV4's canonical URI requires.
+ *
+ * `encodeURIComponent` leaves `!'()*` untouched — they are "mark" characters in
+ * the older RFC 2396. AWS builds the string-to-sign from the fully-encoded path,
+ * so a key containing any of them was signed one way and sent another, and the
+ * request came back `SignatureDoesNotMatch`. Only `A-Za-z0-9-_.~` may stay literal.
+ */
+function uriEncode(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 function sha256(value: Buffer): string { return crypto.createHash('sha256').update(value).digest('hex'); }

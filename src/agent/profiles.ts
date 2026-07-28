@@ -1,6 +1,7 @@
 import { AgentProfile, AgentRole, AgentSpec, Provider } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { allRoles } from '../contrib/manifests.js';
+import { CLAUDE_DEFAULT_MODEL } from './effort.js';
 
 /**
  * The default per-role profiles, derived from the roles the active workflows
@@ -24,7 +25,13 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
 
 export function defaultModel(provider: Provider): string | undefined {
   if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-5.5';
-  if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? 'claude-sonnet-5';
+  // Must stay identical to CLAUDE_DEFAULT_MODEL in src/agent/claude.ts: this one
+  // is stamped onto every role by seedProfiles(), that one is the fallback for a
+  // model-less profile on the metered rail. They used to disagree (`claude-sonnet-5`
+  // — which never existed — vs `claude-sonnet-4-5`, which fails the effort gate),
+  // so a model-less profile silently lost its reasoning effort. Imported rather
+  // than duplicated so they cannot drift again.
+  if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? CLAUDE_DEFAULT_MODEL;
   if (provider === 'opencode') return process.env.KARMAX_OPENCODE_MODEL ?? 'kimi/kimi-for-coding';
   if (provider === 'kimi') return process.env.KARMAX_KIMI_MODEL ?? 'kimi-for-coding';
   if (provider === 'grok') return process.env.KARMAX_GROK_MODEL ?? 'grok-build';

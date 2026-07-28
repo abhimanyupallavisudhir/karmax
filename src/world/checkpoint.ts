@@ -11,6 +11,7 @@ import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
+import { RunnerPoolService } from './runners.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -22,11 +23,19 @@ interface PortableDelta { version: 1; files: DeltaFile[] }
 /** Provider-independent disaster-recovery layer. Provider snapshots remain the
  * fast path; this encrypted delta plus the broker-pushed branch is portable. */
 export class WorldCheckpointService {
+  /** Restoring re-provisions a real (billable) sandbox, so it must pass through
+   * the same durable admission as `createWorld`. `RunnerPoolService` is a thin
+   * facade over the store — the lease queue in SQLite is the source of truth —
+   * so it is constructed here by default rather than threaded through every
+   * caller; tests may inject one. */
+  private runners: RunnerPoolService;
+
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
     private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
-    private resources?: import('./resources.js').ProjectResourceService) {
+    private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService) {
     if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
+    this.runners = runners ?? new RunnerPoolService(store);
   }
 
   async checkpoint(handleInput: WorldHandleRef): Promise<WorldCheckpoint> {
@@ -115,11 +124,32 @@ export class WorldCheckpointService {
     }));
     const cloneCredentials = this.githubApp && repositories.every(Boolean) ? Object.fromEntries(repositories.map((repository) =>
       [repository!.sshUrl, this.githubApp!.repositorySshKey(repository!.id, 'clone')])) : undefined;
-    const world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
-      repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
-      branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
-      ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-      network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
+    // Restoring PROVISIONS A REAL SANDBOX, so it must pass through the same
+    // durable admission as createWorld (activities/core.ts): the runner lease is
+    // what enforces the organization/project `monthlyBudgetMicros`, what produces
+    // the `world.active` usage row cost attribution reads, and — via
+    // `meta.worldLeaseId` — what `destroyWorld` later releases. Restore is reached
+    // from the registry recovery handler (main.ts) and the hibernation wake, i.e.
+    // exactly when a world is silently re-provisioned, so without this a
+    // provider-billed sandbox was invisible to karmax and its capacity was never
+    // returned. Local providers are unmetered and take no lease, matching
+    // createWorld's `remote &&` guard.
+    const remote = this.worlds.get(selected).capabilities?.remote === true;
+    const acquired = remote
+      ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
+        provider: selected, priority: Number(this.store.getTask(checkpoint.worldId)?.params.priority ?? 0) })
+      : undefined;
+    let world: World;
+    try {
+      world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
+        repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
+        branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
+        ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
+        network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
+    } catch (error) {
+      if (acquired) this.runners.release(acquired.leaseId, selected);
+      throw error;
+    }
     try {
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
@@ -141,8 +171,11 @@ export class WorldCheckpointService {
       world.handle = runtime.handle;
       if (runtime.warnings.length)
         world.handle.warnings = [...(world.handle.warnings ?? []), ...runtime.warnings];
+      // Stamped exactly as createWorld does, so `destroyWorld` finds the lease to
+      // release and the world's cost is attributed to the right pool.
+      if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
       const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
-        { runnerPoolId: checkpoint.runnerPoolId,
+        { runnerPoolId: acquired?.runnerPoolId ?? checkpoint.runnerPoolId,
           environmentDigest: environment.digest ?? checkpoint.environmentDigest }) as WorldHandle;
       world.handle = registered;
       return registered;
@@ -150,6 +183,7 @@ export class WorldCheckpointService {
       await this.resources?.release(world.handle).catch(() => undefined);
       await destroyWorldServices(checkpoint.worldId).catch(() => undefined);
       await world.destroy().catch(() => undefined);
+      if (acquired) this.runners.release(acquired.leaseId, selected);
       throw error;
     }
   }

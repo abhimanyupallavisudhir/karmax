@@ -18,7 +18,7 @@
     <div id="app"></div>
     <div id="overlay-root"></div>
     <div id="modal-root"></div>
-    <div class="toasts" id="toasts"></div>
+    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
     <script type="module" src="/app.js"></script>
     <script>
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js');

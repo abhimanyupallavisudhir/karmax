@@ -50,6 +50,26 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
+  /** HTTP status the gateway answers with. Kept on the class so one mapping in
+   *  `Gateway.fail` covers every route instead of each handler wrapping locally. */
+  status = 403;
+}
+
+/**
+ * A named identifier did not resolve. An agent has to be able to tell this from
+ * a denial (escalate) and from a server fault (back off) — `no such task <id>`
+ * used to reach the client as a 500, which reads as "karmax is broken" rather
+ * than "you passed the wrong id".
+ */
+export class NotFoundError extends Error {
+  code = 'not_found';
+  status = 404;
+}
+
+/** Caller-supplied input was rejected. A 400, never a 500. */
+export class ValidationError extends Error {
+  code = 'invalid_request';
+  status = 400;
 }
 
 /**
@@ -63,6 +83,10 @@ export class CapabilityError extends Error {
 export interface TriggerArmer {
   arm(task: TaskRecord): void;
   disarm(taskId: string): void;
+  /** Graph-aware validation (self-dependency, cycles, dangling dependency ids).
+   *  Only the armer can do this half — it needs the store to resolve dependency
+   *  ids — so `armStoredTask` asks for it before mutating anything. */
+  validationErrors?(task: TaskRecord): string[];
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
@@ -118,9 +142,46 @@ const QUERY_TIMEOUT_MS = 3000;
  */
 const START_TIMEOUT_MS = 12_000;
 
-/** A failed execution is terminal, but software-dev can start a replacement run
- * from its persisted world/conversation checkpoint. These mirror escalation's
- * controls; signalTask gives them terminal-aware semantics. */
+/**
+ * Which workflows can start a replacement run from a failed execution's
+ * persisted world/conversation checkpoint.
+ *
+ * `goal` belongs here and used to be excluded by a bare `=== 'software-dev'`
+ * string test: every `goalV1_x` delegates to the matching `softwareDevV1_x`, so
+ * `input.recovery` was already fully supported and only the check rejected it.
+ * The exclusion also caught a task *created* as software-dev and switched to
+ * Goal in flight — `changeWorkflow` persists the new name, so its recovery
+ * controls silently vanished mid-task. Matches the `resumable` predicate below.
+ *
+ * `merge-only` is deliberately NOT here: `recoverFailedTask` injects a
+ * "continue from the existing worktree" message and reads `session:<id>:do`,
+ * and merge-only has no Do agent to resume. Adding it needs that assumption
+ * removed first, not just a name in this set.
+ */
+const RECOVERABLE_WORKFLOWS = new Set(['software-dev', 'goal']);
+
+/**
+ * Reject a queue reorder aimed at a domain this task does not hold.
+ *
+ * A multi-repo task takes ONE merge slot PER REPO, so the check has to be
+ * against the whole set. Views published before software-dev@1.9.0 / merge-only
+ * @1.5.0 carry only `mergeDomain` — the *first* domain — which made this guard
+ * reject a perfectly legitimate request to reorder any later one. So the
+ * complete `mergeDomains` list wins when present, and the known-partial singular
+ * is treated as evidence of membership rather than an exclusive whitelist: a
+ * mismatch there falls through to the coordinator, which is authoritative and
+ * safely no-ops when the task is not actually queued in that domain.
+ */
+function assertInMergeDomain(task: TaskRecord, domain: string): void {
+  const state = task.lastView?.state as { mergeDomain?: unknown; mergeDomains?: unknown } | undefined;
+  const all = Array.isArray(state?.mergeDomains) ? (state!.mergeDomains as string[]) : undefined;
+  if (all && !all.includes(domain)) throw new Error('task is not in that merge queue domain');
+}
+
+
+/** A failed execution is terminal, but a recoverable workflow can start a
+ * replacement run from its persisted world/conversation checkpoint. These mirror
+ * escalation's controls; signalTask gives them terminal-aware semantics. */
 const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
   { name: 'retry', kind: 'signal', label: 'Retry', enabled: true },
   {
@@ -460,6 +521,32 @@ export class KarmaxApi {
   }
 
   /**
+   * Authorize every `agent:<role>.resumeFrom.taskId` in a task's params against
+   * the **source** task, not just the task being created/edited.
+   *
+   * `resumeFrom` makes the activity runtime (`src/activities/core.ts`) load
+   * another task's provider session and splice its transcript into the new
+   * agent's messages. That is a conversation read of the source task, so it has
+   * to be checked at the source's project/organization — otherwise a token
+   * holding only `task:create` in its own project could replay any conversation
+   * from any sibling project or tenant into an agent it controls. `forkTaskAgent`
+   * already models the intended check; this closes the same door on the raw
+   * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
+   */
+  private authorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const resumeFrom = (value as Record<string, unknown>).resumeFrom;
+      if (!resumeFrom || typeof resumeFrom !== 'object' || Array.isArray(resumeFrom)) continue;
+      const sourceId = (resumeFrom as Record<string, unknown>).taskId;
+      if (typeof sourceId !== 'string' || !sourceId) continue;
+      const source = this.deps.store.getTask(sourceId);
+      if (!source) throw new NotFoundError(`no task ${sourceId} to resume from`);
+      this.require(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId });
+    }
+  }
+
+  /**
    * A repo-oriented workflow — one whose manifest declares a `repos` param — run
    * against a project with no repository configured would silently get a
    * throwaway scratch repo from the world provider (worktree.ts): the agent ends
@@ -533,6 +620,12 @@ export class KarmaxApi {
       credentialPolicies?: VaultTaskPolicyOverrides;
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
+      /** Ordinal priority (index into PRIORITY_NAMES). Part of the creation
+       *  payload, so it is applied under `task:create` — see `applyTagPatch`. */
+      priority?: number;
+      /** Tag names or `a/b` paths, created on demand. Applied under
+       *  `task:create` for the same reason as `priority`. */
+      tags?: string[];
       assignee?: PrincipalRef;
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
@@ -540,7 +633,7 @@ export class KarmaxApi {
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
     const project = this.deps.store.getProject(args.projectId);
-    if (!project) throw new Error(`no project ${args.projectId}`);
+    if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
@@ -566,6 +659,9 @@ export class KarmaxApi {
     // Wiki context (which pages to inline) isn't a manifest param either; a
     // top-level arg (MCP/API) is folded in like the form sends it via `params`.
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
+    // A `resumeFrom` pointer reads another task's conversation — authorize it
+    // against that task's project before anything is created.
+    this.authorizeResumeSources(token, taskOverrides);
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
     // (drafts may still be saved without one, then checked again at queueTask).
@@ -625,6 +721,12 @@ export class KarmaxApi {
       this.deps.store.setTaskNotes(task.id, args.notes);
       task.notes = args.notes || undefined;
     }
+    // Organizational metadata supplied WITH the create, applied here under the
+    // caller's `task:create` rather than as follow-up `task:edit` calls. Both
+    // are set before the task can be queued, so a created task is never briefly
+    // visible without the priority/tags it was asked for.
+    if (args.priority) this.deps.store.setTaskPriority(task.id, args.priority);
+    if (args.tags?.length) this.applyTagPatch(task.id, task.projectId, { add: args.tags });
     // Materialize up-front alternates before the first workflow can start. Draft
     // creation keeps all of them editable; immediate creation queues all of them.
     const createdAlternates: TaskRecord[] = [];
@@ -898,7 +1000,7 @@ export class KarmaxApi {
   /** Pin a project to a version of a workflow for new tasks (§21d); empty clears to latest. */
   pinWorkflow(token: string, args: { projectId: string; workflow: string; version?: string }): { workflow: string; version: string } {
     const project = this.deps.store.getProject(args.projectId);
-    if (!project) throw new Error(`no project ${args.projectId}`);
+    if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     this.require(token, 'edit_workflow', { projectId: args.projectId, organizationId: project.organizationId });
     if (!this.resolveStart(args.workflow, args.version && args.version !== 'latest' ? args.version : undefined, project.organizationId))
       throw new Error(`workflow "${args.workflow}" is not available to this organization`);
@@ -910,7 +1012,7 @@ export class KarmaxApi {
   /** The version each installed/built-in workflow is pinned to for a project (else 'latest'). */
   workflowPins(token: string, projectId: string): Record<string, string> {
     const project = this.deps.store.getProject(projectId);
-    if (!project) throw new Error(`no project ${projectId}`);
+    if (!project) throw new NotFoundError(`no project ${projectId}`);
     this.require(token, 'list_workflows', { projectId, organizationId: project.organizationId });
     const out: Record<string, string> = {};
     for (const w of this.deps.workflows?.list(project.organizationId) ?? []) out[w.name] = this.workflowPinFor(projectId, w.name) ?? 'latest';
@@ -991,7 +1093,13 @@ export class KarmaxApi {
    */
   private armStoredTask(taskId: string): TaskRecord {
     const task = this.deps.store.getTask(taskId)!;
-    const errs = validateTriggers(normalizeTriggers(task.params));
+    // Validate BEFORE any mutation, and prefer the armer's graph-aware check.
+    // Two bugs here: the pure `validateTriggers` cannot see self-dependencies,
+    // cycles, or dangling dependency ids (it has no store), so those only surfaced
+    // later inside `arm()` — by which point `clearDraft` and `triggerState: armed`
+    // had already been persisted, leaving a rejected task marked armed but never
+    // registered with the dispatcher, i.e. waiting forever with nothing to fire it.
+    const errs = this.armer?.validationErrors?.(task) ?? validateTriggers(normalizeTriggers(task.params));
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     // Arming is the queue transition for triggered work, so this also assigns
     // the logical task's human-facing number if it has never been queued before.
@@ -1006,7 +1114,7 @@ export class KarmaxApi {
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.require(token, 'create_task', { projectId: task.projectId, taskId });
     const group = this.deps.store.attemptGroup(taskId);
     if (group?.committedAttemptId && group.committedAttemptId !== taskId) {
@@ -1139,7 +1247,7 @@ export class KarmaxApi {
     credentialPolicies?: VaultTaskPolicyOverrides,
   ): Promise<TaskRecord> {
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     // Drafts, armed triggers, and repeatable series have no running workflow — edit
     // their stored authorization in place. Everything else routes through the live
     // workflow update below (frozen only once it's cancelled/terminal).
@@ -1191,9 +1299,11 @@ export class KarmaxApi {
    * each trigger fire of a repeatable series, and by "Run again".
    */
   async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
-    const caller = this.require(token, 'create_task');
     const series = this.deps.store.getTask(seriesId);
-    if (!series) throw new Error(`no task ${seriesId}`);
+    // Scope the check to the series' own project (the run inherits it), so a
+    // project-scoped token cannot spawn a run from another project's series.
+    const caller = this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId });
+    if (!series) throw new NotFoundError(`no task ${seriesId}`);
     const run = this.deps.store.createTask({
       projectId: series.projectId,
       listId: series.listId,
@@ -1237,9 +1347,9 @@ export class KarmaxApi {
    * start failure so a fire is never silently lost.
    */
   async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone'): Promise<{ startedTaskId: string }> {
-    this.require(token, 'create_task');
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    this.require(token, 'create_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId)).id };
 
@@ -1256,6 +1366,12 @@ export class KarmaxApi {
       if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
       this.consumeDiscardProgress(taskId);
     } catch (e) {
+      // "Already started" is not a failure to compensate for: the execution IS
+      // running under this task's workflow id (a duplicate fire, a retried
+      // dispatch). Re-arming would leave the row claiming `armed` while the
+      // workflow runs, and `src/platform/reconcile.ts` then excludes it from
+      // reconciliation forever — the task is permanently invisible to recovery.
+      if (e instanceof WorkflowExecutionAlreadyStartedError) return { startedTaskId: taskId };
       this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any);
       throw e;
     }
@@ -1276,9 +1392,9 @@ export class KarmaxApi {
 
   /** Cancel a task's triggers: disarm it and keep it as an editable draft. */
   async cancelTrigger(token: string, taskId: string): Promise<TaskRecord> {
-    this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.armer?.disarm(taskId);
     const { triggerState: _s, ...rest } = task.params as Record<string, unknown>;
     this.deps.store.updateTaskParams(taskId, { ...rest, draft: true } as any);
@@ -1297,9 +1413,12 @@ export class KarmaxApi {
     params: Record<string, unknown>,
     opts: { replace?: boolean; keepArmed?: boolean } = {},
   ): Promise<TaskRecord> {
-    this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    // Editing params can introduce a `resumeFrom` pointer at another task, so
+    // the same source-side conversation check as createTask applies here.
+    this.authorizeResumeSources(token, params);
     const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
       ...(archived !== undefined ? { archived } : {}),
@@ -1373,7 +1492,7 @@ export class KarmaxApi {
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: this.availableStageTransitions(task, view) } : {}),
-        ...(view.status === 'failed' && view.workflow === 'software-dev' && !view.pointOfNoReturnPassed
+        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
           : { actions: this.lifecycleActions(view) }),
       };
@@ -1451,9 +1570,9 @@ export class KarmaxApi {
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
   async addAttempt(token: string, sourceTaskId: string): Promise<TaskRecord> {
-    this.require(token, 'create_task');
     const source = this.deps.store.getTask(sourceTaskId);
-    if (!source) throw new Error(`no task ${sourceTaskId}`);
+    this.require(token, 'create_task', { projectId: source?.projectId, taskId: sourceTaskId });
+    if (!source) throw new NotFoundError(`no task ${sourceTaskId}`);
     const group = this.deps.store.attemptGroup(sourceTaskId);
     if (!group) throw new Error('task has no attempt group');
     if (group.committedAttemptId) throw new Error('no more attempts can be added after an attempt enters Merge');
@@ -1760,7 +1879,7 @@ export class KarmaxApi {
   async moveTaskStage(token: string, taskId: string, target: string): Promise<TaskView> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'signal_task', { projectId: task?.projectId, taskId });
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     const view = task.params.draft ? this.getDraftView(token, taskId) : task.lastView;
     if (!view) throw new Error('task has no lifecycle state yet');
     const move = this.availableStageTransitions(task, view).find((candidate) => candidate.target === target);
@@ -1856,7 +1975,7 @@ export class KarmaxApi {
   async listTaskAgents(token: string, taskId: string): Promise<Array<{ role: string; label: string; session?: string; provider?: string; messageCount: number }>> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_agents', { projectId: task?.projectId, taskId });
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     const view = await this.getTaskView(token, taskId);
     const transcripts = view?.transcripts?.length
       ? view.transcripts
@@ -1882,7 +2001,7 @@ export class KarmaxApi {
   async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
-    if (!source) throw new Error(`no task ${args.taskId}`);
+    if (!source) throw new NotFoundError(`no task ${args.taskId}`);
     const role = args.role ?? 'do';
     if (!this.deps.store.kvGet(`session:${args.taskId}:${role}`) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
@@ -1941,23 +2060,31 @@ export class KarmaxApi {
   }
 
   async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' | 'flag'; description?: string }): Promise<Tag> {
-    this.require(token, 'manage_tag');
+    this.require(token, 'manage_tag', { projectId: input.projectId });
     return this.deps.store.createTag(input);
   }
 
+  // `/api/tags/:id` and `/api/views/:id` carry no project in the path, so the
+  // record has to be looked up BEFORE the check or the token's project/tenant
+  // scope has nothing to compare against and the guard silently passes. Without
+  // this, any token with `task:edit` could rename or delete a tag or a saved
+  // view in any project of any organization.
   async updateTag(token: string, id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | 'flag' | null; description?: string | null }): Promise<Tag | undefined> {
-    this.require(token, 'manage_tag');
+    const tag = this.deps.store.getTag(id);
+    this.require(token, 'manage_tag', { projectId: tag?.projectId });
     return this.deps.store.updateTag(id, patch);
   }
 
   async deleteTag(token: string, id: string): Promise<void> {
-    this.require(token, 'manage_tag');
+    const tag = this.deps.store.getTag(id);
+    this.require(token, 'manage_tag', { projectId: tag?.projectId });
     this.deps.store.deleteTag(id);
   }
 
   /** Replace the full tag set on a task (organization only — never reaches the agent). */
   async setTaskTags(token: string, taskId: string, tagIds: string[]): Promise<string[]> {
-    this.require(token, 'set_task_tags');
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'set_task_tags', { projectId: task?.projectId, taskId });
     this.deps.store.setTaskTags(taskId, tagIds);
     return this.deps.store.tagsFor(taskId);
   }
@@ -1970,8 +2097,24 @@ export class KarmaxApi {
    */
   async tagTask(token: string, taskId: string, patch: { add?: string[]; remove?: string[] }): Promise<{ tags: string[] }> {
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no such task ${taskId}`);
+    if (!task) throw new NotFoundError(`no such task ${taskId}`);
     this.require(token, 'set_task_tags', { projectId: task.projectId, taskId });
+    return this.applyTagPatch(task.id, task.projectId, patch);
+  }
+
+  /**
+   * Tag resolution and application, without the capability check.
+   *
+   * Split out so `createTask` can apply the tags that came WITH the creation
+   * payload under its own `task:create` authorization. Applying them as a
+   * follow-up `tagTask` call needed `task:edit`, which the bundled Do role does
+   * not hold — so an agent creating a tagged sub-task got the task created and
+   * *then* a permission error, with the tags silently missing and a half-built
+   * task left behind. Creating a task with its metadata is one act of creation,
+   * not a create plus an edit.
+   */
+  private applyTagPatch(taskId: string, projectId: string, patch: { add?: string[]; remove?: string[] }): { tags: string[] } {
+    const task = { id: taskId, projectId };
     const resolve = () => {
       const tags = this.deps.store.listTags(task.projectId);
       const byId = new Map(tags.map((t) => [t.id, t]));
@@ -2000,33 +2143,43 @@ export class KarmaxApi {
   /** Set the organizational priority (0–4) — editable at any lifecycle stage. */
   async setTaskPriority(token: string, taskId: string, priority: number): Promise<void> {
     const task = this.deps.store.getTask(taskId);
-    this.require(token, 'set_task_priority', { projectId: task?.projectId, taskId });
+    // Refuse a missing task explicitly. `task?.projectId` on a nonexistent id
+    // passes `undefined` as the scope, and an omitted scope is not a partial
+    // check but NO check — the tenant guard goes inert and the write silently
+    // no-ops instead of reporting that the id was wrong.
+    if (!task) throw new NotFoundError(`no such task ${taskId}`);
+    this.require(token, 'set_task_priority', { projectId: task.projectId, taskId });
     this.deps.store.setTaskPriority(taskId, priority);
   }
 
   // ─── Saved views (a view is a saved query) ───────────────────────────────────
   async listViews(token: string, projectId: string): Promise<SavedView[]> {
-    this.require(token, 'list_views');
+    this.require(token, 'list_views', { projectId });
     return this.deps.store.listViews(projectId);
   }
 
   async createView(token: string, input: { projectId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
-    this.require(token, 'manage_view');
+    this.require(token, 'manage_view', { projectId: input.projectId });
     return this.deps.store.createView(input);
   }
 
+  // As with tags: `/api/views/:id` has no project in the path, so the view is
+  // resolved first and its project supplied as the scope to check against.
   async updateView(token: string, id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
-    this.require(token, 'manage_view');
+    const view = this.deps.store.getView(id);
+    this.require(token, 'manage_view', { projectId: view?.projectId });
     return this.deps.store.updateView(id, patch);
   }
 
   async reorderView(token: string, id: string, ord: number): Promise<void> {
-    this.require(token, 'manage_view');
+    const view = this.deps.store.getView(id);
+    this.require(token, 'manage_view', { projectId: view?.projectId });
     this.deps.store.reorderView(id, ord);
   }
 
   async deleteView(token: string, id: string): Promise<void> {
-    this.require(token, 'manage_view');
+    const view = this.deps.store.getView(id);
+    this.require(token, 'manage_view', { projectId: view?.projectId });
     this.deps.store.deleteView(id);
   }
 
@@ -2037,7 +2190,8 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     const view = task?.lastView;
     if (!task || !view) throw new Error(`no failed task ${taskId}`);
-    if (task.workflow !== 'software-dev' || view.status !== 'failed') throw new Error('only failed software-dev tasks can be recovered');
+    if (!RECOVERABLE_WORKFLOWS.has(task.workflow) || view.status !== 'failed')
+      throw new Error(`only a failed ${[...RECOVERABLE_WORKFLOWS].join(' or ')} task can be recovered`);
     if (view.pointOfNoReturnPassed) throw new Error('cannot recover a task after its merge point of no return');
 
     // Recovery is an explicit migration boundary. Replaying a replacement with
@@ -2170,7 +2324,7 @@ export class KarmaxApi {
       if (!vote.satisfied) return;
     }
     const terminal = this.deps.store.getTask(taskId)?.lastView;
-    if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
+    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) {
         await this.recoverFailedTask(taskId);
         return;
@@ -2477,7 +2631,7 @@ export class KarmaxApi {
   ): Promise<{ workflow: 'software-dev' | 'goal' }> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
     }
@@ -2512,9 +2666,9 @@ export class KarmaxApi {
 
   async reorderQueue(token: string, domain: string, taskId: string): Promise<void> {
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.require(token, 'reorder_queue', { projectId: task.projectId, taskId });
-    if (task.lastView?.state?.mergeDomain && task.lastView.state.mergeDomain !== domain) throw new Error('task is not in that merge queue domain');
+    assertInMergeDomain(task, domain);
     await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
       workflowId: mergeQueueId(domain),
       taskQueue: this.deps.taskQueue,
@@ -2530,9 +2684,9 @@ export class KarmaxApi {
    */
   async moveQueueItem(token: string, domain: string, taskId: string, beforeTaskId?: string): Promise<void> {
     const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.require(token, 'reorder_queue', { projectId: task.projectId, taskId });
-    if (task.lastView?.state?.mergeDomain && task.lastView.state.mergeDomain !== domain) throw new Error('task is not in that merge queue domain');
+    assertInMergeDomain(task, domain);
     if (beforeTaskId && this.deps.store.getTask(beforeTaskId)?.projectId !== task.projectId)
       throw new Error('cannot reorder across project authorization boundaries');
     await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
@@ -2545,11 +2699,15 @@ export class KarmaxApi {
   }
 
   async queueView(token: string, domain: string, projectId?: string): Promise<{ queue: string[]; current?: string }> {
-    this.require(token, 'get_task', projectId ? { projectId } : undefined);
+    const caller = this.require(token, 'queue:read', projectId ? { projectId } : undefined);
+    // A merge-queue domain spans whatever tasks were enqueued into it. With no
+    // explicit project the raw view leaks other projects' task ids, so a
+    // project-scoped token filters to its own project by default.
+    const scopedTo = projectId ?? caller.projectId;
     try {
       const view = (await this.deps.client.workflow.getHandle(mergeQueueId(domain)).query('queue')) as { queue: string[]; current?: string };
-      if (!projectId) return view;
-      const belongs = (id: string | undefined) => !!id && this.deps.store.getTask(id)?.projectId === projectId;
+      if (!scopedTo) return view;
+      const belongs = (id: string | undefined) => !!id && this.deps.store.getTask(id)?.projectId === scopedTo;
       return { queue: view.queue.filter((id) => belongs(id)), ...(belongs(view.current) ? { current: view.current } : {}) };
     } catch {
       return { queue: [] };
@@ -2557,7 +2715,10 @@ export class KarmaxApi {
   }
 
   async agentQueueView(token: string): Promise<{ capacity: number; queue: any[]; current: any[] }> {
-    this.require(token, 'get_task');
+    // The host agent-queue is a queue surface, not a task read: bind it to the
+    // same `queue:read`/`queue:write` pair the gateway route uses, so a
+    // maintainer (queue:*) is not refused by one layer and allowed by the other.
+    this.require(token, 'queue:read');
     const saved = Number(this.deps.store.getSettings('global', 'agent-queue')?.capacity);
     const fallback = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3;
     try {
@@ -2572,7 +2733,12 @@ export class KarmaxApi {
     await this.deps.client.workflow.getHandle(agentQueueId()).signal(SIG_REORDER, { turnId, beforeTurnId });
   }
 
-  async setAgentCapacity(capacity: number): Promise<void> {
+  /** Host-wide concurrent agent turns. Installation configuration, so it takes
+   *  the same `settings:write` the `/api/settings/global/agent-queue` route that
+   *  drives it is bound to — this used to be the one queue mutation with no
+   *  token and no check at all. */
+  async setAgentCapacity(token: string, capacity: number): Promise<void> {
+    this.require(token, 'set_settings');
     const value = Number.isFinite(capacity) && capacity > 0 ? Math.floor(capacity) : 3;
     await this.deps.client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
       workflowId: agentQueueId(),
@@ -2598,8 +2764,12 @@ export class KarmaxApi {
   }
 
   // ── Wiki (org/project skills, memories, prompts — SPEC §4.4 content) ──────
-  // Reads need the scope's read capability; writes reuse skill:write (the wiki
-  // IS the skills store). All paths are traversal-checked inside src/wiki.
+  // Reads need the scope's read capability; writes reuse `skill:write` because
+  // authoring wiki content and saving a skill are the same authority, not
+  // because they are the same store. They are NOT: `saveSkill` writes a flat
+  // file under `<contentDir>/skills/` that is never inlined into a prompt,
+  // while the wiki is the scoped, labelled store that is (SPEC §19.6).
+  // All paths are traversal-checked inside src/wiki.
 
   /** Resolve + authorize one wiki scope. Project wikis default to the caller
    * task's checkout; humans may explicitly select another task or branch. */
@@ -2614,7 +2784,7 @@ export class KarmaxApi {
     let caller;
     if (scope === 'project') {
       const project = this.deps.store.getProject(id);
-      if (!project) throw new Error(`no project ${id}`);
+      if (!project) throw new NotFoundError(`no project ${id}`);
       caller = this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId });
       const canonical = ensureProjectWikiRepository(this.deps.contentDir ?? paths().content, id);
       const requestedTask = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
@@ -2715,7 +2885,15 @@ export class KarmaxApi {
     }
     if (previousPath && previousPath !== nextPath) moveWikiPage(root, previousPath, nextPath);
     const page = writeWikiPage(root, args.path, args.content, args.kind, { create: args.create });
-    if (scope === 'project') commitProjectWiki(root, `wiki: update ${page.path}`);
+    // Scope the commit to the page(s) this edit touched. The canonical wiki root is
+    // shared by every browser tab and every agent editing this project's wiki, so a
+    // whole-tree `git add -A` attributed a concurrent editor's half-written page to
+    // THIS commit (and left theirs empty, silently swallowed by the catch in
+    // commitProjectWiki). A move also has to name the old path, or the removal of
+    // the previous folder is left staged for whoever commits next.
+    if (scope === 'project')
+      commitProjectWiki(root, `wiki: update ${page.path}`,
+        previousPath && previousPath !== nextPath ? [page.path, previousPath] : [page.path]);
     else this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
       operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
       content: page.content, principal: view.principal,
@@ -2723,28 +2901,59 @@ export class KarmaxApi {
     return page;
   }
 
-  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string, selector: { taskId?: string; branch?: string } = {}) {
+  /**
+   * Delete a wiki page, or (with `recursive`) a whole section.
+   *
+   * An organization wiki has no git history — `organization_wiki_versions` IS its
+   * only undo. `readWikiPage` returns undefined for a *section*, so a section
+   * delete used to record no baseline and a `delete` row with `content:
+   * undefined`, while the filesystem removal is a recursive `rmSync`: one
+   * `DELETE …/wiki/page?path=guides` destroyed the subtree unrecoverably.
+   * Every page under the target is baselined and recorded before anything is
+   * removed, and `recursive` is passed through deliberately so the wiki layer's
+   * "this is a section, confirm" guard still stands for an unqualified call.
+   */
+  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string,
+    selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
     const view = this.wikiScope(token, scope, id, true, selector);
     const root = view.root;
     const safe = safeWikiPath(rel);
-    const existing = readWikiPage(root, safe);
-    if (scope === 'organization' && existing)
-      this.deps.store.recordOrganizationWikiVersion({
-        organizationId: id,
-        path: safe,
-        operation: 'baseline',
-        kind: existing.kind,
-        content: existing.content,
-        principal: view.principal,
-        ifEmpty: true,
+    const doomed = this.wikiPagesUnder(root, safe);
+    if (scope === 'organization') {
+      for (const page of doomed)
+        this.deps.store.recordOrganizationWikiVersion({
+          organizationId: id,
+          path: page.path,
+          operation: 'baseline',
+          kind: page.kind,
+          content: page.content,
+          principal: view.principal,
+          ifEmpty: true,
+        });
+    }
+    const deleted = deleteWikiPage(root, rel, { recursive: selector.recursive });
+    if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safe}`, [safe]);
+    if (deleted && scope === 'organization') {
+      for (const page of doomed) this.deps.store.recordOrganizationWikiVersion({
+        organizationId: id, path: page.path, operation: 'delete', kind: page.kind,
+        content: page.content, principal: view.principal,
       });
-    const deleted = deleteWikiPage(root, rel);
-    if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safeWikiPath(rel)}`);
-    if (deleted && scope === 'organization') this.deps.store.recordOrganizationWikiVersion({
-      organizationId: id, path: safe, operation: 'delete', kind: existing?.kind,
-      content: existing?.content, principal: view.principal,
-    });
-    return { deleted };
+    }
+    return { deleted, removed: doomed.map((page) => page.path) };
+  }
+
+  /** Every readable page at `rel` or beneath it (a page returns just itself). */
+  private wikiPagesUnder(root: string, rel: string): { path: string; kind: 'skill' | 'memory'; content: string }[] {
+    const page = readWikiPage(root, rel);
+    if (page) return [{ path: page.path, kind: page.kind, content: page.content }];
+    const out: { path: string; kind: 'skill' | 'memory'; content: string }[] = [];
+    const walk = (entry: { path: string; kind: string; children?: any[] }) => {
+      if (entry.kind === 'section') { for (const child of entry.children ?? []) walk(child); return; }
+      const child = readWikiPage(root, entry.path);
+      if (child) out.push({ path: child.path, kind: child.kind, content: child.content });
+    };
+    walk(listWiki(root, rel) as any);
+    return out;
   }
 
   searchWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
@@ -2814,11 +3023,11 @@ export class KarmaxApi {
   }
 
   async deleteWikiPageResolved(token: string, scope: WikiScope, id: string, rel: string,
-    selector: { taskId?: string; branch?: string } = {}) {
+    selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
     if (!remote) return this.deleteWikiPage(token, scope, id, rel, selector);
     try {
-      const deleted = deleteWikiPage(remote.root, rel);
+      const deleted = deleteWikiPage(remote.root, rel, { recursive: selector.recursive });
       if (deleted) await remote.flush(`wiki: delete ${safeWikiPath(rel)}`);
       return { deleted };
     } finally { await remote.release(); }
@@ -2848,7 +3057,7 @@ export class KarmaxApi {
   private async remoteWikiSnapshot(token: string, projectId: string, write: boolean,
     selector: { taskId?: string; branch?: string }) {
     const project = this.deps.store.getProject(projectId);
-    if (!project) throw new Error(`no project ${projectId}`);
+    if (!project) throw new NotFoundError(`no project ${projectId}`);
     const caller = this.require(token, write ? 'skill:write' : 'project:read',
       { projectId, organizationId: project.organizationId });
     const taskId = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
@@ -2919,7 +3128,7 @@ export class KarmaxApi {
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'edit_workflow', { projectId: args.projectId });
     const project = this.deps.store.getProject(args.projectId);
-    if (!project) throw new Error(`no project ${args.projectId}`);
+    if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, args.projectId, undefined, caller.caps)
       : { profileId: 'caller', capabilities: caller.caps, attenuated: false };

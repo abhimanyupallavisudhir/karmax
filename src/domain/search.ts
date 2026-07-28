@@ -38,6 +38,14 @@ export interface FieldContext extends EvalContext {
   idToNum?: Map<string, number>;
   /** dep-task-id → the tasks that depend on it (reverse edges, for `blocks:`). */
   blockedBy?: Map<string, SearchTask[]>;
+  /**
+   * task id → its soonest upcoming schedule fire, precomputed once per query.
+   * `nextCronFire` walks the calendar minute by minute in the worst case (`29 2`
+   * is ~2900 day-steps), and the `nextRun` sort key is read inside the comparator
+   * — so without this it ran O(n log n) times per sort of the built-in
+   * "Scheduled" view. Absent ⇒ fall back to computing on demand.
+   */
+  nextRun?: Map<string, number | undefined>;
 }
 
 export type FieldType = 'text' | 'enum' | 'number' | 'date' | 'tag' | 'facet';
@@ -183,6 +191,9 @@ const nextRunOf = (t: SearchTask, now: number): number | undefined => {
   }
   return best;
 };
+/** `nextRunOf` through the per-query cache (see `FieldContext.nextRun`). */
+const cachedNextRun = (t: SearchTask, ctx?: FieldContext): number | undefined =>
+  ctx?.nextRun ? ctx.nextRun.get(t.id) : nextRunOf(t, ctx?.now ?? 0);
 /** Task ids this task depends on (across its dependency triggers). */
 const dependencyIds = (t: SearchTask): string[] =>
   normalizeTriggers(t.params)
@@ -251,7 +262,7 @@ export const FIELDS: FieldDef[] = [
   // ── trigger / schedule / dependency fields (this feature) ──
   { key: 'trigger', label: 'Trigger', type: 'enum', options: TRIGGER_OPTIONS, get: primaryTriggerKind, groupable: true, sortable: true, sortKey: (t) => primaryTriggerKind(t) },
   { key: 'schedule', label: 'Schedule', type: 'text', aliases: ['cron'], get: (t) => cronOf(t) },
-  { key: 'nextRun', label: 'Next run', type: 'date', aliases: ['next', 'nextrun'], get: (t, ctx) => nextRunOf(t, ctx?.now ?? 0), sortable: true, sortKey: (t, ctx) => nextRunOf(t, ctx?.now ?? 0) ?? Number.MAX_SAFE_INTEGER },
+  { key: 'nextRun', label: 'Next run', type: 'date', aliases: ['next', 'nextrun'], get: (t, ctx) => cachedNextRun(t, ctx), sortable: true, sortKey: (t, ctx) => cachedNextRun(t, ctx) ?? Number.MAX_SAFE_INTEGER },
   { key: 'dependsOn', label: 'Depends on', type: 'text', aliases: ['dependson', 'dep', 'after'], get: (t, ctx) => refBlob(dependencyIds(t), ctx?.idToNum) },
   { key: 'blocks', label: 'Blocks', type: 'text', get: (t, ctx) => refBlob((ctx?.blockedBy?.get(t.id) ?? []).map((d) => d.id), ctx?.idToNum) },
   { key: 'is', label: 'Is', type: 'facet', aliases: ['has', 'needs'], options: FACET_OPTIONS, get: facetsOf },
@@ -367,7 +378,13 @@ export function resolveTagValue(value: string, tags: Tag[]): Set<string> {
 }
 
 // ─── date value parsing ──────────────────────────────────────────────────────
-type DateVal = { kind: 'instant'; ts: number } | { kind: 'age'; ms: number };
+/**
+ * `day` distinguishes the two spellings that both produce an instant. A
+ * `YYYY-MM-DD` names a whole calendar day, so `>` must mean "after that day
+ * ends"; a raw epoch-millisecond names one point, where `>` means exactly `>`.
+ * Collapsing them made every numeric comparison a full day wrong.
+ */
+type DateVal = { kind: 'instant'; ts: number; day: boolean } | { kind: 'age'; ms: number };
 const DUR_MS: Record<string, number> = { h: 3600e3, d: 86400e3, w: 604800e3, m: 2592000e3 };
 function parseDateValue(value: string, now: number): DateVal | undefined {
   const v = value.trim().toLowerCase();
@@ -375,9 +392,9 @@ function parseDateValue(value: string, now: number): DateVal | undefined {
   const dur = v.match(/^(\d+)\s*([hdwm])$/);
   if (dur) return { kind: 'age', ms: Number(dur[1]) * DUR_MS[dur[2]!]! };
   const abs = v.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (abs) return { kind: 'instant', ts: Date.UTC(Number(abs[1]), Number(abs[2]) - 1, Number(abs[3])) };
+  if (abs) return { kind: 'instant', ts: Date.UTC(Number(abs[1]), Number(abs[2]) - 1, Number(abs[3])), day: true };
   const n = Number(v);
-  if (Number.isFinite(n)) return { kind: 'instant', ts: n };
+  if (Number.isFinite(n)) return { kind: 'instant', ts: n, day: false };
   return undefined;
 }
 
@@ -458,10 +475,29 @@ function matchDate(ts: number, op: FilterClause['op'], val: DateVal, now: number
     if (op === 'gt' || op === 'gte') return ts <= threshold;
     return ts >= threshold;
   }
+  // A raw epoch-millisecond names one POINT in time: compare it exactly. Giving
+  // it the whole-day treatment below shifted every numeric comparison by up to a
+  // day (`created:>1767225600000` silently meant "+24h").
+  if (!val.day) {
+    switch (op) {
+      case 'gt': return ts > val.ts;
+      case 'gte': return ts >= val.ts;
+      case 'lt': return ts < val.ts;
+      case 'lte': return ts <= val.ts;
+      default: return ts === val.ts;
+    }
+  }
+  // An absolute date parses to UTC midnight, i.e. it names a whole DAY, not an
+  // instant — so the four comparisons are genuinely four different half-open
+  // ranges. Collapsing gt≡gte and lt≡lte made `created:>2026-01-01` include Jan 1
+  // (which is not "after" it) and `created:<=2026-01-01` exclude it (which is not
+  // "up to and including" it).
   const day = 86400e3;
   switch (op) {
-    case 'gt': case 'gte': return ts >= val.ts;
-    case 'lt': case 'lte': return ts < val.ts;
+    case 'gt': return ts >= val.ts + day; // strictly after that day
+    case 'gte': return ts >= val.ts; // that day or later
+    case 'lt': return ts < val.ts; // strictly before that day
+    case 'lte': return ts < val.ts + day; // that day or earlier
     default: return ts >= val.ts && ts < val.ts + day; // same calendar day
   }
 }
@@ -517,13 +553,17 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext): FieldContext {
   const idToNum = new Map<string, number>();
   for (const t of tasks) if (t.num != null) idToNum.set(t.id, t.num);
   const blockedBy = new Map<string, SearchTask[]>();
+  const nextRun = new Map<string, number | undefined>();
   for (const t of tasks) {
     for (const dep of dependencyIds(t)) {
       const arr = blockedBy.get(dep) ?? blockedBy.set(dep, []).get(dep)!;
       arr.push(t);
     }
+    // Cron scanning is the one genuinely expensive field key; compute it once per
+    // task here rather than once per comparison inside the sort.
+    if (normalizeTriggers(t.params).some((x) => x.kind === 'schedule')) nextRun.set(t.id, nextRunOf(t, ctx.now));
   }
-  return { ...ctx, idToNum, blockedBy };
+  return { ...ctx, idToNum, blockedBy, nextRun };
 }
 
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {

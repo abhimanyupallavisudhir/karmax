@@ -5,7 +5,9 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
-import { accountCoordinatorId } from '../src/coordinators/names.js';
+import { accountCoordinatorId, mergeQueueId } from '../src/coordinators/names.js';
+import { mergeQueueDomains } from '../src/domain/types.js';
+import { BUNDLED_QUALIFIED } from '../src/workflows/names.js';
 
 const view = (h: any) => h.query('view') as Promise<any>;
 const baseInput = (taskId: string, repo: string, over: any = {}) => ({
@@ -334,6 +336,163 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:feat.txt']);
     expect(onMain.stdout).toContain('feature work');
   });
+
+  /** A repo with `main` plus a `feature` branch carrying one extra commit. */
+  const repoWithFeature = async (name: string) => {
+    const repo = await h.makeRepo(name);
+    await git(repo, ['checkout', '-q', '-b', 'feature']);
+    fs.writeFileSync(path.join(repo, 'feat.txt'), 'feature work\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-q', '-m', 'feat']);
+    await git(repo, ['checkout', '-q', 'main']);
+    return repo;
+  };
+
+  /** Park a merge-queue domain by seeding its singleton coordinator with a slot
+   *  already leased to a task that never releases it. */
+  const holdMergeDomain = async (domain: string) =>
+    h.client.workflow.start('mergeQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: mergeQueueId(domain),
+      args: [{ domain, state: { domain, queue: [], current: 'held', processed: 0 } }],
+    });
+
+  // Both behaviors below are pinned to mergeOnly@1.5.0 — the version the manifest
+  // stamps on every new merge-only task. They are deliberately NOT retrofitted onto
+  // older pins: each changes the commands a workflow task emits at a point older
+  // executions already recorded, which would be a NonDeterminismError on replay.
+  // The `keeps the pre-1.5 shape` test below is the other half of that contract.
+  it('merge-only 1.5: cancelling while queued for a merge slot releases the world instead of leaking it', async () => {
+    const repo = await repoWithFeature('mo-cancel');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('mergeOnly@1.5.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'merge feature', branch: 'feature', target: 'main' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    const parked = await view(handle);
+    const worldRoot = parked.worldPath ?? parked.world.root;
+    expect(fs.existsSync(worldRoot)).toBe(true);
+
+    // Hold the domain this task will queue on so it cannot merge straight through.
+    const domain = `${parked.world.repos?.[0]?.localPath ?? parked.world.repo}:main`;
+    const holder = await holdMergeDomain(domain);
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('mergeSlot');
+    expect((await view(handle)).stage).toBe('merge');
+
+    // Cancel from the queue. This exit used to return `cancelled` without ever
+    // calling destroyWorld — for a cloud world, a leaked billable sandbox.
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+    expect(fs.existsSync(worldRoot)).toBe(false);
+    // …and the slot it was waiting on was handed back, not left queued.
+    expect(((await holder.query('queue')) as any).queue).toEqual([]);
+    // nothing landed on main
+    expect((await git(repo, ['cat-file', '-e', 'main:feat.txt'])).code).not.toBe(0);
+    await holder.terminate('test done');
+  });
+
+  it('merge-only 1.5: a confirm that arrives before the Review gate does not pre-approve it', async () => {
+    const repo = await repoWithFeature('mo-latch');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('mergeOnly@1.5.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'early confirm', branch: 'feature', target: 'main' })],
+    });
+    // Fire the confirm immediately — before the world even exists, so it predates
+    // the gate. `confirmSignal` sets the latch at ANY stage; without the clear on
+    // entry to Review the branch merged completely unreviewed.
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    // Still parked on a human at the gate, and nothing merged.
+    await new Promise((r) => setTimeout(r, 1_500));
+    const v = await view(handle);
+    expect(v.stage).toBe('review');
+    expect(v.waitingFor?.kind).toBe('human');
+    expect((await git(repo, ['cat-file', '-e', 'main:feat.txt'])).code).not.toBe(0);
+    // The Review gate advertises exactly Approve + Cancel — no dead "Request
+    // changes" action (there is no Do stage to send work back to).
+    expect(v.actions.map((a: any) => a.name).sort()).toEqual(['cancel', 'confirm']);
+
+    // A confirm sent while the gate IS open still works.
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:feat.txt'])).stdout).toContain('feature work');
+  });
+
+  it('merge-only pre-1.5: keeps the pre-1.5 confirm-latch shape, so in-flight executions still replay', async () => {
+    const repo = await repoWithFeature('mo-latch-legacy');
+    const taskId = newId('task');
+    // The bare `mergeOnly` type is the 1.1.0 entry point. An execution pinned here
+    // recorded its Review gate returning INSTANTLY for a confirm that predated the
+    // gate; if the 1.5.0 clear leaked onto this version the gate would park instead,
+    // emitting no command where history has one — a NonDeterminismError that wedges
+    // the execution for good. So the old (buggier) behavior is the CORRECT behavior
+    // here, and this test exists to keep anyone from "fixing" it retroactively.
+    const handle = await h.client.workflow.start('mergeOnly', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'early confirm', branch: 'feature', target: 'main' })],
+    });
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:feat.txt'])).stdout).toContain('feature work');
+  });
+
+  // mergeOnly@1.5.0 is implemented but only reachable once it is exported from
+  // src/workflows/index.ts and listed in BUNDLED_QUALIFIED (names.ts) — files this
+  // change deliberately does not touch. The test activates itself the moment they
+  // land; see the report accompanying this change for the exact two lines.
+  it.skipIf(!BUNDLED_QUALIFIED.has('mergeOnly@1.5.0'))(
+    'merge-only 1.5: serializes on EVERY repo domain, not just repo[0]',
+    async () => {
+      const repo = await repoWithFeature('mo-domains');
+      // A real project makes the world multi-repo: karmax attaches the project
+      // wiki companion checkout alongside the development repo, and the wiki pins
+      // its own target branch — precisely the case the old single ad-hoc domain
+      // key merged unserialized.
+      const project = h.store.createProject('MergeOnly domains',
+        { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+      const task = h.store.createTask({ projectId: project.id, title: 'merge feature',
+        workflow: 'merge-only', workflowVersion: '1.5.0', params: { prompt: '' } as any });
+      const taskId = task.id;
+      const handle = await h.client.workflow.start('mergeOnly@1.5.0', {
+        taskQueue: TASK_QUEUE,
+        workflowId: taskId,
+        args: [{
+          ...baseInput(taskId, repo, { title: 'merge feature', branch: 'feature', target: 'main' }),
+          projectId: project.id,
+        }],
+      });
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+      const v = await view(handle);
+      const domains = mergeQueueDomains(v.world, 'main', project.id);
+      expect(domains.length).toBeGreaterThan(1);
+      expect(v.state.mergeDomains).toEqual(domains); // same keys software-dev computes
+      // The one domain the old ad-hoc `repo[0]` key would never have locked.
+      const adHoc = `${v.world.repos?.[0]?.localPath ?? v.world.repo}:main`;
+      const unlocked = domains.filter((d: string) => d !== adHoc);
+      expect(unlocked.length).toBeGreaterThan(0);
+
+      const holder = await holdMergeDomain(unlocked[0]!);
+      await handle.signal('confirm');
+      // Old behavior: blows straight past this domain and merges within a second.
+      await new Promise((r) => setTimeout(r, 4_000));
+      const queued = await view(handle);
+      expect(queued.stage).toBe('merge');
+      expect(queued.waitingFor?.kind).toBe('mergeSlot');
+      expect((await git(repo, ['cat-file', '-e', 'main:feat.txt'])).code).not.toBe(0);
+
+      // Release the held slot → it acquires the rest and merges.
+      await holder.signal('release', { taskId: 'held' });
+      expect((await handle.result()).stage).toBe('done');
+      expect((await git(repo, ['show', 'main:feat.txt'])).stdout).toContain('feature work');
+      await holder.terminate('test done');
+    },
+  );
 
   it('account coordinator: leases account capacity and frees it on return', async () => {
     // a grantee workflow that simply exists to receive the grant signal

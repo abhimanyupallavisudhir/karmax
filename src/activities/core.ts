@@ -756,7 +756,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
       } catch (error) {
-        await destroyWorldServices(args.taskId).catch(() => undefined);
+        // `world` is still live on this path — pass it, or teardown addresses the
+        // HOST daemon while the containers live inside the world (a silent no-op).
+        await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
         throw error;
@@ -1711,9 +1713,49 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // impossible; any history that regresses from baseline-pass to candidate-fail
       // blocks the merge.
       if (!deps.client) return { passed: false, detail: 'tests passed, but replay compatibility could not run: no Temporal client' };
-      const candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
-      if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
+
+      // INTENDED: the replay gate applies only to a repo that actually carries a
+      // karmax workflow bundle. `propose_workflow_edit` also targets external
+      // workflow *package* repos, which declare their own entrypoint and have no
+      // `src/workflows/index.ts` — blocking those for a "missing bundle" made the
+      // package flow unusable. Probe INSIDE the world so the answer is identical
+      // on a remote sandbox, where the host cannot see the world's files at all.
+      const bundleRel = path.posix.join('src', 'workflows', 'index.ts');
+      const hasBundle = (await world.exec('bash', ['-lc', `test -f ${bundleRel} && echo yes || echo no`])).stdout.includes('yes');
+      if (!hasBundle) {
+        record(args.taskId, 'checks.replay', { skipped: 'repo carries no karmax workflow bundle' });
+        return { passed: true, detail: 'tests passed; replay gate does not apply (this repo carries no karmax workflow bundle)' };
+      }
+
+      // The Temporal replay bundler needs a real HOST filesystem tree. A remote
+      // world's `root` is a path inside the provider sandbox, so `fs` on it always
+      // missed and every hosted workflow edit failed the gate with a misleading
+      // "bundle is missing". Mirror the candidate sources out in ONE exec (a
+      // per-file download over the provider API is hundreds of round-trips) and
+      // borrow the running install's node_modules for module resolution.
+      let mirror: string | undefined;
+      let candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
+      if (isRemote(args.worldHandle.kind)) {
+        mirror = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-replay-'));
+        const packed = await world.exec('bash', ['-lc', 'tar czf - src package.json | base64 -w0'], { timeoutMs: 5 * 60_000 });
+        if (packed.code !== 0) {
+          fs.rmSync(mirror, { recursive: true, force: true });
+          return { passed: false, detail: `tests passed, but the candidate sources could not be read from the remote world: ${(packed.stderr || packed.stdout).slice(-400)}` };
+        }
+        fs.writeFileSync(path.join(mirror, 'src.tgz'), Buffer.from(packed.stdout.trim(), 'base64'));
+        try {
+          await pexec('tar', ['xzf', 'src.tgz'], { cwd: mirror });
+        } catch (e) {
+          fs.rmSync(mirror, { recursive: true, force: true });
+          return { passed: false, detail: `tests passed, but the candidate sources could not be unpacked: ${(e instanceof Error ? e.message : String(e)).slice(-400)}` };
+        }
+        // Symlink rather than install: the candidate is a karmax checkout, so the
+        // running install's dependencies are exactly the ones its imports resolve to.
+        fs.symlinkSync(fileURLToPath(new URL('../../node_modules', import.meta.url)), path.join(mirror, 'node_modules'));
+        candidatePath = path.join(mirror, 'src', 'workflows', 'index.ts');
+      }
       try {
+        if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
         const histories: Array<{ workflowId: string; history: unknown }> = [];
         for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
           histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
@@ -1748,6 +1790,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
       } catch (e) {
         return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
+      } finally {
+        if (mirror) fs.rmSync(mirror, { recursive: true, force: true });
       }
     },
 

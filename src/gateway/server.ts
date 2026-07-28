@@ -91,6 +91,9 @@ export interface GatewayDeps {
   /** Whether the browser and the host are the same machine (see `hostLocal`).
    *  Defaults to detecting it from how the gateway is served. */
   hostLocal?: boolean;
+  /** Inbox delivery channels with a registered adapter. The console disables the
+   *  rest rather than offering a switch that silently cannot deliver. */
+  deliveryChannels?: string[];
   remoteAccess?: RemoteAccessController;
 }
 
@@ -129,6 +132,12 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  // A full-tenant export dumps every project, the whole tasks table (prompts and
+  // results included), memberships, settings and executions. `organization:read`
+  // is inside PROJECT_GRANT_CEILING and the developer profile, so gating on it
+  // let a deliberately project-ceilinged agent read every sibling project. This
+  // is an administrative operation, not a read.
+  if (/^\/api\/organizations\/[^/]+\/export$/.test(p)) return 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/(?:accounts|git-profiles|credentials)(?:\/|$)/.test(p))
     return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/organizations\/[^/]+\/workflows(?:\/|$)/.test(p))
@@ -177,7 +186,16 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments') return 'task:create';
+  // Reading one back is a read of the task content it belongs to. The exact match
+  // above does not cover `/api/attachments/:id`, which therefore fell through to the
+  // conservative fallback — an implicit binding for a route that serves task bytes.
+  if (p.startsWith('/api/attachments/')) return 'task:read';
   if (p.startsWith('/api/workflows')) return read ? 'workflow:read' : (p.includes('/install') ? 'workflow:install' : 'workflow:edit');
+  // `/api/agent-queue*` is a queue surface too, but it does NOT start with
+  // `/api/queue`, so it used to fall through to the conservative fallback:
+  // `settings:write` at the gateway against `queue:write` in the service layer,
+  // which 403'd a maintainer who legitimately holds `queue:*`.
+  if (p.startsWith('/api/agent-queue')) return read ? 'queue:read' : 'queue:write';
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
@@ -825,7 +843,13 @@ export class Gateway {
           this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
         return this.json(res, 200, { ...body, ...(events?.length ? { dispatched: events.length } : {}) });
       } catch (error) {
-        return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
+        // Only a genuine signature failure is a 401. Answering 401 for ANY
+        // exception made GitHub redeliver — but `handleWebhook` has already
+        // inserted the delivery dedupe row by then, so the redelivery
+        // short-circuits as a duplicate and the reconcile is lost forever. A 5xx
+        // is the honest answer for a processing fault and is equally retried.
+        const message = error instanceof Error ? error.message : String(error);
+        return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
       }
     }
     // Agent mailbox inbound webhook (PLAN-passwords.md §8): authenticated by a
@@ -997,6 +1021,14 @@ export class Gateway {
         hosted: this.deps.hosted ?? false,
         hostLocal: this.hostLocal,
         worldProviders: this.deps.worlds.catalog(),
+        // Which inbox delivery channels actually have an adapter wired. The console
+        // used to render Email/Slack switches unconditionally and toast "saved" for
+        // them, but `src/main.ts` only registers those adapters when
+        // KARMAX_EMAIL_DELIVERY_URL / KARMAX_SLACK_DELIVERY_URL are set — so a user
+        // could enable Email, be told it saved, and then simply never be notified
+        // again (the failure was logged server-side only). Report the truth and let
+        // the UI disable what cannot work.
+        deliveryChannels: this.deps.deliveryChannels ?? ['browser'],
         sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
       });
     }
@@ -1053,14 +1085,21 @@ export class Gateway {
     }
     const token = session.apiToken;
     const { api, store } = this.deps;
+    let authRecord = this.deps.tokens.verify(token);
     const organizationResource = p.match(/^\/api\/organizations\/([^/]+)\/(accounts|git-profiles|credentials|workflows)(\/.*)?$/);
-    const resourceOrganizationId = organizationResource?.[1] ?? requestedScope.organizationId ?? 'org_personal';
+    // The legacy un-namespaced aliases (`/api/accounts`, `/api/git-profiles`,
+    // `/api/credentials`) carry no organization, and `requestScope` derives none
+    // for them — so this used to fall straight through to `org_personal` and
+    // read/write ANOTHER tenant's credential handles and config-home logins with
+    // the tenant guard inert. The bearer's own organization is the correct
+    // default (the payments block at `/api/cards` already does exactly this).
+    const resourceOrganizationId = organizationResource?.[1] ?? requestedScope.organizationId
+      ?? authRecord?.organizationId ?? 'org_personal';
     const resourcePath = organizationResource
       ? `/api/${organizationResource[2]}${organizationResource[3] ?? ''}`
       : p;
 
     const required = capabilityForRequest(method, p, url);
-    let authRecord = this.deps.tokens.verify(token);
     if (required) {
       const scope = requestedScope;
       const checked = this.deps.tokens.check(token, required, scope);
@@ -1098,12 +1137,16 @@ export class Gateway {
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
+      // Remote access drives `tailscale`/`pkexec` ON THE HOST. That is a
+      // host-machine affordance, so it follows `hostLocal` (the console hides it
+      // on the same predicate), not `hosted` — a self-host served on a public URL
+      // is `hosted:false, hostLocal:false` and must not offer it.
       if (p === '/api/remote-access' && method === 'GET') {
-        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        if (!this.hostLocal || !this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
         return this.json(res, 200, await this.deps.remoteAccess.setupStatus());
       }
       if (p === '/api/remote-access' && method === 'POST') {
-        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        if (!this.hostLocal || !this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
         const b = await this.body(req);
         if (b.action === 'setup') return this.json(res, 202, this.deps.remoteAccess.beginSetup());
         if (b.action === 'enable') return this.json(res, 200, await this.deps.remoteAccess.enable());
@@ -1592,7 +1635,13 @@ export class Gateway {
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         const safety = agentSlotStats();
-        const queue = await api.agentQueueView(token);
+        // The panel needs only counts. `agentQueueView` is bound to `queue:read`
+        // (it is a queue surface), so a principal holding `diagnostic:read`
+        // alone still gets host stats rather than a blanket 403.
+        const queue = await api.agentQueueView(token).catch(() => ({
+          capacity: Number(store.getSettings('global', 'agent-queue')?.capacity) || 3,
+          queue: [] as unknown[], current: [] as unknown[],
+        }));
         return this.json(res, 200, {
           host: hostStats(),
           agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
@@ -1939,7 +1988,11 @@ export class Gateway {
             let revision;
             if (isSnapshotResourceDriver(driver)) {
               if (typeof b.sourcePath === 'string') {
-                if (this.deps.hosted) throw new Error('hosted resource imports must upload bytes; a browser-local path is not available to the control plane');
+                // A host filesystem path only means something when the browser and
+                // the host are the same machine. Gating on `hosted` alone let a
+                // remote caller on a public self-host import `/etc` or `~/.ssh`
+                // and download it back as a resource revision.
+                if (!this.hostLocal) throw new Error('resource imports must upload bytes; a browser-local path is not available unless Krmax runs on your machine');
                 revision = await this.deps.resources.importDirectory(resource.id, expandPath(b.sourcePath));
               } else if (Array.isArray(b.files)) {
                 revision = await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
@@ -1960,7 +2013,15 @@ export class Gateway {
       if (copyGlobsMigration && method === 'POST') {
         const project = store.getProject(copyGlobsMigration[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
-        if (this.deps.hosted) return this.json(res, 400,
+        // `hostLocal`, not `hosted` — the same gate as the scan/import routes above,
+        // and for the same reason: this walks the HOST filesystem
+        // (ProjectResourceService.migrateCopyGlobs readdir/reads the project's repo
+        // roots) and turns what it finds into resources that materialize into the
+        // task world, where the caller can read them from a terminal. `hosted` and
+        // `hostLocal` are orthogonal, so a self-host on a public URL
+        // (`hosted:false, hostLocal:false`) was serving this to remote callers.
+        // The console already hides it on `hostLocal()`; this was the missing half.
+        if (!this.hostLocal) return this.json(res, 400,
           { error: 'copyGlobs migration requires access to the project’s local or managed checkout' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
         try {
@@ -2010,8 +2071,12 @@ export class Gateway {
       if (projectResourceScan && method === 'GET') {
         const project = store.getProject(projectResourceScan[1]!);
         if (!project) return this.json(res, 404, { error: 'project not found' });
-        if (this.deps.hosted) return this.json(res, 200, { proposals: [], unavailable: project.config.repos ?? [],
-          note: 'Hosted repository clones do not expose the user workstation’s ignored files. Choose files or use the uploader.' });
+        // `hosted` and `hostLocal` are orthogonal: a self-host served on a public
+        // URL is `hosted:false, hostLocal:false`. This route reads the HOST
+        // filesystem, and the console hides it on `hostLocal()` — gate the server
+        // on the same predicate, or a remote user still gets the host's file tree.
+        if (!this.hostLocal) return this.json(res, 200, { proposals: [], unavailable: project.config.repos ?? [],
+          note: 'Krmax is not running on your machine, so it cannot see this workstation’s ignored files. Choose files or use the uploader.' });
         return this.json(res, 200, await scanProjectResources(project));
       }
       const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
@@ -2072,7 +2137,9 @@ export class Gateway {
         const b = await this.body(req, 600 * 1024 * 1024);
         try {
           const revision = typeof b.sourcePath === 'string'
-            ? this.deps.hosted ? (() => { throw new Error('hosted imports require uploaded files'); })()
+            // Same host-filesystem gate as the create path above: `hostLocal`,
+            // not `hosted`.
+            ? !this.hostLocal ? (() => { throw new Error('imports require uploaded files unless Krmax runs on your machine'); })()
               : await this.deps.resources.importDirectory(resource.id, expandPath(b.sourcePath))
             : await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
           return this.json(res, 200, redactResourceRevision(revision));
@@ -2269,7 +2336,7 @@ export class Gateway {
           try {
             return this.json(res, 200, await api.updateTag(token, id, b));
           } catch (e) {
-            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            return this.badRequest(res, e);
           }
         }
         if (method === 'DELETE') {
@@ -2323,7 +2390,7 @@ export class Gateway {
           const out = await api.tagTask(token, tagEditMatch[1]!, { add: b.add, remove: b.remove });
           return this.json(res, 200, out);
         } catch (e) {
-          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          return this.badRequest(res, e);
         }
       }
       const priorityMatch = p.match(/^\/api\/tasks\/([^/]+)\/priority$/);
@@ -2565,6 +2632,11 @@ export class Gateway {
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
       if (checkoutMatch && method === 'GET') {
+        // Deliberately NOT gated on `hostLocal`: this is the *Git* handoff — a
+        // `git clone` script into a relative workspace dir, built from the
+        // project's own repository URLs. It exposes no host path, and it is
+        // precisely what `materialize-local` tells a non-host-local user to use
+        // instead. Gating it would remove the only checkout a remote user has.
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         try { return this.json(res, 200, this.deps.handoffs.checkout(checkoutMatch[1]!)); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
@@ -2976,7 +3048,12 @@ export class Gateway {
                 create: b.create === true, prevPath: b.prevPath ? String(b.prevPath) : undefined,
               }, selector));
             }
-            if (method === 'DELETE') return this.json(res, 200, await api.deleteWikiPageResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector));
+            // `recursive=1` is the caller's explicit confirmation that removing a
+            // section (and every entry under it) is intended; without it the wiki
+            // layer refuses a section delete.
+            if (method === 'DELETE') return this.json(res, 200, await api.deleteWikiPageResolved(token, scope, id,
+              String(url.searchParams.get('path') ?? ''),
+              { ...selector, recursive: ['1', 'true'].includes(String(url.searchParams.get('recursive') ?? '')) }));
           }
           if (sub === 'search' && method === 'GET') return this.json(res, 200, await api.searchWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
           if (sub === 'suggest' && method === 'GET') return this.json(res, 200, await api.suggestWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
@@ -4130,7 +4207,7 @@ export class Gateway {
             return this.json(res, 400, { error: 'Unknown brand icon' });
           }
           store.setSettings('global', wf, b.values ?? {});
-          if (wf === 'agent-queue') await api.setAgentCapacity(Number(b.values?.capacity));
+          if (wf === 'agent-queue') await api.setAgentCapacity(token, Number(b.values?.capacity));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -4227,7 +4304,11 @@ export class Gateway {
 
       return this.json(res, 404, { error: 'not found' });
     } catch (e) {
-      if (e instanceof CapabilityError) return this.json(res, 403, { error: e.message });
+      // A status-bearing platform error (denied / not found / invalid input) is a
+      // caller-facing answer, not a server fault: surface its own code rather
+      // than letting `fail` flatten everything but CapabilityError to a 500.
+      const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
+      if (declared) return this.json(res, declared, { error: (e as Error).message });
       throw e;
     }
   }
@@ -4517,7 +4598,11 @@ export class Gateway {
     // a host-wide count across every tenant.
     const projects = this.deps.store.listProjects()
       .filter((pr) => !organizationId || (pr.organizationId ?? 'org_personal') === organizationId);
-    const allTasks = projects.flatMap((pr) => this.deps.store.listTasks(pr.id));
+    // Summaries only: the dashboard reads nothing but `lastView.stage`, while
+    // `listTasks` hydrates every row's full `lastView` — transcripts included —
+    // for every project in the organization at once (the store documents that
+    // pattern as having cost >1 GiB RSS).
+    const allTasks = projects.flatMap((pr) => this.deps.store.listTaskSummaries(pr.id));
     const byStage: Record<string, number> = {};
     for (const t of allTasks) {
       const stage = t.lastView?.stage ?? 'unknown';
@@ -5112,9 +5197,18 @@ export class Gateway {
   }
 
   private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
+    // Routes whose only identifier is a bare record id still belong to exactly
+    // one project. Resolving that project here is what arms the tenant guard in
+    // `TokenAuthority.check` — without it a `task:edit` token from any project
+    // of any organization could rename or delete another tenant's tag or saved
+    // view, because the check had no project to compare its scope against.
+    const tagId = pathname.match(/^\/api\/tags\/([^/]+)/)?.[1];
+    const viewId = pathname.match(/^\/api\/views\/([^/]+)/)?.[1];
     const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1]
+      ?? (tagId ? this.deps.store.getTag(tagId)?.projectId : undefined)
+      ?? (viewId ? this.deps.store.getView(viewId)?.projectId : undefined)
       ?? url.searchParams.get('projectId') ?? undefined;
     const artifact = pathname.match(/^\/api\/artifacts\/([^/]+)/)?.[1];
     const artifactRecord = artifact ? this.deps.store.getPromotedArtifact(artifact) : undefined;
@@ -5181,9 +5275,20 @@ export class Gateway {
     if (exceeded) throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
     return Buffer.concat(chunks);
   }
+  /** Errors that name their own HTTP status (CapabilityError → 403,
+   *  NotFoundError → 404, ValidationError → 400) carry it here, so every route
+   *  answers alike instead of a handful wrapping locally and the rest 500ing. */
+  /** Answer a handler-local failure as a 400 UNLESS the error names its own
+   *  status. Several routes wrapped their body in `catch → 400`, which flattened
+   *  a denial (403) and a bad identifier (404) into "your input was malformed". */
+  private badRequest(res: http.ServerResponse, e: unknown) {
+    const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
+    return this.json(res, declared ?? 400, { error: e instanceof Error ? e.message : String(e) });
+  }
   private fail(res: http.ServerResponse, e: unknown) {
+    const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
     try {
-      this.json(res, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500,
+      this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
         { error: String((e as Error)?.message ?? e) });
     } catch {
       /* ignore */

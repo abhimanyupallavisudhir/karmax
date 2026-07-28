@@ -58,5 +58,13 @@ ok(localWorldPath({}) === '', 'a cloud world has no host path either way');
 for (const l of lines.filter((l) => l.includes('cd ${v.worldPath}')))
   ok(l.includes('localWorldPath(v)'), 'every "cd into the world" command goes through localWorldPath');
 
+// The gateway strips `worldPath` only for REMOTE handles, so a hosted install
+// backed by worktree worlds (explicitly supported) still receives it — every
+// RENDER of it has to be gated client-side. `advancedTab` printed
+// `localPath: v.worldPath` straight into a JSON dump, which was the one place a
+// host filesystem path escaped the gate and reached a remote browser.
+for (const l of lines.filter((l) => /localPath:/.test(l)))
+  ok(l.includes('localWorldPath(v)'), 'a rendered world localPath goes through localWorldPath');
+
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

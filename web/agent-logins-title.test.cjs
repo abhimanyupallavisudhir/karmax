@@ -41,8 +41,9 @@ ok(!/<div class="section-h">Credentials<\/div>/.test(tab), 'Parameters tab no lo
 // New-task form (openTaskForm) label.
 ok(/>Agent logins<\/label>/.test(src), 'new-task form labels the control "Agent logins"');
 
-// Series page (renderSeriesPage) details summary.
-ok(/<summary>Agent logins — precedence/.test(src), 'series page summary reads "Agent logins — precedence…"');
+// Series page (renderSeriesPage) details summary. The title is what's load-bearing
+// here; the trailing gloss is free to be reworded.
+ok(/<summary>Agent logins —/.test(src), 'series page summary is titled "Agent logins"');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

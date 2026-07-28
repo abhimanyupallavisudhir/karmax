@@ -32,6 +32,15 @@ const cancellationAwareTurns = proxyActivities<coreActivities>({
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
+// Bounded-retry coordinator proxy. Temporal's default is `maximumAttempts: 0` =
+// UNLIMITED, so a deterministically failing requestAgentSlot / leaseAccount would
+// retry every ~100 s forever and freeze the task with no path to a human. Retry
+// options are recorded with the ScheduleActivityTask command, so this is pinned to
+// its own behavior version (see justDoV1_4).
+const boundedCoord = proxyActivities<coordinatorActivities>({
+  startToCloseTimeout: '30s',
+  retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
+});
 
 export const followUpSignal = defineSignal<[Message]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
@@ -61,6 +70,11 @@ export async function justDoV1_3(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true, true, true);
 }
 
+/** Bounded coordinator-activity retries, and `confirmed` cleared at the Review gate. */
+export async function justDoV1_4(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
@@ -71,8 +85,14 @@ async function justDoImpl(
   managedTurns: boolean,
   durableAdmission = false,
   awaitTurnCancellation = false,
+  boundedCoordinatorRetries = false,
+  // See the note at the `confirmed` clear below: an execution confirmed before its
+  // Review gate opened recorded that gate returning instantly, so clearing the token
+  // on replay would park where history says it proceeded. Pinned to justDo@1.4.0.
+  clearsConfirmOnGate = false,
 ): Promise<{ stage: Stage }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
+  const coordinator = boundedCoordinatorRetries ? boundedCoord : coord;
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -114,7 +134,7 @@ async function justDoImpl(
   }
   const publish = async () => core.publishView(taskId, view());
   const leaser = managedTurns
-    ? createAgentTurnLeaser(core, coord, {
+    ? createAgentTurnLeaser(core, coordinator, {
         taskId,
         projectId: input.projectId,
         task: () => input,
@@ -255,6 +275,14 @@ async function justDoImpl(
     if (msgs.length > seen) continue;
     stage = 'review';
     status = 'waiting';
+    // `confirmed` is a GATE token, not a latch — clear it on entry to Review, before
+    // any await. `confirmSignal` sets the flag at ANY stage, so without this a
+    // confirm that arrived during Do (or Setup) pre-approved the next Review gate
+    // and the work was accepted unseen. Clearing here, strictly before the
+    // `publish()` that advertises the gate, still preserves the legitimate race: a
+    // confirmer cannot see the gate until after we have cleared, so anything they
+    // click from that point on counts. See the matching note in software-dev.ts.
+    if (clearsConfirmOnGate) confirmed = false;
     // Play the confirm layers in order (SPEC §5.2): every layer must approve; a
     // revise/follow-up returns to Do and the next Review replays from the first.
     let backToDo = false;

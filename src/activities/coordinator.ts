@@ -192,9 +192,12 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         /* coordinator gone — nothing to cancel */
       }
     },
-    async returnAccount(accountId: string): Promise<void> {
+    /** `lease` identifies WHICH granted record is coming back. Optional because the
+     *  signal shipped without it; see the handler in coordinators/account.ts for why
+     *  guessing (drop the oldest) corrupts the ledger's task attribution. */
+    async returnAccount(accountId: string, lease?: { taskId: string; turnId: string }): Promise<void> {
       try {
-        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_RETURN_ACCOUNT, { accountId });
+        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_RETURN_ACCOUNT, { accountId, ...lease });
       } catch {
         /* coordinator gone — nothing to return */
       }

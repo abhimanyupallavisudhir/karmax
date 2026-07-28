@@ -5,10 +5,62 @@ import path from 'node:path';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
+import { MANIFESTS } from '../src/contrib/manifests.js';
+// Derived, not hard-coded: the pinned type moves every time a workflow ships a
+// new replay version, and a literal here just makes an unrelated PR red.
+const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
 
 describe('failed software-dev recovery', () => {
   const dirs: string[] = [];
   afterEach(() => dirs.splice(0).forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
+
+  /**
+   * Regression: both recovery gates were bare `workflow === 'software-dev'`
+   * string tests, so a Goal task — which delegates to the very same
+   * `softwareDevImpl` and fully supports `input.recovery` — was a dead end with
+   * no Retry, no follow-up, and a `recoverFailedTask` that threw. The same gate
+   * also caught a software-dev task switched to Goal in flight.
+   */
+  it('offers the same recovery to a failed Goal task (it delegates to software-dev)', async () => {
+    const store = new Store(':memory:');
+    const tokens = new TokenAuthority();
+    const token = tokens.mint({
+      taskId: 'operator', profileId: 'do', principal: 'user:test',
+      ceiling: ['read-task', 'signal-task'], grantorCaps: ['read-task', 'signal-task'],
+    }).token;
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-goal-recovery-repo-'));
+    const world = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-goal-recovery-world-'));
+    dirs.push(repo, world);
+    const project = store.createProject('Goal recovery', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const task = store.createTask({
+      projectId: project.id, title: 'Autonomous work', workflow: 'goal',
+      workflowVersion: bundledVersion('goal'),
+      params: { prompt: 'keep going', base: 'main', target: 'main' },
+    });
+    store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: 'goal', stage: 'failed', status: 'failed',
+      messages: [{ id: 'm0', role: 'user', text: 'keep going', ts: 0 }],
+      transcripts: [], actions: [], state: {},
+      branch: `karmax/${task.id}`, base: 'main', targetBranch: 'main', worldPath: world,
+      error: 'provider transport died', updatedAt: 1,
+    } as any);
+
+    const starts: [string, any][] = [];
+    const client = {
+      workflow: {
+        getHandle: () => ({ query: async () => { throw new Error('not running'); } }),
+        start: async (type: string, options: any) => { starts.push([type, options]); return { workflowId: options.workflowId }; },
+      },
+    } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
+
+    const failed = await api.getTaskView(token, task.id);
+    expect(failed?.actions.map((a) => a.name)).toEqual(['retry', 'followUp', 'cancel']);
+
+    await api.signalTask(token, task.id, 'retry');
+    expect(starts).toHaveLength(1);
+    expect(starts[0]![0]).toBe(`goal@${bundledVersion('goal')}`);
+  });
 
   it('offers escalation controls and restarts from the existing dirty world', async () => {
     const store = new Store(':memory:');
@@ -65,7 +117,7 @@ describe('failed software-dev recovery', () => {
     await api.signalTask(token, task.id, 'retry');
 
     expect(starts).toHaveLength(1);
-    expect(starts[0]![0]).toBe('softwareDev@1.8.0');
+    expect(starts[0]![0]).toBe(`softwareDev@${bundledVersion('software-dev')}`);
     const options = starts[0]![1];
     expect(options.workflowId).toBe(task.id);
     expect(options.workflowIdReusePolicy).toBe('ALLOW_DUPLICATE_FAILED_ONLY');
@@ -80,7 +132,7 @@ describe('failed software-dev recovery', () => {
     );
     expect(fs.readFileSync(path.join(world, 'dirty-work.txt'), 'utf8')).toBe('must survive');
     expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'do', status: 'active' });
-    expect(store.getTask(task.id)?.workflowVersion).toBe('1.8.0');
+    expect(store.getTask(task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
   });
 
   it('queries through a stale v1 account-wait snapshot but keeps current snapshots fast', async () => {

@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import type {
   ExecOptions,
   ExecResult,
+  ProviderSandboxRef,
   World,
   WorldHandle,
   WorldHttpResponse,
@@ -17,6 +18,7 @@ import type {
 } from './types.js';
 import { worldRelativePath, worldWorkingDirectory } from './types.js';
 import { boundedResponseBody } from './http.js';
+import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 
@@ -64,6 +66,14 @@ export interface E2BFactory {
   /** Control-plane state lookup that must not resume a paused sandbox; absent
    * (or undefined result) means the provider cannot answer cheaply. */
   info?(id: string, options: { apiKey?: string }): Promise<{ state?: string } | undefined>;
+  /** Control-plane enumeration of sandboxes carrying this deployment's
+   * metadata, for orphan reaping. Never connects (which would resume a paused
+   * sandbox and bill it). */
+  list?(options: { apiKey?: string; metadata: Record<string, string> }): Promise<Array<{
+    sandboxId: string; metadata?: Record<string, string> }>>;
+  /** Control-plane teardown by id, so an orphan can be killed without a
+   * handle — and, again, without resuming it first. */
+  kill?(id: string, options: { apiKey?: string }): Promise<unknown>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -104,7 +114,10 @@ export class E2BWorldProvider implements WorldProvider {
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}),
       timeoutMs: this.idleMs,
       lifecycle: { onTimeout: 'pause', autoResume: true },
-      metadata: { karmaxTaskId: spec.taskId },
+      // `karmaxHome` scopes orphan reaping to sandboxes THIS deployment
+      // created: several karmax instances (dev, prod, a colleague's) can share
+      // one E2B account, and reaping by task id alone would kill theirs.
+      metadata: { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel() },
       // Git provisioning is trusted host work and may require protocols (most
       // notably GitHub SSH) that E2B's domain allowlist proxy resets even when
       // the host is explicitly allowed. No task code runs in this phase. The
@@ -126,6 +139,14 @@ export class E2BWorldProvider implements WorldProvider {
       // pushes and merges go through the host-side Git broker.
       await provisionRun(provisioner, 'rm -f /home/user/.ssh/karmax-auth*');
       if (taskNetwork.network) {
+        // `allowInternetAccess` is deliberately NOT sent here, and that does not
+        // weaken the policy: the SDK defines `allowInternetAccess: false` as
+        // *exactly* `denyOut: ['0.0.0.0/0']` (see SandboxNetworkUpdate in
+        // node_modules/e2b), which this call already sends. It is a shorthand
+        // for the catch-all deny rule, not a master override of the CIDR lists,
+        // so the create-time `allowInternetAccess: true` above cannot resurrect
+        // egress once these rules are installed. The update endpoint replaces
+        // the egress configuration atomically, so this is the whole task policy.
         await sandbox.updateNetwork({
           allowOut: taskNetwork.network.allowOut,
           denyOut: taskNetwork.network.denyOut,
@@ -210,6 +231,26 @@ export class E2BWorldProvider implements WorldProvider {
     } catch (error) {
       return looksLikeMissingSandbox(error) ? 'missing' : undefined;
     }
+  }
+
+  /** Every live sandbox this deployment created, for the lifecycle sweep's
+   * orphan reaper. Filtered server-side on the `karmaxHome` metadata so a
+   * shared E2B account's other tenants are never even enumerated. */
+  async listSandboxes(organizationId?: string): Promise<ProviderSandboxRef[]> {
+    if (!this.factory.list) return [];
+    const connection = this.connection(organizationId);
+    const apiKey = connection?.apiKey ? { apiKey: connection.apiKey } : {};
+    const listed = await this.factory.list({ ...apiKey, metadata: { karmaxHome: serviceHomeLabel() } });
+    return listed.map((sandbox) => ({
+      sandboxId: sandbox.sandboxId,
+      ...(sandbox.metadata?.karmaxTaskId ? { taskId: sandbox.metadata.karmaxTaskId } : {}),
+      destroy: async () => {
+        if (this.factory.kill) await this.factory.kill(sandbox.sandboxId, apiKey);
+        else await (await this.factory.connect(sandbox.sandboxId, { timeoutMs: this.idleMs, ...apiKey })).kill();
+        this.sandboxes.delete(sandbox.sandboxId);
+        this.states.set(sandbox.sandboxId, 'missing');
+      },
+    }));
   }
 
   private sealRef(value: Record<string, string>): string {
@@ -567,6 +608,22 @@ function defaultE2BFactory(): E2BFactory {
       // than connect(), which would resume (and bill) a paused sandbox.
       if (typeof Sandbox.getInfo !== 'function') return undefined;
       return Sandbox.getInfo(id, options);
+    },
+    async list(options) {
+      const { Sandbox } = await sdk();
+      if (typeof Sandbox.list !== 'function') return [];
+      const { metadata, ...opts } = options;
+      // Both the paginator (current SDK) and the flat-array (older) shapes:
+      // reaping is best-effort infrastructure and must not depend on which.
+      const paginator = Sandbox.list({ ...opts, query: { metadata, state: ['running', 'paused'] } });
+      if (Array.isArray(paginator)) return paginator;
+      const items: any[] = [];
+      for (let page = 0; page < 50 && paginator?.hasNext; page++) items.push(...await paginator.nextItems(opts));
+      return items;
+    },
+    async kill(id, options) {
+      const { Sandbox } = await sdk();
+      return Sandbox.kill(id, options);
     },
   };
 }

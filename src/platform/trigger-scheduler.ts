@@ -7,6 +7,7 @@ import {
   statusSatisfiesDependency,
   dependencyMet,
   nextCronFire,
+  validateTriggers,
   LIFECYCLE_EVENT,
   type DependencyTrigger,
   type ScheduleTrigger,
@@ -29,6 +30,16 @@ import {
  * should have fired while karmax was down fires on the next boot, and dependency
  * state is re-derived from each dep's last recorded status. Runs in-process off
  * the same bus the self-heal loop uses (main.ts), so no new durable machinery.
+ *
+ * **Cron catch-up is real, not aspirational.** `nextCronFire` is strictly after
+ * the instant it is given, so nothing in the expression itself can express "the
+ * 09:00 run you missed". The mark that makes it representable is
+ * `params.triggerLastFiredAt`: it is seeded when a cron task is armed and moved
+ * forward to the *scheduled* instant of every fire, so on boot `arm()` can ask
+ * "did an occurrence fall between the mark and now?" and, if so, fire exactly
+ * once before arming the next timer. Exactly once, not once per missed
+ * occurrence: a nightly report that slept through a week's downtime wants today's
+ * run, not seven simultaneous ones.
  */
 
 export interface TriggerSchedulerDeps {
@@ -60,6 +71,13 @@ interface ArmedEntry {
 // Node's setTimeout caps at ~24.8 days; re-arm long waits in chunks below this.
 const MAX_TIMER_MS = 20 * 24 * 3600 * 1000;
 
+/** How far back a boot looks for a missed cron occurrence. Long enough to cover a
+ *  weekly schedule and a realistic outage; short enough that a per-minute cron
+ *  costs ~10k cheap `nextCronFire` steps rather than an unbounded replay. */
+const MAX_CATCHUP_WINDOW_MS = 7 * 24 * 3600 * 1000;
+/** Hard stop on the catch-up walk, so no expression can make boot pathological. */
+const MAX_CATCHUP_STEPS = 20_000;
+
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
   private unsub?: () => void;
@@ -77,10 +95,38 @@ export class TriggerScheduler {
 
   /** Subscribe to the bus and re-arm every stored armed task (call once on boot). */
   start(): void {
-    for (const task of this.deps.store.listArmedTasks()) this.arm(task);
+    for (const task of this.deps.store.listArmedTasks()) {
+      // A stored task can have become invalid since it was armed — most often a
+      // dependency task that has since been deleted. Boot must never die on one
+      // bad row, so the refusal is logged per task and the rest still arm.
+      try {
+        this.arm(task);
+      } catch (e) {
+        this.log(`refusing to arm ${task.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     this.unsub = this.deps.bus.onAny((ev) => this.onEvent(ev));
     const n = this.armed.size;
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
+  }
+
+  /**
+   * Validate a task's trigger graph against the live store.
+   *
+   * `validateTriggers` is pure, so the *graph* half of validation (self-reference,
+   * cycles, dangling dependency ids) can only run where a store is in reach —
+   * here. Dependency ids are matched the way `arm()` matches them: by declared id,
+   * with `attemptGroup` folding alternate attempts onto one logical task.
+   */
+  validationErrors(task: TaskRecord): string[] {
+    const dependenciesOf = (id: string): string[] | undefined => {
+      const t = this.deps.store.getTask(id);
+      if (!t) return undefined;
+      const out: string[] = [];
+      for (const trig of normalizeTriggers(t.params)) if (trig.kind === 'dependency') out.push(...(trig.tasks ?? []));
+      return out;
+    };
+    return validateTriggers(normalizeTriggers(task.params), { taskId: task.id, dependenciesOf });
   }
 
   stop(): void {
@@ -95,10 +141,20 @@ export class TriggerScheduler {
     return this.armed.size;
   }
 
-  /** Arm (or re-arm) a task: register its triggers, seed dependency state, set timers. */
+  /**
+   * Arm (or re-arm) a task: register its triggers, seed dependency state, set timers.
+   *
+   * Throws on an unsatisfiable dependency graph rather than arming it. An armed
+   * task with a self-dependency, a cycle, or a deleted dep is indistinguishable
+   * from one that is simply still waiting — it would sit `armed` forever with no
+   * signal — so the loud failure at the moment someone tries to arm it is the only
+   * place a human can act on it. `start()` catches this per task so boot is safe.
+   */
   arm(task: TaskRecord): void {
     const triggers = normalizeTriggers(task.params);
     if (!triggers.length) return;
+    const errs = this.validationErrors(task);
+    if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     this.disarm(task.id); // idempotent re-arm
     const entry: ArmedEntry = { task, triggers, satisfiedDeps: new Set(), timers: [], fired: false };
     this.armed.set(task.id, entry);
@@ -139,11 +195,15 @@ export class TriggerScheduler {
     for (const entry of [...this.armed.values()]) {
       if (entry.fired) continue;
       // `event` triggers: a direct type/scope/payload match fires immediately.
+      // `firedNow` is load-bearing for a REPEATABLE series: `entry.fired` is only
+      // ever set for one-shots, so without it a single event that matched two of
+      // the entry's triggers spawned two runs of the same series.
+      let firedNow = false;
       for (const trig of entry.triggers) {
-        if (entry.fired) break;
-        if (trig.kind === 'event' && eventMatchesEventTrigger(trig, ev)) this.fireFor(entry, trig);
+        if (entry.fired || firedNow) break;
+        if (trig.kind === 'event' && eventMatchesEventTrigger(trig, ev)) firedNow = this.fireFor(entry, trig);
       }
-      if (entry.fired || !this.armed.has(entry.task.id)) continue;
+      if (entry.fired || firedNow || !this.armed.has(entry.task.id)) continue;
       // `dependency` triggers: fold the event into satisfaction, then re-evaluate.
       let advanced = false;
       for (const trig of entry.triggers) {
@@ -153,7 +213,20 @@ export class TriggerScheduler {
     }
   }
 
-  /** Update dependency satisfaction from a lifecycle event; returns true if it advanced. */
+  /**
+   * Update dependency satisfaction from a lifecycle event; returns true if it
+   * advanced (i.e. a dep just became satisfied that was not before).
+   *
+   * `satisfiedDeps` is a LEVEL, re-derived from each dep's current status, and the
+   * entry fires on the rising edge. That single rule serves both masters:
+   *  - duplicate terminal `view.updated` events (a finishing task emits several)
+   *    leave the level unchanged, so a repeatable series — which never sets
+   *    `fired` — does not re-spawn a run per event; and
+   *  - a dep that genuinely RUNS AGAIN first reports a non-terminal status, which
+   *    drops it back out of the set, so the series fires again when it next
+   *    completes. While the set was append-only, a repeatable dependency series
+   *    fired at most once in its whole life and then sat armed doing nothing.
+   */
   private applyDependencyEvent(entry: ArmedEntry, trig: DependencyTrigger, ev: KarmaxEvent): boolean {
     if (ev.type !== LIFECYCLE_EVENT) return false;
     const eventTask = this.deps.store.getTask(ev.taskId);
@@ -170,13 +243,15 @@ export class TriggerScheduler {
       const status = group
         ? principal?.lastView?.status ?? (principal?.id === ev.taskId ? (ev.payload as { status?: string })?.status : undefined)
         : (ev.payload as { status?: string })?.status;
-      if (status && statusSatisfiesDependency(trig.on, status) && !entry.satisfiedDeps.has(dep)) {
-        // Only the NEW satisfaction advances the entry. A finishing task emits
-        // several lifecycle views with a terminal status; without this guard a
-        // repeatable series (which never sets `fired`) would re-spawn a run on
-        // each duplicate event.
-        entry.satisfiedDeps.add(dep); // dependencyMet keys by the declared id
-        advanced = true;
+      if (!status) continue;
+      if (statusSatisfiesDependency(trig.on, status)) {
+        if (!entry.satisfiedDeps.has(dep)) {
+          entry.satisfiedDeps.add(dep); // dependencyMet keys by the declared id
+          advanced = true;
+        }
+      } else {
+        // The dep left the satisfying state — it is running again. Arm the edge.
+        entry.satisfiedDeps.delete(dep);
       }
     }
     return advanced;
@@ -216,8 +291,17 @@ export class TriggerScheduler {
         this.log(`trigger fire failed for ${taskId}: ${e instanceof Error ? e.message : String(e)}`);
         if (!repeatable) {
           // api re-arms the task row on failure; re-arm the in-memory entry too.
-          const t = this.deps.store.getTask(taskId);
-          if (t?.params?.triggerState === 'armed') this.arm(t);
+          // `arm()` THROWS on an invalid graph (e.g. a dependency deleted since
+          // this task was armed), and this is a `.catch()` on a `void`ed chain —
+          // so an unguarded throw becomes an unhandled rejection and leaves the
+          // task armed in the store but absent from the scheduler: it never
+          // fires again, and nothing says so. Guard it exactly as `start()` does.
+          try {
+            const t = this.deps.store.getTask(taskId);
+            if (t?.params?.triggerState === 'armed') this.arm(t);
+          } catch (err) {
+            this.log(`refusing to re-arm ${taskId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
       });
     return true;
@@ -230,19 +314,86 @@ export class TriggerScheduler {
       this.armAt(entry, trig.at, () => this.fireFor(entry, trig));
       return;
     }
-    if (trig.cron) this.armCron(entry, trig);
+    if (trig.cron) {
+      // Catch up on a window missed while karmax was down, then arm the next one.
+      // The catch-up can itself disarm a (non-repeatable) entry, so re-check.
+      const mark = this.catchUpCron(entry, trig);
+      if (this.armed.get(entry.task.id) === entry) this.armCron(entry, trig, mark);
+    }
   }
 
-  private armCron(entry: ArmedEntry, trig: ScheduleTrigger): void {
-    const next = nextCronFire(trig.cron!, this.now());
+  /**
+   * Fire once now if a cron occurrence elapsed since this task's recorded mark,
+   * and return the instant subsequent scheduling should measure from.
+   *
+   * The mark (`params.triggerLastFiredAt`) is seeded on first arm so a task that
+   * has never fired does not retroactively fire for occurrences that predate it.
+   *
+   * The catch-up run is for the *most recent* missed occurrence, not the oldest:
+   * a nightly report that slept through a week of downtime wants today's run.
+   * Firing the oldest would also mean the mark only advanced one occurrence per
+   * boot, so a restart loop would replay history one step at a time.
+   */
+  private catchUpCron(entry: ArmedEntry, trig: ScheduleTrigger): number {
+    const now = this.now();
+    const mark = entry.task.params?.triggerLastFiredAt;
+    if (typeof mark !== 'number') {
+      this.recordCronFire(entry, now);
+      return now;
+    }
+    // Only look back a bounded window: an install that was off for a year should
+    // not walk a per-minute cron through half a million occurrences at boot.
+    let cursor = Math.max(mark, now - MAX_CATCHUP_WINDOW_MS);
+    let last: number | undefined;
+    for (let i = 0; i < MAX_CATCHUP_STEPS; i++) {
+      const next = nextCronFire(trig.cron!, cursor);
+      if (next === undefined || next > now) break;
+      last = next;
+      cursor = next;
+    }
+    if (last === undefined) return mark;
+    this.log(`cron catch-up for ${entry.task.id}: occurrence at ${new Date(last).toISOString()} was missed`);
+    this.recordCronFire(entry, last);
+    this.fireFor(entry, trig);
+    return last;
+  }
+
+  /** Persist the cron mark so catch-up survives a restart. */
+  private recordCronFire(entry: ArmedEntry, whenMs: number): void {
+    const params = { ...entry.task.params, triggerLastFiredAt: whenMs };
+    entry.task = { ...entry.task, params };
+    try {
+      this.deps.store.updateTaskParams(entry.task.id, params);
+    } catch (e) {
+      // A vanished row must not kill the timer chain; the in-memory mark still
+      // dedupes for this process's lifetime.
+      this.log(`could not record cron fire for ${entry.task.id}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Arm the next cron occurrence strictly after `fromMs`.
+   *
+   * `fromMs` is threaded through deliberately instead of being re-read from the
+   * clock. The timer callback used to call `nextCronFire(cron, this.now())`, and
+   * `nextCronFire` floors to the whole minute — so if `now()` read even 1 ms
+   * before the instant that had just fired (a backward NTP step, a VM resume, an
+   * early libuv timer), it returned that same instant, `armAt` clamped the delay
+   * to 0, and the occurrence fired a second time. Nothing downstream dedupes it:
+   * `fireFor` sets no `fired` flag for a repeatable entry.
+   */
+  private armCron(entry: ArmedEntry, trig: ScheduleTrigger, fromMs: number): void {
+    const next = nextCronFire(trig.cron!, fromMs);
     if (next === undefined) {
       this.log(`cron trigger for ${entry.task.id} has no upcoming fire ("${trig.cron}")`);
       return;
     }
     this.armAt(entry, next, () => {
-      // Cron is recurring: fire a clone, then re-arm for the next occurrence.
+      // Cron is recurring: fire a clone, then re-arm for the next occurrence,
+      // measured from the SCHEDULED instant (never from the wall clock).
+      this.recordCronFire(entry, next);
       this.fireFor(entry, trig);
-      if (this.armed.get(entry.task.id) === entry) this.armCron(entry, trig);
+      if (this.armed.get(entry.task.id) === entry) this.armCron(entry, trig, next);
     });
   }
 

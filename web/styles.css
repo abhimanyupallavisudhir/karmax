@@ -816,6 +816,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .form-row input:focus, .form-row select:focus { border-color: var(--accent); }
 .switch { display: flex; align-items: center; gap: 10px; }
 .switch input { width: 38px; height: 22px; }
+.switch.disabled { opacity: .55; cursor: not-allowed; }
 
 /* profile page */
 .profile-page { max-width: 620px; }
@@ -908,9 +909,16 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .empty .big { font-size: 17px; color: var(--ink-2); margin-bottom: 6px; font-weight: 550; }
 
 /* toast */
-.toasts { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 60; }
-.toast { background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 9px; box-shadow: var(--shadow); font-size: 13px; animation: rise .2s ease; }
+/* Above every scrim (.palette-scrim 70, .rail 80, .wiki-mention-menu 90): modals
+   use toasts as their only validation feedback, so a toast behind one is a
+   silent failure. */
+.toasts { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 100; }
+.toast { background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 9px; box-shadow: var(--shadow); font-size: 13px; animation: rise .2s ease; display: flex; align-items: center; max-width: min(520px, calc(100vw - 32px)); }
 .toast.err { background: var(--danger); color: #fff; }
+/* Errors linger, so they need a way out that isn't waiting. */
+.toast-dismiss { flex: none; margin: -4px -8px -4px 12px; padding: 0 6px; border: 0; background: none; color: inherit; opacity: .7; font-size: 16px; line-height: 1.4; cursor: pointer; border-radius: 5px; }
+.toast-dismiss:hover { opacity: 1; }
+.toast-dismiss:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
 /* command palette */
@@ -945,9 +953,11 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .global-search-copy span { color: var(--ink-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .global-search-empty { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 6px; padding: 24px; color: var(--ink-3); text-align: center; }
 .global-search-empty b { color: var(--ink-2); font-size: 14px; }
-.global-search-loading::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1s ease-in-out infinite alternate; }
+.global-search-loading::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--accent); animation: pulse-dot 1s ease-in-out infinite alternate; }
 .global-search-summary { padding: 8px 16px 3px; color: var(--ink-3); font-size: 11px; text-align: center; }
-@keyframes pulse { to { opacity: .3; transform: scale(.75); } }
+/* Distinct name: redeclaring the breathing-dot keyframe above would silently
+   override it and freeze every "agent is working" indicator. */
+@keyframes pulse-dot { to { opacity: .3; transform: scale(.75); } }
 
 /* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
 .task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
@@ -958,7 +968,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .help-row .key { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; min-width: 34px; text-align: center; white-space: nowrap; }
 
 /* login */
-.login-wrap { display: grid; place-items: center; height: 100vh; }
+.login-wrap { display: grid; place-items: center; height: 100vh; height: 100dvh; }
 .login-card { width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 28px; box-shadow: var(--shadow); }
 
 /* Authorization profiles: the finite capability surface is a discoverable
@@ -1235,6 +1245,8 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   font-size: 14px; font-family: var(--font-ui); padding: 4px 0;
 }
 .task-search::placeholder { color: var(--ink-3); }
+/* The input is deliberately borderless, so keyboard focus needs its own ring. */
+.task-search:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
 .search-box .search-x {
   border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 13px;
   padding: 2px 6px; border-radius: 6px;
@@ -1251,6 +1263,8 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .view-chip { display: inline-flex; align-items: center; gap: 6px; }
 .view-chip:hover { border-color: var(--line-strong); color: var(--ink); }
+/* Chips are rendered tabindex="0", so they must show keyboard focus. */
+.view-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .view-chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
 .view-chip.add { color: var(--ink-3); border-style: dashed; }
 .view-chip.builtin { border-style: dotted; }
@@ -1549,7 +1563,9 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   .vault-grant-item { align-items: stretch; flex-direction: column; }
   .vault-grant-policies { padding-left: 25px; justify-content: flex-start; }
 }
-.info-dot { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: var(--surface-2); color: var(--ink-3); font-size: 10px; cursor: pointer; user-select: none; }
+/* A real <button> so it is keyboard-reachable and announced; `border: 0`/`padding: 0`
+   strip the native chrome that would otherwise show through the 15px dot. */
+.info-dot { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; padding: 0; border: 0; border-radius: 999px; background: var(--surface-2); color: var(--ink-3); font-size: 10px; font-family: inherit; line-height: 1; cursor: pointer; user-select: none; }
 .info-dot:hover { color: var(--accent); }
 .vault-custom summary { color: var(--ink-2); font-size: 13px; }
 .vault-custom summary:hover { color: var(--ink); }

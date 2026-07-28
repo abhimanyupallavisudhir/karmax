@@ -2,6 +2,19 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
+import { paths } from '../config/paths.js';
+
+/**
+ * Where throwaway merge/landing worktrees are created: under karmax storage,
+ * never as a sibling of the user's repository. A crash between `worktree add`
+ * and the cleanup used to leave a `.karmax-merge-…` directory sitting in the
+ * user's source tree, next to a repo karmax does not own.
+ */
+export function scratchWorktreeHome(): string {
+  const dir = path.join(paths().worlds, '.merge-scratch');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
 
 /** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
  *  merge commits land in the TARGET's worktree (or a temp one), which carries no
@@ -195,7 +208,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
     }
     dir = targetDir;
   } else {
-    const tmp = path.join(repo, '..', `.karmax-merge-${worldId}-${worldRepo.name}`);
+    const tmp = path.join(scratchWorktreeHome(), `.karmax-merge-${worldId}-${worldRepo.name}`);
     if (fs.existsSync(tmp)) {
       await git(repo, ['worktree', 'remove', '--force', tmp]);
       fs.rmSync(tmp, { recursive: true, force: true });

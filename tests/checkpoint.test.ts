@@ -15,6 +15,7 @@ import { ProjectServices } from '../src/store/project-services.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { RunnerPoolService } from '../src/world/runners.js';
 
 describe('portable world checkpoints', () => {
   it('encrypts a dirty binary delta, restores it into a new generation, and fences the stale generation', async () => {
@@ -124,6 +125,77 @@ describe('portable world checkpoints', () => {
     const restored = await worlds.open(store.currentWorld(task.id) as any);
     expect(await restored.readFile('tracked.txt')).toBe('edited in the sandbox\n');
     await restored.destroy();
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores a remote sandbox under a runner lease, so it is budgeted, attributed and releasable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-lease-'));
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
+    await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Restore', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' },
+      organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+
+    const worlds = new WorldRegistry();
+    const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
+    worlds.register({
+      kind: 'sandbox-test', parkable: true,
+      capabilities: { remote: true, pty: false, snapshots: true, ports: false, networkPolicy: false },
+      async create(spec: Parameters<WorktreeProvider['create']>[0]) {
+        const w = await worktrees.create(spec);
+        w.handle.kind = 'sandbox-test';
+        w.handle.provider = 'sandbox-test';
+        return w;
+      },
+      async open(handle: Parameters<WorktreeProvider['open']>[0]) {
+        const w = await worktrees.open(handle);
+        w.handle.kind = 'sandbox-test';
+        return w;
+      },
+    } as any);
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const runners = new RunnerPoolService(store);
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, undefined, runners);
+
+    const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.writeFile('tracked.txt', 'edited in the sandbox\n');
+    const checkpoint = await checkpoints.checkpoint(world.handle);
+    await world.destroy();
+
+    // Restoring re-provisions a REAL billable sandbox, so it must hold a runner
+    // lease exactly like createWorld does — otherwise the sandbox is invisible to
+    // the budget and destroyWorld finds no lease to hand its capacity back.
+    const restored = await checkpoints.restore(checkpoint.id, 'sandbox-test');
+    const leaseId = restored.meta?.worldLeaseId as string | undefined;
+    expect(typeof leaseId).toBe('string');
+    expect(store.worldLease(leaseId!)?.state).toBe('active');
+    expect(store.activeWorldLeaseCount(task.id)).toBe(1);
+
+    // …and releasing it produces the `world.active` usage row cost attribution reads.
+    runners.release(leaseId!, 'sandbox-test');
+    expect(store.worldLease(leaseId!)?.state).toBe('released');
+    expect(store.usageSummary(organization.id).byKind['world.active']).toBeGreaterThanOrEqual(0);
+    expect(Object.keys(store.usageSummary(organization.id).byKind)).toContain('world.active');
+    await (await worlds.open(restored)).destroy();
+
+    // The lease is also the budget gate: an exhausted organization budget must
+    // stop a silent re-provision instead of billing past it.
+    store.setOrganizationExecutionPolicy(organization.id, { monthlyBudgetMicros: 0 });
+    await expect(checkpoints.restore(checkpoint.id, 'sandbox-test')).rejects.toThrow(/budget/);
+
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });

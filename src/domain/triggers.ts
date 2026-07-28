@@ -92,14 +92,47 @@ export function hasActiveTriggers(params: unknown): boolean {
   return normalizeTriggers(params).length > 0;
 }
 
+/**
+ * Optional graph context for `validateTriggers`.
+ *
+ * Dependency triggers describe a *graph*, and an unsatisfiable graph is invisible
+ * at runtime: the dispatcher simply never fires, so the task sits `armed` forever
+ * with no signal beyond the `is:blocked-on-deps` facet. The three unsatisfiable
+ * shapes are self-reference, a cycle (A→B→A), and a dangling id (a dep that was
+ * never created or has since been deleted). None of them is detectable from the
+ * trigger list alone, so the caller supplies a resolver; when it does not, the
+ * pure per-trigger checks still run exactly as before (back-compatible).
+ */
+export interface TriggerValidationContext {
+  /** Id of the task these triggers belong to — needed to spot a self-dependency. */
+  taskId?: string;
+  /**
+   * Resolve a task id to the ids IT depends on. Return `undefined` for a task
+   * that does not exist (that is what makes a dangling dep detectable), and an
+   * array (possibly empty) for one that does.
+   */
+  dependenciesOf?: (taskId: string) => string[] | undefined;
+}
+
 /** Validate a trigger list, returning human-readable errors (empty ⇒ valid). */
-export function validateTriggers(triggers: TaskTrigger[]): string[] {
+export function validateTriggers(triggers: TaskTrigger[], ctx: TriggerValidationContext = {}): string[] {
   const errs: string[] = [];
   for (const t of triggers) {
     if (t.kind === 'dependency') {
       if (!t.tasks?.length) errs.push('dependency trigger needs at least one task id');
+      errs.push(...validateDependencyGraph(t.tasks ?? [], ctx));
     } else if (t.kind === 'schedule') {
       if (!t.cron && t.at === undefined) errs.push('schedule trigger needs a cron expression or an `at` time');
+      // `cron` and `at` are alternatives, not a pair: `armSchedule` checks `at`
+      // first and silently drops the cron, so the task fires once and then never
+      // again despite showing a schedule. Reject the ambiguity instead.
+      else if (t.cron && t.at !== undefined)
+        errs.push('schedule trigger takes either a cron expression or an `at` time, not both');
+      // A one-shot `at` cannot recur — there is no next occurrence to compute, so
+      // `armSchedule` sets a single timer and `fireFor` (seeing `repeatable`) never
+      // disarms: the task fires once and then stays armed forever with no timer.
+      if (t.at !== undefined && !t.cron && t.recurring === true)
+        errs.push('a one-shot `at` schedule cannot be recurring; use a cron expression');
       if (t.cron && !parseCron(t.cron)) errs.push(`invalid cron expression: "${t.cron}"`);
       // A parseable-but-impossible date (Feb 30) would otherwise be accepted and
       // then never fire, leaving a task permanently "armed" with no next run.
@@ -109,6 +142,39 @@ export function validateTriggers(triggers: TaskTrigger[]): string[] {
     } else if (t.kind === 'event') {
       if (!t.type) errs.push('event trigger needs an event `type`');
     }
+  }
+  return errs;
+}
+
+/**
+ * Reject self-reference, dangling ids, and cycles reachable from `deps`.
+ *
+ * The DFS follows `dependsOn` edges outward from each declared dependency. If it
+ * ever reaches `ctx.taskId` the new trigger would close a cycle; if it reaches an
+ * id the resolver does not know, the dependency can never be satisfied. Both are
+ * reported once per offending id. Without a resolver only self-reference (which
+ * needs no lookup) is checked.
+ */
+function validateDependencyGraph(deps: string[], ctx: TriggerValidationContext): string[] {
+  const errs: string[] = [];
+  const self = ctx.taskId;
+  for (const dep of deps) {
+    if (self && dep === self) { errs.push('a task cannot depend on itself'); continue; }
+    if (!ctx.dependenciesOf) continue;
+    if (ctx.dependenciesOf(dep) === undefined) { errs.push(`dependency task ${dep} does not exist`); continue; }
+    // Walk outward; `seen` also guards against pre-existing cycles elsewhere in
+    // the graph so validation itself can never loop.
+    const seen = new Set<string>([dep]);
+    const stack = [dep];
+    let cyclic = false;
+    while (stack.length && !cyclic) {
+      const next = ctx.dependenciesOf(stack.pop()!) ?? [];
+      for (const id of next) {
+        if (self && id === self) { cyclic = true; break; }
+        if (!seen.has(id)) { seen.add(id); stack.push(id); }
+      }
+    }
+    if (cyclic) errs.push(`dependency on ${dep} would create a cycle`);
   }
   return errs;
 }
@@ -174,7 +240,7 @@ export function forcesRepeatable(triggers: TaskTrigger[]): boolean {
 
 /** Params for a run spawned from a series: the original minus trigger + series metadata. */
 export function cloneParamsWithoutTriggers<T extends Record<string, unknown>>(params: T): T {
-  const { triggers: _t, triggerState: _s, draft: _d, repeatable: _r, runOf: _ro, ...rest } = params as Record<string, unknown>;
+  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, draft: _d, repeatable: _r, runOf: _ro, ...rest } = params as Record<string, unknown>;
   return rest as T;
 }
 
@@ -199,7 +265,10 @@ export function parseCron(expr: string): CronFields | undefined {
     [0, 23], // hour
     [1, 31], // day of month
     [1, 12], // month
-    [0, 6], // day of week (0 = Sunday)
+    // Day of week: 0 = Sunday. POSIX cron also accepts 7 for Sunday (`0 9 * * 7`
+    // is what most crontabs in the wild write), so the field is parsed with 7 in
+    // range and normalized to 0 below.
+    [0, 7],
   ];
   const sets: Set<number>[] = [];
   for (let i = 0; i < 5; i++) {
@@ -207,6 +276,7 @@ export function parseCron(expr: string): CronFields | undefined {
     if (!s) return undefined;
     sets.push(s);
   }
+  if (sets[4]!.delete(7)) sets[4]!.add(0); // 7 ≡ Sunday
   return {
     minute: sets[0]!,
     hour: sets[1]!,
@@ -218,7 +288,18 @@ export function parseCron(expr: string): CronFields | undefined {
   };
 }
 
+/**
+ * Parse one cron field into its allowed value set.
+ *
+ * Every numeric token is matched against `/^\d+$/` rather than being handed to
+ * `Number()`. `Number('')` is 0 and `Number('+5')` is 5, both of which pass
+ * `Number.isInteger` — so `'-5 * * * *'` used to parse as "minutes 0 through 5"
+ * (the dash sits at index 0, making the low token empty) for every field whose
+ * minimum is 0, and a task the user wrote as a typo silently ran six times an
+ * hour. A strict digit test is the whole fix.
+ */
 function parseField(field: string, min: number, max: number): Set<number> | undefined {
+  const num = (token: string): number | undefined => (/^\d+$/.test(token) ? Number(token) : undefined);
   const out = new Set<number>();
   for (const piece of field.split(',')) {
     let range = piece;
@@ -226,23 +307,28 @@ function parseField(field: string, min: number, max: number): Set<number> | unde
     const slash = piece.indexOf('/');
     if (slash >= 0) {
       range = piece.slice(0, slash);
-      step = Number(piece.slice(slash + 1));
-      if (!Number.isInteger(step) || step <= 0) return undefined;
+      const parsed = num(piece.slice(slash + 1));
+      if (parsed === undefined || parsed <= 0) return undefined;
+      step = parsed;
     }
     let lo = min;
     let hi = max;
     if (range !== '*') {
       const dash = range.indexOf('-');
       if (dash >= 0) {
-        lo = Number(range.slice(0, dash));
-        hi = Number(range.slice(dash + 1));
+        const l = num(range.slice(0, dash));
+        const h = num(range.slice(dash + 1));
+        if (l === undefined || h === undefined) return undefined;
+        lo = l;
+        hi = h;
       } else {
-        lo = Number(range);
+        const l = num(range);
+        if (l === undefined) return undefined;
+        lo = l;
         // A bare number with a step (`5/15`) means "from 5 to the max, every
         // step" in standard cron — not just the single value 5.
         hi = slash >= 0 ? max : lo;
       }
-      if (!Number.isInteger(lo) || !Number.isInteger(hi)) return undefined;
       if (lo < min || hi > max || lo > hi) return undefined;
     }
     for (let v = lo; v <= hi; v += step) out.add(v);

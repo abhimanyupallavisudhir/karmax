@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
-import { claudeMessagesEffort } from './effort.js';
+import { CLAUDE_DEFAULT_MODEL, claudeMaxTokens, claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
@@ -20,7 +20,7 @@ import {
 import { spawn } from 'node:child_process';
 import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
-import { activityDetail, claudeToolActivity } from './activity.js';
+import { activityDetail, claudeToolActivity, toolActivityDetail } from './activity.js';
 import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-homes.js';
 import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
@@ -32,6 +32,13 @@ import { worldWorkingDirectory } from '../world/types.js';
  *   - ambient Claude Code login → the Agent SDK (same harness as Claude Code),
  *     loaded lazily so its absence never breaks the build.
  */
+/** Messages-API tool definitions: every provider-neutral schema, Anthropic-shaped.
+ *  Exported so the cross-rail control-tool coverage test reads the SAME list the
+ *  rail sends rather than a restatement of it. */
+export const MESSAGES_API_TOOLS = TOOL_SCHEMAS.map((t) => ({
+  name: t.name, description: t.description, input_schema: t.parameters,
+}));
+
 export class ClaudeAdapter implements AgentAdapter {
   readonly provider = 'claude' as const;
 
@@ -68,9 +75,12 @@ export class ClaudeAdapter implements AgentAdapter {
   private async runMessagesApi(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     const apiKey = input.resolvedAuth?.apiKey ?? process.env.ANTHROPIC_API_KEY!;
     const baseUrl = process.env.KARMAX_ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com';
-    const model = input.profile.model ?? 'claude-sonnet-4-5';
+    // Must match `defaultModel('claude')` — a model-less profile otherwise silently
+    // lost its reasoning effort here (the old fallback, claude-sonnet-4-5, is real
+    // but not effort-capable, so `claudeMessagesEffort` returned undefined for it).
+    const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
     const handlers = platformToolHandlers(input.world, ctx);
-    const tools = TOOL_SCHEMAS.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
+    const tools = MESSAGES_API_TOOLS;
 
     const messages: any[] = [];
     const userMsgs = input.messages.filter((m) => m.role !== 'system');
@@ -124,9 +134,10 @@ export class ClaudeAdapter implements AgentAdapter {
         body: JSON.stringify({
           model,
           // A whole coding response (a rewritten file, a long explanation + tool call)
-          // can exceed 4096 output tokens; too low a cap truncates mid-response, which
-          // the loop below then has to recover from. 8192 keeps most turns single-shot.
-          max_tokens: 8192,
+          // can exceed 8192 output tokens; too low a cap truncates mid-response, which
+          // the loop below then has to recover from at the cost of an extra billed
+          // round trip. Derived per model (see effort.ts) instead of hard-coded.
+          max_tokens: claudeMaxTokens(model),
           system: input.systemPrompt,
           messages,
           tools,
@@ -373,6 +384,10 @@ export class ClaudeAdapter implements AgentAdapter {
     let session = input.session;
     let completionSeen = false; // agent called signal_completion → stop injecting, end the turn
     const toolActivities = new Map<string, ReturnType<typeof claudeToolActivity>>();
+    // tool_use_id → the raw provider tool name, so the tool_result frame can apply
+    // the same credential-bearing denylist the tool_use frame did (the result is
+    // where `/api/vault/resolve`'s plaintext `value` actually arrives).
+    const toolNames = new Map<string, string>();
     let successfulResult: any;
     // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
     // sub-agents, so the main `result` can arrive — completion already signalled —
@@ -595,6 +610,7 @@ export class ClaudeAdapter implements AgentAdapter {
             if (block?.type === 'tool_use') {
               const activity = claudeToolActivity(block, 'started');
               toolActivities.set(activity.id, activity);
+              toolNames.set(activity.id, String(block.name ?? ''));
               ctx.emitActivity(activity);
             }
             else if (block?.type === 'thinking') {
@@ -619,8 +635,8 @@ export class ClaudeAdapter implements AgentAdapter {
           const content = Array.isArray((message as any).message?.content) ? (message as any).message.content : [];
           for (const block of content) {
             if (block?.type !== 'tool_result') continue;
-            const detail = activityDetail(block.content ?? (message as any).tool_use_result);
             const id = String(block.tool_use_id ?? 'tool-result');
+            const detail = toolActivityDetail(toolNames.get(id), block.content ?? (message as any).tool_use_result);
             const prior = toolActivities.get(id);
             ctx.emitActivity({
               id,

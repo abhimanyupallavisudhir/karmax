@@ -72,11 +72,32 @@ export function ensureProjectWikiRepository(contentDir: string, projectId: strin
   return root;
 }
 
-export function commitProjectWiki(root: string, message: string): string {
-  git(root, ['add', '-A']);
-  try { git(root, ['commit', '-q', '-m', message]); }
+/**
+ * Commit wiki changes.
+ *
+ * `pathspecs` scopes the commit to the entries the caller actually touched.
+ * `git add -A` stages the WHOLE shared canonical root, and the root is shared by
+ * every agent and browser tab editing that project's wiki — so with two
+ * concurrent edits (write A → write B → commit A → commit B) commit A carried
+ * B's half-finished page and commit B was empty. The version history then
+ * attributes each change to the wrong author and the wrong message, which is
+ * exactly what the history exists to prevent.
+ *
+ * Omitting `pathspecs` keeps the old whole-tree behaviour, which is still what
+ * baseline/initialization commits want.
+ *
+ * The two per-page call sites in `src/platform/api.ts` (`wiki: update …` and
+ * `wiki: delete …`) pass their page path so a per-page edit is a per-page commit;
+ * a rename passes both the new and previous path.
+ */
+export function commitProjectWiki(root: string, message: string, pathspecs?: string[]): string {
+  const specs = (pathspecs ?? []).filter((spec) => spec && !spec.startsWith('-') && !spec.includes('..'));
+  // `--` separates pathspecs from options, so a page path can never be read as a
+  // git flag even if the filter above is bypassed.
+  git(root, specs.length ? ['add', '--all', '--', ...specs] : ['add', '-A']);
+  try { git(root, ['commit', '-q', '-m', message, ...(specs.length ? ['--', ...specs] : [])]); }
   catch (error) {
-    const status = git(root, ['status', '--porcelain']);
+    const status = git(root, ['status', '--porcelain', ...(specs.length ? ['--', ...specs] : [])]);
     if (status) throw error;
   }
   return git(root, ['rev-parse', 'HEAD']);
@@ -103,6 +124,23 @@ export function projectWikiBranchView(contentDir: string, projectId: string, ref
   const key = crypto.createHash('sha256').update(ref).digest('hex').slice(0, 16);
   const view = path.join(contentDir, 'wiki-views', projectId, key);
   fs.mkdirSync(path.dirname(view), { recursive: true });
+  const head = git(root, ['rev-parse', branchRef]);
+  // REUSE a valid view instead of rebuilding it. This is a read path — two people
+  // opening the same wiki branch at the same time is the normal case — and the
+  // unconditional `worktree remove --force` + re-add meant the second request
+  // deleted the directory the first was midway through reading, so the first saw
+  // a half-empty wiki (or ENOENT). A detached worktree already at the right commit
+  // is byte-identical to the one the rebuild would produce, so there is nothing to
+  // gain from rebuilding it.
+  if (fs.existsSync(path.join(view, '.git'))) {
+    try {
+      if (git(view, ['rev-parse', 'HEAD']) === head) return view;
+      // Same view, different commit: move it forward in place rather than
+      // deleting and recreating the directory under a concurrent reader.
+      git(view, ['checkout', '-q', '--detach', head]);
+      return view;
+    } catch { /* corrupt or stale view — fall through and rebuild it */ }
+  }
   if (fs.existsSync(view)) {
     try { git(root, ['worktree', 'remove', '--force', view]); }
     catch { fs.rmSync(view, { recursive: true, force: true }); }
