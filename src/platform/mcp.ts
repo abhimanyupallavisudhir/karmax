@@ -97,6 +97,21 @@ function compactTags(tags: any[]): { path: string; kind?: string; description?: 
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
+/**
+ * Accept a `platform_request` body as either a structured value or a JSON string.
+ * The string form is the escape hatch for clients that cannot express a free-form
+ * object; a string that is not valid JSON is forwarded verbatim, so an endpoint
+ * genuinely expecting a JSON string still receives one.
+ */
+export function normalizeRequestBody(body: unknown): unknown {
+  if (typeof body !== 'string') return body;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return body;
+  }
+}
+
 /** In-process ops backed by KarmaxApi + the agent's scoped token (worker side). */
 export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
   return {
@@ -432,9 +447,19 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'platform_request',
     {
       description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization.',
-      inputSchema: { method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']), path: z.string().startsWith('/api/'), body: z.unknown().optional() },
+      // `body` must describe a concrete shape. Declared as `z.unknown()` it serialized
+      // to an *empty* JSON Schema (`{}`), and clients dropped the argument before it
+      // ever reached the gateway — every write silently became a no-op against an
+      // empty body (a POST reached createTag as `{}` and threw on `name.trim()`).
+      // The string arm is a deliberate escape hatch for clients that cannot express
+      // a free-form object; it is parsed as JSON below.
+      inputSchema: {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+        path: z.string().startsWith('/api/'),
+        body: z.union([z.record(z.string(), z.unknown()), z.array(z.unknown()), z.string()]).optional(),
+      },
     },
-    async (a) => wrap(() => ops.platformRequest(a.method, a.path, a.body)),
+    async (a) => wrap(() => ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body))),
   );
   server.registerTool('get_task', { description: "Get a task's current view-model.", inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.getTask(a.taskId)));
   server.registerTool('list_tasks', { description: 'List tasks in a project.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));

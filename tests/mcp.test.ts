@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { KarmaxApi } from '../src/platform/api.js';
-import { createPlatformMcpServer, apiOps, httpOps } from '../src/platform/mcp.js';
+import { createPlatformMcpServer, apiOps, httpOps, normalizeRequestBody } from '../src/platform/mcp.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
@@ -63,6 +63,70 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
     expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
+  });
+
+  /**
+   * Regression: `platform_request.body` was declared `z.unknown()`, which serializes to
+   * an *empty* JSON Schema (`{}`). Clients dropped the argument before it left the
+   * caller, so every write reached the gateway with an empty body and silently became a
+   * no-op — a POST arrived at createTag as `{}` and threw on `name.trim()`. The advertised
+   * schema must describe a concrete shape.
+   */
+  it('advertises a concrete body schema for platform_request so writes carry a payload', async () => {
+    const { tools } = await client.listTools();
+    const body = (tools.find((t) => t.name === 'platform_request')!.inputSchema as any).properties.body;
+    expect(body).toBeDefined();
+    expect(Object.keys(body)).not.toHaveLength(0);
+    // An object payload must be expressible (that is the overwhelmingly common case).
+    expect(JSON.stringify(body)).toMatch(/"type":"object"/);
+  });
+
+  /**
+   * Pins the server half of the contract: a body survives client → server → ops.
+   *
+   * Worth being precise about what the empty schema did and did not break. A
+   * well-behaved MCP client (this one) always forwarded an object body, even under
+   * `z.unknown()` — so the *server* was never the fault. The breakage was client-side:
+   * a caller that will not marshal an argument whose advertised schema is empty drops
+   * it, and the gateway then sees `{}`. Declaring a concrete shape is what makes the
+   * argument survive those clients; the JSON-string arm below is new capability.
+   */
+  it('delivers a platform_request body across the MCP boundary to the ops layer', async () => {
+    const seen: { method?: string; path?: string; body?: unknown } = {};
+    const stub = {
+      platformRequest: async (method: string, path: string, body?: unknown) => {
+        Object.assign(seen, { method, path, body });
+        return { ok: true };
+      },
+    } as any;
+    const server = createPlatformMcpServer(stub);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const c = new Client({ name: 'body-test', version: '1.0.0' });
+    await c.connect(clientT);
+
+    await c.callTool({
+      name: 'platform_request',
+      arguments: { method: 'POST', path: '/api/projects/p1/tags', body: { name: 'bug', kind: 'type' } },
+    });
+    expect(seen).toMatchObject({ method: 'POST', path: '/api/projects/p1/tags' });
+    expect(seen.body).toEqual({ name: 'bug', kind: 'type' });
+
+    // The JSON-string escape hatch arrives structured, not as a string.
+    await c.callTool({
+      name: 'platform_request',
+      arguments: { method: 'PATCH', path: '/api/tags/t1', body: '{"kind":"flag"}' },
+    });
+    expect(seen.body).toEqual({ kind: 'flag' });
+  });
+
+  it('accepts a platform_request body as a structured value or a JSON string', () => {
+    expect(normalizeRequestBody({ name: 'bug' })).toEqual({ name: 'bug' });
+    expect(normalizeRequestBody('{"name":"bug"}')).toEqual({ name: 'bug' });
+    expect(normalizeRequestBody([1, 2])).toEqual([1, 2]);
+    expect(normalizeRequestBody(undefined)).toBeUndefined();
+    // A string that is not JSON is forwarded verbatim rather than mangled.
+    expect(normalizeRequestBody('plain text')).toBe('plain text');
   });
 
   it('does not expose direct cross-world filesystem inspection', async () => {
