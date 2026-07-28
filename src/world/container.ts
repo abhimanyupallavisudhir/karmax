@@ -2,7 +2,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { addCheckoutViaExec } from './checkout.js';
 import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
 import { openSpawnedPty, startSpawnedProcess } from './local-execution.js';
@@ -164,6 +165,12 @@ class ContainerWorld implements World {
     if (fs.existsSync(this.handle.root)) walk(this.handle.root, '');
     return out;
   }
+  /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
+   *  here are real clones, so this is one `git worktree add` run in place. */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    return addCheckoutViaExec(this, spec);
+  }
+
   async destroy(): Promise<void> {
     await docker(['rm', '-f', this.name]);
     const { git } = await import('./git.js');

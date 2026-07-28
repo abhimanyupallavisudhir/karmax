@@ -79,7 +79,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(h.store.getTask(task.id)).toMatchObject({
       workflow: 'goal',
       executionWorkflow: 'software-dev',
-      workflowVersion: '1.8.0',
+      workflowVersion: '1.9.0',
     });
   });
 

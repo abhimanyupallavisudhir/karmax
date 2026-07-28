@@ -5161,7 +5161,11 @@ function bindTermScreen(out) {
 function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
+  // A multi-PR task has several checkouts in the one world, so check-in picks
+  // which branch to land in. It is just a cwd — no second world, and the remote
+  // case costs nothing extra for exactly that reason (SPEC §11.1).
+  const checkout = document.getElementById('term-checkout')?.value;
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -5238,7 +5242,29 @@ async function openArtifact(url, external) {
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
 }
+// Approve ONE branch of a multi-PR task. It records that this branch has been
+// reviewed at the commit it is on now; `confirm` still passes the gate.
+function wireCheckoutApprovals(v) {
+  document.querySelectorAll('[data-approve-checkout]').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const name = btn.getAttribute('data-approve-checkout');
+      btn.disabled = true;
+      try {
+        await api(`/api/tasks/${v.taskId}/signal`, {
+          method: 'POST',
+          body: JSON.stringify({ signal: 'approveCheckout', text: name }),
+        });
+        toast(`Approved ${name}`);
+      } catch (e) {
+        btn.disabled = false;
+        toast(e?.message || 'Could not approve that branch', true);
+      }
+    }),
+  );
+}
+
 function wireReviewActions(v) {
+  wireCheckoutApprovals(v);
   const wrap = document.getElementById('review-actions');
   if (!wrap) return;
   const out = document.getElementById('review-action-out');
@@ -5436,6 +5462,45 @@ function subTasksSection(v) {
 // ── the four task-page tabs ───────────────────────────────────────────────────
 // Overview: what the task IS and where it stands — pipeline, review, widgets,
 // sub-tasks, notes. Everything shown comes off the workflow's declared view.
+// The branches a multi-PR task is opening pull requests for (SPEC §11.1). Each is
+// its own reviewable unit, so each gets a row: where it lands, what it stacks on,
+// its pull request, and — at Review — an Approve button.
+//
+// Approving marks a branch as reviewed AT ITS CURRENT HEAD. That is what makes the
+// loop-back cheap: send a follow-up about one branch, and when the task comes back
+// from Do the ones the agent did not touch are still approved, so only the changed
+// work needs another look. Confirm remains the single act that passes the gate.
+function checkoutsSection(v) {
+  const checkouts = v.checkouts || [];
+  if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
+  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
+  const rows = checkouts.map((c) => {
+    const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
+    const pr = c.pr
+      ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
+           href="${esc(c.pr.url)}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
+      : '';
+    return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
+      <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
+      <b>${esc(c.name)}</b>
+      <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
+      <span style="color:var(--ink-3)">${esc(dest)}</span>
+      ${c.head ? `<span class="mono" style="color:var(--ink-3)">${esc(c.head.slice(0, 7))}</span>` : ''}
+      ${pr}
+      <span style="flex:1"></span>
+      ${atReview && !c.approved ? `<button class="btn sm" data-approve-checkout="${esc(c.name)}">Approve</button>` : ''}
+    </div>`;
+  }).join('');
+  const pending = checkouts.filter((c) => !c.approved).length;
+  return `<div class="section-h">Branches</div>
+    <div class="card checkout-list">
+      ${rows}
+      ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
+        ? `${pending} of ${checkouts.length} still to review — approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm approves the rest and passes Review.`
+        : 'Every branch approved. Confirm to pass Review.'}</div>` : ''}
+    </div>`;
+}
+
 function overviewTab(v) {
   const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
   // How the agent's turn reached Review. Current workflows use `finished` only after a
@@ -5476,6 +5541,7 @@ function overviewTab(v) {
     ${waiting}
     ${agentTurn}
     ${subtasks}
+    ${checkoutsSection(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${notesSection(v)}`;
@@ -5874,6 +5940,9 @@ function terminalPane(v) {
       ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
+      ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
+        ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
+      </select>` : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
     </div>
     <div class="ck-term">

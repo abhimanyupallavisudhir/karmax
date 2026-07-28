@@ -15,7 +15,8 @@ import type {
   WorldPtySpec,
   WorldSpec,
 } from './types.js';
-import { worldRelativePath, worldWorkingDirectory } from './types.js';
+import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
@@ -421,6 +422,12 @@ class E2BWorld implements World {
         else await sandbox.pty.kill(remotePid);
       },
     };
+  }
+
+  /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
+   *  here are real clones, so this is one `git worktree add` run in place. */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    return addCheckoutViaExec(this, spec);
   }
 
   async destroy(): Promise<void> {

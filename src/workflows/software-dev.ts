@@ -39,7 +39,9 @@ import {
   SubTaskResponse,
   TaskPullRequest,
 } from './contract.js';
-import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider, samePosition, MERGE_POLL } from './contract.js';
+import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
+  samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
+import type { CheckoutApprovals } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
@@ -83,6 +85,10 @@ export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const confirmSignal = defineSignal('confirm');
+/** Approve ONE branch of a multi-PR task at the head it has right now (SPEC §11.1).
+ *  Lets a human confirm the finished branches and send a follow-up about the rest;
+ *  the approval lapses by itself if the Do agent moves that branch afterwards. */
+export const approveCheckoutSignal = defineSignal<[{ name: string }]>('approveCheckout');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
@@ -240,7 +246,9 @@ export async function softwareDevV1_8(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.8.0');
 }
 
-/** A task parked in a merge queue no longer republishes its whole view every
+/** Multi-PR: a task may partition its change across several branches, each landing
+ *  as its own pull request, and Review tracks approval per branch (SPEC §11.1).
+ *  A task parked in a merge queue also no longer republishes its whole view every
  *  five seconds — see `boundedMergeWait`. */
 export async function softwareDevV1_9(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.9.0');
@@ -299,6 +307,10 @@ async function softwareDevImpl(
   // still arrives by signal, which wakes the condition immediately, so a longer
   // poll costs no latency; it only refreshes the displayed position.
   const boundedMergeWait = minor >= 9;
+  // Multi-PR (SPEC §11.1): adopting a branch the Do agent added, and the
+  // per-checkout Review gate. Gated from 1.9 on so an execution recorded before
+  // it keeps the single-branch Review semantics on replay.
+  const multiPrEnabled = minor >= 9 && !!input.project.multiPr;
   const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
   const recovery = input.recovery;
@@ -314,6 +326,9 @@ async function softwareDevImpl(
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
   let confirmed = false;
+  // checkout name -> head sha it was approved at (multi-PR Review, PLAN-multi-pr.md §3).
+  let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
+  let checkoutHeads: Record<string, string> = {};
   let cancelled = false;
   let retryRequested = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
@@ -633,6 +648,7 @@ async function softwareDevImpl(
       worldPath: world?.workdir ?? world?.root,
       pr,
       ...(prs.length ? { prs } : {}),
+      ...(multiPrEnabled && world ? { checkouts: reviewCheckouts(worldRepos(world as any), checkoutHeads, checkoutApprovals, prs) } : {}),
       mergeQueue: mergeQueuePos,
       subTasks: subTaskIds.length ? subTaskIds : undefined,
       parentTaskId: input.parentTaskId,
@@ -713,6 +729,14 @@ async function softwareDevImpl(
     confirmed = true;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
+  });
+  // Approving one branch is the same decision as Confirm, taken for one pull
+  // request instead of all of them — so a human can approve what is finished and
+  // send a follow-up about the rest. It is recorded against that branch's CURRENT
+  // head, which is what makes it lapse by itself if the Do agent moves it.
+  setHandler(approveCheckoutSignal, ({ name }) => {
+    const head = checkoutHeads[name];
+    if (head) checkoutApprovals = { ...checkoutApprovals, [name]: head };
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed) {
@@ -1305,6 +1329,12 @@ async function softwareDevImpl(
       seen = delivered;
     }
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    // A branch the agent added with `create_branch` already exists in the world;
+    // adopt the handle that now names it so the PR and merge stages see it. The
+    // handle rides back on the turn RESULT, so this is journaled state, not a
+    // second source of truth — and older pinned versions never set it, so their
+    // replay is unaffected.
+    if (multiPrEnabled && turn.worldHandle) world = turn.worldHandle as WorldHandleLike;
     return turn;
   }
 
@@ -1526,7 +1556,7 @@ async function softwareDevImpl(
   await publish();
   if (!world) {
     world = (await withResolve('setup', () =>
-      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress }),
+      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress, ...(input.project.multiPr ? { multiPr: true } : {}) }),
     )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
@@ -1794,6 +1824,16 @@ async function softwareDevImpl(
         const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
+      // Read where every branch stands BEFORE entering Review. Approval is bound to
+      // a head sha, so this is also what makes a stale approval lapse: a branch the
+      // Do agent touched since it was approved now reports a different head and
+      // drops back to unapproved, while the untouched ones keep theirs.
+      //
+      // Deliberately ahead of `stage = 'review'`: the view is served by a live query,
+      // so fetching after the flip leaves a window where Review is observable with
+      // its branches missing their heads — and a branch with no head cannot be
+      // approved, so that window is a Review whose Approve buttons quietly do nothing.
+      if (multiPrEnabled) checkoutHeads = await core.checkoutHeads(world as any).catch(() => checkoutHeads);
       stage = 'review';
       status = 'waiting';
       // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
@@ -1871,10 +1911,20 @@ async function softwareDevImpl(
         waitingFor = { kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
+        // Approving individual branches marks what has been reviewed — deliberately
+        // NOT a way to pass the layer. Confirm stays the one act that does, so the
+        // authorization and quorum rules that guard it (api.signalTask) keep
+        // guarding it, and per-branch approval cannot route around them. What the
+        // marks buy is the loop-back: a branch approved now is still approved when
+        // the task returns from Do, as long as the agent did not touch it.
         await condition(() => confirmed || cancelled || msgs.length > seen || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return await abort();
         if (confirmEpoch !== epoch) { li = 0; confirmed = false; continue; }
+        // One Confirm click is the same decision taken for every branch at once.
+        if (confirmed && multiPrEnabled && world) {
+          checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
+        }
         if (!confirmed) backToDo = true; // follow-up arrived → back to Do
         confirmed = false; // consumed by this layer (a later layer needs its own click)
         li++;

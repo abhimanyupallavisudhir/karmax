@@ -129,6 +129,24 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: {} },
   },
   {
+    name: 'create_branch',
+    description:
+      'Multi-PR tasks ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns: a prep/refactor under a feature, or slices of different repos. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it. All branches stay one task with one Review and one Merge — if a piece needs its own review timing or cancellation, use create_sub_task instead. Fails on a single-branch task; do not retry, just keep working in the one branch.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Short name for this branch: its directory, and the label on its pull request (e.g. "refactor", "docs").',
+        },
+        from: { type: 'string', description: 'Name of the existing checkout whose REPOSITORY to branch (default: the one you started in). Use for a second repo.' },
+        base: { type: 'string', description: 'A sibling checkout\'s name to stack on top of, or a git ref. Default: the same base your current branch has.' },
+        target: { type: 'string', description: 'Branch this one should merge into. Default: the same target as the checkout it came from.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
     name: 'save_skill',
     description: 'Save a reusable skill (markdown content) for future tasks.',
     parameters: {
@@ -446,6 +464,7 @@ export const PLATFORM_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter((t) => !S
 export const SDK_CONTROL_TOOL_NAMES = new Set([
   'create_review_info',
   'create_sub_task',
+  'create_branch',
   'respond_to_sub_task',
   'raise_to_parent',
   'wait_for_subtasks',
@@ -536,6 +555,23 @@ export function platformToolHandlers(
     async wait_for_subtasks() {
       ctx.waitForSubtasks();
       return 'waiting for sub-tasks to finish (or raise)';
+    },
+    async create_branch(args) {
+      try {
+        const added = await ctx.addCheckout({
+          name: String(args?.name ?? ''),
+          from: args?.from ? String(args.from) : undefined,
+          base: args?.base ? String(args.base) : undefined,
+          target: args?.target ? String(args.target) : undefined,
+        });
+        ctx.emit(`branch ${added.branch} checked out at ${added.root}`);
+        return `branch "${added.branch}" is checked out at ${added.root} — work in that directory for the change`
+          + ` belonging to this pull request, and commit it there. It is reviewed and merged with the rest of this task.`;
+      } catch (e: any) {
+        // A refusal here is informational, not a turn failure: the agent can
+        // simply carry on in the branch it already has.
+        return `could not create the branch: ${e?.message ?? e}`;
+      }
     },
     async save_skill(args) {
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
