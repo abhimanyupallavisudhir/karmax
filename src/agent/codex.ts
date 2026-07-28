@@ -84,6 +84,7 @@ export class CodexAdapter implements AgentAdapter {
     // continuing the same session, send only the messages new since it last
     // advanced (the rest is carried server-side by previous_response_id).
     let respId: string | undefined = input.session; // resume from a prior response id
+    let reportedSession: string | undefined; // last id handed to ctx.onSession (fire once per change)
     const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
     let nextInput: any[] = convo.length
       ? convo.map((m) => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.role === 'agent' ? m.text : openaiUserContent(m) }))
@@ -114,9 +115,14 @@ export class CodexAdapter implements AgentAdapter {
     for (let i = 0; i < maxIters; i++) {
       if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
       ctx.heartbeat?.(); // let Temporal deliver a pending cancellation
-      const body: any = { model, tools, tool_choice: 'auto', store: true, input: nextInput };
+      // `instructions` is NOT carried across `previous_response_id` — the
+      // Responses API drops the prior turn's instructions. Sending it only on
+      // the first call meant a multi-step tool-using turn lost its entire system
+      // prompt (task, world path, wiki context, role template) after the very
+      // first model call, and a resumed turn never sent it at all. Always send
+      // it, alongside the chain id. (Claude's metered path does the same.)
+      const body: any = { model, tools, tool_choice: 'auto', store: true, input: nextInput, instructions: input.systemPrompt };
       if (respId) body.previous_response_id = respId;
-      else body.instructions = input.systemPrompt;
       // Reasoning effort (SPEC §10.5) — only reasoning models accept it (not gpt-4.1).
       const reasoningEffort = codexReasoningEffort(model, input.profile.effort);
       if (reasoningEffort) body.reasoning = { effort: reasoningEffort };
@@ -133,8 +139,23 @@ export class CodexAdapter implements AgentAdapter {
       }
       const data = (await res.json()) as any;
       respId = data.id ?? respId;
+      // Checkpoint the session as soon as we have one. This is the sole writer of
+      // the crash-resume record: without it a worker restart or heartbeat timeout
+      // mid-turn replays the whole turn from the *previous* turn's response id,
+      // re-running every tool call already executed this turn. Every other
+      // adapter does this; this rail was the only one that didn't.
+      if (respId && respId !== reportedSession) { reportedSession = respId; ctx.onSession?.(respId); }
       if (data.status !== 'completed') {
         const reason = data.incomplete_details?.reason ?? data.error?.message ?? data.error?.code ?? 'no reason supplied';
+        // Hitting an output boundary is an interruption, not a failure: the
+        // response chain survives, so the retry resumes it. Phrase it with the
+        // prefix isTransportError() recognises so it classifies as a retryable
+        // `agent-infra`, matching ACP and both Claude paths. Anything else is a
+        // genuine non-retryable provider error.
+        if (data.incomplete_details?.reason === 'max_output_tokens' || data.status === 'incomplete') {
+          throw providerErrorFromMessage('codex',
+            `turn interrupted before completion: ${String(reason)}`, 'structured');
+        }
         const message = `OpenAI Responses turn did not complete successfully (status=${String(data.status ?? 'missing')}): ${String(reason)}`;
         throw providerErrorFromMessage('codex', message, 'structured');
       }

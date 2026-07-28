@@ -469,11 +469,12 @@ function principalLabel(principal) {
 }
 
 // The workflows a human may pick when creating a task. INTENDED: `just-do` and
-// `script-exec` are deliberately absent — they are legacy workflows kept
-// resolvable so existing version-pinned tasks keep replaying, and their
-// manifests carry `selectable: false` to say so (src/contrib/manifests.ts).
-// Do not "fix" this by adding them to the picker. `workflowLabel` falls back to
-// the raw id so such a task still renders sensibly wherever one does appear.
+// `script-exec` are deliberately absent because they are clutter in the picker —
+// nobody wants to choose them. That is the whole reason; they are still
+// registered and still run (their manifests carry `selectable: false`), so
+// existing tasks keep replaying and automation can still use them. Do not
+// "fix" this by adding them back. `workflowLabel` falls back to the raw id so
+// such a task still renders sensibly wherever one does appear.
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
