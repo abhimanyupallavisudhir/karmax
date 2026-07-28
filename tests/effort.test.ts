@@ -21,15 +21,18 @@ describe('reasoning-effort → provider parameter mapping (SPEC §10.5)', () => 
       expect(claudeMessagesEffort('claude-haiku-4-5', 'high')).toBeUndefined();
     });
     /**
-     * The SDK's EffortLevel doc lists the families that exist *today*; it is not
-     * a registry of every id that will ever exist. An exact-id allowlist is
-     * therefore default-deny for the future: the day `claude-opus-5` ships, an
-     * allowlist silently drops the requested effort (and drops the model back to
-     * the legacy 8192 output ceiling) with no error anywhere. Match on
+     * The SDK's EffortLevel doc lists the families it knew about when it was
+     * written; it is not a registry of every id that will ever exist. An
+     * exact-id allowlist is therefore default-deny for anything newer — and this
+     * is not a hypothetical about some future model: **`claude-opus-5` is a live
+     * id that karmax agents run on today**, and the allowlist silently dropped
+     * its requested effort and demoted it to the legacy 8192 output ceiling,
+     * with no error anywhere. (The regression was introduced by an edit whose
+     * comment asserted those ids "do not exist"; hence the emphasis.) Match on
      * family + generation instead, so a newer generation of a family inherits
      * that family's newest capabilities.
      */
-    it('keeps sending effort on a newer generation of a known family', () => {
+    it('keeps sending effort on newer generations, including the live claude-opus-5', () => {
       expect(claudeMessagesEffort('claude-opus-5', 'max')).toBe('max');
       expect(claudeMessagesEffort('claude-opus-5', 'xhigh')).toBe('xhigh');
       expect(claudeMessagesEffort('claude-opus-6-2', 'xhigh')).toBe('xhigh');

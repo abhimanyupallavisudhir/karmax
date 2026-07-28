@@ -34,10 +34,14 @@ export const CLAUDE_DEFAULT_MODEL = 'claude-sonnet-4-6';
  * output ceilings) are gates on capabilities that arrived with a *generation*
  * of a family and are never withdrawn from later ones. An exact-id allowlist
  * therefore encodes "unknown id → assume legacy", which is the wrong side of
- * the trade-off: the failure is silent and permanent on both axes. The day a
- * new id ships (`claude-opus-5`), an allowlist drops the requested effort with
- * no error and quietly demotes the model to the 8192 ceiling the rail used to
- * hard-code — a truncated response, blamed on the model. The opposite default,
+ * the trade-off: the failure is silent and permanent on both axes. This already
+ * happened — an edit removed the `opus-5`/`sonnet-5` arms on the stated grounds
+ * that "those ids do not exist", when `claude-opus-5` is in fact a live id that
+ * karmax agents run on. The allowlist then dropped its requested effort with no
+ * error and quietly demoted it to the 8192 ceiling the rail used to hard-code —
+ * a truncated response, blamed on the model. Note the shape of that mistake: an
+ * id absent from the SDK's illustrative list was read as an id that does not
+ * exist. The opposite default,
  * "unknown id → assume modern", fails loudly and only in the narrow window
  * where we guess wrong on a brand-new id: the API rejects the effort level,
  * which is visible and fixable. So: recognise the family, compare generations,
