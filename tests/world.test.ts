@@ -104,6 +104,38 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
+  it('reports only this branch\'s changes when the base branch advances mid-task', async () => {
+    const store = new Store(':memory:');
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const handle = await core.createWorld({ taskId: 'drift', repos: [repo], base: 'main', target: 'main', kind: 'worktree' });
+
+      // Another task merges into the base branch while this world is open.
+      fs.writeFileSync(path.join(repo, 'other-task.js'), 'console.log("theirs")\n');
+      await git(repo, ['add', '-A']);
+      await git(repo, ['commit', '-q', '-m', 'someone else’s merge']);
+
+      // The base moving must not be attributed to this task.
+      expect((await core.buildReview(handle, 'main')).changedFiles).toEqual([]);
+
+      // ...but this branch's own work — committed and not — still is.
+      const workdir = handle.workdir ?? handle.root;
+      fs.writeFileSync(path.join(workdir, 'index.js'), 'console.log(2)\n');
+      fs.writeFileSync(path.join(workdir, 'scratch.txt'), 'wip\n');
+      const review = await core.buildReview(handle, 'main');
+      expect(review.changedFiles).toContain('index.js');
+      expect(review.changedFiles).toContain('scratch.txt (new)');
+      expect(review.changedFiles).not.toContain('other-task.js');
+
+      await worlds.open(handle).then((world) => world.destroy());
+    } finally {
+      store.close();
+    }
+  });
+
   it('warns (but still forks off HEAD) when the configured base branch does not exist', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'nobase', repo, base: 'develop', target: 'main' });

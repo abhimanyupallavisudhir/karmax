@@ -1523,7 +1523,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
-        const tracked = await world.exec('git', ['diff', '--name-only', 'base' in repo ? repo.base : base], { cwd: repo.root });
+        const repoBase = 'base' in repo ? repo.base : base;
+        // Diff from the FORK POINT, not the base branch's current tip. `base` is a
+        // live ref: while this world is open, other tasks merge into it, and a
+        // two-dot `git diff <base>` would report their files as this task's work
+        // (they feed the confirmer's review packet, so a reviewer would be shown —
+        // and asked to approve — changes the task never made). The merge-base is
+        // resolved to a commit so the comparison still includes the worktree, which
+        // `<base>...HEAD` would drop along with every uncommitted change.
+        const forkPoint = await world.exec('git', ['merge-base', repoBase, 'HEAD'], { cwd: repo.root });
+        const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
+        const tracked = await world.exec('git', ['diff', '--name-only', since], { cwd: repo.root });
         const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
         // A companion wiki must not make the sole development checkout appear
         // artificially nested. Keep a stable prefix for wiki changes, while
