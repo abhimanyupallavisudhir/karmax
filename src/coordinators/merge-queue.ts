@@ -7,7 +7,6 @@ import {
   continueAsNew,
   getExternalWorkflowHandle,
   workflowInfo,
-  sleep,
   log,
 } from '@temporalio/workflow';
 import type { coordinatorActivities } from '../activities/coordinator.js';

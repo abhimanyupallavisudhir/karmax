@@ -17,7 +17,8 @@ import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmConfig, ConfirmDecision, ConfirmLayer,
-  TaskPullRequest, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+  TaskPullRequest, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
+  samePosition, MERGE_POLL } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -79,6 +80,12 @@ export async function mergeOnlyV1_4(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true, true, true);
 }
 
+/** A task parked in the merge queue no longer republishes its whole view every
+ *  five seconds — see `boundedMergeWait`. */
+export async function mergeOnlyV1_5(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);
@@ -92,6 +99,10 @@ async function mergeOnlyImpl(
   // New activity calls inside an existing stage break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
   githubPrLifecycle = false,
+  // Poll the merge queue coarsely and republish only on change: the view carries
+  // every message and transcript, and Temporal hard-caps history at 50MB, so the
+  // old 5s unconditional publish turned a long queue wait into a TERMINATE.
+  boundedMergeWait = false,
 ): Promise<{ stage: Stage; sha?: string }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
@@ -366,10 +377,13 @@ async function mergeOnlyImpl(
   }
   while (!mergeGranted && !cancelled) {
     if (managedTurns) {
-      mergeQueue = await coord.mergeQueuePosition(domain, taskId);
-      await publish();
+      const pos = await coord.mergeQueuePosition(domain, taskId);
+      if (!boundedMergeWait || !samePosition(pos, mergeQueue)) {
+        mergeQueue = pos;
+        await publish();
+      }
     }
-    await condition(() => mergeGranted || cancelled, '5s');
+    await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
   }
   if (cancelled && !mergeGranted) {
     await coord.cancelMerge(domain, taskId);

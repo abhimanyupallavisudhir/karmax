@@ -1512,9 +1512,19 @@ export class KarmaxApi {
       || !view.state?.humanPauseOrigin
     ) return undefined;
     const origin = view.state.humanPauseOrigin as Stage;
+    const hasTranscript = (role: AgentRole) =>
+      !!view.transcripts?.some((transcript) => transcript.role === role);
     if (origin === 'do' || origin === 'review') return 'do';
-    if (origin === 'merge' && view.transcripts?.some((transcript) => transcript.role === 'merge')) return 'merge';
-    return undefined;
+    if (origin === 'merge' && hasTranscript('merge')) return 'merge';
+    // A hold can land in a stage whose own agent never ran — pausing during
+    // `merge` while the task is still queued for its slot is the ordinary case,
+    // and it leaves no merge transcript to talk to. Resolving to `undefined`
+    // there made the task inert: `lifecycleActions` strips `followUp` and
+    // splices nothing back, so a task carrying hours of Do context offered no
+    // conversation at all and Cancel was the only way out. Do always exists
+    // once a task has done any work, and it owns the context a follow-up about
+    // the pending merge is actually about.
+    return hasTranscript('do') ? 'do' : undefined;
   }
 
   /**

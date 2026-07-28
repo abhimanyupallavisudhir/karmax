@@ -352,6 +352,28 @@ export function mergeQueueDomains(
   return [...new Set(domains)].sort();
 }
 
+/**
+ * How long a task parked in a merge queue waits between position refreshes.
+ *
+ * The grant itself arrives as a signal, which wakes the wait immediately, so
+ * this interval only controls how fresh the *displayed* position is — it costs
+ * no merge latency. It is deliberately coarse because every tick appends
+ * activity and workflow-task events to a history Temporal hard-caps at 50MB:
+ * a 5s tick let a few hours of queueing terminate the task outright.
+ */
+export const MERGE_POLL = '30s';
+
+/** Whether two merge-queue positions are indistinguishable to a viewer, and so
+ *  whether re-publishing the (large) task view would tell anyone anything. */
+export function samePosition(
+  a: TaskView['mergeQueue'],
+  b: TaskView['mergeQueue'],
+): boolean {
+  return a?.position === b?.position
+    && a?.total === b?.total
+    && !!a?.unreachable === !!b?.unreachable;
+}
+
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
 export interface Project {
@@ -1110,7 +1132,9 @@ export interface TaskView {
    *  repo's, which for a single-repo task is the same one. */
   pr?: TaskPullRequest;
   prs?: TaskPullRequest[];
-  mergeQueue?: { position: number; total: number };
+  /** `unreachable` distinguishes "the coordinator could not be queried" from
+   *  the identical-looking "position -1 of an empty queue". */
+  mergeQueue?: { position: number; total: number; unreachable?: boolean };
   subTasks?: string[];
   parentTaskId?: string;
   error?: string;
