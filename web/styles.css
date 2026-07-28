@@ -102,11 +102,25 @@ a { color: var(--accent); text-decoration: none; }
   z-index: 30;
 }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.01em; }
+/* The artwork carries its own background and rounded corners (see web/brand/),
+   so the mark is just a sized image — no gradient plate behind it. */
 .brand .mark {
   width: 22px; height: 22px; border-radius: 6px;
-  background: linear-gradient(135deg, var(--accent), #8a6cf0);
-  display: grid; place-items: center; color: #fff; font-size: 13px;
-  box-shadow: 0 1px 4px rgba(91, 91, 214, 0.5);
+  display: block; object-fit: contain; flex: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+.brand-picker { display: flex; flex-wrap: wrap; gap: 10px; }
+.brand-option {
+  display: grid; justify-items: center; gap: 6px;
+  padding: 10px; width: 88px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface-2); color: var(--ink-2); font-size: 12px;
+}
+.brand-option img { width: 44px; height: 44px; border-radius: 11px; }
+.brand-option:hover { border-color: var(--ink-3); }
+.brand-option[aria-pressed='true'] {
+  border-color: var(--accent); color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600;
 }
 .org-switcher { max-width: 230px; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 28px 6px 9px; font-weight: 600; }
 .topbar .search {
@@ -958,7 +972,6 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   .topbar { gap: 8px; padding-left:max(10px, env(safe-area-inset-left)); padding-right:max(10px, env(safe-area-inset-right)); }
   .mobile-menu { display:grid; flex:none; }
   .topbar .brand { font-size:0; gap:0; }
-  .topbar .brand .mark { font-size:13px; }
   .topbar #topbar-help, .topbar #topbar-palette { display:none; }
   .topbar-user { max-width:84px; padding:0 9px; }
   .org-switcher { max-width:105px; }

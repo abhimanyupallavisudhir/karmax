@@ -23,8 +23,9 @@ global.parseRoute = (p) => { const m = /\/tasks\/([^/]+)/.exec(p || ''); return 
 const S = global.S = { returnRoute: null };
 let lastGo = null;
 global.go = (path) => { lastGo = path; return path; };
-global.location = { pathname: '/acme/website-redesign' };
+global.location = { pathname: '/acme/website-redesign', search: '' };
 
+eval(extractFn('currentPath'));
 eval(extractFn('isNewTabClick'));
 eval(extractFn('spaNavigate'));
 

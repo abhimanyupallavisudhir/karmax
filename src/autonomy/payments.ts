@@ -39,7 +39,30 @@ export interface CardSpec {
   organizationId?: string;
   currency?: string;
   cardholderId?: string;
+  /** Required by rails that register a card the human already holds (vault-card). */
+  details?: CardDetails;
 }
+
+/** The secret half of a card. Never stored in the metadata index, never returned
+ * to an agent — resolved out of the vault only to be typed into a checkout. */
+export interface CardDetails {
+  number: string;
+  cvc: string;
+  expMonth: number;
+  expYear: number;
+  /** Billing address. Optional, but many checkouts decline on AVS without it. */
+  billing?: CardBillingAddress;
+}
+
+export interface CardBillingAddress {
+  line1?: string;
+  city?: string;
+  postalCode?: string;
+  country?: string;
+}
+
+/** Vault handle holding a registered card's secret half. */
+export const cardSecretHandle = (cardId: string) => `payment:card:${cardId}`;
 
 export interface PaymentBalance {
   available: number;
@@ -68,8 +91,9 @@ export interface AuthorizeResult {
 export interface ProviderInfo {
   name: string;
   label: string;
-  /** 'local' = no external account (mock); 'oauth' = connect a provider account. */
-  kind: 'local' | 'oauth';
+  /** 'local' = no external account (mock); 'card' = register a card you already
+   *  hold; 'oauth' = connect a provider account that issues cards for you. */
+  kind: 'local' | 'card' | 'oauth';
   /** Whether this deployment has a complete, usable connection flow. */
   available: boolean;
   connected: boolean;
@@ -93,6 +117,11 @@ export interface PaymentProvider {
   readonly name: string;
   /** Immediate providers settle at request time; webhook providers reserve first. */
   readonly authorizationMode: 'immediate' | 'webhook';
+  /** Whether `cap` is a ceiling the rail enforces independently of funds (default
+   * true). A rail that only mirrors a limit the human set at their own issuer has
+   * no second ceiling: spending past the declared figure means "top up", not
+   * "denied". Enforcement there is the issuer's decline, never this number. */
+  readonly enforcesCardCap?: boolean;
   provisionCard(spec: CardSpec): Promise<Card>;
   getCard(cardId: string): Promise<Card | undefined>;
   fund(cardId: string, amount: number): Promise<void>;
@@ -104,8 +133,13 @@ export interface PaymentProvider {
   connect(ctx?: PaymentConnectionContext): Promise<ConnectResult>;
   balance(organizationId: string): Promise<PaymentBalance>;
   revoke(cardId: string): Promise<void>;
-  listCardholders(organizationId: string): Promise<any[]>;
-  createCardholder(organizationId: string, input: PaymentCardholderInput): Promise<any>;
+  /** Resolve the secret half so it can be typed into a checkout. Only rails that
+   * move real money implement this; its presence is what makes a card fillable. */
+  retrieveCardDetails?(cardId: string): Promise<CardDetails>;
+  /** Issuing-only: rails that mint cards against a compliance record. A rail that
+   * registers a card the human already holds has no cardholder surface. */
+  listCardholders?(organizationId: string): Promise<any[]>;
+  createCardholder?(organizationId: string, input: PaymentCardholderInput): Promise<any>;
 }
 
 /** Mock rail: card state lives in the karmax store. Real rails (Stripe) keep it provider-side. */
@@ -164,8 +198,126 @@ export class MockPaymentProvider implements PaymentProvider {
     if (!this.store.getCard(cardId)) throw new Error('no such card');
     this.store.updateCard(cardId, { status: 'canceled', available: 0 });
   }
-  async listCardholders(): Promise<any[]> { return []; }
-  async createCardholder(): Promise<any> { throw new Error('Local test funds do not need a cardholder'); }
+}
+
+/**
+ * The universal rail (SPEC §7.6): a virtual card the human already holds — from
+ * their own bank, Revolut, Wise, a prepaid card — whose spending limit they set
+ * with their own issuer.
+ *
+ * This is the rail that works in every country with no signup, because karmax
+ * does not issue, fund, or authorize anything: the issuer declines when the
+ * limit is reached, and "top up" means raising that limit. Karmax stores the
+ * secret half in the vault and types it into checkout through the origin-checked
+ * secure fill; the PAN never enters an agent's context.
+ *
+ * The trade against an issuing rail is honest and one-sided: karmax cannot read
+ * the real balance, so `cap`/`available` here are the human's *declared* figure.
+ * They drive fast failure and bookkeeping, not enforcement — a decline at the
+ * issuer is the only authoritative answer.
+ */
+export class VaultCardProvider implements PaymentProvider {
+  readonly name = 'vault-card';
+  readonly authorizationMode = 'immediate';
+  readonly enforcesCardCap = false;
+  constructor(private store: Store, private broker: CredentialBroker) {}
+
+  private validate(details: CardDetails | undefined): CardDetails {
+    if (!details) throw new Error('card details are required to register a card');
+    const number = String(details.number ?? '').replace(/[\s-]/g, '');
+    if (!/^\d{12,19}$/.test(number) || !luhnValid(number))
+      throw new Error('card number must be a valid 12–19 digit card number');
+    if (!/^\d{3,4}$/.test(String(details.cvc ?? ''))) throw new Error('cvc must be 3 or 4 digits');
+    const expMonth = Number(details.expMonth);
+    const expYear = Number(details.expYear);
+    if (!Number.isInteger(expMonth) || expMonth < 1 || expMonth > 12 || !Number.isInteger(expYear))
+      throw new Error('card expiry must be a real month and year');
+    const now = new Date();
+    if (expYear < now.getFullYear() || (expYear === now.getFullYear() && expMonth < now.getMonth() + 1))
+      throw new Error('card has already expired');
+    const billing = Object.fromEntries(Object.entries(details.billing ?? {})
+      .map(([field, value]) => [field, String(value ?? '').trim()]).filter(([, value]) => value));
+    return { number, cvc: String(details.cvc), expMonth, expYear,
+      ...(Object.keys(billing).length ? { billing } : {}) };
+  }
+
+  async provisionCard(spec: CardSpec): Promise<Card> {
+    if (!Number.isSafeInteger(spec.cap) || spec.cap <= 0)
+      throw new Error('card limit must be a positive number of cents');
+    const details = this.validate(spec.details);
+    const card: Card = {
+      id: newId('card'), provider: this.name, scope: spec.scope, scopeId: spec.scopeId,
+      label: spec.label, cap: spec.cap, available: spec.cap, merchantLock: spec.merchantLock,
+      currency: (spec.currency ?? 'usd').toLowerCase(), status: 'active',
+      last4: details.number.slice(-4), createdAt: Date.now(),
+    };
+    this.broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details));
+    this.store.createCard(card);
+    return card;
+  }
+  async getCard(cardId: string): Promise<Card | undefined> {
+    const card = this.store.getCard(cardId) as Card | undefined;
+    return card?.provider === this.name ? card : undefined;
+  }
+  /** "Topping up" is the human raising the limit at their own issuer; karmax
+   *  only mirrors that figure so it can fail fast before a decline. */
+  async fund(cardId: string, amount: number): Promise<void> {
+    if (!Number.isSafeInteger(amount) || amount <= 0)
+      throw new Error('top-up amount must be a positive number of cents');
+    const card = await this.getCard(cardId);
+    if (!card) throw new Error('no such card');
+    if (card.status === 'canceled') throw new Error('card is not active');
+    this.store.updateCard(cardId, { available: card.available + amount, cap: card.cap + amount });
+  }
+  async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
+    const card = await this.getCard(cardId);
+    if (!card) return { ok: false, reason: 'no such card' };
+    if (card.status === 'canceled') return { ok: false, reason: 'card is not active' };
+    if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
+    if (card.merchantLock?.length && (!merchant || !card.merchantLock.includes(merchant)))
+      return { ok: false, reason: 'merchant not allowed' };
+    if (amount > card.available) return { ok: false, reason: 'exceeds the declared remaining limit' };
+    this.store.updateCard(cardId, { available: card.available - amount });
+    return { ok: true, transactionId: newId('txn') };
+  }
+  async retrieveCardDetails(cardId: string): Promise<CardDetails> {
+    const card = await this.getCard(cardId);
+    if (!card || card.status === 'canceled') throw new Error('card is not active');
+    const handle = cardSecretHandle(cardId);
+    return JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as CardDetails;
+  }
+  describe(): ProviderInfo {
+    return { name: this.name, label: 'Your own virtual card', kind: 'card', available: true, connected: true,
+      help: 'Create a virtual card with a spending limit in your own banking app, then register it here. '
+        + 'Your bank enforces the limit and declines when it runs out; raise the limit to top it up.' };
+  }
+  async connect(): Promise<ConnectResult> {
+    return { status: 'connected', detail: 'Nothing to connect — register a card below.' };
+  }
+  async balance(organizationId: string): Promise<PaymentBalance> {
+    return { available: this.store.listOrganizationCards(organizationId)
+      .filter((card) => card.provider === this.name && card.status !== 'canceled')
+      .reduce((sum, card) => sum + card.available, 0), currency: 'usd' };
+  }
+  /** Revoking must destroy the secret, not just hide the row. */
+  async revoke(cardId: string): Promise<void> {
+    if (!await this.getCard(cardId)) throw new Error('no such card');
+    this.broker.deleteHandle(cardSecretHandle(cardId));
+    this.store.updateCard(cardId, { status: 'canceled', available: 0 });
+  }
+}
+
+/** Catches transposed/mistyped digits before a card is ever presented. */
+function luhnValid(number: string): boolean {
+  let sum = 0;
+  let double = false;
+  for (let i = number.length - 1; i >= 0; i--) {
+    let digit = number.charCodeAt(i) - 48;
+    if (double) digit = digit > 4 ? digit * 2 - 9 : digit * 2;
+    sum += digit;
+    double = !double;
+  }
+  return sum % 10 === 0;
 }
 
 const STRIPE_API_VERSION = '2025-03-31.basil';
@@ -786,7 +938,10 @@ export class BudgetService {
       spent: this.spent(ctx.taskId),
       threshold,
       available: refreshed.available,
-      hardCap: Math.max(0, refreshed.cap - this.store.cardPaymentSpent(refreshed.id)),
+      // A rail without its own ceiling can only run out of funds, never breach a
+      // cap — so an oversized request asks for a top-up rather than being denied.
+      hardCap: provider.enforcesCardCap === false ? Number.MAX_SAFE_INTEGER
+        : Math.max(0, refreshed.cap - this.store.cardPaymentSpent(refreshed.id)),
       merchant: args.merchant,
       merchantLock: refreshed.merchantLock,
     });

@@ -64,12 +64,11 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: '', // the working query string (Linear-style tokens + free text)
+  search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
-  activeView: null, // id of the selected saved view, or null for the ad-hoc/default view
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
@@ -132,6 +131,17 @@ function projectBySlug(slug, organizationId) {
 // to a slug of the name for older records that predate it.
 function orgSlug(o) { return o ? (o.slug || slugify(o.name)) : ''; }
 function organizationById(id) { return (S.organizations || []).find((o) => o.id === id); }
+// Re-authorization is always offered once OAuth is configured. `userAuthorized`
+// only reports that a stored credential EXISTS, not that GitHub still accepts
+// it — so hiding this button whenever one exists left no escape hatch for a
+// token invalidated server-side (revocation, secret rotation, a single-use
+// refresh chain consumed by a concurrent instance). Re-authorizing a healthy
+// grant is idempotent, so there is no cost to keeping the affordance visible.
+function githubAuthorizeButton(githubApp, id) {
+  if (!githubApp?.oauthConfigured) return '';
+  const label = githubApp.userAuthorized ? 'Re-authorize GitHub' : 'Authorize repository creation';
+  return `<button class="btn sm" id="${id}">${label}</button>`;
+}
 function organizationBySlug(slug) {
   const s = slugify(slug);
   return (S.organizations || []).find((o) => orgSlug(o) === s) || (S.organizations || []).find((o) => o.id === slug);
@@ -149,7 +159,13 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', profile: 'profile' };
 
-function parseRoute(pathname) {
+// Parse an in-app URL — a path, optionally with its `?…` query string — into the
+// page it names. The tasks list's whole search state (free text, filters, group,
+// sort) is the one query string in `?q=`, so it rides along as `q` on every
+// project route: a search is just a URL.
+function parseRoute(url) {
+  const [pathname, search = ''] = String(url).split('?');
+  const q = new URLSearchParams(search).get('q') || '';
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
@@ -161,7 +177,7 @@ function parseRoute(pathname) {
     const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, legacy: true };
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, q, legacy: true };
   }
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
@@ -170,16 +186,33 @@ function parseRoute(pathname) {
   const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab };
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q };
+}
+
+// The `/<org>/<project>` prefix every project URL builds on ('' when unknown).
+function projectBase(pid) {
+  const p = projectById(pid);
+  return p ? `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}` : '';
 }
 
 // The list/tab route for a project (by id): /<org>/<project> for the default
-// tasks tab, with the tab appended for the others.
-function projectRoute(pid, tab = 'tasks') {
-  const p = projectById(pid);
-  if (!p) return globalRoute('dashboard');
-  const base = `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}`;
-  return tab === 'tasks' ? base : `${base}/${tab}`;
+// tasks tab, with the tab appended for the others. The tasks list additionally
+// carries the working query in `?q=`, so its links are the durable, shareable
+// form of a search — and so moving between tabs (or back from a task) restores
+// the exact filtered/grouped/sorted view. It defaults to the query in hand,
+// which belongs to the project currently on screen and to no other.
+function projectRoute(pid, tab = 'tasks', q = pid === S.projectId ? S.search : '') {
+  const base = projectBase(pid);
+  if (!base) return globalRoute('dashboard');
+  if (tab !== 'tasks') return `${base}/${tab}`;
+  return q ? `${base}?q=${encodeQuery(q)}` : base;
+}
+
+// Query strings are meant to be read and hand-edited in the address bar, so we
+// keep the characters that are legal there legal-looking: ':' and ',' survive
+// unescaped and a space rides as '+' (which URLSearchParams decodes back).
+function encodeQuery(q) {
+  return encodeURIComponent(q).replace(/%3A/g, ':').replace(/%2C/g, ',').replace(/%20/g, '+');
 }
 
 // An organization-level route (dashboard / settings / inbox) under the current
@@ -189,11 +222,15 @@ function globalRoute(tab, org = currentOrg()) {
   return `${orgBase(org)}/${seg}`;
 }
 
+// The URL we are on, query string included — the full identity of the current
+// view, since a search lives in `?q=`.
+function currentPath() { return location.pathname + location.search; }
+
 // Navigate: update the URL then reconcile app state to it. `replace` swaps the
 // current history entry instead of pushing a new one.
 function go(path, opts = {}) {
   closeTaskFormPage();
-  if (path !== location.pathname) {
+  if (path !== currentPath()) {
     history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
   }
   return applyRoute();
@@ -222,7 +259,7 @@ async function applyRoute() {
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
-  const r = parseRoute(location.pathname);
+  const r = parseRoute(currentPath());
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
     return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
@@ -247,7 +284,7 @@ async function applyRoute() {
     if (!r.tab) {
       const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
       const dest = pid ? projectRoute(pid) : globalRoute('dashboard');
-      if (dest !== location.pathname) return go(dest, { replace: true });
+      if (dest !== currentPath()) return go(dest, { replace: true });
       r.tab = 'dashboard'; // fall through to a real page
     }
     if (r.legacy) {
@@ -275,8 +312,8 @@ async function applyRoute() {
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
     const dest = r.taskKey
-      ? `${projectRoute(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
-      : projectRoute(proj.id, r.tab);
+      ? `${projectBase(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
+      : projectRoute(proj.id, r.tab, r.q);
     return go(dest, { replace: true });
   }
   const pid = proj.id;
@@ -286,12 +323,12 @@ async function applyRoute() {
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
-    // its query/selected-view/roving-cursor/search-result can't bleed into the
-    // new project (they'd otherwise re-run the old query against new data and
-    // highlight a view/cursor that doesn't exist here).
+    // its query/roving-cursor/search-result can't bleed into the new project
+    // (they'd otherwise re-run the old query against new data and highlight a
+    // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
+    // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
     S.search = '';
-    S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
     await loadTasks().catch(() => {});
@@ -314,6 +351,9 @@ async function applyRoute() {
   S.tab = tab;
   if (!taskId) closeTaskDom();
   if (tab === 'tasks' && !taskId) {
+    // The list is query-driven and the URL owns the query: a pasted, bookmarked,
+    // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
+    S.search = r.q || '';
     await runSearch().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -330,12 +370,14 @@ async function applyRoute() {
 }
 
 // The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
-// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
+// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click). It stays
+// free of the list's ?q=: a task link is about the task, and the query you came
+// from is remembered in S.returnRoute (and in the history entry behind you).
 function taskUrl(id) {
   const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
-  return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
+  return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
 // True when a click means "open in a new tab/window" by browser convention: any
@@ -350,7 +392,7 @@ function isNewTabClick(ev) {
 // previous task). Generalises the old goToTask logic to any SPA link.
 function spaNavigate(href) {
   const to = parseRoute(href);
-  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  if (to && to.taskKey && !parseRoute(currentPath()).taskKey) S.returnRoute = currentPath();
   return go(href);
 }
 
@@ -498,6 +540,16 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
 }
 
 // The "Agent environment" (worldProvider) choices depend on the deployment and
+// Whether the browser and the karmax host are the same computer. Host-machine
+// affordances — typing a filesystem path on the host, materializing a checkout to
+// `cd` into, importing the host's `pass` store — are noise to anyone reaching
+// karmax over a public URL, so they are hidden. The gateway detects it from how it
+// is served (src/config/deployment.ts); a hosted cell is never host-local.
+const hostLocal = () => S.meta?.hostLocal !== false;
+// A world path is a directory on the karmax host: only its own machine can `cd`
+// into it. Elsewhere the world is still reachable — over `karmax attach`, not a path.
+const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
+
 // which remote sandbox providers the organization has connected — so the manifest
 // ships an empty option list and the client fills it in. An empty first option ⇒
 // inherit the project / organization default.
@@ -1830,18 +1882,31 @@ async function runSearch() {
   }
 }
 
+// Mirror the working query into the address bar, so every search — text, filters,
+// grouping, sorting — is a link you can copy, bookmark, reload or reach with Back.
+// replaceState, not push: editing a query refines the view you are on rather than
+// opening a new page, so a typed search doesn't bury the previous page under a
+// history entry per keystroke.
+function syncQueryUrl() {
+  if (S.tab !== 'tasks' || S.selected || !S.projectId) return; // only the list is query-driven
+  const path = projectRoute(S.projectId);
+  if (path !== currentPath()) history.replaceState({ kx: 1 }, '', path);
+}
+
 let searchDebounce = null;
 function scheduleSearch() {
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(async () => { await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+  searchDebounce = setTimeout(async () => { syncQueryUrl(); await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
 }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
-// Updates the topbar box (which renderMain doesn't own), re-evaluates, re-renders.
+// Updates the topbar box (which renderMain doesn't own) and the URL, re-evaluates,
+// re-renders.
 async function setQuery(q) {
   S.search = q || '';
   const box = $('#task-search');
   if (box) box.value = S.search;
+  syncQueryUrl();
   await runSearch();
   if (S.tab === 'tasks') renderMain();
 }
@@ -1852,10 +1917,9 @@ async function navigateToTagSection(tagId) {
   const tag = tagById(tagId);
   if (!tag) return;
   $('#modal-root').innerHTML = '';
-  S.activeView = null;
   // Section by the tag's own kind so the target section is present in the grouping.
-  S.search = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
-  await go(projectRoute(tag.projectId));
+  const q = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
+  await go(projectRoute(tag.projectId, 'tasks', q));
   const section = document.getElementById(tagSectionId(tagId));
   if (!section) return;
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1894,6 +1958,10 @@ function stringifyQuery(q) {
   if (q.text) parts.push(String(q.text).includes(' ') ? `"${q.text}"` : q.text);
   return parts.join(' ');
 }
+
+// A query string's canonical form (parse → stringify), so two spellings of the
+// same search — token order, spacing, quoting — compare equal.
+function normalizeQuery(q) { return stringifyQuery(parseQueryClient(q || '')); }
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
@@ -2064,12 +2132,37 @@ function wireVerificationBanner() {
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
 }
 
+// Mirrors BRAND_ICONS in src/domain/brand.ts — each id is a directory under web/brand/.
+const BRAND_ICON_CHOICES = [
+  { id: 'diamond', label: 'Diamond' },
+  { id: 'knot', label: 'Knot' },
+  { id: 'check', label: 'Check' },
+  { id: 'clover', label: 'Clover' },
+];
+
+// The gateway resolves /brand/* against the instance-wide icon setting, so the
+// mark carries no client state — which is also what lets it render on the
+// pre-auth login screens. The counter only busts the HTTP cache after a switch.
+let brandVersion = 0;
+function brandMark() {
+  return `<img class="mark" src="/brand/icon-192.png${brandVersion ? `?v=${brandVersion}` : ''}" alt="" />`;
+}
+
+/** Re-point the favicon and every on-screen mark so a switch shows up at once,
+ * without a reload — the URLs are unchanged, so only the cache needs busting. */
+function refreshBrandAssets() {
+  brandVersion++;
+  const bust = (el, attr) => { el[attr] = `${String(el[attr]).split('?')[0]}?v=${brandVersion}`; };
+  document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]').forEach((l) => bust(l, 'href'));
+  document.querySelectorAll('.brand .mark').forEach((m) => bust(m, 'src'));
+}
+
 function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
-      <div class="brand"><span class="mark">◇</span> karmax</div>
+      <div class="brand">${brandMark()} karmax</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
         <option value="__new">＋ New organization</option>
@@ -2354,19 +2447,36 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
+// Which view chip a query lights up. A view IS a query, so the query decides —
+// there is no separate "selected view" to keep in sync, and a pasted or reloaded
+// ?q= URL lights the right chip for free. Comparison is on the canonical form, so
+// a view still matches when its query was re-spelled by the toolbar or round-tripped
+// through the saved (structured) form. The empty query is the "All" chip; a query
+// that matches no view lights nothing — "no filter" and "a filter I haven't saved"
+// are different states, and only the first of them is All.
+const ALL_VIEW = '__all__'; // the chip standing for the empty (unfiltered) query
+function viewIdForQuery(q) {
+  const s = normalizeQuery(q);
+  if (!s) return ALL_VIEW;
+  return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
+    || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
+    || null;
+}
+
 // The saved-views switcher — every chip is a query. "All" is the default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
+  const active = viewIdForQuery(S.search);
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
   const saved = S.views
     .map(
-      (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
     <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
@@ -2776,12 +2886,11 @@ function wireOrgControls() {
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      if (id === ALL_VIEW) { setQuery(''); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
-      if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
+      if (builtin) { setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
       if (!v) return;
-      S.activeView = id;
       setQuery(stringifyQuery(v.query || {}));
     }),
   );
@@ -2795,24 +2904,24 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        renderMain(); // the query stays in hand (and in the URL); only the chip is gone
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
-    search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+    search.addEventListener('input', (e) => { S.search = e.target.value; scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); setQuery(''); } });
   }
 
-  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
+  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
 }
 
 // Persist the current working query as a named view (Save-view button).
@@ -2827,8 +2936,7 @@ async function saveCurrentView() {
       body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
     });
     S.views.push(v);
-    S.activeView = v.id;
-    renderMain();
+    renderMain(); // the new chip lights up on its own — it is the query already in the box
     toast(`Saved view “${name}”`);
   } catch (err) { toast(err.message, true); }
 }
@@ -2941,7 +3049,6 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   const list = $('#pk-list', host);
   const close = () => host.remove();
   let q = '';
-  let activeView = null;
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → role→session (agent mode, fetched on expand)
@@ -2950,22 +3057,22 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   // View chips (All + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
   const paintControls = () => {
+    const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
-      `<div class="view-chip ${!activeView ? 'active' : ''}" data-pkview="__all__">≡ All</div>`,
+      `<div class="view-chip ${activeView === ALL_VIEW ? 'active' : ''}" data-pkview="${ALL_VIEW}">≡ All</div>`,
       ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
       ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
     ].join('');
     host.querySelectorAll('[data-pkview]').forEach((el) =>
       el.addEventListener('click', () => {
         const id = el.dataset.pkview;
-        activeView = id === '__all__' ? null : id;
         const bv = BUILTIN_VIEWS.find((x) => x.id === id);
         const sv = S.views.find((x) => x.id === id);
-        setQ(id === '__all__' ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
+        setQ(id === ALL_VIEW ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
       }),
     );
     $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
-    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => { activeView = null; setQ(nq); } });
+    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => setQ(nq) });
   };
 
   let deb = null;
@@ -3056,7 +3163,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     paintList();
   };
 
-  search.addEventListener('input', () => { activeView = null; setQ(search.value, true); });
+  search.addEventListener('input', () => setQ(search.value, true));
   search.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, navRows().length - 1); paintHi(); }
@@ -3724,7 +3831,7 @@ async function openTaskForm(workflow, draft, seedText) {
     const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
     if (row) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
-      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
   }
   // Image attachments for the full task form: pasting/dropping an image into any
@@ -4010,10 +4117,9 @@ async function openTaskForm(workflow, draft, seedText) {
 
 // ── task page ─────────────────────────────────────────────────────────────────
 // A task opens as a PAGE of its own (route /<org>/<project>/tasks/:num), rendered
-// into #main with four tabs — Overview (pipeline, review, widgets, sub-tasks,
-// notes), Check-in (agent conversations + the ephemeral terminal), Parameters
-// (priority/tags, workflow params, credentials) and Advanced (event log,
-// structured state). The workflow still owns everything shown — actions, stages,
+// into #main with tabs — Overview (pipeline, review, widgets, sub-tasks,
+// notes), Check-in (agent conversations + the ephemeral terminal) and Parameters
+// (priority/tags, workflow params, credentials). The workflow still owns everything shown — actions, stages,
 // params, widgets and transcripts all come off the declared view; the host only
 // lays them out. Declared actions (Confirm/Cancel/…) live in a footer bar that
 // stays visible on every tab.
@@ -4022,7 +4128,6 @@ const TASK_TABS = [
   { key: 'checkin', label: 'Check-in' },
   { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
-  { key: 'advanced', label: 'Advanced' },
 ];
 
 // The tab a task page opens on when the URL doesn't pin one: while the workflow
@@ -5399,7 +5504,7 @@ function checkinTab(v) {
           <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
-        ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
+        ${localWorldPath(v) ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
       </div>
     </div>
     <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
@@ -5420,8 +5525,8 @@ function conversationPane(v, t) {
   // sessions can't be forked from a terminal, so no command is shown. The session
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
   const sess = S.sessions && S.sessions[t.role];
-  const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
-  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && !S.meta?.hosted;
+  const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
     : remoteFork
@@ -5710,8 +5815,8 @@ function terminalPane(v) {
       <b>Ephemeral terminal</b>
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
-      ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
+      ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
@@ -5738,7 +5843,7 @@ function wireCheckinSidebar(v) {
 }
 
 async function openLocalCheckout(v) {
-  if (!S.meta?.hosted) return materializeLocalCheckout(v);
+  if (hostLocal()) return materializeLocalCheckout(v);
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
   catch (error) { return toast(error.message, true); }
@@ -6306,6 +6411,9 @@ function paramCurrentValue(f, v, rec) {
       return shared;
     }
   }
+  // The Review route belongs to the logical task: the intent's shared snapshot is
+  // the route actually in play, even when this attempt stored no override of its own.
+  if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
 function displayParam(f, val) {
@@ -6338,6 +6446,14 @@ function collectParamEdits(root, fields) {
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      // The Review route is sent whole (layers are atomic), not inherit-diffed —
+      // an in-flight edit is a concrete live value, not an overlay override.
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = { layers: readConfirmerLayers(box) };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -7905,15 +8021,15 @@ async function hydrateProjectData(proj) {
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Karmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
-      ${!S.meta?.hosted && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
-      ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>'}
+      ${hostLocal() && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
+      ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
-          ${S.meta?.hosted ? '' : '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>'}
+          ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
           <label class="form-row wide"><span>Or upload a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
@@ -8101,7 +8217,7 @@ async function hydrateProjectResources(proj) {
     const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
     box.innerHTML = `<div class="section-h">Attached resources</div>
       <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${S.meta?.hosted ? '' : '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>'}
+      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
       <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
         <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
           <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
@@ -8115,7 +8231,7 @@ async function hydrateProjectResources(proj) {
         <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
         <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
         <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${S.meta?.hosted ? '' : '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>'}
+        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
         <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
       </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
     const driverInput = $('#resource-driver');
@@ -8246,11 +8362,11 @@ async function hydrateProjectAccess(proj) {
       <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
     repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
+      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
       ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="project-authorize-github">Authorize repository creation</button>' : ''}</div>
+        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>
           ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
     $('#project-member-add')?.addEventListener('click', async () => {
       const entered = $('#project-member-principal')?.value.trim().toLowerCase();
@@ -8265,7 +8381,7 @@ async function hydrateProjectAccess(proj) {
     }));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
+    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
@@ -8436,10 +8552,54 @@ async function hydrateExecutionProviders(proj) {
 }
 
 // ── organization defaults (legacy APIs still call this global scope) ─────────
+/** The brand icon is instance-wide, like host capacity: it is the same mark for
+ * everyone, including on the sign-in screen before any organization is known. */
+function appearanceCard() {
+  return `<div class="card" id="appearance-card">
+      <div class="section-h">Icon <span class="chip">whole instance</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The mark in the top bar and on the sign-in screen, the browser favicon, and the installed app icon.</p>
+      <div class="brand-picker" id="brand-picker">
+        ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
+          <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
+        </button>`).join('')}
+      </div>
+    </div>`;
+}
+
+async function wireAppearanceCard() {
+  const picker = $('#brand-picker');
+  if (!picker) return;
+  const mark = (id) => picker.querySelectorAll('.brand-option').forEach((b) =>
+    b.setAttribute('aria-pressed', String(b.dataset.icon === id)));
+  let current = 'diamond';
+  // The mark is instance-wide, so only the operator (settings:*) may change it —
+  // below that the read fails and the card hides entirely, as outbound email does.
+  try { current = (await api('/api/settings/global/appearance')).icon || 'diamond'; }
+  catch { $('#appearance-card').style.display = 'none'; return; }
+  mark(current);
+  picker.querySelectorAll('.brand-option').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const icon = b.dataset.icon;
+      if (icon === current) return;
+      const previous = current;
+      current = icon;
+      mark(icon);
+      try {
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { icon } }) });
+        refreshBrandAssets();
+      } catch (e) {
+        current = previous;
+        mark(previous);
+        toast(e.message, true);
+      }
+    }));
+}
+
 function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
+    ${appearanceCard()}
     ${profilesCard('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
@@ -8825,49 +8985,71 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Payments — budget & cards</div>
-    ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
-      <div class="pay-stripe-platform" style="margin-bottom:10px"></div>
-      <div class="pay-providers-list">Loading…</div>
-      <div class="pay-balance" style="margin-top:8px"></div>
+    <div class="section-h">Payments</div>
+    <p class="task-sub" style="margin-top:0">Agents can make payments with a virtual card.</p>
+    <div class="cards-list" style="margin-bottom:10px"></div>
+    <div class="settings-grid">
+      <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
+      <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
+      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
+      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" placeholder="MM/YY" /></label>
+      <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
+      <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
+      <label class="form-row">City<input class="card-city" /></label>
+      <label class="form-row">Postal code<input class="card-postal" /></label>
+      <label class="form-row">Country<input class="card-country" placeholder="GB" maxlength="2" /></label>
+      <label class="form-row">Restrict to merchants<input class="card-merchants" placeholder="optional, comma-separated domains" /></label>
     </div>
-    <details class="pay-cardholder hidden" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Stripe cardholder — required before issuing a card</summary>
-      <p class="task-sub">This is Stripe’s compliance record for the real person or company legally authorized to use the card. It is not a Karmax user, a label, or a funding source. Use accurate identity and billing details; Stripe may require verification.</p>
-      <div class="settings-grid">
-        <label class="form-row">Cardholder type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
-        <label class="form-row">Name shown in Stripe<input class="holder-name" placeholder="Full legal or company name" /></label>
-        <label class="form-row">First name (individual)<input class="holder-first" /></label>
-        <label class="form-row">Last name (individual)<input class="holder-last" /></label>
-        <label class="form-row">Date of birth (individual)<input class="holder-dob" type="date" /></label>
-        <label class="form-row">Email<input class="holder-email" type="email" /></label>
-        <label class="form-row">Phone<input class="holder-phone" /></label>
-        <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
-        <label class="form-row">City<input class="holder-city" /></label>
-        <label class="form-row">State or region<input class="holder-state" /></label>
-        <label class="form-row">Postal code<input class="holder-postal" /></label>
-        <label class="form-row">Country code<input class="holder-country" placeholder="US" maxlength="2" /></label>
+    <button class="btn primary" data-addcard="${scope}">Add card</button>
+    <details class="pay-stripe" style="margin-top:16px">
+      <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
+      <p class="task-sub">For registered businesses. Lets Karmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
+      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
+      <div class="pay-providers-list"></div>
+      <div class="pay-balance" style="margin:8px 0"></div>
+      <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
+        <p class="task-sub">Stripe’s compliance record for the person or company legally authorized to use the card. Stripe may require verification.</p>
+        <div class="settings-grid">
+          <label class="form-row">Type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
+          <label class="form-row">Name<input class="holder-name" placeholder="Full legal or company name" /></label>
+          <label class="form-row">First name<input class="holder-first" /></label>
+          <label class="form-row">Last name<input class="holder-last" /></label>
+          <label class="form-row">Date of birth<input class="holder-dob" type="date" /></label>
+          <label class="form-row">Email<input class="holder-email" type="email" /></label>
+          <label class="form-row">Phone<input class="holder-phone" /></label>
+          <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
+          <label class="form-row">City<input class="holder-city" /></label>
+          <label class="form-row">State or region<input class="holder-state" /></label>
+          <label class="form-row">Postal code<input class="holder-postal" /></label>
+          <label class="form-row">Country<input class="holder-country" placeholder="US" maxlength="2" /></label>
+        </div>
+        <button class="btn sm" data-addholder>Create cardholder</button>
+      </details>` : '<p class="task-sub">Set up Stripe Issuing in organization settings.</p>'}
+      <div class="stripe-issue hidden" style="margin-top:10px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input class="sc-label" placeholder="Name" />
+          <input class="sc-cap" type="number" step="0.01" placeholder="cap USD" style="width:120px" />
+          <select class="card-cardholder"><option value="">Choose cardholder</option></select>
+          <button class="btn sm" data-issuecard="${scope}">Issue card</button>
+        </div>
       </div>
-      <button class="btn sm" data-addholder>Create required Stripe record</button>
-    </details>` : ''}
-    <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
-    <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
-    <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
-    <div class="section-h" style="margin-top:14px">Cards</div>
-    <div class="cards-list" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Add ${scope === 'global' ? 'an organization' : 'a project'} card</label>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <input class="card-label" placeholder="label (e.g. Ops)" />
-        <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
-        <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
-        <select class="card-provider"><option value="mock">Local test funds</option></select>
-        <select class="card-cardholder hidden"><option value="">Choose required Stripe cardholder</option></select>
-        <button class="btn" data-addcard="${scope}">Add card</button>
-      </div></div>
-    ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
-      <div class="section-h" style="margin-top:14px">Payment activity</div><div class="pay-transactions"></div>` : ''}
+    </details>
+    <div class="section-h" style="margin-top:16px">Spend limits</div>
+    <div class="settings-grid">
+      <label class="form-row">Allowance per task (USD)<input class="pay-allow" type="number" step="0.01" placeholder="unlimited" /></label>
+      <label class="form-row">Approval threshold (USD)<input class="pay-thresh" type="number" step="0.01" placeholder="never" /></label>
+    </div>
+    <button class="btn sm" data-savepolicy="${scope}">Save spend limits</button>
+    ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
+      <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
+}
+/** "MM/YY", "MM/YYYY", or "MMYY" → {expMonth, expYear}; null when unparseable. */
+function parseExpiry(raw) {
+  const m = String(raw || '').trim().match(/^(\d{1,2})\s*[/\-\s]?\s*(\d{2}|\d{4})$/);
+  if (!m) return null;
+  const year = Number(m[2]);
+  return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
 async function wirePaymentProviders(box, organizationId) {
@@ -8916,13 +9098,14 @@ async function wirePaymentProviders(box, organizationId) {
       } catch (e) { toast(e.message, true); }
     });
   }
-  list.innerHTML = data.providers.length
-    ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
-          <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
-        ${p.kind === 'oauth' && (p.connected || p.connectionStatus) ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('')
-    : '<span style="color:var(--ink-3)">No payment providers.</span>';
+  // Only OAuth rails need a connect surface; the vault-card rail needs nothing
+  // and the mock rail is a development fixture, not a user-facing choice.
+  const connectable = data.providers.filter((p) => p.kind === 'oauth');
+  list.innerHTML = connectable.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
+      <div style="flex:1">${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : '<span class="chip">not connected</span>'}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
+      ${p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
+      ${p.connected || p.connectionStatus ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('');
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
       const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
@@ -8940,11 +9123,13 @@ async function wirePaymentProviders(box, organizationId) {
       wirePaymentProviders(box, organizationId);
     } catch (e) { toast(e.message, true); }
   }));
-  if (organizationId && data.active) {
+  // Only a rail with a balance karmax can read has one worth showing.
+  const el = box.querySelector('.pay-balance');
+  if (el) el.innerHTML = '';
+  if (organizationId && connectable.some((p) => p.name === 'stripe' && p.connected)) {
     try {
-      const balance = await api(`${paymentsBase}/balance?provider=${encodeURIComponent(data.active)}`);
-      const el = box.querySelector('.pay-balance');
-      if (el) el.innerHTML = `<b>Available balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
+      const balance = await api(`${paymentsBase}/balance?provider=stripe`);
+      if (el) el.innerHTML = `<b>Issuing balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
     } catch {}
   }
   return data;
@@ -8963,20 +9148,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   else {
     try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
   }
-  const providerSelect = box.querySelector('.card-provider');
   const holderSelect = box.querySelector('.card-cardholder');
-  const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
-  const stripeConnected = usableProviders.some((p) => p.name === 'stripe');
+  const stripeConnected = (providerData?.providers || []).some((p) => p.name === 'stripe' && p.connected);
   box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
-  providerSelect.innerHTML = usableProviders.map((p) =>
-    `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  box.querySelector('.stripe-issue')?.classList.toggle('hidden', !stripeConnected);
   const loadCardholders = async () => {
-    const stripe = providerSelect.value === 'stripe';
-    holderSelect.classList.toggle('hidden', !stripe);
-    if (!stripe) return;
+    if (!stripeConnected || !holderSelect) return;
     try {
       const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose required Stripe cardholder</option>${holders.map((h) => {
+      holderSelect.innerHTML = `<option value="">Choose cardholder</option>${holders.map((h) => {
         const requirements = h.requirements?.past_due || [];
         const ready = h.status === 'active' && requirements.length === 0;
         return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
@@ -8985,7 +9165,6 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
       holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
     }
   };
-  providerSelect.addEventListener('change', loadCardholders);
   await loadCardholders();
   box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
     const dobValue = box.querySelector('.holder-dob').value;
@@ -9036,14 +9215,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
-      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="chip">${esc(c.provider)}</span> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope} · ${esc(c.id)}</span><div class="task-sub">${esc(c.status || 'active')} · available ${usd(c.available)} / cap ${usd(c.cap)}${c.merchantLock?.length ? ` · merchants ${c.merchantLock.map(esc).join(', ')}` : ''}</div></div>
-        ${c.provider === 'mock' && c.status !== 'canceled' ? `<input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button>` : ''}
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
+          <div class="task-sub">${usd(c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
+        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
-      : '<span style="color:var(--ink-3)">No cards.</span>';
+      : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
-      if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — Karmax only mirrors the figure.');
+      if (!amt || !Number(amt)) return;
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
     list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Revoke this card? This cannot be undone.')) return;
@@ -9055,23 +9235,48 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     }));
   };
   await renderCards();
-  box.querySelector(`[data-addcard]`).addEventListener('click', async () => {
-    const label = box.querySelector('.card-label').value.trim() || 'Card';
-    const cap = box.querySelector('.card-cap').value;
+  const field = (name) => box.querySelector(name).value.trim();
+  const addCard = (body) => api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
+    scope: scope === 'project' ? 'project' : 'organization',
+    projectId: scope === 'project' ? projectId : undefined,
+    ...body,
+  }) });
+  box.querySelector('[data-addcard]').addEventListener('click', async () => {
+    const expiry = parseExpiry(field('.card-expiry'));
+    if (!expiry) return toast('Expiry must look like MM/YY', true);
     try {
-      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
-        scope: scope === 'project' ? 'project' : 'organization',
-        projectId: scope === 'project' ? projectId : undefined,
-        label,
-        cap: Math.round(Number(cap || 0) * 100),
-        merchantLock: box.querySelector('.card-merchants').value.split(',').map((value) => value.trim()).filter(Boolean),
-        provider: providerSelect.value,
-        cardholderId: providerSelect.value === 'stripe' ? holderSelect.value : undefined,
-      }) });
-      box.querySelector('.card-label').value = '';
-      box.querySelector('.card-cap').value = '';
-      box.querySelector('.card-merchants').value = '';
+      await addCard({
+        provider: 'vault-card',
+        label: field('.card-label') || 'Card',
+        cap: Math.round(Number(field('.card-cap') || 0) * 100),
+        merchantLock: field('.card-merchants').split(',').map((value) => value.trim()).filter(Boolean),
+        details: {
+          number: field('.card-number'),
+          cvc: field('.card-cvc'),
+          ...expiry,
+          billing: { line1: field('.card-line1'), city: field('.card-city'),
+            postalCode: field('.card-postal'), country: field('.card-country') },
+        },
+      });
+      // Clear the secret half from the DOM as soon as it has been vaulted.
+      for (const name of ['.card-label', '.card-cap', '.card-merchants', '.card-number', '.card-expiry',
+        '.card-cvc', '.card-line1', '.card-city', '.card-postal', '.card-country'])
+        box.querySelector(name).value = '';
       toast('Card added');
+      renderCards();
+    } catch (e) { toast(e.message, true); }
+  });
+  box.querySelector('[data-issuecard]')?.addEventListener('click', async () => {
+    try {
+      await addCard({
+        provider: 'stripe',
+        label: field('.sc-label') || 'Card',
+        cap: Math.round(Number(field('.sc-cap') || 0) * 100),
+        cardholderId: holderSelect.value,
+      });
+      box.querySelector('.sc-label').value = '';
+      box.querySelector('.sc-cap').value = '';
+      toast('Card issued');
       renderCards();
     } catch (e) { toast(e.message, true); }
   });
@@ -9123,7 +9328,7 @@ function credentialRequestTaskLink(request) {
   const key = task.num != null ? task.num : task.id;
   const label = `${task.num != null ? `#${task.num} · ` : ''}${task.title}`;
   return project
-    ? `<a data-spa href="${projectRoute(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
+    ? `<a data-spa href="${projectBase(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
     : `<span>${esc(label)}</span>`;
 }
 
@@ -9179,6 +9384,27 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
       toast(error.message, true);
     }
   })));
+}
+
+/**
+ * Import a connector selection in batches, reporting progress as they land.
+ * Reading a secret out of a real store is expensive — a `pass` entry costs a
+ * GPG decrypt, and a whole tree takes minutes — so a single blocking request
+ * looks exactly like a dead button. Batching keeps the UI honest, commits what
+ * has been read so far, and lets the server skip entries that have not changed.
+ */
+async function importFromConnector(sync, externalIds, onProgress, batchSize = 25) {
+  const totals = { imported: 0, skipped: 0, failures: [], done: 0, total: externalIds.length };
+  for (let at = 0; at < externalIds.length; at += batchSize) {
+    onProgress?.(totals);
+    const result = await sync(externalIds.slice(at, at + batchSize));
+    totals.imported += result.count || 0;
+    totals.skipped += result.skipped || 0;
+    totals.failures.push(...(result.failures || []));
+    totals.done = Math.min(at + batchSize, externalIds.length);
+  }
+  onProgress?.(totals);
+  return totals;
 }
 
 function passwordsCard() {
@@ -9393,20 +9619,29 @@ async function wireVaultCards(organizationId) {
     overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
     tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
     tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
-    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+    const go = overlay.querySelector('[data-imp-go]');
+    go.addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
       if (!externalIds.length) { toast('Select at least one', true); return; }
+      const sync = (batch) => api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+        externalIds: batch,
+        policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+        ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+      }) });
+      go.disabled = true;
       try {
-        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
-          externalIds,
-          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
-          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
-        }) });
-        toast(`Imported ${r.count} item(s)`);
+        const r = await importFromConnector(sync, externalIds, (p) => {
+          go.textContent = `Importing ${p.done}/${p.total}…`;
+          countEl.textContent = `· ${p.imported} imported${p.skipped ? `, ${p.skipped} unchanged` : ''}`;
+        });
+        const summary = [`Imported ${r.imported} item(s)`, r.skipped ? `${r.skipped} already up to date` : '',
+          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : ''].filter(Boolean).join(' · ');
+        toast(summary, r.failures.length > 0);
         close();
         renderItems();
         renderConnectors();
       } catch (e) { toast(e.message, true); }
+      finally { go.disabled = false; go.textContent = 'Import'; }
     });
   };
   box.querySelector('.vi-add').addEventListener('click', async () => {
@@ -9828,6 +10063,7 @@ async function hydrateAuthorization(scope, projectId) {
 
 function wireGlobalSettings(organizationId) {
   hydratePhoneAccess();
+  wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
@@ -10005,7 +10241,7 @@ async function openInboxItem(item) {
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
-  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
+  return go(`${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user
@@ -10201,7 +10437,9 @@ async function hydrateOrganizationView() {
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
   if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
-  for (const card of [$('#main [data-wf="agent-queue"]'), $('#resilience-card')])
+  // Instance-wide cards render inside globalSettingsView but belong under
+  // Advanced, not among the task defaults. Moving the node keeps its listeners.
+  for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
@@ -10234,7 +10472,7 @@ async function hydrateOrganizationView() {
     <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Karmax refreshes repository access when you ask instead of using webhooks.'}</p>
-    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>` : `
+    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
     <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
@@ -10889,7 +11127,7 @@ function openGlobalSearch() {
       ...found.taskHits.map(({ project, task }) => {
         const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
         const number = task.num != null ? `#${task.num} · ` : '';
-        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
+        const href = `${projectBase(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,
@@ -11004,7 +11242,7 @@ function openHelp() {
 // ── login ────────────────────────────────────────────────────────────────────
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:18px"><span class="mark">◇</span> karmax</div>
+    <div class="brand" style="margin-bottom:18px">${brandMark()} karmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a karmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
@@ -11040,7 +11278,7 @@ function renderLogin() {
 // whether an address has an account.
 function renderForgotPassword() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Reset password</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Reset password</div>
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
     <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
     <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
@@ -11068,7 +11306,7 @@ function renderForgotPassword() {
 // password via Better Auth, then returns to sign in.
 function renderResetPassword(token) {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Choose a new password</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Choose a new password</div>
     ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
       : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
@@ -11101,7 +11339,7 @@ function renderResetPassword(token) {
 
 function renderSignup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Create account</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
     ${S.pendingInvite
       ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
       : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
@@ -11136,7 +11374,7 @@ function renderSignup() {
 
 function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Account created</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your account is active, but you don't have access to any project yet.</p>
     <p class="task-sub">Ask a karmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
@@ -11162,7 +11400,7 @@ function renderAccessPending() {
 
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Set up karmax</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up karmax</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>

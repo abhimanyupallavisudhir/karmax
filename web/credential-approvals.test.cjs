@@ -31,7 +31,7 @@ global.esc = (value) => String(value ?? '').replace(/[&<>"]/g, (char) => ({
 })[char]);
 global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
-global.projectRoute = () => '/personal/app';
+global.projectBase = () => '/personal/app';
 
 for (const name of ['credentialRequestTaskLink', 'credentialRequestRows', 'defaultTaskTab']) eval(extractFn(name));
 

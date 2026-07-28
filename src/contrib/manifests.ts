@@ -32,9 +32,15 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // list has the usual default-inheritance; an agent layer carries the same agent
 // knobs (provider/model/effort/fork) as the Do/Merge fields, PLUS the
 // review-request prompt template (pre-filled with `promptDefault`, editable per
-// task/project/global). Chosen at task creation (queue-time), like the other agent
-// selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+// task/project/global).
+// `untilUsed`: the route is consumed by the gate it drives, not by queueing — so
+// it stays editable in-flight right up to the moment Review passes (SPEC §4.5/§5.5).
+// That is exactly when re-routing is useful ("actually, have Bob look at this"),
+// and it also self-heals the race the old queue-time freeze only avoided: a task
+// reaching Review while someone is mid-edit now simply picks up the saved route.
+// The workflows re-read the layers at every gate iteration and replay the gate
+// from its first layer when the route changes under them.
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at

@@ -192,10 +192,13 @@ async function main() {
     store.setWorldState((store.currentWorld(handle.id) ?? handle) as import('./world/types.js').WorldHandle, 'degraded');
     return checkpoints.restore(checkpoint.id, handle.kind);
   });
-  const { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
+  const { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
+  // The universal rail: a card the human already holds, limit enforced by their
+  // own issuer. Registered before Stripe Issuing, which needs a business account.
+  paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
@@ -424,6 +427,7 @@ async function main() {
     resources,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
+    hostLocal: deployment.hostLocal,
     remoteAccess,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;

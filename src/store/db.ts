@@ -1898,14 +1898,23 @@ export class Store {
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }
 
-  setIntentConfirmer(intentId: string, field: string, confirmer: unknown) {
+  /**
+   * Write the shared Review route of a logical task. It is shared across attempts
+   * (activities/core.ts) — never per-attempt — so this is the only writer.
+   *
+   * The draft-only guard exists because the *task form* has no idea whether a live
+   * attempt's gate has already played. `inFlight` is the caller (KarmaxApi.updateParams)
+   * saying the live workflow itself accepted the edit, which means it authoritatively
+   * had not consumed the route yet: the route is `untilUsed`, not `queue` (SPEC §4.5/§5.5).
+   */
+  setIntentConfirmer(intentId: string, field: string, confirmer: unknown, opts?: { inFlight?: boolean }) {
     const attempts = this.attemptsOf(intentId);
     const group = this.attemptGroup(intentId);
-    if (attempts.some((a) => !a.params.draft)) {
+    if (!opts?.inFlight && attempts.some((a) => !a.params.draft)) {
       // Full-form replacement includes disabled controls too. Re-sending the
       // existing shared value is harmless; only an actual divergence is locked.
       if (JSON.stringify(group?.confirmer) === JSON.stringify(confirmer)) return;
-      throw new Error('the confirmer is shared and freezes when any attempt is queued');
+      throw new Error('the confirmer is shared; edit it on the task page while its Review gate is still open');
     }
     this.db.prepare('UPDATE task_intents SET confirmer=? WHERE id=?').run(JSON.stringify(confirmer), intentId);
     for (const a of attempts) this.updateTaskParams(a.id, { ...a.params, [field]: confirmer });

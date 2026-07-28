@@ -135,6 +135,17 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
     const auto = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers: [] } }, { taskId: 't2', projectId: 'p1', title: 'X', project: {} });
     expect(auto.confirm).toEqual({ layers: [] });
   });
+
+  // The Review route is consumed by the gate it drives, not by queueing (SPEC §4.5/§5.5).
+  // Its window has to reach the workflow, or the update validator has nothing to enforce.
+  it('carries the Review route as an `untilUsed` window, on every workflow that has one', () => {
+    const input = assembleTaskInput(sd, { prompt: 'build X' }, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    expect(input.paramWindows?.confirm).toBe('untilUsed');
+    for (const name of ['software-dev', 'just-do', 'goal', 'merge-only']) {
+      const field = manifest(name)!.params.find((f) => f.type === 'confirmer')!;
+      expect([name, field.mutable]).toEqual([name, 'untilUsed']);
+    }
+  });
 });
 
 describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
