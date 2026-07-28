@@ -176,7 +176,13 @@ describe.skipIf(!canSwitch)('LIVE Claude — resume conversation under a SWITCHE
 describe.skipIf(!claudeSub)('LIVE Claude — native fork of a prior session (SPEC §10.5)', () => {
   it('branches a NEW session that RECALLS the source conversation (not prompt-stuffing)', async () => {
     const a = new ClaudeAdapter();
-    const home = path.join(os.homedir(), '.claude'); // ambient login home
+    // Resolve the ambient login home the same way the adapter does
+    // (src/agent/claude.ts). Hard-coding ~/.claude broke whenever the suite runs
+    // with CLAUDE_CONFIG_DIR set — notably when karmax is developing itself
+    // inside a karmax task, where the turn writes its session into the config
+    // home while the fork was materialized into ~/.claude, so the SDK reported
+    // "No conversation found with session ID".
+    const home = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
     const codeword = 'ZQX' + Math.random().toString(36).slice(2, 8).toUpperCase();
     // Turn 1 (source) in world A: plant the codeword; capture the session id.
     const worldA = await makeWorld();
