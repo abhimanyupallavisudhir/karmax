@@ -553,7 +553,7 @@ async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBi
               ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 60_000,
           })
         : dependencyInstall;
-      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Karmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
+      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Krmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
     }
     await world.writeFile(marker, JSON.stringify({ chromium, playwright: PLAYWRIGHT_VERSION }));
   }

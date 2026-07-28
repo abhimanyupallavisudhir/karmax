@@ -285,7 +285,7 @@ export class KarmaxApi {
       `[Collaboration request ${request.id}]`,
       input.message?.trim() || `Task ${requester.num ? `#${requester.num}` : requester.id} needs your current branch.`,
       'Continue your work as needed, then commit all intended changes and call publish_task_branch.',
-      'Karmax will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.',
+      'Krmax will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.',
     ].join('\n\n');
     try {
       await this.deliverWorkflowMessage(target.id, instruction, input.role ?? 'do');
@@ -2080,7 +2080,7 @@ export class KarmaxApi {
     messages.push({
       id: `recovery-${Date.now()}`,
       role: 'user',
-      text: `Karmax recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
+      text: `Krmax recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
       ts: messages.length,
     });
     const session = this.deps.store.kvGet(`session:${taskId}:do`) || undefined;

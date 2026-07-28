@@ -389,7 +389,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     onActivate: {
       spawnTask: {
         workflow: 'goal',
-        title: 'Make this project karmax-ready',
+        title: 'Make this project krmax-ready',
         prompt:
           'Ensure git is initialized in each repo. For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them. Report what you changed.',
       },

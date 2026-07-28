@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { paths } from '../config/paths.js';
 
 /**
  * Fork a prior agent's session (SPEC §10.5) — branch a NEW conversation from the
@@ -52,7 +53,7 @@ function claudeHomeCandidates(srcHome?: string, forkHome?: string): string[] {
   const add = (h?: string) => { if (h && !homes.includes(h)) homes.push(h); };
   add(srcHome);
   add(forkHome); // the destination home — so an already-in-place session resolves too
-  const base = path.join(os.homedir(), '.karmax', 'config-homes');
+  const base = paths().configHomes;
   try { for (const d of fs.readdirSync(base)) add(path.join(base, d)); } catch { /* none */ }
   add(path.join(os.homedir(), '.claude')); // ambient login
   return homes;
@@ -89,7 +90,7 @@ function codexHomeCandidates(srcHome?: string): string[] {
   const homes: string[] = [];
   const add = (h?: string) => { if (h && !homes.includes(h)) homes.push(h); };
   add(srcHome);
-  const base = path.join(os.homedir(), '.karmax', 'config-homes');
+  const base = paths().configHomes;
   try { for (const d of fs.readdirSync(base)) add(path.join(base, d)); } catch { /* none */ }
   add(path.join(os.homedir(), '.codex')); // ambient login
   return homes;
