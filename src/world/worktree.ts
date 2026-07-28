@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
 import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } from './git.js';
+import { withWorktreeLock } from './worktree-lock.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
@@ -119,19 +120,24 @@ export class WorktreeProvider implements WorldProvider {
       warnings?.push(`repo "${name}": base branch "${spec.base}" not found — forked off HEAD instead`);
     }
 
-    // Clean any stale worktree at this path.
-    if (fs.existsSync(wt)) {
-      await git(repo, ['worktree', 'remove', '--force', wt]);
-      fs.rmSync(wt, { recursive: true, force: true });
-    }
-    await git(repo, ['worktree', 'prune']);
-    if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
-    // Reuse the branch if it already exists, else create it.
-    const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
-    const addArgs = branchExists
-      ? ['worktree', 'add', wt, branch]
-      : ['worktree', 'add', '-b', branch, wt, baseRef];
-    await gitOrThrow(repo, addArgs);
+    // Clean any stale worktree at this path, then claim a fresh one. The prune
+    // and the add share one critical section: the prune frees admin-dir names
+    // and the add takes the lowest free one, so anything else adding/removing a
+    // worktree of this repo in between could be handed — or delete — ours.
+    await withWorktreeLock(repo, async () => {
+      if (fs.existsSync(wt)) {
+        await git(repo, ['worktree', 'remove', '--force', wt]);
+        fs.rmSync(wt, { recursive: true, force: true });
+      }
+      await git(repo, ['worktree', 'prune']);
+      if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
+      // Reuse the branch if it already exists, else create it.
+      const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
+      const addArgs = branchExists
+        ? ['worktree', 'add', wt, branch]
+        : ['worktree', 'add', '-b', branch, wt, baseRef];
+      await gitOrThrow(repo, addArgs);
+    });
     await this.applyIdentity(wt, spec.gitIdentity);
 
     // Make the checkout runnable: a git worktree does NOT inherit the origin
@@ -384,8 +390,10 @@ class WorktreeWorld implements World {
   async destroy(): Promise<void> {
     const repos = worldRepos(this.handle);
     for (const r of repos) {
-      await git(r.repo, ['worktree', 'remove', '--force', r.root]);
-      await git(r.repo, ['worktree', 'prune']);
+      await withWorktreeLock(r.repo, async () => {
+        await git(r.repo, ['worktree', 'remove', '--force', r.root]);
+        await git(r.repo, ['worktree', 'prune']);
+      });
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }

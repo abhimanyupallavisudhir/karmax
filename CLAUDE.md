@@ -30,7 +30,7 @@ npm run reset                                 # wipe Temporal durable state + ka
 
 Integration test files each boot a **real** Temporal dev server + Worker (via `tests/helpers/harness.ts` — real Temporal, real git, mock agent). `vitest.config.ts` forces sequential single-process execution (`singleFork`, `fileParallelism: false`, `maxConcurrency: 1`) and the Worker is resource-capped in `src/temporal/worker.ts`. **Do not re-enable parallelism** — several concurrent Temporal servers + workers can exhaust RAM and freeze the machine.
 
-- Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
+- Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `worktree-lock`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
 - Heavy files (boot a Temporal server, one at a time): `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
 - `tests/live-agent.test.ts` runs only with a real API key and spends real tokens; force-skip with `KARMAX_SKIP_LIVE=1`.
 - `tests/cloud-live.test.ts` runs only with `E2B_API_KEY` / `DAYTONA_API_KEY` and spends real provider credit (one tiny sandbox each); force-skip with `KARMAX_SKIP_LIVE=1`.
