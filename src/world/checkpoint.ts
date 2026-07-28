@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
+import { Context as activityContext } from '@temporalio/activity';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { WorldCheckpoint, WorldHandleRef } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -19,6 +20,35 @@ export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
 interface DeltaFile { repo: string; path: string; deleted?: boolean; data?: string }
 interface PortableDelta { version: 1; files: DeltaFile[] }
+
+/** How a restoring activity keeps its runner-lease wait alive and cancellable. */
+export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void }
+
+/**
+ * `restore` is only ever reached from inside an activity (the openWorld recovery
+ * path, the registry recovery handler installed in main.ts, the hibernation wake),
+ * so it resolves the runner-lease wait's signal/heartbeat from the **ambient**
+ * activity context it already runs in. Outside an activity (tests, CLI)
+ * `Context.current()` throws and we simply get no hooks — as before.
+ *
+ * Callers may override via `RestoreOptions`, but `recoverVanishedWorld`
+ * deliberately does NOT thread its activity's signal in explicitly. Doing that
+ * made `tests/pipeline.test.ts`'s parent/child cancellation test fail ~2 runs in
+ * 3: the child was terminated "by parent close policy" instead of winding down as
+ * `cancelled`. Recovery runs on teardown paths where that signal is *already
+ * aborted*, and feeding an aborted signal into cleanup changes shutdown ordering.
+ * The ambient lookup reaches the same context without that hazard — prefer it.
+ * The parameter exists for tests and for any caller with a genuinely different
+ * lifetime; measure before adding another explicit call site.
+ */
+function ambientActivityHooks(): RestoreOptions {
+  try {
+    const ctx = activityContext.current();
+    return { signal: ctx.cancellationSignal, heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) };
+  } catch {
+    return {};
+  }
+}
 
 /** Provider-independent disaster-recovery layer. Provider snapshots remain the
  * fast path; this encrypted delta plus the broker-pushed branch is portable. */
@@ -100,7 +130,7 @@ export class WorldCheckpointService {
     return checkpoint;
   }
 
-  async restore(checkpointId: string, provider?: WorldKind): Promise<WorldHandle> {
+  async restore(checkpointId: string, provider?: WorldKind, options?: RestoreOptions): Promise<WorldHandle> {
     const checkpoint = this.store.getWorldCheckpoint(checkpointId);
     if (!checkpoint?.filesystemDelta) throw new Error('checkpoint has no portable filesystem delta');
     const project = this.store.getProject(checkpoint.projectId);
@@ -134,10 +164,18 @@ export class WorldCheckpointService {
     // provider-billed sandbox was invisible to karmax and its capacity was never
     // returned. Local providers are unmetered and take no lease, matching
     // createWorld's `remote &&` guard.
+    //
+    // The lease acquisition polls until the pool has room, so it MUST carry the
+    // caller's cancellation signal and heartbeat, exactly as the two call sites in
+    // activities/core.ts do. Without the heartbeat a saturated pool blocks past the
+    // activity heartbeat timeout; without the signal the killed activity strands a
+    // `queued` lease row that nothing ever releases, permanently eating capacity.
     const remote = this.worlds.get(selected).capabilities?.remote === true;
+    const hooks = options ?? ambientActivityHooks();
     const acquired = remote
       ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
-        provider: selected, priority: Number(this.store.getTask(checkpoint.worldId)?.params.priority ?? 0) })
+        provider: selected, priority: Number(this.store.getTask(checkpoint.worldId)?.params.priority ?? 0),
+        signal: hooks.signal, heartbeat: hooks.heartbeat })
       : undefined;
     let world: World;
     try {

@@ -41,13 +41,48 @@ import { SDK_CONTROL_TOOL_SCHEMAS, type ToolSchema } from './tools.js';
  * rails use, so behaviour is identical across providers by construction — there
  * is no second implementation to drift.
  *
- * Security posture: these tools carry **no durable authority and no credential**
- * — they can only mutate the current turn's result — so the transport
- * deliberately carries no scoped token (unlike the `karmax` stdio MCP, which
- * needs `KARMAX_TOKEN`). What it must guarantee instead is that it does not
- * outlive the turn: the socket lives in a 0700 temp directory under an
- * unguessable name, is chmod 0600, and `close()` destroys every connection and
- * removes the directory in the adapter's `finally`.
+ * Security posture: this socket is authenticated, and it has to be.
+ *
+ * An earlier version of this comment claimed these tools "carry no durable
+ * authority and no credential — they can only mutate the current turn's result"
+ * and used that to justify carrying no token at all. That was wrong, and it is
+ * why the hole below existed. Read `SDK_CONTROL_TOOL_NAMES` in `tools.ts`: at
+ * least three of the ten reach well past this turn's result —
+ *
+ *   · `request_spend`      allocates real budget against the account,
+ *   · `fill_payment_card`  types a real card PAN/CVC into a browser over CDP,
+ *   · `create_sub_task`    creates a durable task on the list.
+ *
+ * Nor do the file permissions isolate anything that matters. The socket sits in
+ * a 0700 `mkdtemp` directory and is chmod 0600, which excludes other **unix
+ * users** — but every karmax agent runs as the SAME uid on the host (worktree
+ * and container worlds both spawn the `codex exec`/ACP harness host-side). So
+ * agent A's ordinary `bash` tool can list `/tmp`, glob `kx-ctl-*`, connect to
+ * agent B's live bridge and speak this NDJSON protocol at it — driving B's
+ * `confirm_decision`, `request_spend` or `fill_payment_card`. Mode bits are not
+ * a boundary between peers who share a uid.
+ *
+ * What makes this a genuinely per-turn PRIVATE channel is the token: 32 random
+ * bytes minted when the bridge starts, handed to the child alongside the socket
+ * path (`KARMAX_CONTROL_TOKEN`, same env channel as `KARMAX_CONTROL_SOCKET`) and
+ * required on EVERY frame — `list` as much as `call`, so an unauthorized peer
+ * cannot even enumerate the tool surface. The comparison is constant-time with a
+ * length guard, and a rejection never echoes the expected value. Knowing the
+ * socket path is therefore not enough; you must have been given the token, and
+ * only the harness this turn spawned was.
+ *
+ * The lifetime guarantee still holds on top of that: `close()` destroys every
+ * connection and removes the directory in the adapter's `finally`, so the token
+ * and its listener both die with the turn.
+ *
+ * What this does NOT claim (the previous comment's mistake was overclaiming):
+ * the token rides the child's environment, and a same-uid peer can read
+ * `/proc/<pid>/environ` of a running harness. Same-uid is not a security
+ * boundary in the kernel's eyes, and the honest fix for that is per-agent uids
+ * or a real sandbox. The token closes the *enumerable* hole — an idle
+ * `ls /tmp` + connect is no longer enough — which is the difference between a
+ * one-line attack any agent can stumble into and one that requires targeting a
+ * specific live pid.
  *
  * Windows has no unix-domain sockets in the POSIX sense, so `available()` is
  * false there and those two rails behave as before. karmax is not supported on
@@ -56,6 +91,10 @@ import { SDK_CONTROL_TOOL_SCHEMAS, type ToolSchema } from './tools.js';
  */
 
 export const CONTROL_SOCKET_ENV = 'KARMAX_CONTROL_SOCKET';
+/** Sibling of `CONTROL_SOCKET_ENV`: the per-turn bearer token every frame needs.
+ *  Travels the same env channel, so any rail that already plumbs the socket path
+ *  plumbs this too. */
+export const CONTROL_TOKEN_ENV = 'KARMAX_CONTROL_TOKEN';
 /** The MCP server name the harness sees. Deliberately distinct from `karmax`
  *  (the durable gateway bridge) — a shared name let the two shadow each other. */
 export const CONTROL_SERVER_NAME = 'karmax_control';
@@ -63,6 +102,9 @@ export const CONTROL_SERVER_NAME = 'karmax_control';
 export interface ControlBridge {
   /** Path to pass to the child as `KARMAX_CONTROL_SOCKET`. */
   socketPath: string;
+  /** Per-turn secret to pass as `KARMAX_CONTROL_TOKEN`. Required on every frame;
+   *  the socket path alone authorizes nothing. */
+  token: string;
   /** Absolute path of the stdio MCP entrypoint the child should run under node. */
   entry: string;
   /** The tools actually served (schemas whose handler exists in this turn). */
@@ -100,7 +142,7 @@ export function controlMcpServerSpec(bridge: ControlBridge): { command: string; 
   return {
     command: process.execPath,
     args: [bridge.entry],
-    env: { [CONTROL_SOCKET_ENV]: bridge.socketPath },
+    env: { [CONTROL_SOCKET_ENV]: bridge.socketPath, [CONTROL_TOKEN_ENV]: bridge.token },
   };
 }
 
@@ -126,6 +168,9 @@ export async function startControlBridge(
     /* best effort */
   }
   const socketPath = path.join(dir, `${crypto.randomBytes(4).toString('hex')}.sock`);
+  // The actual access control (see the header). Same-uid peers can reach the
+  // socket; only the child we hand this to can use it.
+  const token = crypto.randomBytes(32).toString('hex');
 
   const sockets = new Set<net.Socket>();
   const server = net.createServer((socket) => {
@@ -139,7 +184,7 @@ export async function startControlBridge(
       while ((index = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, index);
         buffer = buffer.slice(index + 1);
-        void handleLine(line, socket, handlers, available);
+        void handleLine(line, socket, handlers, available, token);
       }
     });
   });
@@ -158,6 +203,7 @@ export async function startControlBridge(
   let closed = false;
   return {
     socketPath,
+    token,
     entry: controlMcpEntry(),
     tools: available,
     close() {
@@ -173,11 +219,24 @@ export async function startControlBridge(
   };
 }
 
+/** Constant-time bearer check. Length is compared first because
+ *  `timingSafeEqual` throws on a length mismatch — and an unequal length is
+ *  already public information (the token's length is fixed), so leaking it costs
+ *  nothing while a byte-by-byte `===` would leak the prefix. */
+function tokenMatches(presented: unknown, expected: string): boolean {
+  if (typeof presented !== 'string') return false;
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 async function handleLine(
   line: string,
   socket: net.Socket,
   handlers: Record<string, (args: any) => Promise<string>>,
   schemas: ToolSchema[],
+  token: string,
 ): Promise<void> {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -191,6 +250,15 @@ async function handleLine(
     try { socket.write(`${JSON.stringify({ id: request?.id, ...body })}\n`); }
     catch { /* the child went away mid-turn */ }
   };
+  // Authenticate BEFORE looking at `op`: an unauthorized peer must not be able to
+  // enumerate the tool surface with `list` either. The error names no expected
+  // value and does not distinguish "absent" from "wrong", and the connection is
+  // dropped so a peer cannot sit on the socket grinding guesses.
+  if (!tokenMatches(request?.token, token)) {
+    reply({ ok: false, error: 'unauthorized: this control socket is private to one turn' });
+    socket.end();
+    return;
+  }
   if (request?.op === 'list') {
     reply({ ok: true, tools: schemas });
     return;

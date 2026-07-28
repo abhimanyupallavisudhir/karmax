@@ -461,6 +461,41 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(started).toHaveLength(0); // arming does NOT start the workflow
   });
 
+  /**
+   * Pausing is not missing. `cancelTrigger` stripped `triggerState` but kept
+   * `triggerLastFiredAt`, so a cron task paused for days and then re-queued
+   * looked to `catchUpCron` like one that had slept through an occurrence — and
+   * fired a spurious run the moment it was re-queued. A task deliberately not
+   * armed has nothing to catch up on.
+   */
+  it('re-queuing a paused cron task does not fire a catch-up run', async () => {
+    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
+    const tokens = new TokenAuthority();
+    const token = tokens.mintPrincipal('u', ['*']).token;
+    const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
+    api.setTriggerArmer({ arm: () => {}, disarm: () => {} });
+
+    const t = await api.createTask(token, { projectId, workflow: 'just-do',
+      params: { prompt: 'p', triggers: [{ kind: 'schedule', cron: '0 9 * * *' }] } });
+    // It has fired before, a week ago — the mark a real armed cron carries.
+    store.updateTaskParams(t.id, {
+      ...store.getTask(t.id)!.params, triggerLastFiredAt: Date.parse('2026-01-01T09:00:00Z'),
+    });
+
+    await api.cancelTrigger(token, t.id); // pause it
+    // The stale mark must not survive the pause, or the re-queue below catches up.
+    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBeUndefined();
+
+    await api.queueTask(token, t.id); // re-queue, days later
+    const fired: [string, string][] = [];
+    const s = new TriggerScheduler({ store, bus, fire: async (id, mode) => void fired.push([id, mode]),
+      now: () => Date.parse('2026-01-08T10:00:00Z'), setTimer: clock.set, clearTimer: clock.clear });
+    s.start();
+    expect(fired).toHaveLength(0); // no phantom run for the week it was paused
+    s.stop();
+  });
+
   it('rejects an invalid trigger graph BEFORE marking the task armed', async () => {
     store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
     const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;

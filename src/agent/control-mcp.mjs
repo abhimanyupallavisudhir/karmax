@@ -25,8 +25,11 @@
  *     `-32000 ConnectionClosed` (the same lesson as `src/mcp/stdio.ts`). If the
  *     socket is unreachable the handshake still completes and individual calls
  *     return a clear error.
- *   · No credential is carried: these tools have no durable authority, so unlike
- *     the gateway-backed `karmax` MCP there is no token to forward.
+ *   · A credential IS carried. `KARMAX_CONTROL_TOKEN` is the per-turn secret the
+ *     activity minted next to the socket path, and it goes on every frame. The
+ *     socket is same-uid reachable by any other agent on this host, and these
+ *     tools are not harmless (`request_spend`, `fill_payment_card`,
+ *     `create_sub_task`) — see the security section of `control-bridge.ts`.
  */
 import net from 'node:net';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -34,12 +37,17 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const SOCKET = process.env.KARMAX_CONTROL_SOCKET;
+const TOKEN = process.env.KARMAX_CONTROL_TOKEN;
 
 /** NDJSON request/response client over the activity's unix socket. */
 function connect() {
   return new Promise((resolve, reject) => {
     if (!SOCKET) {
       reject(new Error('KARMAX_CONTROL_SOCKET is not set — karmax did not spawn this bridge'));
+      return;
+    }
+    if (!TOKEN) {
+      reject(new Error('KARMAX_CONTROL_TOKEN is not set — karmax did not spawn this bridge'));
       return;
     }
     const pending = new Map();
@@ -58,7 +66,9 @@ function connect() {
         const id = nextId++;
         return new Promise((res, rej) => {
           pending.set(id, { resolve: res, reject: rej });
-          socket.write(`${JSON.stringify({ id, ...body })}\n`);
+          // Every frame is authenticated, `list` included — the parent refuses
+          // (and hangs up on) anything else.
+          socket.write(`${JSON.stringify({ id, token: TOKEN, ...body })}\n`);
         });
       },
     };

@@ -80,7 +80,12 @@ export async function createBackup(options: {
   // install; refuse to *produce* a torn snapshot for the same reason.
   const live = scanInstances(path.join(p.state, 'instances'), process.pid);
   if (live.length && !options.allowRunning)
-    throw new Error(`stop karmax before taking a backup, or pass allowRunning (live app pids: ${live.join(', ')})`);
+    // Name a remedy the operator can actually carry out. "pass allowRunning"
+    // described an API option that the `npm run backup` CLI had no flag for, so
+    // the only way out of this error did not exist from where they were standing.
+    throw new Error(`stop Krmax before taking a backup (live app pids: ${live.join(', ')}), `
+      + 'or re-run with `npm run backup -- --allow-running` to accept a snapshot '
+      + 'that is not point-in-time consistent');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const destination = path.resolve(options.destination ?? path.join(p.backups, `${stamp}-${crypto.randomBytes(3).toString('hex')}`));
   if (destination === home || isInside(destination, path.join(home, 'worlds')))
@@ -168,6 +173,10 @@ export async function restoreBackup(source: string, options: { home?: string; al
   const p = paths(home);
   const running = scanInstances(path.join(p.state, 'instances'), process.pid);
   if (running.length && !options.allowRunning)
+    // No `--allow-running` escape offered here on purpose: restoring swaps state
+    // components under a live process, which corrupts rather than merely tears.
+    // "Krmax" not "karmax": this is operator-facing output, which carries the
+    // brand (see the naming note in the SPEC, and tests/brand.test.ts).
     throw new Error(`stop Krmax before restore (live app pids: ${running.join(', ')})`);
   if (manifest.temporal === 'embedded') await stopEmbeddedTemporal(p.temporal);
 

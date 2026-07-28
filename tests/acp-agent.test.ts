@@ -193,7 +193,12 @@ describe('generic ACP agent adapter', () => {
     const control = created.params.mcpServers.find((s: any) => s.name === 'karmax_control');
     expect(control.command).toBe(process.execPath);
     expect(control.args[0]).toMatch(/control-mcp\.mjs$/);
-    expect(control.env).toEqual([{ name: 'KARMAX_CONTROL_SOCKET', value: expect.stringMatching(/\.sock$/) }]);
+    // The socket path is NOT the credential: same-uid peers can reach it, so the
+    // per-turn token must be plumbed here too (control-bridge.ts security notes).
+    expect(control.env).toEqual([
+      { name: 'KARMAX_CONTROL_SOCKET', value: expect.stringMatching(/\.sock$/) },
+      { name: 'KARMAX_CONTROL_TOKEN', value: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    ]);
     // The socket must not outlive the turn it mutates.
     expect(fs.existsSync(control.env[0].value)).toBe(false);
     expect(prompted.params.prompt.filter((block: any) => block.type === 'image')).toHaveLength(1);

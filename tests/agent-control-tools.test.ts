@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
@@ -9,6 +10,7 @@ import { MESSAGES_API_TOOLS, buildSdkTools } from '../src/agent/claude.js';
 import { CodexAdapter, RESPONSES_API_TOOLS, codexDynamicTools, ensureLocalCodexSessionTools } from '../src/agent/codex.js';
 import {
   CONTROL_SERVER_NAME,
+  CONTROL_TOKEN_ENV,
   controlMcpServerSpec,
   startControlBridge,
   type ControlBridge,
@@ -161,6 +163,174 @@ describe('control bridge (codex exec / ACP transport)', () => {
 });
 
 /**
+ * The bridge socket is NOT isolation between agents.
+ *
+ * Every karmax agent's harness (`codex exec`, ACP) is spawned host-side by the same
+ * uid, so the 0700 temp dir and 0600 socket exclude other unix *users* and nobody
+ * else. Agent A's ordinary `bash` tool can list `os.tmpdir()`, find agent B's live
+ * `kx-ctl-*` socket and speak the NDJSON protocol at it. Three of the ten control
+ * tools reach past this turn — `request_spend` allocates budget, `fill_payment_card`
+ * types a real PAN/CVC over CDP, `create_sub_task` creates a durable task — so an
+ * unauthenticated socket is a cross-agent hijack of B's turn, not a cosmetic gap.
+ * The per-turn token is what makes it a private channel.
+ */
+describe('control bridge rejects a second agent on the same host', () => {
+  const bridges: ControlBridge[] = [];
+  afterEach(() => {
+    for (const bridge of bridges.splice(0)) bridge.close();
+  });
+
+  /** A hostile client: raw NDJSON straight at the socket, no child MCP involved. */
+  function attacker(socketPath: string) {
+    const socket = net.createConnection(socketPath);
+    socket.setEncoding('utf8');
+    const lines: string[] = [];
+    const waiters: ((line: string) => void)[] = [];
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      let index: number;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (!line) continue;
+        const waiter = waiters.shift();
+        if (waiter) waiter(line);
+        else lines.push(line);
+      }
+    });
+    const ready = new Promise<void>((resolve, reject) => {
+      socket.once('connect', () => resolve());
+      socket.once('error', reject);
+    });
+    return {
+      ready,
+      close: () => socket.destroy(),
+      async send(frame: Record<string, unknown>): Promise<any> {
+        await ready;
+        const reply = new Promise<string>((resolve, reject) => {
+          const buffered = lines.shift();
+          if (buffered) { resolve(buffered); return; }
+          waiters.push(resolve);
+          // The bridge may also answer an unauthorized frame by hanging up; a
+          // dropped connection is a refusal too, not a test hang.
+          socket.once('close', () => reject(new Error('closed')));
+          setTimeout(() => reject(new Error('timeout')), 5_000).unref();
+        });
+        socket.write(`${JSON.stringify(frame)}\n`);
+        return JSON.parse(await reply.catch(() => '{"ok":false,"error":"connection dropped"}'));
+      },
+    };
+  }
+
+  async function victimTurn(): Promise<{ bridge: ControlBridge; recorded: any }> {
+    const recorded: any = {};
+    const bridge = (await startControlBridge(platformToolHandlers({} as any, {
+      confirmDecision: (d: any) => { recorded.confirm = d; },
+      emit() {}, emitActivity() {},
+    } as any)))!;
+    bridges.push(bridge);
+    return { bridge, recorded };
+  }
+
+  it('the premise: another same-uid process can find and open the socket', async () => {
+    const { bridge } = await victimTurn();
+    // This is the enumeration agent A's bash tool would do.
+    const found = fs.readdirSync(os.tmpdir())
+      .filter((entry) => entry.startsWith('kx-ctl-'))
+      .flatMap((entry) => {
+        const dir = path.join(os.tmpdir(), entry);
+        try { return fs.readdirSync(dir).map((f) => path.join(dir, f)); } catch { return []; }
+      });
+    expect(found).toContain(bridge.socketPath);
+    const client = attacker(bridge.socketPath);
+    await expect(client.ready).resolves.toBeUndefined();
+    client.close();
+  });
+
+  it('refuses a call with no token, and the victim turn is not mutated', async () => {
+    const { bridge, recorded } = await victimTurn();
+    const client = attacker(bridge.socketPath);
+    try {
+      const reply = await client.send({ id: 1, op: 'call', name: 'confirm_decision', args: { action: 'confirm' } });
+      expect(reply.ok).not.toBe(true);
+      expect(String(reply.error)).toMatch(/unauthorized/i);
+      expect(recorded.confirm).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  });
+
+  it('refuses `list` with no token — the tool surface is not even enumerable', async () => {
+    const { bridge } = await victimTurn();
+    const client = attacker(bridge.socketPath);
+    try {
+      const reply = await client.send({ id: 1, op: 'list' });
+      expect(reply.ok).not.toBe(true);
+      expect(reply.tools).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  });
+
+  it('refuses a wrong token without leaking the expected one', async () => {
+    const { bridge, recorded } = await victimTurn();
+    const client = attacker(bridge.socketPath);
+    try {
+      const guess = 'a'.repeat(bridge.token.length); // same length: no length oracle
+      const reply = await client.send({ id: 1, token: guess, op: 'call', name: 'confirm_decision', args: { action: 'confirm' } });
+      expect(reply.ok).not.toBe(true);
+      expect(JSON.stringify(reply)).not.toContain(bridge.token);
+      expect(recorded.confirm).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  });
+
+  it('refuses the real child MCP when it is pointed at a socket it has no token for', async () => {
+    const { bridge, recorded } = await victimTurn();
+    const spec = controlMcpServerSpec(bridge);
+    // Exactly what agent A can do: run karmax's own child script against B's socket.
+    // A knows the path (it enumerated /tmp) but not B's per-turn token.
+    const stolen = { ...spec.env };
+    delete stolen[CONTROL_TOKEN_ENV];
+    const client = new Client({ name: 'attacker', version: '1.0.0' });
+    await client.connect(new StdioClientTransport({ command: spec.command, args: spec.args, env: stolen }));
+    try {
+      expect((await client.listTools()).tools).toEqual([]);
+      const hijack: any = await client.callTool({ name: 'confirm_decision', arguments: { action: 'confirm' } });
+      expect(hijack.isError).toBe(true);
+      expect(recorded.confirm).toBeUndefined();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('the legitimate child — same socket, with the token — still works end to end', async () => {
+    const { bridge, recorded } = await victimTurn();
+    const spec = controlMcpServerSpec(bridge);
+    expect(spec.env[CONTROL_TOKEN_ENV]).toBe(bridge.token);
+    expect(bridge.token).toMatch(/^[0-9a-f]{64}$/); // 32 unguessable bytes
+    const client = new Client({ name: 'test', version: '1.0.0' });
+    await client.connect(new StdioClientTransport({ command: spec.command, args: spec.args, env: { ...spec.env } }));
+    try {
+      expect((await client.listTools()).tools.map((t) => t.name)).toEqual(expect.arrayContaining(CONTROL_NAMES));
+      const ok: any = await client.callTool({ name: 'confirm_decision', arguments: { action: 'confirm' } });
+      expect(ok.content[0].text).toBe('confirm decision recorded: confirm');
+      expect(recorded.confirm).toEqual({ action: 'confirm' });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('gives every turn a distinct token', async () => {
+    const a = await victimTurn();
+    const b = await victimTurn();
+    expect(a.bridge.token).not.toBe(b.bridge.token);
+  });
+});
+
+/**
  * `codex exec` is a one-shot subprocess with no dynamic-tool control channel, so the
  * bridge is registered as an stdio MCP server through `-c` config overrides. The stub
  * records the argv it was launched with and probes the socket while it runs.
@@ -216,6 +386,10 @@ describe('codex exec registers the control bridge as an MCP server', () => {
       `mcp_servers.${CONTROL_SERVER_NAME}.command=${JSON.stringify(process.execPath)}`,
       expect.stringMatching(/^mcp_servers\.karmax_control\.args=\[".*control-mcp\.mjs"\]$/),
       expect.stringMatching(/^mcp_servers\.karmax_control\.env\.KARMAX_CONTROL_SOCKET="/),
+      // The socket path is reachable by every same-uid agent on this host, so the
+      // per-turn token has to ride the same `-c` env channel or `codex exec`'s
+      // child cannot authenticate (control-bridge.ts security notes).
+      expect.stringMatching(/^mcp_servers\.karmax_control\.env\.KARMAX_CONTROL_TOKEN="[0-9a-f]{64}"$/),
     ]));
     // Live while codex ran…
     expect(record.socketLive).toBe(true);

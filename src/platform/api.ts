@@ -1396,7 +1396,12 @@ export class KarmaxApi {
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.armer?.disarm(taskId);
-    const { triggerState: _s, ...rest } = task.params as Record<string, unknown>;
+    // Drop the cron catch-up mark along with the armed state. Keeping
+    // `triggerLastFiredAt` while disarming meant a task paused for days and then
+    // re-queued looked, to `catchUpCron`, like a task that had missed an
+    // occurrence — so it fired once immediately on being re-queued. Pausing is
+    // not missing: a task that was deliberately not armed has nothing to catch up.
+    const { triggerState: _s, triggerLastFiredAt: _f, ...rest } = task.params as Record<string, unknown>;
     this.deps.store.updateTaskParams(taskId, { ...rest, draft: true } as any);
     return this.deps.store.getTask(taskId)!;
   }

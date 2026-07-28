@@ -200,6 +200,91 @@ describe('portable world checkpoints', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('aborts a queued runner lease when the restoring activity is cancelled, instead of stranding it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-cancel-'));
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
+    await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Saturated', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { repos: [repo], defaultBase: 'main', worldProvider: 'sandbox-test' },
+      organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    // A pool with room for exactly one world, so the restore's lease must queue.
+    const pool = store.createRunnerPool({ id: `${organization.id}:tiny`, organizationId: organization.id,
+      name: 'Tiny', provider: 'sandbox-test', mode: 'managed',
+      capacity: { activeWorlds: 1, cpu: 40, memoryMb: 81_920, gpu: 0 }, enabled: true });
+    store.setProjectExecutionPolicy(project.id, { runnerPoolId: pool.id });
+
+    const worlds = new WorldRegistry();
+    const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
+    worlds.register({
+      kind: 'sandbox-test', parkable: true,
+      capabilities: { remote: true, pty: false, snapshots: true, ports: false, networkPolicy: false },
+      async create(spec: Parameters<WorktreeProvider['create']>[0]) {
+        const w = await worktrees.create(spec);
+        w.handle.kind = 'sandbox-test';
+        w.handle.provider = 'sandbox-test';
+        return w;
+      },
+      async open(handle: Parameters<WorktreeProvider['open']>[0]) {
+        const w = await worktrees.open(handle);
+        w.handle.kind = 'sandbox-test';
+        return w;
+      },
+    } as any);
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const runners = new RunnerPoolService(store);
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, undefined, runners);
+
+    const world = await worlds.create('sandbox-test', { taskId: task.id, repos: [repo], base: 'main' });
+    world.handle.meta = { projectId: project.id };
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.writeFile('tracked.txt', 'edited in the sandbox\n');
+    const checkpoint = await checkpoints.checkpoint(world.handle);
+    await world.destroy();
+
+    // Saturate the pool: the restore below cannot be granted until this is released.
+    const occupant = await runners.acquire({ project: store.getProject(project.id)!, taskId: 'other',
+      worldId: 'other', provider: 'sandbox-test' });
+    expect(store.worldLease(occupant.leaseId)?.state).toBe('active');
+
+    // `restore` is reached from an activity, and `RunnerPoolService.acquire` polls
+    // a ~1s loop that only gives the queued lease row back when the signal aborts.
+    // Without the activity's cancellation signal and heartbeat threaded in, the
+    // restore blocks past the heartbeat timeout and the killed activity leaves a
+    // `queued` lease row nothing will ever release — pool capacity gone for good.
+    const controller = new AbortController();
+    const beats: string[] = [];
+    const restore = checkpoints.restore(checkpoint.id, 'sandbox-test',
+      { signal: controller.signal, heartbeat: () => beats.push('beat') });
+    const settled = restore.then(() => 'resolved', (e: unknown) => `rejected: ${e instanceof Error ? e.message : String(e)}`);
+    const timer = setTimeout(() => controller.abort(new Error('activity cancelled')), 500);
+    try {
+      const outcome = await Promise.race([settled,
+        new Promise((resolve) => setTimeout(() => resolve('still-blocked-after-abort'), 6000))]);
+      expect(outcome).toMatch(/^rejected/);
+      expect(beats.length).toBeGreaterThan(0); // it heartbeats while it waits
+      // Nothing left holding pool capacity except the occupant we created.
+      expect(store.listWorldLeases(pool.id).map((lease: any) => lease.id)).toEqual([occupant.leaseId]);
+    } finally {
+      clearTimeout(timer);
+      // Free the pool so any still-spinning acquire finishes rather than leaking
+      // a poll loop into the rest of the run.
+      runners.release(occupant.leaseId, 'sandbox-test');
+      await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 5000))]);
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('replays checkpoint-pinned boot hooks and service topology with opaque endpoint handles', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-checkpoint-runtime-'));
     const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);

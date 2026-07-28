@@ -81,6 +81,27 @@ describe('control-plane backup', () => {
     await expect(createBackup({ home, destination: path.join(root, 's2'), externalTemporal: true, allowRunning: true })).resolves.toBeTruthy();
   });
 
+  /**
+   * The refusal above has to name a remedy the operator can actually carry out.
+   * It used to say "pass allowRunning" — an API option that `npm run backup` had
+   * no flag for, so the only documented way out of the error did not exist from
+   * where the person reading it was standing. Pin both halves: the message names
+   * a real command, and that command really parses the flag it advertises.
+   */
+  it('points the operator at a command that exists', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-remedy-'));
+    const home = path.join(root, 'home');
+    roots.push(root);
+    fs.mkdirSync(path.join(home, 'state', 'instances'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'state', 'instances', `${process.ppid}.pid`), JSON.stringify({ pid: process.ppid, home }));
+
+    await expect(createBackup({ home, destination: path.join(root, 's'), externalTemporal: true }))
+      .rejects.toThrow(/npm run backup -- --allow-running/);
+
+    const cli = fs.readFileSync(new URL('../src/scripts/backup.ts', import.meta.url), 'utf8');
+    expect(cli).toContain("'--allow-running'");
+  });
+
   it('rejects a backup whose payload changed', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-tamper-'));
     const home = path.join(root, 'home');
