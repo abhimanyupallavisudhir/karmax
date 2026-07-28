@@ -427,6 +427,7 @@ async function main() {
     resources,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
+    hostLocal: deployment.hostLocal,
     remoteAccess,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;

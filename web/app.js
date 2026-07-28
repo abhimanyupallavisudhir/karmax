@@ -64,12 +64,11 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: '', // the working query string (Linear-style tokens + free text)
+  search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
-  activeView: null, // id of the selected saved view, or null for the ad-hoc/default view
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
@@ -160,7 +159,13 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', profile: 'profile' };
 
-function parseRoute(pathname) {
+// Parse an in-app URL — a path, optionally with its `?…` query string — into the
+// page it names. The tasks list's whole search state (free text, filters, group,
+// sort) is the one query string in `?q=`, so it rides along as `q` on every
+// project route: a search is just a URL.
+function parseRoute(url) {
+  const [pathname, search = ''] = String(url).split('?');
+  const q = new URLSearchParams(search).get('q') || '';
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
@@ -172,7 +177,7 @@ function parseRoute(pathname) {
     const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, legacy: true };
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, q, legacy: true };
   }
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
@@ -181,16 +186,33 @@ function parseRoute(pathname) {
   const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab };
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q };
+}
+
+// The `/<org>/<project>` prefix every project URL builds on ('' when unknown).
+function projectBase(pid) {
+  const p = projectById(pid);
+  return p ? `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}` : '';
 }
 
 // The list/tab route for a project (by id): /<org>/<project> for the default
-// tasks tab, with the tab appended for the others.
-function projectRoute(pid, tab = 'tasks') {
-  const p = projectById(pid);
-  if (!p) return globalRoute('dashboard');
-  const base = `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}`;
-  return tab === 'tasks' ? base : `${base}/${tab}`;
+// tasks tab, with the tab appended for the others. The tasks list additionally
+// carries the working query in `?q=`, so its links are the durable, shareable
+// form of a search — and so moving between tabs (or back from a task) restores
+// the exact filtered/grouped/sorted view. It defaults to the query in hand,
+// which belongs to the project currently on screen and to no other.
+function projectRoute(pid, tab = 'tasks', q = pid === S.projectId ? S.search : '') {
+  const base = projectBase(pid);
+  if (!base) return globalRoute('dashboard');
+  if (tab !== 'tasks') return `${base}/${tab}`;
+  return q ? `${base}?q=${encodeQuery(q)}` : base;
+}
+
+// Query strings are meant to be read and hand-edited in the address bar, so we
+// keep the characters that are legal there legal-looking: ':' and ',' survive
+// unescaped and a space rides as '+' (which URLSearchParams decodes back).
+function encodeQuery(q) {
+  return encodeURIComponent(q).replace(/%3A/g, ':').replace(/%2C/g, ',').replace(/%20/g, '+');
 }
 
 // An organization-level route (dashboard / settings / inbox) under the current
@@ -200,11 +222,15 @@ function globalRoute(tab, org = currentOrg()) {
   return `${orgBase(org)}/${seg}`;
 }
 
+// The URL we are on, query string included — the full identity of the current
+// view, since a search lives in `?q=`.
+function currentPath() { return location.pathname + location.search; }
+
 // Navigate: update the URL then reconcile app state to it. `replace` swaps the
 // current history entry instead of pushing a new one.
 function go(path, opts = {}) {
   closeTaskFormPage();
-  if (path !== location.pathname) {
+  if (path !== currentPath()) {
     history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
   }
   return applyRoute();
@@ -233,7 +259,7 @@ async function applyRoute() {
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
-  const r = parseRoute(location.pathname);
+  const r = parseRoute(currentPath());
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
     return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
@@ -258,7 +284,7 @@ async function applyRoute() {
     if (!r.tab) {
       const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
       const dest = pid ? projectRoute(pid) : globalRoute('dashboard');
-      if (dest !== location.pathname) return go(dest, { replace: true });
+      if (dest !== currentPath()) return go(dest, { replace: true });
       r.tab = 'dashboard'; // fall through to a real page
     }
     if (r.legacy) {
@@ -286,8 +312,8 @@ async function applyRoute() {
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
     const dest = r.taskKey
-      ? `${projectRoute(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
-      : projectRoute(proj.id, r.tab);
+      ? `${projectBase(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
+      : projectRoute(proj.id, r.tab, r.q);
     return go(dest, { replace: true });
   }
   const pid = proj.id;
@@ -297,12 +323,12 @@ async function applyRoute() {
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
-    // its query/selected-view/roving-cursor/search-result can't bleed into the
-    // new project (they'd otherwise re-run the old query against new data and
-    // highlight a view/cursor that doesn't exist here).
+    // its query/roving-cursor/search-result can't bleed into the new project
+    // (they'd otherwise re-run the old query against new data and highlight a
+    // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
+    // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
     S.search = '';
-    S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
     await loadTasks().catch(() => {});
@@ -325,6 +351,9 @@ async function applyRoute() {
   S.tab = tab;
   if (!taskId) closeTaskDom();
   if (tab === 'tasks' && !taskId) {
+    // The list is query-driven and the URL owns the query: a pasted, bookmarked,
+    // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
+    S.search = r.q || '';
     await runSearch().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -341,12 +370,14 @@ async function applyRoute() {
 }
 
 // The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
-// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
+// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click). It stays
+// free of the list's ?q=: a task link is about the task, and the query you came
+// from is remembered in S.returnRoute (and in the history entry behind you).
 function taskUrl(id) {
   const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
-  return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
+  return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
 // True when a click means "open in a new tab/window" by browser convention: any
@@ -361,7 +392,7 @@ function isNewTabClick(ev) {
 // previous task). Generalises the old goToTask logic to any SPA link.
 function spaNavigate(href) {
   const to = parseRoute(href);
-  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  if (to && to.taskKey && !parseRoute(currentPath()).taskKey) S.returnRoute = currentPath();
   return go(href);
 }
 
@@ -509,6 +540,16 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
 }
 
 // The "Agent environment" (worldProvider) choices depend on the deployment and
+// Whether the browser and the karmax host are the same computer. Host-machine
+// affordances — typing a filesystem path on the host, materializing a checkout to
+// `cd` into, importing the host's `pass` store — are noise to anyone reaching
+// karmax over a public URL, so they are hidden. The gateway detects it from how it
+// is served (src/config/deployment.ts); a hosted cell is never host-local.
+const hostLocal = () => S.meta?.hostLocal !== false;
+// A world path is a directory on the karmax host: only its own machine can `cd`
+// into it. Elsewhere the world is still reachable — over `karmax attach`, not a path.
+const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
+
 // which remote sandbox providers the organization has connected — so the manifest
 // ships an empty option list and the client fills it in. An empty first option ⇒
 // inherit the project / organization default.
@@ -1841,18 +1882,31 @@ async function runSearch() {
   }
 }
 
+// Mirror the working query into the address bar, so every search — text, filters,
+// grouping, sorting — is a link you can copy, bookmark, reload or reach with Back.
+// replaceState, not push: editing a query refines the view you are on rather than
+// opening a new page, so a typed search doesn't bury the previous page under a
+// history entry per keystroke.
+function syncQueryUrl() {
+  if (S.tab !== 'tasks' || S.selected || !S.projectId) return; // only the list is query-driven
+  const path = projectRoute(S.projectId);
+  if (path !== currentPath()) history.replaceState({ kx: 1 }, '', path);
+}
+
 let searchDebounce = null;
 function scheduleSearch() {
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(async () => { await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+  searchDebounce = setTimeout(async () => { syncQueryUrl(); await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
 }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
-// Updates the topbar box (which renderMain doesn't own), re-evaluates, re-renders.
+// Updates the topbar box (which renderMain doesn't own) and the URL, re-evaluates,
+// re-renders.
 async function setQuery(q) {
   S.search = q || '';
   const box = $('#task-search');
   if (box) box.value = S.search;
+  syncQueryUrl();
   await runSearch();
   if (S.tab === 'tasks') renderMain();
 }
@@ -1863,10 +1917,9 @@ async function navigateToTagSection(tagId) {
   const tag = tagById(tagId);
   if (!tag) return;
   $('#modal-root').innerHTML = '';
-  S.activeView = null;
   // Section by the tag's own kind so the target section is present in the grouping.
-  S.search = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
-  await go(projectRoute(tag.projectId));
+  const q = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
+  await go(projectRoute(tag.projectId, 'tasks', q));
   const section = document.getElementById(tagSectionId(tagId));
   if (!section) return;
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1905,6 +1958,10 @@ function stringifyQuery(q) {
   if (q.text) parts.push(String(q.text).includes(' ') ? `"${q.text}"` : q.text);
   return parts.join(' ');
 }
+
+// A query string's canonical form (parse → stringify), so two spellings of the
+// same search — token order, spacing, quoting — compare equal.
+function normalizeQuery(q) { return stringifyQuery(parseQueryClient(q || '')); }
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
@@ -2390,19 +2447,36 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
+// Which view chip a query lights up. A view IS a query, so the query decides —
+// there is no separate "selected view" to keep in sync, and a pasted or reloaded
+// ?q= URL lights the right chip for free. Comparison is on the canonical form, so
+// a view still matches when its query was re-spelled by the toolbar or round-tripped
+// through the saved (structured) form. The empty query is the "All" chip; a query
+// that matches no view lights nothing — "no filter" and "a filter I haven't saved"
+// are different states, and only the first of them is All.
+const ALL_VIEW = '__all__'; // the chip standing for the empty (unfiltered) query
+function viewIdForQuery(q) {
+  const s = normalizeQuery(q);
+  if (!s) return ALL_VIEW;
+  return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
+    || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
+    || null;
+}
+
 // The saved-views switcher — every chip is a query. "All" is the default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
+  const active = viewIdForQuery(S.search);
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
   const saved = S.views
     .map(
-      (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
     <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
@@ -2812,12 +2886,11 @@ function wireOrgControls() {
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      if (id === ALL_VIEW) { setQuery(''); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
-      if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
+      if (builtin) { setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
       if (!v) return;
-      S.activeView = id;
       setQuery(stringifyQuery(v.query || {}));
     }),
   );
@@ -2831,24 +2904,24 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        renderMain(); // the query stays in hand (and in the URL); only the chip is gone
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
-    search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+    search.addEventListener('input', (e) => { S.search = e.target.value; scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); setQuery(''); } });
   }
 
-  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
+  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
 }
 
 // Persist the current working query as a named view (Save-view button).
@@ -2863,8 +2936,7 @@ async function saveCurrentView() {
       body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
     });
     S.views.push(v);
-    S.activeView = v.id;
-    renderMain();
+    renderMain(); // the new chip lights up on its own — it is the query already in the box
     toast(`Saved view “${name}”`);
   } catch (err) { toast(err.message, true); }
 }
@@ -2977,7 +3049,6 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   const list = $('#pk-list', host);
   const close = () => host.remove();
   let q = '';
-  let activeView = null;
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → role→session (agent mode, fetched on expand)
@@ -2986,22 +3057,22 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   // View chips (All + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
   const paintControls = () => {
+    const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
-      `<div class="view-chip ${!activeView ? 'active' : ''}" data-pkview="__all__">≡ All</div>`,
+      `<div class="view-chip ${activeView === ALL_VIEW ? 'active' : ''}" data-pkview="${ALL_VIEW}">≡ All</div>`,
       ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
       ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
     ].join('');
     host.querySelectorAll('[data-pkview]').forEach((el) =>
       el.addEventListener('click', () => {
         const id = el.dataset.pkview;
-        activeView = id === '__all__' ? null : id;
         const bv = BUILTIN_VIEWS.find((x) => x.id === id);
         const sv = S.views.find((x) => x.id === id);
-        setQ(id === '__all__' ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
+        setQ(id === ALL_VIEW ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
       }),
     );
     $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
-    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => { activeView = null; setQ(nq); } });
+    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => setQ(nq) });
   };
 
   let deb = null;
@@ -3092,7 +3163,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     paintList();
   };
 
-  search.addEventListener('input', () => { activeView = null; setQ(search.value, true); });
+  search.addEventListener('input', () => setQ(search.value, true));
   search.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, navRows().length - 1); paintHi(); }
@@ -3760,7 +3831,7 @@ async function openTaskForm(workflow, draft, seedText) {
     const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
     if (row) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
-      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
   }
   // Image attachments for the full task form: pasting/dropping an image into any
@@ -5433,7 +5504,7 @@ function checkinTab(v) {
           <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
-        ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
+        ${localWorldPath(v) ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
       </div>
     </div>
     <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
@@ -5454,8 +5525,8 @@ function conversationPane(v, t) {
   // sessions can't be forked from a terminal, so no command is shown. The session
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
   const sess = S.sessions && S.sessions[t.role];
-  const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
-  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && !S.meta?.hosted;
+  const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
     : remoteFork
@@ -5744,8 +5815,8 @@ function terminalPane(v) {
       <b>Ephemeral terminal</b>
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
-      ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
+      ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
@@ -5772,7 +5843,7 @@ function wireCheckinSidebar(v) {
 }
 
 async function openLocalCheckout(v) {
-  if (!S.meta?.hosted) return materializeLocalCheckout(v);
+  if (hostLocal()) return materializeLocalCheckout(v);
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
   catch (error) { return toast(error.message, true); }
@@ -6340,6 +6411,9 @@ function paramCurrentValue(f, v, rec) {
       return shared;
     }
   }
+  // The Review route belongs to the logical task: the intent's shared snapshot is
+  // the route actually in play, even when this attempt stored no override of its own.
+  if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
 function displayParam(f, val) {
@@ -6372,6 +6446,14 @@ function collectParamEdits(root, fields) {
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      // The Review route is sent whole (layers are atomic), not inherit-diffed —
+      // an in-flight edit is a concrete live value, not an overlay override.
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = { layers: readConfirmerLayers(box) };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -7939,15 +8021,15 @@ async function hydrateProjectData(proj) {
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Krmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
-      ${!S.meta?.hosted && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
-      ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>'}
+      ${hostLocal() && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
+      ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
-          ${S.meta?.hosted ? '' : '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>'}
+          ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
           <label class="form-row wide"><span>Or upload a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
@@ -8135,7 +8217,7 @@ async function hydrateProjectResources(proj) {
     const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
     box.innerHTML = `<div class="section-h">Attached resources</div>
       <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${S.meta?.hosted ? '' : '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>'}
+      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
       <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
         <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
           <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
@@ -8149,7 +8231,7 @@ async function hydrateProjectResources(proj) {
         <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
         <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
         <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${S.meta?.hosted ? '' : '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>'}
+        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
         <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
       </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
     const driverInput = $('#resource-driver');
@@ -8280,7 +8362,7 @@ async function hydrateProjectAccess(proj) {
       <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
     repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
+      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
       ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
@@ -8299,7 +8381,7 @@ async function hydrateProjectAccess(proj) {
     }));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
+    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
@@ -9246,7 +9328,7 @@ function credentialRequestTaskLink(request) {
   const key = task.num != null ? task.num : task.id;
   const label = `${task.num != null ? `#${task.num} · ` : ''}${task.title}`;
   return project
-    ? `<a data-spa href="${projectRoute(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
+    ? `<a data-spa href="${projectBase(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
     : `<span>${esc(label)}</span>`;
 }
 
@@ -9302,6 +9384,27 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
       toast(error.message, true);
     }
   })));
+}
+
+/**
+ * Import a connector selection in batches, reporting progress as they land.
+ * Reading a secret out of a real store is expensive — a `pass` entry costs a
+ * GPG decrypt, and a whole tree takes minutes — so a single blocking request
+ * looks exactly like a dead button. Batching keeps the UI honest, commits what
+ * has been read so far, and lets the server skip entries that have not changed.
+ */
+async function importFromConnector(sync, externalIds, onProgress, batchSize = 25) {
+  const totals = { imported: 0, skipped: 0, failures: [], done: 0, total: externalIds.length };
+  for (let at = 0; at < externalIds.length; at += batchSize) {
+    onProgress?.(totals);
+    const result = await sync(externalIds.slice(at, at + batchSize));
+    totals.imported += result.count || 0;
+    totals.skipped += result.skipped || 0;
+    totals.failures.push(...(result.failures || []));
+    totals.done = Math.min(at + batchSize, externalIds.length);
+  }
+  onProgress?.(totals);
+  return totals;
 }
 
 function passwordsCard() {
@@ -9516,20 +9619,29 @@ async function wireVaultCards(organizationId) {
     overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
     tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
     tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
-    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+    const go = overlay.querySelector('[data-imp-go]');
+    go.addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
       if (!externalIds.length) { toast('Select at least one', true); return; }
+      const sync = (batch) => api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+        externalIds: batch,
+        policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+        ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+      }) });
+      go.disabled = true;
       try {
-        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
-          externalIds,
-          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
-          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
-        }) });
-        toast(`Imported ${r.count} item(s)`);
+        const r = await importFromConnector(sync, externalIds, (p) => {
+          go.textContent = `Importing ${p.done}/${p.total}…`;
+          countEl.textContent = `· ${p.imported} imported${p.skipped ? `, ${p.skipped} unchanged` : ''}`;
+        });
+        const summary = [`Imported ${r.imported} item(s)`, r.skipped ? `${r.skipped} already up to date` : '',
+          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : ''].filter(Boolean).join(' · ');
+        toast(summary, r.failures.length > 0);
         close();
         renderItems();
         renderConnectors();
       } catch (e) { toast(e.message, true); }
+      finally { go.disabled = false; go.textContent = 'Import'; }
     });
   };
   box.querySelector('.vi-add').addEventListener('click', async () => {
@@ -10129,7 +10241,7 @@ async function openInboxItem(item) {
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
-  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
+  return go(`${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user
@@ -11015,7 +11127,7 @@ function openGlobalSearch() {
       ...found.taskHits.map(({ project, task }) => {
         const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
         const number = task.num != null ? `#${task.num} · ` : '';
-        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
+        const href = `${projectBase(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,

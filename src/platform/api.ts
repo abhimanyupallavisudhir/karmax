@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, mergeQueueDomains } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, mergeQueueDomains } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -2423,12 +2423,45 @@ export class KarmaxApi {
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>): Promise<{ applied: string[] }> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    // A Review-route edit is the one field whose validity the deterministic sandbox
+    // cannot judge: "does @qa resolve to a human here?" is a store question. Assert it
+    // up front so a re-route can never park the gate on an audience nobody can see.
+    const confirmer = task && this.confirmerFieldOf(task);
+    if (confirmer && patch[confirmer.field.name] !== undefined)
+      this.assertHumanRoutes(task!, confirmer.manifest, { [confirmer.field.name]: patch[confirmer.field.name] } as ValueMap);
     try {
       const result = (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
+      if (confirmer && result.applied.includes(confirmer.field.name))
+        await this.shareConfirmerAcrossAttempts(task!, confirmer.field.name, patch[confirmer.field.name]);
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));
+    }
+  }
+
+  /** The task's Review-route field (if its workflow has one) with the manifest it came from. */
+  private confirmerFieldOf(task: TaskRecord): { field: FieldSpec; manifest: WorkflowManifest } | undefined {
+    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId;
+    const start = this.resolveStart(task.workflow, task.workflowVersion, organizationId);
+    const field = start?.manifest.params.find((f) => f.type === 'confirmer');
+    return start && field ? { field, manifest: start.manifest } : undefined;
+  }
+
+  /**
+   * A confirmer belongs to the LOGICAL task, not one attempt (activities/core.ts) —
+   * sibling attempts must never review against divergent routes. So an accepted
+   * in-flight re-route is written through to the shared intent snapshot and pushed
+   * into every other live attempt. A sibling that rejects it has already passed its
+   * own gate (or its point of no return); it keeps the route it actually used.
+   */
+  private async shareConfirmerAcrossAttempts(task: TaskRecord, field: string, confirmer: unknown): Promise<void> {
+    this.deps.store.setIntentConfirmer(task.intentId ?? task.id, field, confirmer, { inFlight: true });
+    for (const sibling of this.deps.store.attemptGroup(task.intentId ?? task.id)?.attempts ?? []) {
+      if (sibling.id === task.id || sibling.params?.draft) continue;
+      try {
+        await this.deps.client.workflow.getHandle(sibling.id).executeUpdate('updateParams', { args: [{ [field]: confirmer }] });
+      } catch { /* already past its gate — it keeps the route it played */ }
     }
   }
 

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { deploymentConfig, hydrateSecretFiles, validateDeployment } from '../src/config/deployment.js';
+import { deploymentConfig, hostLocal, hydrateSecretFiles, validateDeployment } from '../src/config/deployment.js';
 
 describe('deployment profiles', () => {
   it('keeps local development zero-config', () => {
-    expect(validateDeployment({})).toEqual({ hosted: false, singleNode: false, cellId: 'local' });
+    expect(validateDeployment({})).toEqual({ hosted: false, singleNode: false, cellId: 'local', hostLocal: true });
   });
 
   it('fails closed when a hosted cell lacks durable or isolated services', () => {
@@ -24,7 +24,8 @@ describe('deployment profiles', () => {
       KARMAX_GITHUB_APP_PRIVATE_KEY: 'pem', KARMAX_GITHUB_WEBHOOK_SECRET: secret,
       KARMAX_CLOUD_WORLD_PROVIDER: 'e2b', E2B_API_KEY: 'e2b-key',
     };
-    expect(validateDeployment(env)).toEqual({ hosted: true, singleNode: false, cellId: 'eu-1', cloudWorldProvider: 'e2b' });
+    expect(validateDeployment(env)).toEqual({ hosted: true, singleNode: false, cellId: 'eu-1', hostLocal: false,
+      cloudWorldProvider: 'e2b' });
     expect(deploymentConfig(env).hosted).toBe(true);
   });
 
@@ -36,7 +37,7 @@ describe('deployment profiles', () => {
       KARMAX_VAULT_KEY: secret, KARMAX_WORLD_REF_KEY: secret, KARMAX_TEMPORAL_ADDRESS: 'temporal:7233',
       KARMAX_OBJECT_STORE: 'local', KARMAX_CLOUD_WORLD_PROVIDER: 'daytona',
     };
-    expect(validateDeployment(env)).toEqual({ hosted: true, singleNode: true, cellId: 'cell-1',
+    expect(validateDeployment(env)).toEqual({ hosted: true, singleNode: true, cellId: 'cell-1', hostLocal: false,
       cloudWorldProvider: 'daytona' });
   });
 
@@ -64,6 +65,30 @@ describe('deployment profiles', () => {
     };
     expect(() => validateDeployment({ ...base, KARMAX_PREVIEW_ORIGIN: 'https://karmax.example' }))
       .toThrow(/different origin/);
+  });
+
+  it('treats an unconfigured install as the operator sitting at the machine', () => {
+    expect(hostLocal({})).toBe(true);
+    expect(hostLocal({ KARMAX_HOST: '127.0.0.1' })).toBe(true);
+    expect(hostLocal({ KARMAX_HOST: 'localhost', KARMAX_PUBLIC_URL: 'http://localhost:4505' })).toBe(true);
+    expect(hostLocal({ KARMAX_HOST: '[::1]' })).toBe(true);
+  });
+
+  it('withdraws host-machine features once the gateway is served to other people', () => {
+    expect(hostLocal({ KARMAX_HOST: '0.0.0.0' })).toBe(false);
+    expect(hostLocal({ KARMAX_HOST: '::' })).toBe(false);
+    expect(hostLocal({ KARMAX_HOST: '192.168.1.5' })).toBe(false);
+    expect(hostLocal({ KARMAX_PUBLIC_URL: 'https://karmax.example.com' })).toBe(false);
+    expect(hostLocal({ KARMAX_PUBLIC_URL: 'https://laptop.tail1234.ts.net' })).toBe(false);
+    expect(hostLocal({ KARMAX_DEPLOYMENT: 'hosted' })).toBe(false);
+  });
+
+  it('lets an operator override detection a tunnel would defeat', () => {
+    expect(hostLocal({ KARMAX_HOST: '0.0.0.0', KARMAX_HOST_LOCAL: '1' })).toBe(true);
+    expect(hostLocal({ KARMAX_HOST_LOCAL: '0' })).toBe(false);
+    // A hosted cell is never the operator's own machine, whatever the override says.
+    expect(hostLocal({ KARMAX_DEPLOYMENT: 'hosted', KARMAX_HOST_LOCAL: '1' })).toBe(false);
+    expect(deploymentConfig({ KARMAX_DEPLOYMENT: 'hosted' }).hostLocal).toBe(false);
   });
 
   it('loads file-backed secrets without replacing explicit values', () => {

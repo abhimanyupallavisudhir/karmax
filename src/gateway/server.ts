@@ -32,6 +32,7 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { hostLocal } from '../config/deployment.js';
 import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
@@ -87,6 +88,9 @@ export interface GatewayDeps {
   resources?: import('../world/resources.js').ProjectResourceService;
   cellId?: string;
   hosted?: boolean;
+  /** Whether the browser and the host are the same machine (see `hostLocal`).
+   *  Defaults to detecting it from how the gateway is served. */
+  hostLocal?: boolean;
   remoteAccess?: RemoteAccessController;
 }
 
@@ -393,6 +397,9 @@ export class Gateway {
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
+  /** Host-machine affordances (`pass` import, host filesystem paths, a local
+   *  checkout to `cd` into) are only offered to the machine karmax runs on. */
+  private get hostLocal(): boolean { return this.deps.hostLocal ?? hostLocal(); }
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
@@ -979,6 +986,7 @@ export class Gateway {
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
+        hostLocal: this.hostLocal,
         worldProviders: this.deps.worlds.catalog(),
         sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
       });
@@ -2542,7 +2550,8 @@ export class Gateway {
         const expiresAt = Date.now() + 5 * 60_000;
         for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
         this.terminalTickets.set(ticket, { taskId, session, expiresAt });
-        const attachArgv = this.deps.hosted ? ['karmax'] : [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))];
+        // A path into this install's checkout only means something to the machine it lives on.
+        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))] : ['karmax'];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
@@ -2554,7 +2563,7 @@ export class Gateway {
       const materializeMatch = p.match(/^\/api\/tasks\/([^/]+)\/materialize-local$/);
       if (materializeMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
-        if (this.deps.hosted) return this.json(res, 409, { error: 'use the Git checkout handoff when Krmax is hosted remotely' });
+        if (!this.hostLocal) return this.json(res, 409, { error: 'use the Git checkout handoff when Krmax is not running on your machine' });
         const taskId = materializeMatch[1]!;
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
@@ -3265,7 +3274,7 @@ export class Gateway {
           if (b.id && b.secrets && Object.keys(b.secrets).length) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3325,7 +3334,7 @@ export class Gateway {
           if (prior && b.secrets) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3338,7 +3347,7 @@ export class Gateway {
           let writeBack: Array<{ connector: string; externalId?: string; error?: string }> = [];
           if (!prior) {
             const { defaultConnectors } = await import('../autonomy/connectors.js');
-            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId).writeBackCreated(saved.id);
+            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal }).writeBackCreated(saved.id);
             for (const result of writeBack) {
               store.appendAudit({ principalId: callerTaskId ? `task:${callerTaskId}` : principal,
                 action: result.error ? 'vault.write_back.failed' : 'vault.write_back',
@@ -3464,7 +3473,7 @@ export class Gateway {
         if (p.startsWith('/api/vault/connectors')) {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
           const { defaultConnectors } = await import('../autonomy/connectors.js');
-          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId);
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal });
           if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
           const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
           if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });
