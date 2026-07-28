@@ -90,7 +90,7 @@ describe('task stage transitions', () => {
 
     const restored = await f.api.moveTaskStage(f.token, f.task.id, 'do');
     expect(f.starts).toHaveLength(1);
-    expect(f.starts[0]!.type).toBe('softwareDev@1.7.0');
+    expect(f.starts[0]!.type).toBe('softwareDev@1.8.0');
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', messages: f.view.messages });
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
   });
@@ -173,7 +173,7 @@ describe('task stage transitions', () => {
 
     await f.api.changeWorkflow(f.token, f.task.id, 'goal');
 
-    expect(f.starts.at(-1)!.type).toBe('goal@1.7.0');
+    expect(f.starts.at(-1)!.type).toBe('goal@1.8.0');
     expect(f.starts.at(-1)!.options.args[0]).toMatchObject({ recovery: { resumeStage: 'do' } });
     expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1).text).toMatch(/continue autonomously/i);
     expect(f.store.getTask(f.task.id)?.workflow).toBe('goal');

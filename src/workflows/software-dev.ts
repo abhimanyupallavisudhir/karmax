@@ -37,6 +37,7 @@ import {
   ChildRaise,
   ParentResponse,
   SubTaskResponse,
+  TaskPullRequest,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
@@ -233,23 +234,49 @@ export async function softwareDevV1_7(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.7.0');
 }
 
+/** Full GitHub pull-request lifecycle under remote policy 'pr': the PR is
+ *  reconciled with the merge outcome and closed when the task is cancelled. */
+export async function softwareDevV1_8(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.8.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0';
+
+/**
+ * The workflow type a sub-task child is started as. From 1.5.0 on a child
+ * inherits its parent's behavior version, so it gets the same cancellation
+ * semantics (and everything since) rather than silently dropping to the bare
+ * type. Parents older than that keep the bare v1.1 child type, because their
+ * recorded StartChildWorkflow command has to stay replay-compatible.
+ *
+ * Expressed as a comparison, not a list of versions: a new bundled version is
+ * then correct here by construction instead of needing an edit nobody would
+ * notice was missing.
+ */
+export function childWorkflowType(behaviorVersion: BehaviorVersion): string {
+  return Number(behaviorVersion.split('.')[1] ?? 0) >= 5 ? `softwareDev@${behaviorVersion}` : 'softwareDev';
+}
+
 async function softwareDevImpl(
   input: SoftwareDevInput,
-  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0',
+  behaviorVersion: BehaviorVersion,
 ): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
   const providerTerminalCompletion =
-    ['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0'].includes(behaviorVersion);
-  const modeSwitching = ['1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0'].includes(behaviorVersion);
-  const durableAgentAdmission = ['1.4.0', '1.5.0', '1.6.0', '1.7.0'].includes(behaviorVersion);
-  const responsiveHumanHold = behaviorVersion === '1.7.0';
-  const agentTurns = behaviorVersion === '1.6.0' || behaviorVersion === '1.7.0'
+    ['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion);
+  const modeSwitching = ['1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion);
+  const durableAgentAdmission = ['1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion);
+  const responsiveHumanHold = behaviorVersion === '1.7.0' || behaviorVersion === '1.8.0';
+  // New activity calls in an existing stage would break replay for executions
+  // recorded before them, so the PR lifecycle is pinned to its own version.
+  const githubPrLifecycle = behaviorVersion === '1.8.0';
+  const agentTurns = ['1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion)
     ? cancellationAwareTurns
     : turns;
   const taskId = input.taskId;
@@ -283,7 +310,8 @@ async function softwareDevImpl(
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined;
   let terminalOrigin: Stage | undefined;
-  let pr: { url: string; number: number } | undefined;
+  let pr: TaskPullRequest | undefined;
+  let prs: TaskPullRequest[] = [];
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
@@ -581,6 +609,7 @@ async function softwareDevImpl(
       world,
       worldPath: world?.workdir ?? world?.root,
       pr,
+      ...(prs.length ? { prs } : {}),
       mergeQueue: mergeQueuePos,
       subTasks: subTaskIds.length ? subTaskIds : undefined,
       parentTaskId: input.parentTaskId,
@@ -1365,17 +1394,8 @@ async function softwareDevImpl(
       });
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);
-      // Current children inherit the parent's cancellation semantics. Historical
-      // versions keep the bare v1.1 child type so their recorded command stays
-      // replay-compatible.
       const child = await startChild<typeof softwareDev>(
-        behaviorVersion === '1.7.0'
-          ? 'softwareDev@1.7.0'
-          : behaviorVersion === '1.6.0'
-            ? 'softwareDev@1.6.0'
-          : behaviorVersion === '1.5.0'
-            ? 'softwareDev@1.5.0'
-            : 'softwareDev',
+        childWorkflowType(behaviorVersion),
         {
           workflowId: childInput.taskId,
           args: [childInput as SoftwareDevInput],
@@ -1853,8 +1873,15 @@ async function softwareDevImpl(
     // Opening a PR binds it to `target`; close the edit window before we do (SPEC §2).
     targetLocked = true;
     await publish();
-    const opened = await withResolve('pr', () => core.openPr(world as any, target));
-    if (opened) pr = opened;
+    const opened = await withResolve('pr', () => core.openPr(world as any, target, {
+      title: input.title,
+      summary: reviewInfo?.summary ?? lastOutputs(msgs),
+    }));
+    prs = opened ?? [];
+    pr = prs[0];
+    // No publish here: the merge stage below opens with one, and adding an
+    // activity call inside a stage older pinned versions also run would break
+    // their replay.
   }
   }
 
@@ -1970,7 +1997,14 @@ async function softwareDevImpl(
       // the machine — push it (and under 'pr', GitHub marks the PR merged).
       // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
       if (remotePolicyOf(input.project) !== 'none') {
-        await core.pushTarget(world as any, target).catch(() => undefined);
+        const pushed = await core.pushTarget(world as any, target).catch(() => undefined);
+        // Under 'pr' the pull request is part of the deliverable: reconcile it
+        // with what actually landed (merged / closed / still open, and why).
+        if (githubPrLifecycle && prs.length) {
+          prs = await core.finalizePrs(world as any, prs, { target, sha, pushed: pushed?.pushed ?? [] })
+            .catch(() => prs);
+          pr = prs[0];
+        }
       }
       break;
     }
@@ -2036,6 +2070,14 @@ async function softwareDevImpl(
     stage = 'cancelled';
     status = 'cancelled';
     await cancelChildren(liveAgentStates); // don't strand children when we go away
+    // A cancelled task must not leave an open pull request proposing work that
+    // will never land.
+    if (githubPrLifecycle && world && prs.some((p) => p.state === 'open')) {
+      await core.closePrs(world as any, prs, 'The karmax task for this branch was cancelled; closing the pull request.')
+        .catch(() => undefined);
+      prs = prs.map((p) => ({ ...p, state: 'closed' as const }));
+      pr = prs[0];
+    }
     await publish();
     if (world) {
       const remoteWorld = releaseWorldOnCompletion(world);

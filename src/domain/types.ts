@@ -546,6 +546,20 @@ export function remotePolicyOf(project: ProjectConfig | undefined): RemotePolicy
   return project?.remote ?? (project?.openGithubPr ? 'pr' : 'none');
 }
 
+/** A GitHub pull request karmax opened for one repo of a task's world. The
+ *  slug/number pair is what every later lifecycle call (comment, close, state
+ *  re-read) needs, so it travels on the task view rather than being re-derived. */
+export interface TaskPullRequest {
+  /** World repo name the PR belongs to (multi-repo tasks open one per repo). */
+  repo: string;
+  /** `owner/name` on GitHub. */
+  slug: string;
+  number: number;
+  url: string;
+  state: 'open' | 'closed';
+  merged?: boolean;
+}
+
 /**
  * A named bundle of git identity + credentials — the git analogue of an agent
  * config-home account. The record itself carries NO secrets: the three key
@@ -1092,7 +1106,10 @@ export interface TaskView {
   /** Safe projection indicating that provider-native noVNC check-in exists. */
   worldDesktop?: boolean;
   worldPath?: string;
-  pr?: { url: string; number: number };
+  /** The primary repo's pull request (remote policy 'pr'); `prs` carries every
+   *  repo's, which for a single-repo task is the same one. */
+  pr?: TaskPullRequest;
+  prs?: TaskPullRequest[];
   mergeQueue?: { position: number; total: number };
   subTasks?: string[];
   parentTaskId?: string;

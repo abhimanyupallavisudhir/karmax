@@ -214,12 +214,24 @@ export class GitProfiles {
       const name = await git(process.cwd(), ['config', '--global', 'user.name']);
       checks.push({ label: 'host git identity', ok: name.code === 0 && !!name.stdout.trim(), detail: name.stdout.trim() || 'unset — karmax commits as karmax@localhost' });
     }
-    // gh CLI availability under this tier (GH_TOKEN selects the account).
-    try {
-      await pexec('bash', ['-lc', 'command -v gh >/dev/null && gh auth status >/dev/null 2>&1'], { env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env }, timeout: 15_000 });
-      checks.push({ label: 'gh CLI', ok: true, detail: 'installed and authorized' });
-    } catch {
-      checks.push({ label: 'gh CLI', ok: false, detail: 'not installed or not authorized — PRs are skipped' });
+    // A GitHub API token for remote policy 'pr'. PRs go through the REST API, so
+    // this is a token question, not a `gh` installation question — the CLI is
+    // only consulted as the personal organization's host-login fallback.
+    if (profile?.githubToken) {
+      checks.push({ label: 'GitHub pull requests', ok: true, detail: 'profile GitHub token' });
+    } else if (this.organizationId !== 'org_personal') {
+      checks.push({ label: 'GitHub pull requests', ok: false,
+        detail: 'connect the repositories to the GitHub App, or add a GitHub token to this profile' });
+    } else if (process.env.GH_TOKEN || process.env.GITHUB_TOKEN) {
+      checks.push({ label: 'GitHub pull requests', ok: true, detail: 'host GH_TOKEN' });
+    } else {
+      try {
+        const { stdout } = await pexec('gh', ['auth', 'token'], { env: { ...process.env, ...env }, timeout: 15_000 });
+        checks.push({ label: 'GitHub pull requests', ok: !!stdout.trim(), detail: 'host `gh` login' });
+      } catch {
+        checks.push({ label: 'GitHub pull requests', ok: false,
+          detail: 'no GitHub token — add one to the profile, or authorize `gh` on the host' });
+      }
     }
     // Each configured repo: origin remote present + reachable non-interactively.
     for (const r of project?.repos ?? []) {

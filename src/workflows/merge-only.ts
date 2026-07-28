@@ -17,7 +17,7 @@ import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmConfig, ConfirmDecision, ConfirmLayer,
-  releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+  TaskPullRequest, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -74,6 +74,11 @@ export async function mergeOnlyV1_3(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true, true);
 }
 
+/** Full GitHub pull-request lifecycle under remote policy 'pr'. */
+export async function mergeOnlyV1_4(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);
@@ -84,6 +89,9 @@ async function mergeOnlyImpl(
   managedTurns: boolean,
   durableAdmission = false,
   awaitTurnCancellation = false,
+  // New activity calls inside an existing stage break replay for executions
+  // recorded before them, so the PR lifecycle is pinned to its own version.
+  githubPrLifecycle = false,
 ): Promise<{ stage: Stage; sha?: string }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
@@ -114,6 +122,8 @@ async function mergeOnlyImpl(
   let agentTurn: TaskView['agentTurn'];
   let mergeQueue: { position: number; total: number; current?: string } | undefined;
   let pointOfNoReturnPassed = false;
+  let pr: TaskPullRequest | undefined;
+  let prs: TaskPullRequest[] = [];
   // `target` is editable in-flight until committed to the merge queue / a PR opens.
   let targetLocked = false;
   const isConsumed = (name: string): boolean =>
@@ -162,6 +172,7 @@ async function mergeOnlyImpl(
       actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
       editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
+      pr, ...(prs.length ? { prs } : {}),
       updatedAt: workflowInfo().historyLength,
     };
   }
@@ -330,8 +341,13 @@ async function mergeOnlyImpl(
 
   if (remotePolicyOf(input.project) === 'pr') {
     targetLocked = true; // opening a PR binds it to `target` (SPEC §2)
-    const opened = await core.openPr(world as any, target);
-    if (opened) reviewInfo = { ...reviewInfo, links: [...(reviewInfo?.links ?? []), { label: 'PR', url: opened.url }] };
+    prs = await core.openPr(world as any, target, { title: input.title, summary: reviewInfo?.summary }) ?? [];
+    pr = prs[0];
+    if (prs.length) reviewInfo = { ...reviewInfo,
+      links: [...(reviewInfo?.links ?? []), ...prs.map((p) => ({ label: prs.length > 1 ? `PR (${p.repo})` : 'PR', url: p.url }))] };
+    // No publish here: the merge stage below opens with one, and adding an
+    // activity call inside a stage older pinned versions also run would break
+    // their replay.
   }
 
   stage = 'merge';
@@ -381,7 +397,12 @@ async function mergeOnlyImpl(
   // Remote policy 'push'/'pr' (PLAN-git-config.md §5): best-effort push of the
   // landed target — the merge is the deliverable, a failed push is not fatal.
   if (remotePolicyOf(input.project) !== 'none') {
-    await core.pushTarget(world as any, target).catch(() => undefined);
+    const pushed = await core.pushTarget(world as any, target).catch(() => undefined);
+    if (githubPrLifecycle && prs.length) {
+      prs = await core.finalizePrs(world as any, prs, { target, sha: result.sha, pushed: pushed?.pushed ?? [] })
+        .catch(() => prs);
+      pr = prs[0];
+    }
   }
   stage = 'done';
   status = 'done';
