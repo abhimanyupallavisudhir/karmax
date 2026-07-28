@@ -28,6 +28,7 @@ import {
   Stage,
   AgentRole,
   AgentSpec,
+  ConfirmConfig,
   ConfirmLayer,
   Message,
   ReviewInfo,
@@ -326,7 +327,14 @@ async function softwareDevImpl(
   // top-level tasks.
   // Goal owns the zero-layer policy dynamically. Keeping the normal Software Dev
   // layers separately means switching back restores the task's original gate.
-  const softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
+  // Mutable: the Review route is `untilUsed`, so an in-flight edit replaces these
+  // layers and the gate below re-reads them on every iteration (SPEC §4.5/§5.5).
+  let softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
+  // Bumped by every accepted `confirm` edit. The Review gate captures it before it
+  // parks; a change while parked means the route it was playing is stale, so the
+  // gate replays from its first layer rather than crediting layers approved under
+  // the old route.
+  let confirmEpoch = 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, {
     accountId: string;
@@ -353,7 +361,9 @@ async function softwareDevImpl(
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
   // Params the workflow has already consumed (value now load-bearing). `target` is
   // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
-  // (provider/session) once its turn runs — its model/effort stay retunable after.
+  // (provider/session) once its turn runs — its model/effort stay retunable after;
+  // `confirm` once the Review gate it drives has fully passed (a gate that sends the
+  // task back to Do will play again, so the route is not consumed yet).
   const consumed = new Set<string>();
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
   const paramEditable = (name: string): boolean =>
@@ -429,19 +439,32 @@ async function softwareDevImpl(
       }
       if (!paramEditable(name))
         throw ApplicationFailure.nonRetryable(
-          `"${name}" can't be edited now — it's frozen after queue, already in use, or past the point of no return`,
+          name === 'confirm'
+            ? `the Review route can't be changed now — this task's Review gate has already passed`
+            : `"${name}" can't be edited now — it's frozen after queue, already in use, or past the point of no return`,
           'ParamLocked',
           name,
         );
+      // Shape check only. Whether a human audience resolves to real people is a
+      // store question the deterministic sandbox can't answer — the platform
+      // asserts that (assertHumanRoutes) before it sends the update.
+      if (name === 'confirm' && (!patch.confirm || typeof patch.confirm !== 'object'))
+        throw ApplicationFailure.nonRetryable('the Review route must be a confirm config', 'ParamLocked', name);
     }
   }
   /** Apply an already-validated patch to live state. `target` is re-read at PR/merge;
-   *  `agent:<role>` overrides are re-read when that role's turn runs. */
+   *  `agent:<role>` overrides are re-read when that role's turn runs; `confirm` is
+   *  re-read on every Review-gate iteration. */
   function applyParamPatch(patch: Record<string, unknown>): { applied: string[] } {
     const applied: string[] = [];
     if (typeof patch.target === 'string' && patch.target) {
       target = patch.target;
       applied.push('target');
+    }
+    if (patch.confirm && typeof patch.confirm === 'object') {
+      softwareDevConfirmLayers = confirmLayersOf(patch.confirm as ConfirmConfig);
+      confirmEpoch++;
+      applied.push('confirm');
     }
     for (const name of Object.keys(patch)) {
       const role = agentRoleOf(name);
@@ -1745,13 +1768,23 @@ async function softwareDevImpl(
       // would push a zero-/partial-work diff straight through to merge unseen: a stall
       // degrades to a single human gate. (In goal mode the loop above already
       // guarantees completed|raise here, so the guard changes no reachable goal path.)
-      const confirmLayers: ConfirmLayer[] = modeSwitching
-        ? (goalMode ? (turn.raise ? [{ kind: 'human', audience: ['@creator'] }] : []) : softwareDevConfirmLayers)
-        : softwareDevConfirmLayers;
-      const gates: ConfirmLayer[] = confirmLayers.length || turnFinished || turn.raise
-        ? confirmLayers : [{ kind: 'human', audience: ['@creator'] }];
+      // Recomputed on every iteration, never captured: the Review route is `untilUsed`,
+      // so an edit that lands while the gate is parked must take effect here.
+      const gatesNow = (): ConfirmLayer[] => {
+        const layers: ConfirmLayer[] = modeSwitching
+          ? (goalMode ? (turn.raise ? [{ kind: 'human', audience: ['@creator'] }] : []) : softwareDevConfirmLayers)
+          : softwareDevConfirmLayers;
+        return layers.length || turnFinished || turn.raise ? layers : [{ kind: 'human', audience: ['@creator'] }];
+      };
       let backToDo = false;
-      for (let li = 0; li < gates.length && !backToDo; li++) {
+      let li = 0;
+      while (!backToDo) {
+        // Snapshot the route's revision before parking; a bump means what we were
+        // playing is stale, so the gate replays from its first layer (partial approval
+        // under a route the user has since replaced is not credit worth keeping).
+        const epoch = confirmEpoch;
+        const gates = gatesNow();
+        if (li >= gates.length) break; // every layer approved (or the route is now empty)
         const layer = gates[li]!;
         const gateDetail = gates.length > 1 ? `confirm layer ${li + 1}/${gates.length}` : undefined;
         if (layer.kind === 'agent') {
@@ -1762,7 +1795,10 @@ async function softwareDevImpl(
           const decision = await confirmTurn(layer);
           waitingFor = undefined;
           if (cancelled) return await abort();
-          if (decision?.action === 'confirm') continue; // this layer approves → the next
+          // The route changed while this agent was reviewing — its verdict was about a
+          // gate that no longer exists, so replay rather than credit it.
+          if (confirmEpoch !== epoch) { li = 0; continue; }
+          if (decision?.action === 'confirm') { li++; continue; } // this layer approves → the next
           if (decision?.action === 'reject') {
             if (decision.text) msgs.push({ id: `cr-${msgs.length}`, role: 'system', text: `Confirm agent rejected the work: ${decision.text}`, ts: msgs.length });
             cancelled = true;
@@ -1779,18 +1815,25 @@ async function softwareDevImpl(
           // below so nothing is silently auto-confirmed.
         }
         // A human layer: wait for the Confirm click — one click passes ONE layer — or a
-        // follow-up, which sends the task back to Do.
+        // follow-up, which sends the task back to Do. A re-route also wakes us, so the
+        // newly named audience is who the task is actually shown as waiting on.
         waitingFor = { kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
-        await condition(() => confirmed || cancelled || msgs.length > seen);
+        await condition(() => confirmed || cancelled || msgs.length > seen || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return await abort();
+        if (confirmEpoch !== epoch) { li = 0; confirmed = false; continue; }
         if (!confirmed) backToDo = true; // follow-up arrived → back to Do
         confirmed = false; // consumed by this layer (a later layer needs its own click)
+        li++;
       }
       if (!backToDo) {
         confirmed = true; // every layer approved
+        // The route has now done its job for this task; freeze it (SPEC §4.5/§5.5).
+        // A gate that sent the task back to Do never reaches here, so a re-route
+        // stays possible for as long as another Review can still happen.
+        consumed.add('confirm');
         break;
       }
       stage = 'do';

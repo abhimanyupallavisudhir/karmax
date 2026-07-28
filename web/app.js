@@ -3831,7 +3831,7 @@ async function openTaskForm(workflow, draft, seedText) {
     const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
     if (row) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
-      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
   }
   // Image attachments for the full task form: pasting/dropping an image into any
@@ -6411,6 +6411,9 @@ function paramCurrentValue(f, v, rec) {
       return shared;
     }
   }
+  // The Review route belongs to the logical task: the intent's shared snapshot is
+  // the route actually in play, even when this attempt stored no override of its own.
+  if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
 function displayParam(f, val) {
@@ -6443,6 +6446,14 @@ function collectParamEdits(root, fields) {
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      // The Review route is sent whole (layers are atomic), not inherit-diffed —
+      // an in-flight edit is a concrete live value, not an overlay override.
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = { layers: readConfirmerLayers(box) };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -9375,6 +9386,27 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
   })));
 }
 
+/**
+ * Import a connector selection in batches, reporting progress as they land.
+ * Reading a secret out of a real store is expensive — a `pass` entry costs a
+ * GPG decrypt, and a whole tree takes minutes — so a single blocking request
+ * looks exactly like a dead button. Batching keeps the UI honest, commits what
+ * has been read so far, and lets the server skip entries that have not changed.
+ */
+async function importFromConnector(sync, externalIds, onProgress, batchSize = 25) {
+  const totals = { imported: 0, skipped: 0, failures: [], done: 0, total: externalIds.length };
+  for (let at = 0; at < externalIds.length; at += batchSize) {
+    onProgress?.(totals);
+    const result = await sync(externalIds.slice(at, at + batchSize));
+    totals.imported += result.count || 0;
+    totals.skipped += result.skipped || 0;
+    totals.failures.push(...(result.failures || []));
+    totals.done = Math.min(at + batchSize, externalIds.length);
+  }
+  onProgress?.(totals);
+  return totals;
+}
+
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
@@ -9587,20 +9619,29 @@ async function wireVaultCards(organizationId) {
     overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
     tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
     tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
-    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+    const go = overlay.querySelector('[data-imp-go]');
+    go.addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
       if (!externalIds.length) { toast('Select at least one', true); return; }
+      const sync = (batch) => api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+        externalIds: batch,
+        policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+        ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+      }) });
+      go.disabled = true;
       try {
-        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
-          externalIds,
-          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
-          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
-        }) });
-        toast(`Imported ${r.count} item(s)`);
+        const r = await importFromConnector(sync, externalIds, (p) => {
+          go.textContent = `Importing ${p.done}/${p.total}…`;
+          countEl.textContent = `· ${p.imported} imported${p.skipped ? `, ${p.skipped} unchanged` : ''}`;
+        });
+        const summary = [`Imported ${r.imported} item(s)`, r.skipped ? `${r.skipped} already up to date` : '',
+          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : ''].filter(Boolean).join(' · ');
+        toast(summary, r.failures.length > 0);
         close();
         renderItems();
         renderConnectors();
       } catch (e) { toast(e.message, true); }
+      finally { go.disabled = false; go.textContent = 'Import'; }
     });
   };
   box.querySelector('.vi-add').addEventListener('click', async () => {

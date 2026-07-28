@@ -57,9 +57,9 @@ describe('Bitwarden connector', () => {
 
   it('pulls secrets for selected items only', async () => {
     const c = new BitwardenConnector(() => 'sess', exec);
-    const pulled = await c.pull(['bw1']);
-    expect(pulled).toHaveLength(1);
-    expect(pulled[0]!.secrets).toEqual({ password: 'p@ss', totp: 'SEED234' });
+    const { items } = await c.pull(['bw1']);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.secrets).toEqual({ password: 'p@ss', totp: 'SEED234' });
   });
 });
 
@@ -74,7 +74,7 @@ describe('1Password connector', () => {
     const c = new OnePasswordConnector(() => 'tok', exec);
     expect((await c.describe()).available).toBe(true);
     expect((await c.list())[0]!.type).toBe('login');
-    const [pulled] = await c.pull(['op1']);
+    const [pulled] = (await c.pull(['op1'])).items;
     expect(pulled!.username).toBe('octo');
     expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: '123456' });
   });
@@ -98,7 +98,7 @@ describe('pass connector', () => {
       'pass show github.com': 'hunter2\nusername: alice\nsome random note\notpauth://totp/x?secret=SEED\nmore notes',
     });
     const c = new PassConnector(exec, root);
-    const [pulled] = await c.pull(['github.com']);
+    const [pulled] = (await c.pull(['github.com'])).items;
     expect(pulled!.secrets.password).toBe('hunter2');
     expect(pulled!.secrets.totp).toContain('otpauth://');
     // the notes/username lines are NOT stored as any secret field
@@ -110,7 +110,21 @@ describe('pass connector', () => {
       if (cmd === 'find') return found('x');
       throw new Error('gpg: decryption failed: No secret key');
     };
-    await expect(new PassConnector(exec, root).pull(['x'])).rejects.toThrow(/GPG key is locked/);
+    const { items, failures } = await new PassConnector(exec, root).pull(['x']);
+    expect(items).toEqual([]);
+    expect(failures).toEqual([{ externalId: 'x', error: expect.stringMatching(/GPG key is locked/) }]);
+  });
+  it('reports the entry that would not decrypt and keeps the rest of the batch (V)', async () => {
+    const exec: Exec = async (cmd, args) => {
+      if (cmd === 'find') return found('a.com', 'broken', 'b.com');
+      if (args[1] === 'broken') throw new Error('gpg: public key decryption failed: Operation cancelled');
+      return `pw-${args[1]}\n`;
+    };
+    const { items, failures } = await new PassConnector(exec, root).pull(['a.com', 'broken', 'b.com']);
+    expect(items.map((i) => i.externalId)).toEqual(['a.com', 'b.com']);
+    expect(items.map((i) => i.secrets.password)).toEqual(['pw-a.com', 'pw-b.com']);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.externalId).toBe('broken');
   });
   it('exposes folder + basename label for grouping in the import UI', async () => {
     const files = [path.join(root, 'alts', 'stackexchange.com.gpg'), path.join(root, 'email.com.gpg')].join('\0') + '\0';
@@ -143,7 +157,7 @@ describe('pass connector', () => {
     expect(listed.find((i) => i.externalId.includes('GITHUB_ACCESS'))).toMatchObject({
       domains: [],
     });
-    expect(await connector.pull(['software/www.overleaf.com/alice@example.com'])).toEqual([
+    expect((await connector.pull(['software/www.overleaf.com/alice@example.com'])).items).toEqual([
       expect.objectContaining({
         domains: ['www.overleaf.com'],
         username: 'alice@example.com',
@@ -166,7 +180,7 @@ describe('pass connector', () => {
     const connector = new PassConnector(exec, root);
 
     expect((await connector.list()).map((item) => item.externalId)).toEqual(['alts/real.md']);
-    const pulled = await connector.pull(['alts/ANON_POSTS.md', 'alts/real.md']);
+    const { items: pulled } = await connector.pull(['alts/ANON_POSTS.md', 'alts/real.md']);
     expect(pulled.map((item) => item.externalId)).toEqual(['alts/real.md']);
     expect(calls).not.toContain('pass show alts/ANON_POSTS.md');
   });
@@ -210,6 +224,119 @@ describe('Connectors sync into the vault (§9)', () => {
     const second = await connectors.sync('bitwarden', ['bw1']);
     expect(second.itemIds).toEqual(first.itemIds); // same item id, updated in place
     expect(items.list().filter((i) => i.provenance.externalId === 'bw1')).toHaveLength(1);
+  });
+
+  /** A `pass` store on disk + an exec that "decrypts" by reading the file, so
+   *  the mtime-based skip is exercised exactly as it runs against real GPG. */
+  function passStore() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pass-'));
+    fs.mkdirSync(path.join(dir, 'sites'));
+    const shown: string[] = [];
+    const undecryptable = new Set<string>();
+    const write = (id: string, body: string, mtime?: number) => {
+      fs.writeFileSync(path.join(dir, `${id}.gpg`), body);
+      if (mtime) fs.utimesSync(path.join(dir, `${id}.gpg`), new Date(mtime), new Date(mtime));
+    };
+    const exec: Exec = async (cmd, args) => {
+      if (cmd === 'find') return fs.readdirSync(path.join(dir, 'sites')).map((f) => path.join(dir, 'sites', f)).join('\0') + '\0';
+      if (cmd === 'pass' && args[0] === 'show') {
+        shown.push(args[1]!);
+        if (undecryptable.has(args[1]!)) throw new Error('gpg: public key decryption failed: Operation cancelled');
+        return fs.readFileSync(path.join(dir, `${args[1]}.gpg`), 'utf8');
+      }
+      throw new Error(`unexpected: ${[cmd, ...args].join(' ')}`);
+    };
+    return { dir, shown, write, undecryptable, connector: new PassConnector(exec, dir) };
+  }
+
+  it('re-importing a store re-reads only the entries that changed (V)', async () => {
+    const { shown, write, connector, dir } = passStore();
+    write('sites/a.com', 'pw-a');
+    write('sites/b.com', 'pw-b');
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+
+    const first = await connectors.sync('pass', ['sites/a.com', 'sites/b.com']);
+    expect(first.count).toBe(2);
+    expect(shown).toEqual(['sites/a.com', 'sites/b.com']);
+
+    // The user adds one password and clicks "select all" again: decrypting the
+    // whole store costs seconds per entry, so only the new one may be read.
+    shown.length = 0;
+    write('sites/c.com', 'pw-c');
+    const second = await connectors.sync('pass', ['sites/a.com', 'sites/b.com', 'sites/c.com']);
+    expect(shown).toEqual(['sites/c.com']);
+    expect(second).toMatchObject({ count: 1, skipped: 2 });
+    expect(items.list()).toHaveLength(3);
+    expect(connectors.config('pass').lastSync?.count).toBe(3); // the running total, not this batch
+    expect(items.resolveField(items.list().find((i) => i.provenance.externalId === 'sites/c.com')!, 'password', { mode: 'reveal' })).toBe('pw-c');
+
+    // …but an entry edited in `pass` afterwards is pulled again.
+    shown.length = 0;
+    write('sites/a.com', 'pw-a2', Date.now() + 5_000);
+    await connectors.sync('pass', ['sites/a.com', 'sites/b.com', 'sites/c.com']);
+    expect(shown).toEqual(['sites/a.com']);
+    expect(items.resolveField(items.list().find((i) => i.provenance.externalId === 'sites/a.com')!, 'password', { mode: 'reveal' })).toBe('pw-a2');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a policy edit on a mirrored item does not make it look up to date', async () => {
+    const { shown, write, connector } = passStore();
+    write('sites/a.com', 'pw-a');
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    const { itemIds } = await connectors.sync('pass', ['sites/a.com']);
+    write('sites/a.com', 'pw-a2', Date.now() + 5_000);
+    items.setPolicy(itemIds[0]!, { use: 'ask' }); // bumps updatedAt, NOT the mirror clock
+    shown.length = 0;
+    await connectors.sync('pass', ['sites/a.com']);
+    expect(shown).toEqual(['sites/a.com']);
+    expect(items.resolveField(items.get(itemIds[0]!)!, 'password', { mode: 'reveal' })).toBe('pw-a2');
+  });
+
+  it('items mirrored before the mirror clock existed are not re-read either', async () => {
+    const { shown, write, connector } = passStore();
+    write('sites/a.com', 'pw-a', Date.now() - 60_000);
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    // A pre-upgrade import: provenance carries no syncedAt.
+    items.save({ type: 'login', label: 'sites/a.com', secrets: { password: 'pw-a' },
+      provenance: { source: 'connector:pass', externalId: 'sites/a.com' } });
+
+    const result = await connectors.sync('pass', ['sites/a.com']);
+    expect(shown).toEqual([]);
+    expect(result.skipped).toBe(1);
+  });
+
+  it('one undecryptable entry no longer discards the whole import (V)', async () => {
+    const { write, connector, dir, undecryptable } = passStore();
+    write('sites/a.com', 'pw-a');
+    write('sites/b.com', 'pw-b');
+    write('sites/c.com', 'pw-c');
+    undecryptable.add('sites/b.com');
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+
+    const result = await connectors.sync('pass', ['sites/a.com', 'sites/b.com', 'sites/c.com']);
+    expect(result.count).toBe(2);
+    expect(result.failures.map((f) => f.externalId)).toEqual(['sites/b.com']);
+    expect(items.list().map((i) => i.provenance.externalId)).toEqual(['sites/a.com', 'sites/c.com']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('still explains itself when nothing at all could be pulled', async () => {
+    const exec: Exec = async (cmd) => {
+      if (cmd === 'find') return `${path.join(os.tmpdir(), 'password-store', 'x.gpg')}\0`;
+      throw new Error('gpg: decryption failed: No secret key');
+    };
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new PassConnector(exec, path.join(os.tmpdir(), 'password-store')));
+    await expect(connectors.sync('pass', ['x'])).rejects.toThrow(/GPG key is locked/);
   });
 
   it('import options apply the chosen policy + write-back to NEW items only', async () => {
