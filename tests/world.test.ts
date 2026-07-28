@@ -1,9 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { WorktreeProvider } from '../src/world/worktree.js';
+import { World } from '../src/world/types.js';
 import { git, gitOrThrow, currentBranch, ensureIdentity } from '../src/world/git.js';
+import { withWorktreeLock } from '../src/world/worktree-lock.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
@@ -212,5 +214,38 @@ describe('WorktreeProvider (real git)', () => {
     const others = await git(world.handle.root, ['ls-files', '--others', '--exclude-standard']);
     expect(others.stdout).not.toContain('.env');
     await world.destroy();
+  });
+
+  /**
+   * Releasing a world must not take an arriving world's git plumbing with it.
+   * Every task in a project branches off the SAME origin repo, so every world
+   * contends for one recycled `<origin>/.git/worktrees/<basename><n>` name
+   * sequence — see src/world/worktree-lock.ts for how a release then deletes a
+   * newcomer's admin dir, silently leaving it unable to commit or merge.
+   * Both halves must therefore hold the repo's worktree lock.
+   */
+  it('creates a world only while holding the repo\'s worktree lock', async () => {
+    const provider = new WorktreeProvider(home);
+    let created = false;
+    let creating!: Promise<World>;
+    await withWorktreeLock(repo, async () => {
+      creating = provider.create({ taskId: 'arriving', repo, base: 'main', target: 'main' })
+        .then((world) => { created = true; return world; });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(created, 'world creation ran its `worktree add` while another holder had the lock').toBe(false);
+    });
+    await (await creating).destroy();
+  });
+
+  it('releases a world only while holding the repo\'s worktree lock', async () => {
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'leaving', repo, base: 'main', target: 'main' });
+    let released = false;
+    await withWorktreeLock(repo, async () => {
+      void world.destroy().then(() => { released = true; });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(released, 'world release ran its `worktree remove` while another holder had the lock').toBe(false);
+    });
+    await vi.waitFor(() => expect(released).toBe(true));
   });
 });
