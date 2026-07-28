@@ -1553,3 +1553,15 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .info-dot:hover { color: var(--accent); }
 .vault-custom summary { color: var(--ink-2); font-size: 13px; }
 .vault-custom summary:hover { color: var(--ink); }
+
+/* Live-socket gap. The console is websocket-driven, so when the socket is down
+   the page is frozen rather than empty — say so instead of showing stale state
+   as if it were current. Reuses the "waiting" tone, not an error tone: nothing
+   has failed, updates are just paused. */
+.ws-offline {
+  display: inline-flex; align-items: center; font-size: 11px; font-weight: 600;
+  padding: 3px 10px; border-radius: 999px; margin-right: 8px;
+  background: var(--working-weak); color: var(--working);
+}
+@media (max-width: 640px) { .ws-offline { font-size: 0; padding: 5px; }
+  .ws-offline::before { content: "⟳"; font-size: 12px; } }

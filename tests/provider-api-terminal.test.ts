@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
-import { ProviderFailure } from '../src/agent/limits.js';
+import { ProviderFailure, isTransportError } from '../src/agent/limits.js';
 
 const world: any = { handle: { id: 'w', root: '/tmp', branch: 'task', base: 'main' } };
 const messages: any[] = [{ id: 'm', role: 'user', text: 'do the task', ts: 0 }];
@@ -65,7 +65,7 @@ describe('metered provider API terminal outcomes', () => {
     expect(turn.termination).toEqual({ kind: 'success', status: 'completed' });
   });
 
-  it('rejects an OpenAI incomplete response even when it contains partial text', async () => {
+  it('rejects an OpenAI incomplete response even when it contains partial text, retryably', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -76,6 +76,18 @@ describe('metered provider API terminal outcomes', () => {
     await expect(new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'o', provider: 'codex', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
-    } as any, ctx)).rejects.toThrow(/status=incomplete.*max_output_tokens/i);
+    } as any, ctx)).rejects.toThrow(/max_output_tokens/i);
+
+    // The load-bearing guarantee is unchanged: a partial response is NEVER
+    // returned as a successful turn. What changed is the classification — an
+    // output-boundary stop is now phrased as a resumable interruption so it
+    // retries and resumes the response chain, instead of escalating to a human
+    // the way it used to. ACP and both Claude paths already behaved this way.
+    const err: Error = await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'o', provider: 'codex', role: 'do', capabilities: [] },
+      world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
+    } as any, ctx).catch((e) => e);
+    expect(err.message).not.toContain('partial');
+    expect(isTransportError(err.message)).toBe(true);
   });
 });

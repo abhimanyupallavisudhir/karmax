@@ -67,6 +67,26 @@ describe('cron parsing + next-fire (UTC)', () => {
     expect(new Date(next!).toISOString()).toBe('2026-01-05T08:00:00.000Z');
   });
 
+  it('arms a Feb-29 cron that is years away, instead of silently never firing', () => {
+    // Regression: the search horizon was 366 days, so every `* * 29 2 *` returned
+    // undefined. TriggerScheduler.armCron's undefined branch sets no timer at all,
+    // so the task stayed "armed" forever and never ran.
+    const next = nextCronFire('0 0 29 2 *', at('2026-07-27T00:00:00Z'));
+    expect(new Date(next!).toISOString()).toBe('2028-02-29T00:00:00.000Z');
+    // The worst legal gap is a century non-leap year: 2096 → 2104.
+    const century = nextCronFire('0 0 29 2 *', at('2096-03-01T00:00:00Z'));
+    expect(new Date(century!).toISOString()).toBe('2104-02-29T00:00:00.000Z');
+  });
+
+  it('rejects a parseable but impossible cron rather than arming a dead task', () => {
+    // Feb 30 never occurs. It used to validate fine and then never fire.
+    expect(nextCronFire('0 0 30 2 *', at('2026-01-01T00:00:00Z'))).toBeUndefined();
+    expect(validateTriggers([{ kind: 'schedule', cron: '0 0 30 2 *' } as TaskTrigger]))
+      .toEqual([expect.stringContaining('never occurs')]);
+    // A far-future-but-real schedule must still validate.
+    expect(validateTriggers([{ kind: 'schedule', cron: '0 0 29 2 *' } as TaskTrigger])).toEqual([]);
+  });
+
   it('ORs day-of-month and day-of-week when both are set (standard cron rule)', () => {
     // "0 0 13 * 5" = midnight on the 13th OR any Friday.
     const next = nextCronFire('0 0 13 * 5', at('2026-02-01T00:00:00Z')); // Feb 1 2026 is a Sunday

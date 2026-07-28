@@ -185,10 +185,19 @@ async function main() {
     return user ? { id: user.id, name: user.name, email: user.email } : undefined;
   });
   worlds.setHandleResolver((handle) => store.currentWorld(handle.id) as import('./world/types.js').WorldHandle | undefined);
+  // Rebuild a world from its last checkpoint ONLY when the provider has genuinely
+  // lost the sandbox. Restoring replays just the dirty delta captured at the last
+  // park, so doing it after a *transient* control-plane error (a 5xx, a rate limit,
+  // a socket timeout) would silently discard everything the agent has done since
+  // then. The probe gate is the whole safety property — see the matching gate in
+  // activities/core.ts (recoverVanishedWorld). Providers with no probe (the local
+  // worktree) return undefined and are therefore never rolled back.
   worlds.setRecoveryHandler(async (handle) => {
     if (store.worldState(handle.id) === 'released') return undefined;
     const checkpoint = store.latestWorldCheckpoint(handle.id);
     if (!checkpoint) return undefined;
+    const state = await worlds.probe(handle).catch(() => undefined);
+    if (state !== 'missing') return undefined; // transient/parked → keep the original error
     store.setWorldState((store.currentWorld(handle.id) ?? handle) as import('./world/types.js').WorldHandle, 'degraded');
     return checkpoints.restore(checkpoint.id, handle.kind);
   });

@@ -935,7 +935,9 @@ export class Gateway {
         } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
       }
       if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
-      if (this.deps.password && b.password === this.deps.password) {
+      // Constant-time, like the Stripe webhook and the agent-mail ingest secret:
+      // this compares a shared secret on an unauthenticated route.
+      if (this.deps.password && timingSafeEqualStr(String(b.password ?? ''), this.deps.password)) {
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
       }
@@ -3325,6 +3327,18 @@ export class Gateway {
             });
           } else {
             // Rotation of a foreign item: allowed iff the task's grant covers it.
+            //
+            // INTENDED: this is gated on the *use* grant, deliberately NOT on the
+            // item's `reveal` policy — so a use-only task may rotate an item whose
+            // policy is `reveal: 'never'`, and thereby know the value it just set.
+            // That looks like a hole but the alternative is worse: an agent that
+            // changes a password on a live site and then cannot write it back
+            // leaves the vault holding a stale value and locks everyone out. Note
+            // the "leaked" secret is one the agent chose, not one it learned, and
+            // it is only a working credential if the agent really did change the
+            // site — otherwise it has merely desynced the vault, which the audit
+            // record below makes visible. Availability wins here; don't "fix" it
+            // by gating on reveal.
             if (!vault.covered(caps, callerTaskId, prior!))
               return this.json(res, 403, { error: 'this task was not granted this credential — request_credential first, or create your own item' });
             const secretFields = Object.keys(b.secrets ?? {});

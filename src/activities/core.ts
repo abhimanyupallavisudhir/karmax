@@ -531,6 +531,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   // ensureRunnerLease) transparently uses it.
   async function recoverVanishedWorld(handle: WorldHandle, taskId: string, cause: unknown): Promise<World | undefined> {
     if (!isRemote(handle.kind) || !deps.checkpoints) return undefined;
+    // A finished task's world is deliberately gone. Without this guard a stray
+    // open on a released handle (a retried activity, a late artifact fetch, an
+    // MCP call holding the old handle) would probe 'missing' — correctly, it was
+    // destroyed — and re-provision a fresh billable sandbox for a done task.
+    if (store.worldState(handle.id) === 'released') return undefined;
     const checkpointId = handle.checkpointId ?? (store.currentWorld(handle.id) as WorldHandle | undefined)?.checkpointId;
     if (!checkpointId) return undefined;
     const state = await worlds.probe(handle).catch(() => undefined);
