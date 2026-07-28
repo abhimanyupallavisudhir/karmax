@@ -4709,7 +4709,7 @@ function renderTaskPage() {
             ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
-          ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
+          ${mergeQueueBadge(v)}
           ${pullRequestLinks(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
@@ -6703,6 +6703,21 @@ async function seedQueue() {
   if (S.tab === 'queue') renderMain();
 }
 
+// The merge-queue badge for a task header. A coordinator that cannot be queried
+// reports position -1 / total 0, and printing those numbers renders a wedged
+// domain as "queue #-1/0" — indistinguishable from an empty queue, and the exact
+// misreading that let #345 sit in `merge` for 11 hours while it looked like
+// nothing was queued at all. Say "unreachable" rather than quote a total we
+// never actually learned.
+function mergeQueueBadge(v) {
+  const q = v.mergeQueue;
+  if (!q) return '';
+  if (q.unreachable) {
+    return `<span style="color:var(--danger)" title="The merge-queue coordinator for this domain did not answer. It is wedged or has not started; this task keeps waiting for a grant that may never arrive.">queue unreachable</span>`;
+  }
+  return `<span>queue #${q.position}/${q.total}</span>`;
+}
+
 // Rank a task within its domain: the leased (merging) task pins to the top, then the
 // coordinator's queue order when known, else the task's last-published position.
 function queueRank(t) {
@@ -6738,7 +6753,7 @@ function mergeQueuePanel() {
           return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
         ${canMove ? `<div class="queue-actions"><button class="btn sm" data-move="top" data-id="${t.id}" data-domain="${esc(domain)}">Move to top</button><button class="btn sm" data-move="bottom" data-id="${t.id}" data-domain="${esc(domain)}">Move to bottom</button></div>` : ''}
       </div>`;

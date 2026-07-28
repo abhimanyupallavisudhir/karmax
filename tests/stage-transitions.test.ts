@@ -90,7 +90,7 @@ describe('task stage transitions', () => {
 
     const restored = await f.api.moveTaskStage(f.token, f.task.id, 'do');
     expect(f.starts).toHaveLength(1);
-    expect(f.starts[0]!.type).toBe('softwareDev@1.8.0');
+    expect(f.starts[0]!.type).toBe('softwareDev@1.9.0');
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', messages: f.view.messages });
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
   });
@@ -173,7 +173,7 @@ describe('task stage transitions', () => {
 
     await f.api.changeWorkflow(f.token, f.task.id, 'goal');
 
-    expect(f.starts.at(-1)!.type).toBe('goal@1.8.0');
+    expect(f.starts.at(-1)!.type).toBe('goal@1.9.0');
     expect(f.starts.at(-1)!.options.args[0]).toMatchObject({ recovery: { resumeStage: 'do' } });
     expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1).text).toMatch(/continue autonomously/i);
     expect(f.store.getTask(f.task.id)?.workflow).toBe('goal');
@@ -199,6 +199,31 @@ describe('task stage transitions', () => {
     expect(held?.actions[0]?.roles).toEqual(['merge']);
     await expect(f.api.signalTask(f.token, f.task.id, 'followUp', 'wrong agent', 'do'))
       .rejects.toThrow(/waiting on the merge agent/i);
+  });
+
+  it('falls back to the Do conversation when the held stage never ran an agent', async () => {
+    // Task #350 was paused during `merge` while still queued for its slot, so the
+    // merge agent had never run and there was no merge transcript. The hold then
+    // resolved to no conversation at all: `followUp` was filtered out and nothing
+    // spliced back, leaving a task with 13 hours of Do context and no way to say
+    // anything to it — Cancel was the only action. Do always exists once a task
+    // has worked, and it owns the context the follow-up is about.
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'merge',
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      transcripts: [{ role: 'do', label: 'Do agent', messages: f.view.messages }],
+      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true }],
+      state: { ...f.view.state, humanPauseOrigin: 'merge' },
+    });
+
+    const held = await f.api.getTaskView(f.token, f.task.id);
+    expect(held?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
+    expect(held?.actions[0]?.roles).toEqual(['do']);
+    await expect(f.api.signalTask(f.token, f.task.id, 'followUp', 'redirect this', 'do'))
+      .resolves.toBeDefined();
   });
 
   it('does not advertise a lossy human hold from the internal Resolve frame', async () => {

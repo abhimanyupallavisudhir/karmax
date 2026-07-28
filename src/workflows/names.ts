@@ -48,6 +48,7 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.softwareDev, '1.6.0'),
   qualifiedType(WF.softwareDev, '1.7.0'),
   qualifiedType(WF.softwareDev, '1.8.0'),
+  qualifiedType(WF.softwareDev, '1.9.0'),
   qualifiedType(WF.justDo, '1.0.0'),
   qualifiedType(WF.justDo, '1.1.0'),
   qualifiedType(WF.justDo, '1.2.0'),
@@ -62,11 +63,13 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.goal, '1.6.0'),
   qualifiedType(WF.goal, '1.7.0'),
   qualifiedType(WF.goal, '1.8.0'),
+  qualifiedType(WF.goal, '1.9.0'),
   qualifiedType(WF.mergeOnly, '1.0.0'),
   qualifiedType(WF.mergeOnly, '1.1.0'),
   qualifiedType(WF.mergeOnly, '1.2.0'),
   qualifiedType(WF.mergeOnly, '1.3.0'),
   qualifiedType(WF.mergeOnly, '1.4.0'),
+  qualifiedType(WF.mergeOnly, '1.5.0'),
 ]);
 
 /**

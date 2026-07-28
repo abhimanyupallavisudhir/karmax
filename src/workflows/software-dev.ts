@@ -39,7 +39,7 @@ import {
   SubTaskResponse,
   TaskPullRequest,
 } from './contract.js';
-import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider, samePosition, MERGE_POLL } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
@@ -240,13 +240,27 @@ export async function softwareDevV1_8(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.8.0');
 }
 
+/** A task parked in a merge queue no longer republishes its whole view every
+ *  five seconds — see `boundedMergeWait`. */
+export async function softwareDevV1_9(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.9.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0';
+
+/** The minor of a behavior version. Every feature gate below is a `>=` test on
+ * this rather than a list of versions to remember to extend, for the same
+ * reason `childWorkflowType` is: a newly bundled version is then correct by
+ * construction instead of needing an edit nobody would notice was missing. */
+function behaviorMinor(behaviorVersion: BehaviorVersion): number {
+  return Number(behaviorVersion.split('.')[1] ?? 0);
+}
 
 /**
  * The workflow type a sub-task child is started as. From 1.5.0 on a child
@@ -267,18 +281,25 @@ async function softwareDevImpl(
   input: SoftwareDevInput,
   behaviorVersion: BehaviorVersion,
 ): Promise<{ stage: Stage; sha?: string }> {
+  const minor = behaviorMinor(behaviorVersion);
   const liveAgentStates = behaviorVersion !== '1.0.0';
-  const providerTerminalCompletion =
-    ['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion);
-  const modeSwitching = ['1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion);
-  const durableAgentAdmission = ['1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion);
-  const responsiveHumanHold = behaviorVersion === '1.7.0' || behaviorVersion === '1.8.0';
+  const providerTerminalCompletion = minor >= 2;
+  const modeSwitching = minor >= 3;
+  const durableAgentAdmission = minor >= 4;
+  const responsiveHumanHold = minor >= 7;
   // New activity calls in an existing stage would break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
-  const githubPrLifecycle = behaviorVersion === '1.8.0';
-  const agentTurns = ['1.6.0', '1.7.0', '1.8.0'].includes(behaviorVersion)
-    ? cancellationAwareTurns
-    : turns;
+  const githubPrLifecycle = minor >= 8;
+  // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
+  // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
+  // republished the entire TaskView (messages + every agent transcript) every
+  // 5s. Temporal caps a workflow's history at 50MB, so a task queued behind a
+  // slow or wedged coordinator accumulated its way to a hard TERMINATE in a few
+  // hours — the queue stall silently became permanent task death. The grant
+  // still arrives by signal, which wakes the condition immediately, so a longer
+  // poll costs no latency; it only refreshes the displayed position.
+  const boundedMergeWait = minor >= 9;
+  const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
   const recovery = input.recovery;
   const recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
@@ -1928,9 +1949,15 @@ async function softwareDevImpl(
       await coord.enqueueMerge(domain, taskId);
       // Wait for this domain's grant; allow cancel only before it.
       while (!mergeGranted && !cancelled) {
-        mergeQueuePos = await coord.mergeQueuePosition(domain, taskId);
-        await publish();
-        await condition(() => mergeGranted || cancelled, '5s');
+        const pos = await coord.mergeQueuePosition(domain, taskId);
+        // Republish only on an actual change: the view carries every message and
+        // transcript, so an unconditional publish per tick is what pushed a long
+        // wait into Temporal's history-size limit (see `boundedMergeWait`).
+        if (!boundedMergeWait || !samePosition(pos, mergeQueuePos)) {
+          mergeQueuePos = pos;
+          await publish();
+        }
+        await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
       }
       if (cancelled && !mergeGranted) {
         await coord.cancelMerge(domain, taskId); // drop the slot we're still waiting on

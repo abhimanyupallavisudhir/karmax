@@ -8,6 +8,7 @@ import {
   softwareDevV1_6,
   softwareDevV1_7,
   softwareDevV1_8,
+  softwareDevV1_9,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -56,6 +57,12 @@ export async function goalV1_7(input: TaskInput): Promise<{ stage: Stage; sha?: 
 /** Full GitHub pull-request lifecycle under remote policy 'pr'. */
 export async function goalV1_8(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_8({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** A task parked in a merge queue no longer republishes its whole view every
+ *  five seconds. */
+export async function goalV1_9(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_9({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

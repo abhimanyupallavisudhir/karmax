@@ -84,10 +84,19 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signalArgs: [{ taskId }],
       });
     },
+    /** Where `taskId` sits in `domain`'s queue.
+     *
+     * A failed query means the coordinator could not answer — it is wedged
+     * (a nondeterministic workflow task retries forever, and queries against it
+     * never resolve), or it has not started yet. That is NOT the same as an
+     * empty queue, and reporting it as one is actively misleading: a task can
+     * then sit in `merge` for hours while every surface says the queue is
+     * empty. `unreachable` keeps the two distinguishable all the way to the UI.
+     */
     async mergeQueuePosition(
       domain: string,
       taskId: string,
-    ): Promise<{ position: number; total: number; current?: string }> {
+    ): Promise<{ position: number; total: number; current?: string; unreachable?: boolean }> {
       try {
         const view = (await client.workflow
           .getHandle(mergeQueueId(domain))
@@ -95,9 +104,26 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         const total = view.queue.length + (view.current ? 1 : 0);
         if (view.current === taskId) return { position: 0, total, current: view.current };
         const idx = view.queue.indexOf(taskId);
-        return { position: idx < 0 ? -1 : idx + 1, total, current: view.current };
+        if (idx < 0) {
+          // We are polling for a slot in a queue that has never heard of us: the
+          // enqueue was lost because the coordinator was rebuilt (see
+          // `healCoordinators`) or reset underneath us. Waiting on a grant that
+          // is never coming is exactly how a task burns its history down to a
+          // hard TERMINATE, so re-enqueue instead. The coordinator ignores a
+          // taskId it already has, making this idempotent — including on a first
+          // poll that races ahead of our own enqueue being applied.
+          await client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
+            workflowId: mergeQueueId(domain),
+            taskQueue,
+            args: [{ domain }],
+            signal: SIG_ENQUEUE,
+            signalArgs: [{ taskId }],
+          });
+          return { position: view.queue.length + 1, total: total + 1, current: view.current };
+        }
+        return { position: idx + 1, total, current: view.current };
       } catch {
-        return { position: -1, total: 0 };
+        return { position: -1, total: 0, unreachable: true };
       }
     },
     /** Crash-safety check: is the grantee workflow still running? */
