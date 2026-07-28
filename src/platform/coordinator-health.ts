@@ -75,14 +75,35 @@ const SPECS: Record<string, CoordinatorSpec> = {
 };
 
 /**
+ * Does this error say that current code cannot replay recorded history?
+ *
+ * Answering a query means replaying the whole history, so a query that comes
+ * back with a nondeterminism error has already proved the divergence — even
+ * though nothing has failed a workflow task yet. That distinction is not
+ * academic: a coordinator parked in `condition()` executes no workflow task
+ * until something signals it, so its last recorded task is a *completed* one
+ * and a history-only verdict calls it healthy right up until the moment it
+ * wedges for real. The GitHub merge domain was in exactly that latent state
+ * while `master` had already wedged hard.
+ *
+ * Matching on the message keeps this narrow: an unregistered query name or a
+ * transport blip does not mention nondeterminism, and so still cannot trigger a
+ * destructive rebuild.
+ */
+function isReplayFailure(error: unknown): boolean {
+  return /TMPRL1100|non-?determin/i.test(
+    error instanceof Error ? error.message : String(error ?? ''),
+  );
+}
+
+/**
  * Is this execution unable to replay its own history?
  *
- * A query can fail for boring reasons (the query name isn't registered, a
- * transient transport error), and rebuilding on those would be destructive. So
- * the verdict comes from the workflow's own history rather than the query error:
- * scan back to the most recent workflow task and see how it ended. A
- * `WorkflowTaskFailed` carrying a nondeterminism error means today's code cannot
- * replay what was recorded, and Temporal retries that task forever — the
+ * The complement of `isReplayFailure`: a query can fail for boring reasons, so
+ * when the error itself is not diagnostic the verdict comes from the workflow's
+ * own history. Scan back to the most recent workflow task and see how it ended.
+ * A `WorkflowTaskFailed` carrying a nondeterminism error means today's code
+ * cannot replay what was recorded, and Temporal retries that task forever — the
  * coordinator can neither act nor answer. A `WorkflowTaskCompleted` first means
  * it is making progress and the query failure was something else.
  */
@@ -134,18 +155,23 @@ export async function healCoordinators(
 
     for (const { workflowId, runId } of running) {
       result.checked++;
+      let queryError: unknown;
       try {
         await withTimeout(client.workflow.getHandle(workflowId, runId).query(spec.query), PROBE_TIMEOUT_MS);
         continue; // answered — healthy
-      } catch {
-        // fall through to classification
+      } catch (e) {
+        queryError = e;
       }
 
-      let wedged = false;
-      try {
-        wedged = await isUnreplayable(client, workflowId, runId);
-      } catch {
-        continue; // couldn't classify — never rebuild on a guess
+      // The query error is conclusive when it names the divergence itself;
+      // otherwise fall back to what the history recorded.
+      let wedged = isReplayFailure(queryError);
+      if (!wedged) {
+        try {
+          wedged = await isUnreplayable(client, workflowId, runId);
+        } catch {
+          continue; // couldn't classify — never rebuild on a guess
+        }
       }
       if (!wedged) continue;
 

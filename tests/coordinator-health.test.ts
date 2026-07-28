@@ -16,8 +16,9 @@ const NONDET = '[TMPRL1100] Nondeterminism error: Activity machine does not hand
 
 interface FakeOpts {
   running: Record<string, { workflowId: string; runId?: string }[]>;
-  /** Query outcome per workflowId: 'ok' answers, 'fail' throws. */
-  query: Record<string, 'ok' | 'fail'>;
+  /** Query outcome per workflowId: 'ok' answers, 'fail' throws a generic
+   *  error, 'fail-nondet' throws the replay error a divergent query returns. */
+  query: Record<string, 'ok' | 'fail' | 'fail-nondet'>;
   /** Last workflow-task event per workflowId. */
   history: Record<string, 'failed-nondet' | 'failed-other' | 'completed' | 'none'>;
 }
@@ -46,7 +47,9 @@ function fakeClient(opts: FakeOpts) {
       getHandle(workflowId: string, runId?: string) {
         return {
           async query() {
-            if (opts.query[workflowId] === 'ok') return { queue: [], current: undefined };
+            const mode = opts.query[workflowId];
+            if (mode === 'ok') return { queue: [], current: undefined };
+            if (mode === 'fail-nondet') throw new Error(NONDET);
             throw new Error('Unable to query workflow due to Workflow Task in failed state');
           },
           async fetchHistory() { return historyFor(workflowId); },
@@ -95,6 +98,26 @@ describe('healCoordinators', () => {
 
     // A replacement started concurrently must never be the run we kill.
     expect(f.terminated[0]?.runId).toBe('run-abc');
+  });
+
+  it('catches a latent wedge whose last workflow task still completed', async () => {
+    // Found by running the classifier against the live incident: the GitHub
+    // merge domain answered queries with TMPRL1100 while its most recent
+    // workflow task had *completed*, because a coordinator parked in
+    // `condition()` executes no task until something signals it. A
+    // history-only verdict calls that healthy right up to the moment it wedges
+    // hard — so the query error, when it names the divergence, is conclusive.
+    const f = fakeClient({
+      running: { mergeQueue: [{ workflowId: MQ_ID, runId: 'run-latent' }] },
+      query: { [MQ_ID]: 'fail-nondet' },
+      history: { [MQ_ID]: 'completed' },
+    });
+
+    const health = await healCoordinators(f.client, 'karmax');
+
+    expect(health.wedged).toEqual([MQ_ID]);
+    expect(health.rebuilt).toEqual([MQ_ID]);
+    expect(f.terminated).toEqual([{ workflowId: MQ_ID, runId: 'run-latent' }]);
   });
 
   it('leaves a healthy coordinator alone', async () => {
