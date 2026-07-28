@@ -40,6 +40,7 @@ export { softwareDevV1_5 as 'softwareDev@1.5.0' } from './software-dev.js';
 export { softwareDevV1_6 as 'softwareDev@1.6.0' } from './software-dev.js';
 export { softwareDevV1_7 as 'softwareDev@1.7.0' } from './software-dev.js';
 export { softwareDevV1_8 as 'softwareDev@1.8.0' } from './software-dev.js';
+export { softwareDevV1_9 as 'softwareDev@1.9.0' } from './software-dev.js';
 export { justDoV1 as 'justDo@1.0.0' } from './just-do.js';
 export { justDo as 'justDo@1.1.0' } from './just-do.js';
 export { justDoV1_2 as 'justDo@1.2.0' } from './just-do.js';

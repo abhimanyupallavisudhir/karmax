@@ -385,6 +385,12 @@ export interface ProjectConfig {
    * happens only when a task explicitly asks its agent to push.
    */
   remote?: RemotePolicy;
+  /** Allow one task to partition its change across several branches, each landing
+   *  as its own pull request (SPEC §11.1, the agent's `create_branch`). Its only
+   *  structural effect is that the world nests its checkouts at Setup, so a
+   *  branch added later has somewhere to live inside the world boundary; the
+   *  task's lifecycle stays singular (one Review, one Merge). */
+  multiPr?: boolean;
   /** Named git identity/credentials (an organization-owned GitProfile)
    *  this project's worlds commit and push as. Absent ⇒ the organization default
    *  profile. Only the migrated personal organization may fall back to the
@@ -549,6 +555,27 @@ export function remotePolicyOf(project: ProjectConfig | undefined): RemotePolicy
 /** A GitHub pull request karmax opened for one repo of a task's world. The
  *  slug/number pair is what every later lifecycle call (comment, close, state
  *  re-read) needs, so it travels on the task view rather than being re-derived. */
+/**
+ * One branch of a task, as the task view shows it (SPEC §11.1). A single-branch
+ * task has exactly one; a multi-PR task has one per pull request it is opening.
+ * `approved` is bound to `head`: it lapses whenever the branch moves, so partial
+ * Review approval can never carry over onto work nobody looked at.
+ */
+export interface TaskCheckout {
+  /** World-unique name: its directory, and the label on its pull request. */
+  name: string;
+  branch: string;
+  base: string;
+  target?: string;
+  /** Head commit of the branch when the view was built. */
+  head?: string;
+  /** Approved at exactly `head` (Review). */
+  approved?: boolean;
+  /** Name of the sibling checkout this one is stacked on, if any. */
+  stackedOn?: string;
+  pr?: TaskPullRequest;
+}
+
 export interface TaskPullRequest {
   /** World repo name the PR belongs to (multi-repo tasks open one per repo). */
   repo: string;
@@ -1110,6 +1137,9 @@ export interface TaskView {
    *  repo's, which for a single-repo task is the same one. */
   pr?: TaskPullRequest;
   prs?: TaskPullRequest[];
+  /** Every branch this task is opening a pull request for (SPEC §11.1). Present
+   *  only for a multi-PR task; a single-branch task keeps `branch`/`prs` alone. */
+  checkouts?: TaskCheckout[];
   mergeQueue?: { position: number; total: number };
   subTasks?: string[];
   parentTaskId?: string;
@@ -1245,6 +1275,10 @@ export interface TaskRecoveryCheckpoint {
   resumeStage?: Stage;
   /** Start parked for a human, retaining `resumeStage` as the return route. */
   pausedForHuman?: boolean;
+  /** Multi-PR Review approvals (checkout name -> approved head sha). Carried so a
+   *  replacement execution does not make a human re-approve branches nothing has
+   *  touched; an approval whose branch moved lapses on its own either way. */
+  checkoutApprovals?: Record<string, string>;
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

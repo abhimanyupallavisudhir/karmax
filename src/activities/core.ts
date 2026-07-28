@@ -223,6 +223,9 @@ export interface CreateWorldArgs {
   branch?: string;
   resetBranch?: boolean;
   copyGlobs?: string[];
+  /** Multi-PR task: nest the checkouts so branches added later have somewhere
+   *  to live inside the world boundary (SPEC §11.1). */
+  multiPr?: boolean;
   kind: WorldKind;
   /** The project's git profile selection (PLAN-git-config.md §3); the activity
    *  resolves it (project → global default) and materializes identity/signing. */
@@ -694,6 +697,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           repo: worldSources.length === 1 ? worldSources[0] : undefined,
           repos: worldSources.length > 1 ? worldSources : undefined,
           scratch: developmentSources.length === 0,
+          ...(args.multiPr ? { layout: 'nested' as const } : {}),
           base: args.base,
           target: args.target,
           branch: args.branch,
@@ -1601,6 +1605,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         );
       }
 
+      // A branch the agent added with `create_branch` exists on disk now, but the
+      // DURABLE handle is what merge, the PR stage and check-in re-open the world
+      // from — so persist it here as well as returning it for the workflow to
+      // adopt. Recorded before the turn result is consumed, so a checkout can
+      // never be live on disk yet invisible to the stages that must land it.
+      if (result.worldHandle?.repos?.length) {
+        try {
+          store.updateWorldCheckouts(args.worldHandle, result.worldHandle.repos);
+          record(args.taskId, 'world.checkout_added', {
+            checkouts: result.worldHandle.repos.map((repo) => ({ name: repo.name, branch: repo.branch, base: repo.base })),
+          });
+        } catch (error) {
+          // A stale generation means this turn's world was already replaced; the
+          // branch belongs to a world nobody will merge, so say so rather than
+          // failing a turn whose actual work succeeded.
+          record(args.taskId, 'world.checkout_orphaned', { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       if (result.skills?.length) {
         for (const s of result.skills) record(args.taskId, 'skill.saved', { name: s.name });
       }
@@ -1746,6 +1769,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     },
 
+    /**
+     * Head commit of every checkout in the world, keyed by checkout name.
+     *
+     * Review approval for a multi-PR task is bound to `(checkout, head sha)`
+     * (PLAN-multi-pr.md §3), so the gate needs the heads to tell an approval that
+     * still stands from one the Do agent has since invalidated. A branch whose
+     * head cannot be read is simply absent, which the domain helpers treat as
+     * unapproved — the gate fails closed rather than passing by omission.
+     */
+    async checkoutHeads(handle: WorldHandle): Promise<Record<string, string>> {
+      const world = await openWorld(handle);
+      const heads: Record<string, string> = {};
+      for (const repo of worldRepos(world.handle)) {
+        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root }).catch(() => undefined);
+        if (head?.code === 0 && head.stdout.trim()) heads[repo.name] = head.stdout.trim();
+      }
+      return heads;
+    },
+
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
       const world = await openWorld(handle);
       const repos = worldRepos(world.handle);
@@ -1820,7 +1862,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const opened: TaskPullRequest[] = [];
       for (const { repo, slug, api } of targets) {
-        const base = worldRepoTarget(repo, target);
+        // A checkout whose base is a SIBLING's branch is a stacked pull request:
+        // open it against that branch so GitHub renders the stack and its diff
+        // shows only this branch's own change, not the base's as well.
+        const stacked = repos.some((other) => other !== repo && other.branch === repo.base);
+        const base = stacked ? repo.base : worldRepoTarget(repo, target);
         // karmax's own model lets a worktree stay dirty until the merge stage
         // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
         // here with nothing committed is a state the design produces. GitHub
@@ -1836,7 +1882,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const { pr, created } = await api.openOrUpdate(slug, {
           head: repo.branch, base,
-          title: details.title?.trim() || `karmax: ${repo.branch}`,
+          // With several branches in flight the task title alone names none of
+          // them; say which pull request this one is.
+          title: repos.length > 1
+            ? `${details.title?.trim() || 'karmax'} (${repo.name})`
+            : details.title?.trim() || `karmax: ${repo.branch}`,
           body: prBody(handle, details, store.getTask(handle.id)?.num, repos.length > 1 ? repo.name : undefined),
         });
         const ref: TaskPullRequest = { repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged };

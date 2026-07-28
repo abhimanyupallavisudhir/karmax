@@ -9,6 +9,7 @@ import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } fr
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
+import { addCheckoutWith } from './checkout.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -378,59 +379,10 @@ class WorktreeWorld implements World {
    * so an extra entry IS an extra pull request.
    */
   async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
-    const repos = worldRepos(this.handle);
-    const name = spec.name.trim();
-    if (!name || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
-      throw new Error(`invalid checkout name "${spec.name}" — use letters, digits, "-", "_" or "."`);
-    }
-    if (repos.some((r) => r.name === name)) throw new Error(`checkout "${name}" already exists in this world`);
-    // A flat world root IS a checkout's working tree; a sibling could only go
-    // inside it (where the first checkout's git would see it) or outside the
-    // world boundary (breaking file/PTY confinement). Nesting is decided at
-    // Setup, so this is a configuration error, not something to paper over.
-    if (repos.some((r) => r.root === this.handle.root)) {
-      throw new Error('this world has a flat layout, so it can hold only one checkout —'
-        + ' create it with layout "nested" to allow several branches');
-    }
-
-    const from = spec.from ? repos.find((r) => r.name === spec.from) : repos[0];
-    if (!from) throw new Error(`no checkout named "${spec.from}" to branch from`);
-    const branch = spec.branch?.trim() || `${this.handle.branch}-${name}`;
-    if (repos.some((r) => r.branch === branch)) throw new Error(`branch "${branch}" is already checked out in this world`);
-    // A base naming a sibling checkout is a stacked PR: record the SIBLING'S
-    // BRANCH as the base so the ordering in orderCheckouts() and the landed-file
-    // diff in finalizeMergeRepo both read the stack off plain handle data.
-    const sibling = spec.base ? repos.find((r) => r.name === spec.base) : undefined;
-    const base = sibling ? sibling.branch : (spec.base?.trim() || from.base);
-    const root = path.join(this.handle.root, name);
-
-    if ((await git(from.repo, ['rev-parse', '--verify', base])).code !== 0) {
-      throw new Error(`base "${base}" does not exist in repo "${from.name}"`);
-    }
-    if (fs.existsSync(root)) {
-      await git(from.repo, ['worktree', 'remove', '--force', root]);
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-    await git(from.repo, ['worktree', 'prune']);
-    const branchExists = (await git(from.repo, ['rev-parse', '--verify', branch])).code === 0;
-    await gitOrThrow(from.repo, branchExists
-      ? ['worktree', 'add', root, branch]
-      : ['worktree', 'add', '-b', branch, root, base]);
-    // Inherit the world's identity and runnability from the checkout it forked.
-    await this.inheritWorktreeSetup(from.root, root);
-
-    const added: WorldRepo = {
-      name,
-      repo: from.repo,
-      ...(from.source ? { source: from.source } : {}),
-      ...(from.localPath ? { localPath: from.localPath } : {}),
-      root,
-      branch,
-      base,
-      ...(spec.target ?? from.target ? { target: spec.target ?? from.target } : {}),
-      targetPinned: spec.target ? true : from.targetPinned,
-    };
-    this.handle = { ...this.handle, repos: [...repos, added] };
+    this.handle = await addCheckoutWith(this.handle, spec, {
+      git: (cwd, args) => git(cwd, args),
+      removeDir: async (absPath) => { fs.rmSync(absPath, { recursive: true, force: true }); },
+    }, (from, added) => this.inheritWorktreeSetup(from.root, added.root));
     return this.handle;
   }
 

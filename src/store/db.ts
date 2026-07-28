@@ -3165,6 +3165,19 @@ export class Store {
     return next;
   }
 
+  /** Record a branch the Do agent added to this world (SPEC §11.1, multi-PR).
+   *  The durable handle is what every later activity re-opens the world from —
+   *  merge, PR, the terminal — so a checkout that exists on disk but not here
+   *  would simply not be merged or reviewed. */
+  updateWorldCheckouts(handle: WorldHandleRef, repos: NonNullable<WorldHandleRef['repos']>): WorldHandleRef {
+    const current = this.currentWorld(handle.id);
+    if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
+    const next = { ...current, repos };
+    this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), handle.id, handle.generation ?? 1);
+    return next;
+  }
+
   updateWorldMeta(handle: WorldHandleRef, patch: Record<string, unknown>): WorldHandleRef {
     const current = this.currentWorld(handle.id);
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');

@@ -418,6 +418,16 @@ a { color: var(--accent); text-decoration: none; }
 .pr-link.merged .pr-state { background: var(--merged-weak); color: var(--merged); }
 .pr-link.closed .pr-state { background: var(--danger-weak); color: var(--danger); }
 
+/* ── multi-PR branches (one row per pull request the task is opening) ── */
+.checkout-list { display: flex; flex-direction: column; gap: 2px; }
+.checkout-row {
+  display: flex; align-items: center; gap: 10px; padding: 7px 2px; font-size: 13px;
+  border-bottom: 1px solid var(--line);
+}
+.checkout-row:last-of-type { border-bottom: 0; }
+.checkout-mark { color: var(--ink-3); width: 12px; text-align: center; }
+.checkout-row.approved .checkout-mark { color: var(--merged, var(--accent)); }
+
 /* ── buttons ────────────────────────────────────────────────── */
 .btn {
   display: inline-flex; align-items: center; gap: 7px; cursor: pointer;

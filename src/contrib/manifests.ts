@@ -70,6 +70,21 @@ const remoteField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
+// Multi-PR (SPEC §11.1, PLAN-multi-pr.md). Off, a task is one branch per repo,
+// exactly as before. On, the Do agent may partition its change across several
+// branches with `create_branch`, each landing as its own pull request — so the
+// world nests its checkouts from Setup, which is the only structural difference
+// and is why this is a task-scoped field rather than something inferred later.
+// The lifecycle stays singular: one Review, one Merge, one point of no return.
+const multiPrField = (): FieldSpec => ({
+  name: 'multiPr',
+  type: 'boolean',
+  label: 'Allow several branches per task',
+  help: 'Let the agent split one task\'s change into several branches, each reviewed and merged as its own pull request (including stacked ones). They share a single Review gate and a single Merge — work that needs its own review timing belongs in a separate task.',
+  default: false,
+  scopes: ALL,
+  bind: 'project',
+});
 const gitProfileField = (): FieldSpec => ({
   name: 'gitProfile',
   type: 'string',
@@ -337,7 +352,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.8.0',
+    version: '1.9.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -379,6 +394,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       targetField(),
       agentEnvironmentField(),
       reposField(),
+      multiPrField(),
       copyGlobsField(),
       remoteField(),
       gitProfileField(),

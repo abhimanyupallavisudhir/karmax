@@ -1623,6 +1623,12 @@ export class KarmaxApi {
       reviewInfo: view.reviewInfo,
       seen: typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : view.messages.length,
       target: view.targetBranch,
+      // Carry multi-PR Review approvals across a replacement execution so a human
+      // is not asked to re-approve branches nothing has touched. Each is still
+      // pinned to the head it was given at, so a moved branch lapses regardless.
+      ...(view.checkouts?.some((checkout) => checkout.approved)
+        ? { checkoutApprovals: Object.fromEntries(view.checkouts.filter((c) => c.approved && c.head).map((c) => [c.name, c.head!])) }
+        : {}),
     };
     return {
       ...source,
@@ -2153,13 +2159,18 @@ export class KarmaxApi {
         : undefined;
     if (signal === SIG.confirm && heldOrigin && heldOrigin !== 'review')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a Review decision; resume it or send the relevant agent a follow-up`);
-    if (signal === SIG.confirm && scopedTask?.lastView?.waitingFor?.kind === 'human') {
+    if ((signal === SIG.confirm || signal === SIG.approveCheckout)
+      && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
       if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
       if (!this.deps.store.humanMayAct(taskId, userId))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
-      this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
-        payload: { userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true } });
+      // Approving one branch is not the confirmation itself — only `confirm`
+      // passes the gate, so only `confirm` is journalled as the decision.
+      if (signal === SIG.confirm) {
+        this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+          payload: { userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true } });
+      }
     } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
       if (!userId) throw new CapabilityError('only an explicitly targeted human can satisfy this confirmation policy');
@@ -2254,6 +2265,8 @@ export class KarmaxApi {
         // accepted message separately so every open conversation can render it
         // mid-turn without changing replay-sensitive workflow command histories.
         this.publishConversationMessage(taskId, role, followUp);
+      } else if (signal === SIG.approveCheckout) {
+        await handle.signal(signal, { name: text ?? '' });
       } else {
         await handle.signal(signal);
       }
