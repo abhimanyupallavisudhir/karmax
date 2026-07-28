@@ -2,7 +2,40 @@ export interface DeploymentConfig {
   hosted: boolean;
   singleNode: boolean;
   cellId: string;
+  /** Whether host-machine affordances are meaningful — see {@link hostLocal}. */
+  hostLocal: boolean;
   cloudWorldProvider?: string;
+}
+
+/** A hostname only the machine running karmax can reach. `0.0.0.0`/`::` are
+ *  deliberately excluded: binding every interface publishes the gateway. */
+function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  return h === 'localhost' || h === '::1' || /^127(\.\d{1,3}){3}$/.test(h);
+}
+
+/**
+ * Whether the person using this karmax is sitting at the machine that runs it.
+ *
+ * Some features only exist because the browser and the host are the same
+ * computer: importing from the host's `pass` store (which needs a terminal to
+ * unlock gpg-agent), typing a host filesystem path, materializing a checkout to
+ * `cd` into. Served from a public URL they are noise at best and someone else's
+ * secrets at worst, so the UI hides them and the gateway withdraws them.
+ *
+ * Detected from how the gateway is served — a managed cell, a non-loopback bind,
+ * or a public URL all mean someone else is on the other end. `KARMAX_HOST_LOCAL`
+ * (`1`/`0`) overrides the detection for setups it cannot see, such as a tunnel
+ * in front of a loopback bind.
+ */
+export function hostLocal(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.KARMAX_DEPLOYMENT === 'hosted') return false; // a managed cell is nobody's own machine
+  const override = env.KARMAX_HOST_LOCAL?.trim();
+  if (override) return override !== '0';
+  if (!isLoopbackHost(env.KARMAX_HOST?.trim() || '127.0.0.1')) return false;
+  const publicUrl = env.KARMAX_PUBLIC_URL?.trim();
+  if (!publicUrl) return true;
+  try { return isLoopbackHost(new URL(publicUrl).hostname); } catch { return false; }
 }
 
 const SECRET_FILE_ENV = [
@@ -32,6 +65,7 @@ export function deploymentConfig(env: NodeJS.ProcessEnv = process.env): Deployme
   const hosted = env.KARMAX_DEPLOYMENT === 'hosted';
   const singleNode = hosted && env.KARMAX_SINGLE_NODE === '1';
   return { hosted, singleNode, cellId: env.KARMAX_CELL_ID?.trim() || (hosted ? 'cell-1' : 'local'),
+    hostLocal: hostLocal(env),
     ...(hosted ? { cloudWorldProvider: env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || 'e2b' } : {}) };
 }
 

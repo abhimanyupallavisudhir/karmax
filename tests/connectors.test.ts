@@ -7,6 +7,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { VaultItems, VaultItemStore } from '../src/autonomy/vault-items.js';
 import {
   Connectors,
+  defaultConnectors,
   BitwardenConnector,
   OnePasswordConnector,
   PassConnector,
@@ -182,6 +183,21 @@ describe('pass connector', () => {
     const { items: pulled } = await connector.pull(['alts/ANON_POSTS.md', 'alts/real.md']);
     expect(pulled.map((item) => item.externalId)).toEqual(['alts/real.md']);
     expect(calls).not.toContain('pass show alts/ANON_POSTS.md');
+  });
+});
+
+describe('the default registry follows where karmax is served', () => {
+  it('offers the host password store only to the machine that runs karmax', async () => {
+    const { items, broker, store } = makeVault();
+    const names = async (opts?: { hostLocal?: boolean }) =>
+      (await defaultConnectors(store, items, broker, 'org_personal', opts).describe()).map((c) => c.name);
+
+    expect(await names({ hostLocal: true })).toContain('pass');
+    // Served to anyone but the operator, `pass` would read the *host's* store —
+    // secrets nobody on the other end of the browser owns.
+    expect(await names({ hostLocal: false })).not.toContain('pass');
+    // The token-authenticated stores stay: their credential comes from the tenant.
+    expect(await names({ hostLocal: false })).toEqual(expect.arrayContaining(['bitwarden', '1password']));
   });
 });
 
