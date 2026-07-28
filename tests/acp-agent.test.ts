@@ -149,7 +149,7 @@ describe('generic ACP agent adapter', () => {
     const turn = await new AcpAdapter(provider).runTurn({
       profile: {
         id: 'p', name: 'Agent', provider, modelProvider,
-        model, effort: 'high', maxTurns: 7, role: 'do', capabilities: [],
+        model, effort: 'high', maxTurns: 7, role: 'do',
       },
       world: { handle: { id: 'w', root: dir, branch: 'task', base: 'main' } },
       messages: [{ id: 'm', role: 'user', text: 'make it beautiful', ts: 0, ...(image ? { images: [image] } : {}) }],

@@ -9873,7 +9873,6 @@ function profileRow(p, scope) {
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
-    <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
       ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -9937,7 +9936,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       for (const orig of targets) {
         await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
           role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
-          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities,
+          projectId: scope === 'project' ? projectId : undefined,
           ...knobs,
         }) });
       }

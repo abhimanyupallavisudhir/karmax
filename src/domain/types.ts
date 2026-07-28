@@ -1160,8 +1160,10 @@ export interface AgentProfile {
   role: AgentRole;
   /** Prompt template path under the content store, or inline text. */
   promptTemplate?: string;
-  /** Capability ceiling this profile may ever attempt (SPEC §8.2). */
-  capabilities: string[];
+  /** @deprecated The declaring workflow owns the role's capability ceiling
+   *  (SPEC §8.2), resolved per turn by `roleCeiling(role)`; persisted values are
+   *  ignored. A per-profile copy only ever drifted from the manifest. */
+  capabilities?: string[];
   maxTurns?: number;
   /** @deprecated Credentials policy is authoritative; persisted values are ignored. */
   auth?: AuthSource;
