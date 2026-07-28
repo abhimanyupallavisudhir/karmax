@@ -32,6 +32,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(meta.version).toBeTruthy();
     expect(meta.agent.provider).toBeTruthy();
     expect(meta.resolveAgentEnabled).toBe(false);
+    // The console needs to know whether host-machine affordances are worth showing.
+    expect(meta.hostLocal).toBe(true);
   });
 
   it('keeps untrusted preview hosts outside the app/API origin', async () => {

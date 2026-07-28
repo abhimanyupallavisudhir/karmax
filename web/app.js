@@ -540,6 +540,16 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
 }
 
 // The "Agent environment" (worldProvider) choices depend on the deployment and
+// Whether the browser and the karmax host are the same computer. Host-machine
+// affordances — typing a filesystem path on the host, materializing a checkout to
+// `cd` into, importing the host's `pass` store — are noise to anyone reaching
+// karmax over a public URL, so they are hidden. The gateway detects it from how it
+// is served (src/config/deployment.ts); a hosted cell is never host-local.
+const hostLocal = () => S.meta?.hostLocal !== false;
+// A world path is a directory on the karmax host: only its own machine can `cd`
+// into it. Elsewhere the world is still reachable — over `karmax attach`, not a path.
+const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
+
 // which remote sandbox providers the organization has connected — so the manifest
 // ships an empty option list and the client fills it in. An empty first option ⇒
 // inherit the project / organization default.
@@ -3821,7 +3831,7 @@ async function openTaskForm(workflow, draft, seedText) {
     const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
     if (row) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
-      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
   }
   // Image attachments for the full task form: pasting/dropping an image into any
@@ -5494,7 +5504,7 @@ function checkinTab(v) {
           <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
-        ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
+        ${localWorldPath(v) ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
       </div>
     </div>
     <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
@@ -5515,8 +5525,8 @@ function conversationPane(v, t) {
   // sessions can't be forked from a terminal, so no command is shown. The session
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
   const sess = S.sessions && S.sessions[t.role];
-  const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
-  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && !S.meta?.hosted;
+  const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
     : remoteFork
@@ -5805,8 +5815,8 @@ function terminalPane(v) {
       <b>Ephemeral terminal</b>
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
-      ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
+      ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
@@ -5833,7 +5843,7 @@ function wireCheckinSidebar(v) {
 }
 
 async function openLocalCheckout(v) {
-  if (!S.meta?.hosted) return materializeLocalCheckout(v);
+  if (hostLocal()) return materializeLocalCheckout(v);
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
   catch (error) { return toast(error.message, true); }
@@ -6401,6 +6411,9 @@ function paramCurrentValue(f, v, rec) {
       return shared;
     }
   }
+  // The Review route belongs to the logical task: the intent's shared snapshot is
+  // the route actually in play, even when this attempt stored no override of its own.
+  if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
 function displayParam(f, val) {
@@ -6433,6 +6446,14 @@ function collectParamEdits(root, fields) {
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      // The Review route is sent whole (layers are atomic), not inherit-diffed —
+      // an in-flight edit is a concrete live value, not an overlay override.
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = { layers: readConfirmerLayers(box) };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -8000,15 +8021,15 @@ async function hydrateProjectData(proj) {
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Karmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
-      ${!S.meta?.hosted && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
-      ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>'}
+      ${hostLocal() && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
+      ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
-          ${S.meta?.hosted ? '' : '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>'}
+          ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
           <label class="form-row wide"><span>Or upload a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
@@ -8196,7 +8217,7 @@ async function hydrateProjectResources(proj) {
     const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
     box.innerHTML = `<div class="section-h">Attached resources</div>
       <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${S.meta?.hosted ? '' : '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>'}
+      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
       <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
         <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
           <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
@@ -8210,7 +8231,7 @@ async function hydrateProjectResources(proj) {
         <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
         <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
         <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${S.meta?.hosted ? '' : '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>'}
+        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
         <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
       </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
     const driverInput = $('#resource-driver');
@@ -8341,7 +8362,7 @@ async function hydrateProjectAccess(proj) {
       <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
     repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
+      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
       ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
@@ -8360,7 +8381,7 @@ async function hydrateProjectAccess(proj) {
     }));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
+    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
@@ -9365,6 +9386,27 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
   })));
 }
 
+/**
+ * Import a connector selection in batches, reporting progress as they land.
+ * Reading a secret out of a real store is expensive — a `pass` entry costs a
+ * GPG decrypt, and a whole tree takes minutes — so a single blocking request
+ * looks exactly like a dead button. Batching keeps the UI honest, commits what
+ * has been read so far, and lets the server skip entries that have not changed.
+ */
+async function importFromConnector(sync, externalIds, onProgress, batchSize = 25) {
+  const totals = { imported: 0, skipped: 0, failures: [], done: 0, total: externalIds.length };
+  for (let at = 0; at < externalIds.length; at += batchSize) {
+    onProgress?.(totals);
+    const result = await sync(externalIds.slice(at, at + batchSize));
+    totals.imported += result.count || 0;
+    totals.skipped += result.skipped || 0;
+    totals.failures.push(...(result.failures || []));
+    totals.done = Math.min(at + batchSize, externalIds.length);
+  }
+  onProgress?.(totals);
+  return totals;
+}
+
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
@@ -9577,20 +9619,29 @@ async function wireVaultCards(organizationId) {
     overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
     tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
     tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
-    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+    const go = overlay.querySelector('[data-imp-go]');
+    go.addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
       if (!externalIds.length) { toast('Select at least one', true); return; }
+      const sync = (batch) => api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+        externalIds: batch,
+        policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+        ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+      }) });
+      go.disabled = true;
       try {
-        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
-          externalIds,
-          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
-          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
-        }) });
-        toast(`Imported ${r.count} item(s)`);
+        const r = await importFromConnector(sync, externalIds, (p) => {
+          go.textContent = `Importing ${p.done}/${p.total}…`;
+          countEl.textContent = `· ${p.imported} imported${p.skipped ? `, ${p.skipped} unchanged` : ''}`;
+        });
+        const summary = [`Imported ${r.imported} item(s)`, r.skipped ? `${r.skipped} already up to date` : '',
+          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : ''].filter(Boolean).join(' · ');
+        toast(summary, r.failures.length > 0);
         close();
         renderItems();
         renderConnectors();
       } catch (e) { toast(e.message, true); }
+      finally { go.disabled = false; go.textContent = 'Import'; }
     });
   };
   box.querySelector('.vi-add').addEventListener('click', async () => {

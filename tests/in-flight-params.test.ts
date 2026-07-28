@@ -27,14 +27,22 @@ function input(over: { taskId: string; repo: string; prompt: string; target?: st
     agents: { do: { provider: 'mock' as const } },
     // target until PR/merge; every agent's model+effort is retunable in-flight
     // ('always'), while an identity swap is gated by the workflow validator (SPEC §5.5).
+    // `confirm` (the Review route) is `untilUsed` too — consumed by the gate it drives,
+    // not by queueing, so it stays editable right up to the moment Review passes.
     paramWindows: {
       target: 'untilUsed' as const,
+      confirm: 'untilUsed' as const,
       'agent:do': 'always' as const,
       'agent:merge': 'always' as const,
       'agent:resolve': 'always' as const,
     },
   };
 }
+
+const human = (...audience: string[]) => ({ kind: 'human' as const, audience });
+/** Workflow input carrying an explicit Review route. */
+const routed = (over: { taskId: string; repo: string; prompt: string }, layers: ReturnType<typeof human>[]) =>
+  ({ ...input(over), confirm: { layers } });
 
 describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
   let h: Harness;
@@ -129,6 +137,107 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
       .toBe(true);
 
     await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  });
+
+  // ── the Review route (SPEC §5.2) ──
+  // It is consumed by the gate it drives, not by queueing, so it stays editable while
+  // the task runs — including while the gate is already parked on someone.
+
+  it('re-routes a Review gate that is already parked, and waits on the NEW audience', async () => {
+    const repo = await h.makeRepo('reroute');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [routed({ taskId, repo, prompt: '@write r.txt :: hi\n@review done' }, [human('@creator')])],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+
+    const v0 = await view(handle);
+    expect(v0.editableParams).toContain('confirm'); // NOT frozen at queue
+    expect(v0.waitingFor).toMatchObject({ kind: 'human', audience: ['@creator'] });
+
+    // The edit lands on the gate that is already parked — no restart, no lost work.
+    expect(await handle.executeUpdate('updateParams', { args: [{ confirm: { layers: [human('@owners')] } }] }))
+      .toEqual({ applied: ['confirm'] });
+    await expect.poll(async () => (await view(handle)).waitingFor?.audience, { timeout: 10_000 }).toEqual(['@owners']);
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  });
+
+  it('emptying the route while the gate is parked auto-confirms it (the gate re-reads, not the queue)', async () => {
+    const repo = await h.makeRepo('reroute-empty');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [routed({ taskId, repo, prompt: '@write e.txt :: hi\n@review done' }, [human('@creator')])],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+
+    // No steps means auto-confirm — and nobody ever clicks Confirm here.
+    expect(await handle.executeUpdate('updateParams', { args: [{ confirm: { layers: [] } }] }))
+      .toEqual({ applied: ['confirm'] });
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:e.txt'])).stdout).toContain('hi');
+  });
+
+  it('a re-route replays the gate from its FIRST layer — approvals under the old route are not credited', async () => {
+    const repo = await h.makeRepo('reroute-replay');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [routed({ taskId, repo, prompt: '@write p.txt :: hi\n@review done' }, [human('@creator'), human('@creator')])],
+    });
+    const detail = async () => (await view(handle)).waitingFor?.detail;
+    await expect.poll(detail, { timeout: 15_000 }).toBe('confirm layer 1/2');
+
+    await handle.signal('confirm'); // layer 1 of the OLD route passes
+    await expect.poll(detail, { timeout: 10_000 }).toBe('confirm layer 2/2');
+
+    // Swap in a three-layer route: the banked click was for a gate that no longer
+    // exists, so the new route plays from its first layer.
+    await handle.executeUpdate('updateParams', { args: [{ confirm: { layers: [human('@creator'), human('@creator'), human('@creator')] } }] });
+    await expect.poll(detail, { timeout: 10_000 }).toBe('confirm layer 1/3');
+
+    await handle.signal('confirm');
+    await expect.poll(detail, { timeout: 10_000 }).toBe('confirm layer 2/3');
+    await handle.signal('confirm');
+    await expect.poll(detail, { timeout: 10_000 }).toBe('confirm layer 3/3');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  });
+
+  it('a re-route through the api validates the audience and re-shares it with every attempt', async () => {
+    const repo = await h.makeRepo('reroute-api');
+    // assertHumanRoutes only bites once the organization actually has people.
+    const organization = h.store.createOrganization({ name: 'Acme reroute', ownerUserId: 'owner' });
+    const project = h.store.createProject('P', { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false }, organization.id);
+    const token = h.tokens.mint({
+      taskId: 't', profileId: 'do', principal: 'user:owner',
+      ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task'],
+      grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task'],
+    }).token;
+    const task = await h.api.createTask(token, {
+      projectId: project.id, workflow: 'software-dev', prompt: '@write s.txt :: hi\n@review ok',
+    });
+    const handle = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+
+    // A route nobody can see is rejected platform-side: the deterministic sandbox
+    // cannot answer "is user:ghost a human here?", so the gate must never park on one.
+    await expect(h.api.updateParams(token, task.id, { confirm: { layers: [human('user:ghost')] } }))
+      .rejects.toThrow(/does not resolve to a human/i);
+    expect((await view(handle)).waitingFor?.audience).toEqual(['@creator']); // untouched
+
+    const applied = await h.api.updateParams(token, task.id, { confirm: { layers: [] } });
+    expect(applied.applied).toEqual(['confirm']);
+    // The route belongs to the logical task, so the shared snapshot moved with it.
+    expect(h.store.attemptGroup(task.id)?.confirmer).toEqual({ layers: [] });
+
     expect((await handle.result()).stage).toBe('done');
   });
 

@@ -68,13 +68,17 @@ export interface VaultItem {
   /** `source`: manual | connector:<name> | task:<id>. `externalId` identifies
    *  an imported connector item (and remains the legacy single write-back
    *  binding). `externalIds` records every connector an agent-created item was
-   *  pushed to, so later rotations update the right entries without guessing. */
+   *  pushed to, so later rotations update the right entries without guessing.
+   *  `syncedAt` is when the secrets were last mirrored IN, which is what a
+   *  re-sync compares against the store's own change time (never `updatedAt`,
+   *  which also moves when the user edits a policy here). */
   provenance: {
     source: string;
     taskId?: string;
     externalId?: string;
     externalIds?: Record<string, string>;
     at: number;
+    syncedAt?: number;
   };
   updatedAt: number;
 }
@@ -247,7 +251,7 @@ export class VaultItems {
     envVar?: string;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
-    provenance?: { source: string; taskId?: string; externalId?: string };
+    provenance?: { source: string; taskId?: string; externalId?: string; syncedAt?: number };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? this.get(args.id) : undefined;
@@ -282,7 +286,10 @@ export class VaultItems {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',
         reveal: args.policy?.reveal ?? prior?.policy.reveal ?? 'ask',
       },
-      provenance: prior?.provenance ?? { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), at: Date.now() },
+      // Provenance is birth-data: only the mirror clock moves on a re-sync.
+      provenance: prior
+        ? { ...prior.provenance, ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
+        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
       updatedAt: Date.now(),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
