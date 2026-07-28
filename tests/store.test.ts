@@ -108,6 +108,52 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('backfills kind-less tags to topic on an existing catalogue', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-kind-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = new Store(dbPath);
+    const project = legacy.createProject('Legacy kinds');
+    const bare = legacy.createTag({ projectId: project.id, name: 'orphan' });
+    const typed = legacy.createTag({ projectId: project.id, name: 'bug', kind: 'type' });
+    const flagged = legacy.createTag({ projectId: project.id, name: 'no-merge', kind: 'flag' });
+    // An older build (and `tag_task` before this change) left `kind` NULL.
+    legacy.db.prepare('UPDATE tags SET kind = NULL WHERE id = ?').run(bare.id);
+    legacy.close();
+
+    const migrated = new Store(dbPath);
+    expect(migrated.getTag(bare.id)!.kind).toBe('topic');
+    // A tag that already declares a kind is never reclassified.
+    expect(migrated.getTag(typed.id)!.kind).toBe('type');
+    expect(migrated.getTag(flagged.id)!.kind).toBe('flag');
+    migrated.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('defaults a new tag to the topic kind', () => {
+    const p = store.createProject('Kinds');
+    // The implicit path: an agent naming a new tag via tag_task passes no kind.
+    expect(store.createTag({ projectId: p.id, name: 'auth' }).kind).toBe('topic');
+    // An explicit kind is honoured.
+    expect(store.createTag({ projectId: p.id, name: 'bug', kind: 'type' }).kind).toBe('type');
+    expect(store.createTag({ projectId: p.id, name: 'no-merge', kind: 'flag' }).kind).toBe('flag');
+    // Reusing an existing tag without naming a kind must not reclassify it.
+    expect(store.createTag({ projectId: p.id, name: 'bug' }).kind).toBe('type');
+  });
+
+  it('applies a path tag kind to its ancestors, not just the leaf', () => {
+    const p = store.createProject('Paths');
+    // A hierarchy is within-kind: kind-scoped sectioning drops a child whose
+    // parent carries a different kind, so ancestors inherit the declared kind.
+    const leaf = store.createTag({ projectId: p.id, name: 'release/blocker', kind: 'flag' });
+    expect(leaf.kind).toBe('flag');
+    const parent = store.getTag(leaf.parentId!)!;
+    expect(parent).toMatchObject({ name: 'release', kind: 'flag' });
+    // With no kind declared, the whole path defaults to topic.
+    const plain = store.createTag({ projectId: p.id, name: 'frontend/web' });
+    expect(plain.kind).toBe('topic');
+    expect(store.getTag(plain.parentId!)!.kind).toBe('topic');
+  });
+
   it('creates a project with a default task list', () => {
     const p = store.createProject('Acme', { defaultBase: 'main' });
     expect(p.id).toMatch(/^proj_/);

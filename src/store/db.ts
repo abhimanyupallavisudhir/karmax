@@ -186,6 +186,15 @@ export class Store {
       }
       if (changed) this.db.prepare('UPDATE kv SET v=? WHERE k=?').run(JSON.stringify(items), vrow.k);
     }
+
+    // Tag `kind` used to be optional, surfaced as a "general" choice. That option is
+    // gone — every tag is now type/topic/flag — so a kind-less row left behind by an
+    // older build (or by an agent naming a tag through `tag_task`) is no longer
+    // representable: the editor pre-selects `topic` and silently reclassifies it on
+    // save, and kind-scoped sections (`group:tag-type`/`tag-topic`) bucket it under
+    // Untagged. Adopt that same reading explicitly. Idempotent: creation now always
+    // sets a kind, so a re-run matches nothing.
+    this.db.prepare("UPDATE tags SET kind = 'topic' WHERE kind IS NULL OR kind = ''").run();
   }
 
   private migrate() {
@@ -2460,7 +2469,9 @@ export class Store {
     if (!raw) throw new Error('tag name required');
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
-    // types the path. `color`/`kind` apply to the leaf; ancestors created bare.
+    // types the path. `color`/`description` apply to the leaf; `kind` applies to the
+    // whole path, because a hierarchy is within-kind — kind-scoped sectioning
+    // (`group:tag-type`) drops a child whose parent carries a different kind.
     const segments = raw.split('/').map((s) => s.trim()).filter(Boolean);
     if (segments.length > 1) {
       let parentId = input.parentId;
@@ -2471,7 +2482,8 @@ export class Store {
           projectId: input.projectId,
           name: segments[i]!,
           parentId,
-          ...(isLeaf ? { color: input.color, kind: input.kind, description: input.description } : {}),
+          kind: input.kind,
+          ...(isLeaf ? { color: input.color, description: input.description } : {}),
         });
         parentId = leaf.id;
       }
@@ -2507,7 +2519,12 @@ export class Store {
       name,
       parentId: input.parentId,
       color: input.color,
-      kind: input.kind,
+      // Every tag carries a kind. `topic` is the default because it is the neutral
+      // "what area" axis, and because the callers that omit one are the implicit
+      // ones (an agent naming a new tag through `tag_task`, a path ancestor). A
+      // kind-less tag is not representable in the UI and falls out of kind-scoped
+      // sections. Reuse of an existing tag above deliberately never overwrites.
+      kind: input.kind ?? 'topic',
       description: input.description?.trim() || undefined,
       createdAt: Date.now(),
     };
