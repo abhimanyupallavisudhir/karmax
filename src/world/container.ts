@@ -168,9 +168,12 @@ class ContainerWorld implements World {
     await docker(['rm', '-f', this.name]);
     const { git } = await import('./git.js');
     const { worldRepos } = await import('./types.js');
+    const { withWorktreeLock } = await import('./worktree-lock.js');
     for (const r of worldRepos(this.handle)) {
-      await git(r.repo, ['worktree', 'remove', '--force', r.root]);
-      await git(r.repo, ['worktree', 'prune']);
+      await withWorktreeLock(r.repo, async () => {
+        await git(r.repo, ['worktree', 'remove', '--force', r.root]);
+        await git(r.repo, ['worktree', 'prune']);
+      });
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }

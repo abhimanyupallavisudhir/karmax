@@ -107,7 +107,13 @@ export function projectWikiBranchView(contentDir: string, projectId: string, ref
     try { git(root, ['worktree', 'remove', '--force', view]); }
     catch { fs.rmSync(view, { recursive: true, force: true }); }
   }
-  git(root, ['worktree', 'prune']);
+  // Deliberately no `worktree prune` here. A prune frees admin-dir names across
+  // the whole repo, and this wiki repo is also checked out into every multi-repo
+  // world — so a prune racing a world's `worktree remove` can hand that world's
+  // name away mid-removal (see src/world/worktree-lock.ts). This view's own name
+  // is the content hash below, which nothing else can be given, and `add` just
+  // suffixes it if the rm fallback above left a stale entry; world create and
+  // destroy prune the repo properly, under the lock.
   git(root, ['worktree', 'add', '--force', '--detach', view, branchRef]);
   return view;
 }
