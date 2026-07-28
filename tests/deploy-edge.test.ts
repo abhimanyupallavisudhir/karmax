@@ -8,7 +8,7 @@ const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8
 
 /** The `path` patterns of every rate-limit zone declared in the Caddyfile. */
 function zonePaths(caddyfile: string): string[] {
-  return [...caddyfile.matchAll(/^\s*path\s+(.+)$/gm)].flatMap((m) => m[1].trim().split(/\s+/));
+  return [...caddyfile.matchAll(/^\s*path\s+(.+)$/gm)].flatMap((m) => m[1]!.trim().split(/\s+/));
 }
 
 /** Caddy's path matcher: a trailing `*` is a prefix match, anything else exact. */
@@ -43,7 +43,7 @@ describe('public edge (Caddy) rate limiting', () => {
 
   it('keys every zone on the client address rather than a spoofable header', () => {
     const caddyfile = read('Caddyfile');
-    const keys = [...caddyfile.matchAll(/^\s*key\s+(.+)$/gm)].map((m) => m[1].trim());
+    const keys = [...caddyfile.matchAll(/^\s*key\s+(.+)$/gm)].map((m) => m[1]!.trim());
     expect(keys.length).toBeGreaterThan(0);
     for (const key of keys) expect(key).toBe('{http.request.remote.host}');
   });
