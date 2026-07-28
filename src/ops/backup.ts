@@ -85,7 +85,7 @@ export async function restoreBackup(source: string, options: { home?: string; al
   const directory = path.resolve(source);
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as BackupManifest;
   if (manifest.format !== 'karmax-backup' || manifest.version !== 1 || !Array.isArray(manifest.files))
-    throw new Error('unsupported or invalid Karmax backup manifest');
+    throw new Error('unsupported or invalid Krmax backup manifest');
   const payload = path.join(directory, 'payload');
   for (const entry of manifest.files) {
     const file = safeJoin(payload, entry.path);
@@ -98,7 +98,7 @@ export async function restoreBackup(source: string, options: { home?: string; al
   const p = paths(home);
   const running = scanInstances(path.join(p.state, 'instances'), process.pid);
   if (running.length && !options.allowRunning)
-    throw new Error(`stop Karmax before restore (live app pids: ${running.join(', ')})`);
+    throw new Error(`stop Krmax before restore (live app pids: ${running.join(', ')})`);
   if (manifest.temporal === 'embedded') await stopEmbeddedTemporal(p.temporal);
 
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });

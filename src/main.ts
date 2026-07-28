@@ -51,7 +51,7 @@ async function main() {
   const p = ensurePaths();
   const { provider, reason } = defaultProvider();
 
-  console.log('\n  karmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
+  console.log('\n  krmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
 
   // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
   // running against one KARMAX_HOME — each with its own worker fanning out agent
@@ -61,7 +61,7 @@ async function main() {
   const instance = registerAppInstance();
   if (instance.others.length) {
     console.warn(
-      `\n  ⚠  ${instance.others.length} other karmax app instance(s) already running against ${p.home}` +
+      `\n  ⚠  ${instance.others.length} other krmax app instance(s) already running against ${p.home}` +
         ` (pids ${instance.others.join(', ')}).\n` +
         `     Each runs its own worker + agent fan-out and competes for the same RAM —\n` +
         `     the exact condition behind the July-5 OOM (karmax#4). Stop the extras unless this is deliberate.\n`,
@@ -192,10 +192,13 @@ async function main() {
     store.setWorldState((store.currentWorld(handle.id) ?? handle) as import('./world/types.js').WorldHandle, 'degraded');
     return checkpoints.restore(checkpoint.id, handle.kind);
   });
-  const { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
+  const { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
+  // The universal rail: a card the human already holds, limit enforced by their
+  // own issuer. Registered before Stripe Issuing, which needs a business account.
+  paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
@@ -243,7 +246,7 @@ async function main() {
   const { reapOrphans } = await import('./agent/custody.js');
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
-  if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live karmax instance untouched`);
+  if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live krmax instance untouched`);
   const serviceOrphans = await sweepOrphanedServiceContainers((taskId) => store.worldState(taskId)).catch(() => 0);
   if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
   // A concurrently running dogfooding instance can die after this app has
@@ -424,6 +427,7 @@ async function main() {
     resources,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
+    hostLocal: deployment.hostLocal,
     remoteAccess,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
@@ -439,7 +443,7 @@ async function main() {
   // browser/user-defined MCP servers.
   configHomes.refreshPlatformMcp(internalUrl);
 
-  console.log(`\n  ✓ karmax is running:  ${url}\n`);
+  console.log(`\n  ✓ krmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
   try {
     if (!deployment.hosted) {
@@ -483,7 +487,7 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error('karmax failed to start:', e);
+  console.error('krmax failed to start:', e);
   process.exit(1);
 });
 

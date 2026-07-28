@@ -113,3 +113,28 @@ describe('version retirement (§21c — never drop code a live execution replays
     expect(store.retire('software-dev', '9.9.9')).toBe(false);
   });
 });
+
+/**
+ * A sub-task's child workflow used to be selected by a hand-maintained chain of
+ * `behaviorVersion === '1.x.0'` arms. Releasing a version without extending it
+ * silently dropped every child of that version to the bare (v1.1) type — no
+ * error, just a child running years-old semantics. This pins the rule instead.
+ */
+describe('sub-task children inherit their parent version', () => {
+  it('resolves to the parent version from 1.5.0 on, and that type is registered', async () => {
+    const { childWorkflowType } = await import('../src/workflows/software-dev.js');
+    const { BUNDLED_QUALIFIED } = await import('../src/workflows/names.js');
+
+    // Historical parents keep the bare type their recorded command replays.
+    for (const old of ['1.0.0', '1.1.0', '1.2.0', '1.3.0', '1.4.0'] as const)
+      expect(childWorkflowType(old)).toBe('softwareDev');
+    for (const current of ['1.5.0', '1.6.0', '1.7.0', '1.8.0'] as const)
+      expect(childWorkflowType(current)).toBe(`softwareDev@${current}`);
+
+    // The current bundled version must be inheritable AND registered, or its
+    // sub-tasks fail to start at all.
+    const version = bundled('software-dev')!.version;
+    expect(childWorkflowType(version as '1.8.0')).toBe(`softwareDev@${version}`);
+    expect(BUNDLED_QUALIFIED.has(`softwareDev@${version}`)).toBe(true);
+  });
+});

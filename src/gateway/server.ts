@@ -7,6 +7,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -31,6 +32,7 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { hostLocal } from '../config/deployment.js';
 import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
@@ -86,6 +88,9 @@ export interface GatewayDeps {
   resources?: import('../world/resources.js').ProjectResourceService;
   cellId?: string;
   hosted?: boolean;
+  /** Whether the browser and the host are the same machine (see `hostLocal`).
+   *  Defaults to detecting it from how the gateway is served. */
+  hostLocal?: boolean;
   remoteAccess?: RemoteAccessController;
 }
 
@@ -392,6 +397,9 @@ export class Gateway {
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
+  /** Host-machine affordances (`pass` import, host filesystem paths, a local
+   *  checkout to `cd` into) are only offered to the machine karmax runs on. */
+  private get hostLocal(): boolean { return this.deps.hostLocal ?? hostLocal(); }
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
@@ -711,6 +719,7 @@ export class Gateway {
       return void res.end();
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
+    if (p.startsWith('/brand/')) return this.brand(p, res);
     if (p.startsWith('/api/')) return this.api(req, res, url);
     if (p === '/ws') return; // handled by ws
     return this.static(p, res);
@@ -835,7 +844,7 @@ export class Gateway {
       // response timing (matches the Stripe webhook check).
       const secretOk = !!presented && (timingSafeEqualStr(presented, minted) || (!!legacy && timingSafeEqualStr(presented, legacy)));
       if (!secretOk)
-        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL karmax shows the operator)' });
+        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL krmax shows the operator)' });
       // Providers POST different shapes/encodings; parse by content-type and
       // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
       // MIME from the Cloudflare Email Worker).
@@ -933,7 +942,7 @@ export class Gateway {
       return this.json(res, 401, { error: 'invalid password' });
     }
     if (p === '/api/setup' && method === 'POST' && this.deps.identity) {
-      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'karmax has already been set up' });
+      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'krmax has already been set up' });
       const b = await this.body(req);
       try {
         const { response, user } = await this.deps.identity.bootstrap(
@@ -984,6 +993,7 @@ export class Gateway {
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
+        hostLocal: this.hostLocal,
         worldProviders: this.deps.worlds.catalog(),
         sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
       });
@@ -1158,7 +1168,7 @@ export class Gateway {
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
         const value = store.exportOrganization(organizationExport[1]!);
-        res.setHeader('Content-Disposition', `attachment; filename="karmax-${organizationExport[1]!}-export.json"`);
+        res.setHeader('Content-Disposition', `attachment; filename="krmax-${organizationExport[1]!}-export.json"`);
         return this.json(res, 200, value);
       }
       if (organizationMatch && method === 'DELETE') {
@@ -1253,15 +1263,15 @@ export class Gateway {
           if (this.deps.email?.configured() && result.invitation.email) {
             const link = `${this.publicUrl(req)}/invite?token=${encodeURIComponent(result.token)}`;
             const organization = store.getOrganization(organizationId);
-            const orgName = organization?.name ?? 'a karmax organization';
+            const orgName = organization?.name ?? 'a krmax organization';
             const { emailHtml } = await import('../auth/identity.js');
             try {
               await this.deps.email.send({
                 to: result.invitation.email,
-                subject: `You've been invited to ${orgName} on karmax`,
-                text: `You've been invited to join ${orgName} on karmax.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
+                subject: `You've been invited to ${orgName} on krmax`,
+                text: `You've been invited to join ${orgName} on krmax.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
                 html: emailHtml(`You've been invited to ${orgName}`,
-                  `You've been invited to join ${orgName} on karmax. Accept the invitation to get started.`,
+                  `You've been invited to join ${orgName} on krmax. Accept the invitation to get started.`,
                   'Accept invitation', link, `This is a one-time link. If you weren't expecting this, you can ignore it.`),
               });
               emailed = true;
@@ -1335,7 +1345,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'user:write').ok)
-            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared GitHub App' });
+            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });
           const b = await this.body(req);
           try {
             return this.json(res, 200, this.deps.githubApp.configure({ appId: b.appId, appSlug: String(b.appSlug ?? ''),
@@ -1349,7 +1359,7 @@ export class Gateway {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!this.deps.tokens.check(token, 'user:write').ok)
-          return this.json(res, 403, { error: 'Only a Karmax installation administrator can create the shared GitHub App' });
+          return this.json(res, 403, { error: 'Only a Krmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = store.createGithubInstallState(githubManifest[1]!, session.userId);
@@ -2547,7 +2557,8 @@ export class Gateway {
         const expiresAt = Date.now() + 5 * 60_000;
         for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
         this.terminalTickets.set(ticket, { taskId, session, expiresAt });
-        const attachArgv = this.deps.hosted ? ['karmax'] : [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))];
+        // A path into this install's checkout only means something to the machine it lives on.
+        const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))] : ['karmax'];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
@@ -2559,7 +2570,7 @@ export class Gateway {
       const materializeMatch = p.match(/^\/api\/tasks\/([^/]+)\/materialize-local$/);
       if (materializeMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
-        if (this.deps.hosted) return this.json(res, 409, { error: 'use the Git checkout handoff when Karmax is hosted remotely' });
+        if (!this.hostLocal) return this.json(res, 409, { error: 'use the Git checkout handoff when Krmax is not running on your machine' });
         const taskId = materializeMatch[1]!;
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
@@ -3104,7 +3115,7 @@ export class Gateway {
         });
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'user:write').ok)
-            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared Stripe Connect application' });
+            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared Stripe Connect application' });
           const b = await this.body(req);
           try {
             return this.json(res, 200, {
@@ -3172,12 +3183,16 @@ export class Gateway {
       if (paymentCardholders && method === 'GET') {
         const provider = this.deps.paymentRegistry?.get(url.searchParams.get('provider') ?? 'stripe');
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        // Only issuing rails mint cards against a compliance record.
+        if (!provider.listCardholders) return this.json(res, 200, []);
         return this.json(res, 200, await provider.listCardholders(paymentCardholders[1]!));
       }
       if (paymentCardholders && method === 'POST') {
         const b = await this.body(req);
         const provider = this.deps.paymentRegistry?.get(String(b.provider ?? 'stripe'));
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        if (!provider.createCardholder)
+          return this.json(res, 400, { error: `the ${provider.name} rail does not use cardholders` });
         try {
           return this.json(res, 200, await provider.createCardholder(paymentCardholders[1]!, {
             type: b.type === 'company' ? 'company' : 'individual',
@@ -3266,7 +3281,7 @@ export class Gateway {
           if (b.id && b.secrets && Object.keys(b.secrets).length) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3326,7 +3341,7 @@ export class Gateway {
           if (prior && b.secrets) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3339,7 +3354,7 @@ export class Gateway {
           let writeBack: Array<{ connector: string; externalId?: string; error?: string }> = [];
           if (!prior) {
             const { defaultConnectors } = await import('../autonomy/connectors.js');
-            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId).writeBackCreated(saved.id);
+            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal }).writeBackCreated(saved.id);
             for (const result of writeBack) {
               store.appendAudit({ principalId: callerTaskId ? `task:${callerTaskId}` : principal,
                 action: result.error ? 'vault.write_back.failed' : 'vault.write_back',
@@ -3443,8 +3458,8 @@ export class Gateway {
             const item = resolved.itemId ? vault.get(resolved.itemId) : undefined;
             const label = item?.label ?? resolved.domain ?? 'credential';
             const message = action === 'deny'
-              ? `[Karmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
-              : `[Karmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
+              ? `[Krmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
+              : `[Krmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
             const resume = await api.resumeAfterCredentialDecision(resolved.taskId, message);
             const task = store.getTask(resolved.taskId);
             if (task && store.getProject(task.projectId)?.organizationId === organizationId) {
@@ -3465,7 +3480,7 @@ export class Gateway {
         if (p.startsWith('/api/vault/connectors')) {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
           const { defaultConnectors } = await import('../autonomy/connectors.js');
-          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId);
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal });
           if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
           const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
           if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });
@@ -3632,7 +3647,7 @@ export class Gateway {
         const to = String(b.to ?? session.email ?? '').trim();
         if (!to) return this.json(res, 400, { error: 'no recipient — pass { to } or sign in with an email' });
         try {
-          await this.deps.email.send({ to, subject: 'karmax test email',
+          await this.deps.email.send({ to, subject: 'krmax test email',
             text: 'This is a test email from karmax. Outbound email is working.' });
           return this.json(res, 200, { ok: true, to });
         } catch (e) { return this.json(res, 502, { error: e instanceof Error ? e.message : String(e) }); }
@@ -3661,17 +3676,30 @@ export class Gateway {
           ? this.deps.paymentRegistry?.get(String(b.provider))
           : this.deps.paymentRegistry?.active(cardOrg) ?? this.deps.payments;
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
-        const card = await provider.provisionCard({
-          scope: b.scope === 'project' ? 'project' : 'organization',
-          scopeId: b.scope === 'project' ? b.projectId : cardOrg,
-          label: b.label ?? 'Card',
-          cap: Number(b.cap ?? 0),
-          merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
-          organizationId: cardOrg,
-          currency: b.currency ? String(b.currency) : 'usd',
-          cardholderId: b.cardholderId ? String(b.cardholderId) : undefined,
-        });
-        return this.json(res, 200, card);
+        try {
+          const card = await provider.provisionCard({
+            scope: b.scope === 'project' ? 'project' : 'organization',
+            scopeId: b.scope === 'project' ? b.projectId : cardOrg,
+            label: b.label ?? 'Card',
+            cap: Number(b.cap ?? 0),
+            merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
+            organizationId: cardOrg,
+            currency: b.currency ? String(b.currency) : 'usd',
+            cardholderId: b.cardholderId ? String(b.cardholderId) : undefined,
+            // Only the vault-card rail consumes these; the secret half goes
+            // straight into the vault and is never echoed back in the response.
+            details: b.details ? {
+              number: String(b.details.number ?? ''),
+              cvc: String(b.details.cvc ?? ''),
+              expMonth: Number(b.details.expMonth),
+              expYear: Number(b.details.expYear),
+              billing: b.details.billing,
+            } : undefined,
+          });
+          return this.json(res, 200, card);
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const fundMatch = p.match(/^\/api\/cards\/([^/]+)\/fund$/);
       if (fundMatch && method === 'POST') {
@@ -4084,6 +4112,9 @@ export class Gateway {
           if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
             return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
           }
+          if (wf === 'appearance' && !isBrandIcon(b.values?.icon)) {
+            return this.json(res, 400, { error: 'Unknown brand icon' });
+          }
           store.setSettings('global', wf, b.values ?? {});
           if (wf === 'agent-queue') await api.setAgentCapacity(Number(b.values?.capacity));
           return this.json(res, 200, { ok: true });
@@ -4275,7 +4306,7 @@ export class Gateway {
         // name is only for the first provisioning attempt.
         const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
         const repository = await githubApp.ensureRepository(connection.id, actor, {
-          name, description: `Karmax project wiki for ${project.name}`,
+          name, description: `Krmax project wiki for ${project.name}`,
           private: true, defaultBranch: 'main', autoInit: false,
         });
         // Link before the push so even a transient network failure keeps this
@@ -4479,6 +4510,28 @@ export class Gateway {
       byStage[stage] = (byStage[stage] ?? 0) + 1;
     }
     return { accounts, projects: projects.length, tasks: allTasks.length, byStage };
+  }
+
+  /** Brand assets, resolved per request against the instance-wide icon setting.
+   * Serving them from one stable path is what lets the favicon, the installed
+   * app icon and the pre-auth login mark all follow the setting with no client
+   * knowledge of it — and no build step over `web/`. */
+  private async brand(p: string, res: http.ServerResponse) {
+    const name = p.slice('/brand/'.length);
+    // `/brand/<file>` follows the setting; `/brand/<variant>/<file>` addresses one
+    // variant directly, which is how the settings picker previews the choices.
+    if (!BRAND_FILES.includes(name as (typeof BRAND_FILES)[number])) return this.static(p, res);
+    const icon = brandIconOf(this.deps.store.getSettings('global', 'appearance'));
+    try {
+      const data = await fs.promises.readFile(path.join(this.deps.staticDir, 'brand', icon, name));
+      // Favicons are cached hard by default; revalidating keeps a switch instant.
+      res.writeHead(200, { 'content-type': MIME[path.extname(name)]!, 'cache-control': 'no-cache' });
+      res.end(data);
+    } catch {
+      // A variant need not ship every format (only the diamond has an SVG); the
+      // browser falls through to the next <link rel="icon"> on a miss.
+      res.writeHead(404).end('not found');
+    }
   }
 
   // ── static SPA ──
@@ -5078,13 +5131,13 @@ export class Gateway {
     res.end(body);
   }
   private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {
-    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    const body = `<!doctype html><meta charset="utf-8"><title>Krmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
       'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private paymentCallbackPage(res: http.ServerResponse, status: number, message: string) {
-    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    const body = `<!doctype html><meta charset="utf-8"><title>Krmax · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8',
       'content-length': String(Buffer.byteLength(body)), 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
@@ -5176,7 +5229,7 @@ function scimList(Resources: unknown[]) {
 }
 
 function prometheusMetrics(snapshot: Record<string, unknown>): string {
-  const lines = ['# HELP karmax_info Karmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const lines = ['# HELP karmax_info Krmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
   const scalar = (name: string, help: string, value: unknown) => {
     lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
   };

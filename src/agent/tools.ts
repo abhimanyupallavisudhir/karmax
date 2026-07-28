@@ -167,7 +167,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_spend',
     description:
-      'Reserve authorization to pay with a permitted project/organization card. Amount in cents. Returns granted (settled for Local funds; reserved for Stripe), needs_approval, needs_funding, or denied. If not granted, stop and report — the human will fund/approve, then you can retry.',
+      'Reserve authorization to pay with a permitted project/organization card. Amount in cents. Returns granted, needs_approval, needs_funding, or denied. If not granted, stop and report — the human will raise the card limit or approve, then you can retry.',
     parameters: {
       type: 'object',
       properties: {
@@ -182,7 +182,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fill_payment_card',
     description:
-      'After request_spend returns granted for a Stripe card, securely fill that reserved virtual card into checkout inputs over loopback Chrome DevTools. Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
+      'After request_spend returns granted, securely fill that reserved card into checkout inputs over loopback Chrome DevTools. Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
     parameters: {
       type: 'object',
       properties: {
@@ -193,6 +193,10 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         expiry_selector: { type: 'string', description: 'Combined MM/YY field. Use this or both month/year selectors. @tab advances once from the prior field.' },
         exp_month_selector: { type: 'string' },
         exp_year_selector: { type: 'string' },
+        line1_selector: { type: 'string', description: 'Optional billing street field; filled only when the card carries a billing address.' },
+        city_selector: { type: 'string', description: 'Optional billing city field.' },
+        postal_code_selector: { type: 'string', description: 'Optional billing postal/ZIP field.' },
+        country_selector: { type: 'string', description: 'Optional billing country field.' },
       },
       required: ['request_id', 'cdp_url', 'number_selector', 'cvc_selector'],
     },
@@ -567,6 +571,10 @@ export function platformToolHandlers(
           expiry: args?.expiry_selector ? String(args.expiry_selector) : undefined,
           expMonth: args?.exp_month_selector ? String(args.exp_month_selector) : undefined,
           expYear: args?.exp_year_selector ? String(args.exp_year_selector) : undefined,
+          line1: args?.line1_selector ? String(args.line1_selector) : undefined,
+          city: args?.city_selector ? String(args.city_selector) : undefined,
+          postalCode: args?.postal_code_selector ? String(args.postal_code_selector) : undefined,
+          country: args?.country_selector ? String(args.country_selector) : undefined,
         },
       }));
     },

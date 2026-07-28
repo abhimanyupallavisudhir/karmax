@@ -1,7 +1,9 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { hostLocal } from '../config/deployment.js';
 import { CredentialBroker } from './broker.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
 import { hostOf, passEntryMetadata } from './pass-path.js';
@@ -43,11 +45,26 @@ export interface ExternalItem {
   folder?: string;
   /** Secret fields available to pull (so the UI can preview what arrives). */
   fields: VaultFieldName[];
+  /** When the entry last changed in the external store (epoch ms), when the
+   *  store can say. A re-sync skips entries that have not changed since they
+   *  were last mirrored — decrypting a whole `pass` tree costs seconds per
+   *  entry, so re-importing everything must not re-read everything. */
+  changedAt?: number;
 }
 
 /** An external entry WITH its secrets, ready to write into the vault. */
 export interface ExternalSecretItem extends ExternalItem {
   secrets: Partial<Record<VaultFieldName, string>>;
+}
+
+/**
+ * What a pull produced. Failures are DATA, not exceptions: one undecryptable
+ * entry must not throw away the other 500 credentials of a bulk import (and
+ * with them the many minutes the user waited for it).
+ */
+export interface PullResult {
+  items: ExternalSecretItem[];
+  failures: Array<{ externalId: string; error: string }>;
 }
 
 export interface CredentialConnector {
@@ -56,7 +73,7 @@ export interface CredentialConnector {
   /** Enumerate mirrorable items (metadata only). */
   list(): Promise<ExternalItem[]>;
   /** Fetch the selected items with their secrets. */
-  pull(externalIds: string[]): Promise<ExternalSecretItem[]>;
+  pull(externalIds: string[]): Promise<PullResult>;
   /** Optional write-back of an agent-created item (creates a NEW entry). */
   push?(item: ExternalSecretItem): Promise<{ externalId: string }>;
   /**
@@ -106,7 +123,7 @@ export class BitwardenConnector implements CredentialConnector {
     const folderName = new Map<string, string>(folders.map((f: any) => [f.id, f.name]));
     return items.map((it) => normalizeBitwarden(it, folderName.get(it.folderId) ?? '')).filter((x): x is ExternalItem => !!x);
   }
-  async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
+  async pull(externalIds: string[]): Promise<PullResult> {
     const wanted = new Set(externalIds);
     const items = JSON.parse(await this.exec('bw', ['list', 'items'], { env: this.env() })) as any[];
     const out: ExternalSecretItem[] = [];
@@ -120,7 +137,7 @@ export class BitwardenConnector implements CredentialConnector {
       if (norm.type === 'note' && it.notes) secrets.note = it.notes;
       out.push({ ...norm, secrets });
     }
-    return out;
+    return { items: out, failures: [] };
   }
   /** Field-level edit: read the item JSON, change one field, `bw edit` it back —
    *  every other field (username, notes, uris, totp) is preserved. */
@@ -137,13 +154,20 @@ export class BitwardenConnector implements CredentialConnector {
 }
 
 function normalizeBitwarden(it: any, folder: string): ExternalItem | undefined {
+  const changedAt = timestampOf(it.revisionDate);
   if (it.type === 1 && it.login) {
     const domains = (it.login.uris ?? []).map((u: any) => hostOf(u?.uri)).filter(Boolean);
     return { externalId: it.id, type: 'login', label: it.name ?? 'login', username: it.login.username ?? undefined,
-      domains, folder, fields: ['password', ...(it.login.totp ? (['totp'] as VaultFieldName[]) : [])] };
+      domains, folder, fields: ['password', ...(it.login.totp ? (['totp'] as VaultFieldName[]) : [])], ...changedAt };
   }
-  if (it.type === 2) return { externalId: it.id, type: 'note', label: it.name ?? 'note', folder, fields: ['note'] };
+  if (it.type === 2) return { externalId: it.id, type: 'note', label: it.name ?? 'note', folder, fields: ['note'], ...changedAt };
   return undefined; // cards/identities out of scope for v1
+}
+
+/** `{ changedAt }` for a store's revision date, or `{}` when it has none. */
+function timestampOf(value: unknown): { changedAt?: number } {
+  const ms = typeof value === 'string' || typeof value === 'number' ? new Date(value).getTime() : NaN;
+  return Number.isFinite(ms) ? { changedAt: ms } : {};
 }
 
 // ── 1Password (`op` CLI + service-account token; no desktop ceremony) ─────────
@@ -167,12 +191,19 @@ export class OnePasswordConnector implements CredentialConnector {
     const items = JSON.parse(await this.exec('op', ['item', 'list', '--format=json'], { env: this.env() })) as any[];
     return items.map((it) => ({ externalId: it.id, type: categoryType(it.category), label: it.title ?? 'item',
       domains: (it.urls ?? []).map((u: any) => hostOf(u?.href)).filter(Boolean),
-      folder: it.vault?.name ?? '', fields: itemFieldsFor(categoryType(it.category)) }));
+      folder: it.vault?.name ?? '', fields: itemFieldsFor(categoryType(it.category)), ...timestampOf(it.updated_at) }));
   }
-  async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
+  async pull(externalIds: string[]): Promise<PullResult> {
     const out: ExternalSecretItem[] = [];
+    const failures: PullResult['failures'] = [];
     for (const id of externalIds) {
-      const full = JSON.parse(await this.exec('op', ['item', 'get', id, '--format=json'], { env: this.env() }));
+      let full: any;
+      try {
+        full = JSON.parse(await this.exec('op', ['item', 'get', id, '--format=json'], { env: this.env() }));
+      } catch (e) {
+        failures.push({ externalId: id, error: e instanceof Error ? e.message : String(e) });
+        continue;
+      }
       const type = categoryType(full.category);
       const byId = new Map<string, any>((full.fields ?? []).map((f: any) => [f.id, f]));
       const val = (fid: string) => byId.get(fid)?.value;
@@ -185,7 +216,7 @@ export class OnePasswordConnector implements CredentialConnector {
       out.push({ externalId: id, type, label: full.title ?? 'item', username: val('username'),
         domains: (full.urls ?? []).map((u: any) => hostOf(u?.href)).filter(Boolean), fields: Object.keys(secrets) as VaultFieldName[], secrets });
     }
-    return out;
+    return { items: out, failures };
   }
   /** Field-level edit via `op item edit` — assignments touch only the named
    *  field, leaving notes and everything else in the item intact. */
@@ -237,23 +268,27 @@ export class PassConnector implements CredentialConnector {
         label: slash >= 0 ? entry.slice(slash + 1) : entry,
         folder: slash >= 0 ? entry.slice(0, slash) : '',
         domains: domain ? [domain] : [], ...(username ? { username } : {}),
-        fields: ['password'] as VaultFieldName[] };
+        fields: ['password'] as VaultFieldName[], ...this.changedAt(entry) };
     });
   }
-  async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
+  async pull(externalIds: string[]): Promise<PullResult> {
     // Treat the store itself as the authority, not ids posted back by the UI.
     // Besides preventing stale/tampered selections from reaching `pass show`,
     // this keeps non-GPG files out of the import execution path as well as the
     // preview.
     const entries = new Set(await this.entries());
     const out: ExternalSecretItem[] = [];
+    const failures: PullResult['failures'] = [];
     for (const id of externalIds) {
       if (!entries.has(id)) continue;
       let body: string;
       try {
         body = await this.exec('pass', ['show', id]);
       } catch (e) {
-        throw new Error(gpgHint(e));
+        // A single entry that will not decrypt (wrong recipient, a gpg hiccup)
+        // is reported and skipped; the rest of the import still lands.
+        failures.push({ externalId: id, error: gpgHint(e) });
+        continue;
       }
       const lines = body.replace(/\r/g, '').split('\n');
       // `pass` convention: the FIRST line is the password; everything after is
@@ -266,9 +301,18 @@ export class PassConnector implements CredentialConnector {
       const { domain, username } = passEntryMetadata(id);
       out.push({ externalId: id, type: 'login', label: id, domains: domain ? [domain] : [],
         ...(username ? { username } : {}),
-        fields: Object.keys(secrets) as VaultFieldName[], secrets });
+        fields: Object.keys(secrets) as VaultFieldName[], secrets, ...this.changedAt(id) });
     }
-    return out;
+    return { items: out, failures };
+  }
+  /** The entry file's mtime — `pass` keeps one GPG file per entry, so the
+   *  filesystem already records when a credential last changed. */
+  private changedAt(entry: string): { changedAt?: number } {
+    try {
+      return { changedAt: fs.statSync(path.join(this.storeDir, `${entry}.gpg`)).mtimeMs };
+    } catch {
+      return {};
+    }
   }
   private async entries(): Promise<string[]> {
     // `pass ls` cannot be used for enumeration: its `tree` output includes
@@ -364,8 +408,21 @@ const connectorAuthHandle = (org: string, name: string) => `connector:${org}:${n
 export interface ConnectorConfig {
   /** Opt-in write-back of agent-created items. */
   writeBack?: boolean;
-  /** Last successful sync (epoch ms) + how many items it wrote. */
+  /** Last successful sync (epoch ms) + how many of its items the vault now
+   *  mirrors. The count is the running total, not this batch's share, so a
+   *  big import split into batches still reports what the user has. */
   lastSync?: { at: number; count: number };
+}
+
+/** The outcome of one `sync` batch. */
+export interface SyncResult {
+  /** Items pulled and written this time. */
+  count: number;
+  itemIds: string[];
+  /** Entries already mirrored and unchanged in the store — not re-read. */
+  skipped: number;
+  /** Entries the store could not hand over; the rest still landed. */
+  failures: Array<{ externalId: string; error: string }>;
 }
 
 export interface ConnectorStore {
@@ -426,16 +483,48 @@ export class Connectors {
    * Re-syncing updates the same items (matched by connector + externalId)
    * rather than duplicating; new items start with the connector's policy
    * defaults (`use: auto`, `reveal: ask`).
+   *
+   * Two properties make a whole-store import survivable, because reading a
+   * secret out of a real store is expensive (a `pass` entry costs a GPG
+   * decrypt — seconds each, and gpg-agent serializes them):
+   *  - **unchanged entries are not re-read.** Re-importing a 600-entry `pass`
+   *    tree after adding one password costs one decrypt, not six hundred.
+   *  - **failures are partial.** An entry that will not decrypt is reported
+   *    and skipped instead of discarding everything else the pull collected.
    */
-  async sync(name: string, externalIds: string[], opts: { policy?: Partial<VaultItemPolicy>; writeBack?: boolean } = {}): Promise<{ count: number; itemIds: string[] }> {
+  async sync(name: string, externalIds: string[], opts: { policy?: Partial<VaultItemPolicy>; writeBack?: boolean } = {}): Promise<SyncResult> {
     const connector = this.get(name);
     if (!connector) throw new Error(`no connector "${name}"`);
     if (opts.writeBack !== undefined) this.setConfig(name, { writeBack: opts.writeBack });
-    const pulled = await connector.pull(externalIds);
     const source = `connector:${name}`;
+    const mirrored = new Map(this.items.list()
+      .filter((i) => i.provenance.source === source && i.provenance.externalId)
+      .map((i) => [i.provenance.externalId!, i]));
+
+    // Only ask the store when something might be skippable (a first import has
+    // nothing to compare against, and `list()` is itself a CLI round-trip).
+    let wanted = externalIds;
+    if (mirrored.size) {
+      const changedAt = new Map((await connector.list()).map((i) => [i.externalId, i.changedAt]));
+      wanted = externalIds.filter((id) => {
+        const at = changedAt.get(id);
+        const item = mirrored.get(id);
+        // Items mirrored before `syncedAt` existed fall back to `updatedAt`,
+        // so an upgrade does not force one more full-store re-read; they get a
+        // real mirror clock the first time they are pulled again.
+        const since = item && (item.provenance.syncedAt ?? item.updatedAt);
+        return !(at !== undefined && since !== undefined && at <= since);
+      });
+    }
+
+    const { items: pulled, failures } = await connector.pull(wanted);
+    // Nothing at all came back: surface why (a locked GPG key, an expired
+    // session) rather than reporting a silent zero-item success.
+    if (!pulled.length && failures.length) throw new Error(failures[0]!.error);
+    const syncedAt = Date.now();
     const itemIds: string[] = [];
     for (const ext of pulled) {
-      const existing = this.items.findByExternal(source, ext.externalId);
+      const existing = mirrored.get(ext.externalId);
       const saved = this.items.save({
         id: existing?.id,
         type: ext.type,
@@ -446,12 +535,13 @@ export class Connectors {
         // clobber a policy the user has since tuned on an existing item.
         ...(existing ? {} : { policy: opts.policy }),
         secrets: ext.secrets,
-        provenance: { source, externalId: ext.externalId },
+        provenance: { source, externalId: ext.externalId, syncedAt },
       });
       itemIds.push(saved.id);
     }
-    this.setConfig(name, { lastSync: { at: Date.now(), count: itemIds.length } });
-    return { count: itemIds.length, itemIds };
+    const total = this.items.list().filter((i) => i.provenance.source === source).length;
+    this.setConfig(name, { lastSync: { at: syncedAt, count: total } });
+    return { count: itemIds.length, itemIds, skipped: externalIds.length - wanted.length, failures };
   }
 
   /**
@@ -565,11 +655,17 @@ export class Connectors {
 }
 
 /** The standard registry (Bitwarden + 1Password + pass), one construction shared
- *  by every gateway call site so the wiring cannot drift. */
-export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined, organizationId: string): Connectors {
+ *  by every gateway call site so the wiring cannot drift.
+ *
+ *  Bitwarden and 1Password authenticate with a token the tenant supplies, so they
+ *  travel anywhere. `pass` has no such credential — it reads the *host's*
+ *  `~/.password-store` through the host's gpg-agent — so it is offered only while
+ *  the browser and the host are the same machine. */
+export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined,
+  organizationId: string, opts: { hostLocal?: boolean } = {}): Connectors {
   const connectors = new Connectors(store, items, broker, organizationId);
   connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
   connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
-  connectors.register(new PassConnector());
+  if (opts.hostLocal ?? hostLocal()) connectors.register(new PassConnector());
   return connectors;
 }

@@ -131,11 +131,11 @@ export class GitHubAppService {
   manifest(publicUrl: string, state: string): { action: string; manifest: Record<string, unknown> } {
     const parsed = new URL(publicUrl);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
-      throw new Error('Karmax needs an http(s) browser URL to set up GitHub');
+      throw new Error('Krmax needs an http(s) browser URL to set up GitHub');
     const origin = parsed.origin;
     const hostname = new URL(origin).hostname.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 35) || 'host';
     const manifest: Record<string, unknown> = {
-      name: `Karmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
+      name: `Krmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
       url: origin,
       public: false,
       // Keep the CSRF state in the path. GitHub's manifest validator is

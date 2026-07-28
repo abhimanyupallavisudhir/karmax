@@ -271,8 +271,8 @@ export class RemoteAccessController {
         setupStage: 'serve',
         ...(url ? { url } : {}),
         detail: servedPort
-          ? `Tailscale already routes this phone address to another local service on port ${servedPort}. If that is your main Karmax, keep using the address above. To expose this Karmax instead, turn off Phone Access in the other instance first.`
-          : 'Tailscale already routes this phone address to another local service. Karmax left that configuration untouched.',
+          ? `Tailscale already routes this phone address to another local service on port ${servedPort}. If that is your main Krmax, keep using the address above. To expose this Krmax instead, turn off Phone Access in the other instance first.`
+          : 'Tailscale already routes this phone address to another local service. Krmax left that configuration untouched.',
         canSetup: false,
         canEnable: false,
         canDisable: false,
@@ -317,7 +317,7 @@ export class RemoteAccessController {
           method: 'tailscale',
           state: 'error',
           setupStage: 'authorize',
-          detail: raw || 'Karmax could not finish Tailscale setup.',
+          detail: raw || 'Krmax could not finish Tailscale setup.',
           canSetup: true,
           canEnable: false,
           canDisable: false,
@@ -373,7 +373,7 @@ export class RemoteAccessController {
         setupStage: 'authorize',
         detail: permissionDenied(raw)
           ? 'System authorization was not completed. Approve the prompt on this computer, or use the terminal fallback below.'
-          : (raw || 'Karmax could not authorize Tailscale on this computer.'),
+          : (raw || 'Krmax could not authorize Tailscale on this computer.'),
         canSetup: true,
         canEnable: false,
         canDisable: false,
@@ -492,7 +492,7 @@ export async function remoteAccessPlan(port: number, opts: {
       guidance:
         `Phone access: open Settings → Phone Access, or run:\n` +
         `  tailscale serve --bg http://127.0.0.1:${port}\n` +
-        `  Karmax stays on localhost and is shared privately over HTTPS.${authNote}`,
+        `  Krmax stays on localhost and is shared privately over HTTPS.${authNote}`,
     };
   }
   return {

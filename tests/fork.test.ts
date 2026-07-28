@@ -84,8 +84,15 @@ describe('materializeFork — Codex (by id in the home)', () => {
 
   it('finds a rollout by id in ANY config-home when no srcHome is given (raw pasted id)', () => {
     // Simulates a raw pasted session id: the caller has no idea which home minted it,
-    // so materialize must sweep ~/.karmax/config-homes to resolve it.
-    const configHomes = path.join(os.homedir(), '.karmax', 'config-homes');
+    // so materialize must sweep the DATA HOME's config-homes to resolve it. The home
+    // is whatever KARMAX_HOME says — pointing it at a temp dir keeps this test out of
+    // the developer's real ~/.karmax (the harness isolation rule) and pins the
+    // regression: the sweep used to hard-code ~/.karmax and ignore KARMAX_HOME.
+    const dataHome = tmp('karmax-forkhome-');
+    const priorHome = process.env.KARMAX_HOME;
+    process.env.KARMAX_HOME = dataHome;
+    const configHomes = path.join(dataHome, 'config-homes');
+    fs.mkdirSync(configHomes, { recursive: true });
     const owner = fs.mkdtempSync(path.join(configHomes, 'codex-test-owner-'));
     const forkHome = tmp('karmax-cxfork3-');
     const session = sid();
@@ -97,7 +104,29 @@ describe('materializeFork — Codex (by id in the home)', () => {
       expect(materializeFork({ provider: 'codex', session, forkHome, worldPath: '/tmp/w' })).toBe(true);
       expect(fs.existsSync(path.join(forkHome, 'sessions', 'forked', `rollout-2026-07-05T00-00-00-${session}.jsonl`))).toBe(true);
     } finally {
-      fs.rmSync(owner, { recursive: true, force: true });
+      if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
+      fs.rmSync(dataHome, { recursive: true, force: true });
+      fs.rmSync(forkHome, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps the configured data home for a Claude session too', () => {
+    // The Claude candidate list had the same hard-coded home as the Codex one.
+    const dataHome = tmp('karmax-forkhome-cl-');
+    const priorHome = process.env.KARMAX_HOME;
+    process.env.KARMAX_HOME = dataHome;
+    const owner = path.join(dataHome, 'config-homes', 'claude-test-owner');
+    const forkHome = tmp('karmax-clfork-');
+    const session = sid();
+    try {
+      const projects = path.join(owner, 'projects', '-tmp-old-world');
+      fs.mkdirSync(projects, { recursive: true });
+      fs.writeFileSync(path.join(projects, `${session}.jsonl`), '{}\n');
+      expect(materializeFork({ provider: 'claude', session, forkHome, worldPath: '/tmp/w' })).toBe(true);
+      expect(fs.existsSync(path.join(forkHome, 'projects', claudeCwdSlug('/tmp/w'), `${session}.jsonl`))).toBe(true);
+    } finally {
+      if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
+      fs.rmSync(dataHome, { recursive: true, force: true });
       fs.rmSync(forkHome, { recursive: true, force: true });
     }
   });
