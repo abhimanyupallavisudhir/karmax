@@ -47,7 +47,7 @@ import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { manifest } from '../contrib/manifests.js';
+import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, type TaskPullRequest } from '../domain/types.js';
 import { newId } from '../util/id.js';
@@ -974,13 +974,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
-      // capabilities = intersection(profile ceiling, granting principal).
+      // capabilities = intersection(role ceiling, granting principal). The two are
+      // orthogonal axes — the ceiling is what this ROLE could ever need (declared by
+      // the workflow), the grant is what the task's authorization profile delegated —
+      // so a Merge agent stays a Merge agent even on an administrator-authorized task.
       // Human-approved credential escalations recorded after creation
       // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
       const grant = [...(args.task.grant ?? DEFAULT_GRANT), ...orgVaultItems.extensionCaps(args.taskId)];
-      const effective = attenuate(profile.capabilities, grant);
+      const ceiling = roleCeiling(args.role);
+      const effective = attenuate(ceiling, grant);
       let token: string | undefined;
       if (deps.tokens) {
         const minted = deps.tokens.mint({
@@ -992,7 +996,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           audience: 'karmax-platform',
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           worldGeneration: args.worldHandle.generation,
-          ceiling: profile.capabilities,
+          ceiling,
           grantorCaps: grant,
         });
         token = minted.token;

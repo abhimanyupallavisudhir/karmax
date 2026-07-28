@@ -623,6 +623,23 @@ export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIF
   return roleDef(name, manifests) ?? (name === 'resolve' ? { ...LEGACY_RESOLVE_ROLE, workflows: [] } : undefined);
 }
 
+/**
+ * The capability ceiling a turn is minted against (SPEC §8.2) — always resolved
+ * from the declaring workflow, never from a copy stored on the agent profile.
+ *
+ * The ceiling is the ROLE contract ("what could a Merge agent ever need"), which
+ * is orthogonal to the task's authorization grant ("what this task's creator may
+ * delegate"); effective caps are the intersection of the two. Because it is the
+ * workflow's to declare, it is not a user setting: a persisted copy only ever
+ * went stale — profiles seed once, so a role that gained a capability kept the
+ * old ceiling forever and the new tool silently 403'd.
+ *
+ * An undeclared role is floored at `signal-completion` so a turn can always end.
+ */
+export function roleCeiling(name: string, manifests: WorkflowManifest[] = MANIFESTS): string[] {
+  return agentRoleDef(name, manifests)?.capabilities ?? ['signal-completion'];
+}
+
 /** Resolve the transitive closure of `requires` for a set of workflows (SPEC §4.6). */
 export function resolveRequires(names: string[]): string[] {
   const seen = new Set<string>();

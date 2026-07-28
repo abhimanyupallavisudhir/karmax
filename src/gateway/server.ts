@@ -3039,6 +3039,7 @@ export class Gateway {
             modelProvider: _legacyModelProvider,
             allowedAccounts: _legacyAllowedAccounts,
             auth: _legacyAuth,
+            capabilities: _legacyCapabilities,
             ...visibleProfile
           } = pr;
           if (visibleProfile.inherited) {
@@ -3046,6 +3047,7 @@ export class Gateway {
               modelProvider: _legacyInheritedProvider,
               allowedAccounts: _legacyInheritedAllowedAccounts,
               auth: _legacyInheritedAuth,
+              capabilities: _legacyInheritedCapabilities,
               ...visibleInherited
             } = visibleProfile.inherited;
             visibleProfile.inherited = visibleInherited;
@@ -3089,9 +3091,12 @@ export class Gateway {
           modelProvider: _legacyModelProvider,
           allowedAccounts: _legacyAllowedAccounts,
           auth: _legacyAuth,
+          // The role's workflow owns the capability ceiling (roleCeiling); a submitted
+          // one must neither narrow nor escalate what the role's turns are minted with.
+          capabilities: _legacyCapabilities,
           ...rest
         } = b;
-        store.upsertProfile({ provider: 'claude', capabilities: [], ...rest, id });
+        store.upsertProfile({ provider: 'claude', ...rest, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
       // reset a project profile override back to the global default
