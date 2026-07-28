@@ -807,7 +807,14 @@ export class Gateway {
           String(req.headers['x-github-event'] ?? ''), String(req.headers['x-github-delivery'] ?? ''), raw,
           typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
         );
-        return this.json(res, 200, result);
+        // GitHub's PR lifecycle enters karmax as ordinary task events, so the
+        // timeline and `event` triggers see it like any other happening (SPEC §5.4).
+        // The service already resolved each event to a task of the installing
+        // organization, so dispatch is unconditional here.
+        const { events, ...body } = result;
+        for (const event of events ?? [])
+          this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
+        return this.json(res, 200, { ...body, ...(events?.length ? { dispatched: events.length } : {}) });
       } catch (error) {
         return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
       }

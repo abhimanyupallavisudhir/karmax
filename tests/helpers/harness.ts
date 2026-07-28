@@ -43,7 +43,13 @@ export interface Harness {
 }
 
 /** Boots a full karmax backend (Temporal + worker + deps) for integration tests. */
-export async function bootHarness(provider: Provider = 'mock', adapterOverride?: import('../../src/agent/types.js').AgentAdapter): Promise<Harness> {
+export async function bootHarness(
+  provider: Provider = 'mock',
+  adapterOverride?: import('../../src/agent/types.js').AgentAdapter,
+  /** Activity-dep overrides a test needs the worker to run with (e.g. a stub
+   *  GitHub endpoint for the pull-request integration). */
+  overrides: { githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions } = {},
+): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
   const conn = { address: server.address, namespace: server.namespace };
   const c = await makeClient(conn);
@@ -93,6 +99,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     taskQueue: TASK_QUEUE,
     broker,
     resources,
+    ...overrides,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();

@@ -2687,6 +2687,19 @@ function customBranch(v, taskId) {
   return v.branch && v.branch !== `karmax/${taskId}`;
 }
 
+// The task's GitHub pull requests (remote policy 'pr'), with their live state —
+// merged / closed / open — so the PR is visible from the task, not just in the
+// event log. `prs` carries one per repo; `pr` alone is the pre-multi-repo shape.
+function pullRequestLinks(v) {
+  const prs = v.prs?.length ? v.prs : v.pr ? [v.pr] : [];
+  return prs.map((pr) => {
+    const state = pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
+    const label = prs.length > 1 && pr.repo ? `${pr.repo} #${pr.number}` : `PR #${pr.number}`;
+    return `<a class="pr-link ${state}" href="${esc(pr.url)}" target="_blank" rel="noopener"
+      title="${esc(pr.slug ? `${pr.slug} — ${state}` : state)}">⇱ ${esc(label)}<span class="pr-state">${state}</span></a>`;
+  }).join('');
+}
+
 // Human-facing task-state label. A wait reason is more useful than the pipeline
 // position while a task is parked: the pipeline already shows that it is in Do,
 // Review, etc. In the `merge` stage, old/in-flight views may not have waitingFor,
@@ -4554,6 +4567,7 @@ function renderTaskPage() {
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
+          ${pullRequestLinks(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
