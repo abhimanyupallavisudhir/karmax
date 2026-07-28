@@ -6752,11 +6752,29 @@ function summarize(p) {
 // Fetch the coordinator's authoritative queue order for every domain currently in
 // the merge stage, so the view reflects reorders immediately (the per-task polled
 // position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
+// Every merge-queue domain a task occupies. A multi-repo task takes ONE SLOT PER
+// REPO, so `mergeDomains` (plural) is authoritative; `mergeDomain` (singular) is
+// only ever its first, and is kept as a fallback for views published before the
+// plural existed.
+//
+// Keying the panel on the singular had two consequences. A multi-repo task
+// appeared in — and could be reordered within — only its first repo's queue. And
+// a MERGE-ONLY task, which publishes only the plural (src/workflows/merge-only.ts),
+// fell into the unnamed `''` group: it still rendered, but with no domain label,
+// no drag handle, no reorder buttons, and no coordinator order fetched for it, so
+// its position was whatever its last self-published number happened to say. Inert
+// but present is the worse failure of the two — nothing looks wrong.
+function taskMergeDomains(view) {
+  const state = view?.state || {};
+  if (Array.isArray(state.mergeDomains) && state.mergeDomains.length) return state.mergeDomains.filter(Boolean);
+  return state.mergeDomain ? [state.mergeDomain] : [];
+}
+
 async function seedQueue() {
   const projectId = S.projectId;
   const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
+  const domains = [...new Set(inMerge.flatMap((t) => taskMergeDomains(t.lastView)))];
   const orders = {};
   await Promise.all(
     domains.map(async (d) => {
@@ -6776,10 +6794,13 @@ async function seedQueue() {
 
 // Rank a task within its domain: the leased (merging) task pins to the top, then the
 // coordinator's queue order when known, else the task's last-published position.
-function queueRank(t) {
+function queueRank(t, domain) {
   const v = t.lastView || {};
   if (v.state?.mergeGranted) return -1;
-  const ord = S.queueOrders[v.state?.mergeDomain];
+  // Rank within the domain being rendered — a task in several domains sits at a
+  // different position in each, so ranking it by its first one put it in the
+  // wrong place in every other queue.
+  const ord = S.queueOrders[domain ?? taskMergeDomains(v)[0]];
   if (ord) { const i = ord.queue.indexOf(t.id); return i < 0 ? 1e6 : i; }
   const p = v.mergeQueue?.position;
   return p > 0 ? p : 1e6 - 1;
@@ -6792,20 +6813,24 @@ function mergeQueuePanel() {
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
   for (const t of inMerge) {
-    const d = t.lastView?.state?.mergeDomain || '';
-    if (!groups.has(d)) groups.set(d, []);
-    groups.get(d).push(t);
+    // A task appears in EVERY domain it holds, because it really does occupy a
+    // slot in each. `''` keeps a task whose view predates domain publication
+    // visible rather than dropping it off the queue.
+    for (const d of taskMergeDomains(t.lastView).length ? taskMergeDomains(t.lastView) : ['']) {
+      if (!groups.has(d)) groups.set(d, []);
+      groups.get(d).push(t);
+    }
   }
   const multi = groups.size > 1;
   return [...groups.entries()]
     .map(([domain, tasks]) => {
-      tasks.sort((a, b) => queueRank(a) - queueRank(b));
+      tasks.sort((a, b) => queueRank(a, domain) - queueRank(b, domain));
       const rows = tasks
         .map((t) => {
           const v = t.lastView || {};
           const pos = v.mergeQueue?.position;
           const merging = !!v.state?.mergeGranted;
-          const canMove = !merging && !!v.state?.mergeDomain;
+          const canMove = !merging && !!domain;
           return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
@@ -6862,8 +6887,8 @@ function localQueue(domain) {
   const ord = S.queueOrders[domain];
   if (ord) return ord;
   const ids = S.tasks
-    .filter((t) => (t.lastView?.state?.mergeDomain || '') === domain && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
-    .sort((a, b) => queueRank(a) - queueRank(b))
+    .filter((t) => taskMergeDomains(t.lastView).includes(domain) && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
+    .sort((a, b) => queueRank(a, domain) - queueRank(b, domain))
     .map((t) => t.id);
   const seeded = { queue: ids };
   S.queueOrders[domain] = seeded;
