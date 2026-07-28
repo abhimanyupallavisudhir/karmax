@@ -70,6 +70,8 @@ const S = {
   views: [], // saved views (named queries)
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
+  searchFailed: false, // last evaluation errored — distinct from "nothing matched"
+  wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
@@ -466,6 +468,13 @@ function principalLabel(principal) {
   return `Task agent · ${principal.role}`;
 }
 
+// The workflows a human may pick when creating a task. INTENDED: `just-do` and
+// `script-exec` are deliberately absent because they are clutter in the picker —
+// nobody wants to choose them. That is the whole reason; they are still
+// registered and still run (their manifests carry `selectable: false`), so
+// existing tasks keep replaying and automation can still use them. Do not
+// "fix" this by adding them back. `workflowLabel` falls back to the raw id so
+// such a task still renders sensibly wherever one does appear.
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
@@ -1875,9 +1884,14 @@ async function runSearch() {
     }));
     if (r.groups) r.groups = overlayGroups(r.groups);
     S.searchResult = r;
+    S.searchFailed = false;
     return true;
   } catch {
-    if (S.searchEpoch === epoch && S.projectId === projectId) S.searchResult = null;
+    // Distinguish "the server couldn't evaluate this" from "nothing matched".
+    // Without the flag the view falls back to a client-side filter and shows
+    // "No matching tasks", so a server outage reads as a bad query and the user
+    // edits a perfectly good one.
+    if (S.searchEpoch === epoch && S.projectId === projectId) { S.searchResult = null; S.searchFailed = true; }
     return false;
   }
 }
@@ -2070,7 +2084,22 @@ function connectWs() {
     if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
-  ws.onclose = () => setTimeout(connectWs, 1500);
+  // The whole task page (stage chip, streaming agent bubble, conversation, merge
+  // queue, activity feed) is driven only by this socket. A silent drop left the
+  // page showing stale state as if it were truth, and events missed during the
+  // gap were never re-fetched. Surface the gap, and backfill on reconnect.
+  ws.onopen = () => {
+    setWsOnline(true);
+    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.taskId) refreshTask().catch(() => {}); }
+    wsHadDropped = false;
+  };
+  ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
+}
+
+let wsHadDropped = false;
+function setWsOnline(online) {
+  S.wsOnline = online;
+  document.getElementById('ws-offline')?.classList.toggle('hidden', online);
 }
 
 let taskRefreshPromise = null;
@@ -2168,6 +2197,7 @@ function renderShell() {
         <option value="__new">＋ New organization</option>
       </select>
       <div class="spacer"></div>
+      <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
       <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
@@ -2602,9 +2632,11 @@ function tasksView() {
   } else {
     body = flat.map((t) => taskRow(t)).join('');
   }
-  const empty = S.search
-    ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
-    : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
+  const empty = S.searchFailed
+    ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
+    : S.search
+      ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
+      : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
@@ -2707,7 +2739,7 @@ function seriesRow(t) {
       <span class="status-dot ${dot}" title="repeatable series"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
@@ -2739,7 +2771,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot waiting" title="waiting for trigger"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
@@ -2753,7 +2785,7 @@ function taskRow(t, { showTags = true } = {}) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Queue</button>
@@ -2776,7 +2808,7 @@ function taskRow(t, { showTags = true } = {}) {
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
-          <span class="wf">${esc(t.workflow)}</span>
+          <span class="wf">${esc(workflowLabel(t.workflow))}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
           ${v.approvalRequests ? '<span class="chip approval-needed">approval needed</span>' : ''}
@@ -3114,7 +3146,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <span class="status-dot ${status}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t)}</div>
+        <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
@@ -3328,8 +3360,7 @@ function wireTasksView() {
       // Deleting a draft is a hard delete with no undo, so confirm first.
       const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
       if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
-      await deleteDraft(b.dataset.deldraft);
-      toast('Draft removed');
+      if (await deleteDraft(b.dataset.deldraft)) toast('Draft removed');
     }),
   );
   $('#main').querySelectorAll('[data-runnow]').forEach((b) =>
@@ -3390,6 +3421,7 @@ function wireTasksView() {
       toast(e.message, true);
     }
   };
+  $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
   $('#draft-task')?.addEventListener('click', () => add(true));
   $('#add-task')?.addEventListener('click', () => add(false));
   // Enter opens the FULL form (carrying the typed text into its prompt field) so
@@ -3454,11 +3486,17 @@ async function deleteDraft(id) {
   // Drafts never started a workflow, so the record is hard-deleted server-side.
   // A 404 means it's already gone (e.g. a racing double-delete) — treat that as
   // success rather than surfacing a confusing "no such task" error.
+  // Returns whether the draft is gone, so the caller doesn't announce success
+  // on top of a failure toast (a server error used to show red "HTTP 500" and
+  // green "Draft removed" for the same click, with the row still on screen).
   try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); }
-  catch (e) { if (!/no such task|HTTP 404/i.test(e.message || '')) return toast(e.message, true); }
+  catch (e) {
+    if (!/no such task|HTTP 404/i.test(e.message || '')) { toast(e.message, true); return false; }
+  }
   S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
   S.tasks = S.tasks.filter((t) => t.id !== id);
   renderMain();
+  return true;
 }
 
 // ── triggers section of the task form (generic, workflow-agnostic) ───────────
@@ -4671,7 +4709,7 @@ function renderTaskPage() {
             ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
-          ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
+          ${mergeQueueBadge(v)}
           ${pullRequestLinks(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
@@ -5876,7 +5914,10 @@ function conversationPresence(v, t) {
       ? { label: 'Working now', tone: 'working' }
       : { label: v.waitingFor?.detail || 'Starting agent', tone: 'waiting' };
   }
-  if (t.role === liveRoleFor(v) && v.waitingFor) return { label: v.waitingFor.detail || `Waiting for ${v.waitingFor.kind}`, tone: 'waiting' };
+  // Route through waitingText(), never the raw discriminant: `kind` values are
+  // internal enums (mergeSlot/agentSlot/account) and this pane is exactly where
+  // a user watches for progress — it used to read "Waiting for mergeSlot".
+  if (t.role === liveRoleFor(v) && v.waitingFor) return { label: waitingText(v.waitingFor), tone: 'waiting' };
   if (v.status === 'failed') return { label: 'Failed', tone: 'failed' };
   if (v.status === 'done') return { label: 'Finished', tone: 'done' };
   return { label: 'Idle', tone: 'idle' };
@@ -6731,6 +6772,21 @@ async function seedQueue() {
   if (S.tab === 'queue') renderMain();
 }
 
+// The merge-queue badge for a task header. A coordinator that cannot be queried
+// reports position -1 / total 0, and printing those numbers renders a wedged
+// domain as "queue #-1/0" — indistinguishable from an empty queue, and the exact
+// misreading that let #345 sit in `merge` for 11 hours while it looked like
+// nothing was queued at all. Say "unreachable" rather than quote a total we
+// never actually learned.
+function mergeQueueBadge(v) {
+  const q = v.mergeQueue;
+  if (!q) return '';
+  if (q.unreachable) {
+    return `<span style="color:var(--danger)" title="The merge-queue coordinator for this domain did not answer. It is wedged or has not started; this task keeps waiting for a grant that may never arrive.">queue unreachable</span>`;
+  }
+  return `<span>queue #${q.position}/${q.total}</span>`;
+}
+
 // Rank a task within its domain: the leased (merging) task pins to the top, then the
 // coordinator's queue order when known, else the task's last-published position.
 function queueRank(t) {
@@ -6766,7 +6822,7 @@ function mergeQueuePanel() {
           return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : v.mergeQueue?.unreachable ? 'queue unreachable' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
         ${canMove ? `<div class="queue-actions"><button class="btn sm" data-move="top" data-id="${t.id}" data-domain="${esc(domain)}">Move to top</button><button class="btn sm" data-move="bottom" data-id="${t.id}" data-domain="${esc(domain)}">Move to bottom</button></div>` : ''}
       </div>`;
@@ -9901,7 +9957,6 @@ function profileRow(p, scope) {
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
-    <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
       ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -9965,7 +10020,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       for (const orig of targets) {
         await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
           role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
-          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities,
+          projectId: scope === 'project' ? projectId : undefined,
           ...knobs,
         }) });
       }

@@ -45,6 +45,10 @@ import { sweepOrphanedServiceContainers } from './world/services.js';
 
 const VERSION = '1.0.0';
 
+/** How often to re-check the task index against live workflows. Each pass is one
+ *  bounded `describe` per non-terminal task, so it stays cheap at list scale. */
+const RECONCILE_INTERVAL_MS = 60_000;
+
 async function main() {
   hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
   const deployment = validateDeployment();
@@ -185,10 +189,19 @@ async function main() {
     return user ? { id: user.id, name: user.name, email: user.email } : undefined;
   });
   worlds.setHandleResolver((handle) => store.currentWorld(handle.id) as import('./world/types.js').WorldHandle | undefined);
+  // Rebuild a world from its last checkpoint ONLY when the provider has genuinely
+  // lost the sandbox. Restoring replays just the dirty delta captured at the last
+  // park, so doing it after a *transient* control-plane error (a 5xx, a rate limit,
+  // a socket timeout) would silently discard everything the agent has done since
+  // then. The probe gate is the whole safety property — see the matching gate in
+  // activities/core.ts (recoverVanishedWorld). Providers with no probe (the local
+  // worktree) return undefined and are therefore never rolled back.
   worlds.setRecoveryHandler(async (handle) => {
     if (store.worldState(handle.id) === 'released') return undefined;
     const checkpoint = store.latestWorldCheckpoint(handle.id);
     if (!checkpoint) return undefined;
+    const state = await worlds.probe(handle).catch(() => undefined);
+    if (state !== 'missing') return undefined; // transient/parked → keep the original error
     store.setWorldState((store.currentWorld(handle.id) ?? handle) as import('./world/types.js').WorldHandle, 'degraded');
     return checkpoints.restore(checkpoint.id, handle.kind);
   });
@@ -258,10 +271,36 @@ async function main() {
   }, 10_000);
   orphanSweep.unref();
 
+  // Repair coordinator singletons whose history this build can no longer replay.
+  // Runs before task reconciliation so a merge queue that self-heals here is
+  // already answering by the time tasks waiting on it are examined.
+  const { healCoordinators } = await import('./platform/coordinator-health.js');
+  const health = await healCoordinators(client, TASK_QUEUE)
+    .catch(() => ({ checked: 0, wedged: [], rebuilt: [], reported: [] }));
+  if (health.rebuilt.length)
+    console.log(`  • Rebuilt ${health.rebuilt.length} unreplayable coordinator(s)`);
+  for (const { workflowId, reason } of health.reported)
+    console.warn(`  ! Coordinator ${workflowId} is wedged; left alone: ${reason}`);
+
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
   const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));
   if (recon.settled) console.log(`  • Reconciled ${recon.settled} task(s) lost/finished while offline`);
+
+  // …and keep reconciling while we run. A workflow can die *without* karmax
+  // hearing about it — Temporal terminates one that exceeds its history limit,
+  // and termination runs no catch block, so the last view the task published
+  // stands forever. Reconciling only at boot left such a task rendering as
+  // active-and-progressing (and hid the recovery affordance, which requires a
+  // failed status) until the next restart, which for a long-lived host is never.
+  const reconcileSweep = setInterval(() => {
+    void reconcileTasks(store, client)
+      .then((r) => {
+        if (r.settled) console.log(`  • Reconciled ${r.settled} task(s) whose workflow ended without publishing`);
+      })
+      .catch(() => undefined);
+  }, RECONCILE_INTERVAL_MS);
+  reconcileSweep.unref();
 
   // Register connected logins into the account/token coordinator (SPEC §6.2).
   // Empty pool ⇒ per-turn leasing stays off (zero behavior change).
@@ -468,6 +507,7 @@ async function main() {
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     clearInterval(orphanSweep);
+    clearInterval(reconcileSweep);
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();

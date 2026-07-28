@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-karmax is an agent-orchestration platform centered on a todo list, built on Temporal for durable execution, TypeScript end-to-end. **The karmax spec — the `SPEC` page in the project wiki (open the Wiki tab, or `read_wiki`) — is the source of truth** for design decisions and rationale; the `PLAN*` wiki pages are feature design plans layered on top of it. Runs on Node ≥ 22 (uses built-in `node:sqlite`) and needs the Temporal CLI at `~/.temporalio/bin/temporal` (or `TEMPORAL_CLI`).
+karmax is an agent-orchestration platform centered on a todo list, built on Temporal for durable execution, TypeScript end-to-end. **The karmax spec — the `SPEC` page in the project wiki (open the Wiki tab, or `read_wiki`) — is the source of truth** for design decisions and rationale; the `PLAN*` wiki pages are feature design plans layered on top of it. Both live **only** in the wiki — there are deliberately no `SPEC.md`/`PLAN-*.md` copies in the repo, because duplicates drift (they did, and contradicted each other). Edit the wiki page; never reintroduce a repo copy. Runs on Node ≥ 22 (uses built-in `node:sqlite`) and needs the Temporal CLI at `~/.temporalio/bin/temporal` (or `TEMPORAL_CLI`).
 
 ## Philosophy
 
@@ -30,7 +30,7 @@ npm run reset                                 # wipe Temporal durable state + ka
 
 Integration test files each boot a **real** Temporal dev server + Worker (via `tests/helpers/harness.ts` — real Temporal, real git, mock agent). `vitest.config.ts` forces sequential single-process execution (`singleFork`, `fileParallelism: false`, `maxConcurrency: 1`) and the Worker is resource-capped in `src/temporal/worker.ts`. **Do not re-enable parallelism** — several concurrent Temporal servers + workers can exhaust RAM and freeze the machine.
 
-- Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
+- Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `worktree-lock`, `merge`, `merge-wait`, `coordinator-health`, `stage-transitions`, `security`, `mcp`, `overlays`, `repo-path`, `deploy-edge`.
 - Heavy files (boot a Temporal server, one at a time): `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
 - `tests/live-agent.test.ts` runs only with a real API key and spends real tokens; force-skip with `KARMAX_SKIP_LIVE=1`.
 - `tests/cloud-live.test.ts` runs only with `E2B_API_KEY` / `DAYTONA_API_KEY` and spends real provider credit (one tiny sandbox each); force-skip with `KARMAX_SKIP_LIVE=1`.
@@ -46,6 +46,7 @@ The load-bearing constraint: **workflows are deterministic, activities do the si
 - `src/workflows/` + `src/coordinators/` run inside Temporal's deterministic sandbox. They may only await engine primitives (activities, timers, signals, queries, updates, child workflows) and do pure computation. No Node-only imports — workflow code imports types only through `src/workflows/contract.ts` (pure type re-exports of `src/domain/types.ts`). Every side effect (LLM calls, git, I/O, clocks, randomness) goes through an activity in `src/activities/`.
 - `src/workflows/index.ts` is the worker's bundle entry. Workflows are also exported under version-qualified names (`export { softwareDev as 'softwareDev@1.0.0' }`) — an execution records its type at start and replays it forever; that string export is the per-execution version pin. Bare names remain for back-compat.
 - Editing workflow code can break replay for in-flight executions (running singletons replay old history against new code) — if the dev server wedges after workflow edits, `npm run reset`.
+- **Coordinators have no version pin.** A task workflow is protected by its version-qualified export; a coordinator in `src/coordinators/` cannot be, because it is keyed by *id*, started once, and runs for weeks — it replays against whatever code is loaded today. So editing one wedges every in-flight singleton that had already entered the changed path, and a nondeterministic workflow task retries forever: it can neither act nor answer a query. This is not hypothetical — it stalled two tasks for hours (see `tests/coordinator-health.test.ts`). Boot now probes and rebuilds unreplayable coordinators (`src/platform/coordinator-health.ts`), but that is a net, not a licence: prefer gating a coordinator behavior change on state carried through continue-as-new over reshaping its loop in place, and remember the probe is boot-only while `src/temporal/worker-pool.ts` can roll the bundle without a restart.
 
 Layers around that core:
 

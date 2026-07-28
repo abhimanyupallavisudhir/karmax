@@ -69,9 +69,15 @@ describe('remote subscription agents', () => {
       KARMAX_TOKEN: 'turn-token',
       DATABASE_URL: 'postgres://task-db',
     });
-    expect(installedClaudeCodeVersion()).toBe('2.1.220');
+    // The remote CLI pin is *derived* from the installed Agent SDK's declared
+    // `claudeCodeVersion` (see remote-process.ts) precisely so that no second,
+    // hand-written version exists to drift. Assert that invariant rather than a
+    // literal: a literal here would reintroduce the very pin the source avoids,
+    // and would fail on every legitimate SDK bump.
+    const pinned = installedClaudeCodeVersion();
+    expect(pinned).toMatch(/^\d+\.\d+\.\d+/);
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
-      .toEqual(expect.arrayContaining(['@anthropic-ai/claude-code@2.1.220', '--print', '--resume', 's']));
+      .toEqual(expect.arrayContaining([`@anthropic-ai/claude-code@${pinned}`, '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
       .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
   });

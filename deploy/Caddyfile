@@ -14,8 +14,52 @@
 	}
 }
 
+# Registration is open to the internet, so the edge — not the app — is what
+# bounds a stranger's cost. Keyed on the client address; Caddy terminates TLS
+# here, so that is the real peer and not a header anyone can set.
+(karmax_ratelimit) {
+	rate_limit {
+		# Account creation. karmax's /api/signup and /api/setup call Better
+		# Auth's *server* API directly, which bypasses Better Auth's own
+		# limiter (that runs only in its HTTP router), so nothing else covers
+		# these. Tight enough to stop scripted signup spam filling the disk,
+		# loose enough for a few friends behind one NAT.
+		zone signup {
+			match {
+				path /api/signup /api/setup
+			}
+			key {http.request.remote.host}
+			events 10
+			window 1h
+		}
+		# Credential guessing. /api/login is karmax's own password route and is
+		# likewise not covered by Better Auth; /api/auth/* is, but a second
+		# bound means a regression there is not immediately fatal.
+		# /api/invitations/accept is unauthenticated and grants organization
+		# membership on presenting a token, so it belongs here and not in the
+		# general budget.
+		zone auth {
+			match {
+				path /api/login /api/auth/* /api/invitations/accept
+			}
+			key {http.request.remote.host}
+			events 30
+			window 1m
+		}
+		# Everything else, including anything added later: generous enough for
+		# the console's burst on load, low enough that nobody mines the API for
+		# free. A zone with no matcher applies to every request.
+		zone api {
+			key {http.request.remote.host}
+			events 600
+			window 1m
+		}
+	}
+}
+
 {$KARMAX_DOMAIN} {
 	import karmax_security
+	import karmax_ratelimit
 	reverse_proxy app:4505
 }
 

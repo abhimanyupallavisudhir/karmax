@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget, orderCheckouts } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
+import { withWorktreeLock } from './worktree-lock.js';
 
 /** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
  *  merge commits land in the TARGET's worktree (or a temp one), which carries no
@@ -201,14 +202,16 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
     dir = targetDir;
   } else {
     const tmp = path.join(repo, '..', `.karmax-merge-${worldId}-${worldRepo.name}`);
-    if (fs.existsSync(tmp)) {
-      await git(repo, ['worktree', 'remove', '--force', tmp]);
-      fs.rmSync(tmp, { recursive: true, force: true });
-    }
-    await gitOrThrow(repo, ['worktree', 'add', '--force', tmp, target]);
+    await withWorktreeLock(repo, async () => {
+      if (fs.existsSync(tmp)) {
+        await git(repo, ['worktree', 'remove', '--force', tmp]);
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+      await gitOrThrow(repo, ['worktree', 'add', '--force', tmp, target]);
+    });
     dir = tmp;
     cleanup = async () => {
-      await git(repo, ['worktree', 'remove', '--force', tmp]);
+      await withWorktreeLock(repo, () => git(repo, ['worktree', 'remove', '--force', tmp]));
       fs.rmSync(tmp, { recursive: true, force: true });
     };
   }

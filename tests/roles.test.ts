@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { allRoles, roleDef, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
+import { allRoles, roleDef, roleCeiling, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
@@ -7,7 +7,7 @@ import { autoResolve } from '../src/resolve/cases.js';
 
 const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
 const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
-const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude', role: 'do', capabilities: [], ...over } as any);
+const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude', role: 'do', ...over } as any);
 
 describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', () => {
   it('aggregates declared roles across the bundled workflows, tracking who uses each', () => {
@@ -41,13 +41,35 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     expect(r.promptTemplate).toContain('Review');
   });
 
-  it('seeds one default profile per declared role, carrying the role capabilities', () => {
+  it('seeds one default profile per declared role, with no copy of the role ceiling', () => {
     const profiles = makeDefaultProfiles('claude');
     expect(profiles.map((p) => p.id).sort()).toEqual(['confirm-default', 'do-default', 'merge-default']);
     const merge = profiles.find((p) => p.id === 'merge-default')!;
     expect(merge.role).toBe('merge');
-    expect(merge.capabilities).toContain('merge-into:*');
     expect(merge.model).toBeTruthy(); // provider/model resolved at seed time
+    // The ceiling is the role contract, resolved from the manifest at turn time —
+    // seeding a copy is what let it go stale (and what the dead settings field edited).
+    expect(profiles.every((p) => p.capabilities === undefined)).toBe(true);
+  });
+
+  it('resolves the capability ceiling from the manifest, never from a stored profile', () => {
+    // The ceiling a turn is minted against is looked up by ROLE NAME, so a stale or
+    // hand-edited copy on the persisted profile is structurally unreachable.
+    expect(roleCeiling('merge')).toEqual(roleDef('merge')!.capabilities);
+    expect(roleCeiling('merge')).toContain('merge-into:*');
+    expect(roleCeiling('do')).toContain('create-sub-task');
+    expect(roleCeiling('confirm')).toContain('confirm-decision');
+    // A Merge agent never gets the Do role's ceiling, whatever the task grant says.
+    expect(roleCeiling('merge')).not.toContain('create-sub-task');
+  });
+
+  it('keeps the retired Resolve ceiling resolvable so pinned executions replay', () => {
+    expect(roleDef('resolve')).toBeUndefined(); // absent from current manifests
+    expect(roleCeiling('resolve')).toContain('resolve-decision');
+  });
+
+  it('floors an undeclared role at signal-completion rather than granting nothing or everything', () => {
+    expect(roleCeiling('reviewer')).toEqual(['signal-completion']);
   });
 
   it('resets provider-scoped model and credentials on a per-task provider switch', () => {

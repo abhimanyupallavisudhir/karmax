@@ -326,6 +326,12 @@ class E2BWorld implements World {
       background: true,
       cwd: this.cwd(spec.cwd),
       envs: this.remoteEnv(spec.env),
+      // A background process is long-lived by definition — a review dev server
+      // stays up for as long as the human is clicking around. The SDK's
+      // CommandStartOpts.timeoutMs defaults to 60s and would kill it mid-review
+      // with a spurious exit; 0 disables that bound, as openPty already does.
+      // (keepAlive() below refreshes the *sandbox* lease, not this timeout.)
+      timeoutMs: 0,
       onStdout: emit,
       onStderr: emit,
     });

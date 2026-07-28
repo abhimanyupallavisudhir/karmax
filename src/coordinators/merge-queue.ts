@@ -7,7 +7,6 @@ import {
   continueAsNew,
   getExternalWorkflowHandle,
   workflowInfo,
-  sleep,
   log,
 } from '@temporalio/workflow';
 import type { coordinatorActivities } from '../activities/coordinator.js';
@@ -114,17 +113,24 @@ export async function mergeQueue(input: { domain: string; state?: MergeQueueStat
         continue;
       }
 
-      // Await release or lease timeout; on timeout, reclaim if the grantee died.
-      const released = await condition(() => current === undefined, LEASE_TIMEOUT);
-      if (!released && current === taskId) {
-        const alive = await act.isTaskAlive(taskId);
-        if (!alive) {
+      // Await release, re-checking liveness once per lease window. This MUST
+      // loop: with a single check, a grantee that is alive at the first timeout
+      // (a long merge is entirely normal) but dies later holds the slot forever
+      // — the park at the top of the loop blocks while `current` is set, so the
+      // sweep never runs again, and release/cancel are reachable only from the
+      // grantee's own workflow. Every task in the domain would then wait behind
+      // a dead holder with no operator escape hatch.
+      // Each iteration blocks for a full LEASE_TIMEOUT, so this cannot spin; and
+      // it always exits with `current === undefined`, which is what the
+      // continue-as-new guards below require.
+      while (current === taskId) {
+        if (await condition(() => current === undefined, LEASE_TIMEOUT)) break;
+        if (!(await act.isTaskAlive(taskId))) {
           log.warn(`lease timeout; grantee ${taskId} not alive; reclaiming`);
           current = undefined;
-        } else {
-          // Grantee still working; give it another lease window.
-          await sleep(1000);
+          break;
         }
+        // Grantee still working; give it another lease window.
       }
     }
     // Bound history even when continuously busy.

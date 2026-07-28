@@ -352,6 +352,28 @@ export function mergeQueueDomains(
   return [...new Set(domains)].sort();
 }
 
+/**
+ * How long a task parked in a merge queue waits between position refreshes.
+ *
+ * The grant itself arrives as a signal, which wakes the wait immediately, so
+ * this interval only controls how fresh the *displayed* position is — it costs
+ * no merge latency. It is deliberately coarse because every tick appends
+ * activity and workflow-task events to a history Temporal hard-caps at 50MB:
+ * a 5s tick let a few hours of queueing terminate the task outright.
+ */
+export const MERGE_POLL = '30s';
+
+/** Whether two merge-queue positions are indistinguishable to a viewer, and so
+ *  whether re-publishing the (large) task view would tell anyone anything. */
+export function samePosition(
+  a: TaskView['mergeQueue'],
+  b: TaskView['mergeQueue'],
+): boolean {
+  return a?.position === b?.position
+    && a?.total === b?.total
+    && !!a?.unreachable === !!b?.unreachable;
+}
+
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
 export interface Project {
@@ -1140,7 +1162,9 @@ export interface TaskView {
   /** Every branch this task is opening a pull request for (SPEC §11.1). Present
    *  only for a multi-PR task; a single-branch task keeps `branch`/`prs` alone. */
   checkouts?: TaskCheckout[];
-  mergeQueue?: { position: number; total: number };
+  /** `unreachable` distinguishes "the coordinator could not be queried" from
+   *  the identical-looking "position -1 of an empty queue". */
+  mergeQueue?: { position: number; total: number; unreachable?: boolean };
   subTasks?: string[];
   parentTaskId?: string;
   error?: string;
@@ -1190,8 +1214,10 @@ export interface AgentProfile {
   role: AgentRole;
   /** Prompt template path under the content store, or inline text. */
   promptTemplate?: string;
-  /** Capability ceiling this profile may ever attempt (SPEC §8.2). */
-  capabilities: string[];
+  /** @deprecated The declaring workflow owns the role's capability ceiling
+   *  (SPEC §8.2), resolved per turn by `roleCeiling(role)`; persisted values are
+   *  ignored. A per-profile copy only ever drifted from the manifest. */
+  capabilities?: string[];
   maxTurns?: number;
   /** @deprecated Credentials policy is authoritative; persisted values are ignored. */
   auth?: AuthSource;

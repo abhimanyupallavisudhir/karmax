@@ -91,7 +91,7 @@ describe('profile + account management (Global settings backend)', () => {
     expect(res.status).toBe(400);
   });
 
-  it('ignores retired per-profile credential routing fields', async () => {
+  it('ignores retired per-profile credential routing and capability-ceiling fields', async () => {
     const saved = await fetch(`${base}/api/profiles`, {
       method: 'PUT',
       headers: auth(),
@@ -100,7 +100,9 @@ describe('profile + account management (Global settings backend)', () => {
         role: 'merge',
         name: 'Merge agent',
         provider: 'claude',
-        capabilities: [],
+        // The ceiling belongs to the workflow role, not to this profile: a submitted
+        // one must neither narrow the role nor escalate it.
+        capabilities: ['*'],
         modelProvider: 'anthropic',
         allowedAccounts: ['login:claude:work'],
         auth: { kind: 'configHome', configHome: '/tmp/legacy' },
@@ -109,6 +111,10 @@ describe('profile + account management (Global settings backend)', () => {
     expect(saved.modelProvider).toBeUndefined();
     expect(saved.allowedAccounts).toBeUndefined();
     expect(saved.auth).toBeUndefined();
+    expect(saved.capabilities).toBeUndefined();
+    expect(h.store.getProfile('merge-default')!.capabilities).toBeUndefined();
+    const list = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
+    expect(list.every((p: any) => p.capabilities === undefined)).toBe(true);
   });
 
   it('supports project-scoped profile overrides that fall back to global (1e)', async () => {
