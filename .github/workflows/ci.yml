@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A newer push to the same branch makes the in-flight run redundant. master is
+# excluded so every landed commit keeps a result of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  test:
+    name: typecheck + tests
+    runs-on: ubuntu-latest
+    # The suite is sequential by design (vitest.config.ts forces singleFork):
+    # several concurrent Temporal servers would exhaust the runner. ~10 min of
+    # real work, with headroom for a slow runner.
+    timeout-minutes: 45
+    env:
+      # Live suites spend real money and need real provider keys. Docker-gated
+      # suites are covered by the deploy-artifacts job instead.
+      KARMAX_SKIP_LIVE: '1'
+      KARMAX_SKIP_DOCKER: '1'
+      TEMPORAL_CLI_VERSION: '1.7.2'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      # Integration tests boot a real Temporal dev server. src/temporal/dev-server.ts
+      # looks here by default; pinned so a CLI release cannot break the build.
+      - name: Install Temporal CLI
+        run: |
+          mkdir -p ~/.temporalio/bin
+          curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C ~/.temporalio/bin temporal
+          ~/.temporalio/bin/temporal --version
+
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy-artifacts:
+    name: deploy artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the control-plane image
+        run: docker build -f deploy/Dockerfile -t karmax:ci .
+
+      # rate_limit is a third-party module; Caddy refuses to start on a directive
+      # it does not recognise, so building the edge is what makes the Caddyfile
+      # below valid at all.
+      - name: Build the edge image
+        run: docker build -f deploy/Caddy.Dockerfile -t karmax-caddy:ci deploy
+
+      - name: Validate the Caddyfile against the edge image
+        run: |
+          docker run --rm \
+            -e KARMAX_DOMAIN=karmax.example.com \
+            -e KARMAX_PREVIEW_DOMAIN=preview.karmax.example.com \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            karmax-caddy:ci caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Validate both compose profiles
+        run: |
+          docker compose --env-file deploy/.env.example -f deploy/compose.hosted.yml config -q
+          printf 'KARMAX_DOMAIN=karmax.example.com\nKARMAX_PREVIEW_DOMAIN=preview.karmax.example.com\nPOSTGRES_PASSWORD=ci\n' > "$RUNNER_TEMP/ci.env"
+          docker compose --project-directory deploy --env-file "$RUNNER_TEMP/ci.env" -f deploy/compose.turnkey.yml config -q
+
+      - name: Check the operator script parses
+        run: sh -n deploy/karmax

@@ -1,81 +1,130 @@
-# Hosting readiness — env vars & the path to a multi-tenant SaaS
+# Hosting krmax
 
-Your instinct is right: **env vars can't carry per-user config in a hosted app.**
-But not every env var is a problem — the fix is to separate infrastructure
-bootstrap from settings an operator reasonably expects to manage in the product.
+`deploy/README.md` is the operator runbook — DNS, backups, upgrades. This page
+is the *why*: which configuration belongs to the operator, which belongs to a
+tenant, and what the hosted profile enforces on your behalf.
 
-## The distinction
+For the deployment topologies themselves, see `deploy/compose.turnkey.yml`
+(one VPS) and `deploy/compose.hosted.yml` (managed Temporal + S3).
 
-- **Operator config** — set **once** by whoever runs the karmax deployment.
-  Infrastructure roots (vault master key, database, network) belong in deployment
-  secrets. Application integrations such as Stripe and GitHub should be
-  manageable in the UI, backed by the encrypted vault, with env vars only as an
-  optional bootstrap path.
-- **Per-tenant config** — differs per user/workspace. These **must** live in the
-  DB/vault keyed by tenant, never in process env, or one tenant's setting leaks to
-  all of them.
+## The configuration boundary
 
-## Audit of every `process.env.*` in karmax today
+- **Operator config** — set **once** by whoever runs the deployment.
+  Infrastructure roots (vault master key, database, network) belong in
+  deployment secrets, delivered as `NAME_FILE` paths and hydrated by
+  `hydrateSecretFiles()` before any subsystem reads `process.env`.
+- **Per-tenant config** — differs per organization. These live in the DB and the
+  encrypted vault keyed by `organizationId`, never in process env, or one
+  tenant's setting becomes everyone's.
 
-| Env var | Bucket | Verdict |
+| Env var | Bucket | Notes |
 |---|---|---|
-| `KARMAX_HOME`, `KARMAX_PORT`, `KARMAX_GATEWAY_URL` | operator | ✅ fine — infra |
-| `TEMPORAL_CLI`, `KARMAX_TEMPORAL_LOG`, `KARMAX_MAX_WFT`/`_ACT`/`_CACHED_WORKFLOWS` | operator | ✅ fine — Temporal infra |
-| `KARMAX_VAULT_KEY` | operator | ✅ correct — the vault master key belongs in a secrets manager, never per-user |
-| `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | ✅ fine as platform defaults; already overridable per-tenant via profiles |
-| `KARMAX_CLAUDE_LOGIN_ARGS`, `KARMAX_CODEX_LOGIN_ARGS` | operator/test | ✅ fine — how the login CLI is invoked |
-| `KARMAX_TOKEN`, `CLAUDE_CONFIG_DIR` | runtime | ✅ not user config — injected per agent spawn |
-| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | **optional bootstrap** | The installation administrator normally enters these under **Organization settings → Payments → Stripe platform setup**; secrets are encrypted in the Karmax vault. Environment variables remain an optional first-boot/managed-secret fallback. They identify the deployment's Connect application and webhook, never a funding source. |
-| `STRIPE_API_VERSION` | operator | Optional Stripe API-version override. The default is the direct real-time authorization version used by the webhook response contract. |
-| `KARMAX_SAFE_MODE` | operator/global | ✅ fine (also a UI toggle); becomes per-workspace when workspaces exist |
-| `KARMAX_PASSWORD` | operator (single-tenant) | ⚠️ becomes **per-user auth** in hosted — replace with a real accounts/auth system |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` (+ the ambient `~/.claude` login) | **per-tenant** | ⚠️ **the real hazard** — see below |
+| `KARMAX_HOME`, `KARMAX_HOST`, `KARMAX_PORT`, `KARMAX_PUBLIC_URL`, `KARMAX_PREVIEW_ORIGIN` | operator | Infrastructure and origins. |
+| `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
+| `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires a real Temporal address; managed multi-node requires S3. |
+| `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). |
+| `KARMAX_MAX_WFT` / `_ACT` / `_CACHED_WORKFLOWS`, `KARMAX_AGENT_*` | operator | Worker and host-admission capacity. |
+| `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | Platform defaults; already overridable per-tenant via profiles. |
+| `KARMAX_SAFE_MODE` | operator | Also a UI toggle. |
+| `KARMAX_TOKEN`, `CLAUDE_CONFIG_DIR` | runtime | Not config — injected per agent spawn. |
+| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | optional bootstrap | Normally entered under **Organization settings → Payments**; UI values take precedence. They identify the deployment's Connect app, never a funding source. |
+| `KARMAX_PASSWORD` | **local only** | Rejected outright in hosted mode — the gateway returns 503 and requires the identity service. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` (+ ambient `~/.claude`) | **local only** | See below. |
 
-## The one genuine multi-tenancy hazard: credential fallback
+## What the hosted profile already enforces
 
-The agent adapters currently **fall back** to `process.env.ANTHROPIC_API_KEY` /
-`OPENAI_API_KEY` (and the ambient `~/.claude` login) when a profile has no resolved
-auth. In a shared hosted deployment that means **a tenant with no connected account
-would silently run on the operator's key / the operator's Claude subscription** —
-the operator pays, and it's a cross-tenant credential leak.
+`KARMAX_DEPLOYMENT=hosted` (set in both compose files) is not a hint — it is a
+fail-closed switch. `validateDeployment()` in `src/config/deployment.ts` refuses
+to boot unless the public and preview origins are **separate** HTTPS origins,
+the stable keys exist, Temporal is durable, and the object store fits the
+profile. On top of that:
 
-The per-tenant path already exists and is correct: connected **logins** (config
-homes) and **API-key handles** (vault) resolved per profile. The fix for hosting is
-to **disable the env/ambient fallback** in a hosted deployment so every turn must
-use a tenant-owned credential.
+- **Host-machine affordances are withdrawn, not hidden.** `hostLocal()` returns
+  false, so importing from the host's `pass` store, typing a host filesystem
+  path, and materializing a local checkout are refused *by the gateway*. The UI
+  hides them too (via `/api/meta`), but that is cosmetic — the server is the gate.
+- **Repository code never runs on the control plane.** Hosted projects cannot
+  select worktree, memory, or Docker worlds; execution is forced onto E2B or
+  Daytona.
+- **Previews are isolated per lease.** Each gets an opaque
+  `p-<digest>.<preview-domain>` origin behind an HttpOnly, lease-scoped cookie,
+  and Caddy asks karmax (`/api/tls/preview-allow`) before obtaining a
+  certificate — so the catch-all cannot be used to mint certs for arbitrary names.
+- **Tenancy is enforced in the store, not the UI.** Projects, repositories,
+  vault items, config homes, executions, preview leases and usage all carry
+  `organizationId`, and the caller's token — not a query parameter — is
+  authoritative for scope.
 
-**Recommended (small, when the tenant model lands):** a `KARMAX_MULTI_TENANT=1`
-flag that makes `runAgentTurn` refuse the `process.env` key / ambient-login
-fallback and require a resolved per-account credential (broker handle or config
-home), failing the turn with a clear "connect an account" message otherwise. This
-is a few lines in `core.ts` auth resolution + `claude.ts`/`codex.ts`. Left unbuilt
-for now because there is **no tenant/workspace model yet** — building the gate
-before the thing it protects would be premature (and would break your current
-single-user ambient-login setup).
+### Agent credentials cannot leak between tenants
 
-## What hosted multi-tenancy actually needs (the bigger effort)
+An earlier version of this page called the `process.env` credential fallback the
+one genuine multi-tenancy hazard, and proposed a `KARMAX_MULTI_TENANT` flag to
+close it. No flag is needed; it is already closed, twice over:
 
-1. **Workspaces + accounts + auth** — replace the single `user: "me"` +
-   `KARMAX_PASSWORD` with real user accounts, sessions, and workspaces. Every
-   store row (projects, tasks, profiles, cards, logins, vault handles) gets scoped
-   by `workspaceId`; the gateway authorizes each request against the caller's
-   workspace.
-2. **Per-tenant credential isolation** — the fallback gate above; config homes and
-   vault entries already key by account, so extend that to workspace.
-3. **Per-tenant Stripe (only if you offer Issuing)** — the `vault-card` rail is
-   already per-tenant, since each card is an org-scoped vault handle. Issuing is
-   implemented as a platform Connect app (operator) plus
-   organization-owned connected accounts and Issuing balances. OAuth state,
-   account ids, cardholders, cards, reservations, authorization decisions, and
-   transaction/dispute reconciliation are tenant-scoped. The operator key is
-   used only to act as the Connect platform and is never treated as tenant money.
-4. **Resource isolation** — worktrees/containers, token/budget coordinators, and
-   task queues partitioned or fair-shared per workspace.
+1. `src/activities/core.ts` refuses a turn for any organization other than the
+   installation's own `org_personal` unless that org has a connected login or
+   API-key handle, failing with *"connect an organization login or API key"*.
+   Every self-signup lands in a freshly minted `org_<id>`, so this covers all of
+   them.
+2. The shipped compose files pass **no** `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`
+   into the app container, and the image has no `~/.claude` login — so there is
+   nothing to fall back *to*.
 
-The remaining items are broader tenancy concerns rather than reasons to require
-shell access for application setup. The credential fallback and
-`KARMAX_PASSWORD` still need the hosted treatment described above; Stripe and
-GitHub application setup are already UI-managed and vault-backed.
+The fallback therefore survives only where it is wanted: a local single-user
+install, where the operator's ambient login is the whole point.
+
+## Edge rate limiting
+
+Registration is open to the internet, so the edge bounds a stranger's cost
+before traffic reaches the app. `deploy/Caddyfile` defines three zones, all
+keyed on the client address (Caddy terminates TLS, so that is the real peer and
+not a header anyone can set):
+
+| Zone | Paths | Budget per IP |
+|---|---|---|
+| `signup` | `/api/signup`, `/api/setup` | 10 / hour |
+| `auth` | `/api/login`, `/api/auth/*`, `/api/invitations/accept` | 30 / minute |
+| `api` | everything else | 600 / minute |
+
+The `signup` and `auth` zones are load-bearing rather than belt-and-braces:
+karmax's own `/api/signup`, `/api/setup` and `/api/login` call Better Auth's
+**server** API directly, which bypasses Better Auth's built-in limiter — that
+runs only inside its HTTP router, which those routes never enter. Without the
+edge they are unmetered.
+
+Zones are independent: exhausting the signup budget does not affect the rest of
+the site. Preview origins are deliberately unmetered — they serve someone's
+running app behind a lease, and a shared control-plane budget would throttle
+legitimate traffic.
+
+`rate_limit` is a third-party module, so the edge is built from
+`deploy/Caddy.Dockerfile` rather than pulled from the stock image; Caddy refuses
+to start on a directive it does not recognise, which makes a mismatch loud
+instead of silent. `tests/deploy-edge.test.ts` guards the zone coverage, and CI
+validates the Caddyfile against the built image.
+
+## The remaining decision: open registration
+
+Once the first administrator exists, `/api/signup` is reachable by anyone who
+finds the URL, and each signup provisions its own personal-workspace
+organization. That is intentional for a public SaaS. Two consequences worth
+knowing:
+
+- **Cost is bounded; storage is not.** A new tenant has no agent credential and
+  no cloud-world provider, so they cannot spend your model tokens or boot a
+  sandbox — every turn fails closed. They *can* create projects, tasks, wiki
+  pages and attachments, which the `signup` zone bounds but does not eliminate.
+- **Email addresses are unverified.** `emailVerification.sendOnSignUp` is on, but
+  `requireEmailVerification` is not set, so an account is usable immediately and
+  the address may be junk. Turning it on is a one-line change in
+  `src/auth/identity.ts`, with one catch: the mailer is injected *after* the
+  Better Auth instance is constructed (so a provider connected later in Settings
+  works without a restart), so it must be a lazy getter rather than a static
+  boolean — otherwise it reads `undefined` at boot and never requires anything.
+  Do not enable it before outbound email is configured, or nobody can sign in.
+
+To run invite-only instead, gate `/api/signup` behind the existing
+organization-invitation flow, which is already token-hash validated.
 
 ## Payment rails
 
