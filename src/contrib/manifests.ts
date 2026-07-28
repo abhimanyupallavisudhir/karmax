@@ -32,9 +32,15 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // list has the usual default-inheritance; an agent layer carries the same agent
 // knobs (provider/model/effort/fork) as the Do/Merge fields, PLUS the
 // review-request prompt template (pre-filled with `promptDefault`, editable per
-// task/project/global). Chosen at task creation (queue-time), like the other agent
-// selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+// task/project/global).
+// `untilUsed`: the route is consumed by the gate it drives, not by queueing — so
+// it stays editable in-flight right up to the moment Review passes (SPEC §4.5/§5.5).
+// That is exactly when re-routing is useful ("actually, have Bob look at this"),
+// and it also self-heals the race the old queue-time freeze only avoided: a task
+// reaching Review while someone is mid-edit now simply picks up the saved route.
+// The workflows re-read the layers at every gate iteration and replay the gate
+// from its first layer when the route changes under them.
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -331,7 +337,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.7.0',
+    version: '1.8.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -383,7 +389,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     onActivate: {
       spawnTask: {
         workflow: 'goal',
-        title: 'Make this project karmax-ready',
+        title: 'Make this project krmax-ready',
         prompt:
           'Ensure git is initialized in each repo. For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them. Report what you changed.',
       },
@@ -434,7 +440,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.7.0',
+    version: '1.8.0',
     description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -448,7 +454,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'merge-only',
-    version: '1.3.0',
+    version: '1.4.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],
@@ -525,35 +531,45 @@ export const MANIFESTS: WorkflowManifest[] = [
  * resolvable for existing version-pinned tasks. They are intentionally omitted
  * from MANIFESTS so workflow pickers expose only the current release. */
 export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
-  .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
-  .flatMap((m) => [
-    { ...m, version: '1.0.0' },
-    { ...m, version: '1.1.0' },
-    ...((m.name === 'software-dev' || m.name === 'goal')
-      ? [
-          { ...m, version: '1.2.0' },
-          { ...m, version: '1.3.0' },
-          { ...m, version: '1.4.0' },
-          { ...m, version: '1.5.0' },
-          { ...m, version: '1.6.0' },
-        ]
-      : [{ ...m, version: '1.2.0' }]),
-  ]);
+  .filter((m) => ['software-dev', 'just-do', 'goal', 'merge-only'].includes(m.name))
+  // Bundled workflows release as `1.<n>.0`, and every earlier minor is still
+  // replayed by executions pinned to it — so the historical set is simply every
+  // minor below the current one, and a version bump needs no edit here.
+  .flatMap((m) => Array.from({ length: Number(m.version.split('.')[1]) },
+    (_, minor) => ({ ...m, version: `1.${minor}.0` })));
 
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);
 }
 
+/** The pull-request payload every GitHub webhook event carries (see
+ *  `pullRequestWebhookEvent`), so each `github.pr.*` entry declares one shape. */
+const GITHUB_PR_FIELDS = {
+  number: 'number', url: 'string', repo: 'owner/name on GitHub', branch: 'the task branch the PR heads',
+  target: 'the branch the PR merges into', state: 'open | closed', merged: 'boolean', title: 'string',
+} as const;
+/** …plus the delivery's action, on the events minted from `pull_request` itself. */
+const GITHUB_PR_ACTION_FIELDS = {
+  ...GITHUB_PR_FIELDS, action: "GitHub's action for the delivery (opened, synchronize, merged, …)",
+} as const;
+
 /**
  * Core platform events (not owned by any one workflow) that a task can trigger
  * on, with the payload keys a filter can match. These are the generally-useful,
- * stable events emitted by the activity layer (src/activities/core.ts) — a
- * curated subset, not every internal event, so the event-trigger picker offers
- * meaningful choices rather than raw noise.
+ * stable events emitted by the activity layer (src/activities/core.ts) and the
+ * GitHub feed — a curated subset, not every internal event, so the event-trigger
+ * picker offers meaningful choices rather than raw noise.
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', waitingDetail: 'string | null', waitingProvider: 'string | null', waitingResetAt: 'number | null', agentTurn: 'waiting-slot | running | null' } },
-  { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
+  { type: 'pr.opened', description: 'karmax opened a pull request for a task (remote policy "pr").', fields: { repo: 'world repo name', slug: 'owner/name on GitHub', number: 'number', url: 'string', base: 'the branch the PR merges into', state: 'open | closed' } },
+  // The GitHub side of the same pull request, fed back by the App's webhook —
+  // what happened *on GitHub*, as opposed to what karmax did (SPEC §5.4).
+  { type: 'github.pr.opened', description: "A task's pull request was opened on GitHub.", fields: GITHUB_PR_ACTION_FIELDS },
+  { type: 'github.pr.merged', description: "A task's pull request was merged on GitHub.", fields: GITHUB_PR_ACTION_FIELDS },
+  { type: 'github.pr.closed', description: "A task's pull request was closed without merging.", fields: GITHUB_PR_ACTION_FIELDS },
+  { type: 'github.pr.synchronize', description: "New commits were pushed to a task's pull request.", fields: GITHUB_PR_ACTION_FIELDS },
+  { type: 'github.pr.review', description: "A review was submitted on a task's pull request.", fields: { ...GITHUB_PR_FIELDS, review: 'approved | changes_requested | commented | dismissed', reviewer: 'GitHub login' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
   { type: 'world.created', description: "A task's local or cloud world was provisioned.", fields: {} },

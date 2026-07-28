@@ -32,6 +32,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(meta.version).toBeTruthy();
     expect(meta.agent.provider).toBeTruthy();
     expect(meta.resolveAgentEnabled).toBe(false);
+    // The console needs to know whether host-machine affordances are worth showing.
+    expect(meta.hostLocal).toBe(true);
   });
 
   it('keeps untrusted preview hosts outside the app/API origin', async () => {
@@ -709,13 +711,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
   });
 
-  it('seeds a brand-new project with the karmax-ready prep task', async () => {
+  it('seeds a brand-new project with the krmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's current onActivate Goal prep task automatically (SPEC §4.6) —
     // no manual "activate workflow" step. Covers both create-project routes.
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
-    const prepTitle = 'Make this project karmax-ready';
+    const prepTitle = 'Make this project krmax-ready';
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
       const project: any = await post(path, { name: `Fresh via ${path}` });
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());

@@ -77,6 +77,34 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(obj.safeParse({ caption: '😀'.repeat(MAX_REVIEW_TEXT_LENGTH) }).success).toBe(true);
   });
 
+  /**
+   * Regression: `jsonPropToZod` collapsed nested `items`/`properties` to `any`, so the
+   * schema the model is shown advertised `actions: { items: {} }` — no member field
+   * names at all — even though the source schema fully specifies them. Agents then
+   * guessed the shape (e.g. `{ label, run }` instead of `{ kind, label, command }`)
+   * and their review actions were silently discarded.
+   */
+  it('preserves nested array item schemas (create_review_info.actions)', () => {
+    const schema = TOOL_SCHEMAS.find((t) => t.name === 'create_review_info')!;
+    const obj = z.object(jsonSchemaToZodShape(z, schema.parameters));
+    // Well-formed actions validate…
+    expect(obj.safeParse({ actions: [{ kind: 'run', label: 'Tests', command: 'npm test' }] }).success).toBe(true);
+    expect(obj.safeParse({ actions: [{ kind: 'open', label: 'Report', target: 'out/report.html' }] }).success).toBe(true);
+    // …and the item contract is enforced rather than rubber-stamped.
+    expect(obj.safeParse({ actions: [{ kind: 'bogus', label: 'x' }] }).success).toBe(false); // enum
+    expect(obj.safeParse({ actions: [{ label: 'no kind' }] }).success).toBe(false); // required member
+    expect(obj.safeParse({ actions: [{ kind: 'run', label: 'x', server: 'yes' }] }).success).toBe(false); // boolean
+    expect(obj.safeParse({ actions: [{ kind: 'run', label: 'x', openUrls: [1] }] }).success).toBe(false); // nested array
+  });
+
+  it('treats an untyped property as free-form instead of coercing it to a string', () => {
+    const obj = z.object(jsonSchemaToZodShape(z, { type: 'object', properties: { body: {} } }));
+    // An empty JSON Schema means "anything goes"; `string()` rejected structured values.
+    expect(obj.safeParse({ body: { name: 'x' } }).success).toBe(true);
+    expect(obj.safeParse({ body: [1, 2] }).success).toBe(true);
+    expect(obj.safeParse({ body: 'raw' }).success).toBe(true);
+  });
+
   it('rejects overlong review text without recording it and tells the agent why', async () => {
     let recorded: any;
     const handlers = platformToolHandlers({} as any, {

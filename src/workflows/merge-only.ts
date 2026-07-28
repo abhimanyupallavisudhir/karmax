@@ -16,8 +16,8 @@ import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
-  releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmConfig, ConfirmDecision, ConfirmLayer,
+  TaskPullRequest, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -74,6 +74,11 @@ export async function mergeOnlyV1_3(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true, true);
 }
 
+/** Full GitHub pull-request lifecycle under remote policy 'pr'. */
+export async function mergeOnlyV1_4(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);
@@ -84,6 +89,9 @@ async function mergeOnlyImpl(
   managedTurns: boolean,
   durableAdmission = false,
   awaitTurnCancellation = false,
+  // New activity calls inside an existing stage break replay for executions
+  // recorded before them, so the PR lifecycle is pinned to its own version.
+  githubPrLifecycle = false,
 ): Promise<{ stage: Stage; sha?: string }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
@@ -99,8 +107,14 @@ async function mergeOnlyImpl(
   let world: WorldHandleLike | undefined;
   // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
-  // and the `autoConfirm` flag normalize to their layer equivalents.
-  const confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
+  // and the `autoConfirm` flag normalize to their layer equivalents. The route is
+  // `untilUsed` (SPEC §4.5/§5.5), so an in-flight edit replaces these layers and the
+  // gate re-reads them on every iteration; `confirmEpoch` bumps on each accepted edit
+  // so a gate parked on a stale route replays from its first layer.
+  let confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
+  let confirmEpoch = 0;
+  // Set once the Review gate has fully passed — the route is load-bearing no longer.
+  let confirmConsumed = false;
   let reviewInfo: ReviewInfo | undefined;
   let mergeGranted = false;
   let checks: { passed: boolean; detail?: string } | undefined;
@@ -108,23 +122,40 @@ async function mergeOnlyImpl(
   let agentTurn: TaskView['agentTurn'];
   let mergeQueue: { position: number; total: number; current?: string } | undefined;
   let pointOfNoReturnPassed = false;
+  let pr: TaskPullRequest | undefined;
+  let prs: TaskPullRequest[] = [];
   // `target` is editable in-flight until committed to the merge queue / a PR opens.
   let targetLocked = false;
+  const isConsumed = (name: string): boolean =>
+    name === 'target' ? targetLocked : name === 'confirm' ? confirmConsumed : false;
   const paramEditable = (name: string): boolean =>
-    !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: name === 'target' ? targetLocked : false, pointOfNoReturnPassed });
+    !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: isConsumed(name), pointOfNoReturnPassed });
   const editableParamsNow = (): string[] => Object.keys(input.paramWindows ?? {}).filter(paramEditable);
   function validateParamPatch(patch: Record<string, unknown>): void {
     const names = Object.keys(patch);
     if (!names.length) throw ApplicationFailure.nonRetryable('no params to edit', 'ParamEditEmpty');
-    for (const name of names)
+    for (const name of names) {
       if (!paramEditable(name))
-        throw ApplicationFailure.nonRetryable(`"${name}" can't be edited now — frozen after queue, in use, or past the point of no return`, 'ParamLocked', name);
+        throw ApplicationFailure.nonRetryable(
+          name === 'confirm'
+            ? `the Review route can't be changed now — this task's Review gate has already passed`
+            : `"${name}" can't be edited now — frozen after queue, in use, or past the point of no return`,
+          'ParamLocked', name);
+      // Shape only; whether a human audience resolves is asserted platform-side.
+      if (name === 'confirm' && (!patch.confirm || typeof patch.confirm !== 'object'))
+        throw ApplicationFailure.nonRetryable('the Review route must be a confirm config', 'ParamLocked', name);
+    }
   }
   function applyParamPatch(patch: Record<string, unknown>): { applied: string[] } {
     const applied: string[] = [];
     if (typeof patch.target === 'string' && patch.target) {
       target = patch.target;
       applied.push('target');
+    }
+    if (patch.confirm && typeof patch.confirm === 'object') {
+      confirmLayers = confirmLayersOf(patch.confirm as ConfirmConfig);
+      confirmEpoch++;
+      applied.push('confirm');
     }
     return { applied };
   }
@@ -141,6 +172,7 @@ async function mergeOnlyImpl(
       actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
       editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
+      pr, ...(prs.length ? { prs } : {}),
       updatedAt: workflowInfo().historyLength,
     };
   }
@@ -253,13 +285,19 @@ async function mergeOnlyImpl(
     // Play the confirm layers in order (SPEC §5.2); every layer must approve.
     // [] ⇒ auto-confirm. There is no Do stage to send a `revise` back to, so a
     // revise / no-verdict agent layer leaves the rest of the gate to a human.
+    // `confirmLayers` is re-read every iteration, never captured — an edit that lands
+    // while the gate is parked replays it from the first layer (see `confirmEpoch`).
     let leftToHuman = false;
-    for (const layer of confirmLayers) {
-      if (cancelled || leftToHuman) break;
+    let li = 0;
+    while (!cancelled && !leftToHuman) {
+      const epoch = confirmEpoch;
+      if (li >= confirmLayers.length) break;
+      const layer = confirmLayers[li]!;
       if (layer.kind === 'agent') {
         await publish();
         const decision = await runConfirm(layer);
-        if (decision?.action === 'confirm') continue;
+        if (confirmEpoch !== epoch) { li = 0; continue; } // verdict was about a route since replaced
+        if (decision?.action === 'confirm') { li++; continue; }
         if (decision?.action === 'reject') {
           if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
           cancelled = true;
@@ -270,14 +308,19 @@ async function mergeOnlyImpl(
         // A human layer: one Approve click passes ONE layer.
         waitingFor = { kind: 'human', audience: layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
-        await condition(() => confirmed || cancelled);
+        await condition(() => confirmed || cancelled || confirmEpoch !== epoch);
         waitingFor = undefined;
+        if (confirmEpoch !== epoch) { li = 0; confirmed = false; continue; }
         confirmed = false; // consumed by this layer
+        li++;
       }
     }
     if (!cancelled && !leftToHuman) confirmed = true;
     if (leftToHuman) waitingFor = { kind: 'human', audience: ['@creator'] };
   }
+  // The gate has played (or was blocked by failing checks); the route is load-bearing
+  // no longer, so it freezes here rather than at queue time (SPEC §4.5/§5.5).
+  confirmConsumed = true;
   await publish();
   await condition(() => confirmed || cancelled);
   waitingFor = undefined;
@@ -298,8 +341,13 @@ async function mergeOnlyImpl(
 
   if (remotePolicyOf(input.project) === 'pr') {
     targetLocked = true; // opening a PR binds it to `target` (SPEC §2)
-    const opened = await core.openPr(world as any, target);
-    if (opened) reviewInfo = { ...reviewInfo, links: [...(reviewInfo?.links ?? []), { label: 'PR', url: opened.url }] };
+    prs = await core.openPr(world as any, target, { title: input.title, summary: reviewInfo?.summary }) ?? [];
+    pr = prs[0];
+    if (prs.length) reviewInfo = { ...reviewInfo,
+      links: [...(reviewInfo?.links ?? []), ...prs.map((p) => ({ label: prs.length > 1 ? `PR (${p.repo})` : 'PR', url: p.url }))] };
+    // No publish here: the merge stage below opens with one, and adding an
+    // activity call inside a stage older pinned versions also run would break
+    // their replay.
   }
 
   stage = 'merge';
@@ -349,7 +397,12 @@ async function mergeOnlyImpl(
   // Remote policy 'push'/'pr' (PLAN-git-config.md §5): best-effort push of the
   // landed target — the merge is the deliverable, a failed push is not fatal.
   if (remotePolicyOf(input.project) !== 'none') {
-    await core.pushTarget(world as any, target).catch(() => undefined);
+    const pushed = await core.pushTarget(world as any, target).catch(() => undefined);
+    if (githubPrLifecycle && prs.length) {
+      prs = await core.finalizePrs(world as any, prs, { target, sha: result.sha, pushed: pushed?.pushed ?? [] })
+        .catch(() => prs);
+      pr = prs[0];
+    }
   }
   stage = 'done';
   status = 'done';

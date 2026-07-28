@@ -43,7 +43,8 @@ describe('GitHub App integration', () => {
       redirect_url: 'https://karmax.example/api/github/manifest/callback/state',
       setup_on_update: true, callback_urls: ['https://karmax.example/api/github/oauth/callback'] });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
-    expect(manifest.manifest).not.toHaveProperty('default_events');
+    // Installation events arrive automatically; the PR lifecycle must be asked for.
+    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review']);
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
     expect(service.status('owner')).toMatchObject({ configured: true, appSlug: 'karmax-acme', oauthConfigured: true,
@@ -271,6 +272,50 @@ describe('GitHub App integration', () => {
     expect(broker.hasHandle(keys.cloneHandle)).toBe(false);
     expect(broker.hasHandle(keys.writeHandle)).toBe(false);
     expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(2);
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('turns verified pull-request deliveries into karmax task events', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-pr-hook-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret');
+    const organization = store.createOrganization({ name: 'Hooks', ownerUserId: 'owner' });
+    store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const project = store.createProject('App', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
+      workflowVersion: '1.8.0', params: { prompt: 'do it' } });
+    // A task of a DIFFERENT tenant, whose branch name this installation must not
+    // be able to name its way into.
+    const other = store.createOrganization({ name: 'Rival', ownerUserId: 'rival' });
+    const otherTask = store.createTask({ projectId: store.createProject('Theirs', {}, other.id).id,
+      title: 'Theirs', workflow: 'software-dev', workflowVersion: '1.8.0', params: { prompt: 'x' } });
+    const service = new GitHubAppService(store, broker, { appId: '123' });
+    const deliver = async (event: string, id: string, body: unknown) => {
+      const raw = Buffer.from(JSON.stringify(body));
+      return service.handleWebhook(event, id, raw,
+        `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
+    };
+    const pull = (branch: string, over: Record<string, unknown> = {}) => ({
+      installation: { id: 42 }, action: 'closed', repository: { full_name: 'acme/app' },
+      pull_request: { number: 3, html_url: 'https://github.com/acme/app/pull/3', state: 'closed', merged: true,
+        title: 'Work', head: { ref: branch }, base: { ref: 'main' }, ...over },
+    });
+
+    const merged = await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`));
+    expect(merged.events).toHaveLength(1);
+    expect(merged.events![0]).toMatchObject({ taskId: task.id, type: 'github.pr.merged' });
+    // A branch no karmax task owns is accepted and produces nothing to dispatch.
+    expect(await deliver('pull_request', 'pr-2', pull('feature/manual'))).toEqual({ accepted: true });
+    // Neither does a branch naming a task in an organization that did not install
+    // this App — an installation drives only its own tenant's tasks.
+    expect(await deliver('pull_request', 'pr-3', pull(`karmax/${otherTask.id}`))).toEqual({ accepted: true });
+    // …nor one naming a task that does not exist at all.
+    expect(await deliver('pull_request', 'pr-4', pull('karmax/task_ghost'))).toEqual({ accepted: true });
+    // Deliveries are still de-duplicated by id.
+    expect((await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`))).accepted).toBe(false);
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });

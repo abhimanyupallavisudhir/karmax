@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
+import { pullRequestWebhookEvent, type GithubPrWebhookEvent } from './github-pr.js';
 
 const pexec = promisify(execFile);
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
@@ -130,11 +131,11 @@ export class GitHubAppService {
   manifest(publicUrl: string, state: string): { action: string; manifest: Record<string, unknown> } {
     const parsed = new URL(publicUrl);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
-      throw new Error('Karmax needs an http(s) browser URL to set up GitHub');
+      throw new Error('Krmax needs an http(s) browser URL to set up GitHub');
     const origin = parsed.origin;
     const hostname = new URL(origin).hostname.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 35) || 'host';
     const manifest: Record<string, unknown> = {
-      name: `Karmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
+      name: `Krmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
       url: origin,
       public: false,
       // Keep the CSRF state in the path. GitHub's manifest validator is
@@ -151,8 +152,12 @@ export class GitHubAppService {
     // demand instead. Installation lifecycle events are deliberately omitted:
     // GitHub Apps receive them automatically and GitHub rejects attempts to
     // subscribe to installation_repositories explicitly.
-    if (publicWebhookOrigin(parsed))
+    if (publicWebhookOrigin(parsed)) {
       manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
+      // Pull-request lifecycle is the one non-installation feed karmax subscribes
+      // to: it is what turns a PR karmax opened into task events (SPEC §5.4).
+      manifest.default_events = ['pull_request', 'pull_request_review'];
+    }
     return {
       action: 'https://github.com/settings/apps/new',
       manifest,
@@ -241,7 +246,8 @@ export class GitHubAppService {
     return repositories;
   }
 
-  async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined): Promise<{ accepted: boolean; reconciled?: number }> {
+  async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
+  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[] }> {
     if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
     if (!this.store.recordGithubDelivery(deliveryId, event)) return { accepted: false };
     const payload = JSON.parse(raw.toString('utf8')) as any;
@@ -256,11 +262,28 @@ export class GitHubAppService {
       this.tokenCache.delete(saved.id);
       return { accepted: true, reconciled: 0 };
     }
+    if (event === 'pull_request' || event === 'pull_request_review') {
+      // The PR lifecycle karmax itself started: correlated back to its task so
+      // the timeline shows it and `event` triggers can fire on it. Correlation is
+      // by branch name, which anyone can pick — so the task must also belong to
+      // the tenant that installed this App, or a `karmax/<id>` branch pushed to
+      // any repo would inject events into someone else's task.
+      const prEvent = pullRequestWebhookEvent(event, payload);
+      if (!prEvent || !this.ownsTask(connection.organizationId, prEvent.taskId)) return { accepted: true };
+      return { accepted: true, events: [prEvent] };
+    }
     if (['installation', 'installation_repositories', 'repository'].includes(event)) {
       const repositories = await this.reconcile({ ...connection, provider: 'github' });
       return { accepted: true, reconciled: repositories.length };
     }
     return { accepted: true };
+  }
+
+  /** Is `taskId` a live task of the organization that installed the App? */
+  private ownsTask(organizationId: string, taskId: string): boolean {
+    const task = this.store.getTask(taskId);
+    const project = task ? this.store.getProject(task.projectId) : undefined;
+    return project?.organizationId === organizationId;
   }
 
   async installationToken(connection: GitConnection): Promise<string> {

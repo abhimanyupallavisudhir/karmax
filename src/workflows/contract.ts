@@ -29,6 +29,7 @@ export type {
   RaiseType,
   SubTaskAction,
   RemotePolicy,
+  TaskPullRequest,
   WorldHandleRef,
 } from '../domain/types.js';
 

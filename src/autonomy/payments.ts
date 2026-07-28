@@ -373,7 +373,7 @@ export class StripeIssuingProvider implements PaymentProvider {
   }
   configurePlatform(input: { clientId: string; secretKey?: string; webhookSecret?: string }): StripePlatformStatus {
     const store = this.requireStore();
-    if (!this.broker) throw new Error('Karmax encrypted secret storage is unavailable');
+    if (!this.broker) throw new Error('Krmax encrypted secret storage is unavailable');
     const clientId = input.clientId.trim();
     const secretKey = input.secretKey?.trim();
     const webhookSecret = input.webhookSecret?.trim();
@@ -441,9 +441,9 @@ export class StripeIssuingProvider implements PaymentProvider {
       help: connection?.status === 'ready'
         ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET') ? '' : ' Add the webhook signing secret in Stripe platform setup before issuing active cards.'}`
         : connection?.status === 'attention'
-          ? `Connected account ${connection.accountId} needs Stripe card_issuing capability activation before Karmax can issue cards.`
+          ? `Connected account ${connection.accountId} needs Stripe card_issuing capability activation before Krmax can issue cards.`
         : available
-          ? 'Connect this organization’s Stripe account. The deployment Connect app identifies Karmax; it does not fund cards.'
+          ? 'Connect this organization’s Stripe account. The deployment Connect app identifies Krmax; it does not fund cards.'
           : 'An installation administrator must complete Stripe platform setup before organizations can connect.',
     };
   }

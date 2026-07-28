@@ -1,14 +1,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
 import { worldRepos, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, type MergeResult } from './merge.js';
-
-const pexec = promisify(execFile);
 
 export interface GitBrokerCredential {
   /** Private key is materialized to a 0600 file only for one broker operation. */
@@ -359,46 +355,27 @@ export async function brokerFinalizeMerge(
   return { merged: true, sha, landedFiles, note: `landed by the trusted Git broker${repos.length > 1 ? ` across ${repos.length} repos` : ''}` };
 }
 
-export async function brokerOpenGithubPr(
-  world: World,
-  target: string,
-  auth: GitBrokerAuth,
-): Promise<{ url: string; number: number } | null> {
-  const repos = worldRepos(world.handle);
-  const primary = repos[0];
-  if (!primary) return null;
-  const primaryTarget = worldRepoTarget(primary, target);
-  // Remote policy 'pr' explicitly sanctions the remote op, so the branch is
-  // pushed to origin even for repos whose merges land in a local checkout.
-  const published: string[] = [];
-  for (const repo of repos) {
+/**
+ * Push every repo's task branch to its origin. Unlike `brokerPublishBranch`
+ * (which routes a repo to its authoritative destination), remote policy 'pr'
+ * explicitly sanctions the remote op — so the branch goes to origin even for
+ * repos whose merges land in a host-local checkout, because that is where the
+ * pull request has to read it from.
+ */
+export async function brokerPushBranches(world: World, auth: GitBrokerAuth): Promise<GitBrokerPublishResult> {
+  const pushed: string[] = [];
+  const skipped: string[] = [];
+  const errors: Record<string, string> = {};
+  for (const repo of worldRepos(world.handle)) {
     try {
       await pushBranchToOrigin(world, repo, auth);
-      published.push(repo.name);
-    } catch { /* a repo without push access simply has no PR */ }
+      pushed.push(repo.name);
+    } catch (error) {
+      skipped.push(repo.name);
+      errors[repo.name] = error instanceof Error ? error.message : String(error);
+    }
   }
-  if (!published.includes(primary.name)) return null;
-  const slug = githubSlug(primary.repo);
-  if (!slug) return null;
-  const credential = await resolveCredential(auth, primary);
-  const env = credential.env ?? {};
-  try {
-    // `gh pr create` prints a URL and deliberately has no `--json` flag. Create
-    // first, then query the PR through `pr view` for the stable structured shape.
-    await pexec('gh', [
-      'pr', 'create', '--repo', slug, '--base', primaryTarget, '--head', primary.branch, '--fill',
-    ], { env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
-    return await viewGithubPr(slug, primary.branch, env);
-  } catch {
-    return viewGithubPr(slug, primary.branch, env).catch(() => null);
-  }
-}
-
-async function viewGithubPr(slug: string, branch: string, env: Record<string, string>): Promise<{ url: string; number: number }> {
-  const { stdout } = await pexec('gh', ['pr', 'view', branch, '--repo', slug, '--json', 'url,number'], {
-    env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
-  });
-  return JSON.parse(stdout);
+  return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
 }
 
 /** Package the world's named task ref as a bundle and hand it to the host.
@@ -497,11 +474,6 @@ async function conflictMarkerFiles(dir: string, branch: string, files: string[])
   const open = await grep('^<{7}( |$)');
   const close = await grep('^>{7}( |$)');
   return [...open].filter((file) => close.has(file));
-}
-
-function githubSlug(remote: string): string | undefined {
-  const match = remote.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i);
-  return match?.[1];
 }
 
 function escapeRegExp(value: string): string {

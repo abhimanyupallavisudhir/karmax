@@ -28,9 +28,10 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
-import { worldRepos, worldRepoSource } from '../world/types.js';
+import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
-import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
+import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
+import { GithubPrApi, githubSlug, type GithubPrApiOptions } from '../integrations/github-pr.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
@@ -40,13 +41,15 @@ import { materializeFork } from '../agent/fork.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole, type TaskPullRequest } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -157,13 +160,15 @@ class AgentAdmissionInfrastructureError extends Error {
  *     and resumes the session.
  * Either way the raw signal string is appended (truncated) for diagnostics.
  */
+const pexec = promisify(execFile);
+
 function signalKillMessage(raw: string): string {
   const h = hostStats();
   const mem = `${h.freeMemMb}MB free of ${h.totalMemMb}MB (${h.usedMemPct}% used, load ${h.loadPerCore}/core)`;
   const diagnosis = hostMemoryTight()
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
       `Reduce Concurrent agent turns in Global settings (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
-    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a karmax ` +
+    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a krmax ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
@@ -180,6 +185,8 @@ export interface CoreActivityDeps {
   tokens?: TokenAuthority;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
+  /** GitHub REST endpoint/transport override for pull-request operations (tests). */
+  githubPr?: GithubPrApiOptions;
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
@@ -187,6 +194,22 @@ export interface CoreActivityDeps {
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
   contentDir?: string;
+}
+
+/** What the PR stage puts on the pull request it opens for the task. */
+export interface OpenPrDetails {
+  title?: string;
+  /** Human-facing summary of the work — normally the task's review info. */
+  summary?: string;
+}
+
+/** The PR description: the task's own summary, plus the provenance line that
+ *  correlates the pull request back to the karmax task (also what the webhook
+ *  dispatcher's branch matching relies on being true). */
+function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
+  const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
+  const task = num != null ? `karmax task #${num} (\`${handle.id}\`)` : `karmax task \`${handle.id}\``;
+  return `${summary}\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
 }
 
 export interface CreateWorldArgs {
@@ -369,6 +392,85 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } catch {
       return fallback;
     }
+  }
+
+  /**
+   * The GitHub API token PR operations on `slug` run as, in the order karmax
+   * trusts credentials (PLAN-git-config.md §4B): the project's App installation
+   * (the hosted path — scoped to exactly the enrolled repository), then the
+   * world's git profile, then — only for the migrated personal organization,
+   * which is the one allowed host fallback — the host's own token or `gh` login.
+   */
+  async function githubTokenFor(handle: WorldHandle, slug: string): Promise<string | undefined> {
+    const projectId = typeof handle.meta?.projectId === 'string'
+      ? handle.meta.projectId
+      : store.getTask(handle.id)?.projectId;
+    if (projectId && deps.githubApp) {
+      const enrolled = store.listProjectRepositories(projectId).map((entry) => entry.repository);
+      const wiki = store.projectWiki(projectId)?.repository;
+      const repository = [...enrolled, ...(wiki ? [wiki] : [])]
+        .find((candidate) => `${candidate.owner}/${candidate.name}`.toLowerCase() === slug.toLowerCase());
+      const connection = repository?.gitConnectionId ? store.getGitConnection(repository.gitConnectionId) : undefined;
+      if (connection) return await deps.githubApp.installationToken(connection);
+    }
+    const env = gitEnvFor(handle, handle.id);
+    if (env.GH_TOKEN) return env.GH_TOKEN;
+    // `isolatedGitEnvironment()` blanks GH_TOKEN: an organization without a
+    // credentialed profile fails closed rather than borrowing the host's login.
+    if ('GH_TOKEN' in env) return undefined;
+    if (process.env.GH_TOKEN || process.env.GITHUB_TOKEN) return process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+    try {
+      const { stdout } = await pexec('gh', ['auth', 'token'], { timeout: 15_000 });
+      return stdout.trim() || undefined;
+    } catch { return undefined; }
+  }
+
+  async function prApiFor(handle: WorldHandle, slug: string): Promise<GithubPrApi> {
+    const token = await githubTokenFor(handle, slug);
+    if (!token) {
+      throw new Error(`no GitHub credential can act on ${slug} — connect the repository to the GitHub App,`
+        + ' give this project a git profile with a GitHub token, or authorize `gh` on the host');
+    }
+    return new GithubPrApi(token, deps.githubPr ?? {});
+  }
+
+  /** Each world repo that a pull request can be opened against. A repo without
+   *  a GitHub origin is recorded and skipped — a project may legitimately mix a
+   *  GitHub repo with a local-only one. */
+  async function githubPrTargets(world: World, handle: WorldHandle):
+  Promise<{ repo: ReturnType<typeof worldRepos>[number]; slug: string; api: GithubPrApi }[]> {
+    const targets = [];
+    for (const repo of worldRepos(world.handle)) {
+      // The *configured* origin URL, not `remote get-url`: that one applies the
+      // host's `insteadOf` rewrites, which are a transport detail (mirrors,
+      // ssh-for-https) and can hide the github.com identity the PR is keyed on.
+      const origin = await world.exec('git', ['config', '--get', 'remote.origin.url'], { cwd: repo.root });
+      const slug = githubSlug(worldRepoSource(repo)) ?? (origin.code === 0 ? githubSlug(origin.stdout.trim()) : undefined);
+      if (!slug) {
+        record(handle.id, 'pr.skipped', { repo: repo.name, reason: 'no GitHub origin remote' });
+        continue;
+      }
+      targets.push({ repo, slug, api: await prApiFor(handle, slug) });
+    }
+    return targets;
+  }
+
+  /** Publish every repo's task branch to origin so a PR can reference it. */
+  async function pushTaskBranches(world: World, handle: WorldHandle, env: Record<string, string>) {
+    if (isRemote(handle.kind)) return brokerPushBranches(world, brokerAuthFor(handle, handle.id));
+    const pushed: string[] = [];
+    const skipped: string[] = [];
+    const errors: Record<string, string> = {};
+    for (const repo of worldRepos(world.handle)) {
+      const push = await world.exec('git', ['push', '-u', 'origin', repo.branch],
+        { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
+      if (push.code === 0) pushed.push(repo.name);
+      else {
+        skipped.push(repo.name);
+        errors[repo.name] = (push.stderr || push.stdout).slice(0, 300);
+      }
+    }
+    return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
   }
 
   function brokerAuthFor(handle: WorldHandle, taskId?: string): GitBrokerAuth {
@@ -973,7 +1075,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // id (we run under this profile's provider).
             record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
             throw ApplicationFailure.create({
-              message: `Cannot resume session "${session}": no such ${profile.provider} conversation found in any connected config home. Check the id, or that it belongs to a ${profile.provider} login connected to karmax (cross-provider resume is unsupported).`,
+              message: `Cannot resume session "${session}": no such ${profile.provider} conversation found in any connected config home. Check the id, or that it belongs to a ${profile.provider} login connected to krmax (cross-provider resume is unsupported).`,
               type: 'agent-error',
               nonRetryable: true,
             });
@@ -1528,7 +1630,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
-        const tracked = await world.exec('git', ['diff', '--name-only', 'base' in repo ? repo.base : base], { cwd: repo.root });
+        const repoBase = 'base' in repo ? repo.base : base;
+        // Diff from the FORK POINT, not the base branch's current tip. `base` is a
+        // live ref: while this world is open, other tasks merge into it, and a
+        // two-dot `git diff <base>` would report their files as this task's work
+        // (they feed the confirmer's review packet, so a reviewer would be shown —
+        // and asked to approve — changes the task never made). The merge-base is
+        // resolved to a commit so the comparison still includes the worktree, which
+        // `<base>...HEAD` would drop along with every uncommitted change.
+        const forkPoint = await world.exec('git', ['merge-base', repoBase, 'HEAD'], { cwd: repo.root });
+        const since = forkPoint.code === 0 && forkPoint.stdout.trim() ? forkPoint.stdout.trim() : repoBase;
+        const tracked = await world.exec('git', ['diff', '--name-only', since], { cwd: repo.root });
         const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
         // A companion wiki must not make the sole development checkout appear
         // artificially nested. Keep a stable prefix for wiki changes, while
@@ -1692,39 +1804,109 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     },
 
-    async openPr(handle: WorldHandle, target: string): Promise<{ url: string; number: number } | null> {
-      // GitHub PRs are an optional integration (SPEC §5.2). Use `gh` if present
-      // and authorized; otherwise the Review stage IS the conceptual PR. The git
-      // profile's credentials (GH_TOKEN / GIT_SSH_COMMAND) select the account per
-      // subprocess (PLAN-git-config.md §4B — never `gh auth switch`).
+    /**
+     * The PR stage under remote policy 'pr' (SPEC §5.2, PLAN-git-config.md §5):
+     * push every repo's task branch and open — or update — its pull request.
+     *
+     * Idempotent by construction: the PR is keyed on the task branch, so a
+     * retried stage, a follow-up that reopened Do, or a replacement execution
+     * all land on the same PR with a refreshed title/body. Unlike the earlier
+     * best-effort `gh` path, a policy that asks for PRs and cannot get one is an
+     * error the human is told about (through Resolve), not a silent skip.
+     */
+    async openPr(handle: WorldHandle, target: string, details: OpenPrDetails = {}): Promise<TaskPullRequest[]> {
       const world = await openWorld(handle);
-      const env = gitEnvFor(handle, handle.id);
-      if (isRemote(handle.kind)) {
-        const remotePr = await brokerOpenGithubPr(world, target, brokerAuthFor(handle, handle.id));
-        record(handle.id, remotePr ? 'pr.opened' : 'pr.skipped', remotePr ?? { reason: 'cloud Git broker could not push/open PR' });
-        return remotePr;
+      const repos = worldRepos(world.handle);
+      const pushed = await pushTaskBranches(world, handle, gitEnvFor(handle, handle.id));
+      const targets = await githubPrTargets(world, handle);
+      if (!targets.length) {
+        throw new Error('remote policy "pr" is on, but no repository in this world has a GitHub origin remote'
+          + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin');
       }
-      const which = await world.exec('bash', ['-lc', 'command -v gh && gh auth status >/dev/null 2>&1 && echo ok || echo no'], { env });
-      if (!which.stdout.includes('ok')) {
-        record(handle.id, 'pr.skipped', { reason: 'gh not available/authorized' });
-        return null;
+      const opened: TaskPullRequest[] = [];
+      for (const { repo, slug, api } of targets) {
+        const base = worldRepoTarget(repo, target);
+        // karmax's own model lets a worktree stay dirty until the merge stage
+        // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
+        // here with nothing committed is a state the design produces. GitHub
+        // answers it with an opaque 422 — diagnose it ourselves instead.
+        const ahead = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+        if (ahead.code === 0 && ahead.stdout.trim() === '0') {
+          throw new Error(`branch "${repo.branch}" of repo "${repo.name}" has no commits ahead of "${base}",`
+            + ' so there is nothing to open a pull request for — the agent must commit its work before the PR stage');
+        }
+        if (!pushed.pushed.includes(repo.name)) {
+          throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
+            + `${pushed.errors?.[repo.name] ? `: ${pushed.errors[repo.name]}` : ''}`);
+        }
+        const { pr, created } = await api.openOrUpdate(slug, {
+          head: repo.branch, base,
+          title: details.title?.trim() || `karmax: ${repo.branch}`,
+          body: prBody(handle, details, store.getTask(handle.id)?.num, repos.length > 1 ? repo.name : undefined),
+        });
+        const ref: TaskPullRequest = { repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged };
+        record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base });
+        opened.push(ref);
       }
-      const push = await world.exec('git', ['push', '-u', 'origin', handle.branch], { env });
-      if (push.code !== 0) {
-        record(handle.id, 'pr.skipped', { reason: 'push failed', detail: push.stderr.slice(0, 300) });
-        return null;
+      return opened;
+    },
+
+    /**
+     * Reconcile the PRs with what actually landed, after the merge and the
+     * policy push. The local merge is the deliverable, so this never fails the
+     * task — but it is where the PR stops being a fire-and-forget artifact: the
+     * outcome is commented on it, a PR GitHub already marked merged is recorded
+     * as such, and one left open because the target push never reached GitHub
+     * says so instead of dangling silently.
+     */
+    async finalizePrs(handle: WorldHandle, prs: TaskPullRequest[], outcome: { target: string; sha?: string; pushed: string[] }):
+    Promise<TaskPullRequest[]> {
+      const settled: TaskPullRequest[] = [];
+      for (const ref of prs) {
+        try {
+          const api = await prApiFor(handle, ref.slug);
+          const landed = outcome.pushed.includes(ref.repo);
+          const as = outcome.sha ? ` as ${outcome.sha}` : '';
+          // Settle the PR first, then describe the state it settled in. GitHub
+          // marks a PR merged by itself once its commits reach the base, and it
+          // can do so moments after the push — so deciding the wording from a
+          // read taken beforehand narrates a state the PR has already left.
+          if (landed && !(await api.get(ref.slug, ref.number)).merged) {
+            // The merge commit is on the pushed target but GitHub still shows the
+            // PR open (a squash/rebase-shaped history, or a base it can't match).
+            // Close it explicitly — the work is in, the PR is done.
+            await api.update(ref.slug, ref.number, { state: 'closed' }).catch(() => undefined);
+          }
+          const after = await api.get(ref.slug, ref.number);
+          await api.comment(ref.slug, ref.number,
+            after.merged ? `Merged into \`${outcome.target}\` by karmax${as}.`
+            : landed ? `karmax merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
+            : `karmax merged this branch into \`${outcome.target}\` locally${as}, but could not push`
+              + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`);
+          const next = { ...ref, state: after.state, merged: after.merged };
+          record(handle.id, after.merged ? 'pr.merged' : after.state === 'closed' ? 'pr.closed' : 'pr.open', next);
+          settled.push(next);
+        } catch (error) {
+          record(handle.id, 'pr.finalize_failed', { ...ref, error: error instanceof Error ? error.message : String(error) });
+          settled.push(ref);
+        }
       }
-      // `gh pr create` prints a URL; only `pr view` supports structured JSON.
-      // Query after the create attempt, which also makes this idempotently return
-      // an already-existing PR without interpolating branch names into a shell.
-      await world.exec('gh', ['pr', 'create', '--base', target, '--head', handle.branch, '--fill'], { env });
-      const pr = await world.exec('gh', ['pr', 'view', handle.branch, '--json', 'url,number'], { env });
-      try {
-        const parsed = JSON.parse(pr.stdout);
-        record(handle.id, 'pr.opened', parsed);
-        return { url: parsed.url, number: parsed.number };
-      } catch {
-        return null;
+      return settled;
+    },
+
+    /** Close the task's still-open PRs (cancellation). Best-effort: a task that
+     *  is going away must not be held up by GitHub being unreachable. */
+    async closePrs(handle: WorldHandle, prs: TaskPullRequest[], reason: string): Promise<void> {
+      for (const ref of prs) {
+        try {
+          const api = await prApiFor(handle, ref.slug);
+          if ((await api.get(ref.slug, ref.number)).state === 'closed') continue;
+          await api.comment(ref.slug, ref.number, reason);
+          await api.update(ref.slug, ref.number, { state: 'closed' });
+          record(handle.id, 'pr.closed', { ...ref, state: 'closed' as const, reason });
+        } catch (error) {
+          record(handle.id, 'pr.close_failed', { ...ref, error: error instanceof Error ? error.message : String(error) });
+        }
       }
     },
 

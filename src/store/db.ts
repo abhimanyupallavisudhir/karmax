@@ -186,6 +186,15 @@ export class Store {
       }
       if (changed) this.db.prepare('UPDATE kv SET v=? WHERE k=?').run(JSON.stringify(items), vrow.k);
     }
+
+    // Tag `kind` used to be optional, surfaced as a "general" choice. That option is
+    // gone — every tag is now type/topic/flag — so a kind-less row left behind by an
+    // older build (or by an agent naming a tag through `tag_task`) is no longer
+    // representable: the editor pre-selects `topic` and silently reclassifies it on
+    // save, and kind-scoped sections (`group:tag-type`/`tag-topic`) bucket it under
+    // Untagged. Adopt that same reading explicitly. Idempotent: creation now always
+    // sets a kind, so a re-run matches nothing.
+    this.db.prepare("UPDATE tags SET kind = 'topic' WHERE kind IS NULL OR kind = ''").run();
   }
 
   private migrate() {
@@ -1889,14 +1898,23 @@ export class Store {
     if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
   }
 
-  setIntentConfirmer(intentId: string, field: string, confirmer: unknown) {
+  /**
+   * Write the shared Review route of a logical task. It is shared across attempts
+   * (activities/core.ts) — never per-attempt — so this is the only writer.
+   *
+   * The draft-only guard exists because the *task form* has no idea whether a live
+   * attempt's gate has already played. `inFlight` is the caller (KarmaxApi.updateParams)
+   * saying the live workflow itself accepted the edit, which means it authoritatively
+   * had not consumed the route yet: the route is `untilUsed`, not `queue` (SPEC §4.5/§5.5).
+   */
+  setIntentConfirmer(intentId: string, field: string, confirmer: unknown, opts?: { inFlight?: boolean }) {
     const attempts = this.attemptsOf(intentId);
     const group = this.attemptGroup(intentId);
-    if (attempts.some((a) => !a.params.draft)) {
+    if (!opts?.inFlight && attempts.some((a) => !a.params.draft)) {
       // Full-form replacement includes disabled controls too. Re-sending the
       // existing shared value is harmless; only an actual divergence is locked.
       if (JSON.stringify(group?.confirmer) === JSON.stringify(confirmer)) return;
-      throw new Error('the confirmer is shared and freezes when any attempt is queued');
+      throw new Error('the confirmer is shared; edit it on the task page while its Review gate is still open');
     }
     this.db.prepare('UPDATE task_intents SET confirmer=? WHERE id=?').run(JSON.stringify(confirmer), intentId);
     for (const a of attempts) this.updateTaskParams(a.id, { ...a.params, [field]: confirmer });
@@ -2460,7 +2478,9 @@ export class Store {
     if (!raw) throw new Error('tag name required');
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
     // level under the previous, so the UI never needs a parent picker — the user just
-    // types the path. `color`/`kind` apply to the leaf; ancestors created bare.
+    // types the path. `color`/`description` apply to the leaf; `kind` applies to the
+    // whole path, because a hierarchy is within-kind — kind-scoped sectioning
+    // (`group:tag-type`) drops a child whose parent carries a different kind.
     const segments = raw.split('/').map((s) => s.trim()).filter(Boolean);
     if (segments.length > 1) {
       let parentId = input.parentId;
@@ -2471,7 +2491,8 @@ export class Store {
           projectId: input.projectId,
           name: segments[i]!,
           parentId,
-          ...(isLeaf ? { color: input.color, kind: input.kind, description: input.description } : {}),
+          kind: input.kind,
+          ...(isLeaf ? { color: input.color, description: input.description } : {}),
         });
         parentId = leaf.id;
       }
@@ -2507,7 +2528,12 @@ export class Store {
       name,
       parentId: input.parentId,
       color: input.color,
-      kind: input.kind,
+      // Every tag carries a kind. `topic` is the default because it is the neutral
+      // "what area" axis, and because the callers that omit one are the implicit
+      // ones (an agent naming a new tag through `tag_task`, a path ancestor). A
+      // kind-less tag is not representable in the UI and falls out of kind-scoped
+      // sections. Reuse of an existing tag above deliberately never overwrites.
+      kind: input.kind ?? 'topic',
       description: input.description?.trim() || undefined,
       createdAt: Date.now(),
     };

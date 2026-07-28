@@ -404,6 +404,20 @@ a { color: var(--accent); text-decoration: none; }
 .chip.done { background: var(--merged-weak); color: var(--merged); border-color: transparent; }
 .chip.approval-needed { background: var(--working-weak); color: var(--working); border-color: transparent; }
 
+/* GitHub pull request, in the task byline: link + live state. */
+.pr-link {
+  display: inline-flex; align-items: center; gap: 5px; text-decoration: none;
+  color: var(--ink-2); border-bottom: 1px dotted var(--line);
+}
+.pr-link:hover { color: var(--accent); }
+.pr-link .pr-state {
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 6px; border-radius: 999px; background: var(--surface-2); color: var(--ink-3);
+}
+.pr-link.open .pr-state { background: var(--accent-weak); color: var(--accent); }
+.pr-link.merged .pr-state { background: var(--merged-weak); color: var(--merged); }
+.pr-link.closed .pr-state { background: var(--danger-weak); color: var(--danger); }
+
 /* ── buttons ────────────────────────────────────────────────── */
 .btn {
   display: inline-flex; align-items: center; gap: 7px; cursor: pointer;

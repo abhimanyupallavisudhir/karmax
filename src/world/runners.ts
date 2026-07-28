@@ -23,7 +23,7 @@ export class RunnerPoolService {
     const remote = !['worktree', 'container', 'memory'].includes(provider);
     const id = `${organizationId}:${remote ? `managed-${provider}` : 'local'}`;
     return this.store.getRunnerPool(id) ?? this.store.createRunnerPool({ id, organizationId,
-      name: remote ? `Karmax managed (${provider})` : 'Local runner', provider,
+      name: remote ? `Krmax managed (${provider})` : 'Local runner', provider,
       mode: remote ? 'managed' : 'customer', capacity: DEFAULT_CAPACITY, enabled: true });
   }
 
