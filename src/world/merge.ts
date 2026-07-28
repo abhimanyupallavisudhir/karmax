@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget } from './types.js';
+import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget, orderCheckouts } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
 
 /** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
@@ -28,13 +28,18 @@ export interface MergeResult {
 
 /**
  * The authoritative merge (SPEC §5.2 "Merge", the point of no return). For a
- * multi-repo world it merges every repo, each into `target`, aggregating the
- * landed files (prefixed by repo name) and stopping at the first conflict so the
- * merge agent can resolve it and re-run — repos that already landed re-merge as
- * no-ops, so the retry is safe (partial-merge recoverable, not atomic).
+ * world with several checkouts — one per repo, and/or several branches of one
+ * repo when the task's change is partitioned into several pull requests — it
+ * merges every checkout into its target, aggregating the landed files (prefixed
+ * by checkout name) and stopping at the first conflict so the merge agent can
+ * resolve it and re-run; checkouts that already landed re-merge as no-ops, so
+ * the retry is safe (partial-merge recoverable, not atomic).
+ *
+ * Checkouts are merged in stack order (`orderCheckouts`), so a branch based on a
+ * sibling lands after it and each pull request carries only its own change.
  */
 export async function finalizeMerge(world: World, target: string, identity?: WorldGitIdentity): Promise<MergeResult> {
-  const repos = worldRepos(world.handle);
+  const repos = orderCheckouts(worldRepos(world.handle));
   if (!repos.length) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
   if (repos.length === 1) return finalizeMergeRepo(repos[0]!, worldRepoTarget(repos[0]!, target), world.handle.id, identity);
 

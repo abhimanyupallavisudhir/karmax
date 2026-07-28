@@ -4,7 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, WorldCheckoutSpec, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
 import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } from './git.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
@@ -66,15 +66,16 @@ export class WorktreeProvider implements WorldProvider {
       // No repo configured — a scratch sandbox (the world itself is the deliverable).
       const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
       repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings, undefined, ephemeralPaths));
-    } else if (resolvedSources.length === 1) {
+    } else if (resolvedSources.length === 1 && spec.layout !== 'nested') {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
         this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined, ephemeralPaths,
         '', Boolean(spec.repositoryBranches?.[resolved.source]?.target)));
     } else {
-      // Multi-repo: the world root is a parent dir holding one worktree per repo,
-      // each in a subdirectory named after the repo (deduped on collision).
+      // Multi-repo (or a lone repo a multi-PR task asked to nest): the world root
+      // is a parent dir holding one worktree per checkout, each in a subdirectory
+      // named after the repo (deduped on collision).
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });
       const names = uniqueNames(resolvedSources.map((resolved) => repoName(resolved.source)));
@@ -91,6 +92,11 @@ export class WorktreeProvider implements WorldProvider {
       kind: 'worktree',
       id: spec.taskId,
       root,
+      // A nested lone repo leaves the world root a bare parent directory, so
+      // point the agent at the checkout rather than at the container holding it.
+      // With several repos the agent is meant to see them side by side at the
+      // root, and createWorld picks the workdir for companion-repo layouts.
+      ...(spec.layout === 'nested' && repos.length === 1 ? { workdir: repos[0]!.root } : {}),
       branch,
       base: spec.base,
       repo: repos[0]!.repo,
@@ -362,6 +368,97 @@ class WorktreeWorld implements World {
       ...spec,
       cwd: spec.cwd ?? worldWorkingDirectory(this.handle),
     });
+  }
+
+  /**
+   * Check out another branch of one of this world's repos, side by side with the
+   * existing ones (SPEC §11.1 `addCheckout`). This is the whole multi-PR
+   * primitive on the local backend: a `WorldRepo` is already
+   * `(source, dir, branch, base, target)` and merge/PR/queue all iterate them,
+   * so an extra entry IS an extra pull request.
+   */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    const repos = worldRepos(this.handle);
+    const name = spec.name.trim();
+    if (!name || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
+      throw new Error(`invalid checkout name "${spec.name}" — use letters, digits, "-", "_" or "."`);
+    }
+    if (repos.some((r) => r.name === name)) throw new Error(`checkout "${name}" already exists in this world`);
+    // A flat world root IS a checkout's working tree; a sibling could only go
+    // inside it (where the first checkout's git would see it) or outside the
+    // world boundary (breaking file/PTY confinement). Nesting is decided at
+    // Setup, so this is a configuration error, not something to paper over.
+    if (repos.some((r) => r.root === this.handle.root)) {
+      throw new Error('this world has a flat layout, so it can hold only one checkout —'
+        + ' create it with layout "nested" to allow several branches');
+    }
+
+    const from = spec.from ? repos.find((r) => r.name === spec.from) : repos[0];
+    if (!from) throw new Error(`no checkout named "${spec.from}" to branch from`);
+    const branch = spec.branch?.trim() || `${this.handle.branch}-${name}`;
+    if (repos.some((r) => r.branch === branch)) throw new Error(`branch "${branch}" is already checked out in this world`);
+    // A base naming a sibling checkout is a stacked PR: record the SIBLING'S
+    // BRANCH as the base so the ordering in orderCheckouts() and the landed-file
+    // diff in finalizeMergeRepo both read the stack off plain handle data.
+    const sibling = spec.base ? repos.find((r) => r.name === spec.base) : undefined;
+    const base = sibling ? sibling.branch : (spec.base?.trim() || from.base);
+    const root = path.join(this.handle.root, name);
+
+    if ((await git(from.repo, ['rev-parse', '--verify', base])).code !== 0) {
+      throw new Error(`base "${base}" does not exist in repo "${from.name}"`);
+    }
+    if (fs.existsSync(root)) {
+      await git(from.repo, ['worktree', 'remove', '--force', root]);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+    await git(from.repo, ['worktree', 'prune']);
+    const branchExists = (await git(from.repo, ['rev-parse', '--verify', branch])).code === 0;
+    await gitOrThrow(from.repo, branchExists
+      ? ['worktree', 'add', root, branch]
+      : ['worktree', 'add', '-b', branch, root, base]);
+    // Inherit the world's identity and runnability from the checkout it forked.
+    await this.inheritWorktreeSetup(from.root, root);
+
+    const added: WorldRepo = {
+      name,
+      repo: from.repo,
+      ...(from.source ? { source: from.source } : {}),
+      ...(from.localPath ? { localPath: from.localPath } : {}),
+      root,
+      branch,
+      base,
+      ...(spec.target ?? from.target ? { target: spec.target ?? from.target } : {}),
+      targetPinned: spec.target ? true : from.targetPinned,
+    };
+    this.handle = { ...this.handle, repos: [...repos, added] };
+    return this.handle;
+  }
+
+  /** Copy the forked checkout's worktree-scoped identity and node_modules link
+   *  onto a newly added one, so a branch added mid-task commits as the same
+   *  author and can still run the project. Best-effort, like world creation. */
+  private async inheritWorktreeSetup(from: string, to: string) {
+    try {
+      for (const key of ['user.name', 'user.email', 'gpg.format', 'user.signingKey', 'commit.gpgsign']) {
+        const value = await git(from, ['config', '--get', key]);
+        if (value.code !== 0 || !value.stdout.trim()) continue;
+        if (key === 'user.name') await git(to, ['config', 'extensions.worktreeConfig', 'true']);
+        await git(to, ['config', '--worktree', key, value.stdout.trim()]);
+      }
+      const src = path.join(from, 'node_modules');
+      const dst = path.join(to, 'node_modules');
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        fs.symlinkSync(fs.realpathSync(src), dst, 'dir');
+        const exclude = await git(to, ['rev-parse', '--git-path', 'info/exclude']);
+        if (exclude.code === 0) {
+          const excludePath = path.resolve(to, exclude.stdout.trim());
+          fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+          fs.appendFileSync(excludePath, '/node_modules\n');
+        }
+      }
+    } catch {
+      // A missing identity or link must not cost the task its branch.
+    }
   }
 
   async listFiles(): Promise<string[]> {
