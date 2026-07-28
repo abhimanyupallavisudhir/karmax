@@ -87,7 +87,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         taskId,
         projectId: 'p1',
         title: 'Add a greeter',
-        prompt: 'Implement it.\n@write greet.js :: export const g = () => "hi";\n@review Added greet.js',
+        // The Do agent commits its own work — without a commit the branch has
+        // nothing to propose and GitHub rejects the pull request outright.
+        prompt: 'Implement it.\n@write greet.js :: export const g = () => "hi";\n'
+          + '@run git add -A && git commit -q -m "add greet.js"\n@review Added greet.js',
         base: 'main',
         target: 'main',
         project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
@@ -131,7 +134,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         taskId,
         projectId: 'p1',
         title: 'Legacy',
-        prompt: 'Implement it.\n@write legacy.js :: export const l = 1;\n@review Added legacy.js',
+        prompt: 'Implement it.\n@write legacy.js :: export const l = 1;\n'
+          + '@run git add -A && git commit -q -m "add legacy.js"\n@review Added legacy.js',
         base: 'main',
         target: 'main',
         project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },

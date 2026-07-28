@@ -1797,11 +1797,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const opened: TaskPullRequest[] = [];
       for (const { repo, slug, api } of targets) {
+        const base = worldRepoTarget(repo, target);
+        // karmax's own model lets a worktree stay dirty until the merge stage
+        // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
+        // here with nothing committed is a state the design produces. GitHub
+        // answers it with an opaque 422 — diagnose it ourselves instead.
+        const ahead = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+        if (ahead.code === 0 && ahead.stdout.trim() === '0') {
+          throw new Error(`branch "${repo.branch}" of repo "${repo.name}" has no commits ahead of "${base}",`
+            + ' so there is nothing to open a pull request for — the agent must commit its work before the PR stage');
+        }
         if (!pushed.pushed.includes(repo.name)) {
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushed.errors?.[repo.name] ? `: ${pushed.errors[repo.name]}` : ''}`);
         }
-        const base = worldRepoTarget(repo, target);
         const { pr, created } = await api.openOrUpdate(slug, {
           head: repo.branch, base,
           title: details.title?.trim() || `karmax: ${repo.branch}`,
@@ -1828,24 +1837,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       for (const ref of prs) {
         try {
           const api = await prApiFor(handle, ref.slug);
-          const live = await api.get(ref.slug, ref.number);
           const landed = outcome.pushed.includes(ref.repo);
-          if (live.merged) {
-            await api.comment(ref.slug, ref.number, `Merged into \`${outcome.target}\` by karmax`
-              + `${outcome.sha ? ` as ${outcome.sha}` : ''}.`);
-          } else if (landed) {
+          const as = outcome.sha ? ` as ${outcome.sha}` : '';
+          // Settle the PR first, then describe the state it settled in. GitHub
+          // marks a PR merged by itself once its commits reach the base, and it
+          // can do so moments after the push — so deciding the wording from a
+          // read taken beforehand narrates a state the PR has already left.
+          if (landed && !(await api.get(ref.slug, ref.number)).merged) {
             // The merge commit is on the pushed target but GitHub still shows the
             // PR open (a squash/rebase-shaped history, or a base it can't match).
             // Close it explicitly — the work is in, the PR is done.
-            await api.comment(ref.slug, ref.number, `karmax merged this branch into \`${outcome.target}\``
-              + `${outcome.sha ? ` as ${outcome.sha}` : ''} and pushed it. Closing.`);
-            await api.update(ref.slug, ref.number, { state: 'closed' });
-          } else {
-            await api.comment(ref.slug, ref.number, `karmax merged this branch into \`${outcome.target}\` locally`
-              + `${outcome.sha ? ` as ${outcome.sha}` : ''}, but could not push \`${outcome.target}\` to origin.`
-              + ' This pull request stays open until that target lands.');
+            await api.update(ref.slug, ref.number, { state: 'closed' }).catch(() => undefined);
           }
           const after = await api.get(ref.slug, ref.number);
+          await api.comment(ref.slug, ref.number,
+            after.merged ? `Merged into \`${outcome.target}\` by karmax${as}.`
+            : landed ? `karmax merged this branch into \`${outcome.target}\`${as} and pushed it. Closing.`
+            : `karmax merged this branch into \`${outcome.target}\` locally${as}, but could not push`
+              + ` \`${outcome.target}\` to origin. This pull request stays open until that target lands.`);
           const next = { ...ref, state: after.state, merged: after.merged };
           record(handle.id, after.merged ? 'pr.merged' : after.state === 'closed' ? 'pr.closed' : 'pr.open', next);
           settled.push(next);

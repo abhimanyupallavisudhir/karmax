@@ -208,6 +208,27 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  /** karmax's own model tolerates an uncommitted worktree until the merge stage
+   *  (PLAN-git-config.md §6 loops it back to the merge agent), so reaching the PR
+   *  stage with nothing committed is a state the design actually produces — and
+   *  GitHub answers it with an opaque 422 ("No commits between …"). Diagnose it
+   *  here instead, naming the repo and what to do. */
+  it('says the branch has no commits rather than passing an empty branch to GitHub', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('empty');
+    const handle = await core.createWorld({ taskId: 'task_pr4', repo, base: 'main', target: 'main', kind: 'worktree' });
+    // The agent wrote a file but never committed it — exactly the dirty-worktree case.
+    await fs.promises.writeFile(path.join(handle.root, 'uncommitted.txt'), 'x');
+
+    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/no commits/i);
+    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/empty/); // names the repo
+    expect(gh.prs).toHaveLength(0);
+    // No pointless POST to GitHub either — the branch is checked first.
+    expect(gh.calls.filter((c) => c.startsWith('POST'))).toHaveLength(0);
+    await core.destroyWorld(handle);
+  });
+
   it('fails with an actionable message when no GitHub credential can act', async () => {
     const gh = fakeGithub();
     const core = await coreFor(gh);
@@ -256,6 +277,28 @@ describe('PR lifecycle after the merge', () => {
     expect(gh.prs[0].state).toBe('closed');
     expect(settled[0]!.state).toBe('closed');
     expect(gh.comments[0]!.body).toContain('Closing');
+    await core.destroyWorld(handle);
+  });
+
+  /** Observed against real GitHub: the merge commit reaches the base branch, but
+   *  GitHub has not finished marking the PR `merged` when karmax first reads it —
+   *  and it does so moments later. The audit comment must describe the state the
+   *  PR actually settled in, not the one karmax raced past. */
+  it('reports the merge GitHub records only after the outcome is decided', async () => {
+    const { gh, core, handle, prs } = await withOpenPr();
+    let reads = 0;
+    const lagging = await coreFor({ ...gh, options: { apiBase: 'https://api.github.test',
+      fetch: (async (url: string, init: RequestInit = {}) => {
+        const isRead = (init.method ?? 'GET') === 'GET' && /\/pulls\/\d+$/.test(new URL(String(url)).pathname);
+        // GitHub notices the merge right after karmax's first look.
+        if (isRead && reads++ === 1) { gh.prs[0].state = 'closed'; gh.prs[0].merged_at = '2026-01-01T00:00:00Z'; }
+        return gh.fetcher(url as any, init);
+      }) as unknown as typeof fetch } });
+    const settled = await lagging.finalizePrs(handle, prs, { target: 'main', sha: 'cafe123', pushed: ['svc'] });
+    expect(settled[0]).toMatchObject({ state: 'closed', merged: true });
+    expect(gh.comments[0]!.body).toContain('Merged into `main` by karmax');
+    expect(gh.comments[0]!.body).toContain('cafe123');
+    expect(gh.comments[0]!.body).not.toContain('Closing');
     await core.destroyWorld(handle);
   });
 
