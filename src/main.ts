@@ -245,7 +245,7 @@ async function main() {
   // Upgrade durable MCP launch/auth configuration before the worker starts
   // polling and can resume an agent. The gateway refresh below replaces this
   // provisional address with the actual bound control-plane URL.
-  configHomes.refreshPlatformMcp(
+  configHomes.refreshManagedMcp(
     process.env.KARMAX_GATEWAY_URL ?? `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
   );
 
@@ -529,11 +529,11 @@ async function main() {
   // Keep service-to-service agent/MCP traffic on the control plane's loopback,
   // even when browsers use a public TLS URL through a reverse proxy.
   process.env.KARMAX_GATEWAY_URL = internalUrl;
-  // Config homes are durable and may contain an MCP command written by an older
-  // karmax version. Refresh only the platform entry on every boot so existing
-  // accounts receive transport/auth fixes without reconnecting or losing their
-  // browser/user-defined MCP servers.
-  configHomes.refreshPlatformMcp(internalUrl);
+  // Config homes are durable and may contain MCP commands written by an older
+  // karmax version. Refresh managed entries on every boot so existing accounts
+  // receive transport/auth/browser-fill fixes without reconnecting or losing
+  // user-defined MCP servers.
+  configHomes.refreshManagedMcp(internalUrl);
 
   console.log(`\n  ✓ krmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');

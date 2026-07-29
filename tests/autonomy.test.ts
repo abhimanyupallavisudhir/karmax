@@ -111,27 +111,38 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('forwards the scoped token to Codex MCP and upgrades existing homes without clobbering other servers', async () => {
+  it('upgrades managed platform and browser MCPs in existing homes without clobbering other servers', async () => {
     const { platformMcpSpec } = await import('../src/autonomy/config-homes.js');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcp-refresh-'));
     const mgr = new ConfigHomeManager(dir);
     const codexHome = mgr.ensure('codex', 'work');
-    fs.writeFileSync(path.join(codexHome, 'config.toml'), `model = "custom"\n\n[mcp_servers.keep]\ncommand = "keep"\n\n[mcp_servers.karmax]\ncommand = "npx"\nargs = ["tsx", "old.ts"]\n`);
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), `model = "custom"\n\n[mcp_servers.keep]\ncommand = "keep"\n\n[mcp_servers.chrome-devtools]\ncommand = "npx"\nargs = ["-y", "chrome-devtools-mcp"]\n\n[mcp_servers.karmax]\ncommand = "npx"\nargs = ["tsx", "old.ts"]\n`);
     const claudeHome = mgr.ensure('claude', 'work');
-    fs.writeFileSync(path.join(claudeHome, '.claude.json'), JSON.stringify({ mcpServers: { keep: { command: 'keep', args: [] }, karmax: { command: 'npx', args: ['tsx', 'old.ts'] } } }));
+    fs.writeFileSync(path.join(claudeHome, '.claude.json'), JSON.stringify({ mcpServers: {
+      keep: { command: 'keep', args: [] },
+      'chrome-devtools': { command: 'npx', args: ['-y', 'chrome-devtools-mcp'] },
+      karmax: { command: 'npx', args: ['tsx', 'old.ts'] },
+    } }));
 
-    mgr.refreshPlatformMcp('http://127.0.0.1:9876');
+    mgr.refreshManagedMcp('http://127.0.0.1:9876');
 
     const toml = fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8');
     expect(toml.match(/^\[mcp_servers\.karmax]$/gm)).toHaveLength(1);
+    expect(toml.match(/^\[mcp_servers\.chrome-devtools]$/gm)).toHaveLength(1);
     expect(toml).toContain(`command = ${JSON.stringify(process.execPath)}`);
     expect(toml).toContain('env_vars = ["KARMAX_TOKEN"]');
     expect(toml).toContain('KARMAX_GATEWAY_URL = "http://127.0.0.1:9876"');
+    expect(toml).toContain('chrome-cdp-launcher.mjs');
+    expect(toml).not.toContain('args = ["-y", "chrome-devtools-mcp"]');
     expect(toml).toContain('[mcp_servers.keep]');
     expect(toml).toContain('model = "custom"');
 
     const claude = JSON.parse(fs.readFileSync(path.join(claudeHome, '.claude.json'), 'utf8'));
     expect(claude.mcpServers.keep.command).toBe('keep');
+    expect(claude.mcpServers['chrome-devtools']).toEqual(expect.objectContaining({
+      command: process.execPath,
+      args: [expect.stringMatching(/chrome-cdp-launcher\.mjs$/)],
+    }));
     expect(claude.mcpServers.karmax).toEqual(expect.objectContaining({
       command: platformMcpSpec('http://127.0.0.1:9876').command,
       env: { KARMAX_GATEWAY_URL: 'http://127.0.0.1:9876' },
