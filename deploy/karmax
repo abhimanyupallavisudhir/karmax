@@ -36,10 +36,17 @@ env_value() {
 
 random_hex() { od -An -N"${1:-48}" -tx1 /dev/urandom | tr -d ' \n'; }
 
+# Compose bind-mounts these files into the app container with their host
+# ownership intact, and that container runs as its own unprivileged uid (see
+# deploy/Dockerfile) which matches no host user — so a 0600 secret is
+# unreadable exactly where it is needed. $SECRETS_DIR stays 0700, which is what
+# actually keeps other users on the host out: they cannot traverse into it.
+secret_mode() { chmod 644 "$@"; }
+
 write_secret() {
   file="$SECRETS_DIR/$1"
   [ -s "$file" ] || random_hex 48 > "$file"
-  chmod 600 "$file"
+  secret_mode "$file"
 }
 
 configure() {
@@ -184,7 +191,8 @@ cmd_restore() {
   dc down
   rm -rf "$SECRETS_DIR"
   cp -R "$source/deployment-secrets" "$SECRETS_DIR"
-  chmod -R go-rwx "$SECRETS_DIR"
+  chmod 700 "$SECRETS_DIR"
+  secret_mode "$SECRETS_DIR"/*
   dc up -d postgresql
   attempt=0
   until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
