@@ -221,7 +221,13 @@ cmd_update() {
       note 'Fast-forwarding the Karmax source checkout…'
       git -C "$ROOT_DIR" pull --ff-only
     else
-      note 'Source has local changes; leaving it untouched and rebuilding the current revision.'
+      # This used to carry on and rebuild the current revision. Run by hand that
+      # is merely surprising; run from the post-push workflow it is a lie — the
+      # deploy reports success while the commit CI just validated never reaches
+      # the instance, and the drift is invisible until someone SSHes in.
+      git -C "$ROOT_DIR" status --short --untracked-files=no >&2
+      die 'the source checkout has local changes, so it cannot be fast-forwarded.
+Commit or discard the files listed above (git -C '"$ROOT_DIR"' checkout -- .), then deploy again.'
     fi
   fi
   dc build --pull app
