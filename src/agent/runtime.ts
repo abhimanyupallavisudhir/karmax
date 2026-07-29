@@ -70,6 +70,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const subTasks: { title: string; prompt: string }[] = [];
   const subTaskResponses: SubTaskResponse[] = [];
   const skills: { name: string; content: string }[] = [];
+  // Set only if the agent partitioned its change across another branch this turn.
+  let worldHandle: import('../world/types.js').WorldHandle | undefined;
 
   const ctx: PlatformToolContext = {
     // Optional, structured task-finish annotation. Provider completion is established
@@ -108,6 +110,25 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     saveSkill(s) {
       skills.push(s);
+    },
+    // Do the checkout NOW, so the agent can work in the new branch for the rest
+    // of this turn, and hand the updated handle back for the workflow to adopt.
+    async addCheckout(spec) {
+      // Do-agent only. Every activity re-opens the world from the DURABLE handle
+      // (activities/core.ts `ensureRunnerLease`), so a branch added by the merge or
+      // resolve agent would be persisted and then landed by a merge that nobody
+      // reviewed — while the Do transcript, which owns the partitioning, never
+      // mentioned it. Partitioning the change is the Do agent's decision.
+      if (input.role !== 'do') {
+        throw new Error(`the ${input.role} agent cannot add branches — only the Do agent partitions a task's change`);
+      }
+      if (!input.world.addCheckout) {
+        throw new Error(`the "${input.world.handle.kind}" world backend cannot add branches`);
+      }
+      worldHandle = await input.world.addCheckout(spec);
+      const added = worldHandle.repos?.[worldHandle.repos.length - 1];
+      if (!added) throw new Error('checkout was not recorded on the world handle');
+      return { name: added.name, root: added.root, branch: added.branch };
     },
     async requestSpend(args) {
       if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
@@ -224,6 +245,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     subTasks: subTasks.length ? subTasks : undefined,
     subTaskResponses: subTaskResponses.length ? subTaskResponses : undefined,
     skills: skills.length ? skills : undefined,
+    ...(worldHandle ? { worldHandle } : {}),
     // Legacy v1.0/v1.1 workflows use this old no-signal marker. New versions use
     // providerCompleted and do not interpret a missing optional tool call as a stall.
     needsInput:

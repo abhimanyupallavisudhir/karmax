@@ -272,6 +272,26 @@ describe('spawn-time materialization (§5A)', () => {
     // ungranted task gets nothing
     expect(Object.keys(items.envFor('t2', []))).toHaveLength(0);
   });
+
+  it('a one-shot "once" approval never becomes standing env injection', () => {
+    const { items } = makeService();
+    const item = items.save({ type: 'api-key', label: 'stripe', envVar: 'STRIPE_KEY', policy: { use: 'ask' }, secrets: { secret: 'sk-live' } });
+    // The task was never granted this credential, so it parks for a human…
+    const asked = items.request({ taskId: 't1', caps: [], itemId: item.id, mode: 'use', why: 'charge once' });
+    expect(asked.status).toBe('needs_approval');
+    // …who approves exactly one use. NOT `task`, which is the action that means
+    // "for the rest of this task" and grants a durable capability extension.
+    items.resolve(asked.requestId!, { action: 'once', by: 'user:alice', itemId: item.id });
+
+    // envFor runs on EVERY agent turn. It used to see the un-consumed one-shot pass
+    // and inject the secret each time — for the task's whole life — turning a
+    // deliberately single-use approval into a permanent ambient grant.
+    expect(items.envFor('t1', []).STRIPE_KEY).toBeUndefined();
+    expect(items.envFor('t1', []).STRIPE_KEY).toBeUndefined();
+    // …and the pass is still intact for the one explicit use it was granted for.
+    expect(items.access([], 't1', item, 'use', { consume: true }).status).toBe('granted');
+    expect(items.access([], 't1', item, 'use', { consume: true }).status).toBe('needs_approval');
+  });
 });
 
 describe('zero-exposure CDP fill (§5B)', () => {

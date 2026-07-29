@@ -26,10 +26,18 @@ import { paths } from '../config/paths.js';
  *    custody that works after a SIGKILL/crash — graceful teardown never ran.
  *
  * PID-reuse guard: a stale pidfile's number may have been recycled by an
- * unrelated process after a reboot. On Linux we verify `/proc/<pid>/cmdline`
- * still matches the recorded command before killing; where we can't verify
- * (no procfs), we clear the pidfile without killing. Better to leak a truly
- * dead record than to kill an innocent bystander.
+ * unrelated process after a reboot. Identity is established by the process START
+ * TICK (`/proc/<pid>/stat` field 22) recorded at spawn — the same primitive
+ * `src/activities/agent-slots.ts` uses for lease owners — and only then by
+ * `/proc/<pid>/cmdline`. The cmdline check alone is NOT sufficient: for the
+ * Claude Agent-SDK rail the spawned command is the node executable, so
+ * `rec.cmd === 'node'` and a recycled pid belonging to ANY node process on the
+ * box would pass it and be SIGKILLed with its whole process group — precisely
+ * the 2026-07-12 cross-instance-kill incident class. Where we can't verify (no
+ * procfs, or a record written before start ticks were stamped), we clear the
+ * pidfile WITHOUT killing. Better to leak a truly dead record for one boot than
+ * to kill an innocent bystander; the custodyId sweep below still reaps every
+ * marked descendant exactly, so nothing verifiable is lost.
  *
  * Live-owner guard (2026-07-12 incident): "anything recorded here is an orphan"
  * is only true when this boot is the sole karmax app. With the world-rooted boot
@@ -54,6 +62,13 @@ export interface AgentRecord {
   /** Unique inherited marker used to find descendants across process groups. */
   custodyId?: string;
   startedAt: number;
+  /** Linux `/proc/<pid>/stat` field 22 (process start tick) for `pid`, stamped by
+   *  `registerAgent`. Wall-clock `startedAt` cannot disambiguate pid reuse; this
+   *  can. Absent on non-Linux hosts and on records written before this existed. */
+  pidStart?: string;
+  /** The same start tick for `owner`, so a recycled owner pid cannot make a
+   *  genuine orphan permanently unreapable. */
+  ownerStart?: string;
 }
 
 export const CUSTODY_ENV = 'KARMAX_CUSTODY_CHAIN';
@@ -87,11 +102,24 @@ export function createCustodyEnv<T extends Record<string, string | undefined>>(
   };
 }
 
-/** Record a freshly-spawned agent so it can be reaped after a hard kill. */
+/**
+ * Record a freshly-spawned agent so it can be reaped after a hard kill. The
+ * start ticks are stamped HERE rather than by each adapter so every call site
+ * (and every future one) gets the PID-reuse guard for free.
+ */
 export function registerAgent(rec: AgentRecord): void {
   try {
     fs.mkdirSync(agentsDir(), { recursive: true });
-    fs.writeFileSync(fileFor(rec.pid), JSON.stringify(rec));
+    const pidStart = rec.pidStart ?? processStart(rec.pid);
+    const ownerStart = rec.ownerStart ?? processStart(rec.owner);
+    fs.writeFileSync(
+      fileFor(rec.pid),
+      JSON.stringify({
+        ...rec,
+        ...(pidStart ? { pidStart } : {}),
+        ...(ownerStart ? { ownerStart } : {}),
+      }),
+    );
   } catch {
     /* custody is best-effort; never fail a turn over a pidfile */
   }
@@ -127,7 +155,12 @@ function alive(pid: number): boolean {
 }
 
 /** On Linux, does `/proc/<pid>` still belong to the command we spawned? Returns
- *  false when we can't read procfs (non-Linux) — the safe default is "don't kill". */
+ *  false when we can't read procfs (non-Linux) — the safe default is "don't kill".
+ *
+ *  NOTE: this is a WEAK check and must never be the only one guarding a SIGKILL.
+ *  `rec.cmd` is a basename, and for the Claude Agent-SDK rail the command we
+ *  spawn is the node executable, so it is literally "node" — matched by every
+ *  node process on the host. `startMatches()` is the authoritative guard. */
 function cmdlineMatches(pid: number, cmd: string): boolean {
   try {
     const raw = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
@@ -135,6 +168,39 @@ function cmdlineMatches(pid: number, cmd: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Linux `/proc/<pid>/stat` field 22: the tick at which the process started. Two
+ *  processes with the same pid at different times cannot share it, so it is the
+ *  only reliable identity check available after the parent has died. Mirrors
+ *  `processStart()` in src/activities/agent-slots.ts. */
+function processStart(pid: number | undefined): string | undefined {
+  if (!pid || pid <= 0 || process.platform !== 'linux') return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // The comm field may itself contain spaces/parens; split after the LAST ')'.
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    return afterComm[19]; // the array begins at field 3, so index 19 is field 22
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Is `pid` still the very process the record was written for?
+ *
+ * `recorded === undefined` (a pre-start-tick record, or a non-Linux host) is
+ * treated as NOT verified. That is the conservative direction on purpose: an
+ * unverifiable record can only cost us a leaked, already-dead pidfile for one
+ * boot, whereas guessing "yes" reintroduces exactly the incident this guards —
+ * SIGKILLing a whole process group belonging to some unrelated recycled pid.
+ * The custodyId sweep is unaffected: it matches an exact inherited marker in
+ * `/proc/<pid>/environ`, so genuine descendants are still reaped precisely.
+ */
+function startMatches(pid: number, recorded: string | undefined): boolean {
+  if (!recorded) return false;
+  const now = processStart(pid);
+  return now !== undefined && now === recorded;
 }
 
 /** Exact custody ids inherited by a process. Linux procfs is the recovery
@@ -189,13 +255,24 @@ function signalCustody(custodyId: string | undefined, signal: NodeJS.Signals): n
 
 /** Is the karmax process that spawned this agent still alive? A live owner means
  *  the record is NOT an orphan — another running app instance is mid-turn on it.
- *  PID-reuse guard: the owner's pid may have been recycled after a reboot, so on
- *  Linux require its cmdline to still look like a Node process (karmax always
- *  runs under node/tsx). Where we can't verify (no procfs), a live pid counts as
- *  a live owner — better to leak a true orphan for one boot than to SIGKILL an
- *  in-flight agent turn. */
-function ownerAlive(owner: number | undefined): boolean {
+ *
+ *  PID-reuse guard, mirrored from the kill path: when the record carries an
+ *  `ownerStart`, the live pid must ALSO have that exact start tick, otherwise the
+ *  owner is a recycled stranger and the record is a genuine orphan (previously a
+ *  recycled owner pid running any node process made an orphan permanently
+ *  unreapable). Without a recorded tick we fall back to the old cmdline heuristic
+ *  and, failing that, treat a live pid as a live owner — the conservative
+ *  direction HERE is the opposite of the kill path's: leaking a true orphan for
+ *  one boot beats SIGKILLing another instance's in-flight agent turn. */
+function ownerAlive(rec: Pick<AgentRecord, 'owner' | 'ownerStart'>): boolean {
+  const owner = rec.owner;
   if (!owner || owner <= 1 || !alive(owner)) return false;
+  const recorded = rec.ownerStart;
+  if (recorded) {
+    const now = processStart(owner);
+    // `undefined` = procfs unreadable ⇒ unverifiable ⇒ assume the owner is live.
+    return now === undefined || now === recorded;
+  }
   try {
     return fs.readFileSync(`/proc/${owner}/cmdline`, 'utf8').includes('node');
   } catch {
@@ -297,7 +374,7 @@ export function reapOrphans(): { reaped: number; cleared: number; skipped: numbe
     } catch {
       /* corrupt/partial pidfile — just clear it below */
     }
-    if (rec && ownerAlive(rec.owner)) {
+    if (rec && ownerAlive(rec)) {
       // Not an orphan: the instance that spawned it is still running its turn.
       skipped++;
       continue;
@@ -309,9 +386,15 @@ export function reapOrphans(): { reaped: number; cleared: number; skipped: numbe
       // already be gone. The inherited marker still identifies the whole scope.
       killed = true;
     }
-    if (Number.isFinite(pid) && pid > 1 && alive(pid) && rec && cmdlineMatches(pid, rec.cmd)) {
-      // Compatibility/fallback for old records and descendants that scrubbed
-      // their environment. The live root + command check guards PID reuse.
+    if (
+      Number.isFinite(pid) && pid > 1 && rec && alive(pid)
+      // Authoritative PID-reuse guard: the pid must be the SAME process incarnation
+      // we recorded. Without this, `cmd === 'node'` (every Claude Agent-SDK record)
+      // let any recycled node pid's whole process group be SIGKILLed.
+      && startMatches(pid, rec.pidStart)
+      && cmdlineMatches(pid, rec.cmd)
+    ) {
+      // Compatibility/fallback for descendants that scrubbed their environment.
       killProcessGroup(pid, 'SIGKILL');
       killed = true;
     }

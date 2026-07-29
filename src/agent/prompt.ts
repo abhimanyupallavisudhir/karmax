@@ -11,6 +11,28 @@ import { agentRoleDef, manifest } from '../contrib/manifests.js';
  * from the content store (skills/memory) — represented inline for v1.
  */
 
+/**
+ * This preamble is sent to EVERY agent regardless of provider, so it may only
+ * name tools every rail actually registers — otherwise an agent is told to call
+ * something that does not exist on its harness.
+ *
+ * Two families keep that promise:
+ *   · durable platform tools (task list, wiki, vault, `platform_request`) —
+ *     served by the gateway-backed `karmax` stdio MCP, or in-process as function
+ *     tools on the raw-API rails;
+ *   · TURN-LOCAL controls (`create_review_info`, `signal_completion`,
+ *     `create_sub_task`, `raise_to_parent`, `confirm_decision`, …) — they mutate
+ *     the running activity's result, so each rail hosts them itself; see the rail
+ *     table in `control-bridge.ts`.
+ *
+ * The second family is the one that silently went missing on the Codex
+ * app-server / `codex exec` / ACP rails, which made the Resolve and Confirm
+ * gates structurally unreachable on a Codex subscription or OpenCode while this
+ * text still advertised them. `tests/agent-control-tools.test.ts` now asserts
+ * every rail registers all ten, so this preamble stays honest by construction —
+ * if you add a rail, add it to that table-driven test rather than trimming text
+ * here.
+ */
 const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
 - create_sub_task(title, prompt): spawn a child task the parent awaits.
 - create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically.

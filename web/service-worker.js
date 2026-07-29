@@ -1,4 +1,4 @@
-// Installation support without caching authenticated Krmax data or stale app
+// Installation support without caching authenticated krmax data or stale app
 // code. Every request remains network-first and the browser owns normal HTTP
 // caching; offline task mutation would be misleading for a live control plane.
 self.addEventListener('install', () => self.skipWaiting());

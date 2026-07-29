@@ -29,6 +29,11 @@ export interface PlatformToolContext {
   waitForSubtasks(): void;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void;
+  /** Do-agent ONLY: partition this task's change across another branch, checked
+   *  out beside the current one and landed as its own pull request (SPEC §11.1).
+   *  Performed immediately so the agent can work in it during the SAME turn; the
+   *  updated world handle rides back on the turn result for the workflow to adopt. */
+  addCheckout(spec: import('../world/types.js').WorldCheckoutSpec): Promise<{ name: string; root: string; branch: string }>;
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */
@@ -186,6 +191,10 @@ export interface TurnResult {
    *  a deliberately-left-running background process (e.g. a dev server) can't wedge it. */
   pendingBackgroundShells?: number;
   skills?: { name: string; content: string }[];
+  /** The world handle after any branch the agent added this turn (SPEC §11.1).
+   *  Present only when it changed, so a workflow version that predates multi-PR
+   *  — and every turn that added nothing — is untouched. */
+  worldHandle?: import('../world/types.js').WorldHandle;
   needsInput?: boolean;
   /** Absolute count of conversation messages the turn delivered (see AdapterTurn.delivered). */
   delivered?: number;

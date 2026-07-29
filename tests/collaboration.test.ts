@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import { BrowserDeliveryAdapter, DeliveryDispatcher } from '../src/collaboration/delivery.js';
 
 describe('organization and collaboration domain', () => {
   it('migrates installation records into a personal organization', () => {
@@ -293,5 +294,37 @@ describe('organization and collaboration domain', () => {
     expect(store.kvGet(`wfpin:${project.id}:software-dev`)).toBeUndefined();
     expect(store.db.prepare('SELECT projectId, taskId, worldId, metadata FROM usage_events').get())
       .toMatchObject({ projectId: null, taskId: null, worldId: null, metadata: null });
+  });
+});
+
+describe('DeliveryDispatcher error handling', () => {
+  it('never leaks an unhandled rejection from its drain loop', async () => {
+    // `drain()` CAN reject: claimDelivery() runs outside the per-item try (it is
+    // the claim transaction itself) and rethrows after ROLLBACK. Both call sites
+    // used a bare `void`, so a locked/corrupt database became an unhandled
+    // rejection — a process-level failure for a retryable projection.
+    const store = new Store(':memory:');
+    const boom = new Error('database is locked');
+    (store as any).claimDelivery = () => { throw boom; };
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    const errors: unknown[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args);
+    try {
+      const dispatcher = new DeliveryDispatcher(store, { browser: new BrowserDeliveryAdapter() }, undefined, 1);
+      dispatcher.start();
+      await new Promise((r) => setTimeout(r, 20));
+      dispatcher.stop();
+      // Give any pending microtask rejection a chance to surface.
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      console.error = consoleError;
+      process.off('unhandledRejection', onRejection);
+    }
+    expect(rejections).toHaveLength(0);
+    expect(errors.length).toBeGreaterThan(0); // the failure is reported, not swallowed
   });
 });

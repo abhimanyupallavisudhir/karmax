@@ -215,6 +215,67 @@ describe('process-tree custody', () => {
     expect(isAlive(pid)).toBe(true);
   });
 
+  // The Claude Agent-SDK rail spawns `node`, so `rec.cmd` is literally "node" and
+  // the cmdline check passes for ANY node process that happens to inherit the pid.
+  // Only the /proc start tick (field 22) actually identifies a process (this is the
+  // same primitive src/activities/agent-slots.ts already uses for lease owners).
+  const linuxOnly = process.platform === 'linux' ? it : it.skip;
+
+  linuxOnly('reapOrphans does NOT kill a recycled pid whose start tick differs (cmdline alone is not enough)', async () => {
+    const pid = spawnDetachedSleep();
+    // `cmd` deliberately MATCHES the live process (as "node" always would for the
+    // Agent-SDK rail) while the recorded start tick does not: this is exactly a
+    // recycled pid now owned by an unrelated process.
+    custody.registerAgent({ pid, cmd: 'sleep', owner: await deadOwnerPid(), startedAt: Date.now() });
+    const file = path.join(agentsDir(), `${pid}.json`);
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(rec.pidStart).toBeTruthy(); // registerAgent stamps it
+    fs.writeFileSync(file, JSON.stringify({ ...rec, pidStart: String(Number(rec.pidStart) + 12345) }));
+
+    const result = custody.reapOrphans();
+    expect(result.reaped).toBe(0);
+    expect(isAlive(pid)).toBe(true); // the innocent bystander survives
+    expect(fs.existsSync(file)).toBe(false); // stale record still cleared
+  });
+
+  linuxOnly('reapOrphans still kills a genuine orphan whose start tick matches', async () => {
+    const pid = spawnDetachedSleep();
+    custody.registerAgent({ pid, cmd: 'sleep', owner: await deadOwnerPid(), startedAt: Date.now() });
+    const result = custody.reapOrphans();
+    expect(result.reaped).toBe(1);
+    expect(await waitDead(pid)).toBe(true);
+  });
+
+  linuxOnly('reapOrphans treats a RECYCLED owner pid as dead, so a real orphan stays reapable', async () => {
+    const pid = spawnDetachedSleep();
+    // owner = this live node process, but with a start tick from a different
+    // incarnation: the pid was recycled, so this is NOT a live karmax instance and
+    // the record must not be spared forever.
+    custody.registerAgent({ pid, cmd: 'sleep', owner: process.pid, startedAt: Date.now() });
+    const file = path.join(agentsDir(), `${pid}.json`);
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(rec.ownerStart).toBeTruthy();
+    fs.writeFileSync(file, JSON.stringify({ ...rec, ownerStart: String(Number(rec.ownerStart) + 12345) }));
+
+    const result = custody.reapOrphans();
+    expect(result.skipped).toBe(0);
+    expect(result.reaped).toBe(1);
+    expect(await waitDead(pid)).toBe(true);
+  });
+
+  linuxOnly('reapOrphans refuses to group-kill a legacy record that carries no start tick', async () => {
+    const pid = spawnDetachedSleep();
+    custody.registerAgent({ pid, cmd: 'sleep', owner: await deadOwnerPid(), startedAt: Date.now() });
+    const file = path.join(agentsDir(), `${pid}.json`);
+    const { pidStart: _drop, ...legacy } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify(legacy)); // a record written before this fix
+
+    const result = custody.reapOrphans();
+    expect(result.reaped).toBe(0); // unverifiable ⇒ leak the record rather than kill a bystander
+    expect(isAlive(pid)).toBe(true);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
   it('reapOrphans on an empty/absent dir is a harmless no-op', () => {
     const result = custody.reapOrphans();
     expect(result).toEqual({ reaped: 0, cleared: 0, skipped: 0 });

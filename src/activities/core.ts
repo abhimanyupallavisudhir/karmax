@@ -223,6 +223,9 @@ export interface CreateWorldArgs {
   branch?: string;
   resetBranch?: boolean;
   copyGlobs?: string[];
+  /** Multi-PR task: nest the checkouts so branches added later have somewhere
+   *  to live inside the world boundary (SPEC §11.1). */
+  multiPr?: boolean;
   kind: WorldKind;
   /** The project's git profile selection (PLAN-git-config.md §3); the activity
    *  resolves it (project → global default) and materializes identity/signing. */
@@ -699,6 +702,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           repo: worldSources.length === 1 ? worldSources[0] : undefined,
           repos: worldSources.length > 1 ? worldSources : undefined,
           scratch: developmentSources.length === 0,
+          ...(args.multiPr ? { layout: 'nested' as const } : {}),
           base: args.base,
           target: args.target,
           branch: args.branch,
@@ -756,7 +760,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
       } catch (error) {
-        await destroyWorldServices(args.taskId).catch(() => undefined);
+        // `world` is still live on this path — pass it, or teardown addresses the
+        // HOST daemon while the containers live inside the world (a silent no-op).
+        await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
         throw error;
@@ -1610,6 +1616,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         );
       }
 
+      // A branch the agent added with `create_branch` exists on disk now, but the
+      // DURABLE handle is what merge, the PR stage and check-in re-open the world
+      // from — so persist it here as well as returning it for the workflow to
+      // adopt. Recorded before the turn result is consumed, so a checkout can
+      // never be live on disk yet invisible to the stages that must land it.
+      if (result.worldHandle?.repos?.length) {
+        try {
+          store.updateWorldCheckouts(args.worldHandle, result.worldHandle.repos);
+          record(args.taskId, 'world.checkout_added', {
+            checkouts: result.worldHandle.repos.map((repo) => ({ name: repo.name, branch: repo.branch, base: repo.base })),
+          });
+        } catch (error) {
+          // A stale generation means this turn's world was already replaced; the
+          // branch belongs to a world nobody will merge, so say so rather than
+          // failing a turn whose actual work succeeded.
+          record(args.taskId, 'world.checkout_orphaned', { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       if (result.skills?.length) {
         for (const s of result.skills) record(args.taskId, 'skill.saved', { name: s.name });
       }
@@ -1715,9 +1740,49 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // impossible; any history that regresses from baseline-pass to candidate-fail
       // blocks the merge.
       if (!deps.client) return { passed: false, detail: 'tests passed, but replay compatibility could not run: no Temporal client' };
-      const candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
-      if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
+
+      // INTENDED: the replay gate applies only to a repo that actually carries a
+      // karmax workflow bundle. `propose_workflow_edit` also targets external
+      // workflow *package* repos, which declare their own entrypoint and have no
+      // `src/workflows/index.ts` — blocking those for a "missing bundle" made the
+      // package flow unusable. Probe INSIDE the world so the answer is identical
+      // on a remote sandbox, where the host cannot see the world's files at all.
+      const bundleRel = path.posix.join('src', 'workflows', 'index.ts');
+      const hasBundle = (await world.exec('bash', ['-lc', `test -f ${bundleRel} && echo yes || echo no`])).stdout.includes('yes');
+      if (!hasBundle) {
+        record(args.taskId, 'checks.replay', { skipped: 'repo carries no karmax workflow bundle' });
+        return { passed: true, detail: 'tests passed; replay gate does not apply (this repo carries no karmax workflow bundle)' };
+      }
+
+      // The Temporal replay bundler needs a real HOST filesystem tree. A remote
+      // world's `root` is a path inside the provider sandbox, so `fs` on it always
+      // missed and every hosted workflow edit failed the gate with a misleading
+      // "bundle is missing". Mirror the candidate sources out in ONE exec (a
+      // per-file download over the provider API is hundreds of round-trips) and
+      // borrow the running install's node_modules for module resolution.
+      let mirror: string | undefined;
+      let candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
+      if (isRemote(args.worldHandle.kind)) {
+        mirror = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-replay-'));
+        const packed = await world.exec('bash', ['-lc', 'tar czf - src package.json | base64 -w0'], { timeoutMs: 5 * 60_000 });
+        if (packed.code !== 0) {
+          fs.rmSync(mirror, { recursive: true, force: true });
+          return { passed: false, detail: `tests passed, but the candidate sources could not be read from the remote world: ${(packed.stderr || packed.stdout).slice(-400)}` };
+        }
+        fs.writeFileSync(path.join(mirror, 'src.tgz'), Buffer.from(packed.stdout.trim(), 'base64'));
+        try {
+          await pexec('tar', ['xzf', 'src.tgz'], { cwd: mirror });
+        } catch (e) {
+          fs.rmSync(mirror, { recursive: true, force: true });
+          return { passed: false, detail: `tests passed, but the candidate sources could not be unpacked: ${(e instanceof Error ? e.message : String(e)).slice(-400)}` };
+        }
+        // Symlink rather than install: the candidate is a karmax checkout, so the
+        // running install's dependencies are exactly the ones its imports resolve to.
+        fs.symlinkSync(fileURLToPath(new URL('../../node_modules', import.meta.url)), path.join(mirror, 'node_modules'));
+        candidatePath = path.join(mirror, 'src', 'workflows', 'index.ts');
+      }
       try {
+        if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
         const histories: Array<{ workflowId: string; history: unknown }> = [];
         for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
           histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
@@ -1752,7 +1817,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
       } catch (e) {
         return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
+      } finally {
+        if (mirror) fs.rmSync(mirror, { recursive: true, force: true });
       }
+    },
+
+    /**
+     * Head commit of every checkout in the world, keyed by checkout name.
+     *
+     * Review approval for a multi-PR task is bound to `(checkout, head sha)`
+     * (PLAN-multi-pr.md §3), so the gate needs the heads to tell an approval that
+     * still stands from one the Do agent has since invalidated. A branch whose
+     * head cannot be read is simply absent, which the domain helpers treat as
+     * unapproved — the gate fails closed rather than passing by omission.
+     */
+    async checkoutHeads(handle: WorldHandle): Promise<Record<string, string>> {
+      const world = await openWorld(handle);
+      const heads: Record<string, string> = {};
+      for (const repo of worldRepos(world.handle)) {
+        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root }).catch(() => undefined);
+        if (head?.code === 0 && head.stdout.trim()) heads[repo.name] = head.stdout.trim();
+      }
+      return heads;
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
@@ -1829,7 +1915,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const opened: TaskPullRequest[] = [];
       for (const { repo, slug, api } of targets) {
-        const base = worldRepoTarget(repo, target);
+        // A checkout whose base is a SIBLING's branch is a stacked pull request:
+        // open it against that branch so GitHub renders the stack and its diff
+        // shows only this branch's own change, not the base's as well.
+        const stacked = repos.some((other) => other !== repo && other.branch === repo.base);
+        const base = stacked ? repo.base : worldRepoTarget(repo, target);
         // karmax's own model lets a worktree stay dirty until the merge stage
         // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
         // here with nothing committed is a state the design produces. GitHub
@@ -1845,7 +1935,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const { pr, created } = await api.openOrUpdate(slug, {
           head: repo.branch, base,
-          title: details.title?.trim() || `karmax: ${repo.branch}`,
+          // With several branches in flight the task title alone names none of
+          // them; say which pull request this one is.
+          title: repos.length > 1
+            ? `${details.title?.trim() || 'karmax'} (${repo.name})`
+            : details.title?.trim() || `karmax: ${repo.branch}`,
           body: prBody(handle, details, store.getTask(handle.id)?.num, repos.length > 1 ? repo.name : undefined),
         });
         const ref: TaskPullRequest = { repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged };

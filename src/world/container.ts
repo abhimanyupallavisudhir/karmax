@@ -2,10 +2,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
+import { World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { addCheckoutViaExec } from './checkout.js';
 import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
-import { openSpawnedPty, startSpawnedProcess } from './local-execution.js';
+import { boundedResponseBody } from './http.js';
+import { openSpawnedPty, runLocalCommand, startSpawnedProcess } from './local-execution.js';
 
 const pexec = promisify(execFile);
 const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22-slim';
@@ -49,6 +51,12 @@ export async function dockerAvailable(): Promise<boolean> {
 export class ContainerWorldProvider implements WorldProvider {
   readonly kind = 'container' as const;
   readonly parkable = true;
+  /** Declared (rather than left undefined) so `/api/meta`'s worldProviders has
+   * one shape for every provider. `remote: false` is load-bearing: it is what
+   * tells runner accounting, world access, and the Git broker that this world's
+   * checkout lives on the host. Ports are served through the container's own
+   * IP (see `fetchPort`), not a published host port. */
+  readonly capabilities = { remote: false, pty: true, snapshots: false, ports: true, networkPolicy: false } as const;
   private worktrees: WorktreeProvider;
 
   constructor(home = paths().worlds) {
@@ -72,7 +80,12 @@ export class ContainerWorldProvider implements WorldProvider {
       await base.destroy();
       throw new Error(`failed to start container: ${run.stderr}`);
     }
-    const handle: WorldHandle = { ...base.handle, kind: 'container', meta: { container: name, image } };
+    // Keep the worktree's meta: it carries `ephemeralPaths` (copyGlobs and
+    // materialized resources), which checkpointing reads to tell inputs apart
+    // from project data. Spreading `base.handle` and then overwriting `meta`
+    // wholesale silently dropped them.
+    const handle: WorldHandle = { ...base.handle, kind: 'container',
+      meta: { ...base.handle.meta, container: name, image } };
     return new ContainerWorld(handle);
   }
 
@@ -116,10 +129,56 @@ class ContainerWorld implements World {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const inner = [cmd, ...args].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
     const dArgs = ['exec'];
+    // `-i` keeps the container process's stdin attached to ours so a secret can
+    // be piped in instead of passed through argv/env, where every co-resident
+    // process could read it out of /proc (the vault's fillInWorld relies on
+    // this channel). Without it the helper just gets EOF.
+    if (opts.input !== undefined) dArgs.push('-i');
     dArgs.push('-w', this.containerCwdFromAny(opts.cwd ?? worldWorkingDirectory(this.handle)));
     for (const [k, v] of Object.entries(opts.env ?? {})) dArgs.push('-e', `${k}=${v}`);
     dArgs.push(this.name, 'bash', '-lc', inner);
+    if (opts.input !== undefined)
+      return runLocalCommand('docker', dArgs, { timeoutMs: opts.timeoutMs, input: opts.input });
     return docker(dArgs, { timeoutMs: opts.timeoutMs });
+  }
+
+  /**
+   * A container world's `localhost:<port>` is inside the container's network
+   * namespace — the host's port of the same number belongs to something else
+   * entirely. `docker run` publishes no ports (the port an agent picks is not
+   * known at create time), so previews are proxied through the container's own
+   * bridge IP, which the host can route to directly on Linux. On Docker Desktop
+   * (macOS/Windows) the container network is not routable from the host and the
+   * connection fails with a clear error rather than a wrong page.
+   */
+  async fetchPort(port: number, requestPath: string, request: WorldHttpRequest = { method: 'GET' }): Promise<WorldHttpResponse> {
+    const host = await this.containerAddress(port);
+    const safePath = requestPath.startsWith('/') ? requestPath : `/${requestPath}`;
+    const method = request.method.toUpperCase();
+    const response = await fetch(`http://${host}:${port}${safePath}`, {
+      method,
+      ...(request.headers ? { headers: request.headers } : {}),
+      ...(!['GET', 'HEAD'].includes(method) && request.body?.length ? { body: request.body } : {}),
+      redirect: 'manual',
+    });
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => { headers[key] = value; });
+    return { status: response.status, headers, body: await boundedResponseBody(response) };
+  }
+
+  async previewSocketTarget(port: number, requestPath: string) {
+    const host = await this.containerAddress(port);
+    const safePath = requestPath.startsWith('/') ? requestPath : `/${requestPath}`;
+    return { url: `ws://${host}:${port}${safePath}` };
+  }
+
+  private async containerAddress(port: number): Promise<string> {
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('invalid preview port');
+    const inspected = await docker(['inspect', '-f',
+      '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}', this.name], { timeoutMs: 10_000 });
+    const address = inspected.stdout.trim().split(/\s+/).find((value) => /^\d+\.\d+\.\d+\.\d+$/.test(value));
+    if (!address) throw new Error('container world has no routable address for previews');
+    return address;
   }
   // file ops use the host bind-mount (fast, and visible inside the container)
   async readFile(rel: string): Promise<string> {
@@ -164,6 +223,12 @@ class ContainerWorld implements World {
     if (fs.existsSync(this.handle.root)) walk(this.handle.root, '');
     return out;
   }
+  /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
+   *  here are real clones, so this is one `git worktree add` run in place. */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    return addCheckoutViaExec(this, spec);
+  }
+
   async destroy(): Promise<void> {
     await docker(['rm', '-f', this.name]);
     const { git } = await import('./git.js');

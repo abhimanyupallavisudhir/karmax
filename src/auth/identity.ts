@@ -43,7 +43,15 @@ function secretFor(dbFile: string, supplied?: string): string {
   if (supplied) return supplied;
   if (dbFile === ':memory:') return crypto.randomBytes(32).toString('base64url');
   const file = `${dbFile}.secret`;
-  try { return fs.readFileSync(file, 'utf8').trim(); } catch { /* first boot */ }
+  try {
+    return fs.readFileSync(file, 'utf8').trim();
+  } catch (error) {
+    // ONLY "the file isn't there" means first boot. Treating every read error as
+    // first boot meant a transient EACCES/EIO regenerated the signing secret,
+    // silently invalidating every live session and every outstanding password
+    // reset / email verification link — and then overwrote the real secret.
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const value = crypto.randomBytes(32).toString('base64url');
   fs.writeFileSync(file, `${value}\n`, { mode: 0o600 });
@@ -70,6 +78,16 @@ export class IdentityService {
   private constructor(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string;
     oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] } } = {}) {
     this.db = new DatabaseSync(dbFile);
+    // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
+    // runs the gateway, the worker and every activity in one process, so a
+    // concurrent writer must wait rather than fail with SQLITE_BUSY.
+    if (dbFile !== ':memory:') {
+      try {
+        this.db.exec('PRAGMA journal_mode=WAL');
+        this.db.exec('PRAGMA busy_timeout=5000');
+        this.db.exec('PRAGMA synchronous=NORMAL');
+      } catch { /* a read-only or non-file database keeps its defaults */ }
+    }
     this.oidcProviderId = opts.oidc?.providerId;
     this.auth = betterAuth({
       appName: 'krmax',
@@ -111,6 +129,16 @@ export class IdentityService {
         },
       },
       session: { expiresIn: 60 * 60 * 24 * 14, updateAge: 60 * 60 * 24 },
+      // Better Auth defaults `rateLimit.enabled` to `isProduction`, and karmax
+      // never sets NODE_ENV=production — so sign-in, password reset and email
+      // verification were unthrottled in EVERY deployment, hosted included.
+      // Enable it explicitly; the stricter per-path rules Better Auth ships for
+      // the credential endpoints then apply on top of this window.
+      // In-memory storage (the default) is right here: karmax runs the gateway,
+      // the worker and every activity in ONE process, and `storage: 'database'`
+      // additionally needs a rateLimit table whose schema Better Auth and
+      // node:sqlite disagree about (bigint vs number).
+      rateLimit: { enabled: true, window: 60, max: 100 },
       plugins: [admin({ defaultRole: 'user', adminRoles: ['admin'] }),
         ...(opts.oidc ? [genericOAuth({ config: [{ providerId: opts.oidc.providerId,
           discoveryUrl: opts.oidc.discoveryUrl, issuer: opts.oidc.issuer, clientId: opts.oidc.clientId,
@@ -177,7 +205,16 @@ export class IdentityService {
     if (this.hasUsers()) throw new Error('krmax has already been set up');
     const response = await this.auth.api.signUpEmail({ body: input, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
-    const user = this.listUsers()[0];
+    // Promote the account this call actually created, resolved by its own email —
+    // NOT `listUsers()[0]`. `hasUsers()` above is a TOCTOU check, so two
+    // concurrent bootstrap POSTs both create an account and both used to promote
+    // whichever row sorted first: requester B got a valid session and an
+    // "you are the administrator" response while holding role `user`, and A was
+    // silently promoted twice.
+    const created = (await response.clone().json().catch(() => ({})) as any)?.user as { id?: string } | undefined;
+    const email = input.email.trim().toLowerCase();
+    const user = this.listUsers().find((candidate) => (created?.id ? candidate.id === created.id
+      : String(candidate.email).toLowerCase() === email));
     if (!user) throw new Error('account creation did not persist');
     this.db.prepare("UPDATE user SET role = 'admin' WHERE id = ?").run(user.id);
     return { response, user: { ...user, role: 'admin' } };

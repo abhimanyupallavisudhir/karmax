@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -61,6 +62,84 @@ export interface GitHubAppOptions {
   apiBase?: string;
   fetch?: typeof fetch;
   keyPair?: () => Promise<{ privateKey: string; publicKey: string }>;
+  /** Injectable delay for rate-limit/5xx backoff (tests pass a no-op). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** At most 10,000 repositories per installation — a ceiling on a remote-driven
+ *  pagination loop, not a real limit anyone will reach. */
+const MAX_REPOSITORY_PAGES = 100;
+/** Extra attempts after the first for a retryable GitHub response. */
+const MAX_REQUEST_RETRIES = 3;
+/** Never sleep longer than this on GitHub's say-so, whatever it asks for. */
+const MAX_RETRY_WAIT_MS = 60_000;
+/**
+ * Methods whose 5xx may be retried.
+ *
+ * A 5xx says "something went wrong", NOT "nothing happened" — GitHub may have
+ * applied the write and then failed to answer (or the connection dropped after
+ * it did). So the set is exactly the methods where applying the same request
+ * twice leaves the same state:
+ *  - GET/HEAD: read-only.
+ *  - PUT `/user/installations/:id/repositories/:repo` — the only PUT karmax
+ *    sends; it SETS membership of a fixed repository in a fixed installation
+ *    (204, no body, no id minted), so a repeat is a no-op. Genuinely idempotent,
+ *    not merely idempotent-by-RFC.
+ *  - DELETE `/repos/:o/:r/keys/:id` — the only DELETE karmax sends; it names an
+ *    already-existing resource, so a repeat either deletes it or 404s, and every
+ *    caller (`deleteDeployKey`) already tolerates that 404. GitHub does not
+ *    recycle key ids, so a retry cannot hit a different key.
+ * POST is deliberately absent: `POST /repos/:o/:r/keys` MINTS a resource, and
+ * retrying it after a processed-then-5xx create enrolls a SECOND write-capable
+ * deploy key whose id karmax never records — orphaned at GitHub with write
+ * access forever, because `removeOrphanDeployKeys` only sweeps repositories with
+ * no local record at all. Do not "improve reliability" by widening this set: a
+ * failed write must surface so the caller can decide, and the callers here are
+ * either idempotent themselves (`ensureRepository`, `ensureDeployKeys`) or
+ * redelivered by GitHub. PATCH is absent for the same reason.
+ */
+const RETRYABLE_5XX_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
+/**
+ * Retry budget for work driven by an inbound webhook. GitHub abandons a delivery
+ * after ~10 s, so a `retry-after: 60` honoured three times would hold the HTTP
+ * response open for minutes that nobody is listening to — and `reconcile` makes
+ * many requests. Past the budget the error surfaces, the gateway answers 5xx, the
+ * delivery claim is released, and GitHub redelivers: the retry still happens, on
+ * GitHub's clock instead of inside our request handler.
+ */
+const WEBHOOK_RETRY_BUDGET_MS = 8_000;
+/** Epoch ms after which the ambient caller refuses to keep sleeping, if any. */
+const retryDeadline = new AsyncLocalStorage<number>();
+
+/**
+ * How long to wait before retrying a failed GitHub response, or `undefined` if
+ * the failure is not retryable.
+ *
+ * Order matters: `retry-after` (secondary rate limit / abuse detection) is
+ * GitHub's explicit instruction and wins; then a primary rate limit, recognised
+ * by `x-ratelimit-remaining: 0` plus an `x-ratelimit-reset` epoch-SECONDS
+ * timestamp; then plain 5xx, which gets exponential-ish backoff.
+ *
+ * Rate limits are retryable for EVERY method: GitHub rejects a limited request
+ * before executing it, so no side effect happened. 5xx is retryable only for
+ * `RETRYABLE_5XX_METHODS` — see there.
+ */
+function retryDelayMs(response: Response, attempt = 0, method = 'GET'): number | undefined {
+  const clamp = (ms: number) => Math.min(MAX_RETRY_WAIT_MS, Math.max(0, ms));
+  const rateLimited = response.status === 403 || response.status === 429;
+  const replayable = rateLimited || RETRYABLE_5XX_METHODS.has(method);
+  const retryAfter = Number(response.headers.get('retry-after'));
+  if (replayable && Number.isFinite(retryAfter) && response.headers.get('retry-after')) return clamp(retryAfter * 1000);
+  if (rateLimited) {
+    const remaining = response.headers.get('x-ratelimit-remaining');
+    const reset = Number(response.headers.get('x-ratelimit-reset'));
+    if (remaining === '0' && Number.isFinite(reset) && reset > 0) return clamp(reset * 1000 - Date.now());
+    // A 403 that is NOT a rate limit is a permissions error — never retry it.
+    if (response.status === 429) return clamp(1000);
+    return undefined;
+  }
+  if (response.status >= 500 && RETRYABLE_5XX_METHODS.has(method)) return clamp(1000 * 2 ** attempt);
+  return undefined;
 }
 
 /** Organization-owned GitHub App integration. App and deploy-key secrets live
@@ -69,6 +148,8 @@ export class GitHubAppService {
   private fetcher: typeof fetch;
   private apiBase: string;
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
+  /** In-flight token mints, keyed by connection — collapses concurrent callers. */
+  private tokenMints = new Map<string, Promise<string>>();
   private keyPair: () => Promise<{ privateKey: string; publicKey: string }>;
 
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
@@ -223,10 +304,17 @@ export class GitHubAppService {
   async reconcile(connection: GitConnection): Promise<Repository[]> {
     const token = await this.installationToken(connection);
     const remote: GitHubRepositoryPayload[] = [];
-    for (let page = 1; ; page++) {
+    // A page ceiling, and a shape check. The loop had neither: a `for (;;)` over
+    // a paginated endpoint is an unbounded remote-controlled loop, and a response
+    // missing `repositories` threw a bare `TypeError: not iterable` that told the
+    // operator nothing. 100 pages = 10,000 repositories, far beyond any real
+    // installation.
+    for (let page = 1; page <= MAX_REPOSITORY_PAGES; page++) {
       const response = await this.request<{ repositories: GitHubRepositoryPayload[] }>(
         `/installation/repositories?per_page=100&page=${page}`, token,
       );
+      if (!Array.isArray(response?.repositories))
+        throw new Error('GitHub /installation/repositories returned no repository list');
       remote.push(...response.repositories);
       if (response.repositories.length < 100) break;
     }
@@ -249,7 +337,26 @@ export class GitHubAppService {
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
   Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[] }> {
     if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
+    // The delivery id is CLAIMED here (so two concurrent copies of one delivery
+    // cannot both reconcile) but the claim is provisional: `dispatchWebhook` does
+    // unbounded network I/O, and if that throws the claim must be released. It
+    // used to be permanent — the exception became a gateway error, GitHub
+    // redelivered, and the redelivery short-circuited as a duplicate, losing the
+    // reconcile forever.
     if (!this.store.recordGithubDelivery(deliveryId, event)) return { accepted: false };
+    try {
+      // Bounded retry budget: this call is inside GitHub's ~10 s delivery
+      // timeout, so a long backoff must fail fast and let GitHub redeliver
+      // rather than hold the response open (see WEBHOOK_RETRY_BUDGET_MS).
+      return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw));
+    } catch (error) {
+      this.store.releaseGithubDelivery(deliveryId);
+      throw error;
+    }
+  }
+
+  private async dispatchWebhook(event: string, raw: Buffer):
+  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[] }> {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
@@ -261,6 +368,21 @@ export class GitHubAppService {
         accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() });
       this.tokenCache.delete(saved.id);
       return { accepted: true, reconciled: 0 };
+    }
+    // The inverse transition. Without it `suspendedAt` was write-only: the ONLY
+    // path that ever cleared it was the browser install callback, so an
+    // `installation.unsuspend` fell through to `reconcile()` →
+    // `installationToken()` → "installation is suspended", and the connection
+    // stayed dead until someone reinstalled the App by hand. `created` is here for
+    // the same reason — a reinstall of a previously-suspended installation.
+    if (event === 'installation' && (payload.action === 'unsuspend' || payload.action === 'created')) {
+      const saved = this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
+        accountLogin: payload.installation?.account?.login ?? connection.accountLogin,
+        accountType: payload.installation?.account?.type ?? connection.accountType ?? undefined,
+        suspendedAt: undefined });
+      this.tokenCache.delete(saved.id);
+      const repositories = await this.reconcile(saved);
+      return { accepted: true, reconciled: repositories.length };
     }
     if (event === 'pull_request' || event === 'pull_request_review') {
       // The PR lifecycle karmax itself started: correlated back to its task so
@@ -286,16 +408,38 @@ export class GitHubAppService {
     return project?.organizationId === organizationId;
   }
 
+  /**
+   * Mint (or reuse) an installation token.
+   *
+   * Three things this deliberately gets right:
+   *  - the SUSPENDED check runs before the cache read, so a connection suspended
+   *    while a valid token was cached stops working immediately rather than
+   *    keeping GitHub access for up to an hour;
+   *  - a malformed `expires_at` yields `NaN`, and every `NaN > x` comparison is
+   *    false — so the cache silently never hit and karmax minted a fresh token on
+   *    every single call. An unparseable expiry now falls back to GitHub's
+   *    documented one-hour lifetime (minus the same safety margin);
+   *  - concurrent callers share ONE in-flight mint instead of racing N of them
+   *    (each mint invalidates nothing, but N round trips per burst is pure waste
+   *    and counts against the App's rate limit).
+   */
   async installationToken(connection: GitConnection): Promise<string> {
+    if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
     const cached = this.tokenCache.get(connection.id);
     if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
-    if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
-    const created = await this.appRequest<{ token: string; expires_at: string }>(
-      `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`, { method: 'POST' },
-    );
-    const value = { token: created.token, expiresAt: Date.parse(created.expires_at) };
-    this.tokenCache.set(connection.id, value);
-    return value.token;
+    const inFlight = this.tokenMints.get(connection.id);
+    if (inFlight) return inFlight;
+    const mint = (async () => {
+      const created = await this.appRequest<{ token: string; expires_at: string }>(
+        `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`, { method: 'POST' },
+      );
+      const parsed = Date.parse(created.expires_at ?? '');
+      const expiresAt = Number.isFinite(parsed) ? parsed : Date.now() + 3600_000;
+      this.tokenCache.set(connection.id, { token: created.token, expiresAt });
+      return created.token;
+    })().finally(() => this.tokenMints.delete(connection.id));
+    this.tokenMints.set(connection.id, mint);
+    return mint;
   }
 
   /** Read-only material is for provisioning; write material is broker-only. */
@@ -402,16 +546,26 @@ export class GitHubAppService {
 
   /** Remove every repository-scoped key Karmax installed for a tenant. Failure
    * is surfaced so organization deletion can be retried instead of orphaning a
-   * write-capable deploy key in GitHub. */
+   * write-capable deploy key in GitHub.
+   *
+   * A SUSPENDED (or deleted) installation is the exception: `installationToken`
+   * refuses to mint for one, so minting unconditionally whenever repositories
+   * existed made every retry of an organization delete fail identically —
+   * permanently blocking deletion, the opposite of what the paragraph above
+   * promises. GitHub has already revoked the installation's access in that case,
+   * so its deploy keys are inert; skip the remote deletes and still clean up the
+   * local broker handles, which are the part karmax actually owns. */
   async disconnectOrganization(organizationId: string): Promise<void> {
     for (const connection of this.store.listGitConnections(organizationId)) {
       const repositories = this.store.listRepositories(organizationId).filter((repo) => repo.gitConnectionId === connection.id);
-      const token = repositories.length ? await this.installationToken(connection) : undefined;
+      const token = repositories.length && !connection.suspendedAt ? await this.installationToken(connection) : undefined;
       for (const repository of repositories) {
         const keys = this.store.repositoryDeployKeys(repository.id);
         if (!keys) continue;
-        await this.deleteDeployKey(repository, keys.cloneKeyId, token!);
-        await this.deleteDeployKey(repository, keys.writeKeyId, token!);
+        if (token) {
+          await this.deleteDeployKey(repository, keys.cloneKeyId, token);
+          await this.deleteDeployKey(repository, keys.writeKeyId, token);
+        }
         this.broker.deleteHandle(keys.cloneHandle);
         this.broker.deleteHandle(keys.writeHandle);
       }
@@ -419,8 +573,24 @@ export class GitHubAppService {
     }
   }
 
+  /**
+   * Enroll this repository's isolated clone/write deploy keys, exactly once.
+   *
+   * Both keys are created at GitHub before anything durable is written, so a
+   * crash in the middle leaves keys GitHub knows about and karmax does not — and
+   * the next reconcile, seeing no local record, mints two more. The `catch` below
+   * covers an *error* (it deletes what it created), but not a process death.
+   *
+   * The durable mitigation is here: before creating anything, sweep GitHub's
+   * existing keys for karmax's own deterministic titles and delete the orphans.
+   * `karmax clone <repositoryId>` / `karmax broker <repositoryId>` are unique per
+   * repository and only ever written by this method, so a key bearing one with no
+   * local record can only be such an orphan. Best-effort — a listing failure must
+   * not block enrollment.
+   */
   private async ensureDeployKeys(repository: Repository, installationToken: string): Promise<void> {
     if (this.store.repositoryDeployKeys(repository.id)) return;
+    await this.removeOrphanDeployKeys(repository, installationToken);
     const clone = await this.keyPair();
     const write = await this.keyPair();
     let cloneKeyId: string | undefined;
@@ -449,6 +619,21 @@ export class GitHubAppService {
       this.broker.deleteHandle(writeHandle);
       throw error;
     }
+  }
+
+  /** Delete deploy keys GitHub still has under karmax's own titles for a
+   *  repository karmax has no local record for (see `ensureDeployKeys`). */
+  private async removeOrphanDeployKeys(repository: Repository, installationToken: string): Promise<void> {
+    const titles = new Set([`karmax clone ${repository.id}`, `karmax broker ${repository.id}`]);
+    try {
+      const existing = await this.request<Array<{ id: number | string; title?: string }>>(
+        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/keys?per_page=100`,
+        installationToken);
+      if (!Array.isArray(existing)) return;
+      for (const key of existing) {
+        if (key?.title && titles.has(key.title)) await this.deleteDeployKey(repository, String(key.id), installationToken);
+      }
+    } catch { /* listing is a best-effort cleanup; never block enrollment */ }
   }
 
   private async removeRepository(repository: Repository, installationToken: string): Promise<void> {
@@ -502,14 +687,45 @@ export class GitHubAppService {
     return this.request(pathname, this.appJwt(), init);
   }
 
+  /** Injectable so tests do not actually wait out a rate-limit backoff. */
+  private sleep(ms: number): Promise<void> {
+    return this.options.sleep ? this.options.sleep(ms) : new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * One GitHub API call, with the two retries the API's own contract asks for.
+   *
+   * Neither existed before: a secondary rate limit (403/429 with `retry-after`, or
+   * a primary limit with `x-ratelimit-remaining: 0` and `x-ratelimit-reset`) was
+   * turned straight into an exception, and a transient 5xx failed the whole
+   * reconcile/PR operation. Both are explicitly retryable, and GitHub tells us
+   * exactly how long to wait — honouring that is politer AND more reliable than
+   * failing and being redelivered.
+   *
+   * Deliberately bounded and conservative: at most `MAX_REQUEST_RETRIES` attempts,
+   * each wait capped at `MAX_RETRY_WAIT_MS`, and only for conditions that cannot
+   * duplicate a side effect — rate limits (rejected before execution) on any
+   * method, and 5xx only on `RETRYABLE_5XX_METHODS`. A 5xx on a POST/PATCH is
+   * raised, because GitHub may have applied it; so is a 4xx that is not a rate
+   * limit. An ambient `retryDeadline` (the webhook path) can cut the budget short.
+   */
   private async request<T = unknown>(pathname: string, token: string, init: RequestInit = {}): Promise<T> {
-    const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
-      accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
-      'x-github-api-version': '2022-11-28', 'content-type': 'application/json', ...(init.headers ?? {}),
-    } });
-    if (!response.ok) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 500)}`);
-    if (response.status === 204) return undefined as T;
-    return await response.json() as T;
+    const method = (init.method ?? 'GET').toUpperCase();
+    for (let attempt = 0; ; attempt++) {
+      const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
+        accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
+        'x-github-api-version': '2022-11-28', 'content-type': 'application/json', ...(init.headers ?? {}),
+      } });
+      if (response.ok) {
+        if (response.status === 204) return undefined as T;
+        return await response.json() as T;
+      }
+      let waitMs = attempt < MAX_REQUEST_RETRIES ? retryDelayMs(response, attempt, method) : undefined;
+      const deadline = retryDeadline.getStore();
+      if (waitMs !== undefined && deadline !== undefined && Date.now() + waitMs > deadline) waitMs = undefined;
+      if (waitMs === undefined) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 500)}`);
+      await this.sleep(waitMs);
+    }
   }
 
   private saveUserToken(userId: string, value: any): void {

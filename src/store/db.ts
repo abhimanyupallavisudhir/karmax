@@ -78,6 +78,37 @@ export interface CollaborationRequest {
 const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
 
 /**
+ * Statuses after which `agent.output` rows may be pruned (`saveView`).
+ *
+ * Deliberately NOT `failed`, for the same reason `AUTO_ARCHIVE_STATUS` above is
+ * not: a failed task is the one a human actually has to read. Pruning is only safe
+ * because the full agent text has already been written into the view/transcripts —
+ * and that premise fails exactly here. `src/platform/reconcile.ts` synthesizes a
+ * `failed` view for any task whose Temporal execution died, so a boot-time
+ * reconcile after a crash used to wipe the streamed output of every task that was
+ * mid-flight, destroying the only record of what the agent was doing when it broke.
+ */
+const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
+
+/**
+ * Does an event type mean "a human is being asked to look at this"? Such events
+ * are routed to the review audience as an ACTIONABLE inbox item (`routeInbox`).
+ *
+ * Event types are dotted `namespace.action` paths (`software-dev.review-requested`,
+ * `github.pr.review`, `review.built`), so the test is on a whole SEGMENT: a
+ * segment that is `review` or begins `review-`/`review_`.
+ *
+ * The old test was `ev.type.includes('review')` — a substring match on an open
+ * vocabulary. Every `preview.*` type contains "review", as would any type a
+ * workflow package chose to declare, so unrelated lifecycle noise arrived in
+ * reviewers' inboxes flagged as work they had to act on. Segment matching keeps
+ * every real review event and drops `preview.active`, `world.preview-created`
+ * and friends.
+ */
+export const isReviewEvent = (type: string): boolean =>
+  type.split('.').some((segment) => segment === 'review' || /^review[-_]/.test(segment));
+
+/**
  * The metadata index. Temporal holds the authoritative live workflow state;
  * this store is the searchable index of projects/lists/tasks/profiles plus an
  * append-only event log that powers the live UI stream.
@@ -108,9 +139,16 @@ export class Store {
     // projects silently lose general internet access even though the current
     // organization default is unrestricted. Match the complete legacy tuple so
     // a deliberately customized project policy is never mistaken for a default.
+    // Every JSON.parse below is guarded and every write is conditional. This runs
+    // on EVERY boot, so one malformed row (a truncated write, a hand-edited value)
+    // would otherwise throw out of the constructor and make the install
+    // unbootable — a migration that cannot skip a row it does not understand is a
+    // liveness bug, not a correctness one. The vault loop already worked this way.
     const projects = this.db.prepare('SELECT id, config FROM projects').all() as Array<{ id: string; config: string }>;
     for (const row of projects) {
-      const config = JSON.parse(row.config) as Record<string, any>;
+      let config: Record<string, any>;
+      try { config = JSON.parse(row.config) as Record<string, any>; } catch { continue; }
+      if (!config || typeof config !== 'object') continue;
       const resources = config.resources;
       const network = config.network;
       const environment = config.environment;
@@ -136,7 +174,10 @@ export class Store {
     // match the new "no limit unless you set one" behavior.
     const rows = this.db.prepare("SELECT id, json FROM profiles WHERE id LIKE '%-default'").all() as any[];
     for (const r of rows) {
-      const p = JSON.parse(r.json);
+      let p: any;
+      try { p = JSON.parse(r.json); } catch { continue; }
+      if (!p || typeof p !== 'object') continue;
+      let profileChanged = false;
       const legacyDoCapabilities = ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'];
       const modernDoCapabilities = [
         ...legacyDoCapabilities, 'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
@@ -146,6 +187,7 @@ export class Store {
         && p.capabilities.length === legacyDoCapabilities.length
         && legacyDoCapabilities.every((capability) => p.capabilities.includes(capability))) {
         p.capabilities = modernDoCapabilities;
+        profileChanged = true;
       }
       // Direct cross-world file inspection was replaced by durable Git handoff.
       // Migrate existing profiles so the removed capability does not strand their
@@ -153,11 +195,15 @@ export class Store {
       if (Array.isArray(p.capabilities) && p.capabilities.includes('task:world:read')) {
         p.capabilities = [...new Set(p.capabilities.filter((capability: string) => capability !== 'task:world:read')
           .concat(['task:git:publish', 'task:git:import']))];
+        profileChanged = true;
       }
       if (p.maxTurns !== undefined) {
         delete p.maxTurns;
+        profileChanged = true;
       }
-      this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id);
+      // Only write when something actually changed: an unconditional UPDATE
+      // rewrote every role-default profile row on every boot.
+      if (profileChanged) this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id);
     }
 
     // Older `pass`-connector mirrors stored `domains` as the entry's TOP FOLDER
@@ -640,12 +686,23 @@ export class Store {
     }
   }
 
-  /** Next task number within a project: MAX(num)+1 scoped to that project. */
-  private nextTaskNum(projectId: string): number {
-    return (
-      (this.db.prepare('SELECT COALESCE(MAX(num), 0) AS m FROM tasks WHERE projectId = ?').get(projectId) as any)
-        .m as number
-    ) + 1;
+  /**
+   * Allocate a task's per-project number atomically.
+   *
+   * A single UPDATE whose value is a MAX+1 subquery: SQLite evaluates it under
+   * the statement's write lock, so two Store instances queuing into the same
+   * database cannot read the same maximum. The read-then-insert version this
+   * replaced computed MAX+1 in JS outside any transaction and could hand two
+   * tasks the same number — which the `idx_tasks_num_project` unique index then
+   * turns into a hard insert failure. `clearDraft` has always used this form;
+   * this is the same statement, so the two allocation paths cannot diverge.
+   */
+  private allocateTaskNum(projectId: string, taskId: string): number | undefined {
+    this.db.prepare(`UPDATE tasks SET num = (
+      SELECT COALESCE(MAX(num), 0) + 1 FROM tasks WHERE projectId = ?
+    ) WHERE id = ? AND num IS NULL`).run(projectId, taskId);
+    const row = this.db.prepare('SELECT num FROM tasks WHERE id = ?').get(taskId) as any;
+    return row?.num == null ? undefined : Number(row.num);
   }
 
   // ─── Projects ──────────────────────────────────────────────────────────────
@@ -1526,6 +1583,10 @@ export class Store {
     return this.db.prepare('SELECT * FROM repository_deploy_keys WHERE repositoryId=?').get(repositoryId) as any;
   }
 
+  /** Claim a webhook delivery id. `false` ⇒ already consumed (a duplicate). The
+   *  claim is provisional: a handler that fails must `releaseGithubDelivery` so
+   *  GitHub's redelivery is not discarded as a duplicate. Rows age out via
+   *  `retentionSweep`. */
   recordGithubDelivery(deliveryId: string, event: string): boolean {
     const info = this.db.prepare('INSERT OR IGNORE INTO github_webhook_deliveries (deliveryId, event, receivedAt) VALUES (?, ?, ?)')
       .run(deliveryId, event, Date.now());
@@ -1788,8 +1849,10 @@ export class Store {
       attemptNumber,
       // Alternate attempts share the root's number. A new logical task receives
       // its number now only when it is being created directly into the queue;
-      // drafts receive one in clearDraft(), at their queue transition.
-      num: input.intentId || input.params.draft ? undefined : this.nextTaskNum(input.projectId),
+      // drafts receive one in clearDraft(), at their queue transition. The value
+      // is allocated by `allocateTaskNum` AFTER the insert so the allocation is a
+      // single atomic statement rather than a read-then-write race.
+      num: undefined,
       projectId: input.projectId,
       listId,
       title: input.title,
@@ -1832,6 +1895,7 @@ export class Store {
         jsonOrNull(t.delegate),
         jsonOrNull(t.confirmationPolicy),
       );
+    if (!input.intentId && !input.params.draft) t.num = this.allocateTaskNum(t.projectId, t.id);
     if (t.createdBy?.kind === 'user') this.subscribeTask(t.id, t.createdBy);
     if (t.assignee) this.subscribeTask(t.id, t.assignee);
     if (!input.intentId) {
@@ -1974,18 +2038,24 @@ export class Store {
   }
 
   /** Tasks currently armed on a trigger (stored-not-started), across all projects.
-   *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3). */
+   *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3).
+   *
+   *  Filtered in SQL. The predicate used to run in JS over `SELECT *` across the
+   *  WHOLE tasks table, hydrating every row — including every full `lastView`
+   *  transcript — at every boot, to find the handful of armed rows. */
   listArmedTasks(): TaskRecord[] {
-    return (this.db.prepare('SELECT * FROM tasks ORDER BY createdAt').all() as any[])
-      .map(rowToTask)
-      .filter((t) => t.params?.triggerState === 'armed');
+    return (this.db.prepare(`SELECT * FROM tasks
+      WHERE json_extract(params, '$.triggerState') = 'armed' ORDER BY createdAt`).all() as any[])
+      .map(rowToTask);
   }
 
-  /** Runs spawned from a series (repeatable template), newest first. */
+  /** Runs spawned from a series (repeatable template), newest first.
+   *  Filtered in SQL — this is reachable unpaginated from an HTTP request, so the
+   *  old whole-table scan + JS filter was a per-request full transcript hydration. */
   runsOf(seriesId: string): TaskRecord[] {
-    return (this.db.prepare('SELECT * FROM tasks ORDER BY createdAt DESC').all() as any[])
-      .map(rowToTask)
-      .filter((t) => t.params?.runOf === seriesId);
+    return (this.db.prepare(`SELECT * FROM tasks
+      WHERE json_extract(params, '$.runOf') = ? ORDER BY createdAt DESC`).all(seriesId) as any[])
+      .map(rowToTask);
   }
 
   childTasks(parentTaskId: string): TaskRecord[] {
@@ -2042,6 +2112,13 @@ export class Store {
     if (prev && resolvedNow && !prev.params?.archived) {
       this.updateTaskParams(taskId, { ...prev.params, archived: true });
     }
+    // Retention: a task that has just settled will never stream live output again,
+    // so its per-chunk `agent.output` rows (the biggest driver of `events` growth)
+    // have no remaining reader — the full agent text is in the view/transcripts
+    // this call just wrote. Fire on the TRANSITION only, so a later view re-save of
+    // an already-finished task is not a repeated delete over the same rows.
+    const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
+    if (settledNow) this.pruneAgentOutput(taskId);
   }
 
   reorderTask(taskId: string, ord: number) {
@@ -2132,11 +2209,32 @@ export class Store {
       this.saveView(taskId, { taskId, title: prior.title, workflow: prior.workflow, stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: { deletedDraft: true }, updatedAt: Date.now() });
       return;
     }
-    this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
-    this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId);
-    this.db.prepare('DELETE FROM task_subscribers WHERE taskId = ?').run(taskId);
-    this.db.prepare('DELETE FROM inbox WHERE taskId = ?').run(taskId);
-    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+    // One transaction, and the SAME table set `deleteProject` clears. Five loose
+    // deletes left a half-erased task behind on any failure, and four tables were
+    // missed outright: `task_confirmation` / `confirmation_votes` /
+    // `collaboration_requests` / `world_instances` kept rows for a task that no
+    // longer exists, and `delivery_outbox` rows were orphaned by the `inbox`
+    // delete — permanently unclaimable, because `claimDelivery` inner-joins
+    // `inbox`, so each one sat in the outbox forever.
+    const inboxIds = (this.db.prepare('SELECT id FROM inbox WHERE taskId = ?').all(taskId) as any[])
+      .map((row) => String(row.id));
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
+      this.db.prepare('DELETE FROM inbox WHERE taskId = ?').run(taskId);
+      this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
+      this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId);
+      this.db.prepare('DELETE FROM task_subscribers WHERE taskId = ?').run(taskId);
+      this.db.prepare('DELETE FROM task_confirmation WHERE taskId = ?').run(taskId);
+      this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId);
+      this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId);
+      this.db.prepare('DELETE FROM world_instances WHERE worldId = ?').run(taskId);
+      this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     if (prior?.intentId) {
       const left = this.attemptsOf(prior.intentId);
       if (!left.length) this.db.prepare('DELETE FROM task_intents WHERE id = ?').run(prior.intentId);
@@ -2387,7 +2485,7 @@ export class Store {
       // remain a deterministic resolver for automated/delegated tasks.
       for (const member of this.listOrganizationMemberships(project.organizationId))
         if (member.role === 'owner') users.push(member.userId);
-    } else if (ev.type.includes('review') || (ev.type === 'view.updated' && (ev.payload.status === 'waiting' || ev.payload.stage === 'review'))) {
+    } else if (isReviewEvent(ev.type) || (ev.type === 'view.updated' && (ev.payload.status === 'waiting' || ev.payload.stage === 'review'))) {
       kind = 'review-requested'; actionable = true; users = this.reviewAudience(task);
     } else if (ev.type.includes('escalat') || ev.payload.waitingFor === 'human') {
       kind = 'escalated'; actionable = true;
@@ -2462,12 +2560,15 @@ export class Store {
       (this.db.prepare(`SELECT ${column} value, COUNT(*) count FROM ${table} GROUP BY ${column}`).all() as any[])
         .map((row) => [String(row.value), Number(row.count)]),
     );
-    const tasks: Record<string, number> = {};
-    for (const row of this.db.prepare('SELECT lastView FROM tasks').all() as any[]) {
-      let status = 'setup';
-      try { status = String(JSON.parse(row.lastView ?? '{}').status ?? 'setup'); } catch {}
-      tasks[status] = (tasks[status] ?? 0) + 1;
-    }
+    // Count statuses inside SQLite. Selecting `lastView` and JSON.parsing it in
+    // Node allocated every task's FULL transcript just to read one string — the
+    // exact pattern `listTaskSummaries` documents as having pushed a few hundred
+    // tasks past 1 GiB RSS — and this runs on every Prometheus scrape (15 s by
+    // default), i.e. continuously.
+    const tasks: Record<string, number> = Object.fromEntries(
+      (this.db.prepare(`SELECT COALESCE(json_extract(lastView, '$.status'), 'setup') s, COUNT(*) c
+        FROM tasks GROUP BY s`).all() as any[]).map((row) => [String(row.s), Number(row.c)]),
+    );
     const artifact = this.db.prepare('SELECT COUNT(*) count, COALESCE(SUM(bytes),0) bytes FROM promoted_artifacts').get() as any;
     const database = this.db.prepare('SELECT page_count * page_size bytes FROM pragma_page_count(), pragma_page_size()').get() as any;
     const latestEvent = this.db.prepare('SELECT COALESCE(MAX(seq),0) seq FROM events').get() as any;
@@ -3189,6 +3290,19 @@ export class Store {
     return next;
   }
 
+  /** Record a branch the Do agent added to this world (SPEC §11.1, multi-PR).
+   *  The durable handle is what every later activity re-opens the world from —
+   *  merge, PR, the terminal — so a checkout that exists on disk but not here
+   *  would simply not be merged or reviewed. */
+  updateWorldCheckouts(handle: WorldHandleRef, repos: NonNullable<WorldHandleRef['repos']>): WorldHandleRef {
+    const current = this.currentWorld(handle.id);
+    if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
+    const next = { ...current, repos };
+    this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), handle.id, handle.generation ?? 1);
+    return next;
+  }
+
   updateWorldMeta(handle: WorldHandleRef, patch: Record<string, unknown>): WorldHandleRef {
     const current = this.currentWorld(handle.id);
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
@@ -3689,6 +3803,13 @@ export class Store {
       .run(id, input.organizationId, input.projectId, input.taskId, input.cardId ?? null, input.amount,
         input.currency ?? 'usd', input.merchant ?? null, input.why ?? null, input.status,
         input.reason ?? null, input.shortfall ?? null, now, now, input.expiresAt ?? now + 30 * 60_000);
+    // The `spent:<taskId>` kv mirror below is DEAD in production: nothing reads
+    // it — `paymentSpent` recomputes the sum from `payment_spend_requests` on
+    // every call, as it must (authorizations expire on a clock). It is retained
+    // only because tests/payments.test.ts asserts on it; removing the write and
+    // that assertion together is a one-line follow-up owned by whoever owns that
+    // test file. `deleteProjectKv` already sweeps the key on task deletion, so it
+    // does not leak beyond a task's lifetime.
     if (input.status === 'authorized') this.kvSet(`spent:${input.taskId}`, String(this.paymentSpent(input.taskId)));
     return this.getPaymentSpendRequest(id);
   }
@@ -3721,7 +3842,7 @@ export class Store {
         patch.resolvedBy ?? current.resolvedBy ?? null, patch.expiresAt ?? current.expiresAt,
         Date.now(), id);
     const updated = this.getPaymentSpendRequest(id);
-    this.kvSet(`spent:${current.taskId}`, String(this.paymentSpent(current.taskId)));
+    this.kvSet(`spent:${current.taskId}`, String(this.paymentSpent(current.taskId))); // see the note above
     return updated;
   }
   paymentSpent(taskId: string): number {
@@ -3849,6 +3970,45 @@ export class Store {
     return Number(this.db.prepare('DELETE FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now).changes);
   }
 
+  /** How long a GitHub delivery id stays in the dedupe table. GitHub retries a
+   *  failed delivery for at most ~24 h and the manual "Redeliver" button is a
+   *  deliberate act, so a week is generous while still bounding the table. */
+  static readonly GITHUB_DELIVERY_RETENTION_MS = 7 * 24 * 3600_000;
+
+  /** Age out consumed GitHub webhook delivery ids (unbounded growth otherwise:
+   *  one row per delivery, forever, and nothing ever deleted them). */
+  purgeGithubDeliveries(olderThanMs = Store.GITHUB_DELIVERY_RETENTION_MS, now = Date.now()): number {
+    return Number(this.db.prepare('DELETE FROM github_webhook_deliveries WHERE receivedAt <= ?')
+      .run(now - olderThanMs).changes);
+  }
+
+  /**
+   * The periodic retention sweep. Every sweep here is idempotent and bounded, so
+   * a caller can run it on any interval (hourly is plenty).
+   *
+   * This exists because `purgeScopedTokens` had ZERO call sites repo-wide —
+   * `scoped_tokens` accumulated every expired and revoked row forever, and the
+   * `idx_scoped_tokens_expiry` index existed purely for a sweep that never ran.
+   * `github_webhook_deliveries` had the same problem. Per-task `agent.output`
+   * pruning is NOT here: it is event-driven off `saveView` (a task settling), so
+   * it needs no timer.
+   *
+   * SEAM: the app boot (`src/main.ts`) is what must schedule this — e.g.
+   * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
+   */
+  retentionSweep(now = Date.now()): { scopedTokens: number; githubDeliveries: number } {
+    return {
+      scopedTokens: this.purgeScopedTokens(now),
+      githubDeliveries: this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now),
+    };
+  }
+
+  /** Undo a delivery claim so a GitHub redelivery is processed instead of being
+   *  short-circuited as a duplicate (see `recordGithubDelivery`). */
+  releaseGithubDelivery(deliveryId: string): void {
+    this.db.prepare('DELETE FROM github_webhook_deliveries WHERE deliveryId=?').run(deliveryId);
+  }
+
   kvGet(k: string): string | undefined {
     const r = this.db.prepare('SELECT v FROM kv WHERE k = ?').get(k) as any;
     return r?.v;
@@ -3917,13 +4077,30 @@ function selectRows(db: DatabaseSyncType, table: string, where: string, args: an
   return db.prepare(`SELECT * FROM ${table} WHERE ${where}`).all(...args) as any[];
 }
 
-function rowsFor(db: DatabaseSyncType, table: string, column: string, values: string[]): any[] {
-  if (!values.length) return [];
-  return selectRows(db, table, `${column} IN (${values.map(() => '?').join(',')})`, values);
+/**
+ * SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 32,766 — one placeholder per
+ * id means a project with more tasks than that makes `IN (...)` a hard error, so
+ * a big project could not be deleted at all. Chunk well under the limit.
+ */
+const SQL_VARIABLE_CHUNK = 900;
+
+function chunked<T>(values: T[], run: (chunk: T[]) => void): void {
+  for (let i = 0; i < values.length; i += SQL_VARIABLE_CHUNK) run(values.slice(i, i + SQL_VARIABLE_CHUNK));
 }
 
-function deleteRows(db: DatabaseSyncType, table: string, column: string, values: string[]): void {
-  if (values.length) db.prepare(`DELETE FROM ${table} WHERE ${column} IN (${values.map(() => '?').join(',')})`).run(...values);
+function rowsFor(db: DatabaseSyncType, table: string, column: string, values: string[]): any[] {
+  if (!values.length) return [];
+  const out: any[] = [];
+  chunked(values, (chunk) => {
+    out.push(...selectRows(db, table, `${column} IN (${chunk.map(() => '?').join(',')})`, chunk));
+  });
+  return out;
+}
+
+export function deleteRows(db: DatabaseSyncType, table: string, column: string, values: string[]): void {
+  chunked(values, (chunk) => {
+    db.prepare(`DELETE FROM ${table} WHERE ${column} IN (${chunk.map(() => '?').join(',')})`).run(...chunk);
+  });
 }
 
 function redactWorldHandle(value: string): Record<string, unknown> {

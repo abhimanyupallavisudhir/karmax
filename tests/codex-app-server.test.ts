@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { SDK_CONTROL_TOOL_NAMES } from '../src/agent/tools.js';
 
 const STUB = `#!/usr/bin/env node
 const fs = require('fs');
@@ -16,10 +17,19 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   else if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'thread-new' } } });
   else if (msg.method === 'thread/resume') send({ id: msg.id, result: { thread: { id: msg.params.threadId } } });
   else if (msg.method === 'thread/fork') send({ id: msg.id, result: { thread: { id: 'thread-forked' } } });
+  else if (msg.id === 5000) {
+    // Karmax answered our dynamic-tool call; now finish the turn.
+    send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+  }
   else if (msg.method === 'turn/start') {
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
     const mode = process.env.STUB_MODE || 'completed';
+    if (mode === 'tool') {
+      // A server→client request: the model called a karmax dynamic tool.
+      send({ id: 5000, method: 'item/tool/call', params: { callId: 'c1', tool: 'confirm_decision', arguments: { action: 'confirm' } } });
+      return;
+    }
     if (mode === 'exit') process.exit(0);
     else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
     else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
@@ -40,7 +50,7 @@ describe('CodexAdapter app-server security policy', () => {
     dir = undefined;
   });
 
-  async function run(session?: string, mode?: string, fork = false): Promise<any[]> {
+  async function run(session?: string, mode?: string, fork = false, ctx: any = {}): Promise<any[]> {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-app-server-'));
     const stub = path.join(dir, 'codex-stub.cjs');
     const requests = path.join(dir, 'requests.jsonl');
@@ -60,7 +70,7 @@ describe('CodexAdapter app-server security policy', () => {
         resolvedAuth: { configHome: dir },
         ...(session ? { session } : {}), ...(fork ? { fork: true } : {}),
       } as any,
-      { emit() {} } as any,
+      { emit() {}, emitActivity() {}, ...ctx } as any,
     );
     return fs.readFileSync(requests, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   }
@@ -74,6 +84,33 @@ describe('CodexAdapter app-server security policy', () => {
     expect(requests.find((r) => r.method === 'turn/start')?.params).toMatchObject({
       sandboxPolicy: { type: 'dangerFullAccess' },
       approvalPolicy: 'never',
+    });
+  });
+
+  /**
+   * The turn-local controls (confirm/resolve/review-info/…) mutate the running
+   * activity's result, so they are registered as app-server `dynamicTools` and
+   * executed here over `item/tool/call`. This used to happen only in a remote
+   * world, which left a plain Codex-subscription agent with no way to record a
+   * Review verdict at all.
+   */
+  it('registers the turn-local control tools on a LOCAL subscription thread', async () => {
+    const requests = await run();
+    const dynamic = requests.find((r) => r.method === 'thread/start')?.params?.dynamicTools ?? [];
+    expect(dynamic.map((t: any) => t.name).sort()).toEqual([...SDK_CONTROL_TOOL_NAMES].sort());
+    // Durable platform tools stay on the config home's gateway-backed `karmax` MCP.
+    expect(dynamic.map((t: any) => t.name)).not.toContain('platform_request');
+  });
+
+  it('executes a control tool call from a LOCAL thread into this turn’s result', async () => {
+    let decision: any;
+    const requests = await run(undefined, 'tool', false, { confirmDecision: (d: any) => { decision = d; } });
+    // The handler ran in this activity and produced the Review verdict…
+    expect(decision).toEqual({ action: 'confirm', text: undefined });
+    // …and the app-server got a successful tool result back.
+    expect(requests.find((r) => r.id === 5000)?.result).toMatchObject({
+      success: true,
+      contentItems: [{ type: 'inputText', text: 'confirm decision recorded: confirm' }],
     });
   });
 

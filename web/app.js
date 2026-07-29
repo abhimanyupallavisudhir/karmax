@@ -417,6 +417,19 @@ function installLinkRouter() {
   });
 }
 
+// `title` covers hover on desktop; this covers touch, where there is no hover.
+// Delegated because policyTip()'s markup is re-rendered constantly and app.js is
+// a module (an inline handler cannot see `toast`).
+function installInfoDotTips() {
+  document.addEventListener('click', (ev) => {
+    const dot = ev.target.closest('.info-dot');
+    if (!dot) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    toast(dot.getAttribute('title'));
+  });
+}
+
 // Tag chips are navigation everywhere they appear. Capture before row/form click
 // handlers so a chip never opens a task or mutates its tags as a side effect.
 function installTagRouter() {
@@ -765,9 +778,9 @@ function cfLayerHtml(f, layer, agentDefault) {
       <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
       <select class="cf-kind">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
       <span style="flex:1"></span>
-      <button type="button" class="btn sm cf-move" data-dir="-1" title="Move layer up">↑</button>
-      <button type="button" class="btn sm cf-move" data-dir="1" title="Move layer down">↓</button>
-      <button type="button" class="btn sm cf-del" title="Remove this layer">✕</button>
+      <button type="button" class="btn sm cf-move" data-dir="-1" title="Move this step up">↑</button>
+      <button type="button" class="btn sm cf-move" data-dir="1" title="Move this step down">↓</button>
+      <button type="button" class="btn sm cf-del" title="Remove this step">✕</button>
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
       <label class="form-row">Who confirms
@@ -792,8 +805,8 @@ function renderConfirmerField(f, own, inherited, alt) {
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
   return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
     <div class="cf-layers">${cfListHtml(f, layers, agentDefault)}</div>
-    <div class="cf-empty" style="font-size:12px;color:var(--ink-3);padding:2px 0;${layers.length ? 'display:none' : ''}">No layers — the task auto-confirms at Review.</div>
-    <button type="button" class="btn sm cf-add" style="margin-top:6px">+ Add layer</button>
+    <div class="cf-empty" style="font-size:12px;color:var(--ink-3);padding:2px 0;${layers.length ? 'display:none' : ''}">No reviewers — this task auto-confirms at Review.</div>
+    <button type="button" class="btn sm cf-add" style="margin-top:6px">+ Add a review step</button>
   </div>`;
 }
 
@@ -1678,9 +1691,19 @@ function toast(msg, err = false, action) {
     btn.textContent = action.label;
     btn.addEventListener('click', () => { t.remove(); action.fn(); });
     t.appendChild(btn);
+  } else if (err) {
+    // An error is often a form's only feedback and may need reading twice, so it
+    // dwells longer than a "Saved" and can be dismissed by hand.
+    const close = document.createElement('button');
+    close.className = 'toast-dismiss';
+    close.type = 'button';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.textContent = '×';
+    close.addEventListener('click', () => t.remove());
+    t.appendChild(close);
   }
   $('#toasts').appendChild(t);
-  setTimeout(() => t.remove(), action ? 6500 : 3200);
+  setTimeout(() => t.remove(), action ? 6500 : err ? 9000 : 3200);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -1751,6 +1774,7 @@ async function boot() {
   bindKeys();
   installLinkRouter();
   installTagRouter();
+  installInfoDotTips();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -2090,7 +2114,7 @@ function connectWs() {
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
     setWsOnline(true);
-    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.taskId) refreshTask().catch(() => {}); }
+    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
     wsHadDropped = false;
   };
   ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
@@ -2148,14 +2172,18 @@ function verificationBanner() {
   </div>`;
 }
 
+// One failure, one message: a network error and a rejecting server are the same
+// thing to the person clicking Resend.
+const EMAIL_SEND_FAILED = 'Couldn’t send the email. Outbound email may not be set up.';
+
 function wireVerificationBanner() {
   $('#verify-resend')?.addEventListener('click', async () => {
     const btn = $('#verify-resend'); btn.disabled = true;
     try {
       const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
-      toast(res.ok ? 'Confirmation email sent — check your inbox.' : 'Could not send — ask an operator to set up outbound email.', !res.ok);
-    } catch { toast('Could not send confirmation email', true); }
+      toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
+    } catch { toast(EMAIL_SEND_FAILED, true); }
     btn.disabled = false;
   });
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
@@ -3114,7 +3142,7 @@ function openFilterPicker(fieldKey, onAdd) {
     // Show the hierarchy as indented paths; picking one adds tag:<path>.
     const rows = S.tags.length
       ? S.tags.map((t) => `<div class="opt" data-val="${esc(tagPathStr(t.id))}">${esc(tagPathStr(t.id))}${t.kind ? ` <span class="pal-sub">${esc(t.kind)}</span>` : ''}</div>`).join('')
-      : `<div class="pal-empty">No tags yet — add some via 🏷 Tags.</div>`;
+      : `<div class="pal-empty">No tags yet. Create one with the 🏷 Tags button.</div>`;
     inner = rows;
   } else if (field.options) {
     inner = field.options.map((o) => `<div class="opt" data-val="${esc(o.value)}">${esc(o.label)}</div>`).join('');
@@ -3230,7 +3258,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     const s = sessions.get(t.id);
     if (!s) return `<div class="pk-empty">Loading agent sessions…</div>`;
     const roles = Object.keys(s);
-    if (!roles.length) return `<div class="pk-empty">No resumable agent sessions.</div>`;
+    if (!roles.length) return `<div class="pk-empty">No earlier agent to continue from — this will start fresh.</div>`;
     return roles
       .map((role) => `<div class="pick-row pk-session" data-nav data-task="${t.id}" data-role="${esc(role)}">
         <span class="pk-fork">⑂</span>
@@ -3746,7 +3774,10 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
               </span>
             </div>`;
           }).join('')
-          : '<span class="vault-grant-empty">No vault credentials are available.</span>'
+          // Name the section that actually exists: the vault lives under
+          // "Passwords & payments" (#settings-payments); there has never been a
+          // section named "Vault", which is where this used to send people.
+          : `<span class="vault-grant-empty">No vault items yet. Add one in <a data-spa href="${globalRoute('organization')}#settings-payments">Settings → Passwords &amp; payments</a>.</span>`
       }<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span></div>
     </div>
     <div class="vault-grant-actions">
@@ -3912,7 +3943,7 @@ async function openTaskForm(workflow, draft, seedText) {
               </button>
             </div>
             <div class="form-row" data-row="__creds">
-              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Agent logins</label></div>
+              <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Agent logins</label></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
@@ -3925,7 +3956,7 @@ async function openTaskForm(workflow, draft, seedText) {
       <div class="tf-foot">
         <div class="tf-foot-inner">
           <span class="tf-hint">Closing keeps your work as a draft</span>
-          <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
+          <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </footer>
@@ -4224,7 +4255,13 @@ async function openTaskForm(workflow, draft, seedText) {
       }
       }
       root.innerHTML = '';
-      toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
+      // Keep the toast in the button's vocabulary. Queuing an EXISTING draft used to
+      // say "Task created" — nothing was created, the task already existed, so the
+      // user could not tell whether they had just made a duplicate. The draft row's
+      // Queue button already toasts "Queued"; same action, same word.
+      toast(editInPlace
+        ? (draftMode ? 'Moved to drafts' : 'Saved')
+        : draftMode ? 'Draft saved' : draft ? 'Queued' : 'Task created');
       refreshTasks();
     } catch (e) { toast(e.message, true); }
   };
@@ -4300,7 +4337,7 @@ async function renderSeriesPage(rec) {
             <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
           </div>
           <details class="advanced" style="margin-top:10px">
-            <summary>Agent logins — precedence &amp; enable/disable</summary>
+            <summary>Agent logins — which accounts run this, in what order</summary>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
@@ -4364,7 +4401,7 @@ function taskAttempts(v) {
       <span class="status-dot ${esc(status)}"></span>
       <b>Attempt ${a.attemptNumber || 1}</b>
       ${principal ? '<span class="chip">principal</span>' : ''}
-      ${committed ? '<span class="chip done" title="Attempt has been irrevocably selected as the winner; sibling attempts will not be allowed to pass">jayadratha</span>' : ''}
+      ${committed ? '<span class="chip done" title="Selected to merge — the other attempts are stopped.">committed</span>' : ''}
       <span class="attempt-stage">${stageIndicator(a.params?.draft ? { ...av, state: { ...(av.state || {}), draft: true } } : av, a.id, true)}</span>
     </div>`;
   }).join('');
@@ -5235,7 +5272,11 @@ function bindTermScreen(out) {
 function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
+  // A multi-PR task has several checkouts in the one world, so check-in picks
+  // which branch to land in. It is just a cwd — no second world, and the remote
+  // case costs nothing extra for exactly that reason (SPEC §11.1).
+  const checkout = document.getElementById('term-checkout')?.value;
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}${checkout ? `&checkout=${encodeURIComponent(checkout)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -5312,7 +5353,29 @@ async function openArtifact(url, external) {
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
 }
+// Approve ONE branch of a multi-PR task. It records that this branch has been
+// reviewed at the commit it is on now; `confirm` still passes the gate.
+function wireCheckoutApprovals(v) {
+  document.querySelectorAll('[data-approve-checkout]').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const name = btn.getAttribute('data-approve-checkout');
+      btn.disabled = true;
+      try {
+        await api(`/api/tasks/${v.taskId}/signal`, {
+          method: 'POST',
+          body: JSON.stringify({ signal: 'approveCheckout', text: name }),
+        });
+        toast(`Approved ${name}`);
+      } catch (e) {
+        btn.disabled = false;
+        toast(e?.message || 'Could not approve that branch', true);
+      }
+    }),
+  );
+}
+
 function wireReviewActions(v) {
+  wireCheckoutApprovals(v);
   const wrap = document.getElementById('review-actions');
   if (!wrap) return;
   const out = document.getElementById('review-action-out');
@@ -5414,7 +5477,13 @@ async function wireResourceReview(v, force = false) {
   } catch (error) {
     if (!document.body.contains(wrap)) return;
     wrap.classList.remove('hidden');
-    wrap.innerHTML = `<div class="task-sub" style="color:var(--warn)">Could not inspect task resources: ${esc(error.message)}</div>`;
+    // Raw server text here told the user nothing they could act on; a retry is
+    // the only useful next step, so offer that (details stay in the tooltip).
+    wrap.innerHTML = `<div class="inline-form" style="color:var(--warn)"><span class="task-sub" title="${esc(error.message)}">Couldn’t load this task’s resources.</span><button class="btn sm" id="resource-review-retry">Retry</button></div>`;
+    wrap.querySelector('#resource-review-retry')?.addEventListener('click', () => {
+      resourceReviewCache.delete(v.taskId);
+      wireResourceReview(v, true);
+    });
   }
 }
 function setStopBtn(running, procId, taskId) {
@@ -5510,6 +5579,45 @@ function subTasksSection(v) {
 // ── the four task-page tabs ───────────────────────────────────────────────────
 // Overview: what the task IS and where it stands — pipeline, review, widgets,
 // sub-tasks, notes. Everything shown comes off the workflow's declared view.
+// The branches a multi-PR task is opening pull requests for (SPEC §11.1). Each is
+// its own reviewable unit, so each gets a row: where it lands, what it stacks on,
+// its pull request, and — at Review — an Approve button.
+//
+// Approving marks a branch as reviewed AT ITS CURRENT HEAD. That is what makes the
+// loop-back cheap: send a follow-up about one branch, and when the task comes back
+// from Do the ones the agent did not touch are still approved, so only the changed
+// work needs another look. Confirm remains the single act that passes the gate.
+function checkoutsSection(v) {
+  const checkouts = v.checkouts || [];
+  if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
+  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
+  const rows = checkouts.map((c) => {
+    const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
+    const pr = c.pr
+      ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
+           href="${esc(c.pr.url)}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
+      : '';
+    return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
+      <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
+      <b>${esc(c.name)}</b>
+      <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
+      <span style="color:var(--ink-3)">${esc(dest)}</span>
+      ${c.head ? `<span class="mono" style="color:var(--ink-3)">${esc(c.head.slice(0, 7))}</span>` : ''}
+      ${pr}
+      <span style="flex:1"></span>
+      ${atReview && !c.approved ? `<button class="btn sm" data-approve-checkout="${esc(c.name)}">Approve</button>` : ''}
+    </div>`;
+  }).join('');
+  const pending = checkouts.filter((c) => !c.approved).length;
+  return `<div class="section-h">Branches</div>
+    <div class="card checkout-list">
+      ${rows}
+      ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
+        ? `${pending} of ${checkouts.length} still to review — approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm approves the rest and passes Review.`
+        : 'Every branch approved. Confirm to pass Review.'}</div>` : ''}
+    </div>`;
+}
+
 function overviewTab(v) {
   const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
   // How the agent's turn reached Review. Current workflows use `finished` only after a
@@ -5550,6 +5658,7 @@ function overviewTab(v) {
     ${waiting}
     ${agentTurn}
     ${subtasks}
+    ${checkoutsSection(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${notesSection(v)}`;
@@ -5948,6 +6057,9 @@ function terminalPane(v) {
       ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
+      ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
+        ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
+      </select>` : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
     </div>
     <div class="ck-term">
@@ -5980,12 +6092,12 @@ async function openLocalCheckout(v) {
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">The task branch is the handoff boundary. Krmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    <p class="task-sub">The task branch is the handoff boundary. krmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
-    <p class="task-sub">Krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
+    <p class="task-sub">krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
     <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
   </div></div>`;
   host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
@@ -6012,7 +6124,7 @@ async function materializeLocalCheckout(v, session) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+    <p class="task-sub">krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
@@ -6057,7 +6169,7 @@ function parametersTab(v) {
     ${paramsSection(v)}
     ${authorizationSection(v)}
     <div class="section-h">Agent logins</div>
-    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
+    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Drag to reorder, toggle to disable — for this task only.</p>
     <div id="cred-editor-task">Loading…</div>`;
 }
 
@@ -6144,7 +6256,13 @@ function advancedTab(v) {
     <div class="section-h">Live events</div>
     <div class="events" id="tp-events"></div>
     <div class="section-h">Structured state (the view-model floor)</div>
-    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, world: { available: v.worldAvailable, provider: v.worldProvider, localPath: v.worldPath }, pr: v.pr }, null, 2))}</pre>`;
+    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn,
+      // `localPath` goes through localWorldPath() like every other host-path
+      // affordance. The gateway only strips `worldPath` for REMOTE handles, so a
+      // hosted deployment backed by worktree worlds (explicitly supported) was
+      // printing the karmax host's filesystem layout into a remote browser here —
+      // the one place a raw worldPath escaped the hostLocal() gate.
+      world: { available: v.worldAvailable, provider: v.worldProvider, localPath: localWorldPath(v) || undefined }, pr: v.pr }, null, 2))}</pre>`;
 }
 
 function renderDiff(d) {
@@ -6415,11 +6533,16 @@ function renderWidget(w) {
     case 'diff':
       return head + (d ? `<div class="diff">${renderDiff(d)}</div>` : empty(w.empty));
     case 'gauge': {
+      // Widget data comes from installed workflow packages (external git repos),
+      // so it is untrusted like every other branch here: escape it, and keep the
+      // inline width numeric so it cannot break out of the style attribute.
       const g = d || { value: 0, max: 0, pct: 0 };
-      return head + `<div class="wk-gauge" title="${g.value} / ${g.max}">
+      const pct = Math.max(0, Math.min(100, Number(g.pct) || 0));
+      const reading = `${esc(g.value)} / ${esc(g.max)}`;
+      return head + `<div class="wk-gauge" title="${reading}">
         <div class="wk-gauge-bar" style="background:var(--surface-2);border-radius:6px;height:10px;overflow:hidden">
-          <div style="width:${g.pct}%;height:100%;background:var(--accent,#5b8cff)"></div></div>
-        <div class="task-sub" style="color:var(--ink-3)">${g.max ? `${g.value} / ${g.max}` : 'n/a'}</div></div>`;
+          <div style="width:${pct}%;height:100%;background:var(--accent,#5b8cff)"></div></div>
+        <div class="task-sub" style="color:var(--ink-3)">${g.max ? reading : 'n/a'}</div></div>`;
     }
     default:
       return '';
@@ -6633,7 +6756,11 @@ function taskActions(v) {
   for (const a of simple) {
     const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
     const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
-    html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}${kbd}</button>`;
+    // `data-label` carries the bare label because the keyboard digit renders
+    // INSIDE the button: reading `textContent` yields "Confirm1", which fails
+    // actionToast's standard-verb match and produced "Confirm1 — done" instead
+    // of "Confirmed" on the most-used control in the app.
+    html += `<button class="btn ${cls}" data-act="${a.name}" data-label="${esc(a.label)}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -6644,16 +6771,29 @@ function taskActions(v) {
   return html;
 }
 
+/**
+ * One phrasing for "that action went through", used by the task footer, the command
+ * palette, and the action form — the three places the same action can be invoked.
+ *
+ * Past tense is chosen by the button's LABEL, not the signal name. Keying it off the
+ * signal meant a workflow that renames an action still got the generic wording:
+ * merge-only labels `confirm` "Approve & merge" and just-do labels it "Done", but
+ * both toasted "Confirmed", contradicting the button the user had just clicked.
+ */
+function actionToast(signal, label) {
+  const standard = { confirm: 'confirm', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const text = String(label || signal).trim();
+  return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
+}
+
 function wireActions(v) {
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
       try {
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
-        // Button → toast vocabulary must match (Confirm → Confirmed). Fall back to
-        // the button's own label so custom actions read naturally.
-        const done = { confirm: 'Confirmed', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
-        toast(done[act] || `${(btn.textContent || act).trim()} done`);
+        toast(actionToast(act, btn.dataset.label));
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
@@ -6755,11 +6895,29 @@ function summarize(p) {
 // Fetch the coordinator's authoritative queue order for every domain currently in
 // the merge stage, so the view reflects reorders immediately (the per-task polled
 // position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
+// Every merge-queue domain a task occupies. A multi-repo task takes ONE SLOT PER
+// REPO, so `mergeDomains` (plural) is authoritative; `mergeDomain` (singular) is
+// only ever its first, and is kept as a fallback for views published before the
+// plural existed.
+//
+// Keying the panel on the singular had two consequences. A multi-repo task
+// appeared in — and could be reordered within — only its first repo's queue. And
+// a MERGE-ONLY task, which publishes only the plural (src/workflows/merge-only.ts),
+// fell into the unnamed `''` group: it still rendered, but with no domain label,
+// no drag handle, no reorder buttons, and no coordinator order fetched for it, so
+// its position was whatever its last self-published number happened to say. Inert
+// but present is the worse failure of the two — nothing looks wrong.
+function taskMergeDomains(view) {
+  const state = view?.state || {};
+  if (Array.isArray(state.mergeDomains) && state.mergeDomains.length) return state.mergeDomains.filter(Boolean);
+  return state.mergeDomain ? [state.mergeDomain] : [];
+}
+
 async function seedQueue() {
   const projectId = S.projectId;
   const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
+  const domains = [...new Set(inMerge.flatMap((t) => taskMergeDomains(t.lastView)))];
   const orders = {};
   await Promise.all(
     domains.map(async (d) => {
@@ -6794,10 +6952,13 @@ function mergeQueueBadge(v) {
 
 // Rank a task within its domain: the leased (merging) task pins to the top, then the
 // coordinator's queue order when known, else the task's last-published position.
-function queueRank(t) {
+function queueRank(t, domain) {
   const v = t.lastView || {};
   if (v.state?.mergeGranted) return -1;
-  const ord = S.queueOrders[v.state?.mergeDomain];
+  // Rank within the domain being rendered — a task in several domains sits at a
+  // different position in each, so ranking it by its first one put it in the
+  // wrong place in every other queue.
+  const ord = S.queueOrders[domain ?? taskMergeDomains(v)[0]];
   if (ord) { const i = ord.queue.indexOf(t.id); return i < 0 ? 1e6 : i; }
   const p = v.mergeQueue?.position;
   return p > 0 ? p : 1e6 - 1;
@@ -6810,20 +6971,24 @@ function mergeQueuePanel() {
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
   for (const t of inMerge) {
-    const d = t.lastView?.state?.mergeDomain || '';
-    if (!groups.has(d)) groups.set(d, []);
-    groups.get(d).push(t);
+    // A task appears in EVERY domain it holds, because it really does occupy a
+    // slot in each. `''` keeps a task whose view predates domain publication
+    // visible rather than dropping it off the queue.
+    for (const d of taskMergeDomains(t.lastView).length ? taskMergeDomains(t.lastView) : ['']) {
+      if (!groups.has(d)) groups.set(d, []);
+      groups.get(d).push(t);
+    }
   }
   const multi = groups.size > 1;
   return [...groups.entries()]
     .map(([domain, tasks]) => {
-      tasks.sort((a, b) => queueRank(a) - queueRank(b));
+      tasks.sort((a, b) => queueRank(a, domain) - queueRank(b, domain));
       const rows = tasks
         .map((t) => {
           const v = t.lastView || {};
           const pos = v.mergeQueue?.position;
           const merging = !!v.state?.mergeGranted;
-          const canMove = !merging && !!v.state?.mergeDomain;
+          const canMove = !merging && !!domain;
           return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
         ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
@@ -6880,8 +7045,8 @@ function localQueue(domain) {
   const ord = S.queueOrders[domain];
   if (ord) return ord;
   const ids = S.tasks
-    .filter((t) => (t.lastView?.state?.mergeDomain || '') === domain && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
-    .sort((a, b) => queueRank(a) - queueRank(b))
+    .filter((t) => taskMergeDomains(t.lastView).includes(domain) && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
+    .sort((a, b) => queueRank(a, domain) - queueRank(b, domain))
     .map((t) => t.id);
   const seeded = { queue: ids };
   S.queueOrders[domain] = seeded;
@@ -7243,7 +7408,7 @@ async function renderDashboard() {
               </div>
             </div>`;
           }).join('')
-        : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`}`;
+        : `<div class="card" style="color:var(--ink-3)">No agent logins yet. Add one in Settings → Agent logins to spread turns across accounts.</div>`}`}`;
     const recheck = async (btn, body) => {
       const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
       try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
@@ -7717,13 +7882,32 @@ function textareaCaretXY(ta, pos) {
   return xy;
 }
 
+// Every wiring holds a window-level `resize` listener, and renders replace
+// innerHTML — so without this registry each re-rendered textarea (the task-page
+// follow-up box re-renders on every websocket push) left a listener behind that
+// retained the detached element forever. Each wiring lives on an AbortController
+// and is swept the next time anything is wired.
+const wikiMentionWirings = new Set();
+function sweepWikiMentionWirings() {
+  for (const wiring of wikiMentionWirings) {
+    if (wiring.ta.isConnected) continue;
+    wiring.close();          // the menu is a document.body child; don't orphan it
+    wiring.controller.abort();
+    wikiMentionWirings.delete(wiring);
+  }
+}
+
 function wireWikiMention(ta, projectId) {
   if (!ta || !projectId || ta.dataset.wmWired) return;
   ta.dataset.wmWired = '1';
+  sweepWikiMentionWirings();
+  const controller = new AbortController();
+  const { signal } = controller;
   const orgId = projectById(projectId)?.organizationId;
   let menu = null, items = [], active = 0, token = null, seq = 0;
 
   const close = () => { menu?.remove(); menu = null; items = []; token = null; };
+  wikiMentionWirings.add({ ta, controller, close });
   // The @-token immediately before the caret — only at the start or right after
   // whitespace (so `b@`, `\@`, `(@` don't trigger), and never inside an inline
   // code span (odd count of backticks before the @). Mirrors parseWikiRefs.
@@ -7798,8 +7982,8 @@ function wireWikiMention(ta, projectId) {
     render();
   };
 
-  ta.addEventListener('input', update);
-  ta.addEventListener('click', () => { if (!tokenAt()) close(); });
+  ta.addEventListener('input', update, { signal });
+  ta.addEventListener('click', () => { if (!tokenAt()) close(); }, { signal });
   // Registered before the box's own send/submit keydown, so while the menu is
   // open these keys drive it and stopImmediatePropagation keeps them from ALSO
   // reaching the ⌘/Ctrl-Enter send/submit or Esc-close-form handlers.
@@ -7810,9 +7994,12 @@ function wireWikiMention(ta, projectId) {
     else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); }
     else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); }
     else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
-  });
-  ta.addEventListener('blur', () => setTimeout(close, 150));
-  window.addEventListener('resize', close);
+  }, { signal });
+  ta.addEventListener('blur', () => setTimeout(close, 150), { signal });
+  window.addEventListener('resize', () => {
+    if (!ta.isConnected) return sweepWikiMentionWirings();
+    close();
+  }, { signal });
 }
 
 // ── the path-as-title control ────────────────────────────────────────────────
@@ -8058,7 +8245,7 @@ function settingsView(proj) {
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
       <button type="button" data-project-jump="project-secrets"><b>Secret</b><span>A sensitive value</span></button>
-      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files Krmax versions</span></button>
+      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files krmax versions</span></button>
       <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
     </div>
@@ -8066,7 +8253,7 @@ function settingsView(proj) {
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files Krmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files krmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
     <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
@@ -8099,6 +8286,14 @@ function cloudEnvironmentCard(proj) {
     <div id="project-execution">Loading organization execution policy…</div>
   </div>`;
 }
+// A settings pane that fails to load used to dead-end on bare server text. Say
+// plainly what happened, keep the raw detail on hover, and offer the one useful
+// next step.
+function paneError(box, error, retry) {
+  box.innerHTML = `<div class="inline-form"><span class="task-sub" style="color:var(--warn)" title="${esc(error?.message || '')}">Couldn’t load this section.</span><button type="button" class="btn sm">Retry</button></div>`;
+  box.querySelector('button').addEventListener('click', retry);
+}
+
 async function hydrateProjectGitProfile(proj) {
   const box = $('#project-git-profile'); if (!box) return;
   try {
@@ -8114,7 +8309,7 @@ async function hydrateProjectGitProfile(proj) {
       await api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`, { method: 'PUT', body: JSON.stringify({ values: current }) });
       toast('Git profile saved');
     });
-  } catch (error) { box.textContent = error.message; }
+  } catch (error) { paneError(box, error, () => hydrateProjectGitProfile(proj)); }
 }
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
@@ -8124,7 +8319,7 @@ async function hydrateProjectSecrets(proj) {
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
         <div class="project-form-grid">
-          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in Krmax.</small></label>
+          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in krmax.</small></label>
           <label class="form-row"><span>Value</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"><small class="field-help">Encrypted immediately and never returned by the API.</small></label>
           <label class="form-row wide"><span>Deliver as a private file <small>(optional)</small></span><input id="project-secret-file" placeholder=".secrets/service-account.json"><small class="field-help">Leave blank to inject it as an environment variable with the name above. File secrets are mode 0600 and privately Git-excluded.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
@@ -8155,7 +8350,7 @@ async function hydrateProjectSecrets(proj) {
         await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { box.textContent = error.message; }
+  } catch (error) { paneError(box, error, () => hydrateProjectSecrets(proj)); }
 }
 
 async function hydrateProjectData(proj) {
@@ -8163,7 +8358,7 @@ async function hydrateProjectData(proj) {
   try {
     const all = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Krmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
+    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when krmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
@@ -8180,12 +8375,16 @@ async function hydrateProjectData(proj) {
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
       const resource = resources.find((item) => item.id === row.dataset.dataResource);
       row.querySelector('.resource-toggle').addEventListener('click', async () => {
-        await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) });
-        await hydrateProjectData(proj);
+        try {
+          await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) });
+          await hydrateProjectData(proj);
+        } catch (error) { toast(error.message, true); }
       });
       row.querySelector('.resource-delete').addEventListener('click', async () => {
         if (!confirm(`Remove ${resource.name}?`)) return;
-        await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectData(proj);
+        try {
+          await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectData(proj);
+        } catch (error) { toast(error.message, true); }
       });
     });
     $('#data-migrate-copyglobs')?.addEventListener('click', async () => {
@@ -8202,7 +8401,7 @@ async function hydrateProjectData(proj) {
         const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
-          || '<div class="project-empty">Nothing looks like project data. Krmax checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>';
+          || '<div class="project-empty">Nothing looks like project data. krmax checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>';
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
           $('#data-add-panel').open = true;
@@ -8231,7 +8430,7 @@ async function hydrateProjectData(proj) {
         toast('Data resource added'); await hydrateProjectData(proj);
       } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add data'; }
     });
-  } catch (error) { box.textContent = error.message; }
+  } catch (error) { paneError(box, error, () => hydrateProjectData(proj)); }
 }
 
 async function hydrateProjectServices(proj) {
@@ -8254,12 +8453,12 @@ async function hydrateProjectServices(proj) {
           <label class="form-row"><span>Container image</span><input id="service-image" placeholder="postgres:16"></label>
           <label class="form-row"><span>Container port</span><input id="service-port" inputmode="numeric" placeholder="5432"></label>
           <label class="form-row"><span>Give its URL to tasks as</span><input id="service-url-env" placeholder="DATABASE_URL"><small class="field-help">The environment-variable name, not the secret value.</small></label>
-          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">Krmax replaces host and port for each isolated world.</small></label>
+          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">krmax replaces host and port for each isolated world.</small></label>
           <label class="form-row"><span>Optional seed data</span><select id="service-seed"><option value="">No seed data</option>${data.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)} · ${esc(resource.target.path)}</option>`).join('')}</select></label>
           <label class="form-row"><span>Seed destination in container</span><input id="service-seed-path" placeholder="/docker-entrypoint-initdb.d/seed.sql"></label>
         </div></div>
         <div class="service-fields" data-service-kind="external" hidden><div class="project-form-grid">
-          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. Krmax passes only an opaque credential handle to the task world.</small></label>
+          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. krmax passes only an opaque credential handle to the task world.</small></label>
         </div></div>
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
       </details>`;
@@ -8268,8 +8467,11 @@ async function hydrateProjectServices(proj) {
     });
     $('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
     box.querySelectorAll('.service-delete').forEach((button) => button.addEventListener('click', async () => {
-      await api(`/api/projects/${proj.id}/services?name=${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' });
-      await hydrateProjectServices(proj);
+      if (!confirm(`Remove ${button.dataset.name}?`)) return;
+      try {
+        await api(`/api/projects/${proj.id}/services?name=${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' });
+        await hydrateProjectServices(proj);
+      } catch (error) { toast(error.message, true); }
     }));
     $('#service-discover')?.addEventListener('click', async () => {
       try {
@@ -8301,7 +8503,7 @@ async function hydrateProjectServices(proj) {
         }) }); toast('Service saved'); await hydrateProjectServices(proj);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { box.textContent = error.message; }
+  } catch (error) { paneError(box, error, () => hydrateProjectServices(proj)); }
 }
 
 async function hydrateProjectEnvironment(proj) {
@@ -8338,12 +8540,14 @@ async function hydrateProjectEnvironment(proj) {
       } catch (error) { toast(error.message, true); }
     });
     $('#environment-save')?.addEventListener('click', async () => {
-      await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
-        image: $('#environment-image').value.trim() || undefined,
-        setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
-        boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
-        includeDocker: $('#environment-docker').checked,
-      }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
+      try {
+        await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
+          image: $('#environment-image').value.trim() || undefined,
+          setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
+          includeDocker: $('#environment-docker').checked,
+        }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
+      } catch (error) { toast(error.message, true); }
     });
     $('#environment-build')?.addEventListener('click', async () => {
       try {
@@ -8351,7 +8555,7 @@ async function hydrateProjectEnvironment(proj) {
         toast(`Building for ${result.building.provider}…`); setTimeout(() => hydrateProjectEnvironment(proj), 1500);
       } catch (error) { toast(error.message, true); }
     });
-  } catch (error) { box.textContent = error.message; }
+  } catch (error) { paneError(box, error, () => hydrateProjectEnvironment(proj)); }
 }
 
 async function hydrateProjectResources(proj) {
@@ -8520,6 +8724,7 @@ async function hydrateProjectAccess(proj) {
       catch (error) { toast(error.message, true); }
     });
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
+      if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
@@ -8834,7 +9039,7 @@ function globalSettingsView(embedded = false) {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
     </div>
-    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open Krmax securely from your phone</small></div></div>
+    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>`;
@@ -8844,8 +9049,8 @@ function phoneInstallHelp() {
   if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
     return '<span class="phone-installed">Installed on this device ✓</span>';
   }
-  return `<button class="btn sm" id="install-karmax">Add Krmax to this phone</button>
-    <span class="task-sub" id="phone-install-note">No native Krmax app is needed.</span>`;
+  return `<button class="btn sm" id="install-karmax">Add krmax to this phone</button>
+    <span class="task-sub" id="phone-install-note">No native krmax app is needed.</span>`;
 }
 
 function isFetchInterruption(error) {
@@ -8865,12 +9070,12 @@ function renderPhoneAccess(status) {
     : status.state === 'conflict'
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
-    ? `<div class="phone-access-address"><span>Access your Krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your Krmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
+    ? `<div class="phone-access-address"><span>Access your krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
   const phoneSteps = hosted
     ? '<li>Open this same HTTPS address on your phone.</li>'
     : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
-       <li>Open the private Krmax address shown here in your phone’s browser.</li>`;
+       <li>Open the private krmax address shown here in your phone’s browser.</li>`;
   const recovery = ready && !hosted
     ? `<details class="phone-troubleshooting">
         <summary>Address won’t open?</summary>
@@ -8878,7 +9083,7 @@ function renderPhoneAccess(status) {
           <li>Disconnect Mullvad or any other VPN on both devices, then reconnect Tailscale. Android and iOS allow only one active VPN.</li>
           <li>On Android, check Tailscale → Settings → App-based split tunneling. Your browser must not bypass Tailscale.</li>
           <li>If the error mentions DNS or “name not found,” set Android Private DNS to Automatic, turn off browser Secure DNS temporarily, and reconnect Tailscale.</li>
-          <li>Keep this computer awake with Krmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
+          <li>Keep this computer awake with krmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
         </ol>
        </details>`
     : '';
@@ -8888,9 +9093,9 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? 'Why this Krmax is not being served' : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? 'Why this krmax is not being served' : 'Set up instructions';
   const setupIntro = status.state === 'conflict'
-    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or Krmax instance.</p>'
+    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or krmax instance.</p>'
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
         (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
@@ -8917,22 +9122,22 @@ function renderPhoneAccess(status) {
             <button class="btn sm" id="remote-refresh">Check again</button>
             ${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}
           </div>
-          ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. Krmax never sees your OS or Tailscale password.</p>' : ''}
+          ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. krmax never sees your OS or Tailscale password.</p>' : ''}
           ${fallback}
         </div>
        </details>`
     : `<p>${esc(status.detail)}</p>`;
   box.innerHTML = `${address}
     ${setupPanel}
-    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use Krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
       <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">${hosted ? 'Krmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Krmax stays bound to localhost and is never made public.'}</p>`;
+    <p class="phone-security">${hosted ? 'krmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.'}</p>`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
     if (approvalTab) {
       approvalTab.document.title = 'Tailscale setup';
-      approvalTab.document.body.textContent = 'Waiting for Krmax to start Tailscale…';
+      approvalTab.document.body.textContent = 'Waiting for krmax to start Tailscale…';
     }
     button.disabled = true;
     button.textContent = action === 'setup' ? 'Starting…' : action === 'enable' ? 'Turning on…' : 'Turning off…';
@@ -8959,7 +9164,7 @@ function renderPhoneAccess(status) {
           missedChecks++;
           if (missedChecks === 1) {
             renderPhoneAccess(pollingStatus(
-              'Tailscale is reconnecting this computer. A brief interruption is normal; Krmax will keep checking.',
+              'Tailscale is reconnecting this computer. A brief interruption is normal; krmax will keep checking.',
             ));
           }
         }
@@ -8994,7 +9199,7 @@ function renderPhoneAccess(status) {
     } catch (error) {
       if (action === 'setup' && isFetchInterruption(error)) {
         const reconnecting = pollingStatus(
-          'The connection changed while Tailscale started. This can be normal; Krmax will reconnect and keep checking.',
+          'The connection changed while Tailscale started. This can be normal; krmax will reconnect and keep checking.',
         );
         renderPhoneAccess(reconnecting);
         await finishSetup(reconnecting);
@@ -9033,7 +9238,7 @@ function renderPhoneAccess(status) {
       await installPrompt.prompt();
       await installPrompt.userChoice;
       installPrompt = null;
-      if (note) note.textContent = 'Krmax can now open from your Home Screen.';
+      if (note) note.textContent = 'krmax can now open from your Home Screen.';
       return;
     }
     const ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
@@ -9054,14 +9259,14 @@ async function hydratePhoneAccess() {
     if (!renderIsCurrent()) return;
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
-        <span>Access your Krmax at</span>
-        <b>${disconnected ? 'Could not reach Krmax' : 'Could not check Phone Access'}</b>
+        <span>Access your krmax at</span>
+        <b>${disconnected ? 'Could not reach krmax' : 'Could not check Phone Access'}</b>
       </div>
       <div class="phone-setup-body">
         <div class="phone-access-head"><span class="remote-state">Needs attention</span><span>${
           disconnected
             ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
-            : esc(error?.message || 'Krmax could not check Tailscale.')
+            : esc(error?.message || 'krmax could not check Tailscale.')
         }</span></div>
         <div class="phone-access-actions"><button class="btn sm" id="remote-retry">Check again</button></div>
       </div>`;
@@ -9147,7 +9352,7 @@ function paymentsCard(scope) {
     <button class="btn primary" data-addcard="${scope}">Add card</button>
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
-      <p class="task-sub">For registered businesses. Lets Krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
+      <p class="task-sub">For registered businesses. Lets krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
       ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
       <div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
@@ -9218,7 +9423,7 @@ async function wirePaymentProviders(box, organizationId) {
       : '<span class="chip">webhook secret missing</span>';
     platformBox.innerHTML = `<details ${platform.configured && platform.webhookConfigured ? '' : 'open'}>
       <summary style="cursor:pointer;font-weight:600">Stripe platform setup ${status} ${webhook}</summary>
-      <p class="task-sub">One Stripe Connect application identifies this Krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
+      <p class="task-sub">One Stripe Connect application identifies this krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
       <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
       <div class="settings-grid">
         <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
@@ -9228,7 +9433,7 @@ async function wirePaymentProviders(box, organizationId) {
         <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
       </div>
       ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
-      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in Krmax’s encrypted vault and makes them take precedence.</p>' : ''}
+      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in krmax’s encrypted vault and makes them take precedence.</p>' : ''}
     </details>`;
     platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
       try {
@@ -9365,7 +9570,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — Krmax only mirrors the figure.');
+      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — krmax only mirrors the figure.');
       if (!amt || !Number(amt)) return;
       try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
@@ -9463,7 +9668,16 @@ const VAULT_SECRET_LABELS = {
 // Short label + click-to-expand explanation for the two per-item policies.
 const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets it as an environment variable, but never sees the secret text itself. “ask” makes it request your approval each time.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
-function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
+// `title` covers hover on desktop; the click handler is for touch, where there is
+// no hover. It used to call `alert()` — the only modal in a console that speaks in
+// toasts, and on desktop it fired *on top of* the native tooltip.
+// The click is wired by delegation (installInfoDotTips), NOT by an inline
+// `onclick`: app.js is loaded as `<script type="module">`, so every function here
+// is module-scoped and invisible to an inline attribute handler. An inline
+// `onclick="window.__toast(…)"` threw `TypeError: window.__toast is not a
+// function` on every tap — silently breaking the affordance for exactly the
+// touch users it was added for.
+function policyTip(text) { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">ⓘ</button>`; }
 
 function credentialRequestTaskLink(request) {
   const task = request.task || taskRecord(request.taskId);
@@ -10352,7 +10566,16 @@ function inboxView() {
       <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(item.kind.replaceAll('-', ' '))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : '<div class="empty"><div class="big">Inbox zero</div>Only updates meant for you appear here.</div>'}</div>
     <div class="card delivery-card"><div class="section-h">Delivery</div>
-      ${['browser', 'email', 'slack'].map((key) => `<label class="switch"><input type="checkbox" data-delivery="${key}" ${prefs[key] ? 'checked' : ''}/><span>${key[0].toUpperCase() + key.slice(1)}</span></label>`).join('')}
+      ${['browser', 'email', 'slack'].map((key) => {
+    // A channel with no adapter cannot deliver anything. Offering the switch anyway
+    // — and toasting "saved" — meant a user could turn on Email and simply stop
+    // being notified, with the failure logged only on the server.
+    const ready = (S.meta?.deliveryChannels ?? ['browser']).includes(key);
+    const label = key[0].toUpperCase() + key.slice(1);
+    return `<label class="switch${ready ? '' : ' disabled'}"${ready ? '' : ` title="Not set up on this server yet"`}>`
+      + `<input type="checkbox" data-delivery="${key}" ${prefs[key] && ready ? 'checked' : ''} ${ready ? '' : 'disabled'}/>`
+      + `<span>${label}${ready ? '' : ' <span class="task-sub">— not set up</span>'}</span></label>`;
+  }).join('')}
       <button class="btn sm primary" id="save-delivery">Save preferences</button></div>`;
 }
 
@@ -10363,17 +10586,23 @@ function wireInboxView() {
   }));
   $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
     const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
-    await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
-    item.unread = !item.unread; renderMain(); renderRail();
+    try {
+      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
+      item.unread = !item.unread; renderMain(); renderRail();
+    } catch (error) { toast(error.message, true); }
   }));
   $('#inbox-read-all')?.addEventListener('click', async () => {
-    await Promise.all(S.inbox.filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
-    await loadCollaboration(); renderMain(); renderRail();
+    try {
+      await Promise.all(S.inbox.filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
+      await loadCollaboration(); renderMain(); renderRail();
+    } catch (error) { toast(error.message, true); }
   });
   $('#save-delivery')?.addEventListener('click', async () => {
     const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
-    S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
-    toast('Delivery preferences saved');
+    try {
+      S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
+      toast('Delivery preferences saved');
+    } catch (error) { toast(error.message, true); }
   });
 }
 
@@ -10614,9 +10843,9 @@ async function hydrateOrganizationView() {
   $('#org-github').innerHTML = githubApp.configured ? `
     <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
-    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Krmax refreshes repository access when you ask instead of using webhooks.'}</p>
+    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so krmax refreshes repository access when you ask instead of using webhooks.'}</p>
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this Krmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
+    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
@@ -10963,7 +11192,7 @@ function allCommands() {
     }
     // digits 1–9 press the Nth enabled action button in the task page's footer
     const btns = [...document.querySelectorAll('#tp-foot [data-act]:not([disabled])')].slice(0, 9);
-    btns.forEach((b, i) => add({ id: `task.slot.${i + 1}`, title: `Press “${b.textContent.replace(/\d+$/, '').trim()}”`, keybinding: String(i + 1), group: 'Task', palette: false, help: false, run: () => b.click() }));
+    btns.forEach((b, i) => add({ id: `task.slot.${i + 1}`, title: `Press “${b.dataset.label || b.textContent.replace(/\d+$/, '').trim()}”`, keybinding: String(i + 1), group: 'Task', palette: false, help: false, run: () => b.click() }));
   }
   return out;
 }
@@ -10977,7 +11206,7 @@ async function runDeclaredAction(a) {
   if (a.args && a.args.length) return openActionForm(a);
   try {
     await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
-    toast(`${a.label || a.name} sent`);
+    toast(actionToast(a.name, a.label || a.name));
     setTimeout(refreshTask, 250);
     setTimeout(refreshTasks, 400);
   } catch (e) { toast(e.message, true); }
@@ -11016,7 +11245,7 @@ function openActionForm(a) {
     try {
       await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify(body) });
       close();
-      toast(`${a.label || a.name} sent`);
+      toast(actionToast(a.name, a.label || a.name));
       setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) { toast(e.message, true); }
@@ -11517,10 +11746,14 @@ function renderSignup() {
 
 function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px">${brandMark()} Account created</div>
+    <!-- Reached on ANY 403 from /api/projects, not only just after signing up: an
+         existing user removed from their last project lands here too, and telling
+         them their account was just created is simply false. Describe the state
+         (no project access), not a guess about how they got here. -->
+    <div class="brand" style="margin-bottom:12px">${brandMark()} No project access</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
-    <p>Your account is active, but you don't have access to any project yet.</p>
-    <p class="task-sub">Ask a krmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
+    <p>Your account is active, but you're not on any project yet.</p>
+    <p class="task-sub">Ask a krmax admin to add you to a project, or create your own organization below. Any new access shows up as soon as you check again.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
     <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>
@@ -11533,7 +11766,7 @@ function renderAccessPending() {
       const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name: organizationName }) });
       await api(`/api/organizations/${organization.id}/projects`, { method: 'POST', body: JSON.stringify({ name: projectName, config: {} }) });
       location.href = '/';
-    } catch (error) { alert(error.message); }
+    } catch (error) { toast(error.message, true); }
   });
   $('#pending-logout').addEventListener('click', async () => {
     await fetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});

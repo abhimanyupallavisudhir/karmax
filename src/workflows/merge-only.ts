@@ -7,6 +7,7 @@ import {
   condition,
   workflowInfo,
   ApplicationFailure,
+  isCancellation,
   log,
 } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
@@ -17,7 +18,7 @@ import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmConfig, ConfirmDecision, ConfirmLayer,
-  TaskPullRequest, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
+  TaskPullRequest, mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   samePosition, MERGE_POLL } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
@@ -36,6 +37,18 @@ const cancellationAwareTurns = proxyActivities<coreActivities>({
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
+// Coordinator calls with a BOUNDED retry budget (mirrors software-dev's
+// `boundedCoord`). Temporal's default is `maximumAttempts: 0` = UNLIMITED, so a
+// deterministically-failing enqueueMerge / requestAgentSlot retried forever froze
+// the task in place with no route to a human. Failing after a few attempts turns
+// it into an ordinary stage error the platform can surface and recover.
+// Pinned to its own behavior version: activity retry options are part of the
+// recorded ScheduleActivityTask command, so an in-flight execution must keep
+// scheduling with the proxy its history was written against.
+const boundedCoord = proxyActivities<coordinatorActivities>({
+  startToCloseTimeout: '30s',
+  retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
+});
 
 export const confirmSignal = defineSignal('confirm');
 export const followUpSignal = defineSignal<[Message]>('followUp');
@@ -86,6 +99,20 @@ export async function mergeOnlyV1_5(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true, true, true, true);
 }
 
+/**
+ * Per-repo merge-queue serialization (the same `mergeQueueDomains` keys
+ * software-dev uses) plus a bounded coordinator retry budget. Both change the
+ * recorded command stream — the domain strings a merge enqueues under, and the
+ * retry options on every coordinator activity — so they need their own pinned
+ * version rather than silently rewriting in-flight histories.
+ *
+ * 1.6.0 rather than 1.5.0: master published a different 1.5.0 (the bounded merge
+ * wait) concurrently, and one version number cannot mean two behaviour sets.
+ */
+export async function mergeOnlyV1_6(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);
@@ -103,8 +130,24 @@ async function mergeOnlyImpl(
   // every message and transcript, and Temporal hard-caps history at 50MB, so the
   // old 5s unconditional publish turned a long queue wait into a TERMINATE.
   boundedMergeWait = false,
+  // Per-repo merge-queue domains (mergeQueueDomains) + bounded coordinator
+  // retries. Both alter recorded commands (domain strings; activity retry
+  // options), so they are pinned to their own version.
+  serializedMergeDomains = false,
 ): Promise<{ stage: Stage; sha?: string }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
+  const coordinator = serializedMergeDomains ? boundedCoord : coord;
+  // These two ride the same 1.5.0 pin, because each changes the commands a workflow
+  // task emits at a point older executions have already recorded:
+  //  - clearing `confirmed` at the Review gate: an execution confirmed before the
+  //    gate opened recorded that gate returning INSTANTLY, so clearing on replay
+  //    parks where history says it proceeded.
+  //  - routing the cancel exits through `finishCancelled`: that publishes and calls
+  //    `destroyWorld`, commands the older recordings simply do not contain.
+  // Replaying either against an older pin is a NonDeterminismError that wedges the
+  // execution, so older versions deliberately keep the old (buggier) behavior.
+  const clearsConfirmOnGate = serializedMergeDomains;
+  const cancelReleasesWorld = serializedMergeDomains;
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -173,14 +216,27 @@ async function mergeOnlyImpl(
 
   function actions(): DeclaredAction[] {
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: !pointOfNoReturnPassed, danger: true };
-    if (stage === 'review') return [{ name: 'confirm', kind: 'signal', label: 'Approve & merge', enabled: true }, { name: 'followUp', kind: 'signal', label: 'Request changes', enabled: true, args: [{ name: 'text', type: 'text', required: true }] }, cancel];
+    // INTENDED: merge-only has no Do stage, so there is nothing to send work back
+    // to. It used to advertise a "Request changes" follow-up here, but nothing
+    // reacted to it — the signal only appended to `msgs` and neither the layer
+    // gate nor the final `condition` watched the transcript, so clicking it left
+    // the task parked exactly as before. The honest affordances at this gate are
+    // Approve (merge it) and Cancel (don't). Feedback belongs on the branch's
+    // originating task. `followUpSignal` itself is kept: the transcript is still
+    // the record of what was said, and the platform delivers messages here.
+    if (stage === 'review') return [{ name: 'confirm', kind: 'signal', label: 'Approve & merge', enabled: true }, cancel];
     if (stage === 'merge' || stage === 'pr') return [cancel];
     return [cancel];
   }
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'merge-only', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
+      actions: actions(),
+      state: { checks, mergeGranted, targetLocked,
+        // The serialization keys this task merges under, so the UI (and tests)
+        // can see it locks the same domains software-dev would for these repos.
+        ...(serializedMergeDomains && world ? { mergeDomains: mergeQueueDomains(world, target, input.projectId) } : {}) },
+      branch: world?.branch, base, targetBranch: target,
       world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
       editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
       pr, ...(prs.length ? { prs } : {}),
@@ -189,7 +245,7 @@ async function mergeOnlyImpl(
   }
   const publish = async () => core.publishView(taskId, view());
   const leaser = managedTurns
-    ? createAgentTurnLeaser(core, coord, {
+    ? createAgentTurnLeaser(core, coordinator, {
         taskId,
         projectId: input.projectId,
         task: () => input,
@@ -247,9 +303,42 @@ async function mergeOnlyImpl(
         });
       const ct = leaser ? await leaser.run('confirm', invoke) : await invoke();
       return ct.confirmDecision;
-    } catch {
+    } catch (err) {
+      // A mid-turn cancel (SPEC §5.6) aborts this turn's activity. Swallowing that
+      // as "no verdict" quietly degraded a cancelled gate to "waiting for a human";
+      // rethrow it (as just-do does) so the caller can route to the graceful cancel
+      // exit that also releases the world. Every other failure still degrades to the
+      // human gate — a reviewer agent that blows up must not auto-approve.
+      if (isCancellation(err) && cancelReleasesWorld) throw err;
       return undefined;
     }
+  }
+
+  /**
+   * The single cancel exit. EVERY path that ends the task as `cancelled` must go
+   * through here: publish the terminal state, then release the world.
+   *
+   * Why it is shared: the cancel-while-queued exit used to `return { stage:
+   * 'cancelled' }` straight after `cancelMerge`, skipping `destroyWorld`
+   * entirely. For a worktree world that strands a checkout; for a cloud world it
+   * is a leaked, still-billed sandbox whose runner lease is only ever released by
+   * `destroyWorld` (activities/core.ts). Local worlds are left in place for
+   * inspection only when the workflow ends successfully — a cancelled task's
+   * world is always released, exactly as just-do and software-dev do.
+   */
+  async function finishCancelled(): Promise<{ stage: Stage }> {
+    stage = 'cancelled';
+    status = 'cancelled';
+    await publish();
+    if (world) {
+      const remoteWorld = releaseWorldOnCompletion(world);
+      await core.destroyWorld(world as any);
+      if (remoteWorld) {
+        world = undefined;
+        await publish();
+      }
+    }
+    return { stage };
   }
 
   setHandler(viewQuery, view);
@@ -290,6 +379,19 @@ async function mergeOnlyImpl(
 
   stage = 'review';
   status = 'waiting';
+  // `confirmed` is a GATE token, not a latch. Clear it on entry to the Review
+  // gate, before any await, so nothing that arrives from here on is lost.
+  //
+  // Why: `confirmSignal` sets the flag at ANY stage, and merge-only never cleared
+  // it — a confirm that landed during Setup, or while the workflow-edit checks
+  // were still running, pre-approved this gate: the layer loop and the
+  // `condition()` below both returned instantly and the branch merged completely
+  // unreviewed. A confirm now only counts for a gate that was already open when
+  // it arrived. The legitimate race (someone clicking Approve between our
+  // `publish()` and the `condition()` park) is preserved, because the clear
+  // happens strictly BEFORE the publish that advertises the gate. Same fix, same
+  // reasoning as software-dev.ts and just-do.ts.
+  if (clearsConfirmOnGate) confirmed = false;
   // Never confirm a workflow-edit whose checks failed, whatever the confirmer says.
   const mayConfirm = !input.workflowEdit || (checks?.passed ?? true);
   if (mayConfirm) {
@@ -306,7 +408,17 @@ async function mergeOnlyImpl(
       const layer = confirmLayers[li]!;
       if (layer.kind === 'agent') {
         await publish();
-        const decision = await runConfirm(layer);
+        let decision: ConfirmDecision | undefined;
+        try {
+          decision = await runConfirm(layer);
+        } catch (err) {
+          // Cancelled mid-review (runConfirm rethrows cancellation). Take the
+          // graceful exit rather than letting the CancelledFailure escape the
+          // workflow — an escaped failure would terminate the execution with the
+          // world (and, remotely, its billed sandbox) still allocated.
+          if (isCancellation(err)) return await finishCancelled();
+          throw err;
+        }
         if (confirmEpoch !== epoch) { li = 0; continue; } // verdict was about a route since replaced
         if (decision?.action === 'confirm') { li++; continue; }
         if (decision?.action === 'reject') {
@@ -335,20 +447,7 @@ async function mergeOnlyImpl(
   await publish();
   await condition(() => confirmed || cancelled);
   waitingFor = undefined;
-  if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) {
-    stage = 'cancelled';
-    status = 'cancelled';
-    await publish();
-    if (world) {
-      const remoteWorld = releaseWorldOnCompletion(world);
-      await core.destroyWorld(world as any);
-      if (remoteWorld) {
-        world = undefined;
-        await publish();
-      }
-    }
-    return { stage };
-  }
+  if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) return await finishCancelled();
 
   if (remotePolicyOf(input.project) === 'pr') {
     targetLocked = true; // opening a PR binds it to `target` (SPEC §2)
@@ -367,43 +466,94 @@ async function mergeOnlyImpl(
   // Commit `target` to the merge-queue domain — no await between locking and
   // reading it, so a queued edit can't desync the domain (SPEC §5.5).
   targetLocked = true;
-  // The authoritative repo keys the domain (see mergeDomains in software-dev):
-  // a cloud world from a local checkout serializes with worktree worlds of it.
-  const domain = `${world!.repos?.[0]?.localPath ?? world!.repo ?? input.projectId}:${target}`;
-  await coord.enqueueMerge(domain, taskId);
-  if (managedTurns) {
-    status = 'waiting';
-    waitingFor = { kind: 'mergeSlot', detail: `Waiting to merge into ${target}` };
-  }
-  while (!mergeGranted && !cancelled) {
-    if (managedTurns) {
-      const pos = await coord.mergeQueuePosition(domain, taskId);
-      if (!boundedMergeWait || !samePosition(pos, mergeQueue)) {
-        mergeQueue = pos;
-        await publish();
+  // One merge-queue domain per repo this task actually merges, computed by the
+  // SAME pure function software-dev uses (mergeQueueDomains, domain/types.ts).
+  //
+  // The old ad-hoc key `${world.repos[0].localPath ?? world.repo ?? projectId}:
+  // ${target}` was wrong twice over: it locked only repo[0] (a merge-only world
+  // routinely carries the project-wiki companion repo alongside the development
+  // one, and every other repo merged unserialized), and when a repo pins its own
+  // `target` — or when `localPath` is unset and `repo.repo !== world.repo` — it
+  // produced a DIFFERENT string from the one software-dev computes for the same
+  // repo+branch, so the two workflows silently never serialized against each
+  // other at all.
+  //
+  // Acquisition is sequential and in the sorted order mergeQueueDomains returns.
+  // That global ordering is what makes concurrent multi-repo merges deadlock-free
+  // (SPEC §6.1): every task requests shared repos in the same sequence, so the
+  // wait-for graph cannot form a cycle. Do NOT reorder or parallelize it — and
+  // acquiring one at a time also keeps the payload-less grant signal unambiguous.
+  const domains = serializedMergeDomains
+    ? mergeQueueDomains(world, target, input.projectId)
+    : [`${world!.repos?.[0]?.localPath ?? world!.repo ?? input.projectId}:${target}`];
+  const held: string[] = [];
+  let acquireCancelled = false;
+  let result: Awaited<ReturnType<typeof long.finalizeMergeActivity>> | undefined;
+  // Every acquired slot MUST be released — including when the merge (which runs
+  // with `maximumAttempts: 1`) throws. The old bare `releaseMerge` statement after
+  // `finalizeMergeActivity` was skipped entirely on a throw, so the domain stayed
+  // leased until the coordinator's 5-minute lease timeout and every other task on
+  // that repo stalled behind a task that had already failed. Paths that release
+  // explicitly empty `held` first, so this never double-releases.
+  try {
+    for (const domain of domains) {
+      mergeGranted = false;
+      await coordinator.enqueueMerge(domain, taskId);
+      if (managedTurns) {
+        status = 'waiting';
+        waitingFor = { kind: 'mergeSlot', detail: `Waiting to merge into ${target}` };
       }
+      while (!mergeGranted && !cancelled) {
+        if (managedTurns) {
+          // Republish only on a real change, and poll coarsely: the view carries
+          // every message and transcript, and Temporal hard-caps history at 50MB.
+          const pos = await coordinator.mergeQueuePosition(domain, taskId);
+          if (!boundedMergeWait || !samePosition(pos, mergeQueue)) {
+            mergeQueue = pos;
+            await publish();
+          }
+        }
+        await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
+      }
+      if (cancelled && !mergeGranted) {
+        await coordinator.cancelMerge(domain, taskId); // drop the slot we're still waiting on
+        acquireCancelled = true;
+        break;
+      }
+      held.push(domain);
     }
-    await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
+    if (acquireCancelled) {
+      for (const d of held) await coordinator.releaseMerge(d, taskId); // and every slot already held
+      held.length = 0; // released here → the finally below is a no-op (command order preserved)
+      // Older pins recorded this exit as cancelMerge → publish → return, with no
+      // `destroyWorld`; emitting one on replay is a new command at a recorded point.
+      // They keep the (leaky) old shape — see `cancelReleasesWorld` above.
+      if (!cancelReleasesWorld) {
+        stage = 'cancelled';
+        status = 'cancelled';
+        await publish();
+        return { stage };
+      }
+      return await finishCancelled();
+    }
+    if (managedTurns) {
+      waitingFor = undefined;
+      status = 'active';
+      mergeQueue = { position: 0, total: mergeQueue?.total ?? 1, current: taskId };
+      await publish();
+    }
+    result = await long.finalizeMergeActivity(world as any, target);
+  } finally {
+    // Swallow per-domain — see the matching note in software-dev.ts: a bounded
+    // release that exhausts its retries must not abort the loop (leaking the
+    // remaining slots) nor mask the real merge failure.
+    for (const d of held) await coordinator.releaseMerge(d, taskId).catch(() => undefined);
+    held.length = 0;
   }
-  if (cancelled && !mergeGranted) {
-    await coord.cancelMerge(domain, taskId);
-    stage = 'cancelled';
-    status = 'cancelled';
-    await publish();
-    return { stage };
-  }
-  if (managedTurns) {
-    waitingFor = undefined;
-    status = 'active';
-    mergeQueue = { position: 0, total: mergeQueue?.total ?? 1, current: taskId };
-    await publish();
-  }
-  const result = await long.finalizeMergeActivity(world as any, target);
-  await coord.releaseMerge(domain, taskId);
-  if (!result.merged) {
+  if (!result?.merged) {
     stage = 'failed';
     status = 'failed';
-    reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result.dirty ? `uncommitted changes in the worktree:\n${result.dirty}` : (result.conflict ?? result.note)}` };
+    reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result?.dirty ? `uncommitted changes in the worktree:\n${result.dirty}` : (result?.conflict ?? result?.note)}` };
     await publish();
     return { stage };
   }

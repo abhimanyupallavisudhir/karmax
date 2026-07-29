@@ -11,9 +11,26 @@ export class KarmaxBus {
   constructor() {
     this.ee.setMaxListeners(0);
   }
+  /**
+   * Dispatch to every subscriber, isolating each one.
+   *
+   * `EventEmitter.emit` calls listeners inline and synchronously, so an
+   * exception in one subscriber aborted the whole dispatch: every later
+   * subscriber was skipped, and the throw propagated back into whatever
+   * *activity* had emitted the event — failing unrelated work because a
+   * projection had a bug. The bus is a transport (SPEC §3.3); a broken consumer
+   * is that consumer's problem.
+   */
   emit(ev: KarmaxEvent & { seq?: number }) {
-    this.ee.emit('event', ev);
-    this.ee.emit(`task:${ev.taskId}`, ev);
+    for (const channel of ['event', `task:${ev.taskId}`]) {
+      for (const listener of this.ee.listeners(channel) as Array<(e: unknown) => void>) {
+        try {
+          listener(ev);
+        } catch (error) {
+          console.error(`[bus] subscriber for "${channel}" threw:`, error instanceof Error ? error.stack ?? error.message : error);
+        }
+      }
+    }
   }
   onAny(fn: (ev: KarmaxEvent & { seq?: number }) => void): () => void {
     this.ee.on('event', fn);

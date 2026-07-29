@@ -120,11 +120,28 @@ export function resolveBuiltins(root?: string): WikiPage[] {
         if (override) {
           // Frontmatter the override does not restate keeps the default's
           // identity (its folder name `how-to-work` is not a display name).
+          //
+          // `labels` is the delivery switch (`isDefaultDelivered` decides whether
+          // the body is inlined into every prompt), so it needs a *deliberate*
+          // rule rather than the same per-field fallback:
+          //   - an override that WROTE a frontmatter block owns its labels —
+          //     omitting `default` is how you demote the built-in to a TOC entry
+          //     (an intentional affordance, covered by the wiki tests);
+          //   - an override with NO frontmatter block at all never expressed an
+          //     opinion, so it inherits the default's delivery. Without this, a
+          //     user who simply typed replacement instructions into the editor
+          //     stripped GLOBAL_INSTRUCTIONS from every agent prompt in the
+          //     organization — the body was neither inlined nor replaced by the
+          //     bundled default.
+          // `importance` is pure ordering, never delivery, so it always falls back.
           const fm = parseFrontmatter(override.content);
+          const hasFrontmatter = /^---\r?\n/.test(override.content);
           return {
             ...override,
             name: fm.name ?? builtin.name,
             description: fm.description ?? builtin.description,
+            labels: hasFrontmatter ? override.labels : builtin.labels,
+            importance: fm.importance ?? builtin.importance,
             builtin: true,
             overridden: true,
           };
@@ -157,6 +174,57 @@ export function safeWikiPath(rel: string): string {
     .filter(Boolean);
   if (parts.some((s) => s === '.' || s === '..' || s.includes('\0'))) throw new Error('invalid wiki path');
   return parts.join('/');
+}
+
+/**
+ * Resolve `rel` under the wiki root, refusing anything that leaves the root through
+ * a SYMLINK. Returns the absolute path, or undefined if it escapes.
+ *
+ * `safeWikiPath` above is string surgery — it rejects `..` and absolute segments but
+ * cannot see a symlink, and `fs.readFileSync`/`existsSync`/`statSync` all follow
+ * them. That was a real read primitive, not a theoretical one: for a CONTAINER world
+ * the world root is bind-mounted from the host (`-v ${handle.root}:/work`,
+ * src/world/container.ts), and `KarmaxApi.wikiScope` hands back that same host path
+ * as the wiki root. So a sandboxed agent could plant
+ * `<wiki-repo>/pwn/SKILL.md -> /home/<user>/.karmax/vault/vault.key`, call
+ * `read_wiki(path: "pwn")`, and get the host file back in its context — and, via a
+ * symlinked intermediate directory, `writeWikiPage`'s recursive mkdir + write gave
+ * it a constrained write primitive too.
+ *
+ * `searchWiki` already skipped symlinks for exactly this reason (see its lstat
+ * check); the page read/write path is what was missed. Resolving with `realpath`
+ * covers the symlinked-parent case that a per-entry lstat would not.
+ *
+ * For a path that does not exist yet (a page being created), the nearest existing
+ * ancestor is what gets checked — that is the one an attacker could have symlinked.
+ */
+function resolveInRoot(root: string, rel: string): string | undefined {
+  const abs = path.resolve(root, rel);
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch (error) {
+    // ONLY "the root isn't there yet" means there is nothing to escape through.
+    // Catching every error made this confinement fail OPEN: a transient
+    // EACCES/EIO, or an ELOOP on the root itself, returned the UNCHECKED path and
+    // silently handed the read/write primitive above straight back. Same reasoning
+    // as `secretFor` in src/auth/identity.ts.
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+    return abs; // no root on disk yet — nothing to escape through
+  }
+  let probe = abs;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(probe);
+      const suffix = path.relative(probe, abs);
+      const resolved = suffix ? path.join(real, suffix) : real;
+      return real === realRoot || real.startsWith(realRoot + path.sep) ? resolved : undefined;
+    } catch {
+      const parent = path.dirname(probe);
+      if (parent === probe) return undefined;
+      probe = parent;
+    }
+  }
 }
 
 /** A path writes may target: safe AND not under the reserved `@` namespace —
@@ -213,6 +281,27 @@ export function parseFrontmatter(content: string): {
   };
 }
 
+/** Does `dir` hold at least one nested entry (i.e. is it a real section)? An
+ *  empty folder is not — writing a page into one is ordinary. */
+function isSectionDir(dir: string): boolean {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  return names.some((child) => {
+    if (child.startsWith('.')) return false;
+    try {
+      if (!fs.lstatSync(path.join(dir, child)).isDirectory()) return false;
+    } catch {
+      return false;
+    }
+    const entry = readEntry(dir, child);
+    return !!entry && (entry.kind !== 'section' || !!entry.children?.length);
+  });
+}
+
 function pageFileIn(dir: string): { file: string; kind: 'skill' | 'memory' } | undefined {
   for (const f of PAGE_FILES) {
     if (fs.existsSync(path.join(dir, f))) return { file: f, kind: f === 'SKILL.md' ? 'skill' : 'memory' };
@@ -257,7 +346,10 @@ function readEntry(root: string, rel: string): WikiEntry | undefined {
     if (child.startsWith('.') || (!rel && child.startsWith('@'))) continue;
     const childRel = rel ? `${rel}/${child}` : child;
     try {
-      if (!fs.statSync(path.join(dir, child)).isDirectory()) continue;
+      // lstat, not stat: a symlinked section would pull an out-of-root tree into
+      // the listing, and every page under it would then read through. Same reason
+      // searchWiki skips them — see resolveInRoot.
+      if (!fs.lstatSync(path.join(dir, child)).isDirectory()) continue;
     } catch {
       continue;
     }
@@ -289,10 +381,15 @@ function walkLeaves(tree: WikiEntry, fn: (e: WikiEntry) => void): void {
 export function readWikiPage(root: string, rel: string): WikiPage | undefined {
   const safe = safeWikiPath(rel);
   if (!safe) return undefined;
-  const dir = path.join(root, safe);
+  const dir = resolveInRoot(root, safe);
+  if (!dir) return undefined; // symlinked out of the wiki root — see resolveInRoot
   const page = pageFileIn(dir);
   if (!page) return undefined;
-  const content = fs.readFileSync(path.join(dir, page.file), 'utf8');
+  // The page file itself must not be a symlink either: the folder can be genuine
+  // while `SKILL.md` inside it points at an arbitrary host file.
+  const pageFile = resolveInRoot(root, path.join(safe, page.file));
+  if (!pageFile) return undefined;
+  const content = fs.readFileSync(pageFile, 'utf8');
   const fm = parseFrontmatter(content);
   const files: string[] = [];
   const walk = (sub: string) => {
@@ -300,7 +397,11 @@ export function readWikiPage(root: string, rel: string): WikiPage | undefined {
       if (f.startsWith('.')) continue;
       const relFile = sub ? `${sub}/${f}` : f;
       if (relFile === page.file) continue;
-      if (fs.statSync(path.join(dir, relFile)).isDirectory()) walk(relFile);
+      // Attachments are listed by name and fetched separately; a symlinked one
+      // would make that fetch read outside the root, so drop it here.
+      const st = fs.lstatSync(path.join(dir, relFile));
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) walk(relFile);
       else files.push(relFile);
     }
   };
@@ -332,12 +433,21 @@ export function writeWikiPage(
   opts: { create?: boolean } = {},
 ): WikiPage {
   const safe = writableWikiPath(rel);
-  const dir = path.join(root, safe);
+  // Same symlink confinement as the read path (see resolveInRoot): a symlinked
+  // intermediate directory would otherwise let the recursive mkdir + write below
+  // land a SKILL.md/MEMORY.md anywhere on the host filesystem.
+  const dir = resolveInRoot(root, safe);
+  if (!dir) throw new Error(`"${safe}" resolves outside the wiki`);
   const existing = fs.existsSync(dir) ? pageFileIn(dir) : undefined;
   // A built-in "exists" even without an on-disk override — create must not
   // silently become the override for one.
   if (opts.create && (existing || BUILTIN_WIKI_ENTRIES.some((b) => b.path === safe)))
     throw new Error(`an entry already exists at "${safe}"`);
+  // Writing a page AT a section path turns that folder into a leaf: `readEntry`
+  // stops recursing and the whole subtree vanishes from every wiki API while it
+  // is still on disk. Reject it rather than silently hiding content.
+  if (!existing && fs.existsSync(dir) && isSectionDir(dir))
+    throw new Error(`"${safe}" is a section holding other entries; pick a path inside it instead`);
   fs.mkdirSync(dir, { recursive: true });
   const file = (kind ? (kind === 'memory' ? 'MEMORY.md' : 'SKILL.md') : existing?.file) ?? 'SKILL.md';
   if (existing && existing.file !== file) fs.rmSync(path.join(dir, existing.file));
@@ -352,17 +462,36 @@ export function moveWikiPage(root: string, from: string, to: string): void {
   const dst = writableWikiPath(to);
   if (src === dst) return;
   if (src.startsWith('@') || dst.startsWith('@')) throw new Error('built-in entries cannot be renamed');
-  if (!pageFileIn(path.join(root, src))) throw new Error(`no entry at "${src}"`);
-  if (fs.existsSync(path.join(root, dst))) throw new Error(`an entry already exists at "${dst}"`);
-  fs.mkdirSync(path.dirname(path.join(root, dst)), { recursive: true });
-  fs.renameSync(path.join(root, src), path.join(root, dst));
+  // Both ends confined — see resolveInRoot. A symlinked source would move a host
+  // directory into the wiki; a symlinked destination parent would move wiki
+  // content out of it.
+  const srcDir = resolveInRoot(root, src);
+  const dstDir = resolveInRoot(root, dst);
+  if (!srcDir || !dstDir) throw new Error('that path resolves outside the wiki');
+  if (!pageFileIn(srcDir)) throw new Error(`no entry at "${src}"`);
+  if (fs.existsSync(dstDir)) throw new Error(`an entry already exists at "${dst}"`);
+  fs.mkdirSync(path.dirname(dstDir), { recursive: true });
+  fs.renameSync(srcDir, dstDir);
 }
 
-/** Remove a skill folder (or an entire section) from the wiki. */
-export function deleteWikiPage(root: string, rel: string): boolean {
+/**
+ * Remove a skill/memory folder from the wiki.
+ *
+ * A *section* (a folder with no SKILL/MEMORY.md, holding other entries) is a
+ * different and far more destructive operation: the delete is unversioned and
+ * unrecoverable, so one mistyped path could take out an entire subtree of an
+ * organization's knowledge. Removing one therefore requires an explicit
+ * `recursive: true` from the caller, which makes the accidental path impossible
+ * from any API that does not deliberately ask for it.
+ */
+export function deleteWikiPage(root: string, rel: string, opts: { recursive?: boolean } = {}): boolean {
   const safe = writableWikiPath(rel);
-  const dir = path.join(root, safe);
-  if (!fs.existsSync(dir)) return false;
+  // Confined like the read/write paths — a symlinked section must not turn this
+  // recursive rm loose on a host directory outside the wiki (see resolveInRoot).
+  const dir = resolveInRoot(root, safe);
+  if (!dir || !fs.existsSync(dir)) return false;
+  if (!pageFileIn(dir) && !opts.recursive)
+    throw new Error(`"${safe}" is a section, not a page; deleting it removes every entry under it — pass recursive to confirm`);
   fs.rmSync(dir, { recursive: true, force: true });
   return true;
 }
@@ -374,18 +503,98 @@ export interface WikiSearchHit {
   text: string;
 }
 
+/** Longest `search_wiki` query we will compile. The query is agent-controlled
+ *  and matched synchronously per line, so it is bounded input, not free text. */
+export const WIKI_SEARCH_QUERY_MAX = 512;
+
+/**
+ * Is `pattern` safe to hand to `new RegExp` and run per line on the host event
+ * loop? A regex engine with backtracking can take exponential time on patterns
+ * that nest an unbounded quantifier inside another (`(a+)+`, `(a|a)*`), and
+ * karmax runs the gateway, the worker and every activity in ONE process — so a
+ * single catastrophic pattern from `search_wiki` wedges all of them.
+ *
+ * Rather than try to decide the general case, this is deliberately conservative:
+ * only patterns built from clearly-linear constructs pass. Anything else falls
+ * through to a literal (escaped) match, which is what a human typing prose into
+ * the search box wanted anyway. False negatives cost an agent an exotic regex;
+ * a false positive costs the whole process.
+ */
+/** How many unbounded quantifiers (`*`, `+`, `{n,}`) a query may contain. A flat
+ *  run of n of them costs O(line^n) to fail, so this stays small; real search
+ *  queries ("deploy.*runbook", "v\d+\.\d+") sit at one or two. */
+const MAX_UNBOUNDED_QUANTIFIERS = 3;
+
+/** Count unbounded quantifiers, ignoring the two places a `*`/`+`/`{n,}` is just a
+ *  character: escaped (`\*`) and inside a character class (`[*+]`). */
+function countUnboundedQuantifiers(pattern: string): number {
+  let count = 0;
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i]!;
+    if (c === '\\') { i++; continue; }
+    if (inClass) { if (c === ']') inClass = false; continue; }
+    if (c === '[') { inClass = true; continue; }
+    if (c === '*' || c === '+') { count++; continue; }
+    if (c === '{') {
+      const close = pattern.indexOf('}', i);
+      if (close === -1) continue; // a literal `{`, not a repetition
+      if (/^\{\s*\d+\s*,\s*\}$/.test(pattern.slice(i, close + 1))) count++;
+      i = close;
+    }
+  }
+  return count;
+}
+
+export function isSafeSearchPattern(pattern: string): boolean {
+  // Any group that can repeat is the ingredient catastrophic patterns need.
+  // Reject a quantifier applied to a group, and nested quantifiers generally.
+  if (/\)\s*[*+?{]/.test(pattern)) return false;
+  // Back-references turn matching super-linear in several engines.
+  if (/\\\d/.test(pattern)) return false;
+  // Lookaround can hide a quantified group behind an assertion.
+  if (/\(\?[=!<]/.test(pattern)) return false;
+  // Two adjacent unbounded quantifiers (`a+*`, `a*+`) — not valid JS anyway.
+  if (/[*+?}][*+]/.test(pattern)) return false;
+  // Unbounded repetition counts (`a{2,}`) applied repeatedly.
+  if (/\{\s*\d+\s*,\s*\}\s*[*+?]/.test(pattern)) return false;
+  // A GROUP is not required to blow up. Every check above looks for nesting, but a
+  // flat SEQUENCE of unbounded quantifiers over overlapping atoms backtracks
+  // super-polynomially all the same: `a*a*a*a*a*a*a*a*a*a*b` is 21 characters,
+  // compiles, passed every rule above, and never returns against a line of `a`s
+  // with no `b`. Cap the count rather than try to prove the atoms disjoint.
+  if (countUnboundedQuantifiers(pattern) > MAX_UNBOUNDED_QUANTIFIERS) return false;
+  return true;
+}
+
 /**
  * Grep the wiki's markdown (host-side, so it works identically for cloud
  * worlds where the agent's shell cannot reach the karmax home). The query is a
  * case-insensitive regular expression, falling back to a literal match when it
- * does not parse.
+ * does not parse **or when it is not provably linear** (see
+ * `isSafeSearchPattern`).
+ *
+ * The walk uses `lstatSync` and skips symlinks entirely. That is load-bearing,
+ * not tidiness: for container worlds the world root is bind-mounted from the
+ * host, so a symlink planted by the sandboxed agent would otherwise resolve
+ * against the *host* filesystem and give it a read primitive for any `*.md`.
+ * Each entry is also stat'd inside its own try/catch so a dangling symlink or a
+ * racing delete cannot 500 the search for the whole scope.
  */
 export function searchWiki(root: string, query: string, limit = 50): WikiSearchHit[] {
+  const raw = String(query ?? '');
+  if (raw.length > WIKI_SEARCH_QUERY_MAX)
+    throw new Error(`wiki search query is too long (${raw.length} > ${WIKI_SEARCH_QUERY_MAX} characters)`);
+  const literal = () => new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
   let re: RegExp;
-  try {
-    re = new RegExp(query, 'i');
-  } catch {
-    re = new RegExp(String(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+  if (!isSafeSearchPattern(raw)) {
+    re = literal();
+  } else {
+    try {
+      re = new RegExp(raw, 'i');
+    } catch {
+      re = literal();
+    }
   }
   const hits: WikiSearchHit[] = [];
   const walk = (rel: string) => {
@@ -400,13 +609,17 @@ export function searchWiki(root: string, query: string, limit = 50): WikiSearchH
       if (f.startsWith('.')) continue;
       const relFile = rel ? `${rel}/${f}` : f;
       const abs = path.join(root, relFile);
-      if (fs.statSync(abs).isDirectory()) walk(relFile);
-      else if (f.endsWith('.md')) {
-        const lines = fs.readFileSync(abs, 'utf8').split('\n');
-        for (let i = 0; i < lines.length && hits.length < limit; i++) {
-          if (re.test(lines[i]!)) hits.push({ file: relFile, line: i + 1, text: lines[i]!.trim().slice(0, 240) });
+      try {
+        const st = fs.lstatSync(abs);
+        if (st.isSymbolicLink()) continue; // never escape the wiki root
+        if (st.isDirectory()) walk(relFile);
+        else if (st.isFile() && f.endsWith('.md')) {
+          const lines = fs.readFileSync(abs, 'utf8').split('\n');
+          for (let i = 0; i < lines.length && hits.length < limit; i++) {
+            if (re.test(lines[i]!)) hits.push({ file: relFile, line: i + 1, text: lines[i]!.trim().slice(0, 240) });
+          }
         }
-      }
+      } catch { /* dangling symlink, racing delete, unreadable file — skip it */ }
     }
   };
   walk('');
@@ -447,13 +660,18 @@ function stripCodeSpans(text: string): string {
  */
 export function parseWikiRefs(text: string): WikiRef[] {
   const out: WikiRef[] = [];
-  const re = /(?<=^|\s)@(proj|org):(\S+)/g;
+  // Case-insensitive on the scope word: the task-form UI already normalizes and
+  // keeps `@PROJ:` tokens, so matching case-sensitively here meant such a token
+  // persisted in the UI and silently inlined nothing.
+  const re = /(?<=^|\s)@(proj|org):(\S+)/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(stripCodeSpans(text)))) {
-    const scope: WikiScope = m[1] === 'proj' ? 'project' : 'organization';
+    const scope: WikiScope = m[1]!.toLowerCase() === 'proj' ? 'project' : 'organization';
     let rest = m[2]!.replace(/[.,;:!?)"'\]]+$/, ''); // trim trailing sentence punctuation
     if (!rest) continue;
-    if (rest.startsWith('tag:')) {
+    if (/^tag:/i.test(rest)) {
+      // The label VALUE stays case-sensitive (labels are user data); only the
+      // `tag:` marker is normalized.
       const value = rest.slice(4).replace(/\/+$/, '');
       if (value) out.push({ scope, kind: 'label', value });
     } else if (rest.endsWith('/*')) {
@@ -575,18 +793,51 @@ export function suggestWiki(root: string, query: string, limit = 8): WikiSuggest
   return scored.slice(0, limit).map(({ score: _score, ...s }) => s);
 }
 
+/**
+ * Ceiling on the total tokens of *inlined page bodies* per scope, per turn.
+ *
+ * `WIKI_TOC_TOKEN_BUDGET` only ever governed the table of contents, while every
+ * `default`-labelled body was inlined in full into every turn of every task —
+ * twenty 5k-token pages meant 100k tokens per turn with no warning anywhere.
+ * Bodies are far more expensive than TOC lines, so this budget is separate and
+ * smaller. Overflow is not dropped: a page that does not fit is demoted to a TOC
+ * line (it stops being in the `exclude` set), so the agent can still find and
+ * open it.
+ */
+export const WIKI_INLINE_TOKEN_BUDGET = 20_000;
+
 /** Read a set of page paths into ordered (importance desc, then path) pages with
- *  their bodies for prompt delivery. Unreadable entries are skipped. */
-function readOrderedPages(root: string, paths: Iterable<string>): (WikiPage & { body: string })[] {
-  const out: (WikiPage & { body: string })[] = [];
+ *  their bodies for prompt delivery. Unreadable entries are skipped.
+ *  `budget`, when given, caps the total inlined body tokens: pages are taken in
+ *  priority order until the budget is spent and the rest are returned to the
+ *  caller separately as `overflow` so it can list them in the TOC instead. */
+function readOrderedPages(
+  root: string,
+  paths: Iterable<string>,
+  budget?: number,
+): { pages: (WikiPage & { body: string })[]; overflow: string[] } {
+  const all: (WikiPage & { body: string })[] = [];
   for (const rel of paths) {
     try {
       const page = readWikiPage(root, rel);
-      if (page) out.push({ ...page, body: parseFrontmatter(page.content).body.trim() });
+      if (page) all.push({ ...page, body: parseFrontmatter(page.content).body.trim() });
     } catch { /* unreadable entry — skip from delivery */ }
   }
-  out.sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0) || a.path.localeCompare(b.path));
-  return out;
+  all.sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0) || a.path.localeCompare(b.path));
+  if (budget === undefined) return { pages: all, overflow: [] };
+  const pages: (WikiPage & { body: string })[] = [];
+  const overflow: string[] = [];
+  let spent = 0;
+  for (const page of all) {
+    const cost = estimateTokens(page.body);
+    // Always inline at least the single most important page, even if it alone
+    // exceeds the budget — otherwise a scope with one huge `default` page would
+    // deliver no instructions at all.
+    if (pages.length && spent + cost > budget) { overflow.push(page.path); continue; }
+    pages.push(page);
+    spent += cost;
+  }
+  return { pages, overflow };
 }
 
 /** Every `default`-labelled entry of a tree (importance desc, then path), with
@@ -594,7 +845,7 @@ function readOrderedPages(root: string, paths: Iterable<string>): (WikiPage & { 
 export function collectDefaultPages(root: string, tree: WikiEntry): (WikiPage & { body: string })[] {
   const paths: string[] = [];
   walkLeaves(tree, (e) => { if (isDefaultDelivered(e)) paths.push(e.path); });
-  return readOrderedPages(root, paths);
+  return readOrderedPages(root, paths).pages;
 }
 
 /**
@@ -699,7 +950,10 @@ export function buildWikiPromptContext(args: {
     // (before the scope headings), so only on-disk pages are gathered here.
     const inlined = new Set<string>();
     for (const p of resolveWikiRefs(refs, scope, root, tree)) inlined.add(p);
-    const pages = readOrderedPages(root, inlined);
+    // Bodies are budgeted (WIKI_INLINE_TOKEN_BUDGET); anything that does not fit
+    // drops out of `inlined` and is therefore listed in the TOC below instead.
+    const { pages, overflow } = readOrderedPages(root, inlined, WIKI_INLINE_TOKEN_BUDGET);
+    for (const p of overflow) inlined.delete(p);
     // The TOC lists every entry NOT already inlined above (built-ins included in
     // the org catalogue; the `default` ones are inlined, so they drop out too).
     const tocTree =

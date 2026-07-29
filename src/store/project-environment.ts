@@ -147,9 +147,27 @@ export function parseDevcontainer(text: string): Omit<DevcontainerInfo, 'source'
   };
 }
 
+/**
+ * Turn JSONC (what a `devcontainer.json` actually is) into strict JSON.
+ *
+ * The scanner is string-aware throughout, INCLUDING the trailing-comma pass. That
+ * pass used to be a single `text.replace(/,\s*([}\]])/g, '$1')` over the finished
+ * document, which cannot see string boundaries: a perfectly ordinary command such
+ * as `"postCreateCommand": "npm i --workspaces, [dev]"` had characters deleted
+ * out of the middle of the string, and the container then ran a mangled command
+ * (or the JSON silently changed meaning). Commas are now dropped only where the
+ * scanner knows it is outside a string.
+ */
 export function stripJsonComments(text: string): string {
   let out = '';
   let inString = false;
+  /** Drop a just-emitted trailing comma when a `}`/`]` closes outside a string. */
+  const closeStructure = (ch: string) => {
+    let end = out.length;
+    while (end > 0 && /\s/.test(out[end - 1]!)) end--;
+    if (end > 0 && out[end - 1] === ',') out = out.slice(0, end - 1) + out.slice(end);
+    out += ch;
+  };
   for (let index = 0; index < text.length; index++) {
     const pair = text.slice(index, index + 2);
     if (inString) {
@@ -159,9 +177,10 @@ export function stripJsonComments(text: string): string {
     } else if (text[index] === '"') { inString = true; out += text[index]; }
     else if (pair === '//') { while (index < text.length && text[index] !== '\n') index++; out += '\n'; }
     else if (pair === '/*') { index += 2; while (index < text.length && text.slice(index, index + 2) !== '*/') index++; index++; }
+    else if (text[index] === '}' || text[index] === ']') closeStructure(text[index]!);
     else out += text[index];
   }
-  return out.replace(/,\s*([}\]])/g, '$1');
+  return out;
 }
 
 function shellQuote(value: string): string {

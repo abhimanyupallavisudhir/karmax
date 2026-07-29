@@ -2,6 +2,10 @@ import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
+import {
+  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
+  compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
+} from '../platform/platform-request.js';
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
 export interface ToolSchema {
@@ -129,8 +133,26 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: {} },
   },
   {
+    name: 'create_branch',
+    description:
+      'Multi-PR tasks ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns: a prep/refactor under a feature, or slices of different repos. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it. All branches stay one task with one Review and one Merge — if a piece needs its own review timing or cancellation, use create_sub_task instead. Fails on a single-branch task; do not retry, just keep working in the one branch.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Short name for this branch: its directory, and the label on its pull request (e.g. "refactor", "docs").',
+        },
+        from: { type: 'string', description: 'Name of the existing checkout whose REPOSITORY to branch (default: the one you started in). Use for a second repo.' },
+        base: { type: 'string', description: 'A sibling checkout\'s name to stack on top of, or a git ref. Default: the same base your current branch has.' },
+        target: { type: 'string', description: 'Branch this one should merge into. Default: the same target as the checkout it came from.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
     name: 'save_skill',
-    description: 'Save a reusable skill (markdown content) for future tasks.',
+    description: 'Save a reusable skill (markdown content) for future tasks. This writes INSTALLATION-WIDE global state — visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
     parameters: {
       type: 'object',
       properties: { name: { type: 'string' }, content: { type: 'string' } },
@@ -321,9 +343,180 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       },
     },
   },
+  // ─── task list operations ────────────────────────────────────────────────
+  // These mirror the platform MCP server one-for-one. They used to exist ONLY
+  // there, so an agent in a remote/cloud world — which falls back to these
+  // provider-neutral schemas instead of the gateway-backed stdio `karmax` MCP —
+  // simply had no way to create, find, tag, prioritize, or signal a task. Cloud
+  // worlds are the hosted default, so that was the largest practical gap in
+  // "an agent with suitable authorization can do what a human can".
+  {
+    name: 'create_task',
+    description:
+      'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
+      + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
+      + '`tags` accepts names or `a/b` paths and creates missing ones. '
+      + '`wiki_context` inlines wiki pages as `@proj:…`/`@org:…` tokens; omit to inherit the default-labelled pages, pass [] for none.',
+    parameters: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        title: { type: 'string' },
+        prompt: { type: 'string' },
+        workflow: { type: 'string' },
+        wiki_context: { type: 'array', items: { type: 'string' } },
+        draft: { type: 'boolean' },
+        priority: { type: 'string', enum: [...PRIORITY_NAMES] },
+        tags: { type: 'array', items: { type: 'string' } },
+        params: { type: 'object', description: 'Full task-form field values for the workflow.' },
+      },
+      required: ['project_id', 'title', 'prompt'],
+    },
+  },
+  {
+    name: 'get_task',
+    description: "Get a task's current view-model.",
+    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'list_tasks',
+    description: 'List every task in a project as bare {id, title, workflow}. Prefer search_tasks — it takes a query and returns num/status/stage/priority/tags.',
+    parameters: { type: 'object', properties: { project_id: { type: 'string' } }, required: ['project_id'] },
+  },
+  {
+    name: 'search_tasks',
+    description:
+      'Search/organize a project\'s tasks with a Linear-style query and get back a compact list (num, title, status, priority, tags). '
+      + 'Query grammar: `field:value` clauses AND together, commas = OR (`status:active,waiting`), `-` negates (`-tag:bug`), '
+      + 'comparisons on numbers/dates (`priority:>=2`, `created:<7d`), quoted phrases, and bare words = full text. '
+      + 'Fields: status, stage, priority, tag (a/b path matches descendants), workflow, created, updated, num, '
+      + 'is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), '
+      + 'trigger, schedule, nextRun, dependsOn:#N / blocks:#N, and any workflow param via `param.<key>`. '
+      + 'Add `sort:priority-desc` and `group:tag`. An empty query returns everything.',
+    parameters: { type: 'object', properties: { project_id: { type: 'string' }, query: { type: 'string' } }, required: ['project_id'] },
+  },
+  {
+    name: 'list_tags',
+    description: 'List a project\'s tag catalogue as `a/b/c` paths, with kind and optional section description.',
+    parameters: { type: 'object', properties: { project_id: { type: 'string' } }, required: ['project_id'] },
+  },
+  {
+    name: 'tag_task',
+    description:
+      'Add and/or remove tags on a task, by name or `a/b` path. Tags are purely organizational — never sent to any agent. '
+      + 'A name in `add` that does not exist is created (a slash path builds the hierarchy); a `remove` name that is not present is ignored.',
+    parameters: {
+      type: 'object',
+      properties: { task_id: { type: 'string' }, add: { type: 'array', items: { type: 'string' } }, remove: { type: 'array', items: { type: 'string' } } },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'set_task_priority',
+    description: 'Set a task\'s organizational priority — for search/sorting only, never sent to any agent.',
+    parameters: {
+      type: 'object',
+      properties: { task_id: { type: 'string' }, priority: { type: 'string', enum: [...PRIORITY_NAMES] } },
+      required: ['task_id', 'priority'],
+    },
+  },
+  {
+    name: 'signal_task',
+    description: `Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, \`role\` optionally addresses one of the task's attached agents (${AGENT_ROLE_NAMES.join(', ')}); it defaults to the Do agent.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string' },
+        signal: { type: 'string', enum: ['confirm', 'cancel', 'retry', 'followUp'] },
+        text: { type: 'string' },
+        role: { type: 'string', enum: [...AGENT_ROLE_NAMES] },
+      },
+      required: ['task_id', 'signal'],
+    },
+  },
+  {
+    name: 'reorder_queue',
+    description: 'Prioritize a task in a merge queue domain.',
+    parameters: { type: 'object', properties: { domain: { type: 'string' }, task_id: { type: 'string' } }, required: ['domain', 'task_id'] },
+  },
+  {
+    name: 'propose_workflow_edit',
+    description: 'Propose an edit to a workflow repo through the reviewed merge-only PR gate.',
+    parameters: {
+      type: 'object',
+      properties: { project_id: { type: 'string' }, title: { type: 'string' }, repo: { type: 'string' }, branch: { type: 'string' }, target: { type: 'string' } },
+      required: ['project_id', 'title', 'repo', 'branch', 'target'],
+    },
+  },
+  // ─── cloud sandbox providers + execution policy ──────────────────────────
+  {
+    name: 'list_world_providers',
+    description: 'List the cloud sandbox providers connected to an organization. Credentials are write-only and are never returned.',
+    parameters: { type: 'object', properties: { organization_id: { type: 'string' } }, required: ['organization_id'] },
+  },
+  {
+    name: 'connect_world_provider',
+    description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+    parameters: {
+      type: 'object',
+      properties: {
+        organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona'] },
+        api_key: { type: 'string' }, name: { type: 'string' },
+        template: { type: 'string' }, snapshot: { type: 'string' }, image: { type: 'string' },
+        desktop_template: { type: 'string' }, desktop_snapshot: { type: 'string' }, desktop_image: { type: 'string' },
+        api_url: { type: 'string' }, target: { type: 'string' },
+      },
+      required: ['organization_id', 'provider'],
+    },
+  },
+  {
+    name: 'test_world_provider',
+    description: 'Verify an organization cloud provider credential without creating a billable task world.',
+    parameters: {
+      type: 'object',
+      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona'] } },
+      required: ['organization_id', 'provider'],
+    },
+  },
+  {
+    name: 'disconnect_world_provider',
+    description: 'Remove an organization cloud provider credential after all worlds using it are gone.',
+    parameters: {
+      type: 'object',
+      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona'] } },
+      required: ['organization_id', 'provider'],
+    },
+  },
+  {
+    name: 'get_execution_policy',
+    description: 'Read an organization execution policy, or a project override plus its effective inherited policy.',
+    parameters: {
+      type: 'object',
+      properties: { organization_id: { type: 'string' }, project_id: { type: 'string' } },
+      required: ['organization_id'],
+    },
+  },
+  {
+    name: 'set_execution_policy',
+    description: 'Set organization execution defaults or sparse project overrides. Only the fields you pass are changed; null project values restore organization inheritance.',
+    parameters: {
+      type: 'object',
+      properties: {
+        organization_id: { type: 'string' }, project_id: { type: 'string' },
+        world_provider: { type: 'string' }, runner_pool_id: { type: 'string' },
+        environment_flavor: { type: 'string', enum: ['headless', 'desktop'] },
+        cpu: { type: 'number' }, memory_mb: { type: 'number' }, gpu: { type: 'number' },
+        unrestricted_internet: { type: 'boolean' },
+        allow_domains: { type: 'array', items: { type: 'string' } },
+        allow_cidrs: { type: 'array', items: { type: 'string' } },
+        monthly_budget_usd: { type: 'number' }, hibernate_after_days: { type: 'number' },
+      },
+      required: ['organization_id'],
+    },
+  },
   {
     name: 'find_task',
-    description: 'Find a task by project id and human-facing project-local number (#100).',
+    description: 'Resolve a human-facing project-local task number (#100) to its canonical id. Returns a pointer {id, num, projectId} — pass that id to get_task.',
     parameters: { type: 'object', properties: { project_id: { type: 'string' }, number: { type: 'number' } }, required: ['project_id', 'number'] },
   },
   {
@@ -385,10 +578,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'platform_request',
-    description: 'Call any authenticated karmax /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced. Call describe_platform when unsure.',
+    description: 'Call any authenticated karmax /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused. Call describe_platform when unsure.',
     parameters: {
       type: 'object',
-      properties: { method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] }, path: { type: 'string' }, body: { type: 'object' } },
+      properties: {
+        method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+        path: { type: 'string' },
+        body: PLATFORM_REQUEST_BODY_SCHEMA,
+      },
       required: ['method', 'path'],
     },
   },
@@ -446,6 +643,7 @@ export const PLATFORM_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter((t) => !S
 export const SDK_CONTROL_TOOL_NAMES = new Set([
   'create_review_info',
   'create_sub_task',
+  'create_branch',
   'respond_to_sub_task',
   'raise_to_parent',
   'wait_for_subtasks',
@@ -537,6 +735,23 @@ export function platformToolHandlers(
       ctx.waitForSubtasks();
       return 'waiting for sub-tasks to finish (or raise)';
     },
+    async create_branch(args) {
+      try {
+        const added = await ctx.addCheckout({
+          name: String(args?.name ?? ''),
+          from: args?.from ? String(args.from) : undefined,
+          base: args?.base ? String(args.base) : undefined,
+          target: args?.target ? String(args.target) : undefined,
+        });
+        ctx.emit(`branch ${added.branch} checked out at ${added.root}`);
+        return `branch "${added.branch}" is checked out at ${added.root} — work in that directory for the change`
+          + ` belonging to this pull request, and commit it there. It is reviewed and merged with the rest of this task.`;
+      } catch (e: any) {
+        // A refusal here is informational, not a turn failure: the agent can
+        // simply carry on in the branch it already has.
+        return `could not create the branch: ${e?.message ?? e}`;
+      }
+    },
     async save_skill(args) {
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
       return 'skill saved';
@@ -623,6 +838,139 @@ export function platformToolHandlers(
     async use_passkey(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain, cdpUrl: args?.cdp_url }));
     },
+    // ─── task list operations (mirroring the platform MCP server) ─────────
+    async create_task(args) {
+      const projectId = encodeURIComponent(String(args?.project_id ?? ''));
+      // `priority`/`tags` are sent WITH the create rather than as follow-up
+      // edits: those follow-ups needed `task:edit`, which the bundled Do role
+      // does not hold, so a tagged create half-succeeded and then returned a
+      // permission error for a task that already existed. An unknown priority
+      // name is reported rather than silently dropped (`indexOf` → -1).
+      let priority: number | undefined;
+      if (args?.priority !== undefined) {
+        const index = PRIORITY_NAMES.indexOf(String(args.priority) as any);
+        if (index < 0) return `error: unknown priority "${String(args.priority)}" (expected one of ${PRIORITY_NAMES.join(', ')})`;
+        if (index > 0) priority = index;
+      }
+      const tags = Array.isArray(args?.tags) && args.tags.length ? args.tags : undefined;
+      const created: any = await platformRequest('POST', `/api/projects/${projectId}/tasks`, {
+        title: args?.title, prompt: args?.prompt, workflow: args?.workflow,
+        wikiContext: args?.wiki_context, draft: args?.draft, params: args?.params,
+        ...(priority !== undefined ? { priority } : {}), ...(tags ? { tags } : {}),
+      });
+      return JSON.stringify(created);
+    },
+    async get_task(args) {
+      return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`));
+    },
+    async list_tasks(args) {
+      const listed = await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks`) as any[];
+      return JSON.stringify((listed ?? []).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })));
+    },
+    async search_tasks(args) {
+      const projectId = encodeURIComponent(String(args?.project_id ?? ''));
+      const [result, tags] = await Promise.all([
+        platformRequest('GET', `/api/projects/${projectId}/search?q=${encodeURIComponent(String(args?.query ?? ''))}`),
+        platformRequest('GET', `/api/projects/${projectId}/tags`),
+      ]);
+      return JSON.stringify(compactSearch(result, tags as any[]));
+    },
+    async list_tags(args) {
+      const tags = await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tags`);
+      return JSON.stringify(compactTags(tags as any[]));
+    },
+    async tag_task(args) {
+      return JSON.stringify(await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/tag`,
+        { add: args?.add, remove: args?.remove }));
+    },
+    async set_task_priority(args) {
+      const priority = PRIORITY_NAMES.indexOf(String(args?.priority ?? '') as any);
+      if (priority < 0) return `invalid priority — use one of ${PRIORITY_NAMES.join(', ')}`;
+      await platformRequest('PUT', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/priority`, { priority });
+      return `priority set to ${args?.priority}`;
+    },
+    async signal_task(args) {
+      await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/signal`,
+        { signal: args?.signal, text: args?.text, role: args?.role });
+      return 'signalled';
+    },
+    async reorder_queue(args) {
+      await platformRequest('POST', '/api/queue/prioritize', { domain: args?.domain, taskId: args?.task_id });
+      return 'reordered';
+    },
+    async propose_workflow_edit(args) {
+      return JSON.stringify(await platformRequest('POST',
+        `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/propose-workflow-edit`,
+        { title: args?.title, repo: args?.repo, branch: args?.branch, target: args?.target }));
+    },
+    // ─── cloud sandbox providers + execution policy ───────────────────────
+    async list_world_providers(args) {
+      return JSON.stringify(await platformRequest('GET', `/api/organizations/${encodeURIComponent(String(args?.organization_id ?? ''))}/world-providers`));
+    },
+    async connect_world_provider(args) {
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      return JSON.stringify(await platformRequest('PUT', `/api/organizations/${org}/world-providers/${encodeURIComponent(String(args?.provider ?? ''))}`, {
+        apiKey: args?.api_key, name: args?.name,
+        config: { template: args?.template, snapshot: args?.snapshot, image: args?.image,
+          desktopTemplate: args?.desktop_template, desktopSnapshot: args?.desktop_snapshot, desktopImage: args?.desktop_image,
+          apiUrl: args?.api_url, target: args?.target },
+      }));
+    },
+    async test_world_provider(args) {
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      return JSON.stringify(await platformRequest('POST', `/api/organizations/${org}/world-providers/${encodeURIComponent(String(args?.provider ?? ''))}/test`, {}));
+    },
+    async disconnect_world_provider(args) {
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      return JSON.stringify(await platformRequest('DELETE', `/api/organizations/${org}/world-providers/${encodeURIComponent(String(args?.provider ?? ''))}`));
+    },
+    async get_execution_policy(args) {
+      return JSON.stringify(await platformRequest('GET', args?.project_id
+        ? `/api/projects/${encodeURIComponent(String(args.project_id))}/execution-policy`
+        : `/api/organizations/${encodeURIComponent(String(args?.organization_id ?? ''))}/execution-policy`));
+    },
+    async set_execution_policy(args) {
+      const projectId = args?.project_id ? String(args.project_id) : undefined;
+      const url = projectId
+        ? `/api/projects/${encodeURIComponent(projectId)}/execution-policy`
+        : `/api/organizations/${encodeURIComponent(String(args?.organization_id ?? ''))}/execution-policy`;
+      const policy: Record<string, unknown> = {};
+      if (args?.world_provider !== undefined) policy.worldProvider = args.world_provider;
+      if (args?.runner_pool_id !== undefined) policy.runnerPoolId = args.runner_pool_id;
+      if (args?.environment_flavor !== undefined) policy.environment = { flavor: args.environment_flavor };
+      if (args?.monthly_budget_usd !== undefined)
+        policy.monthlyBudgetMicros = args.monthly_budget_usd == null ? null : Math.round(Number(args.monthly_budget_usd) * 1e6);
+      if (args?.hibernate_after_days !== undefined)
+        policy.hibernateAfterMs = args.hibernate_after_days == null ? null : Math.round(Number(args.hibernate_after_days) * 86_400_000);
+      // Sparse by contract: `network` is replaced wholesale by the store, so a
+      // partial change is merged against the policy currently in force rather
+      // than silently clearing the fields the caller did not mention.
+      const wantsResources = args?.cpu !== undefined || args?.memory_mb !== undefined || args?.gpu !== undefined;
+      const wantsNetwork = args?.unrestricted_internet !== undefined || args?.allow_domains !== undefined || args?.allow_cidrs !== undefined;
+      if (wantsResources || wantsNetwork) {
+        const current: any = await platformRequest('GET', url).catch(() => undefined);
+        // Two response shapes: the project route answers `{override, …}`, the
+        // organization route answers the BARE policy (src/gateway/server.ts).
+        // Reading only `.organization` made the org-scoped base `{}`, so the
+        // merge discarded the live policy instead of preserving it.
+        const base = (projectId ? current?.override : (current?.organization ?? current)) ?? {};
+        if (wantsResources) {
+          const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
+          if (args?.cpu !== undefined) resources.cpu = args.cpu;
+          if (args?.memory_mb !== undefined) resources.memoryMb = args.memory_mb;
+          if (args?.gpu !== undefined) resources.gpu = args.gpu;
+          policy.resources = resources;
+        }
+        if (wantsNetwork) {
+          const network: Record<string, unknown> = { ...(base.network ?? {}) };
+          if (args?.unrestricted_internet !== undefined) network.unrestricted = args.unrestricted_internet;
+          if (args?.allow_domains !== undefined) network.allowDomains = args.allow_domains;
+          if (args?.allow_cidrs !== undefined) network.allowCidrs = args.allow_cidrs;
+          policy.network = network;
+        }
+      }
+      return JSON.stringify(await platformRequest('PUT', url, projectId ? { override: policy } : { policy }));
+    },
     async find_task(args) {
       return JSON.stringify(await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks/by-num/${Number(args?.number)}`));
     },
@@ -672,8 +1020,13 @@ export function platformToolHandlers(
       const method = String(args?.method ?? 'GET').toUpperCase();
       const requestPath = String(args?.path ?? '');
       if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return 'error: invalid method';
-      if (!requestPath.startsWith('/api/') || requestPath.startsWith('/api/login') || requestPath.startsWith('/api/setup')) return 'error: authenticated /api/* path required';
-      return JSON.stringify(await platformRequest(method, requestPath, args?.body));
+      // One shared exclusion list with the MCP surface. This copy used to deny
+      // only /api/login and /api/setup, so it permitted POST /api/signup (which
+      // bootstraps an organization *administrator*) and every /api/auth/* Better
+      // Auth route — an agent could mint itself a human login with no user:write.
+      const rejected = platformRequestPathError(requestPath);
+      if (rejected) return `error: ${rejected}`;
+      return JSON.stringify(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)));
     },
     async signal_completion(args) {
       ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);

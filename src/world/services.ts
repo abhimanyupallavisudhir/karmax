@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectService, ResourceAttachment } from '../domain/types.js';
-import type { World } from './types.js';
+import type { ExecResult, World } from './types.js';
 import { paths } from '../config/paths.js';
 
 const pexec = promisify(execFile);
@@ -52,13 +52,41 @@ export async function launchWorldServices(world: World, taskId: string, services
   return result;
 }
 
-export async function destroyWorldServices(taskId: string): Promise<void> {
-  const listed = await hostDocker(['ps', '-aq', '--filter', `label=karmax.task=${taskId}`,
+/**
+ * Tear down a task's per-world service containers. `launchWorldServices` starts
+ * them with `world.exec('docker', …)` — INSIDE the sandbox for a remote world —
+ * so teardown has to speak to the same Docker daemon. Running it on the host
+ * (the only thing this function could do before `world` was threaded through)
+ * is a silent no-op against the wrong daemon: it lists nothing and removes
+ * nothing. Callers that no longer have a live world (a destroyed sandbox takes
+ * its containers with it) may omit it and get the host path.
+ */
+export async function destroyWorldServices(taskId: string, world?: World): Promise<void> {
+  const run = dockerFor(world);
+  const listed = await run(['ps', '-aq', '--filter', `label=karmax.task=${taskId}`,
     '--filter', `label=karmax.home=${serviceHomeLabel()}`], 10_000);
   const ids = listed.stdout.split('\n').map((value) => value.trim()).filter(Boolean);
-  if (ids.length) await hostDocker(['rm', '-f', ...ids], 60_000);
+  if (ids.length) await run(['rm', '-f', ...ids], 60_000);
 }
 
+/** Docker command channel for a world: the world's own daemon when we have a
+ *  world (that is where its service containers were started), the host's when
+ *  the world is already gone. */
+function dockerFor(world: World | undefined): (args: string[], timeout: number) => Promise<ExecResult> {
+  // Mirrors `launchWorldServices`, which ALWAYS starts containers through
+  // `world.exec('docker', …)`. Routing teardown by world *kind* instead sent
+  // `container` worlds to the HOST daemon even though their containers had been
+  // started inside the world — launch and teardown addressed different daemons,
+  // so the removal matched nothing and said nothing. If a world is available,
+  // speak to that world's daemon; kind does not come into it.
+  if (!world) return hostDocker;
+  return async (args, timeout) => world.exec('docker', args, { timeoutMs: timeout });
+}
+
+/** Host-side reaper for service containers whose world is gone. Deliberately
+ * host-only: a remote world's service containers live and die inside its
+ * sandbox, which the world orphan sweep in `WorldLifecycleManager` destroys as
+ * a unit — there is nothing on this host to find for them. */
 export async function sweepOrphanedServiceContainers(worldState: (taskId: string) => string | undefined): Promise<number> {
   const listed = await hostDocker(['ps', '-aq', '--filter', `label=karmax.home=${serviceHomeLabel()}`], 10_000);
   let reaped = 0;
@@ -71,7 +99,7 @@ export async function sweepOrphanedServiceContainers(worldState: (taskId: string
   return reaped;
 }
 
-async function hostDocker(args: string[], timeout: number): Promise<{ stdout: string; stderr: string; code: number }> {
+async function hostDocker(args: string[], timeout: number): Promise<ExecResult> {
   try {
     const { stdout, stderr } = await pexec('docker', args, { timeout, maxBuffer: 16 * 1024 * 1024 });
     return { stdout, stderr, code: 0 };

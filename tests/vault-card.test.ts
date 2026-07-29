@@ -43,7 +43,15 @@ describe('VaultCardProvider — the universal rail', () => {
     const row = store.getCard(card.id);
     expect(row.last4).toBe('4242');
     expect(JSON.stringify(row)).not.toContain('4242424242424242');
-    expect(JSON.stringify(row)).not.toContain('123');
+    // NOT `JSON.stringify(row)).not.toContain('123')`. The row carries a 13-digit
+    // `createdAt` (plus generated ids), so scanning the whole blob for a 3-digit
+    // CVC false-positives whenever a timestamp happens to contain those digits —
+    // ~0.3% of runs, i.e. a suite that fails occasionally for no reason and
+    // teaches everyone to re-run it. Assert the real invariant instead: no stored
+    // field carries the secret, and the secret-bearing keys are absent entirely.
+    expect(Object.values(row)).not.toContain('123');
+    expect(row).not.toHaveProperty('cvc');
+    expect(row).not.toHaveProperty('number');
     expect(broker.hasHandle(cardSecretHandle(card.id))).toBe(true);
   });
 
