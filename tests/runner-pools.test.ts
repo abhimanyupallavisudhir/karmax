@@ -144,6 +144,54 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.worldState('task-local')).toBe('ready');
   });
 
+  /**
+   * Daytona is created with `autoDeleteInterval: -1`, which switches the
+   * provider's own reaper OFF on the explicit promise that karmax reaps
+   * instead. That promise had no implementation — `listSandboxes` was written
+   * on both providers and never called — so a sandbox whose task was deleted
+   * before `destroyWorld` ran billed forever with nothing collecting it.
+   */
+  it('reaps a remote sandbox whose task is gone, and never one it cannot attribute', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Orphans', {});
+    const live = store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    const destroyed: string[] = [];
+    const ref = (sandboxId: string, taskId?: string) => ({
+      sandboxId, ...(taskId ? { taskId } : {}),
+      destroy: async () => { destroyed.push(sandboxId); },
+    });
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'daytona', parkable: true,
+      async listSandboxes() {
+        return [
+          ref('sb-orphan', 'task-deleted-long-ago'), // task row gone → reap
+          ref('sb-live', live.id),                   // task still exists → keep
+          ref('sb-unlabelled'),                      // unattributable → never touch
+        ];
+      } } as any);
+
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    await lifecycle.sweep(Date.now());
+
+    expect(destroyed).toEqual(['sb-orphan']);
+    expect(store.auditSince(0).some((e: { action: string }) => e.action === 'world.orphanReaped')).toBe(true);
+  });
+
+  it('keeps sweeping after one provider control plane fails', async () => {
+    const store = new Store(':memory:');
+    const destroyed: string[] = [];
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true, async listSandboxes() { throw new Error('control plane down'); } } as any);
+    worlds.register({ kind: 'daytona', parkable: true,
+      async listSandboxes() {
+        return [{ sandboxId: 'sb-2', taskId: 'gone', destroy: async () => { destroyed.push('sb-2'); } }];
+      } } as any);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    await expect(lifecycle.sweep(Date.now())).resolves.toBeDefined();
+    expect(destroyed).toEqual(['sb-2']);
+  });
+
   it('releases runner capacity held by an execution lost during failover', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });

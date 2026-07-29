@@ -29,12 +29,20 @@ export async function findFreePortFrom(
   throw new Error(`no free port found at or above ${start} (tried up to ${limit - 1})`);
 }
 
-/** Ask the OS for a free TCP port by binding to :0 and reading it back. */
+/** Ask the OS for a free TCP port by binding to :0 and reading it back.
+ *
+ *  The `error` path closes the server too. It used to reject and walk away,
+ *  leaking a listening (or half-open) socket per failure — and `srv.unref()` only
+ *  stops it holding the event loop open, it does not release the handle. A caller
+ *  that retries in a loop (boot allocating several service ports) leaked one each
+ *  time round. */
 export function findFreePort(host = '127.0.0.1'): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
     srv.unref();
-    srv.on('error', reject);
+    srv.on('error', (error) => {
+      srv.close(() => reject(error));
+    });
     srv.listen(0, host, () => {
       const addr = srv.address();
       if (addr && typeof addr === 'object') {

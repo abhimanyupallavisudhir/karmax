@@ -6,7 +6,7 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager } from './temporal/worker-pool.js';
 import { TASK_QUEUE } from './temporal/config.js';
-import { WorkflowManager, reloadSpecForWorkflowEdit } from './packages/manager.js';
+import { WorkflowManager, reloadSpecForWorkflowEdit, proposerMayInstall } from './packages/manager.js';
 import { WorkflowRepoLoader } from './packages/repo.js';
 import { Store } from './store/db.js';
 import { WorldRegistry } from './world/registry.js';
@@ -45,11 +45,36 @@ import { sweepOrphanedServiceContainers } from './world/services.js';
 
 const VERSION = '1.0.0';
 
+/**
+ * Keep a stray rejection from taking the whole app down.
+ *
+ * Node ≥22 exits the process on an unhandled rejection. karmax is a long-lived
+ * server whose background loops are fire-and-forget by design (the delivery
+ * dispatcher, the mail poller, the trigger scheduler, the lifecycle sweep), so a
+ * single transient SQLITE_BUSY or a provider timeout in any one of them would
+ * otherwise kill the gateway, the worker, and every in-flight agent turn with it.
+ *
+ * This deliberately logs rather than swallows: the stack still reaches the
+ * operator, and each loop remains responsible for its own error handling. It is a
+ * backstop against total loss, not a licence to skip `.catch`.
+ *
+ * INTENDED: `uncaughtException` is NOT handled here. A synchronous throw that
+ * escaped every frame leaves state unknown, and Node's default (crash) is the
+ * right answer — the supervisor restarts into a clean process. Only the
+ * rejection case, where the failure is confined to one awaited chain, is caught.
+ */
+function installProcessGuards(): void {
+  process.on('unhandledRejection', (reason) => {
+    console.error('  ⚠ unhandled rejection (app kept running):', reason instanceof Error ? reason.stack ?? reason.message : reason);
+  });
+}
+
 /** How often to re-check the task index against live workflows. Each pass is one
  *  bounded `describe` per non-terminal task, so it stays cheap at list scale. */
 const RECONCILE_INTERVAL_MS = 60_000;
 
 async function main() {
+  installProcessGuards();
   hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
   const deployment = validateDeployment();
   const p = ensurePaths();
@@ -271,6 +296,19 @@ async function main() {
   }, 10_000);
   orphanSweep.unref();
 
+  // Retention: expired scoped tokens and aged-out GitHub webhook delivery ids grow
+  // without bound otherwise. `Store.retentionSweep` existed and was tested but had
+  // no caller, so neither table was ever purged on a running install. Hourly, and
+  // once at boot so a long-stopped install catches up immediately.
+  const sweepRetention = () => {
+    const swept = store.retentionSweep();
+    if (swept.scopedTokens || swept.githubDeliveries)
+      console.log(`  • Purged ${swept.scopedTokens} expired token(s) and ${swept.githubDeliveries} aged webhook delivery id(s)`);
+  };
+  sweepRetention();
+  const retentionTimer = setInterval(sweepRetention, 3600_000);
+  retentionTimer.unref();
+
   // Repair coordinator singletons whose history this build can no longer replay.
   // Runs before task reconciliation so a merge queue that self-heals here is
   // already answering by the time tasks waiting on it are examined.
@@ -400,9 +438,17 @@ async function main() {
   const healed = new Set<string>();
   bus.onAny((ev) => {
     if (ev.type !== 'view.updated' || (ev.payload as { status?: string })?.status !== 'done' || healed.has(ev.taskId)) return;
-    const spec = reloadSpecForWorkflowEdit(store.getTask(ev.taskId) ?? {}, 'done');
-    if (!spec) return;
     const task = store.getTask(ev.taskId);
+    const spec = reloadSpecForWorkflowEdit(task ?? {}, 'done');
+    if (!spec) {
+      // Distinguish "not a workflow edit" (the common case, silent) from
+      // "was one, but the proposer may not install" — see proposerMayInstall.
+      if ((task?.params as { workflowEdit?: unknown } | undefined)?.workflowEdit && !proposerMayInstall(task ?? {})) {
+        healed.add(ev.taskId);
+        console.warn(`  • Workflow reload after edit skipped: the proposer of task ${ev.taskId} lacks workflow:install`);
+      }
+      return;
+    }
     const organizationId = task ? store.getProject(task.projectId)?.organizationId : undefined;
     healed.add(ev.taskId);
     workflows
@@ -467,6 +513,13 @@ async function main() {
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,
+    // Exactly the channels wired into the DeliveryDispatcher above, so the console
+    // can disable a switch it cannot honour instead of reporting a false "saved".
+    deliveryChannels: [
+      'browser',
+      ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? ['email'] : []),
+      ...(process.env.KARMAX_SLACK_DELIVERY_URL ? ['slack'] : []),
+    ],
     remoteAccess,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;

@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
+import { MANIFESTS } from '../src/contrib/manifests.js';
+// Derived, not hard-coded: the pinned type moves every time a workflow ships a
+// new replay version, and a literal here just makes an unrelated PR red.
+const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
 import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
 
@@ -90,7 +94,7 @@ describe('task stage transitions', () => {
 
     const restored = await f.api.moveTaskStage(f.token, f.task.id, 'do');
     expect(f.starts).toHaveLength(1);
-    expect(f.starts[0]!.type).toBe('softwareDev@1.9.0');
+    expect(f.starts[0]!.type).toBe(`softwareDev@${bundledVersion('software-dev')}`);
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', messages: f.view.messages });
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
   });
@@ -258,7 +262,7 @@ describe('task stage transitions', () => {
 
     await f.api.changeWorkflow(f.token, f.task.id, 'goal');
 
-    expect(f.starts.at(-1)!.type).toBe('goal@1.9.0');
+    expect(f.starts.at(-1)!.type).toBe(`goal@${bundledVersion('goal')}`);
     expect(f.starts.at(-1)!.options.args[0]).toMatchObject({ recovery: { resumeStage: 'do' } });
     expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1).text).toMatch(/continue autonomously/i);
     expect(f.store.getTask(f.task.id)?.workflow).toBe('goal');

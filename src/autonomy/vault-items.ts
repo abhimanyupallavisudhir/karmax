@@ -446,9 +446,20 @@ export class VaultItems {
    * Decide one access. A one-shot pass (a human approved exactly this) grants
    * regardless of coverage/policy and is consumed when `consume` is set — set
    * it on the actual use, not on peeks.
+   *
+   * `ambient` opts OUT of the pass entirely, for standing spawn-time injection
+   * (`envFor`). A one-shot pass answers one request; it is not consumed by an
+   * ambient injection and must not authorize one, or a `once` approval would
+   * silently become permanent — `envFor` runs every turn, so the un-consumed pass
+   * re-granted the secret into the agent's environment for the task's whole life.
+   * `resolve`'s `task` action is the one that means "for the rest of this task",
+   * and it grants a durable capability extension that `covered()` picks up here.
    */
-  access(caps: Capability[], taskId: string | undefined, item: VaultItem, mode: AccessMode, opts: { consume?: boolean } = {}): { status: AccessStatus; reason?: string } {
-    if (taskId && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
+  access(
+    caps: Capability[], taskId: string | undefined, item: VaultItem, mode: AccessMode,
+    opts: { consume?: boolean; ambient?: boolean } = {},
+  ): { status: AccessStatus; reason?: string } {
+    if (taskId && !opts.ambient && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
     const policyForTask = this.effectivePolicy(taskId, item);
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
     if (!this.covered(caps, taskId, item)) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
@@ -486,7 +497,7 @@ export class VaultItems {
     const env: Record<string, string> = {};
     for (const item of this.list()) {
       if (!['env', 'api-key', 'ssh-key'].includes(item.type)) continue;
-      if (this.access(caps, taskId, item, 'use').status !== 'granted') continue;
+      if (this.access(caps, taskId, item, 'use', { ambient: true }).status !== 'granted') continue;
       try {
         if (item.type === 'env' && item.fields.includes('env')) {
           for (const line of this.resolveField(item, 'env', { taskId, mode: 'use' }).split('\n')) {

@@ -25,6 +25,10 @@ const managedRepoClones = new Map<string, Promise<string>>();
 export class WorktreeProvider implements WorldProvider {
   readonly kind = 'worktree' as const;
   readonly parkable = false;
+  /** Declared (rather than left undefined) so `/api/meta`'s worldProviders has
+   * one shape for every provider, and so `capabilities.remote` is the single
+   * question callers ask instead of matching on provider-name lists. */
+  readonly capabilities = { remote: false, pty: true, snapshots: false, ports: false, networkPolicy: false } as const;
 
   constructor(private home = paths().worlds) {}
 

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bundleWorkflowCode, WorkflowBundle, DefaultLogger, LogLevel } from '@temporalio/worker';
+import { ENTRYPOINT_PATTERN } from './schema.js';
 
 /** An externally-loaded workflow to fold into the worker's deterministic bundle. */
 export interface ExternalWorkflowRef {
@@ -50,13 +51,24 @@ export async function buildVersionedBundle(externals: ExternalWorkflowRef[]): Pr
   }
 }
 
-/** The generated bundle entry: re-export the built-ins, then each external type. */
+/**
+ * The generated bundle entry: re-export the built-ins, then each external type.
+ *
+ * `type` and `entryFile` are `JSON.stringify`'d, but `exportName` cannot be — it
+ * is an *identifier* position in the generated `import { X as _ext0 }` and is
+ * therefore raw source. It comes from an untrusted package manifest, so re-check
+ * it here even though `manifestSchema` already validates it: this function is the
+ * last point before attacker text becomes code webpack compiles into the worker,
+ * and defence must not depend on every caller having validated first.
+ */
 export function generateEntry(externals: ExternalWorkflowRef[]): string {
   const lines: string[] = [];
   const reexports: string[] = [];
   externals.forEach((ext, i) => {
     const local = `_ext${i}`;
     const url = JSON.stringify(pathToFileURL(ext.entryFile).href);
+    if (ext.exportName !== undefined && !ENTRYPOINT_PATTERN.test(ext.exportName))
+      throw new Error(`workflow package "${ext.type}" declares an invalid export name; it must be a bare JavaScript identifier`);
     lines.push(ext.exportName ? `import { ${ext.exportName} as ${local} } from ${url};` : `import ${local} from ${url};`);
     reexports.push(`export { ${local} as ${JSON.stringify(ext.type)} };`);
   });

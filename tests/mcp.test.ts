@@ -12,6 +12,7 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { platformToolHandlers } from '../src/agent/tools.js';
 
 describe('platform MCP server (capability-checked tool calls)', () => {
   let store: Store;
@@ -189,6 +190,68 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(JSON.parse(removed.content[0].text)).toEqual({ deleted: true });
   });
 
+  /**
+   * `set_execution_policy` advertises "sparse project overrides", but it built a
+   * FULL `network`/`resources` object whenever any member field was supplied —
+   * and the store replaces `network` wholesale while `resources` merges by
+   * spread (so an explicit `undefined` erases the stored value). So
+   * `{allowDomains}` alone silently set `unrestricted:false` and dropped
+   * `allowCidrs`, and `{memoryMb}` alone erased `cpu` and `gpu`. Disabling
+   * unrestricted internet behind the caller's back is a live-config hazard, not
+   * a cosmetic one.
+   */
+  it('applies set_execution_policy sparsely instead of erasing unrelated fields', async () => {
+    const organization = store.createOrganization({ name: 'Sparse', ownerUserId: 'a' });
+    currentToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, organization.id).token;
+    const call = async (args: any) => {
+      const res: any = await client.callTool({ name: 'set_execution_policy', arguments: { organizationId: organization.id, ...args } });
+      expect(res.isError, res.content?.[0]?.text).toBeFalsy();
+      return JSON.parse(res.content[0].text).organization;
+    };
+
+    await call({ cpu: 4, memoryMb: 8192, gpu: 1, unrestrictedInternet: true,
+      allowDomains: ['pypi.org'], allowCidrs: ['10.0.0.0/8'] });
+
+    // Adding one allowed domain must not revoke unrestricted internet or drop the CIDRs.
+    const afterDomains = await call({ allowDomains: ['pypi.org', 'npmjs.com'] });
+    expect(afterDomains.network).toMatchObject({
+      unrestricted: true, allowDomains: ['pypi.org', 'npmjs.com'], allowCidrs: ['10.0.0.0/8'],
+    });
+    expect(afterDomains.resources).toMatchObject({ cpu: 4, memoryMb: 8192, gpu: 1 });
+
+    // Resizing memory must not erase cpu/gpu, nor touch the network policy.
+    const afterMemory = await call({ memoryMb: 4096 });
+    expect(afterMemory.resources).toMatchObject({ cpu: 4, memoryMb: 4096, gpu: 1 });
+    expect(afterMemory.network).toMatchObject({ unrestricted: true, allowCidrs: ['10.0.0.0/8'] });
+
+    // An explicit value is still honoured — sparseness is not stickiness.
+    expect((await call({ unrestrictedInternet: false })).network).toMatchObject({
+      unrestricted: false, allowCidrs: ['10.0.0.0/8'],
+    });
+  });
+
+  /**
+   * An agent has to tell a denial (escalate) from a bad identifier (retry with
+   * another id) from a server fault (back off). `wrap` only recognized
+   * CapabilityError, so an in-process NotFoundError read as a generic `error:`.
+   */
+  it('distinguishes denied from not-found in the agent-visible error text', async () => {
+    currentToken = tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a',
+      ceiling: ['task:*'], grantorCaps: ['task:*'] }).token;
+    const missing: any = await client.callTool({ name: 'tag_task', arguments: { taskId: 'task_missing', add: ['bug'] } });
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0].text).toMatch(/HTTP 404/);
+    expect(missing.content[0].text).not.toMatch(/permission denied/);
+
+    const pid = store.createProject('Errors').id;
+    const task = store.createTask({ projectId: pid, title: 'Real', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    currentToken = tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a',
+      ceiling: ['signal-completion'], grantorCaps: ['signal-completion'] }).token;
+    const refused: any = await client.callTool({ name: 'tag_task', arguments: { taskId: task.id, add: ['bug'] } });
+    expect(refused.content[0].text).toMatch(/permission denied/);
+  });
+
   it('lets an agent tag, prioritize, and search tasks by attribute', async () => {
     // Seed a project + two tasks directly in the store (createTask via MCP would start a
     // workflow, which this harness's mock client can't do).
@@ -354,5 +417,95 @@ describe('httpOps token resolution (CLI bridge)', () => {
     } finally {
       (globalThis as any).fetch = orig;
     }
+  });
+});
+
+/**
+ * `set_execution_policy`'s sparse merge read its base as `current.organization`.
+ * That key exists on the in-process `apiOps` (`api.getExecutionPolicy` wraps the
+ * org policy as `{organization}`) and on the gateway's PROJECT route
+ * (`{override, organization, effective}`) — but the gateway's ORGANIZATION route
+ * returns the **bare** policy object (`src/gateway/server.ts`, GET
+ * /api/organizations/:id/execution-policy). `httpOps` is the only production
+ * wiring (`src/mcp/stdio.ts`; `apiOps` is used solely by these tests), so on the
+ * shipped path the org-scoped base was always `{}` and the "merge" discarded the
+ * policy in force: because the store replaces `network` wholesale, an update of
+ * just `{allowDomains}` cleared `unrestricted` and dropped `allowCidrs`. The
+ * apiOps-backed test above cannot see this — it never exercises the route shape.
+ */
+describe('set_execution_policy merge base (httpOps — the shipped gateway shape)', () => {
+  const jsonRes = (status: number, body: unknown) =>
+    ({ ok: status < 400, status, headers: { get: () => 'application/json' }, json: async () => body, text: async () => JSON.stringify(body) }) as any;
+
+  /** The policy currently in force, as the store would report it. */
+  const STORED = {
+    worldProvider: 'e2b',
+    resources: { cpu: 4, memoryMb: 8192, gpu: 1 },
+    network: { unrestricted: true, allowDomains: ['pypi.org'], allowCidrs: ['10.0.0.0/8'] },
+  };
+
+  /** Fake gateway: the org route answers BARE, the project route answers wrapped. */
+  const fakeGateway = (puts: any[]) => async (url: string, init: any = {}) => {
+    const method = (init.method ?? 'GET').toUpperCase();
+    if (method === 'PUT') { puts.push(JSON.parse(init.body)); return jsonRes(200, { saved: true }); }
+    if (/\/api\/organizations\/[^/]+\/execution-policy$/.test(url)) return jsonRes(200, STORED);
+    if (/\/api\/projects\/[^/]+\/execution-policy$/.test(url))
+      return jsonRes(200, { override: STORED, organization: {}, effective: STORED });
+    return jsonRes(404, { error: `unexpected ${method} ${url}` });
+  };
+
+  /** Drive the real MCP tool over httpOps; return the bodies it PUT. */
+  const putBodies = async (args: Record<string, unknown>): Promise<any[]> => {
+    const puts: any[] = [];
+    const orig = globalThis.fetch;
+    (globalThis as any).fetch = fakeGateway(puts);
+    try {
+      const server = createPlatformMcpServer(httpOps('http://gw', 'tok'));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const c = new Client({ name: 'test', version: '1.0.0' });
+      await c.connect(clientT);
+      const res: any = await c.callTool({ name: 'set_execution_policy', arguments: args });
+      expect(res.isError, res.content?.[0]?.text).toBeFalsy();
+    } finally {
+      (globalThis as any).fetch = orig;
+    }
+    return puts;
+  };
+
+  it('keeps unrestricted internet and the CIDRs on an org-scoped allowDomains update', async () => {
+    const [body] = await putBodies({ organizationId: 'org_1', allowDomains: ['pypi.org', 'npmjs.com'] });
+    expect(body.policy.network).toEqual({
+      unrestricted: true, allowDomains: ['pypi.org', 'npmjs.com'], allowCidrs: ['10.0.0.0/8'],
+    });
+  });
+
+  it('keeps cpu/gpu on an org-scoped memoryMb update', async () => {
+    const [body] = await putBodies({ organizationId: 'org_1', memoryMb: 4096 });
+    expect(body.policy.resources).toEqual({ cpu: 4, memoryMb: 4096, gpu: 1 });
+  });
+
+  it('still merges a project override from the wrapped {override} shape', async () => {
+    const [body] = await putBodies({ organizationId: 'org_1', projectId: 'p1', memoryMb: 4096 });
+    expect(body.override.resources).toEqual({ cpu: 4, memoryMb: 4096, gpu: 1 });
+    expect(body.override.network).toBeUndefined(); // untouched keys are not resent
+  });
+
+  // `src/agent/tools.ts` carries a second copy of this handler for the
+  // tool-calling (non-MCP) rail, with the identical defect.
+  it('applies the same merge in the agent tool-handler rail', async () => {
+    const puts: { method: string; path: string; body: any }[] = [];
+    const handlers = platformToolHandlers({} as any, {
+      emit: () => {},
+      platformRequest: async (method: string, path: string, body?: unknown) => {
+        if (method === 'GET') return STORED; // bare, as the org route answers
+        puts.push({ method, path, body: body as any });
+        return { saved: true };
+      },
+    } as any);
+    await handlers.set_execution_policy!({ organization_id: 'org_1', allow_domains: ['pypi.org', 'npmjs.com'] });
+    expect(puts[0]!.body.policy.network).toEqual({
+      unrestricted: true, allowDomains: ['pypi.org', 'npmjs.com'], allowCidrs: ['10.0.0.0/8'],
+    });
   });
 });

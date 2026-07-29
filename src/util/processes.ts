@@ -35,6 +35,15 @@ export interface TrackedProcess {
   protected?: boolean;
   /** Preferred kill (e.g. custody's escalating group kill); falls back to signals. */
   kill?: (signal: NodeJS.Signals) => void | Promise<void>;
+  /**
+   * /proc/<pid>/stat field 22 (start time in ticks since boot) captured at
+   * registration. With the pid this is a stable process identity across pid
+   * reuse — the same guard `prevTicks` has always used for CPU counters and
+   * `src/agent/custody.ts` uses for record owners. Undefined off Linux, or when
+   * procfs was unreadable, in which case identity is unverifiable and the bare
+   * pid is trusted (the conservative reading: refuse to *lose* a process).
+   */
+  startTick?: string;
 }
 
 export interface ProcessRow {
@@ -68,12 +77,46 @@ export interface ProcessSample {
 
 const registry = new Map<number, TrackedProcess>();
 
+/**
+ * /proc/<pid>/stat field 22 — the process's start time in ticks since boot.
+ * Identical to `processStart` in src/agent/custody.ts; kept local so this module
+ * stays dependency-free.
+ */
+export function processStartTick(pid: number | undefined): string | undefined {
+  if (!pid || pid <= 0 || process.platform !== 'linux') return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // The comm field may itself contain spaces/parens; split after the LAST ')'.
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    return afterComm[19]; // the array begins at field 3, so index 19 is field 22
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Is the process now at `pid` still the one that was registered?
+ *
+ * A bare pid is NOT an identity: pids are recycled, and this registry outlives
+ * the processes in it (an entry for a process outside karmax's own tree, such as
+ * the reused Temporal server, has no 'exit' event to clean it up). Without this
+ * check, `killTracked` could send SIGKILL to whatever unrelated process the
+ * kernel had since handed that number to — and for a group leader it would
+ * signal that stranger's ENTIRE process group.
+ */
+function sameProcess(entry: TrackedProcess): boolean {
+  if (!entry.startTick) return true; // unverifiable ⇒ trust the pid
+  const now = processStartTick(entry.pid);
+  return now === undefined || now === entry.startTick;
+}
+
 /** Register a spawned process; returns an unregister function (idempotent). */
 export function trackProcess(p: TrackedProcess): () => void {
   if (!p.pid || p.pid <= 1) return () => {};
-  registry.set(p.pid, p);
+  const entry: TrackedProcess = { ...p, startTick: p.startTick ?? processStartTick(p.pid) };
+  registry.set(p.pid, entry);
   return () => {
-    if (registry.get(p.pid) === p) registry.delete(p.pid);
+    if (registry.get(p.pid) === entry) registry.delete(p.pid);
   };
 }
 
@@ -189,9 +232,12 @@ export function sampleProcesses(): ProcessSample {
   }
   const table = readProcTable();
 
-  // Prune registry entries whose process is gone (entries that aren't our direct
-  // children — the reused Temporal server — have no 'exit' event to clean them).
-  for (const pid of [...registry.keys()]) if (!table.has(pid)) registry.delete(pid);
+  // Prune registry entries whose process is gone — OR whose pid has been recycled
+  // by a different process, which would otherwise silently re-label a stranger
+  // with the dead entry's task/kind and make it killable as "ours".
+  for (const [pid, entry] of [...registry.entries()]) {
+    if (!table.has(pid) || !sameProcess(entry)) registry.delete(pid);
+  }
 
   const children = new Map<number, number[]>();
   for (const st of table.values()) {
@@ -281,6 +327,11 @@ export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM
   if (!Number.isInteger(pid) || pid <= 1) return { ok: false, error: 'invalid pid' };
   if (pid === process.pid) return { ok: false, error: 'refusing to kill krmax itself' };
   const entry = registry.get(pid);
+  if (entry && !sameProcess(entry)) {
+    // The registered process exited and an unrelated one took its pid.
+    registry.delete(pid);
+    return { ok: false, error: 'pid was recycled by another process' };
+  }
   if (entry?.protected) return { ok: false, error: `${entry.label} is protected (use \`npm run reset\` to stop Temporal)` };
 
   // Fresh scope check — membership in the LAST sample isn't enough (the pid may
@@ -296,6 +347,9 @@ export async function killTracked(pid: number, signal: NodeJS.Signals = 'SIGTERM
       return { ok: true };
     }
     const st = parseStat(pid);
+    // Re-verify identity immediately before signalling: `sampleProcesses()` above
+    // did I/O, and a group kill on a recycled pid takes out a whole stranger tree.
+    if (entry && !sameProcess(entry)) return { ok: false, error: 'pid was recycled by another process' };
     if (st && st.pgrp === pid) {
       // Group leader (detached agents): signal the whole group so tool
       // subprocesses don't survive their root.

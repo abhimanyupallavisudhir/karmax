@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { Store } from '../src/store/db.js';
+import { Store, isReviewEvent, deleteRows } from '../src/store/db.js';
 
 describe('Store', () => {
   let store: Store;
@@ -161,6 +161,54 @@ describe('Store', () => {
     expect(lists).toHaveLength(1);
     expect(lists[0]!.name).toBe('Tasks');
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
+  });
+
+  it('reorders projects in the sidebar, per organization', () => {
+    const other = store.createOrganization({ name: 'Acme Inc' });
+    const [a, b, c] = ['A', 'B', 'C'].map((n) => store.createProject(n));
+    const foreign = store.createProject('Z', {}, other.id);
+    const order = () => store.listProjects().filter((p) => p.organizationId === 'org_personal').map((p) => p.name);
+    expect(order()).toEqual(['A', 'B', 'C']); // creation order until someone drags
+
+    // Drop C above A: "before" names the project it now sits on top of.
+    store.reorderProject(c!.id, a!.id);
+    expect(order()).toEqual(['C', 'A', 'B']);
+    // Positions are re-densified, so the next drag reads an unambiguous list.
+    expect(store.listProjects().filter((p) => p.organizationId === 'org_personal').map((p) => p.order)).toEqual([0, 1, 2]);
+
+    // No `before` = drop past the last project.
+    store.reorderProject(c!.id);
+    expect(order()).toEqual(['A', 'B', 'C']);
+    // A no-op drag (dropped back where it was) is stable.
+    store.reorderProject(b!.id, c!.id);
+    expect(order()).toEqual(['A', 'B', 'C']);
+
+    // Another organization's projects are never touched, and a project created
+    // after a reorder still lands at the end of its own organization.
+    expect(store.getProject(foreign.id)!.order).toBe(0);
+    const d = store.createProject('D');
+    expect(order()).toEqual(['A', 'B', 'C', 'D']);
+    expect(d.order).toBe(3);
+    // A `before` in a foreign organization is meaningless — treat it as "last".
+    store.reorderProject(a!.id, foreign.id);
+    expect(order()).toEqual(['B', 'C', 'D', 'A']);
+    expect(() => store.reorderProject('proj_nope')).toThrow(/no project/);
+  });
+
+  it('keeps creation order for projects that predate the sidebar ordering column', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-ord-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = new Store(dbPath);
+    const ids = ['A', 'B', 'C'].map((n) => legacy.createProject(n).id);
+    // Undo the column so the reopened store has to migrate a pre-`ord` schema.
+    (legacy as any).db.exec('ALTER TABLE projects DROP COLUMN ord');
+
+    const store2 = new Store(dbPath);
+    expect(store2.listProjects().map((p) => p.name)).toEqual(['A', 'B', 'C']);
+    // …and the first drag still works off that implicit order.
+    store2.reorderProject(ids[2]!, ids[0]!);
+    expect(store2.listProjects().map((p) => p.name)).toEqual(['C', 'A', 'B']);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('rejects reserved routing names for projects and organizations', () => {
@@ -528,6 +576,135 @@ describe('Store', () => {
 
   it('opens with a busy timeout so lock collisions wait instead of failing', () => {
     expect((store.db.prepare('PRAGMA busy_timeout').get() as any).timeout).toBe(5000);
+  });
+
+
+  // ─── retention, projections, and delete completeness ───────────────────────
+
+  it('counts statuses in SQL rather than parsing every task transcript', () => {
+    const project = store.createProject('Ops');
+    const big = 'x'.repeat(2000);
+    for (const status of ['done', 'active', 'active'] as const) {
+      const t = store.createTask({ projectId: project.id, title: status, workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+      store.saveView(t.id, { taskId: t.id, title: status, workflow: 'just-do', stage: 'do', status,
+        messages: [{ role: 'assistant', text: big } as any], actions: [], state: {}, updatedAt: 1 } as any);
+    }
+    // A task that has never produced a view reads as `setup`.
+    store.createTask({ projectId: project.id, title: 'fresh', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    expect(store.operationalSnapshot().tasks).toMatchObject({ done: 1, active: 2, setup: 1 });
+  });
+
+  it('filters armed tasks and series runs in SQL', () => {
+    const project = store.createProject('Triggers');
+    const armed = store.createTask({ projectId: project.id, title: 'a', workflow: 'just-do', workflowVersion: '1.0.0',
+      params: { prompt: 'p', triggers: [{ kind: 'event', type: 'x.y' }], triggerState: 'armed' } });
+    const plain = store.createTask({ projectId: project.id, title: 'b', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    const run = store.createTask({ projectId: project.id, title: 'r', workflow: 'just-do', workflowVersion: '1.0.0',
+      params: { prompt: 'p', runOf: plain.id } });
+    expect(store.listArmedTasks().map((t) => t.id)).toEqual([armed.id]);
+    expect(store.runsOf(plain.id).map((t) => t.id)).toEqual([run.id]);
+    expect(store.runsOf(armed.id)).toEqual([]);
+  });
+
+  it('prunes high-volume agent.output rows when a task settles (and only then)', () => {
+    const project = store.createProject('Retention');
+    const t = store.createTask({ projectId: project.id, title: 't', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    for (let i = 0; i < 5; i++) store.appendEvent({ taskId: t.id, type: 'agent.output', ts: i, payload: { text: 'chunk' } });
+    store.appendEvent({ taskId: t.id, type: 'view.updated', ts: 9, payload: { status: 'active' } });
+    const outputCount = () => Number((store.db.prepare("SELECT COUNT(*) n FROM events WHERE taskId=? AND type='agent.output'").get(t.id) as any).n);
+    const view = (status: string) => ({ taskId: t.id, title: 't', workflow: 'just-do', stage: 'do', status, messages: [], actions: [], state: {}, updatedAt: 1 } as any);
+    store.saveView(t.id, view('active'));
+    expect(outputCount()).toBe(5); // still running: the live stream needs them
+    store.saveView(t.id, view('done'));
+    expect(outputCount()).toBe(0);
+    // Non-output history survives.
+    expect(store.eventsSince(t.id, 0).some((e) => e.type === 'view.updated')).toBe(true);
+  });
+
+  it('keeps agent.output for a FAILED task — that is the one a human has to read', () => {
+    const project = store.createProject('Retention failed');
+    const t = store.createTask({ projectId: project.id, title: 't', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    for (let i = 0; i < 5; i++) store.appendEvent({ taskId: t.id, type: 'agent.output', ts: i, payload: { text: 'chunk' } });
+    const outputCount = () => Number((store.db.prepare("SELECT COUNT(*) n FROM events WHERE taskId=? AND type='agent.output'").get(t.id) as any).n);
+    const view = (status: string) => ({ taskId: t.id, title: 't', workflow: 'just-do', stage: 'do', status, messages: [], actions: [], state: {}, updatedAt: 1 } as any);
+    store.saveView(t.id, view('active'));
+    // Pruning is only safe because the agent text is already in the view/transcripts.
+    // For `failed` it is not: reconcile.ts SYNTHESIZES a failed view for any task
+    // whose Temporal execution died, so a boot-time reconcile after a crash wiped
+    // the streamed output of everything that was mid-flight — exactly the evidence
+    // needed to work out why. `failed` also does not auto-archive, for the same reason.
+    store.saveView(t.id, view('failed'));
+    expect(outputCount()).toBe(5);
+  });
+
+  it('sweeps expired scoped tokens and aged-out webhook deliveries', () => {
+    const now = Date.now();
+    const token = store.db.prepare('INSERT INTO scoped_tokens (tokenHash, tokenId, json, expiresAt) VALUES (?, ?, ?, ?)');
+    token.run('h-old', 'tok-old', '{}', now - 1_000);
+    token.run('h-live', 'tok-live', '{}', now + 60_000);
+    expect(store.recordGithubDelivery('d-old', 'push')).toBe(true);
+    store.db.prepare('UPDATE github_webhook_deliveries SET receivedAt=? WHERE deliveryId=?').run(now - 30 * 86400_000, 'd-old');
+    expect(store.recordGithubDelivery('d-new', 'push')).toBe(true);
+    const swept = store.retentionSweep(now);
+    expect(swept.scopedTokens).toBe(1);
+    expect(swept.githubDeliveries).toBe(1);
+    expect(Number((store.db.prepare('SELECT COUNT(*) n FROM scoped_tokens').get() as any).n)).toBe(1);
+    // The aged-out id can be claimed again; the recent one is still deduped.
+    expect(store.recordGithubDelivery('d-old', 'push')).toBe(true);
+    expect(store.recordGithubDelivery('d-new', 'push')).toBe(false);
+  });
+
+  it('deleteTask clears every table deleteProject does, in one transaction', () => {
+    const project = store.createProject('Cleanup');
+    const other = store.createTask({ projectId: project.id, title: 'other', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    const t = store.createTask({ projectId: project.id, title: 't', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    store.appendEvent({ taskId: t.id, type: 'agent.output', ts: 1, payload: {} });
+    store.db.prepare("INSERT INTO task_confirmation (taskId, cycle, policy, createdAt) VALUES (?, 1, '{}', 1)").run(t.id);
+    store.db.prepare("INSERT INTO confirmation_votes (taskId, cycle, userId, votedAt) VALUES (?, 1, 'u', 1)").run(t.id);
+    store.db.prepare(`INSERT INTO collaboration_requests (id, requesterTaskId, targetTaskId, targetRole, action, status, afterSeq, createdAt, updatedAt)
+      VALUES ('c1', ?, ?, 'do', 'ask', 'open', 0, 1, 1)`).run(t.id, other.id);
+    store.db.prepare("INSERT INTO world_instances (worldId, generation, handle, state, createdAt, updatedAt) VALUES (?, 1, '{}', 'ready', 1, 1)").run(t.id);
+    store.db.prepare(`INSERT INTO inbox (id, organizationId, userId, eventSeq, taskId, kind, unread, actionable, createdAt)
+      VALUES ('ib1', 'org_personal', 'u', 1, ?, 'update', 1, 0, 1)`).run(t.id);
+    store.db.prepare(`INSERT INTO delivery_outbox (id, inboxId, channel, state, attempts, nextAt, createdAt)
+      VALUES ('do1', 'ib1', 'email', 'pending', 0, 0, 1)`).run();
+
+    store.deleteTask(t.id);
+
+    const count = (sql: string, ...args: any[]) => Number((store.db.prepare(sql).get(...args) as any).n);
+    expect(count('SELECT COUNT(*) n FROM tasks WHERE id=?', t.id)).toBe(0);
+    expect(count('SELECT COUNT(*) n FROM events WHERE taskId=?', t.id)).toBe(0);
+    expect(count('SELECT COUNT(*) n FROM task_confirmation WHERE taskId=?', t.id)).toBe(0);
+    expect(count('SELECT COUNT(*) n FROM confirmation_votes WHERE taskId=?', t.id)).toBe(0);
+    expect(count('SELECT COUNT(*) n FROM collaboration_requests')).toBe(0);
+    expect(count('SELECT COUNT(*) n FROM world_instances WHERE worldId=?', t.id)).toBe(0);
+    expect(count('SELECT COUNT(*) n FROM inbox WHERE taskId=?', t.id)).toBe(0);
+    // claimDelivery inner-joins inbox, so an orphaned outbox row would be
+    // permanently unclaimable — it must go with its inbox row.
+    expect(count('SELECT COUNT(*) n FROM delivery_outbox')).toBe(0);
+  });
+
+  it('routes only genuine review events to the review audience', () => {
+    // `ev.type.includes('review')` is a substring match on an open vocabulary:
+    // every `preview.*` type contains it, and so would any package-declared type.
+    expect(isReviewEvent('review.built')).toBe(true);
+    expect(isReviewEvent('github.pr.review')).toBe(true);
+    expect(isReviewEvent('software-dev.review-requested')).toBe(true);
+    expect(isReviewEvent('preview.active')).toBe(false);
+    expect(isReviewEvent('preview.ready')).toBe(false);
+    expect(isReviewEvent('world.preview-created')).toBe(false);
+    expect(isReviewEvent('agent.previewed')).toBe(false);
+  });
+
+  it('chunks IN(...) deletes past SQLite\'s variable limit', () => {
+    const project = store.createProject('Big');
+    // 40k ids exceeds SQLITE_MAX_VARIABLE_NUMBER (32,766) — one placeholder each
+    // used to make deleteProject a hard error for a large project.
+    const ids = Array.from({ length: 40_000 }, (_, i) => `t_${i}`);
+    store.db.prepare("INSERT INTO task_tags (taskId, tagId) VALUES ('t_5', 'tag_x')").run();
+    expect(() => deleteRows(store.db as any, 'task_tags', 'taskId', ids)).not.toThrow();
+    expect(Number((store.db.prepare('SELECT COUNT(*) n FROM task_tags').get() as any).n)).toBe(0);
+    expect(project.id).toBeTruthy();
   });
 
   it('a write waits out another process holding the write lock (no "database is locked")', async () => {

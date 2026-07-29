@@ -328,6 +328,49 @@ describe('evaluateQuery — dates', () => {
   it('relative age: created:>7d = older than 7 days', () => {
     expect(evaluateQuery(tasks, parseQuery('created:>7d'), ctx).tasks.map((t) => t.num)).toEqual([1]);
   });
+
+  it('distinguishes gt/gte and lt/lte on an absolute date', () => {
+    // An absolute date parses to UTC MIDNIGHT, so it names a whole day. gt≡gte and
+    // lt≡lte used to collapse: `created:>2026-01-01` included Jan 1 and
+    // `created:<=2026-01-01` excluded it.
+    const day = 86400e3;
+    const jan1 = Date.UTC(2026, 0, 1);
+    const dated = [
+      task({ title: 'dec31', num: 1, createdAt: jan1 - day }),
+      task({ title: 'jan1', num: 2, createdAt: jan1 + 3600e3 }),
+      task({ title: 'jan2', num: 3, createdAt: jan1 + day }),
+    ];
+    const c = { now: jan1 + 10 * day, tags: [] as Tag[] };
+    const nums = (q: string) => evaluateQuery(dated, parseQuery(q), c).tasks.map((t) => t.num).sort();
+    expect(nums('created:>2026-01-01')).toEqual([3]); // strictly after Jan 1
+    expect(nums('created:>=2026-01-01')).toEqual([2, 3]);
+    expect(nums('created:<2026-01-01')).toEqual([1]); // strictly before Jan 1
+    expect(nums('created:<=2026-01-01')).toEqual([1, 2]);
+    expect(nums('created:2026-01-01')).toEqual([2]); // that calendar day
+  });
+
+  /**
+   * A raw epoch-millisecond names one POINT, not a day. Both spellings parsed to
+   * the same `instant`, so the whole-day ranges above were applied to numbers
+   * too: `created:>N` silently meant `>= N + 24h`, and `created:<=N` swept in an
+   * extra day. Day semantics belong to the `YYYY-MM-DD` spelling only.
+   */
+  it('compares a raw epoch-millisecond exactly, not as a whole day', () => {
+    const jan1 = Date.UTC(2026, 0, 1);
+    const dated = [
+      task({ title: 'before', num: 1, createdAt: jan1 - 1 }),
+      task({ title: 'exact', num: 2, createdAt: jan1 }),
+      task({ title: 'plus1h', num: 3, createdAt: jan1 + 3600e3 }),
+    ];
+    const c = { now: jan1 + 10 * 86400e3, tags: [] as Tag[] };
+    const nums = (q: string) => evaluateQuery(dated, parseQuery(q), c).tasks.map((t) => t.num).sort();
+    // An hour after the mark IS after it — under day semantics it was not.
+    expect(nums(`created:>${jan1}`)).toEqual([3]);
+    expect(nums(`created:>=${jan1}`)).toEqual([2, 3]);
+    expect(nums(`created:<${jan1}`)).toEqual([1]);
+    // …and an hour after the mark is NOT "up to and including" it.
+    expect(nums(`created:<=${jan1}`)).toEqual([1, 2]);
+  });
 });
 
 describe('evaluateQuery — sort and group', () => {

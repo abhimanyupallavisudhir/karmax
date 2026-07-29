@@ -76,6 +76,18 @@ const cancellationAwareTurns = proxyActivities<coreActivities>({
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
+// Coordinator calls with a BOUNDED retry budget. With Temporal's default
+// (`maximumAttempts: 0` = unlimited) a deterministically-failing enqueueMerge /
+// requestAgentSlot retries every ~100 s forever: the task freezes in place and
+// never reaches `withResolve` or a human. Failing after a few attempts turns it
+// into an ordinary stage error that auto-resolve, then escalation, can act on.
+// Pinned to its own behavior version — activity retry options are part of the
+// recorded command, so an in-flight execution must keep scheduling with the proxy
+// its history was written against.
+const boundedCoord = proxyActivities<coordinatorActivities>({
+  startToCloseTimeout: '30s',
+  retry: { maximumAttempts: 5, initialInterval: '1s', backoffCoefficient: 2 },
+});
 
 // ─── Signals / updates / query (SPEC §5.6) ───────────────────────────────────
 // The optional second arg is the agent the follow-up addresses (`do` | `merge` |
@@ -254,13 +266,31 @@ export async function softwareDevV1_9(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.9.0');
 }
 
+/**
+ * Bounded coordinator-activity retries (a deterministically failing merge-queue /
+ * agent-slot call surfaces as a stage error instead of freezing the task forever),
+ * every merge-queue domain published in the view, the confirm latch cleared on
+ * entry to each Review gate, and an escalation that wakes on a follow-up.
+ *
+ * These landed on a branch that had also numbered them 1.9.0, concurrently with
+ * master publishing a DIFFERENT 1.9.0 (multi-PR + the bounded merge wait). Two
+ * behaviour sets cannot share one version number: an execution records its type
+ * at start and replays it forever, so folding both into 1.9.0 would have replayed
+ * master's in-flight 1.9.0 executions against commands they never recorded. They
+ * are therefore 1.10.0, and 1.9.0 above means exactly what master shipped.
+ */
+export async function softwareDevV1_10(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.10.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0';
+
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
  * this rather than a list of versions to remember to extend, for the same
@@ -280,9 +310,18 @@ function behaviorMinor(behaviorVersion: BehaviorVersion): number {
  * Expressed as a comparison, not a list of versions: a new bundled version is
  * then correct here by construction instead of needing an edit nobody would
  * notice was missing.
+ *
+ * The comparison is on (major, minor) NUMERICALLY. Comparing the minor alone —
+ * `split('.')[1] >= 5` — is only accidentally right inside the 1.x line: a future
+ * `2.0.0` has minor 0 and would have silently dropped its children back to the
+ * bare (v1.1) type, quietly losing every semantic gained since 1.5.
  */
 export function childWorkflowType(behaviorVersion: BehaviorVersion): string {
-  return Number(behaviorVersion.split('.')[1] ?? 0) >= 5 ? `softwareDev@${behaviorVersion}` : 'softwareDev';
+  const parts = behaviorVersion.split('.').map((p) => Number(p) || 0);
+  const major = parts[0] ?? 0;
+  const minor = parts[1] ?? 0;
+  const inheritsVersion = major > 1 || (major === 1 && minor >= 5);
+  return inheritsVersion ? `softwareDev@${behaviorVersion}` : 'softwareDev';
 }
 
 async function softwareDevImpl(
@@ -312,6 +351,26 @@ async function softwareDevImpl(
   // it keeps the single-branch Review semantics on replay.
   const multiPrEnabled = minor >= 9 && !!input.project.multiPr;
   const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
+  // Activity retry options are recorded with the ScheduleActivityTask command, so
+  // bounding the coordinator's unlimited default is a versioned behavior change.
+  const coordinator = minor >= 10 ? boundedCoord : coord;
+  // `publish` is an activity, so its argument is recorded in history — adding a
+  // field to the published view is a versioned change too. From 1.10.0 the view
+  // carries EVERY merge-queue domain the task holds, not just the first: a
+  // multi-repo task takes one slot per repo, and `mergeDomain` (singular) left
+  // the console able to show and reorder only the first of them.
+  const publishesAllMergeDomains = minor >= 10;
+  // Clearing the `confirmed` gate token on entry to Review, and waking the
+  // escalation park on a follow-up, both change which commands a workflow task
+  // emits at a point older executions have already recorded — an execution that
+  // was confirmed mid-Do recorded the Review gate returning INSTANTLY, and one
+  // parked at `escalated` recorded a follow-up producing no commands at all.
+  // Replaying either against the new code parks (or resumes) where history says
+  // otherwise, which is a NonDeterminismError that wedges the execution for good.
+  const clearsConfirmOnGate = minor >= 10;
+  // A new activity ARGUMENT is a recorded-input change, so it is versioned too.
+  const identifiedAccountReturns = minor >= 10;
+  const followUpWakesEscalation = minor >= 10;
   const taskId = input.taskId;
   const recovery = input.recovery;
   const recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
@@ -634,6 +693,9 @@ async function softwareDevImpl(
         mergeGranted,
         targetLocked,
         mergeDomain: world ? mergeQueueDomains(world, target, input.projectId)[0] : undefined,
+        ...(publishesAllMergeDomains && world
+          ? { mergeDomains: mergeQueueDomains(world, target, input.projectId) }
+          : {}),
         // A failed Temporal execution is terminal. Persist the full handle needed
         // for a replacement run to OPEN this world; reconstructing it through
         // createWorld would force-remove the dirty worktree and lose work.
@@ -1026,8 +1088,16 @@ async function softwareDevImpl(
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', lastError);
       }
+      // `escalated` advertises [retry, followUp, cancel] (see `allowed()`), so a
+      // follow-up MUST wake this park too. It used to sit invisibly in `msgs` until
+      // someone separately clicked Retry — while the parent path already got this
+      // right (a `comment` response sets `retryRequested`). Snapshot the transcript
+      // length before parking and treat a new message as the retry it plainly is:
+      // the resumed stage re-runs with the follow-up already in the conversation.
+      const seenAtEscalation = msgs.length;
       await publish();
-      await condition(() => retryRequested || cancelled);
+      await condition(() =>
+        retryRequested || cancelled || (followUpWakesEscalation && msgs.length > seenAtEscalation));
       waitingFor = undefined;
       if (cancelled) throw new Cancelled();
       // A human/parent retry resumes the stage that failed. Leaving this as
@@ -1108,7 +1178,7 @@ async function softwareDevImpl(
             });
             if (usesHostCapacity) {
               slotRequested = true;
-              const admission = await coord.requestAgentSlot({
+              const admission = await coordinator.requestAgentSlot({
                 taskId,
                 turnId,
                 role,
@@ -1149,8 +1219,8 @@ async function softwareDevImpl(
       } finally {
         agentSlotGrants.delete(turnId);
         if (durableAgentAdmission && slotRequested) {
-          if (slotHeld) await coord.releaseAgentSlot(taskId, turnId).catch(() => undefined);
-          else await coord.cancelAgentSlot(taskId, turnId).catch(() => undefined);
+          if (slotHeld) await coordinator.releaseAgentSlot(taskId, turnId).catch(() => undefined);
+          else await coordinator.cancelAgentSlot(taskId, turnId).catch(() => undefined);
         }
         if (liveAgentStates && agentTurn?.turnId === turnId) {
           agentTurn = undefined;
@@ -1185,7 +1255,7 @@ async function softwareDevImpl(
         ? credentialProvider
         : undefined;
     const turnId = `${taskId}#${turnSeq++}`;
-    const lease = await coord.leaseAccount(taskId, turnId, credentialProvider, allowed);
+    const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
     const priorStatus = status;
     status = 'waiting';
     // The existing publication command is retained for replay. New activity
@@ -1206,7 +1276,7 @@ async function softwareDevImpl(
     }
     const grant = accountGrants.get(turnId);
     accountGrants.delete(turnId);
-    if (liveAgentStates && cancelled && !grant) await coord.cancelAccount(taskId, turnId).catch(() => undefined);
+    if (liveAgentStates && cancelled && !grant) await coordinator.cancelAccount(taskId, turnId).catch(() => undefined);
     if (!liveAgentStates) {
       // Preserve v1's in-memory transition. It intentionally did not publish here;
       // changing that command sequence would break every extant v1 history.
@@ -1241,9 +1311,15 @@ async function softwareDevImpl(
       if (grant && !passthrough && !cancelled && !isCancellation(err)) {
         const cls = limitFailureClassification(err);
         if (cls?.hard) {
-          await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
+          await coordinator.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
         } else if (cls?.limited) {
-          await coord
+          // Must use the same version-selected proxy as `setAccountAvailability`
+          // above: on the unbounded `coord` this retries forever, and the activity
+          // is a raw `executeUpdate` that does not swallow its own errors — so a
+          // coordinator that keeps rejecting freezes the task here with no route to
+          // a human. `.catch()` cannot save it; an unlimited-retry activity never
+          // rejects, it just never returns.
+          await coordinator
             .reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note })
             .catch(() => undefined);
         }
@@ -1251,7 +1327,22 @@ async function softwareDevImpl(
       throw err;
     } finally {
       // returnAccount runs in the parent (uncancelled) scope so the lease is freed.
-      if (grant && !passthrough) await coord.returnAccount(grant.accountId).catch(() => undefined);
+      // Naming the lease matters: without it the coordinator drops the OLDEST record
+      // for the credential, which may belong to another live task, and its dead-lease
+      // sweep then over-releases (see coordinators/account.ts).
+      //
+      // VERSIONED, like every other change here: the identity is a new ARGUMENT, and
+      // an activity's input is recorded with its ScheduleActivityTask command. Left
+      // ungated it also altered older pins at runtime — the coordinator can only
+      // match an identified return against a record carrying the same identity, so
+      // on an older execution the return found nothing and quietly released nothing,
+      // holding the login's capacity and stalling whatever asked for it next. That
+      // showed up as ~20% flakiness in the parent/child cancellation test on 1.6.0.
+      if (grant && !passthrough) {
+        await (identifiedAccountReturns
+          ? coordinator.returnAccount(grant.accountId, { taskId, turnId })
+          : coordinator.returnAccount(grant.accountId)).catch(() => undefined);
+      }
     }
   }
 
@@ -1560,7 +1651,7 @@ async function softwareDevImpl(
     )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
-  accountPool = await coord.accountPoolSize().catch(() => 0);
+  accountPool = await coordinator.accountPoolSize().catch(() => 0);
 
   // A platform-requested human hold is deliberately outside the pipeline. Keep
   // the originating stage visible. An explicit Resume always wakes it; v1.7 also
@@ -1836,6 +1927,24 @@ async function softwareDevImpl(
       if (multiPrEnabled) checkoutHeads = await core.checkoutHeads(world as any).catch(() => checkoutHeads);
       stage = 'review';
       status = 'waiting';
+      // `confirmed` is a GATE token, not a latch. Clear it the instant we enter the
+      // Review gate — before any await, so nothing that arrives from here on is lost.
+      //
+      // Why: `confirmSignal` / `parentResponseSignal('confirm')` set the flag at ANY
+      // stage. Without this, a confirm that arrived during Do — e.g. a parent
+      // answering `confirm` to a mid-Do `needs_info` raise, which means "yes, go on
+      // with what you asked", not "your final work is approved" — pre-approved the
+      // NEXT Review gate: it returned instantly and the change went to PR/merge
+      // completely unseen.
+      //
+      // Semantics chosen: a confirm only counts for a Review gate that was already
+      // open when it arrived. The legitimate race (a human/parent clicking Confirm
+      // between our `publish()` and the `condition()` park) is preserved, because
+      // the clear happens strictly BEFORE the publish that advertises the gate — a
+      // confirmer cannot even see the gate until after we have cleared. Confirms
+      // that predate the gate are deliberately dropped; the confirmer is re-shown
+      // the gate and can click again.
+      if (clearsConfirmOnGate) confirmed = false;
       // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
       // task plays its confirm layers in order (each a human click or a Confirm agent).
       if (input.parentTaskId) {
@@ -1994,88 +2103,105 @@ async function softwareDevImpl(
     const domains = mergeQueueDomains(world, target, input.projectId);
     const held: string[] = [];
     let acquireCancelled = false;
-    for (const domain of domains) {
-      mergeGranted = false;
-      await coord.enqueueMerge(domain, taskId);
-      // Wait for this domain's grant; allow cancel only before it.
-      while (!mergeGranted && !cancelled) {
-        const pos = await coord.mergeQueuePosition(domain, taskId);
-        // Republish only on an actual change: the view carries every message and
-        // transcript, so an unconditional publish per tick is what pushed a long
-        // wait into Temporal's history-size limit (see `boundedMergeWait`).
-        if (!boundedMergeWait || !samePosition(pos, mergeQueuePos)) {
-          mergeQueuePos = pos;
-          await publish();
-        }
-        await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
-      }
-      if (cancelled && !mergeGranted) {
-        await coord.cancelMerge(domain, taskId); // drop the slot we're still waiting on
-        acquireCancelled = true;
-        break;
-      }
-      held.push(domain);
-    }
-    if (acquireCancelled) {
-      for (const d of held) await coord.releaseMerge(d, taskId); // release every slot already held
-      return await abort();
-    }
-    mergeQueuePos = { position: 0, total: mergeQueuePos?.total ?? 1 };
-    await publish();
-
-    // The merge agent is about to run — freeze `agent:merge` (SPEC §5.5).
-    consumed.add('agent:merge');
-    const mergeIn: Message = {
-      id: `m-in-${mergeMsgs.length}`,
-      role: 'user',
-      text: mergeDirty
-        ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
-        : mergeConflict
-          ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
-          : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`,
-      ts: mergeMsgs.length,
-    };
-    mergeMsgs.push(mergeIn);
     let result;
+    // Every acquired domain MUST be released — including when enqueueMerge / the
+    // position publish / the merge agent throws while acquiring or holding a LATER
+    // domain. Without this, domains 0..n-1 stayed leased until the coordinator's
+    // 5-minute lease timeout and every other task on those repos stalled behind a
+    // task that had already failed. Paths that release explicitly empty `held`
+    // first, so this never double-releases.
     try {
-      // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-      const mt = await leasedTurn('merge', (
-        accountConfigHome,
-        accountApiKeyHandle,
-        agentTurnId,
-        accountCredentialKind,
-        accountCredentialProvider,
-        admission,
-      ) =>
-        agentTurns.runAgentTurn({
-          taskId,
-          role: 'merge',
-          worldHandle: world as any,
-          // Feed the merge agent its full transcript so any human follow-up queued
-          // for it (SPEC §5.6) is included alongside the merge prompt.
-          messages: mergeMsgs,
-          session: sessionMatchesHome(accountConfigHome) ? session : undefined,
-          task: liveInput,
-          bindings: { reviewInfo: reviewInfo?.summary ?? '' },
+      for (const domain of domains) {
+        mergeGranted = false;
+        await coordinator.enqueueMerge(domain, taskId);
+        // Wait for this domain's grant; allow cancel only before it.
+        while (!mergeGranted && !cancelled) {
+          const pos = await coordinator.mergeQueuePosition(domain, taskId);
+          // Republish only on an actual change: the view carries every message and
+          // transcript, so an unconditional publish per tick is what pushed a long
+          // wait into Temporal's history-size limit (see `boundedMergeWait`).
+          if (!boundedMergeWait || !samePosition(pos, mergeQueuePos)) {
+            mergeQueuePos = pos;
+            await publish();
+          }
+          await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
+        }
+        if (cancelled && !mergeGranted) {
+          await coordinator.cancelMerge(domain, taskId); // drop the slot we're still waiting on
+          acquireCancelled = true;
+          break;
+        }
+        held.push(domain);
+      }
+      if (acquireCancelled) {
+        for (const d of held) await coordinator.releaseMerge(d, taskId); // release every slot already held
+        held.length = 0; // released here → the finally below is a no-op (command order preserved)
+        return await abort();
+      }
+      mergeQueuePos = { position: 0, total: mergeQueuePos?.total ?? 1 };
+      await publish();
+
+      // The merge agent is about to run — freeze `agent:merge` (SPEC §5.5).
+      consumed.add('agent:merge');
+      const mergeIn: Message = {
+        id: `m-in-${mergeMsgs.length}`,
+        role: 'user',
+        text: mergeDirty
+          ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
+          : mergeConflict
+            ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
+            : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`,
+        ts: mergeMsgs.length,
+      };
+      mergeMsgs.push(mergeIn);
+      try {
+        // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
+        const mt = await leasedTurn('merge', (
           accountConfigHome,
           accountApiKeyHandle,
+          agentTurnId,
           accountCredentialKind,
           accountCredentialProvider,
-          ...(agentTurnId ? { agentTurnId } : {}),
-          ...admission,
-        }),
-      ).catch((e) => {
-        if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge
-        log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) });
-        return undefined;
-      });
-      if (mt?.output?.trim()) mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length });
-      // …then the authoritative, deterministic merge that guarantees work lands.
-      result = await long.finalizeMergeActivity(world as any, target);
-    } catch (err) {
-      result = { merged: false, landedFiles: [], note: String(err) };
+          admission,
+        ) =>
+          agentTurns.runAgentTurn({
+            taskId,
+            role: 'merge',
+            worldHandle: world as any,
+            // Feed the merge agent its full transcript so any human follow-up queued
+            // for it (SPEC §5.6) is included alongside the merge prompt.
+            messages: mergeMsgs,
+            session: sessionMatchesHome(accountConfigHome) ? session : undefined,
+            task: liveInput,
+            bindings: { reviewInfo: reviewInfo?.summary ?? '' },
+            accountConfigHome,
+            accountApiKeyHandle,
+            accountCredentialKind,
+            accountCredentialProvider,
+            ...(agentTurnId ? { agentTurnId } : {}),
+            ...admission,
+          }),
+        ).catch((e) => {
+          if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge
+          log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) });
+          return undefined;
+        });
+        if (mt?.output?.trim()) mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length });
+        // …then the authoritative, deterministic merge that guarantees work lands.
+        result = await long.finalizeMergeActivity(world as any, target);
+      } catch (err) {
+        result = { merged: false, landedFiles: [], note: String(err) };
+      }
+    } finally {
+      // Swallow per-domain. From 1.9.0 `coordinator` retries a bounded 5 times
+      // (~15 s), which a coordinator mid-continueAsNew or a worker restart can
+      // outlast. An throwing release would abort this loop mid-iteration — leaking
+      // every remaining slot, the exact leak the try/finally exists to prevent —
+      // and replace the in-flight merge error with a release error. Scheduling the
+      // activity is what history records, so catching changes no replay.
+      for (const d of held) await coordinator.releaseMerge(d, taskId).catch(() => undefined);
+      held.length = 0;
     }
-    for (const d of held) await coord.releaseMerge(d, taskId);
 
     if (result.merged) {
       sha = result.sha;
@@ -2125,8 +2251,18 @@ async function softwareDevImpl(
       waitingFor = { kind: 'parent' };
       await notifyParent('blocked', error);
     }
+    // As at the Resolve-exhaustion escalation above: `escalated` advertises a
+    // follow-up action, so a follow-up must wake this park. The Do transcript is the
+    // one a merge escalation's advice belongs in either way (a `merge`-addressed
+    // follow-up lands in `mergeMsgs`, which the retried merge turn reads anyway), so
+    // wake on EITHER transcript growing rather than silently ignoring the user.
+    const seenAtEscalation = msgs.length;
+    const mergeSeenAtEscalation = mergeMsgs.length;
     await publish();
-    await condition(() => retryRequested || cancelled);
+    await condition(() =>
+      retryRequested || cancelled ||
+      (followUpWakesEscalation &&
+        (msgs.length > seenAtEscalation || mergeMsgs.length > mergeSeenAtEscalation)));
     waitingFor = undefined;
     if (cancelled) return await abort();
     stage = 'merge';

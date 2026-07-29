@@ -28,9 +28,12 @@ import {
 } from './provider-registry.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { collectAcpImageBlocks } from './images.js';
-import { activityDetail } from './activity.js';
+import { activityDetail, toolActivityDetail } from './activity.js';
 import { createCustodyEnv, registerAgent, unregisterAgent, killAgent } from './custody.js';
+import { platformToolHandlers } from './tools.js';
+import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge, type ControlBridge } from './control-bridge.js';
 import { trackProcess } from '../util/processes.js';
+import { isRemoteAgentWorld } from './remote-process.js';
 import type { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 
 interface HarnessSpec {
@@ -202,10 +205,27 @@ function executable(command: string, env: Record<string, string>): string {
   return command;
 }
 
-function mcpServers(input: TurnInput): McpServer[] {
+/**
+ * The MCP servers handed to the ACP agent at `session/new` / `resume` / `fork`:
+ *
+ *   · `karmax`         — the durable, gateway-backed platform MCP (task list,
+ *                        wiki, vault, `platform_request`), authorized by the
+ *                        turn's scoped `KARMAX_TOKEN`.
+ *   · `karmax_control` — the TURN-LOCAL control tools (`confirm_decision`,
+ *                        `resolve_decision`, `create_review_info`, …). An ACP
+ *                        harness owns its own model loop and only accepts stdio
+ *                        MCP servers it spawns itself, so these reach this
+ *                        activity over the per-turn socket bridge. Without it an
+ *                        OpenCode agent could not produce a Resolve/Confirm
+ *                        verdict at all, even though prompt.ts advertises the
+ *                        tools (see control-bridge.ts).
+ *   · workflow-declared `agentMcp` servers.
+ */
+function mcpServers(input: TurnInput, control?: ControlBridge): McpServer[] {
   const gateway = platformMcpSpec(process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505');
   const declared = [
     { name: 'karmax', ...gateway },
+    ...(control ? [{ name: CONTROL_SERVER_NAME, ...controlMcpServerSpec(control) }] : []),
     ...(input.agentMcp ?? []).map((s) => ({ name: s.name, command: s.command, args: s.args ?? [], env: s.env })),
   ];
   return declared.map((s) => ({
@@ -262,7 +282,8 @@ function updateActivity(update: SessionUpdate, prior: Map<string, ToolCall>) {
       : tool.kind === 'search' || tool.kind === 'fetch' ? 'search'
       : tool.kind === 'think' ? 'reasoning'
       : 'tool';
-    const detail = activityDetail(tool.rawOutput ?? tool.rawInput ?? tool.content);
+    // Credential-bearing tools publish no detail at all (see SECRET_TOOL_NAMES).
+    const detail = toolActivityDetail(tool.name ?? tool.title, tool.rawOutput ?? tool.rawInput ?? tool.content);
     return {
       id: tool.toolCallId,
       kind,
@@ -298,7 +319,29 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    // ACP harnesses run ONLY on the control-plane host: unlike claude.ts and
+    // codex.ts, this adapter has no `spawnRemoteAgentProcess` path, and
+    // `remote-process.ts` is hardcoded to those two providers' config-home
+    // variables and CLI packages, so it cannot serve an ACP provider as-is.
+    //
+    // Without this guard the `spawn` below ran on the HOST with `cwd` set to a path
+    // that only exists inside the sandbox: Node raised ENOENT, the `child.on
+    // ('error')` handler swallowed it, and the turn hung on the ACP `initialize`
+    // handshake with no stated cause. Worse, if that path happened to exist on the
+    // host, the agent operated on the host's files — which on a hosted deployment
+    // violates the invariant `createWorld` enforces ("hosted deployments cannot run
+    // task code in the control plane"). Hosted forces remote worlds, so an ACP
+    // provider is simply unavailable there until remote-process.ts grows support.
+    if (isRemoteAgentWorld(input.world))
+      throw new Error(
+        `the ${this.provider} agent cannot run in a remote (cloud sandbox) world yet — it only runs where krmax itself runs. `
+        + 'Choose a Claude or Codex agent for this task, or give the project a local/container world.');
     const spec = harnessSpec(input);
+    // Turn-local controls, served over a socket for exactly this turn and torn
+    // down in `finally` below — it must never outlive the activity whose result
+    // it mutates (control-bridge.ts). Started after `harnessSpec`, which throws
+    // for an unsupported provider before there is anything to clean up.
+    const control = await startControlBridge(platformToolHandlers(input.world, ctx));
     const custody = createCustodyEnv(spec.env);
     spec.env = custody.env;
     const child = spawn(spec.command, spec.args, {
@@ -480,7 +523,7 @@ export class AcpAdapter implements AgentAdapter {
           if (!auth) throw new Error(`${this.provider} ACP agent requires an interactive login; connect the account first`);
           await agent.request(methods.agent.authenticate, { methodId: auth.id });
         }
-        const servers = mcpServers(input);
+        const servers = mcpServers(input, control);
         let configOptions: SessionConfigOption[] | null | undefined;
         if (input.session && input.fork) {
           if (!capabilities.sessionCapabilities?.fork) throw new Error(`${this.provider} ACP agent does not support native session fork`);
@@ -596,6 +639,7 @@ export class AcpAdapter implements AgentAdapter {
       throw new Error(`${this.provider} ACP turn failed: ${message}${detail ? `: ${detail.slice(-800)}` : ''}`, { cause: error });
     } finally {
       if (heartbeat) clearInterval(heartbeat);
+      control?.close();
       ctx.signal?.removeEventListener('abort', abort);
       try { child.stdin?.end(); } catch { /* closed */ }
       for (const terminal of terminals.values()) {

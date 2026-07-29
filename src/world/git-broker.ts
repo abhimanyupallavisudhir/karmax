@@ -2,9 +2,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
-import { worldRepos, worldRepoTarget } from './types.js';
+import { sharesHostRefDatabase, worldRepos, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
-import { finalizeMergeRepo, type MergeResult } from './merge.js';
+import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 
 export interface GitBrokerCredential {
   /** Private key is materialized to a 0600 file only for one broker operation. */
@@ -46,13 +46,17 @@ export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Pr
   const errors: Record<string, string> = {};
   for (const repo of worldRepos(world.handle)) {
     try {
-      // Worktree worlds already share refs with their source repository. Trying
-      // to bundle/fetch the live branch back into that same repository either
-      // mistakes its local path for an SSH remote or hits Git's checked-out
-      // branch safety interlock. Verify the shared ref instead; no transfer is
-      // necessary for another task on this Karmax host to import it.
-      const local = await localAuthority(repo, world.handle.kind === 'worktree');
-      if (local && world.handle.kind === 'worktree') await verifySharedWorktreeBranch(world, repo, local);
+      // Worktree-backed worlds already share refs with their source repository.
+      // Trying to bundle/fetch the live branch back into that same repository
+      // either mistakes its local path for an SSH remote or hits Git's
+      // checked-out branch safety interlock. Verify the shared ref instead; no
+      // transfer is necessary for another task on this Karmax host to import
+      // it. Container worlds qualify too — they bind-mount the very same host
+      // worktree — so this must not be a `kind === 'worktree'` test, which used
+      // to fall all the way through to "Git broker requires an SSH remote".
+      const shared = sharesHostRefDatabase(world.handle.kind);
+      const local = await localAuthority(repo, shared);
+      if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
       else if (local) await importBranchToLocal(world, repo, local);
       else await pushBranchToOrigin(world, repo, auth);
       pushed.push(repo.name);
@@ -66,16 +70,18 @@ export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Pr
 
 /** The host-local repository this repo is authoritative to, if any. A recorded
  * checkout that has since vanished is a loud error — silently falling back to
- * origin would reintroduce the split-brain this field exists to prevent. */
-async function localAuthority(repo: WorldRepo, worktreeRepoIsLocal = false): Promise<string | undefined> {
+ * origin would reintroduce the split-brain this field exists to prevent.
+ * `worldRepoIsLocal` means "this world's checkouts live on the host", i.e. the
+ * caller has already established `capabilities.remote === false`. */
+async function localAuthority(repo: WorldRepo, worldRepoIsLocal = false): Promise<string | undefined> {
   if (repo.localPath) {
     if (!(await isGitRepo(repo.localPath)))
       throw new Error(`repo "${repo.name}" was provisioned from local checkout ${repo.localPath}, which is no longer a git repository`);
     return repo.localPath;
   }
-  // Worktree handles store their source checkout in `repo`; unlike an explicit
-  // localPath this may also be a network URL in test/provider-compatible shapes.
-  if (worktreeRepoIsLocal && await isGitRepo(repo.repo)) return repo.repo;
+  // Host-backed handles store their source checkout in `repo`; unlike an
+  // explicit localPath this may also be a network URL in test/provider shapes.
+  if (worldRepoIsLocal && await isGitRepo(repo.repo)) return repo.repo;
   return undefined;
 }
 
@@ -153,7 +159,7 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
     try {
       const basis = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
       const bundlePath = await authorityBundle(temp, repo, repo.branch, auth,
-        basis.code === 0 ? basis.stdout.trim() : undefined, world.handle.kind === 'worktree');
+        basis.code === 0 ? basis.stdout.trim() : undefined, sharesHostRefDatabase(world.handle.kind));
       const data = fs.readFileSync(bundlePath);
       const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
       if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
@@ -225,7 +231,7 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
   try {
     const known = await world.exec('git', ['rev-parse', '--verify', '--quiet', destinationRef], { cwd: destinationRepo.root });
     const bundlePath = await authorityBundle(temp, destinationRepo, branch, auth,
-      known.code === 0 ? known.stdout.trim() : undefined, world.handle.kind === 'worktree');
+      known.code === 0 ? known.stdout.trim() : undefined, sharesHostRefDatabase(world.handle.kind));
     const data = fs.readFileSync(bundlePath);
     const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
     if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
@@ -251,9 +257,9 @@ function cryptoSafeName(value: string): string { return value.replace(/[^A-Za-z0
  * otherwise an authenticated clone of the SSH remote. `basisSha`, when the
  * receiver already holds it, thins the bundle to just the missing history. */
 async function authorityBundle(temp: string, repo: WorldRepo, branch: string, auth: GitBrokerAuth,
-  basisSha?: string, worktreeRepoIsLocal = false): Promise<string> {
+  basisSha?: string, worldRepoIsLocal = false): Promise<string> {
   const bundlePath = path.join(temp, 'incoming.bundle');
-  const local = await localAuthority(repo, worktreeRepoIsLocal);
+  const local = await localAuthority(repo, worldRepoIsLocal);
   if (local && (await git(local, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0) {
     const basis = basisSha && (await git(local, ['cat-file', '-e', `${basisSha}^{commit}`])).code === 0
       ? ['--not', basisSha] : [];
@@ -405,7 +411,10 @@ async function readBranchBundle(world: World, repo: WorldRepo): Promise<Buffer> 
  * markers, target-into-branch merge, target-worktree landing) run unchanged. */
 async function landLocalBranch(localRepo: string, repo: WorldRepo, target: string, worldId: string,
   identity?: WorldGitIdentity): Promise<MergeResult> {
-  const tmp = path.join(localRepo, '..', `.karmax-land-${cryptoSafeName(worldId)}-${cryptoSafeName(repo.name)}`);
+  // Under karmax storage, never beside the user's repository: a crash between
+  // `worktree add` and the `finally` would otherwise litter their source tree
+  // with a directory they never created.
+  const tmp = path.join(scratchWorktreeHome(), `.karmax-land-${cryptoSafeName(worldId)}-${cryptoSafeName(repo.name)}`);
   if (fs.existsSync(tmp)) {
     await git(localRepo, ['worktree', 'remove', '--force', tmp]);
     fs.rmSync(tmp, { recursive: true, force: true });

@@ -59,6 +59,22 @@ const CONTINUE_AS_NEW_AFTER = 500;
  * id IS the singleton). Holds the queue as explicit state and leases the single
  * merge slot. Reorder = a signal; position = a query; crash-safe via a lease
  * timeout + grantee liveness check; continue-as-new to bound history.
+ *
+ * REPLAY NOTE (deliberate, do not "fix" this back). An earlier revision of the
+ * lease-renewal loop below contained an `await sleep(1000)` that was removed; the
+ * `sleep` import it left behind was dead code and is now gone too. A `patched()`
+ * marker is NOT added for it, on purpose:
+ *   - `patched()` can only branch code we still have. To make marker-less
+ *     histories replay, the legacy branch would have to RE-introduce the 1 s
+ *     timer — which would then break every history written since the removal
+ *     (the majority), trading a rare failure for a common one.
+ *   - The two histories differ in the ORDER of a timer and an `isTaskAlive`
+ *     activity, so no single command sequence satisfies both.
+ * The escape hatch for a singleton wedged on the old history is operational, not
+ * code: terminate the fixed-id `mergeQueue:<domain>` execution (or `npm run
+ * reset`) — the queue is rebuilt from the tasks that re-enqueue. This is the only
+ * coordinator edit in the tree that is knowingly not replay-compatible; every
+ * future change to this loop MUST go behind a `patched()` marker instead.
  */
 export async function mergeQueue(input: { domain: string; state?: MergeQueueState }): Promise<void> {
   const domain = input.domain;

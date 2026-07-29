@@ -1,9 +1,22 @@
-/** Agent-readable map of the first-party HTTP surface used by platform_request. */
+/**
+ * Agent-readable map of the first-party HTTP surface used by platform_request.
+ *
+ * This is the ONLY discovery mechanism an agent has for the administrative API,
+ * and `tests/gateway-routes.test.ts` walks it to assert every documented route
+ * has an explicit capability binding — so an omission here is both undiscoverable
+ * *and* untested. When a route is added to `src/gateway/server.ts`, add it here.
+ */
 export const PLATFORM_API_CATALOG = {
   note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
   resources: ['GET /api/resource-drivers'],
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
+    // The org-scoped spelling is the ONLY project-create that works on a hosted
+    // deployment: bare `POST /api/projects` rejects there with "hosted projects must
+    // be created inside an organization". Leaving it undocumented meant an agent on
+    // a hosted install had no discoverable way to create a project at all.
+    'GET|POST /api/organizations/:organizationId/projects (on hosted, project-create MUST use this form)',
+    'POST /api/projects/:projectId/reorder (body {before?: projectId} — sidebar order)',
     'GET|POST /api/projects/:projectId/workflow-pins',
     'GET|POST /api/projects/:projectId/resources', 'GET|PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
     'POST /api/projects/:projectId/resources/:resourceId/import',
@@ -15,6 +28,25 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST|DELETE /api/projects/:projectId/services', 'GET /api/projects/:projectId/services/compose-import',
     'GET|PUT /api/projects/:projectId/environment', 'GET /api/projects/:projectId/environment/proposal',
     'POST /api/projects/:projectId/environment/build',
+    'GET|POST /api/projects/:projectId/members',
+    'DELETE /api/projects/:projectId/members/user|team|organization/:principalId',
+  ],
+  organizations: [
+    // POST needs a human account: it calls bootstrapOrganizationOwner, and a scoped
+    // agent token has no session.userId. Same for /invitations/accept below.
+    'GET|POST /api/organizations (POST requires a human identity — an agent token cannot own an organization)',
+    'GET|DELETE /api/organizations/:organizationId (DELETE body {confirmSlug})',
+    'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
+    'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
+    'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',
+    'GET|POST /api/organizations/:organizationId/members', 'DELETE /api/organizations/:organizationId/members/:userId',
+    'GET|POST /api/organizations/:organizationId/invitations',
+    'POST /api/invitations/accept (body {token}; requires a human identity)',
+    'GET|POST /api/organizations/:organizationId/teams', 'PATCH|DELETE /api/organizations/:organizationId/teams/:teamId',
+    'GET|POST /api/organizations/:organizationId/teams/:teamId/members',
+    'DELETE /api/organizations/:organizationId/teams/:teamId/members/:userId',
+    'GET|PUT /api/organizations/:organizationId/settings/:workflow',
+    'GET|PUT /api/organizations/:organizationId/quick-settings/:workflow',
   ],
   sourceControl: [
     'GET|PUT /api/projects/:projectId/repository-sources',
@@ -38,6 +70,13 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
     'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local',
     'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
+    'GET|POST /api/tasks/:taskId/attempts (mutually-exclusive alternates)',
+    'PATCH /api/tasks/:taskId/workflow (retarget an unstarted task)',
+    'POST /api/tasks/:taskId/stage (move a task to another lifecycle stage)',
+    'GET /api/tasks/:taskId/executions', 'GET /api/tasks/:taskId/file?path=',
+    'GET|PATCH /api/tasks/:taskId/responsibility (assignee/delegate — task:assign)',
+    'GET|POST|DELETE /api/tasks/:taskId/subscribers (task:subscribe)',
+    'GET /api/search/fields (the searchable-field registry behind the query grammar)',
     'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
     'POST /api/agent/escalate (calling task inferred from its token; body {audience, message})',
     'GET /api/agent/escalation-targets (people, teams, and special audience selectors available to the calling task)',
@@ -54,6 +93,9 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
     'GET /api/tasks/:taskId/resources', 'POST /api/tasks/:taskId/resources/:resourceId/promote',
     'POST /api/tasks/:taskId/resources/:resourceId/discard',
+    'GET /api/tasks/:taskId/artifacts', 'POST /api/tasks/:taskId/artifacts/promote',
+    'GET /api/artifacts/:artifactId',
+    'GET|POST /api/tasks/:taskId/preview-leases', 'DELETE /api/preview-leases/:leaseId',
   ],
   automation: [
     'GET /api/organizations/:organizationId/workflows', 'POST /api/organizations/:organizationId/workflows/install',
@@ -91,7 +133,11 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
     'GET /api/organizations/:organizationId/agent-mail/providers (mailbox backends + active provider)',
     'POST /api/organizations/:organizationId/agent-mail/connect (connect this organization mailbox; body {provider, domain?|apiKey?})',
-    'POST /api/agent-mail/ingest?secret= (inbound mail webhook; minted-secret URL shown to the operator; accepts karmax/Postmark/CloudMailin/Mailgun/SendGrid payloads and raw MIME, routed to the recipient organization)',
+    // NOT callable through platform_request — it is in PLATFORM_REQUEST_EXCLUDED_PATHS
+    // (it authenticates by minted secret, before the session gate, so it must not be
+    // reachable with a task's token). Documented because an operator configures the
+    // URL at their mail provider; an agent reads mail via the agent-mail route above.
+    'POST /api/agent-mail/ingest?secret= (inbound mail webhook, configured at your mail provider — NOT callable via platform_request; accepts karmax/Postmark/CloudMailin/Mailgun/SendGrid payloads and raw MIME, routed to the recipient organization)',
   ],
   outboundEmail: [
     'GET /api/email (installation-wide outbound sender: active provider, from, configured, provider catalogue)',
@@ -103,8 +149,9 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',
     'GET /api/organizations/:organizationId/wiki/search?q=',
     'GET /api/organizations/:organizationId/wiki/history?path= (append-only database version history)',
+    'GET /api/organizations/:organizationId/wiki/suggest?q=',
     'GET /api/projects/:projectId/wiki?path=', 'GET|PUT|DELETE /api/projects/:projectId/wiki/page?path=',
-    'GET /api/projects/:projectId/wiki/search?q=',
+    'GET /api/projects/:projectId/wiki/search?q=', 'GET /api/projects/:projectId/wiki/suggest?q=',
     'GET /api/projects/:projectId/wiki/refs (filterable branch/task views; pass taskId= or branch= to reads)',
   ],
   payments: [
@@ -138,6 +185,17 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/activity?projectId=&since=', 'GET /api/dashboard', 'GET /api/diagnostics',
     'GET /api/processes', 'POST /api/processes/kill',
     'GET /api/queue?domain=&projectId=', 'POST /api/queue/prioritize|move?projectId=',
-    'POST /api/attachments (JSON dataUrl or image bytes)', 'WS /ws (authorized event stream)',
+    'GET /api/agent-queue (host concurrent-agent-turn queue)', 'POST /api/agent-queue/move (body {turnId, beforeTurnId?})',
+    'GET /api/metrics', 'GET|POST /api/remote-access (host-local only; body {action: setup|enable|disable})',
+    // The inbox is per-USER by construction, so these three are the human surface:
+    // a scoped agent token has no session.userId and gets a 400, whatever its
+    // capabilities. An agent watches work through /ws and the task view instead.
+    'GET /api/inbox?since= (human identity only — the inbox is per-user)',
+    'PATCH /api/inbox/:itemId (human identity only)',
+    'GET|PUT /api/inbox/preferences (human identity only)',
+    'GET /api/meta (deployment flags: hosted, hostLocal, safeMode — tells you which host-local routes exist here)',
+    'POST /api/attachments (JSON dataUrl or image bytes)', 'GET /api/attachments/:attachmentId',
+    'POST /api/logout', 'GET /api/health/live', 'GET /api/health/ready',
+    'GET /api/platform (this catalog)', 'WS /ws (authorized event stream)',
   ],
 } as const;

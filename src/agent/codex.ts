@@ -4,7 +4,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { PLATFORM_TOOL_SCHEMAS, TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { CONTROL_SERVER_NAME, controlMcpServerSpec, startControlBridge } from './control-bridge.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -13,7 +14,7 @@ import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './cust
 import { trackProcess } from '../util/processes.js';
 import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
-import { activityDetail, codexItemActivity } from './activity.js';
+import { activityDetail, codexItemActivity, toolActivityDetail } from './activity.js';
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
   spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
@@ -31,6 +32,83 @@ import { worldWorkingDirectory } from '../world/types.js';
  *     Threads persist under `$CODEX_HOME` and power resume. The old `codex exec` path
  *     is kept as a fallback (`KARMAX_CODEX_USE_EXEC=1`, or older CLIs without app-server).
  */
+/** Responses-API function tools: every provider-neutral schema, flat-shaped.
+ *  Exported so the cross-rail control-tool coverage test reads the SAME list the
+ *  rail sends rather than a restatement of it. */
+export const RESPONSES_API_TOOLS = TOOL_SCHEMAS.map((t) => ({
+  type: 'function', name: t.name, description: t.description, parameters: t.parameters,
+}));
+
+/**
+ * The app-server `dynamicTools` registration — tools the server asks US to
+ * execute over `item/tool/call`, i.e. tools that run inside this activity.
+ *
+ *  · remote world → every platform tool, because a Codex CLI running inside a
+ *    cloud sandbox cannot launch the host's absolute stdio `karmax` MCP path.
+ *  · local world → only the TURN-LOCAL controls. The durable platform tools are
+ *    already served by the config home's gateway-backed `karmax` MCP under the
+ *    turn's scoped token; registering them twice would give the model two doors
+ *    to the same operation. This mirrors the Claude Agent-SDK rail exactly
+ *    (`remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS`).
+ */
+export function codexDynamicTools(remote: boolean): Array<{ type: string; name: string; description: string; inputSchema: unknown }> {
+  return (remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS).map((tool) => ({
+    type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters,
+  }));
+}
+
+/**
+ * Local twin of `ensureRemoteCodexSessionTools`: rewrite a rollout's leading
+ * `session_meta` record so a RESUMED (or forked) thread advertises the current
+ * dynamic tools. `thread/start` is the only call that takes `dynamicTools`, so
+ * without this every thread created before this registration existed — which is
+ * every local Codex-subscription thread karmax has ever started — would keep
+ * running without turn-local controls forever.
+ *
+ * Best-effort by design: a missing/odd rollout costs the turn its controls, and
+ * must never cost it the turn. (The remote twin throws because a remote world is
+ * seeded from scratch each turn, so a malformed file there is a real bug.)
+ */
+export function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools: unknown[]): boolean {
+  try {
+    const sessions = path.join(configHome, 'sessions');
+    if (!fs.existsSync(sessions)) return false;
+    const stack = [sessions];
+    let file: string | undefined;
+    while (stack.length && !file) {
+      const dir = stack.pop()!;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.name.endsWith('.jsonl') && entry.name.includes(session)) { file = full; break; }
+      }
+    }
+    if (!file) return false;
+    const original = fs.readFileSync(file, 'utf8');
+    const newline = original.indexOf('\n');
+    const metadata = JSON.parse(newline < 0 ? original : original.slice(0, newline));
+    if (metadata?.type !== 'session_meta' || !metadata.payload || typeof metadata.payload !== 'object') return false;
+    metadata.payload.dynamic_tools = dynamicTools;
+    // Write through a temp file + rename, NOT in place. Unlike the remote twin
+    // (which patches a per-turn copy seeded from scratch), this rewrites the
+    // user's real, leased, persistent rollout — a crash or SIGKILL part-way
+    // through an in-place `writeFileSync` truncates the very session history the
+    // resume depends on. `rename` within the same directory is atomic, so the
+    // file is either the old rollout or the new one, never a half of either.
+    const temp = `${file}.karmax-${process.pid}.tmp`;
+    fs.writeFileSync(temp, `${JSON.stringify(metadata)}${newline < 0 ? '' : original.slice(newline)}`, { mode: 0o600 });
+    try {
+      fs.renameSync(temp, file);
+    } catch (error) {
+      fs.rmSync(temp, { force: true });
+      throw error;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class CodexAdapter implements AgentAdapter {
   readonly provider = 'codex' as const;
 
@@ -77,7 +155,7 @@ export class CodexAdapter implements AgentAdapter {
     const model = input.profile.model ?? 'gpt-5.5';
     const handlers = platformToolHandlers(input.world, ctx);
     // Responses API function tools are flat ({type:'function', name, ...}).
-    const tools = TOOL_SCHEMAS.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }));
+    const tools = RESPONSES_API_TOOLS;
 
     // On a fresh session, replay the full conversation so a login switch (which
     // drops the server-bound previous_response_id) doesn't lose context; when
@@ -191,20 +269,24 @@ export class CodexAdapter implements AgentAdapter {
           /* leave empty */
         }
         const handler = handlers[call.name];
+        // `toolActivityDetail` suppresses the detail outright for credential-bearing
+        // tools — a get_credential result carries the approved plaintext reveal.
+        const startedDetail = toolActivityDetail(call.name, args);
         ctx.emitActivity({
           id: String(call.call_id ?? `${call.name}-${i}`),
           kind: 'tool',
           phase: 'started',
           title: String(call.name ?? 'Tool call'),
-          ...(activityDetail(args) ? { detail: activityDetail(args) } : {}),
+          ...(startedDetail ? { detail: startedDetail } : {}),
         });
         const result = handler ? await handler(args) : `unknown tool ${call.name}`;
+        const doneDetail = toolActivityDetail(call.name, result);
         ctx.emitActivity({
           id: String(call.call_id ?? `${call.name}-${i}`),
           kind: 'tool',
           phase: 'completed',
           title: String(call.name ?? 'Tool call'),
-          ...(activityDetail(result) ? { detail: activityDetail(result) } : {}),
+          ...(doneDetail ? { detail: doneDetail } : {}),
         });
         toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: result });
         if (call.name === 'signal_completion') completed = true;
@@ -242,14 +324,16 @@ export class CodexAdapter implements AgentAdapter {
     const remoteHome = remote
       ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session)
       : undefined;
-    const dynamicTools = PLATFORM_TOOL_SCHEMAS.map((tool) => ({
-      type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters,
-    }));
+    const dynamicTools = codexDynamicTools(remote);
     // app-server exposes dynamicTools only on thread/start. A thread created by
-    // an ordinary Codex client has no persisted Karmax definitions, so enrich
-    // its sandbox-local rollout metadata before a true native resume/fork.
+    // an ordinary Codex client — or by a karmax old enough to predate this
+    // registration — has no persisted Karmax definitions, so enrich its rollout
+    // metadata before a true native resume/fork. Remote worlds patch the
+    // sandbox-side copy; local subscriptions patch the leased CODEX_HOME.
     if (remoteHome && input.session)
       await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools);
+    else if (!remote && input.session && input.resolvedAuth?.configHome)
+      ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools);
     let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
       extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
     if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
@@ -295,19 +379,29 @@ export class CodexAdapter implements AgentAdapter {
     // boundary, so run with approvals off and full access — the app-server analogue
     // of `codex exec --dangerously-bypass-approvals-and-sandbox`. Any approval the
     // server still requests is auto-granted below.
+    // The dynamic-tool control channel. It used to answer only in remote worlds,
+    // which meant a LOCAL Codex-subscription agent had no turn-local controls at
+    // all: no way to record a Review verdict, a resolve transition, review info,
+    // or a sub-task. It is now always served; `dynamicTools` above decides which
+    // names exist (remote: every platform tool, because a remote CLI cannot launch
+    // the host's stdio `karmax` MCP; local: only the turn-local controls, since
+    // the config home's `karmax` MCP already serves the durable ones).
     client.onServerRequest(async (method, params) => {
       if (/approval/i.test(method)) return { decision: 'approved_for_session' };
-      if (method !== 'item/tool/call' || !remote) return {};
+      if (method !== 'item/tool/call') return {};
       const tool = String(params?.tool ?? '');
       const handler = platformHandlers[tool];
       if (!handler) return { contentItems: [{ type: 'inputText', text: `unknown Karmax tool ${tool}` }], success: false };
       const id = String(params?.callId ?? tool);
+      // Credential-bearing tools never publish a detail (see SECRET_TOOL_NAMES).
+      const startedDetail = toolActivityDetail(tool, params?.arguments);
       ctx.emitActivity({ id, kind: 'tool', phase: 'started', title: tool,
-        ...(activityDetail(params?.arguments) ? { detail: activityDetail(params.arguments) } : {}) });
+        ...(startedDetail ? { detail: startedDetail } : {}) });
       try {
         const result = await handler(params?.arguments ?? {});
+        const doneDetail = toolActivityDetail(tool, result);
         ctx.emitActivity({ id, kind: 'tool', phase: 'completed', title: tool,
-          ...(activityDetail(result) ? { detail: activityDetail(result) } : {}) });
+          ...(doneDetail ? { detail: doneDetail } : {}) });
         return { contentItems: [{ type: 'inputText', text: result }], success: true };
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
@@ -549,7 +643,7 @@ export class CodexAdapter implements AgentAdapter {
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
           developerInstructions: input.systemPrompt,
-          ...(remote ? { dynamicTools } : {}),
+          dynamicTools,
           ...(model ? { model } : {}),
         });
         threadId = started?.thread?.id ?? threadId;
@@ -681,6 +775,21 @@ export class CodexAdapter implements AgentAdapter {
     const flags = ['--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-o', lastFile];
     if (model) flags.push('-m', model);
     if (effort) flags.push('-c', `model_reasoning_effort=${effort}`);
+    // Turn-local controls (`confirm_decision`, `resolve_decision`, `create_review_info`,
+    // …). `codex exec` is a one-shot subprocess with no dynamic-tool control channel —
+    // its only extension point is stdio MCP servers it spawns itself — so they reach
+    // this activity through the per-turn socket bridge (control-bridge.ts). Registered
+    // with `-c` overrides rather than by writing the leased config home: the socket path
+    // is per-turn, and two concurrent turns sharing a home would clobber each other.
+    // Values are JSON, which is valid TOML for strings and arrays.
+    const control = await startControlBridge(platformToolHandlers(input.world, ctx));
+    if (control) {
+      const spec = controlMcpServerSpec(control);
+      flags.push('-c', `mcp_servers.${CONTROL_SERVER_NAME}.command=${JSON.stringify(spec.command)}`);
+      flags.push('-c', `mcp_servers.${CONTROL_SERVER_NAME}.args=${JSON.stringify(spec.args)}`);
+      for (const [name, value] of Object.entries(spec.env))
+        flags.push('-c', `mcp_servers.${CONTROL_SERVER_NAME}.env.${name}=${JSON.stringify(value)}`);
+    }
     // Image attachments: `codex exec -i <FILE>` (and `exec resume -i <FILE>`) take
     // real file paths, so materialize the referenced attachments to a temp dir and
     // attach each. Fresh turn → every message's images; resuming → only the new
@@ -804,6 +913,7 @@ export class CodexAdapter implements AgentAdapter {
     });
     if (buf.trim()) handleLine(buf); // flush a trailing partial line
     if (hb) clearInterval(hb);
+    control?.close(); // the control socket must not outlive the turn it mutates
     cleanupImages(); // remove the temp image files now the child has consumed them
     await releaseAgent(child.pid, custody.custodyId); // settle marked background tools, then clear custody
     untrack();

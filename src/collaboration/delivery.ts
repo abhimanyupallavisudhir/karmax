@@ -17,12 +17,31 @@ export class BrowserDeliveryAdapter implements DeliveryAdapter {
   async deliver(): Promise<void> {}
 }
 
+/** How long a single webhook POST may take before it is treated as failed. */
+export const WEBHOOK_DELIVERY_TIMEOUT_MS = 20_000;
+
 export class WebhookDeliveryAdapter implements DeliveryAdapter {
-  constructor(private url: string, private channel: 'email' | 'slack', private fetcher: typeof fetch = fetch) {}
+  constructor(private url: string, private channel: 'email' | 'slack', private fetcher: typeof fetch = fetch,
+    private timeoutMs = WEBHOOK_DELIVERY_TIMEOUT_MS) {}
   async deliver(envelope: DeliveryEnvelope): Promise<void> {
-    const response = await this.fetcher(this.url, { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ channel: this.channel, ...envelope }) });
-    if (!response.ok) throw new Error(`${this.channel} delivery returned ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    // Node's fetch has NO default timeout, and `drain()` awaits this call while
+    // holding `running = true` — so a black-holed delivery URL (a host that accepts
+    // the connection and never answers) parked the ONE dispatcher forever. Every
+    // later tick returned early on `if (this.running)`, and because all channels
+    // share that loop, browser inbox delivery stopped too. The store's 60s claim
+    // reclaim could not help: the only dispatcher was the stuck one.
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetcher(this.url, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ channel: this.channel, ...envelope }), signal: abort.signal });
+      if (!response.ok) throw new Error(`${this.channel} delivery returned ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    } catch (error) {
+      if (abort.signal.aborted) throw new Error(`${this.channel} delivery timed out after ${this.timeoutMs}ms`);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -36,9 +55,19 @@ export class DeliveryDispatcher {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.drain(), this.intervalMs);
+    // `drain()` CAN reject: `claimDelivery()` runs outside the per-item try (it is
+    // the transaction that hands out the claim) and rethrows after its ROLLBACK.
+    // A bare `void` there made a locked/corrupt database an unhandled rejection —
+    // which, with the process-level backstop gone or in a strict Node, takes the
+    // whole app down for a retryable projection failure. Every loop owns its own
+    // errors; the interval keeps running and the next tick retries.
+    this.timer = setInterval(() => this.drain().catch((e) => this.onDrainError(e)), this.intervalMs);
     this.timer.unref();
-    void this.drain();
+    this.drain().catch((e) => this.onDrainError(e));
+  }
+
+  private onDrainError(error: unknown): void {
+    console.error('[delivery] drain failed:', error instanceof Error ? error.message : String(error));
   }
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
