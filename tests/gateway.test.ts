@@ -170,6 +170,33 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(res.status).toBe(401);
   });
 
+  it('reorders projects for the sidebar', async () => {
+    const make = async (name: string) => (await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name }) })).json()) as any;
+    const [one, two, three] = [await make('Ord one'), await make('Ord two'), await make('Ord three')];
+    const listed = async () => ((await (await fetch(`${base}/api/projects`, { headers: auth() })).json()) as any[])
+      .map((p) => p.name).filter((n: string) => n.startsWith('Ord '));
+    expect(await listed()).toEqual(['Ord one', 'Ord two', 'Ord three']);
+
+    // The drop names the project the dragged one now sits above.
+    const moved = await fetch(`${base}/api/projects/${three.id}/reorder`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ before: one.id }) });
+    expect(moved.status).toBe(200);
+    expect(await listed()).toEqual(['Ord three', 'Ord one', 'Ord two']);
+
+    // Omitting `before` drops it past the last project, and the new order sticks.
+    await fetch(`${base}/api/projects/${three.id}/reorder`, { method: 'POST', headers: auth(), body: JSON.stringify({}) });
+    expect(await listed()).toEqual(['Ord one', 'Ord two', 'Ord three']);
+    await fetch(`${base}/api/projects/${two.id}/reorder`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ before: one.id }) });
+    expect(await listed()).toEqual(['Ord two', 'Ord one', 'Ord three']);
+
+    const missing = await fetch(`${base}/api/projects/proj_nope/reorder`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({}) });
+    expect(missing.status).toBe(400);
+    expect((await fetch(`${base}/api/projects/${one.id}/reorder`, { method: 'POST' })).status).toBe(401);
+  });
+
   it('deletes provider worlds before committing project deletion', async () => {
     const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ name: 'Disposable' }) })).json();

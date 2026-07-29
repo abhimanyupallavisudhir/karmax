@@ -185,6 +185,11 @@ a { color: var(--accent); text-decoration: none; }
 .rail .proj.active { background: var(--accent-weak); color: var(--ink); font-weight: 600; }
 .rail .proj .glyph { color: var(--accent); }
 .rail .proj .count { margin-left: auto; font-size: 11px; color: var(--ink-3); font-family: var(--font-mono); }
+/* Drag a project up or down to set the sidebar order. The row itself is the
+   handle — the list is short and every row is a link, so an extra grip glyph
+   would be noise. The ghost stays faintly in place to mark where it came from. */
+.rail .proj[draggable="true"]:active { cursor: grabbing; }
+.rail .proj.dragging { opacity: 0.4; }
 .rail .add { color: var(--ink-3); }
 .rail .add:hover { color: var(--accent); }
 .rail .grow { flex: 1; }
