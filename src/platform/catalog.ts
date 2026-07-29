@@ -4,6 +4,7 @@ export const PLATFORM_API_CATALOG = {
   resources: ['GET /api/resource-drivers'],
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
+    'POST /api/projects/:projectId/reorder (body {before?: projectId} — sidebar order)',
     'GET|POST /api/projects/:projectId/workflow-pins',
     'GET|POST /api/projects/:projectId/resources', 'GET|PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
     'POST /api/projects/:projectId/resources/:resourceId/import',

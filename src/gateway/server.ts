@@ -181,6 +181,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/reorder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
@@ -1705,6 +1706,17 @@ export class Gateway {
             if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
           return this.json(res, 200, { deleted: true, projectId: id });
         }
+      }
+      // Sidebar order. The drop tells us which project the dragged one now sits
+      // above (`before`); omitting it means "last". Sending the neighbour rather
+      // than an absolute index keeps a drag correct against a list that changed
+      // under the user, and the store re-densifies the organization's positions.
+      const projReorder = p.match(/^\/api\/projects\/([^/]+)\/reorder$/);
+      if (projReorder && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, store.reorderProject(projReorder[1]!, b.before ?? undefined));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
       if (projectExecution) {

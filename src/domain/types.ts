@@ -384,6 +384,9 @@ export interface Project {
   name: string;
   createdAt: number;
   config: ProjectConfig;
+  /** Hand-picked sidebar position within the organization (drag to reorder).
+   * Optional only while reading historical fixtures, where creation order rules. */
+  order?: number;
 }
 
 export interface ProjectConfig {
