@@ -5885,14 +5885,38 @@ function conversationPane(v, t) {
 function conversationEntries(t) {
   const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
+  // A Temporal activity retry continues the same logical turn, so provider item
+  // ids (especially the synthetic `turn` id) repeat. Keep attempts distinct:
+  // otherwise the resumed `started` event overwrites the prior `failed` event
+  // and inherits its error detail, producing the contradictory
+  // "Agent started working · API Error: 529" row seen on task #353.
+  //
+  // New events carry an explicit attempt number. Infer a generation for older
+  // histories so already-running tasks repair themselves after this UI ships.
+  const legacyGenerations = new Map();
   for (const event of updates) {
     const activity = event.payload || {};
     const turn = activity.turnId || `legacy-${event.seq || event.ts}`;
-    const key = `${turn}/${activity.id || event.seq || event.ts}`;
+    const item = activity.id || event.seq || event.ts;
+    const base = `${turn}/${item}`;
+    let attempt = activity.attempt;
+    let retry = Number(attempt) > 1;
+    if (attempt == null) {
+      let generation = legacyGenerations.get(base) || 1;
+      const prior = activities.get(`${base}/legacy-${generation}`);
+      if (activity.phase === 'started' && ['completed', 'failed'].includes(prior?.activity?.phase)) generation++;
+      legacyGenerations.set(base, generation);
+      attempt = `legacy-${generation}`;
+      retry = generation > 1;
+    }
+    const key = `${base}/${attempt}`;
     const prior = activities.get(key);
+    const displayed = retry && activity.kind === 'turn' && activity.phase === 'started'
+      ? { ...activity, title: 'Agent retry started', detail: undefined }
+      : activity;
     activities.set(key, {
       type: 'activity',
-      activity: { ...(prior?.activity || {}), ...activity },
+      activity: { ...(prior?.activity || {}), ...displayed },
       ts: prior?.ts || event.ts,
       sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,

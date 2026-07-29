@@ -784,6 +784,14 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // of replaying the whole turn from scratch
     const events = h.store.eventsSince(taskId, 0);
     expect(events.some((e) => e.type === 'turn.resumed')).toBe(true);
+    // Attempts share one logical turn id, but the UI must not fold the retry's
+    // fresh "started" row over the prior failure (task #353). The activity event
+    // carries the Temporal attempt so both rows remain independently auditable.
+    const turnActivities = events.filter((e) => e.type === 'agent.activity' && e.payload.id === 'turn');
+    expect(turnActivities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ payload: expect.objectContaining({ phase: 'failed', attempt: 1 }) }),
+      expect.objectContaining({ payload: expect.objectContaining({ phase: 'started', attempt: 2 }) }),
+    ]));
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
