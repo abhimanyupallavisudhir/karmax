@@ -91,6 +91,15 @@ export interface AccountState {
 export interface GrantedAccountLease {
   taskId: string;
   turnId: string;
+  /** When the lease was granted. `sweepDeadLeases` questions an owner's liveness
+   *  only after the lease has gone unreturned for `LEASE_TIMEOUT_MS`; without this
+   *  a lease granted seconds ago was probed on the coordinator's very next wake,
+   *  and a task that was merely CANCELLING (its workflow already closing while its
+   *  turn winds down) reads as not-alive — so the sweep reclaimed a live task's
+   *  credential and perturbed its shutdown. Optional: records carried across a
+   *  continue-as-new from before this field default to the restore instant, which
+   *  restarts the clock rather than sweeping them blind. */
+  grantedAt?: number;
   /** The credential whose `inUse` this lease is holding. Passthrough grants
    *  consume no capacity and are not tracked. */
   accountId: string;
@@ -164,7 +173,7 @@ const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({
 export async function accountCoordinator(input: { state?: AccountCoordinatorState }): Promise<void> {
   let accounts = input.state?.accounts ?? [];
   let queue = input.state?.queue ?? [];
-  let granted = input.state?.granted ?? [];
+  let granted = (input.state?.granted ?? []).map((g) => ({ ...g, grantedAt: g.grantedAt ?? Date.now() }));
   let processed = input.state?.processed ?? 0;
   // Whether `returnAccount` gives capacity back ONLY when it can attribute the
   // return to a granted-lease record (see the handler below). Gated like
@@ -476,7 +485,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         free.inUse++;
         // Remember who holds it, so the lease can be reclaimed if its owner is
         // terminated (no finally) or dies (liveness sweep above).
-        granted.push({ taskId: req.taskId, turnId: req.turnId, accountId: free.id });
+        granted.push({ taskId: req.taskId, turnId: req.turnId, accountId: free.id, grantedAt: Date.now() });
       }
       processed++;
       try {
@@ -505,16 +514,25 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
    * ledger, so a terminated task leaked its `inUse` forever.
    */
   async function sweepDeadLeases(): Promise<void> {
-    const holders = [...new Set(granted.map((g) => g.taskId))];
+    // Only leases that have gone unreturned for the full lease window are
+    // candidates. A freshly granted lease belongs to a turn that is simply still
+    // running, and a task in the middle of cancelling looks dead to `isTaskAlive`
+    // while it is still tidying up — probing either is how a live task loses its
+    // credential mid-turn.
+    const now = Date.now();
+    const stale = granted.filter((g) => now - (g.grantedAt ?? now) >= LEASE_TIMEOUT_MS);
+    if (!stale.length) return;
+    const holders = [...new Set(stale.map((g) => g.taskId))];
     const alive = await Promise.all(holders.map((taskId) => act.isTaskAlive(taskId)));
     const dead = new Set(holders.filter((_, i) => !alive[i]));
     if (!dead.size) return;
-    for (const lease of granted) {
+    for (const lease of stale) {
       if (dead.has(lease.taskId)) {
         log.warn(`account lease held by dead task ${lease.taskId}; reclaiming ${lease.accountId}`);
         releaseGranted(lease);
       }
     }
-    granted = granted.filter((g) => !dead.has(g.taskId));
+    const staleIds = new Set(stale.map((g) => `${g.taskId}:${g.turnId}`));
+    granted = granted.filter((g) => !(dead.has(g.taskId) && staleIds.has(`${g.taskId}:${g.turnId}`)));
   }
 }

@@ -131,15 +131,19 @@ describe('PackageStore (name@version resolution)', () => {
   });
 
   it('pins by version and returns the latest when unspecified', () => {
-    const store = PackageStore.withBundled();
-    store.register({ ...bundled('software-dev'), version: '1.10.0', description: 'newer' });
-    store.register({ ...bundled('software-dev'), version: '1.2.0', description: 'mid' });
-    // numeric, not lexical: 1.10.0 sorts AFTER 1.9.0, and the bundled history is
-    // read from the manifests so a new shipped version does not break this.
     const history = PackageStore.withBundled().versions('software-dev');
-    expect(store.versions('software-dev')).toEqual([...history, '1.10.0']);
+    const store = PackageStore.withBundled();
+    const newest = '1.11.0';
+    store.register({ ...bundled('software-dev'), version: newest, description: 'newer' });
+    store.register({ ...bundled('software-dev'), version: '1.2.0', description: 'mid' });
+    expect(store.versions('software-dev')).toEqual([...history, newest]);
+    // Ordering is NUMERIC, not lexical, and the bundled history is now its own
+    // proof: it spans 1.9.0 → 1.10.0, and lexically '1.10.0' sorts BEFORE '1.9.0'.
+    // Reading it from the manifests keeps this true as versions advance, instead
+    // of hard-coding a list that a version bump turns red.
+    expect(history.indexOf('1.10.0')).toBeGreaterThan(history.indexOf('1.9.0'));
     expect(history.indexOf('1.2.0')).toBeGreaterThan(history.indexOf('1.1.0'));
-    expect(store.resolve('software-dev')!.version).toBe('1.10.0'); // latest
+    expect(store.resolve('software-dev')!.version).toBe(newest); // latest
     expect(store.resolve('software-dev', '1.0.0')!.description).not.toBe('newer'); // old version intact
   });
 

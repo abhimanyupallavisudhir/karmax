@@ -7,7 +7,6 @@ import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 import { accountCoordinatorId, mergeQueueId } from '../src/coordinators/names.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
-import { BUNDLED_QUALIFIED } from '../src/workflows/names.js';
 
 const view = (h: any) => h.query('view') as Promise<any>;
 const baseInput = (taskId: string, repo: string, over: any = {}) => ({
@@ -357,15 +356,16 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       args: [{ domain, state: { domain, queue: [], current: 'held', processed: 0 } }],
     });
 
-  // Both behaviors below are pinned to mergeOnly@1.5.0 — the version the manifest
+  // Both behaviors below are pinned to mergeOnly@1.6.0 — the version the manifest
   // stamps on every new merge-only task. They are deliberately NOT retrofitted onto
   // older pins: each changes the commands a workflow task emits at a point older
   // executions already recorded, which would be a NonDeterminismError on replay.
   // The `keeps the pre-1.5 shape` test below is the other half of that contract.
-  it('merge-only 1.5: cancelling while queued for a merge slot releases the world instead of leaking it', async () => {
+  // (1.6.0, not 1.5.0: master published its own 1.5.0 concurrently — see SPEC §4.5.)
+  it('merge-only 1.6: cancelling while queued for a merge slot releases the world instead of leaking it', async () => {
     const repo = await repoWithFeature('mo-cancel');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('mergeOnly@1.5.0', {
+    const handle = await h.client.workflow.start('mergeOnly@1.6.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [baseInput(taskId, repo, { title: 'merge feature', branch: 'feature', target: 'main' })],
@@ -394,10 +394,10 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await holder.terminate('test done');
   });
 
-  it('merge-only 1.5: a confirm that arrives before the Review gate does not pre-approve it', async () => {
+  it('merge-only 1.6: a confirm that arrives before the Review gate does not pre-approve it', async () => {
     const repo = await repoWithFeature('mo-latch');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('mergeOnly@1.5.0', {
+    const handle = await h.client.workflow.start('mergeOnly@1.6.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [baseInput(taskId, repo, { title: 'early confirm', branch: 'feature', target: 'main' })],
@@ -442,12 +442,12 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:feat.txt'])).stdout).toContain('feature work');
   });
 
-  // mergeOnly@1.5.0 is implemented but only reachable once it is exported from
-  // src/workflows/index.ts and listed in BUNDLED_QUALIFIED (names.ts) — files this
-  // change deliberately does not touch. The test activates itself the moment they
-  // land; see the report accompanying this change for the exact two lines.
-  it.skipIf(!BUNDLED_QUALIFIED.has('mergeOnly@1.5.0'))(
-    'merge-only 1.5: serializes on EVERY repo domain, not just repo[0]',
+  // Asserted, not skip-guarded. This once carried
+  // `it.skipIf(!BUNDLED_QUALIFIED.has(...))` from when the export did not yet
+  // exist; now that it does, that guard could only ever hide a regression which
+  // dropped the export, turning a failure into a silent skip.
+  it(
+    'merge-only 1.6: serializes on EVERY repo domain, not just repo[0]',
     async () => {
       const repo = await repoWithFeature('mo-domains');
       // A real project makes the world multi-repo: karmax attaches the project
@@ -459,7 +459,7 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       const task = h.store.createTask({ projectId: project.id, title: 'merge feature',
         workflow: 'merge-only', workflowVersion: '1.5.0', params: { prompt: '' } as any });
       const taskId = task.id;
-      const handle = await h.client.workflow.start('mergeOnly@1.5.0', {
+      const handle = await h.client.workflow.start('mergeOnly@1.6.0', {
         taskQueue: TASK_QUEUE,
         workflowId: taskId,
         args: [{

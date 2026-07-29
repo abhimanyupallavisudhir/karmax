@@ -368,6 +368,8 @@ async function softwareDevImpl(
   // Replaying either against the new code parks (or resumes) where history says
   // otherwise, which is a NonDeterminismError that wedges the execution for good.
   const clearsConfirmOnGate = minor >= 10;
+  // A new activity ARGUMENT is a recorded-input change, so it is versioned too.
+  const identifiedAccountReturns = minor >= 10;
   const followUpWakesEscalation = minor >= 10;
   const taskId = input.taskId;
   const recovery = input.recovery;
@@ -1328,8 +1330,19 @@ async function softwareDevImpl(
       // Naming the lease matters: without it the coordinator drops the OLDEST record
       // for the credential, which may belong to another live task, and its dead-lease
       // sweep then over-releases (see coordinators/account.ts).
-      if (grant && !passthrough)
-        await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
+      //
+      // VERSIONED, like every other change here: the identity is a new ARGUMENT, and
+      // an activity's input is recorded with its ScheduleActivityTask command. Left
+      // ungated it also altered older pins at runtime — the coordinator can only
+      // match an identified return against a record carrying the same identity, so
+      // on an older execution the return found nothing and quietly released nothing,
+      // holding the login's capacity and stalling whatever asked for it next. That
+      // showed up as ~20% flakiness in the parent/child cancellation test on 1.6.0.
+      if (grant && !passthrough) {
+        await (identifiedAccountReturns
+          ? coordinator.returnAccount(grant.accountId, { taskId, turnId })
+          : coordinator.returnAccount(grant.accountId)).catch(() => undefined);
+      }
     }
   }
 
