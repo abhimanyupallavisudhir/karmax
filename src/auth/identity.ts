@@ -9,6 +9,7 @@ import path from 'node:path';
 export interface IdentityUser {
   id: string;
   email: string;
+  emailVerified?: boolean;
   name: string;
   role?: string | null;
   createdAt: Date | string;
@@ -128,6 +129,16 @@ export class IdentityService {
           }).catch((e) => console.error('[email] verification send failed:', e instanceof Error ? e.message : e));
         },
       },
+      // An address typo must not strand a new account behind a verification
+      // email it can never receive. Better Auth updates an unverified account
+      // immediately and sends a fresh link to the corrected address; an already
+      // verified account keeps its current address until the new one is verified.
+      user: {
+        changeEmail: {
+          enabled: true,
+          updateEmailWithoutVerification: true,
+        },
+      },
       session: { expiresIn: 60 * 60 * 24 * 14, updateAge: 60 * 60 * 24 },
       // Better Auth defaults `rateLimit.enabled` to `isProduction`, and karmax
       // never sets NODE_ENV=production — so sign-in, password reset and email
@@ -185,6 +196,10 @@ export class IdentityService {
 
   async signOut(headers: Headers): Promise<Response> {
     return this.auth.api.signOut({ headers, asResponse: true });
+  }
+
+  async changeEmail(newEmail: string, callbackURL: string, headers: Headers): Promise<Response> {
+    return this.auth.api.changeEmail({ body: { newEmail, callbackURL }, headers, asResponse: true });
   }
 
   async beginSso(callbackURL: string, headers?: Headers): Promise<Response> {
