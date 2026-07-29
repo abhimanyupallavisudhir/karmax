@@ -48,6 +48,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action',
+        'escalate_to_human',
         'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'describe_platform', 'platform_request', 'list_world_providers',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
@@ -64,6 +65,35 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
     expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
+  });
+
+  it('forwards a dedicated human escalation with its chosen audience and reason', async () => {
+    const seen: unknown[] = [];
+    const stub = {
+      escalateToHuman: async (args: unknown) => {
+        seen.push(args);
+        return { status: 'waiting' };
+      },
+    } as any;
+    const server = createPlatformMcpServer(stub);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const c = new Client({ name: 'escalation-test', version: '1.0.0' });
+    await c.connect(clientT);
+
+    const result: any = await c.callTool({
+      name: 'escalate_to_human',
+      arguments: {
+        audience: ['user:designer', '@team:leaders'],
+        message: 'Which launch option should I use?',
+      },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([{
+      audience: ['user:designer', '@team:leaders'],
+      message: 'Which launch option should I use?',
+    }]);
   });
 
   /**
@@ -346,6 +376,28 @@ describe('httpOps token resolution (CLI bridge)', () => {
       const list = await ops.listTasks('p1');
       expect(list).toEqual([]);
       expect(seen).toEqual(['Bearer s_stale', 'Bearer s_fresh']); // retried once with a fresh session
+    } finally {
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it('routes the dedicated escalation tool through the calling-task API', async () => {
+    const seen: Array<{ url: string; init: any }> = [];
+    const orig = globalThis.fetch;
+    (globalThis as any).fetch = async (url: string, init: any = {}) => {
+      seen.push({ url, init });
+      return jsonRes(200, { status: 'waiting' });
+    };
+    try {
+      const ops = httpOps('http://gw', 'agent-token');
+      await ops.escalateToHuman({ audience: ['@team:design'], message: 'Choose a direction.' });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe('http://gw/api/agent/escalate');
+      expect(seen[0]!.init.method).toBe('POST');
+      expect(JSON.parse(seen[0]!.init.body)).toEqual({
+        audience: ['@team:design'],
+        message: 'Choose a direction.',
+      });
     } finally {
       (globalThis as any).fetch = orig;
     }
