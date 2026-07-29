@@ -16,7 +16,7 @@ export type Capability = string;
  * smallest useful groups so an operator can understand what is being granted.
  */
 export const CAPABILITIES = [
-  'task:read', 'task:create', 'task:edit', 'task:signal', 'task:delete',
+  'task:read', 'task:create', 'task:edit', 'task:signal', 'task:escalate', 'task:delete',
   'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
   'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute',
   'task:assign', 'task:subscribe',
@@ -66,6 +66,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['task:create', 'Create tasks', 'Create tasks and choose their workflow authorization profile.'],
       ['task:edit', 'Edit tasks', 'Change task fields, drafts, tags, views, and task-scoped settings.'],
       ['task:signal', 'Act on tasks', 'Send follow-ups, confirmations, cancellations, and other workflow signals.'],
+      ['task:escalate', 'Request human input', 'Pause the calling agent’s task and route a decision to selected people or teams.'],
       ['task:delete', 'Delete tasks', 'Permanently remove task records where the workflow permits it.'],
       ['task:event:read', 'Read task events', 'Read the task activity and diagnostic event stream.'],
       ['task:git:publish', 'Publish task branches', 'Publish the calling task’s committed branch through the trusted Git broker.'],
@@ -213,6 +214,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   create_task: 'task:create', edit_task: 'task:edit', delete_task: 'task:delete',
   create_sub_task: 'task:create', respond_to_sub_task: 'task:signal', wait_for_subtasks: 'task:read',
   raise_to_parent: 'task:signal', create_review_info: 'task:review:write', signal_completion: 'task:signal',
+  escalate_to_human: 'task:escalate',
   save_skill: 'skill:write', signal_task: 'task:signal', reorder_queue: 'queue:write',
   get_task: 'task:read', find_task: 'task:read', list_tasks: 'task:read', search_tasks: 'task:read',
   list_tags: 'task:read', list_views: 'task:read', search_fields: 'task:read',

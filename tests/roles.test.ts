@@ -59,6 +59,9 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     expect(roleCeiling('merge')).toContain('merge-into:*');
     expect(roleCeiling('do')).toContain('create-sub-task');
     expect(roleCeiling('confirm')).toContain('confirm-decision');
+    expect(roleCeiling('do')).toContain('task:escalate');
+    expect(roleCeiling('merge')).toContain('task:escalate');
+    expect(roleCeiling('confirm')).toContain('task:escalate');
     // A Merge agent never gets the Do role's ceiling, whatever the task grant says.
     expect(roleCeiling('merge')).not.toContain('create-sub-task');
   });
@@ -68,8 +71,8 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     expect(roleCeiling('resolve')).toContain('resolve-decision');
   });
 
-  it('floors an undeclared role at signal-completion rather than granting nothing or everything', () => {
-    expect(roleCeiling('reviewer')).toEqual(['signal-completion']);
+  it('floors an undeclared role at completion plus the human-escalation safety valve', () => {
+    expect(roleCeiling('reviewer')).toEqual(['signal-completion', 'task:escalate']);
   });
 
   it('resets provider-scoped model and credentials on a per-task provider switch', () => {

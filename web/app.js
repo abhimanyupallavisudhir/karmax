@@ -2807,13 +2807,30 @@ function priorityFlag(t) {
   return `<span class="prio p${p}" title="Priority: ${PRIORITY_NAMES[p]}">${'▲'}${p >= 3 ? '' : ''} ${PRIORITY_NAMES[p]}</span>`;
 }
 
+// Is one dependency of a dependency trigger already satisfied? Mirrors
+// statusSatisfiesDependency() in src/domain/triggers.ts. A dep the task pool does
+// not hold (deleted, or not yet loaded) counts as unsatisfied — the honest guess,
+// since the dispatcher is still waiting on it.
+function dependencySatisfied(trigger, taskId) {
+  const status = (S.tasks || []).find((t) => t.id === taskId)?.lastView?.status;
+  if (!status) return false;
+  switch (trigger.on || 'success') {
+    case 'failed': return status === 'failed';
+    case 'settled': return status === 'done' || status === 'failed' || status === 'cancelled';
+    default: return status === 'done'; // 'done' | 'success'
+  }
+}
+
 // A one-line human summary of a task's triggers (armed-row subtitle).
 function triggerSummary(triggers) {
   const arr = Array.isArray(triggers) ? triggers : [];
   return arr
     .map((t) => {
       if (t.kind === 'dependency') {
-        const n = (t.tasks || []).length;
+        // What's still outstanding, not the whole list: a task declared "after 3
+        // tasks" with two of them done is waiting on one.
+        const n = (t.tasks || []).filter((id) => !dependencySatisfied(t, id)).length;
+        if (!n) return 'dependencies met';
         return `after ${n} task${n === 1 ? '' : 's'}`;
       }
       if (t.kind === 'schedule') return t.cron ? `cron ${t.cron}` : t.at ? `at ${new Date(t.at).toLocaleString()}` : 'schedule';

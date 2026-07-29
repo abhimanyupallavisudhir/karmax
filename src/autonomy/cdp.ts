@@ -35,8 +35,19 @@ export function assertLoopback(cdpUrl: string): URL {
 
 export async function listPages(cdpUrl: string, timeoutMs = 15_000): Promise<CdpTarget[]> {
   const base = assertLoopback(cdpUrl);
-  const targets = (await (await fetch(new URL('/json/list', base), { signal: AbortSignal.timeout(timeoutMs) })).json()) as CdpTarget[];
-  return targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+  try {
+    const response = await fetch(new URL('/json/list', base), { signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const targets = (await response.json()) as CdpTarget[];
+    return targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+  } catch (e) {
+    throw new Error(
+      `browser credential fill is unavailable: cannot reach Chrome DevTools at ${base.origin}. ` +
+      'Use the Karmax-managed chrome-devtools browser (which exposes a loopback CDP endpoint), ' +
+      `or pass that browser's cdpUrl. ${e instanceof Error ? e.message : String(e)}`,
+      { cause: e },
+    );
+  }
 }
 
 /** Choose the page whose target-list url matches one of `domains` (all if unset). */

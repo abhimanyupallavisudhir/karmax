@@ -176,6 +176,7 @@ const DO_ROLE: WorkflowRole = {
   label: 'Do agent',
   capabilities: [
     'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+    'task:escalate',
     'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
     'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
     // Vault access (PLAN-passwords.md): the ceiling admits the task grant's
@@ -199,7 +200,7 @@ Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
 const MERGE_ROLE: WorkflowRole = {
   name: 'merge',
   label: 'Merge agent',
-  capabilities: ['merge-into:*', 'signal-completion'],
+  capabilities: ['merge-into:*', 'signal-completion', 'task:escalate'],
   promptTemplate: `{{toolsPreamble}}
 
 You are merging task "{{title}}". Its work is on branch {{branch}} in the worktree at {{worldPath}}.
@@ -214,7 +215,7 @@ Finish the turn only when the branch is ready to merge. signal_completion is opt
 const LEGACY_RESOLVE_ROLE: WorkflowRole = {
   name: 'resolve',
   label: 'Resolve agent',
-  capabilities: ['signal-completion', 'save-skill', 'resolve-decision'],
+  capabilities: ['signal-completion', 'save-skill', 'resolve-decision', 'task:escalate'],
   promptTemplate: `{{toolsPreamble}}
 
 You are the RESOLVE agent for task "{{title}}". The "{{stage}}" step failed.
@@ -245,7 +246,7 @@ Always finish by calling resolve_decision exactly once.`,
 const CONFIRM_ROLE: WorkflowRole = {
   name: 'confirm',
   label: 'Confirm agent',
-  capabilities: ['confirm-decision', 'signal-completion'],
+  capabilities: ['confirm-decision', 'signal-completion', 'task:escalate'],
   defaults: { effort: 'low' },
   // The task recap + the Do agent's response arrive as a per-Review conversation
   // message (domain/confirm-prompt.ts, template user-editable via the confirmer
@@ -650,10 +651,11 @@ export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIF
  * went stale — profiles seed once, so a role that gained a capability kept the
  * old ceiling forever and the new tool silently 403'd.
  *
- * An undeclared role is floored at `signal-completion` so a turn can always end.
+ * Every role also gets the self-only human escalation safety valve. An
+ * undeclared role is otherwise floored at `signal-completion`.
  */
 export function roleCeiling(name: string, manifests: WorkflowManifest[] = MANIFESTS): string[] {
-  return agentRoleDef(name, manifests)?.capabilities ?? ['signal-completion'];
+  return [...new Set([...(agentRoleDef(name, manifests)?.capabilities ?? ['signal-completion']), 'task:escalate'])];
 }
 
 /** Resolve the transitive closure of `requires` for a set of workflows (SPEC §4.6). */

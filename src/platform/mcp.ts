@@ -44,6 +44,7 @@ export interface PlatformOps {
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
+  escalateToHuman(a: { audience: string[]; message: string }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
@@ -99,6 +100,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role) => void (await api.signalTask(getToken(), id, sig as any, text, role)),
+    escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
@@ -182,6 +184,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
+    escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
@@ -377,6 +380,21 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'message_agent',
     { description: `Send a follow-up into an attached agent conversation (${AGENT_ROLE_NAMES.join(', ')}). This works for original or forked tasks and is delivered live when that agent is running.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do'), message: z.string() } },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
+  );
+  server.registerTool(
+    'escalate_to_human',
+    {
+      description:
+        'Pause your current task at its exact stage and request input from selected people or teams. ' +
+        'Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+        'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
+        'Calling this stops the current turn; the task resumes when a selected human responds.',
+      inputSchema: {
+        audience: z.array(z.string()).min(1).max(32),
+        message: z.string().trim().min(1).max(4_000),
+      },
+    },
+    async (a) => wrap(() => ops.escalateToHuman(a)),
   );
   server.registerTool(
     'request_agent_action',
