@@ -64,6 +64,20 @@ export interface CardBillingAddress {
 /** Vault handle holding a registered card's secret half. */
 export const cardSecretHandle = (cardId: string) => `payment:card:${cardId}`;
 
+/**
+ * What can still be spent on a card. `available` alone is not the answer: on an
+ * issuing rail it is the *organization's* whole balance, shared by every card
+ * that rail issued, so a card capped at $123 would otherwise report the org's
+ * $250 as its remaining limit. A rail with no ceiling of its own (the human's
+ * own virtual card, where only the issuer can decline) has nothing but funds —
+ * and there `cap - spent` would double-count what `available` already reflects.
+ */
+export function cardRemaining(card: Pick<Card, 'cap' | 'available' | 'status'>, spent: number,
+  enforcesCardCap = true): number {
+  if (card.status === 'canceled') return 0;
+  return Math.max(0, enforcesCardCap ? Math.min(card.available, card.cap - spent) : card.available);
+}
+
 export interface PaymentBalance {
   available: number;
   currency: string;
@@ -659,8 +673,10 @@ export class StripeIssuingProvider implements PaymentProvider {
       let decision: { approved: boolean } = { approved: false };
       if (card && card.status === 'active' && this.organizationForCard(card) === connection.organizationId
         && String(object.currency ?? card.currency ?? 'usd').toLowerCase() === String(card.currency ?? 'usd').toLowerCase()) {
+        // `amount` is what the rail is really authorizing, which the reservation
+        // is only an upper bound on — consume it at that figure, not at the bound.
         const request = this.store!.findPaymentAuthorization(card.id, amount, merchant);
-        if (request && this.store!.consumePaymentAuthorization(request.id, object.id)) {
+        if (request && this.store!.consumePaymentAuthorization(request.id, object.id, amount)) {
           decision = { approved: true };
           this.store!.upsertPaymentTransaction({
             organizationId: connection.organizationId, projectId: request.projectId, taskId: request.taskId,
@@ -743,15 +759,21 @@ export class StripeIssuingProvider implements PaymentProvider {
     if (request && event.type.startsWith('issuing_transaction.')) {
       const transactionType = String(object.type ?? '').toLowerCase();
       const transactionStatus = String(object.status ?? '').toLowerCase();
-      const terminalStatus = transactionType === 'refund' || transactionStatus === 'reversed'
-        ? 'reversed'
-        : transactionType === 'capture' || transactionStatus === 'complete'
-          ? 'settled'
-          : undefined;
-      if (!terminalStatus) return;
-      this.store!.updatePaymentSpendRequest(request.id, {
-        status: terminalStatus,
-      });
+      // Stripe signs an issuing transaction from the cardholder's side — a capture
+      // is negative, a refund positive. Only the magnitude is money that moved.
+      const moved = Math.abs(Number(object.amount ?? 0)) || request.amount;
+      if (transactionType === 'refund' || transactionStatus === 'reversed') {
+        // A refund can be partial: it releases what came back, not the whole
+        // charge. Only when nothing is left does the request stop being a spend.
+        const amount = Math.max(0, request.amount - moved);
+        this.store!.updatePaymentSpendRequest(request.id, amount
+          ? { amount }
+          : { status: 'reversed', reason: 'refunded at the rail' });
+      } else if (transactionType === 'capture' || transactionStatus === 'complete') {
+        // The capture is the final word on the amount — a partial capture, a tip,
+        // or an FX difference all land here, and all of them are what the cap owes.
+        this.store!.updatePaymentSpendRequest(request.id, { status: 'settled', amount: moved });
+      }
     }
   }
 }
@@ -881,6 +903,22 @@ export class BudgetService {
     return this.store.paymentSpent(taskId);
   }
 
+  /**
+   * What is left of the card's ceiling: its cap minus everything already reserved
+   * or charged on it. The cap is CUMULATIVE, so this has to be recounted at every
+   * point that can commit spend — a per-request check passes independently for
+   * each of several queued requests, and letting them all through is exactly the
+   * breach the cap exists to prevent (the budget coordinator has guarded its own
+   * approval path this way from the start; see src/coordinators/budget.ts).
+   *
+   * A rail without its own ceiling can only run out of funds, never breach a cap,
+   * so an oversized request there asks for a top-up rather than being denied.
+   */
+  private remainingCap(provider: PaymentProvider, card: Card): number {
+    return provider.enforcesCardCap === false ? Number.MAX_SAFE_INTEGER
+      : Math.max(0, card.cap - this.store.cardPaymentSpent(card.id));
+  }
+
   private cards(ctx: SpendCtx): Card[] {
     const visible = this.store.listCards(ctx.projectId, ctx.organizationId)
       .filter((card) => card.status !== 'canceled') as Card[];
@@ -938,10 +976,7 @@ export class BudgetService {
       spent: this.spent(ctx.taskId),
       threshold,
       available: refreshed.available,
-      // A rail without its own ceiling can only run out of funds, never breach a
-      // cap — so an oversized request asks for a top-up rather than being denied.
-      hardCap: provider.enforcesCardCap === false ? Number.MAX_SAFE_INTEGER
-        : Math.max(0, refreshed.cap - this.store.cardPaymentSpent(refreshed.id)),
+      hardCap: this.remainingCap(provider, refreshed),
       merchant: args.merchant,
       merchantLock: refreshed.merchantLock,
     });
@@ -994,6 +1029,13 @@ export class BudgetService {
     if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
       return this.result(this.store.updatePaymentSpendRequest(request.id,
         { status: 'denied', reason: 'card is not active', resolvedBy }));
+    // Re-count the ceiling here. Everything else queued while this request waited
+    // for a human has been charged in the meantime, and on a webhook rail approval
+    // is the LAST place a cap breach can be caught: it never calls `authorize()`.
+    if (request.amount > this.remainingCap(provider, refreshed)) {
+      return this.result(this.store.updatePaymentSpendRequest(request.id,
+        { status: 'denied', reason: 'exceeds the card hard cap', resolvedBy }));
+    }
     if (refreshed.available < request.amount) {
       return this.result(this.store.updatePaymentSpendRequest(request.id, {
         status: 'needs_funding', reason: 'insufficient funds on the card',

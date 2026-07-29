@@ -3808,7 +3808,18 @@ export class Gateway {
         const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
         if (pid && cardOrg && store.getProject(pid)?.organizationId !== cardOrg)
           return this.json(res, 404, { error: 'project not found in this organization' });
-        return this.json(res, 200, store.listCards(pid, cardOrg));
+        const { cardRemaining } = await import('../autonomy/payments.js');
+        // `available` is not what is left on the card — on an issuing rail it is
+        // the organization's whole balance. Report the ceiling and what has been
+        // counted against it, so the surface cannot claim more than the cap.
+        return this.json(res, 200, store.listCards(pid, cardOrg).map((card) => {
+          const spent = store.cardPaymentSpent(card.id);
+          // An unregistered rail (a card left behind by a provider this
+          // deployment no longer loads) still has a cap worth reporting.
+          let enforces = true;
+          try { enforces = this.deps.paymentRegistry?.forCard(card).enforcesCardCap !== false; } catch {}
+          return { ...card, spent, remaining: cardRemaining(card, spent, enforces) };
+        }));
       }
       if (p === '/api/cards' && method === 'POST') {
         if (!this.deps.paymentRegistry && !this.deps.payments)

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { evaluateSpend, MockPaymentProvider, StripeIssuingProvider, PaymentRegistry, BudgetService } from '../src/autonomy/payments.js';
+import { cardRemaining, evaluateSpend, MockPaymentProvider, StripeIssuingProvider, PaymentRegistry, BudgetService } from '../src/autonomy/payments.js';
 import { Store } from '../src/store/db.js';
 
 describe('payment providers — the connect surface (SPEC §7.6, task 1g)', () => {
@@ -168,6 +168,38 @@ describe('BudgetService over the mock rail', () => {
       { amount: 300, cardId: card.id, why: 'second' });
     expect(second).toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
     expect((await provider.getCard(card.id))!.available).toBe(1700);
+  });
+
+  it('re-counts the card cap at the review gate, not only when the spend is requested', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Capped', cap: 500 });
+    await provider.fund(card.id, 5000);
+    store.setSettings(projectId, 'payments', { threshold: 100 });
+    // Both clear the request-time check independently — 300 ≤ the full 500 cap,
+    // because neither is counted until the gate decides. Approving both would put
+    // 600 on a card capped at 500: the cumulative ceiling has to be re-counted
+    // here, exactly as the budget coordinator does (src/coordinators/budget.ts).
+    const first = await budget.request({ projectId, taskId: 'gate-a' }, { amount: 300, cardId: card.id, why: 'first' });
+    const second = await budget.request({ projectId, taskId: 'gate-b' }, { amount: 300, cardId: card.id, why: 'second' });
+    expect([first.status, second.status]).toEqual(['needs_approval', 'needs_approval']);
+    expect((await budget.approve(first.requestId!, 'user:alice')).status).toBe('granted');
+    expect(await budget.approve(second.requestId!, 'user:alice'))
+      .toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
+    expect(store.cardPaymentSpent(card.id)).toBe(300);
+  });
+
+  it('reports what is left of the cap, bounded by the funds the rail reports', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Capped', cap: 500 });
+    await provider.fund(card.id, 5000);
+    // Funds exceed the ceiling, so the ceiling is what is left.
+    expect(cardRemaining((await provider.getCard(card.id))!, 0)).toBe(500);
+    await budget.request({ projectId, taskId: 'left' }, { amount: 300, cardId: card.id });
+    const spent = store.cardPaymentSpent(card.id);
+    expect(cardRemaining((await provider.getCard(card.id))!, spent)).toBe(200);
+    // A rail with no ceiling of its own (the human's own card) can only run out
+    // of funds, so `available` is the whole answer — never `cap - spent`, which
+    // on an issuing rail would double-count what `available` already reflects.
+    expect(cardRemaining({ cap: 500, available: 4700, status: 'active' }, spent, false)).toBe(4700);
+    expect(cardRemaining({ cap: 500, available: 4700, status: 'canceled' }, spent)).toBe(0);
   });
 
   it('exports and deletes both organization and project cards with their tenant', async () => {
