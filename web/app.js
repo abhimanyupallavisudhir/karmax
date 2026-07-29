@@ -9358,7 +9358,7 @@ function paymentsCard(scope) {
       <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
       <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
       <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
-      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" placeholder="MM/YY" /></label>
+      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" inputmode="numeric" placeholder="MM/YY" /></label>
       <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
       <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
       <label class="form-row">City<input class="card-city" /></label>
@@ -9409,6 +9409,80 @@ function paymentsCard(scope) {
     ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
       <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
+}
+// ── card fields ──────────────────────────────────────────────────────────────
+// Card number, expiry and CVC behave like any checkout form: separators appear
+// as you type, a pasted number is regrouped whatever it was punctuated with,
+// and Backspace over a separator takes the digit behind it. Only `format` is
+// per-field; the caret bookkeeping below is shared.
+/** Digit groups as the brand prints them on the card; the last entry is the default. */
+const CARD_NUMBER_GROUPS = [
+  { test: /^3[47]/, groups: [4, 6, 5] },              // American Express
+  { test: /^3(?:0[0-59]|[689])/, groups: [4, 6, 4] }, // Diners Club / Carte Blanche
+  { test: /^/, groups: [4, 4, 4, 4, 3] },             // everything else, up to 19 digits
+];
+/** "4242-4242 42424242" → "4242 4242 4242 4242"; Amex → "3782 822463 10005". */
+function formatCardNumber(raw) {
+  const all = String(raw ?? '').replace(/\D/g, '');
+  const { groups } = CARD_NUMBER_GROUPS.find((brand) => brand.test.test(all));
+  const digits = all.slice(0, groups.reduce((sum, size) => sum + size, 0));
+  const out = [];
+  for (let at = 0, g = 0; at < digits.length; at += groups[g++]) out.push(digits.slice(at, at + groups[g]));
+  return out.join(' ');
+}
+/** Anything from "5" to "12 - 2026" → "MM/YY", inserting the slash as soon as the month is known. */
+function formatExpiry(raw) {
+  const s = String(raw ?? '').trim();
+  // A month can only be one digit if it cannot start a two-digit month ("5"),
+  // or if the user closed it with a separator themselves ("1/").
+  let digits = (/^[1-9]/.test(s) && (s[0] > '1' || /^\d\D/.test(s)) ? '0' : '') + s.replace(/\D/g, '');
+  if (digits.length > 4) digits = digits.slice(0, 2) + digits.slice(-2); // a 4-digit year
+  const month = digits.slice(0, 2);
+  return month.length < 2 ? month : `${month}/${digits.slice(2, 4)}`;
+}
+/** CVC: digits only, up to the four American Express prints (three elsewhere). */
+function formatCvc(raw) {
+  return String(raw ?? '').replace(/\D/g, '').slice(0, 4);
+}
+/** Offset in `value` just past its `count`-th digit — where the caret belongs. */
+function caretAfterDigits(value, count) {
+  if (count <= 0) return 0;
+  let seen = 0;
+  for (let i = 0; i < value.length; i++)
+    if (value[i] >= '0' && value[i] <= '9' && ++seen === count) return i + 1;
+  return value.length;
+}
+/** Reformat `raw`, keeping the caret on the same digit the user left it after. */
+function applyDigitFormat(raw, caret, format) {
+  const value = format(raw);
+  // Typing at the end is the common case, and the only one where the format may
+  // legitimately insert a digit ahead of the caret (a padded month).
+  if (caret >= raw.length) return { value, caret: value.length };
+  return { value, caret: caretAfterDigits(value, raw.slice(0, caret).replace(/\D/g, '').length) };
+}
+/** The span a delete should really cover: a separator drags its neighbouring digit along. */
+function separatorDeletion(value, start, end, inputType) {
+  if (start !== end) return null;
+  if (inputType === 'deleteContentBackward' && start > 0 && !/\d/.test(value[start - 1]))
+    return [Math.max(0, start - 2), start];
+  if (inputType === 'deleteContentForward' && start < value.length && !/\d/.test(value[start]))
+    return [start, start + 2];
+  return null;
+}
+function wireCardField(input, format) {
+  if (!input) return;
+  const rewrite = (raw, caret) => {
+    const next = applyDigitFormat(raw, caret, format);
+    input.value = next.value;
+    input.setSelectionRange(next.caret, next.caret);
+  };
+  input.addEventListener('beforeinput', (e) => {
+    const span = separatorDeletion(input.value, input.selectionStart, input.selectionEnd, e.inputType);
+    if (!span) return;
+    e.preventDefault();
+    rewrite(input.value.slice(0, span[0]) + input.value.slice(span[1]), span[0]);
+  });
+  input.addEventListener('input', () => rewrite(input.value, input.selectionStart ?? input.value.length));
 }
 /** "MM/YY", "MM/YYYY", or "MMYY" → {expMonth, expYear}; null when unparseable. */
 function parseExpiry(raw) {
@@ -9506,6 +9580,11 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   // Non-project cards belong to the organization (tenant boundary), not the
   // whole installation. `scope==='global'` here is the org-settings surface.
   const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
+  // Before any await: the card fields must format from the first keystroke even
+  // if the provider lookup below is slow or fails.
+  wireCardField(box.querySelector('.card-number'), formatCardNumber);
+  wireCardField(box.querySelector('.card-expiry'), formatExpiry);
+  wireCardField(box.querySelector('.card-cvc'), formatCvc);
   const paymentsBase = organizationId
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
