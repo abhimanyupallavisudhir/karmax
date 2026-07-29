@@ -16,6 +16,7 @@ export const PLATFORM_API_CATALOG = {
     // be created inside an organization". Leaving it undocumented meant an agent on
     // a hosted install had no discoverable way to create a project at all.
     'GET|POST /api/organizations/:organizationId/projects (on hosted, project-create MUST use this form)',
+    'POST /api/projects/:projectId/reorder (body {before?: projectId} — sidebar order)',
     'GET|POST /api/projects/:projectId/workflow-pins',
     'GET|POST /api/projects/:projectId/resources', 'GET|PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
     'POST /api/projects/:projectId/resources/:resourceId/import',

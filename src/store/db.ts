@@ -246,7 +246,8 @@ export class Store {
   private migrate() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (
-        id TEXT PRIMARY KEY, organizationId TEXT, name TEXT NOT NULL, createdAt INTEGER NOT NULL, config TEXT NOT NULL
+        id TEXT PRIMARY KEY, organizationId TEXT, name TEXT NOT NULL, createdAt INTEGER NOT NULL, config TEXT NOT NULL,
+        ord INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS task_lists (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
@@ -604,6 +605,10 @@ export class Store {
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_hostname ON preview_leases(hostname) WHERE hostname IS NOT NULL');
     if (!projectCols.some((c) => c.name === 'organizationId')) this.db.exec('ALTER TABLE projects ADD COLUMN organizationId TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(organizationId)');
+    // Hand-picked sidebar order. Existing rows all land on 0, and `ORDER BY ord,
+    // createdAt` then reproduces exactly the creation order they had before —
+    // so no backfill pass is needed; the first drag densifies that organization.
+    if (!projectCols.some((c) => c.name === 'ord')) this.db.exec('ALTER TABLE projects ADD COLUMN ord INTEGER NOT NULL DEFAULT 0');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
     // Legacy rows become single-attempt intents. Alternate attempts already point
@@ -706,10 +711,13 @@ export class Store {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     assertRoutableName('project', name);
     validateProjectExecutionConfig(config);
-    const p: Project = { id: newId('proj'), organizationId, name, createdAt: Date.now(), config };
+    const ord = (this.db
+      .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
+      .get(organizationId) as any).m + 1;
+    const p: Project = { id: newId('proj'), organizationId, name, createdAt: Date.now(), config, order: ord };
     this.db
-      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config) VALUES (?, ?, ?, ?, ?)')
-      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config));
+      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord);
     // every project gets a default task list
     this.createList(p.id, 'Tasks');
     return p;
@@ -721,9 +729,25 @@ export class Store {
   }
 
   listProjects(): Project[] {
-    return (this.db.prepare('SELECT * FROM projects ORDER BY createdAt').all() as any[]).map(
+    return (this.db.prepare('SELECT * FROM projects ORDER BY ord, createdAt').all() as any[]).map(
       rowToProject,
     );
+  }
+
+  /** Move a project so it sits immediately before `beforeProjectId` in the sidebar,
+   * or last when that is omitted/unknown. Only the moved project's own organization
+   * is touched, and its rows are re-densified to 0…n-1 so repeated drags stay stable.
+   * Returns that organization's projects in their new order. */
+  reorderProject(id: string, beforeProjectId?: string): Project[] {
+    const moving = this.getProject(id);
+    if (!moving) throw new Error(`no project ${id}`);
+    const organizationId = moving.organizationId ?? 'org_personal';
+    const siblings = this.listProjects()
+      .filter((p) => (p.organizationId ?? 'org_personal') === organizationId && p.id !== id);
+    const at = beforeProjectId ? siblings.findIndex((p) => p.id === beforeProjectId) : -1;
+    siblings.splice(at < 0 ? siblings.length : at, 0, moving);
+    const upd = this.db.prepare('UPDATE projects SET ord = ? WHERE id = ?');
+    return siblings.map((p, ord) => { upd.run(ord, p.id); return { ...p, order: ord }; });
   }
 
   /** One organization-level execution policy. Provider-specific template/image
@@ -4314,7 +4338,7 @@ function providerDisplayName(provider: string): string {
 }
 
 function rowToProject(r: any): Project {
-  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config) };
+  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0 };
 }
 function rowToTag(r: any): Tag {
   return {

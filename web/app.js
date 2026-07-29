@@ -2274,9 +2274,32 @@ function renderShell() {
   // shell reflects the initial URL instead of a default view.
 }
 
+// Move project `id` so it sits immediately before `beforeId`, or last among its own
+// organization's projects when `beforeId` is omitted. Every other organization's
+// projects keep their relative position, so a drag in one organization's rail can
+// never disturb another's. Mirrors Store.reorderProject on the server.
+function reorderProjects(projects, id, beforeId) {
+  const moving = projects.find((p) => p.id === id);
+  if (!moving) return projects;
+  const org = (p) => p.organizationId || 'org_personal';
+  const rest = projects.filter((p) => p.id !== id);
+  // A neighbour in another organization is not a position we can honour — the
+  // server would drop it too, and the two must not disagree about the result.
+  const at = beforeId ? rest.findIndex((p) => p.id === beforeId && org(p) === org(moving)) : -1;
+  // Past the end of its own organization's run, not the end of the whole array.
+  const end = rest.map(org).lastIndexOf(org(moving)) + 1;
+  rest.splice(at < 0 ? (end || rest.length) : at, 0, moving);
+  return rest;
+}
+
+// The rail row currently being dragged, if any. Also a repaint lock: a background
+// refresh that swapped the rail's innerHTML mid-drag would destroy this element.
+let draggingProject = null;
+
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
+  if (draggingProject) return; // never repaint out from under a drag in flight
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
   // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
@@ -2289,7 +2312,7 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
-        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0">
+        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0" draggable="true" title="Drag to reorder">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
         </a>`,
       )
@@ -2304,7 +2327,58 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
+  wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
+}
+
+// HTML5 drag-and-drop reordering of the rail's project links. The rail holds more
+// than projects — "New project", then the organization nav — so dropping past the
+// last project means "just above #new-project", never the container's end. The
+// container handlers are assigned as properties, not addEventListener: the rail
+// element survives every repaint, so listeners would otherwise pile up.
+function wireProjectDrag(rail) {
+  const projects = () => [...rail.querySelectorAll('.proj[draggable="true"]')];
+  const rows = projects();
+  if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
+  const end = $('#new-project');
+  for (const row of rows) {
+    row.addEventListener('dragstart', (e) => {
+      draggingProject = row;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Without this an <a> drags its href, and the drop lands as a URL elsewhere.
+      try { e.dataTransfer.setData('text/plain', row.dataset.id); } catch {}
+    });
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging');
+      if (!draggingProject) return; // a drop already committed and repainted
+      draggingProject = null;
+      renderRail(); // dropped outside the rail — put the saved order back
+    });
+  }
+  rail.ondragover = (e) => {
+    if (!draggingProject) return;
+    e.preventDefault();
+    const before = projects().find((row) => {
+      const box = row.getBoundingClientRect();
+      return row !== draggingProject && e.clientY < box.top + box.height / 2;
+    });
+    rail.insertBefore(draggingProject, before || end);
+  };
+  rail.ondrop = async (e) => {
+    e.preventDefault();
+    const row = draggingProject;
+    if (!row) return;
+    row.classList.remove('dragging');
+    draggingProject = null;
+    const ids = projects().map((r) => r.dataset.id);
+    const before = ids[ids.indexOf(row.dataset.id) + 1];
+    S.projects = reorderProjects(S.projects, row.dataset.id, before);
+    renderRail();
+    try {
+      await api(`/api/projects/${row.dataset.id}/reorder`, { method: 'POST', body: JSON.stringify({ before }) });
+    } catch (err) { toast(err.message, true); await loadProjects(); renderRail(); }
+  };
 }
 
 function switchTab(tab) {

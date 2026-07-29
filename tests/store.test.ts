@@ -163,6 +163,54 @@ describe('Store', () => {
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
   });
 
+  it('reorders projects in the sidebar, per organization', () => {
+    const other = store.createOrganization({ name: 'Acme Inc' });
+    const [a, b, c] = ['A', 'B', 'C'].map((n) => store.createProject(n));
+    const foreign = store.createProject('Z', {}, other.id);
+    const order = () => store.listProjects().filter((p) => p.organizationId === 'org_personal').map((p) => p.name);
+    expect(order()).toEqual(['A', 'B', 'C']); // creation order until someone drags
+
+    // Drop C above A: "before" names the project it now sits on top of.
+    store.reorderProject(c!.id, a!.id);
+    expect(order()).toEqual(['C', 'A', 'B']);
+    // Positions are re-densified, so the next drag reads an unambiguous list.
+    expect(store.listProjects().filter((p) => p.organizationId === 'org_personal').map((p) => p.order)).toEqual([0, 1, 2]);
+
+    // No `before` = drop past the last project.
+    store.reorderProject(c!.id);
+    expect(order()).toEqual(['A', 'B', 'C']);
+    // A no-op drag (dropped back where it was) is stable.
+    store.reorderProject(b!.id, c!.id);
+    expect(order()).toEqual(['A', 'B', 'C']);
+
+    // Another organization's projects are never touched, and a project created
+    // after a reorder still lands at the end of its own organization.
+    expect(store.getProject(foreign.id)!.order).toBe(0);
+    const d = store.createProject('D');
+    expect(order()).toEqual(['A', 'B', 'C', 'D']);
+    expect(d.order).toBe(3);
+    // A `before` in a foreign organization is meaningless — treat it as "last".
+    store.reorderProject(a!.id, foreign.id);
+    expect(order()).toEqual(['B', 'C', 'D', 'A']);
+    expect(() => store.reorderProject('proj_nope')).toThrow(/no project/);
+  });
+
+  it('keeps creation order for projects that predate the sidebar ordering column', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-ord-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = new Store(dbPath);
+    const ids = ['A', 'B', 'C'].map((n) => legacy.createProject(n).id);
+    // Undo the column so the reopened store has to migrate a pre-`ord` schema.
+    (legacy as any).db.exec('ALTER TABLE projects DROP COLUMN ord');
+
+    const store2 = new Store(dbPath);
+    expect(store2.listProjects().map((p) => p.name)).toEqual(['A', 'B', 'C']);
+    // …and the first drag still works off that implicit order.
+    store2.reorderProject(ids[2]!, ids[0]!);
+    expect(store2.listProjects().map((p) => p.name)).toEqual(['C', 'A', 'B']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('rejects reserved routing names for projects and organizations', () => {
     // A project is addressed at /<org>/<project> by the slug of its name, and an
     // organization owns the top URL segment — a name that slugifies to a built-in
