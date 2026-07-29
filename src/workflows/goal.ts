@@ -9,6 +9,7 @@ import {
   softwareDevV1_7,
   softwareDevV1_8,
   softwareDevV1_9,
+  softwareDevV1_10,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -59,9 +60,17 @@ export async function goalV1_8(input: TaskInput): Promise<{ stage: Stage; sha?: 
   return softwareDevV1_8({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
-/** Bounded coordinator-activity retries (see softwareDevV1_9). */
+/** A task parked in a merge queue no longer republishes its whole view every
+ *  five seconds. */
 export async function goalV1_9(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_9({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Bounded coordinator retries, all merge domains published, the confirm latch
+ *  cleared at each Review gate, escalation woken by a follow-up (see
+ *  softwareDevV1_10 for why these are 1.10.0 and not 1.9.0). */
+export async function goalV1_10(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_10({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

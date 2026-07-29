@@ -69,6 +69,10 @@ function installProcessGuards(): void {
   });
 }
 
+/** How often to re-check the task index against live workflows. Each pass is one
+ *  bounded `describe` per non-terminal task, so it stays cheap at list scale. */
+const RECONCILE_INTERVAL_MS = 60_000;
+
 async function main() {
   installProcessGuards();
   hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
@@ -305,10 +309,36 @@ async function main() {
   const retentionTimer = setInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
 
+  // Repair coordinator singletons whose history this build can no longer replay.
+  // Runs before task reconciliation so a merge queue that self-heals here is
+  // already answering by the time tasks waiting on it are examined.
+  const { healCoordinators } = await import('./platform/coordinator-health.js');
+  const health = await healCoordinators(client, TASK_QUEUE)
+    .catch(() => ({ checked: 0, wedged: [], rebuilt: [], reported: [] }));
+  if (health.rebuilt.length)
+    console.log(`  • Rebuilt ${health.rebuilt.length} unreplayable coordinator(s)`);
+  for (const { workflowId, reason } of health.reported)
+    console.warn(`  ! Coordinator ${workflowId} is wedged; left alone: ${reason}`);
+
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
   const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));
   if (recon.settled) console.log(`  • Reconciled ${recon.settled} task(s) lost/finished while offline`);
+
+  // …and keep reconciling while we run. A workflow can die *without* karmax
+  // hearing about it — Temporal terminates one that exceeds its history limit,
+  // and termination runs no catch block, so the last view the task published
+  // stands forever. Reconciling only at boot left such a task rendering as
+  // active-and-progressing (and hid the recovery affordance, which requires a
+  // failed status) until the next restart, which for a long-lived host is never.
+  const reconcileSweep = setInterval(() => {
+    void reconcileTasks(store, client)
+      .then((r) => {
+        if (r.settled) console.log(`  • Reconciled ${r.settled} task(s) whose workflow ended without publishing`);
+      })
+      .catch(() => undefined);
+  }, RECONCILE_INTERVAL_MS);
+  reconcileSweep.unref();
 
   // Register connected logins into the account/token coordinator (SPEC §6.2).
   // Empty pool ⇒ per-turn leasing stays off (zero behavior change).
@@ -530,6 +560,7 @@ async function main() {
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     clearInterval(orphanSweep);
+    clearInterval(reconcileSweep);
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();

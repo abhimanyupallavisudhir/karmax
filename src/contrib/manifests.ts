@@ -70,6 +70,21 @@ const remoteField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
+// Multi-PR (SPEC §11.1, PLAN-multi-pr.md). Off, a task is one branch per repo,
+// exactly as before. On, the Do agent may partition its change across several
+// branches with `create_branch`, each landing as its own pull request — so the
+// world nests its checkouts from Setup, which is the only structural difference
+// and is why this is a task-scoped field rather than something inferred later.
+// The lifecycle stays singular: one Review, one Merge, one point of no return.
+const multiPrField = (): FieldSpec => ({
+  name: 'multiPr',
+  type: 'boolean',
+  label: 'Allow several branches per task',
+  help: 'Let the agent split one task\'s change into several branches, each reviewed and merged as its own pull request (including stacked ones). They share a single Review gate and a single Merge — work that needs its own review timing belongs in a separate task.',
+  default: false,
+  scopes: ALL,
+  bind: 'project',
+});
 const gitProfileField = (): FieldSpec => ({
   name: 'gitProfile',
   type: 'string',
@@ -337,7 +352,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.9.0',
+    version: '1.10.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -379,6 +394,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       targetField(),
       agentEnvironmentField(),
       reposField(),
+      multiPrField(),
       copyGlobsField(),
       remoteField(),
       gitProfileField(),
@@ -440,7 +456,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.9.0',
+    version: '1.10.0',
     description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -454,7 +470,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'merge-only',
-    version: '1.5.0',
+    version: '1.6.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],
@@ -621,6 +637,23 @@ export function roleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS)
  * available only so historical version-pinned executions can replay. */
 export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS): RoleWithSource | undefined {
   return roleDef(name, manifests) ?? (name === 'resolve' ? { ...LEGACY_RESOLVE_ROLE, workflows: [] } : undefined);
+}
+
+/**
+ * The capability ceiling a turn is minted against (SPEC §8.2) — always resolved
+ * from the declaring workflow, never from a copy stored on the agent profile.
+ *
+ * The ceiling is the ROLE contract ("what could a Merge agent ever need"), which
+ * is orthogonal to the task's authorization grant ("what this task's creator may
+ * delegate"); effective caps are the intersection of the two. Because it is the
+ * workflow's to declare, it is not a user setting: a persisted copy only ever
+ * went stale — profiles seed once, so a role that gained a capability kept the
+ * old ceiling forever and the new tool silently 403'd.
+ *
+ * An undeclared role is floored at `signal-completion` so a turn can always end.
+ */
+export function roleCeiling(name: string, manifests: WorkflowManifest[] = MANIFESTS): string[] {
+  return agentRoleDef(name, manifests)?.capabilities ?? ['signal-completion'];
 }
 
 /** Resolve the transitive closure of `requires` for a set of workflows (SPEC §4.6). */

@@ -25,6 +25,7 @@ const ctx = (): PlatformToolContext => ({
   signalCompletion() {},
   createReviewInfo() {},
   createSubTask() {},
+  addCheckout() { return Promise.resolve({ name: '', root: '', branch: '' }); },
   respondToSubTask() {},
   raiseToParent() {},
   waitForSubtasks() {},

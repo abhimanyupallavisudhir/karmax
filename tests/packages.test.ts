@@ -177,7 +177,9 @@ describe('version retirement (§21c — never drop code a live execution replays
     expect(store.retire('goal', '2.0.0', live)).toBe(true);
     expect(store.versions('goal')).toEqual(bundledVersions);
 
-    // once the execution drains (done), the old version can be retired too
+    // once the execution drains (done), the old version can be retired too.
+    // Driven off the registered list rather than a hand-written ladder, so
+    // bundling a new goal version doesn't silently go stale here.
     const drained = livePinnedRefs([task({ workflow: 'goal', workflowVersion: '1.0.0', status: 'done' })]);
     expect(store.retire('goal', '1.0.0', drained)).toBe(true);
     expect(store.resolve('goal')?.version).toBe(bundledVersions[bundledVersions.length - 1]);
@@ -205,7 +207,7 @@ describe('sub-task children inherit their parent version', () => {
     // Historical parents keep the bare type their recorded command replays.
     for (const old of ['1.0.0', '1.1.0', '1.2.0', '1.3.0', '1.4.0'] as const)
       expect(childWorkflowType(old)).toBe('softwareDev');
-    for (const current of ['1.5.0', '1.6.0', '1.7.0', '1.8.0'] as const)
+    for (const current of ['1.5.0', '1.6.0', '1.7.0', '1.8.0', '1.9.0'] as const)
       expect(childWorkflowType(current)).toBe(`softwareDev@${current}`);
 
     // The current bundled version must be inheritable AND registered, or its

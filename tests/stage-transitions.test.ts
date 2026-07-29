@@ -205,6 +205,31 @@ describe('task stage transitions', () => {
       .rejects.toThrow(/waiting on the merge agent/i);
   });
 
+  it('falls back to the Do conversation when the held stage never ran an agent', async () => {
+    // Task #350 was paused during `merge` while still queued for its slot, so the
+    // merge agent had never run and there was no merge transcript. The hold then
+    // resolved to no conversation at all: `followUp` was filtered out and nothing
+    // spliced back, leaving a task with 13 hours of Do context and no way to say
+    // anything to it — Cancel was the only action. Do always exists once a task
+    // has worked, and it owns the context the follow-up is about.
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'merge',
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      transcripts: [{ role: 'do', label: 'Do agent', messages: f.view.messages }],
+      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true }],
+      state: { ...f.view.state, humanPauseOrigin: 'merge' },
+    });
+
+    const held = await f.api.getTaskView(f.token, f.task.id);
+    expect(held?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
+    expect(held?.actions[0]?.roles).toEqual(['do']);
+    await expect(f.api.signalTask(f.token, f.task.id, 'followUp', 'redirect this', 'do'))
+      .resolves.toBeDefined();
+  });
+
   it('does not advertise a lossy human hold from the internal Resolve frame', async () => {
     const f = fixture();
     f.store.saveView(f.task.id, {

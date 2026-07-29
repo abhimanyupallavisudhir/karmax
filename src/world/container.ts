@@ -2,7 +2,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
+import { World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { addCheckoutViaExec } from './checkout.js';
 import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
 import { boundedResponseBody } from './http.js';
@@ -222,13 +223,22 @@ class ContainerWorld implements World {
     if (fs.existsSync(this.handle.root)) walk(this.handle.root, '');
     return out;
   }
+  /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
+   *  here are real clones, so this is one `git worktree add` run in place. */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    return addCheckoutViaExec(this, spec);
+  }
+
   async destroy(): Promise<void> {
     await docker(['rm', '-f', this.name]);
     const { git } = await import('./git.js');
     const { worldRepos } = await import('./types.js');
+    const { withWorktreeLock } = await import('./worktree-lock.js');
     for (const r of worldRepos(this.handle)) {
-      await git(r.repo, ['worktree', 'remove', '--force', r.root]);
-      await git(r.repo, ['worktree', 'prune']);
+      await withWorktreeLock(r.repo, async () => {
+        await git(r.repo, ['worktree', 'remove', '--force', r.root]);
+        await git(r.repo, ['worktree', 'prune']);
+      });
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }

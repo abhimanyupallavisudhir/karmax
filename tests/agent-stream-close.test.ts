@@ -76,6 +76,7 @@ async function runTurn(reviewInfos: ReviewInfo[]) {
     signalCompletion: () => {},
     createReviewInfo: (info) => { reviewInfos.push(info); },
     createSubTask: () => {},
+    addCheckout: async () => ({ name: '', root: '', branch: '' }),
     respondToSubTask: () => {},
     raiseToParent: () => {},
     waitForSubtasks: () => {},

@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, ProviderSandboxRef, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldSpec } from './types.js';
-import { worldRelativePath, worldWorkingDirectory } from './types.js';
+import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
+import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
 import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
@@ -419,6 +420,12 @@ class DaytonaWorld implements World {
     const port = positiveInt(process.env.KARMAX_DAYTONA_NOVNC_PORT, 6080);
     const signed = await this.sandbox.getSignedPreviewUrl(port, 300);
     return { provider: 'daytona', url: signed.url };
+  }
+
+  /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
+   *  here are real clones, so this is one `git worktree add` run in place. */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    return addCheckoutViaExec(this, spec);
   }
 
   async destroy(): Promise<void> { await this.sandbox.delete(60); }

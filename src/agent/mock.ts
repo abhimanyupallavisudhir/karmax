@@ -12,6 +12,7 @@ import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
  *   @write <path> :: <content>      write a file (\n decoded to newlines)
  *   @run <command...>               run a shell command in the world
  *   @subtask <title> :: <prompt>    spawn a child task
+ *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
  *   @respond <action> [:: text]     parent answers a raising child (confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
@@ -126,6 +127,19 @@ export class MockAdapter implements AgentAdapter {
           const [title, prompt = ''] = splitOn(rest, '::');
           ctx.createSubTask({ title: title.trim(), prompt: prompt.trim() });
           outputs.push(`subtask: ${title.trim()}`);
+          break;
+        }
+        case 'branch': {
+          // @branch <name> [:: base]  — partition the change across another
+          // branch (multi-PR, SPEC §11.1). Like the real tool it takes effect
+          // immediately, so later directives in this same turn can write into it.
+          const [name, base = ''] = splitOn(rest, '::');
+          try {
+            const added = await ctx.addCheckout({ name: name.trim(), ...(base.trim() ? { base: base.trim() } : {}) });
+            outputs.push(`branch: ${added.branch} at ${added.root}`);
+          } catch (e: any) {
+            outputs.push(`branch failed: ${e?.message ?? e}`);
+          }
           break;
         }
         case 'respond': {

@@ -49,6 +49,7 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.softwareDev, '1.7.0'),
   qualifiedType(WF.softwareDev, '1.8.0'),
   qualifiedType(WF.softwareDev, '1.9.0'),
+  qualifiedType(WF.softwareDev, '1.10.0'),
   qualifiedType(WF.justDo, '1.0.0'),
   qualifiedType(WF.justDo, '1.1.0'),
   qualifiedType(WF.justDo, '1.2.0'),
@@ -65,12 +66,14 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.goal, '1.7.0'),
   qualifiedType(WF.goal, '1.8.0'),
   qualifiedType(WF.goal, '1.9.0'),
+  qualifiedType(WF.goal, '1.10.0'),
   qualifiedType(WF.mergeOnly, '1.0.0'),
   qualifiedType(WF.mergeOnly, '1.1.0'),
   qualifiedType(WF.mergeOnly, '1.2.0'),
   qualifiedType(WF.mergeOnly, '1.3.0'),
   qualifiedType(WF.mergeOnly, '1.4.0'),
   qualifiedType(WF.mergeOnly, '1.5.0'),
+  qualifiedType(WF.mergeOnly, '1.6.0'),
 ]);
 
 /**
@@ -90,6 +93,10 @@ export const SIG = {
   collaborationRequested: 'collaborationRequested',
   collaborationSettled: 'collaborationSettled',
   confirm: 'confirm',
+  /** Approve ONE branch of a multi-PR task (SPEC §11.1). Records what has been
+   *  reviewed so an untouched branch is not re-reviewed after a loop back to Do;
+   *  `confirm` remains the only signal that passes the Review gate. */
+  approveCheckout: 'approveCheckout',
   cancel: 'cancel',
   retry: 'retry',
 } as const;

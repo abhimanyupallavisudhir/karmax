@@ -4,11 +4,13 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, WorldCheckoutSpec, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
 import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } from './git.js';
+import { withWorktreeLock } from './worktree-lock.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
+import { addCheckoutWith } from './checkout.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -70,15 +72,16 @@ export class WorktreeProvider implements WorldProvider {
       // No repo configured — a scratch sandbox (the world itself is the deliverable).
       const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
       repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings, undefined, ephemeralPaths));
-    } else if (resolvedSources.length === 1) {
+    } else if (resolvedSources.length === 1 && spec.layout !== 'nested') {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
         this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined, ephemeralPaths,
         '', Boolean(spec.repositoryBranches?.[resolved.source]?.target)));
     } else {
-      // Multi-repo: the world root is a parent dir holding one worktree per repo,
-      // each in a subdirectory named after the repo (deduped on collision).
+      // Multi-repo (or a lone repo a multi-PR task asked to nest): the world root
+      // is a parent dir holding one worktree per checkout, each in a subdirectory
+      // named after the repo (deduped on collision).
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });
       const names = uniqueNames(resolvedSources.map((resolved) => repoName(resolved.source)));
@@ -95,6 +98,11 @@ export class WorktreeProvider implements WorldProvider {
       kind: 'worktree',
       id: spec.taskId,
       root,
+      // A nested lone repo leaves the world root a bare parent directory, so
+      // point the agent at the checkout rather than at the container holding it.
+      // With several repos the agent is meant to see them side by side at the
+      // root, and createWorld picks the workdir for companion-repo layouts.
+      ...(spec.layout === 'nested' && repos.length === 1 ? { workdir: repos[0]!.root } : {}),
       branch,
       base: spec.base,
       repo: repos[0]!.repo,
@@ -123,19 +131,24 @@ export class WorktreeProvider implements WorldProvider {
       warnings?.push(`repo "${name}": base branch "${spec.base}" not found — forked off HEAD instead`);
     }
 
-    // Clean any stale worktree at this path.
-    if (fs.existsSync(wt)) {
-      await git(repo, ['worktree', 'remove', '--force', wt]);
-      fs.rmSync(wt, { recursive: true, force: true });
-    }
-    await git(repo, ['worktree', 'prune']);
-    if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
-    // Reuse the branch if it already exists, else create it.
-    const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
-    const addArgs = branchExists
-      ? ['worktree', 'add', wt, branch]
-      : ['worktree', 'add', '-b', branch, wt, baseRef];
-    await gitOrThrow(repo, addArgs);
+    // Clean any stale worktree at this path, then claim a fresh one. The prune
+    // and the add share one critical section: the prune frees admin-dir names
+    // and the add takes the lowest free one, so anything else adding/removing a
+    // worktree of this repo in between could be handed — or delete — ours.
+    await withWorktreeLock(repo, async () => {
+      if (fs.existsSync(wt)) {
+        await git(repo, ['worktree', 'remove', '--force', wt]);
+        fs.rmSync(wt, { recursive: true, force: true });
+      }
+      await git(repo, ['worktree', 'prune']);
+      if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
+      // Reuse the branch if it already exists, else create it.
+      const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
+      const addArgs = branchExists
+        ? ['worktree', 'add', wt, branch]
+        : ['worktree', 'add', '-b', branch, wt, baseRef];
+      await gitOrThrow(repo, addArgs);
+    });
     await this.applyIdentity(wt, spec.gitIdentity);
 
     // Make the checkout runnable: a git worktree does NOT inherit the origin
@@ -368,6 +381,48 @@ class WorktreeWorld implements World {
     });
   }
 
+  /**
+   * Check out another branch of one of this world's repos, side by side with the
+   * existing ones (SPEC §11.1 `addCheckout`). This is the whole multi-PR
+   * primitive on the local backend: a `WorldRepo` is already
+   * `(source, dir, branch, base, target)` and merge/PR/queue all iterate them,
+   * so an extra entry IS an extra pull request.
+   */
+  async addCheckout(spec: WorldCheckoutSpec): Promise<WorldHandle> {
+    this.handle = await addCheckoutWith(this.handle, spec, {
+      git: (cwd, args) => git(cwd, args),
+      removeDir: async (absPath) => { fs.rmSync(absPath, { recursive: true, force: true }); },
+    }, (from, added) => this.inheritWorktreeSetup(from.root, added.root));
+    return this.handle;
+  }
+
+  /** Copy the forked checkout's worktree-scoped identity and node_modules link
+   *  onto a newly added one, so a branch added mid-task commits as the same
+   *  author and can still run the project. Best-effort, like world creation. */
+  private async inheritWorktreeSetup(from: string, to: string) {
+    try {
+      for (const key of ['user.name', 'user.email', 'gpg.format', 'user.signingKey', 'commit.gpgsign']) {
+        const value = await git(from, ['config', '--get', key]);
+        if (value.code !== 0 || !value.stdout.trim()) continue;
+        if (key === 'user.name') await git(to, ['config', 'extensions.worktreeConfig', 'true']);
+        await git(to, ['config', '--worktree', key, value.stdout.trim()]);
+      }
+      const src = path.join(from, 'node_modules');
+      const dst = path.join(to, 'node_modules');
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        fs.symlinkSync(fs.realpathSync(src), dst, 'dir');
+        const exclude = await git(to, ['rev-parse', '--git-path', 'info/exclude']);
+        if (exclude.code === 0) {
+          const excludePath = path.resolve(to, exclude.stdout.trim());
+          fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+          fs.appendFileSync(excludePath, '/node_modules\n');
+        }
+      }
+    } catch {
+      // A missing identity or link must not cost the task its branch.
+    }
+  }
+
   async listFiles(): Promise<string[]> {
     const repos = worldRepos(this.handle);
     // Single-repo world: root is the worktree, list it directly.
@@ -388,8 +443,10 @@ class WorktreeWorld implements World {
   async destroy(): Promise<void> {
     const repos = worldRepos(this.handle);
     for (const r of repos) {
-      await git(r.repo, ['worktree', 'remove', '--force', r.root]);
-      await git(r.repo, ['worktree', 'prune']);
+      await withWorktreeLock(r.repo, async () => {
+        await git(r.repo, ['worktree', 'remove', '--force', r.root]);
+        await git(r.repo, ['worktree', 'prune']);
+      });
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }

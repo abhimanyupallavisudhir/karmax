@@ -16,7 +16,6 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
     provider,
     ...(model ? { model } : {}),
     role: r.name,
-    capabilities: r.capabilities ?? [],
     ...(r.defaults?.effort ? { effort: r.defaults.effort } : {}),
     ...(r.defaults?.maxTurns ? { maxTurns: r.defaults.maxTurns } : {}),
     // no maxTurns unless declared ⇒ unlimited (runaway backstop only)
@@ -97,7 +96,6 @@ export class ProfileResolver {
       provider: this.fallbackProvider,
       ...(model ? { model } : {}),
       role,
-      capabilities: ['signal-completion'],
     };
   }
 }

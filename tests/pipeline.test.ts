@@ -233,6 +233,65 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
   });
 
+  it('multi-PR: the agent adds a second branch, and BOTH land as their own merges', async () => {
+    // Multi-PR (SPEC §11.1): one task, one Do agent, one Review, one Merge — but
+    // the change is partitioned across two branches, each landing as its own pull
+    // request. The world nests its checkouts so the branch added mid-turn has
+    // somewhere to live, and `@branch` takes effect immediately, so the very same
+    // turn writes into it.
+    const repo = await h.makeRepo('app');
+    const name = path.basename(repo);
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.9.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          taskId,
+          projectId: 'p1',
+          title: 'Split the change',
+          prompt:
+            `Refactor, then build on it.\n` +
+            // The agent's cwd IS its checkout, so the second branch is a sibling
+            // directory — exactly how a real agent reaches it.
+            `@write core.js :: export const core = 1;\n` +
+            `@branch docs\n` +
+            `@run echo '# docs' > ../docs/README.md\n` +
+            `@review core.js in the main branch, README.md in a second one`,
+          base: 'main',
+          target: 'main',
+          project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true },
+        },
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const review = await view(handle);
+    // Review sees both branches, each with its head, and neither approved yet.
+    expect(review.checkouts?.map((c: any) => c.name)).toEqual([name, 'docs']);
+    expect(review.checkouts.every((c: any) => c.head)).toBe(true);
+    expect(review.checkouts.some((c: any) => c.approved)).toBe(false);
+
+    // Approving ONE branch marks it without passing the gate — only confirm does
+    // that, so the authorization/quorum rules around confirm cannot be routed past.
+    await handle.signal('approveCheckout', { name: 'docs' });
+    await expect.poll(async () => (await view(handle)).checkouts.find((c: any) => c.name === 'docs')?.approved,
+      { timeout: 5_000 }).toBe(true);
+    expect((await view(handle)).stage).toBe('review');
+
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+
+    // Both branches really landed on main, each through its OWN merge commit —
+    // two reviewable units, not one squashed blob.
+    expect((await git(repo, ['show', 'main:core.js'])).code).toBe(0);
+    expect((await git(repo, ['show', 'main:README.md'])).code).toBe(0);
+    const log = (await git(repo, ['log', '--oneline', 'main'])).stdout;
+    expect(log).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+    expect(log).toMatch(new RegExp(`merge karmax/${taskId}-docs into main`));
+  });
+
   it('returns to Do on a follow-up, then merges after confirm', async () => {
     const repo = await h.makeRepo('app2');
     const taskId = newId('task');

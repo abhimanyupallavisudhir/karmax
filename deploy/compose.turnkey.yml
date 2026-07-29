@@ -104,7 +104,9 @@ services:
     stop_grace_period: 60s
 
   caddy:
-    image: caddy:2.10-alpine
+    build:
+      context: .
+      dockerfile: Caddy.Dockerfile
     restart: unless-stopped
     depends_on:
       app:

@@ -162,6 +162,39 @@ export interface WorldSpec {
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
   resources?: { cpu?: number; memoryMb?: number; gpu?: number };
+  /** Where the checkouts sit under the world root. `flat` (the default for a
+   * lone repo) makes the world root itself the worktree; `nested` always gives
+   * each checkout its own subdirectory — which is what leaves room for a
+   * second one. A multi-PR task nests from Setup so a branch added later has
+   * somewhere to live that is neither inside another checkout's working tree
+   * nor outside the world boundary. */
+  layout?: 'flat' | 'nested';
+}
+
+/**
+ * A checkout added to an existing world (the multi-PR primitive). A task's
+ * change is often best partitioned into several branches — stacked, or in
+ * different repos — each reviewed and landed as its own pull request. One Do
+ * agent still owns all of them: they live side by side in the same world, so
+ * check-in, parking, and the account/compute lease stay single-world.
+ */
+export interface WorldCheckoutSpec {
+  /** World-unique name: the subdirectory it is checked out into, and the label
+   * its pull request carries. */
+  name: string;
+  /** Name of an existing checkout whose SOURCE repository this one branches
+   * from. Defaults to the world's primary checkout, which is what makes "split
+   * this change into two PRs against the same repo" the easy case. */
+  from?: string;
+  /** Branch to create. Defaults to `<world branch>-<name>`, so every branch of
+   * a task still carries its task id. */
+  branch?: string;
+  /** Base ref. Naming a SIBLING checkout stacks this branch on that one (its
+   * branch becomes the base, and the merge orders them accordingly). Anything
+   * else is an ordinary git ref. Defaults to the source checkout's base. */
+  base?: string;
+  /** Branch this checkout merges into. Defaults to the source checkout's target. */
+  target?: string;
 }
 
 /**
@@ -287,6 +320,10 @@ export interface World {
   /** Start (or reconnect to) the provider's desktop stack and return its
    * authenticated noVNC viewer. Present only for desktop-flavor worlds. */
   desktopSession?(): Promise<WorldDesktopSession>;
+  /** Add another checkout (another branch, hence another PR) to this world and
+   * return the updated handle. The world mutates its own handle too, so a
+   * caller holding the live world sees the new checkout immediately. */
+  addCheckout?(spec: WorldCheckoutSpec): Promise<WorldHandle>;
   destroy(): Promise<void>;
 }
 
@@ -299,6 +336,31 @@ export interface ProviderSandboxRef {
   /** The karmax task this sandbox was created for (`karmaxTaskId` metadata). */
   taskId?: string;
   destroy(): Promise<void>;
+}
+
+/**
+ * Order checkouts so a branch stacked on a sibling merges AFTER it. Order is the
+ * whole point of stacking: land the dependent first and it drags its base's
+ * commits along, so the base's own pull request arrives with nothing left of its
+ * own. A plain depth-first walk over `base`-names-a-sibling's-`branch` edges;
+ * a cycle (which no legal stack can produce) degrades to input order rather
+ * than looping. Stable for the flat case — one checkout, or none stacked, comes
+ * back exactly as given.
+ */
+export function orderCheckouts(repos: WorldRepo[]): WorldRepo[] {
+  const byBranch = new Map(repos.map((r) => [r.branch, r]));
+  const ordered: WorldRepo[] = [];
+  const state = new Map<WorldRepo, 'visiting' | 'done'>();
+  const visit = (repo: WorldRepo) => {
+    if (state.get(repo)) return; // already placed, or an ancestor of itself
+    state.set(repo, 'visiting');
+    const parent = byBranch.get(repo.base);
+    if (parent && parent !== repo) visit(parent);
+    state.set(repo, 'done');
+    ordered.push(repo);
+  };
+  for (const repo of repos) visit(repo);
+  return ordered;
 }
 
 export interface WorldProvider {

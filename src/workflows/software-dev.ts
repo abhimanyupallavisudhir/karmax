@@ -39,7 +39,9 @@ import {
   SubTaskResponse,
   TaskPullRequest,
 } from './contract.js';
-import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
+  samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
+import type { CheckoutApprovals } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
@@ -95,6 +97,10 @@ export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const confirmSignal = defineSignal('confirm');
+/** Approve ONE branch of a multi-PR task at the head it has right now (SPEC §11.1).
+ *  Lets a human confirm the finished branches and send a follow-up about the rest;
+ *  the approval lapses by itself if the Do agent moves that branch afterwards. */
+export const approveCheckoutSignal = defineSignal<[{ name: string }]>('approveCheckout');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
@@ -252,10 +258,29 @@ export async function softwareDevV1_8(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.8.0');
 }
 
-/** Bounded coordinator-activity retries: a deterministically failing merge-queue /
- *  agent-slot call surfaces as a stage error instead of freezing the task forever. */
+/** Multi-PR: a task may partition its change across several branches, each landing
+ *  as its own pull request, and Review tracks approval per branch (SPEC §11.1).
+ *  A task parked in a merge queue also no longer republishes its whole view every
+ *  five seconds — see `boundedMergeWait`. */
 export async function softwareDevV1_9(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.9.0');
+}
+
+/**
+ * Bounded coordinator-activity retries (a deterministically failing merge-queue /
+ * agent-slot call surfaces as a stage error instead of freezing the task forever),
+ * every merge-queue domain published in the view, the confirm latch cleared on
+ * entry to each Review gate, and an escalation that wakes on a follow-up.
+ *
+ * These landed on a branch that had also numbered them 1.9.0, concurrently with
+ * master publishing a DIFFERENT 1.9.0 (multi-PR + the bounded merge wait). Two
+ * behaviour sets cannot share one version number: an execution records its type
+ * at start and replays it forever, so folding both into 1.9.0 would have replayed
+ * master's in-flight 1.9.0 executions against commands they never recorded. They
+ * are therefore 1.10.0, and 1.9.0 above means exactly what master shipped.
+ */
+export async function softwareDevV1_10(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.10.0');
 }
 
 /** Replay-compatible entry for executions already recorded as
@@ -264,7 +289,16 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0';
+
+
+/** The minor of a behavior version. Every feature gate below is a `>=` test on
+ * this rather than a list of versions to remember to extend, for the same
+ * reason `childWorkflowType` is: a newly bundled version is then correct by
+ * construction instead of needing an edit nobody would notice was missing. */
+function behaviorMinor(behaviorVersion: BehaviorVersion): number {
+  return Number(behaviorVersion.split('.')[1] ?? 0);
+}
 
 /**
  * The workflow type a sub-task child is started as. From 1.5.0 on a child
@@ -294,28 +328,38 @@ async function softwareDevImpl(
   input: SoftwareDevInput,
   behaviorVersion: BehaviorVersion,
 ): Promise<{ stage: Stage; sha?: string }> {
+  const minor = behaviorMinor(behaviorVersion);
   const liveAgentStates = behaviorVersion !== '1.0.0';
-  const providerTerminalCompletion =
-    ['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0', '1.9.0'].includes(behaviorVersion);
-  const modeSwitching = ['1.3.0', '1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0', '1.9.0'].includes(behaviorVersion);
-  const durableAgentAdmission = ['1.4.0', '1.5.0', '1.6.0', '1.7.0', '1.8.0', '1.9.0'].includes(behaviorVersion);
-  const responsiveHumanHold = ['1.7.0', '1.8.0', '1.9.0'].includes(behaviorVersion);
+  const providerTerminalCompletion = minor >= 2;
+  const modeSwitching = minor >= 3;
+  const durableAgentAdmission = minor >= 4;
+  const responsiveHumanHold = minor >= 7;
   // New activity calls in an existing stage would break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
-  const githubPrLifecycle = behaviorVersion === '1.8.0' || behaviorVersion === '1.9.0';
-  const agentTurns = ['1.6.0', '1.7.0', '1.8.0', '1.9.0'].includes(behaviorVersion)
-    ? cancellationAwareTurns
-    : turns;
+  const githubPrLifecycle = minor >= 8;
+  // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
+  // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
+  // republished the entire TaskView (messages + every agent transcript) every
+  // 5s. Temporal caps a workflow's history at 50MB, so a task queued behind a
+  // slow or wedged coordinator accumulated its way to a hard TERMINATE in a few
+  // hours — the queue stall silently became permanent task death. The grant
+  // still arrives by signal, which wakes the condition immediately, so a longer
+  // poll costs no latency; it only refreshes the displayed position.
+  const boundedMergeWait = minor >= 9;
+  // Multi-PR (SPEC §11.1): adopting a branch the Do agent added, and the
+  // per-checkout Review gate. Gated from 1.9 on so an execution recorded before
+  // it keeps the single-branch Review semantics on replay.
+  const multiPrEnabled = minor >= 9 && !!input.project.multiPr;
+  const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   // Activity retry options are recorded with the ScheduleActivityTask command, so
   // bounding the coordinator's unlimited default is a versioned behavior change.
-  const coordinator = behaviorVersion === '1.9.0' ? boundedCoord : coord;
+  const coordinator = minor >= 10 ? boundedCoord : coord;
   // `publish` is an activity, so its argument is recorded in history — adding a
-  // field to the published view is a versioned change too. From 1.9.0 the view
+  // field to the published view is a versioned change too. From 1.10.0 the view
   // carries EVERY merge-queue domain the task holds, not just the first: a
-  // multi-repo task takes one slot per repo, and `mergeDomain` (singular) made
-  // `reorderQueue`/`moveQueueItem` reject a legitimate request to reorder any
-  // domain after the first. The singular is retained for older executions.
-  const publishesAllMergeDomains = behaviorVersion === '1.9.0';
+  // multi-repo task takes one slot per repo, and `mergeDomain` (singular) left
+  // the console able to show and reorder only the first of them.
+  const publishesAllMergeDomains = minor >= 10;
   // Clearing the `confirmed` gate token on entry to Review, and waking the
   // escalation park on a follow-up, both change which commands a workflow task
   // emits at a point older executions have already recorded — an execution that
@@ -323,9 +367,8 @@ async function softwareDevImpl(
   // parked at `escalated` recorded a follow-up producing no commands at all.
   // Replaying either against the new code parks (or resumes) where history says
   // otherwise, which is a NonDeterminismError that wedges the execution for good.
-  // So both are pinned to 1.9.0 like every other behavior change here.
-  const clearsConfirmOnGate = behaviorVersion === '1.9.0';
-  const followUpWakesEscalation = behaviorVersion === '1.9.0';
+  const clearsConfirmOnGate = minor >= 10;
+  const followUpWakesEscalation = minor >= 10;
   const taskId = input.taskId;
   const recovery = input.recovery;
   const recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
@@ -340,6 +383,9 @@ async function softwareDevImpl(
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
   let confirmed = false;
+  // checkout name -> head sha it was approved at (multi-PR Review, PLAN-multi-pr.md §3).
+  let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
+  let checkoutHeads: Record<string, string> = {};
   let cancelled = false;
   let retryRequested = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
@@ -662,6 +708,7 @@ async function softwareDevImpl(
       worldPath: world?.workdir ?? world?.root,
       pr,
       ...(prs.length ? { prs } : {}),
+      ...(multiPrEnabled && world ? { checkouts: reviewCheckouts(worldRepos(world as any), checkoutHeads, checkoutApprovals, prs) } : {}),
       mergeQueue: mergeQueuePos,
       subTasks: subTaskIds.length ? subTaskIds : undefined,
       parentTaskId: input.parentTaskId,
@@ -742,6 +789,14 @@ async function softwareDevImpl(
     confirmed = true;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
+  });
+  // Approving one branch is the same decision as Confirm, taken for one pull
+  // request instead of all of them — so a human can approve what is finished and
+  // send a follow-up about the rest. It is recorded against that branch's CURRENT
+  // head, which is what makes it lapse by itself if the Do agent moves it.
+  setHandler(approveCheckoutSignal, ({ name }) => {
+    const head = checkoutHeads[name];
+    if (head) checkoutApprovals = { ...checkoutApprovals, [name]: head };
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed) {
@@ -1352,6 +1407,12 @@ async function softwareDevImpl(
       seen = delivered;
     }
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    // A branch the agent added with `create_branch` already exists in the world;
+    // adopt the handle that now names it so the PR and merge stages see it. The
+    // handle rides back on the turn RESULT, so this is journaled state, not a
+    // second source of truth — and older pinned versions never set it, so their
+    // replay is unaffected.
+    if (multiPrEnabled && turn.worldHandle) world = turn.worldHandle as WorldHandleLike;
     return turn;
   }
 
@@ -1573,7 +1634,7 @@ async function softwareDevImpl(
   await publish();
   if (!world) {
     world = (await withResolve('setup', () =>
-      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress }),
+      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress, ...(input.project.multiPr ? { multiPr: true } : {}) }),
     )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
@@ -1841,6 +1902,16 @@ async function softwareDevImpl(
         const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
+      // Read where every branch stands BEFORE entering Review. Approval is bound to
+      // a head sha, so this is also what makes a stale approval lapse: a branch the
+      // Do agent touched since it was approved now reports a different head and
+      // drops back to unapproved, while the untouched ones keep theirs.
+      //
+      // Deliberately ahead of `stage = 'review'`: the view is served by a live query,
+      // so fetching after the flip leaves a window where Review is observable with
+      // its branches missing their heads — and a branch with no head cannot be
+      // approved, so that window is a Review whose Approve buttons quietly do nothing.
+      if (multiPrEnabled) checkoutHeads = await core.checkoutHeads(world as any).catch(() => checkoutHeads);
       stage = 'review';
       status = 'waiting';
       // `confirmed` is a GATE token, not a latch. Clear it the instant we enter the
@@ -1936,10 +2007,20 @@ async function softwareDevImpl(
         waitingFor = { kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
+        // Approving individual branches marks what has been reviewed — deliberately
+        // NOT a way to pass the layer. Confirm stays the one act that does, so the
+        // authorization and quorum rules that guard it (api.signalTask) keep
+        // guarding it, and per-branch approval cannot route around them. What the
+        // marks buy is the loop-back: a branch approved now is still approved when
+        // the task returns from Do, as long as the agent did not touch it.
         await condition(() => confirmed || cancelled || msgs.length > seen || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return await abort();
         if (confirmEpoch !== epoch) { li = 0; confirmed = false; continue; }
+        // One Confirm click is the same decision taken for every branch at once.
+        if (confirmed && multiPrEnabled && world) {
+          checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
+        }
         if (!confirmed) backToDo = true; // follow-up arrived → back to Do
         confirmed = false; // consumed by this layer (a later layer needs its own click)
         li++;
@@ -2022,9 +2103,15 @@ async function softwareDevImpl(
         await coordinator.enqueueMerge(domain, taskId);
         // Wait for this domain's grant; allow cancel only before it.
         while (!mergeGranted && !cancelled) {
-          mergeQueuePos = await coordinator.mergeQueuePosition(domain, taskId);
-          await publish();
-          await condition(() => mergeGranted || cancelled, '5s');
+          const pos = await coordinator.mergeQueuePosition(domain, taskId);
+          // Republish only on an actual change: the view carries every message and
+          // transcript, so an unconditional publish per tick is what pushed a long
+          // wait into Temporal's history-size limit (see `boundedMergeWait`).
+          if (!boundedMergeWait || !samePosition(pos, mergeQueuePos)) {
+            mergeQueuePos = pos;
+            await publish();
+          }
+          await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
         }
         if (cancelled && !mergeGranted) {
           await coordinator.cancelMerge(domain, taskId); // drop the slot we're still waiting on

@@ -18,7 +18,8 @@ import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmConfig, ConfirmDecision, ConfirmLayer,
-  TaskPullRequest, mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
+  TaskPullRequest, mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
+  samePosition, MERGE_POLL } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -92,15 +93,24 @@ export async function mergeOnlyV1_4(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true, true, true);
 }
 
+/** A task parked in the merge queue no longer republishes its whole view every
+ *  five seconds — see `boundedMergeWait`. */
+export async function mergeOnlyV1_5(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true, true);
+}
+
 /**
  * Per-repo merge-queue serialization (the same `mergeQueueDomains` keys
  * software-dev uses) plus a bounded coordinator retry budget. Both change the
  * recorded command stream — the domain strings a merge enqueues under, and the
  * retry options on every coordinator activity — so they need their own pinned
  * version rather than silently rewriting in-flight histories.
+ *
+ * 1.6.0 rather than 1.5.0: master published a different 1.5.0 (the bounded merge
+ * wait) concurrently, and one version number cannot mean two behaviour sets.
  */
-export async function mergeOnlyV1_5(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
-  return mergeOnlyImpl(input, true, true, true, true, true);
+export async function mergeOnlyV1_6(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true, true, true);
 }
 
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
@@ -116,6 +126,10 @@ async function mergeOnlyImpl(
   // New activity calls inside an existing stage break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
   githubPrLifecycle = false,
+  // Poll the merge queue coarsely and republish only on change: the view carries
+  // every message and transcript, and Temporal hard-caps history at 50MB, so the
+  // old 5s unconditional publish turned a long queue wait into a TERMINATE.
+  boundedMergeWait = false,
   // Per-repo merge-queue domains (mergeQueueDomains) + bounded coordinator
   // retries. Both alter recorded commands (domain strings; activity retry
   // options), so they are pinned to their own version.
@@ -491,10 +505,15 @@ async function mergeOnlyImpl(
       }
       while (!mergeGranted && !cancelled) {
         if (managedTurns) {
-          mergeQueue = await coordinator.mergeQueuePosition(domain, taskId);
-          await publish();
+          // Republish only on a real change, and poll coarsely: the view carries
+          // every message and transcript, and Temporal hard-caps history at 50MB.
+          const pos = await coordinator.mergeQueuePosition(domain, taskId);
+          if (!boundedMergeWait || !samePosition(pos, mergeQueue)) {
+            mergeQueue = pos;
+            await publish();
+          }
         }
-        await condition(() => mergeGranted || cancelled, '5s');
+        await condition(() => mergeGranted || cancelled, boundedMergeWait ? MERGE_POLL : '5s');
       }
       if (cancelled && !mergeGranted) {
         await coordinator.cancelMerge(domain, taskId); // drop the slot we're still waiting on

@@ -50,7 +50,7 @@ import { credentialResource, resourceDriverCatalog, snapshotResource } from '../
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldWorkingRelativePath } from '../world/types.js';
+import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { enumerateCredentials } from '../platform/credentials.js';
 import { gatherCredentialSources } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
@@ -617,7 +617,17 @@ export class Gateway {
         openUrls: [], runnerLeaseId: worldLeaseId });
       const opened = await this.deps.worlds.open(handle);
       const world = this.deps.resources ? await this.deps.resources.prepare(opened) : opened;
-      term = await world.openPty({ cols: 80, rows: 24 });
+      // Check-in targets a BRANCH, not just the world: a multi-PR task holds
+      // several checkouts side by side and the user must be able to open a
+      // terminal in any of them (SPEC §11.1). This is the whole cost of that on
+      // every backend — the branches are directories in the one world, so a cwd
+      // is all it takes, and the remote case needs no second sandbox. An unknown
+      // name falls back to the world's default rather than escaping the boundary.
+      const wanted = url.searchParams.get('checkout');
+      const checkout = wanted
+        ? worldRepos(world.handle as import('../world/types.js').WorldHandle).find((r) => r.name === wanted)
+        : undefined;
+      term = await world.openPty({ cols: 80, rows: 24, ...(checkout ? { cwd: checkout.root } : {}) });
       this.deps.store.setExecutionRunning(executionId);
       this.deps.store.appendExecutionFrame(executionId, 'Terminal opened.\n', 'system');
     } catch (error) {
@@ -3116,6 +3126,7 @@ export class Gateway {
             modelProvider: _legacyModelProvider,
             allowedAccounts: _legacyAllowedAccounts,
             auth: _legacyAuth,
+            capabilities: _legacyCapabilities,
             ...visibleProfile
           } = pr;
           if (visibleProfile.inherited) {
@@ -3123,6 +3134,7 @@ export class Gateway {
               modelProvider: _legacyInheritedProvider,
               allowedAccounts: _legacyInheritedAllowedAccounts,
               auth: _legacyInheritedAuth,
+              capabilities: _legacyInheritedCapabilities,
               ...visibleInherited
             } = visibleProfile.inherited;
             visibleProfile.inherited = visibleInherited;
@@ -3166,9 +3178,12 @@ export class Gateway {
           modelProvider: _legacyModelProvider,
           allowedAccounts: _legacyAllowedAccounts,
           auth: _legacyAuth,
+          // The role's workflow owns the capability ceiling (roleCeiling); a submitted
+          // one must neither narrow nor escalate what the role's turns are minted with.
+          capabilities: _legacyCapabilities,
           ...rest
         } = b;
-        store.upsertProfile({ provider: 'claude', capabilities: [], ...rest, id });
+        store.upsertProfile({ provider: 'claude', ...rest, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
       // reset a project profile override back to the global default
