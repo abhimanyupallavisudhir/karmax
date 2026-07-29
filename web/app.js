@@ -1410,7 +1410,8 @@ function renderMarkdown(src, opts = {}) {
   const withMath = !!opts.math;
   const stash = [];
   const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
-  let s = String(src ?? '').replace(/\r\n?/g, '\n');
+  const source = String(src ?? '').replace(/\r\n?/g, '\n');
+  let s = source;
   // Fenced code blocks first (a blank line around the placeholder keeps it its
   // own block).
   s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
@@ -1419,7 +1420,51 @@ function renderMarkdown(src, opts = {}) {
   s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
   if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
   let html = mdBlocks(s, stash);
-  return html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+  html = html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+  return sanitizeMarkdownHtml(html, source);
+}
+
+// Parse the renderer's output in a detached fragment before it becomes part of
+// the page. Besides enforcing the renderer's small element/attribute allowlist,
+// this makes the browser repair and close any accidentally malformed formatting
+// tags *inside this message*. Formatting-element recovery can otherwise carry an
+// unclosed <strong>/<em> through later siblings, affecting subsequent messages
+// and even controls outside the conversation. Raw message text was escaped
+// before rendering; if the allowlist ever fails, fall back to escaped text.
+function sanitizeMarkdownHtml(html, source) {
+  if (typeof document === 'undefined' || !document.createElement) return html;
+  const fallback = () => esc(source).replace(/\n/g, '<br>');
+  try {
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    const allowedTags = new Set([
+      'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+      'HR', 'LI', 'OL', 'P', 'PRE', 'SPAN', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH',
+      'THEAD', 'TR', 'UL',
+    ]);
+    for (const el of template.content.querySelectorAll('*')) {
+      if (!allowedTags.has(el.tagName)) return fallback();
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value;
+        if (name === 'class') continue;
+        if (el.tagName === 'A' && name === 'href') {
+          if (!/^(?:https?:|mailto:|\/|#)/i.test(value)) return fallback();
+          continue;
+        }
+        if (el.tagName === 'A' && name === 'target' && value === '_blank') continue;
+        if (el.tagName === 'A' && name === 'rel' && value === 'noopener noreferrer') continue;
+        if (el.tagName === 'A' && name === 'data-md-local') continue;
+        if (el.tagName === 'OL' && name === 'start' && /^-?\d+$/.test(value)) continue;
+        if ((el.tagName === 'TH' || el.tagName === 'TD') && name === 'style'
+          && /^text-align:\s*(?:left|center|right);?$/i.test(value)) continue;
+        return fallback();
+      }
+    }
+    return template.innerHTML;
+  } catch {
+    return fallback();
+  }
 }
 
 function mdBlocks(s, stash) {
@@ -1614,6 +1659,21 @@ function mdInline(t) {
   // emphasis/link passes treat it as a literal, then restore it at the very end.
   const lit = [];
   x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+  // Generated anchors must not go through the emphasis regexes: doing so lets
+  // Markdown punctuation in a URL rewrite the generated href attribute. Keep
+  // each complete anchor behind an opaque placeholder until formatting is done.
+  const links = [];
+  const keepLink = (html) => `\u0002${links.push(html) - 1}\u0002`;
+  const format = (value) => {
+    let out = value;
+    out = out.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+    out = out.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+    out = out.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
+    return out.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  };
   // Inline links [text](url "optional title") — safe schemes only; the title is
   // dropped. Runs before autolinking so a bare URL inside a link is left alone.
   // A scheme-less relative target (no ":" — so `javascript:`/`data:` are
@@ -1622,26 +1682,30 @@ function mdInline(t) {
   // page, while it stays inert (href="#") everywhere else.
   x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
     if (/^(https?:|mailto:|\/)/i.test(href))
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
-    if (href[0] === '#') return `<a href="${href}">${txt}</a>`;
-    if (!/:/.test(href)) return `<a href="#" data-md-local="${href}">${txt}</a>`;
-    return `<a href="#" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+      return keepLink(`<a href="${href}" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
+    if (href[0] === '#') return keepLink(`<a href="${href}">${format(txt)}</a>`);
+    if (!/:/.test(href)) return keepLink(`<a href="#" data-md-local="${href}">${format(txt)}</a>`);
+    return keepLink(`<a href="#" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
   });
-  // Autolink bare http(s) URLs not already part of a link/attribute (only when
-  // preceded by start-of-string, whitespace or an opening paren). Trailing
-  // sentence punctuation is left outside the link.
-  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, url) => {
+  // Autolink bare http(s) URLs (explicit links are opaque placeholders now).
+  // A closing emphasis marker adjacent to the URL belongs to the surrounding
+  // Markdown when the matching opener occurs before it. Strip that delimiter
+  // first, then ordinary sentence punctuation, and keep both outside the anchor.
+  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, matchedUrl, offset, input) => {
+    let url = matchedUrl;
+    let markdownTail = '';
+    const marker = (url.match(/(\*{1,3}|_{1,3}|~~)$/) || [])[1];
+    const before = input.slice(0, offset + pre.length);
+    if (marker && before.includes(marker)) {
+      url = url.slice(0, -marker.length);
+      markdownTail = marker;
+    }
     const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
     const bare = url.slice(0, url.length - tail.length);
-    return `${pre}<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>${tail}`;
+    return `${pre}${keepLink(`<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>`)}${tail}${markdownTail}`;
   });
-  x = x.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
-  x = x.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
-  x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
-  x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
-  x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
-  x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
-  x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  x = format(x);
+  x = x.replace(/\u0002(\d+)\u0002/g, (_, n) => links[Number(n)] ?? '');
   x = x.replace(/\u0001(\d+)\u0001/g, (_, n) => lit[Number(n)]);
   return x;
 }
@@ -2742,7 +2806,7 @@ function tasksView() {
       : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
+      <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send · Ctrl+V to paste image · (n)" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.draft}</button>
       <button class="btn icon-only" id="expand-task" title="More fields ( N or ↵ )" aria-label="More fields">${ICON.more}</button>
