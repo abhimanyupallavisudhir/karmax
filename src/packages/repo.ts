@@ -30,6 +30,56 @@ const MANIFEST_NAMES = ['manifest.json', 'manifest.mjs', 'manifest.js', 'manifes
 const WORKFLOW_NAMES = ['workflow.mjs', 'workflow.js', 'workflow.ts'];
 
 /**
+ * A package name becomes a directory under the cache home, so it must not be a
+ * relative path component. The old sanitizer replaced "unsafe" characters but
+ * left dots alone, so the name `..` produced `path.join(cacheHome, '..')` — the
+ * clone (and later the recursive `rmSync` in the manager) landed *outside* the
+ * cache. The name/manifest mismatch check that would have caught it runs only
+ * after the write. Require a leading alphanumeric, which excludes `.`/`..` and
+ * dotfiles by construction.
+ */
+const PACKAGE_NAME_PATTERN = /^[a-z0-9][a-z0-9_.-]*$/i;
+
+/** Schemes we are willing to hand to `git clone`. `ext::` is deliberately absent:
+ *  it makes git run an arbitrary host command. */
+const ALLOWED_URL_SCHEMES = new Set(['http:', 'https:', 'ssh:', 'git:', 'file:']);
+
+/** Validate a package name before it is used to build any filesystem path. */
+export function assertSafePackageName(name: string, what = 'package name'): string {
+  if (typeof name !== 'string' || !PACKAGE_NAME_PATTERN.test(name) || name.includes('\0'))
+    throw new Error(`invalid ${what} "${name}": use letters, digits, "_", "-", "." and start with a letter or digit`);
+  return name;
+}
+
+/**
+ * Validate a clone source before it reaches `git clone`.
+ *
+ * `execFile` stops *shell* injection, but git itself parses its arguments: a URL
+ * beginning with `-` is read as an option (`--upload-pack=<cmd>` runs a host
+ * command), and the `ext::` transport runs its argument through a shell. So:
+ * reject leading `-`, reject any `::` (the transport-helper separator), and
+ * allow only known-safe schemes. A bare path (local repo, `user@host:path` scp
+ * syntax) has no scheme and is permitted — `..` in it is harmless because the
+ * destination directory is ours, not the caller's. Callers must additionally pass
+ * `--` before the URL and `-c protocol.ext.allow=never`.
+ */
+export function assertSafeCloneUrl(raw: string): string {
+  const url = String(raw ?? '').trim();
+  if (!url) throw new Error('invalid repository url: empty');
+  if (url.includes('\0') || /[\r\n]/.test(url)) throw new Error('invalid repository url: control characters');
+  if (url.startsWith('-')) throw new Error(`invalid repository url "${url}": must not start with "-" (git would read it as an option)`);
+  if (url.includes('::')) throw new Error(`invalid repository url "${url}": transport helpers ("ext::", "…::…") are not allowed`);
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(url) ?? /^([A-Za-z][A-Za-z0-9+.-]*):(?![\\/])/.exec(url);
+  if (scheme && !ALLOWED_URL_SCHEMES.has(`${scheme[1]!.toLowerCase()}:`))
+    throw new Error(`invalid repository url "${url}": unsupported scheme "${scheme[1]}:"`);
+  return url;
+}
+
+/** Hardening flags applied to the clone/fetch of an untrusted package repo:
+ *  belt-and-braces against the `ext::` transport even if a URL check is bypassed. */
+const GIT_SAFE_CONFIG = ['-c', 'protocol.ext.allow=never'];
+
+/**
  * Loads workflow packages from git repos into a local, SHA-keyed cache and
  * validates their manifests before anything in the system trusts them. This is
  * the *fetch + verify* half of dynamic loading; getting the code into a running
@@ -38,11 +88,13 @@ const WORKFLOW_NAMES = ['workflow.mjs', 'workflow.js', 'workflow.ts'];
 export class WorkflowRepoLoader {
   constructor(private cacheHome: string) {}
 
-  /** Where a given package name keeps its working clone and version snapshots. */
+  /** Where a given package name keeps its working clone and version snapshots.
+   *  Both segments are validated (not merely scrubbed) so no input can produce a
+   *  path outside `cacheHome`. */
   private nameDir(name: string, namespace?: string): string {
-    const safeName = name.replace(/[^a-z0-9_.-]/gi, '-');
+    const safeName = assertSafePackageName(name);
     return namespace
-      ? path.join(this.cacheHome, 'organizations', namespace.replace(/[^a-z0-9_.-]/gi, '-'), safeName)
+      ? path.join(this.cacheHome, 'organizations', assertSafePackageName(namespace, 'organization id'), safeName)
       : path.join(this.cacheHome, safeName);
   }
 
@@ -57,17 +109,20 @@ export class WorkflowRepoLoader {
     namespace?: string,
     env?: Record<string, string>,
   ): Promise<LoadedPackage> {
-    const name = spec.name ?? deriveName(spec.url);
+    // Validate BOTH untrusted inputs before either touches the filesystem or git.
+    const url = assertSafeCloneUrl(spec.url);
+    const name = assertSafePackageName(spec.name ?? deriveName(url));
     const ref = spec.ref ?? 'HEAD';
     const nameDir = this.nameDir(name, namespace);
     const work = path.join(nameDir, '.work');
 
     // Clone once, then fetch on subsequent loads. Local paths and URLs both work.
+    // `--` terminates option parsing so a URL can never be read as a git flag.
     if (!fs.existsSync(path.join(work, '.git'))) {
       fs.mkdirSync(path.dirname(work), { recursive: true });
-      await gitOrThrow(path.dirname(work), ['clone', '--quiet', spec.url, work], { env });
+      await gitOrThrow(path.dirname(work), [...GIT_SAFE_CONFIG, 'clone', '--quiet', '--', url, work], { env });
     } else {
-      await git(work, ['fetch', '--quiet', '--tags', '--prune', 'origin'], { env });
+      await git(work, [...GIT_SAFE_CONFIG, 'fetch', '--quiet', '--tags', '--prune', 'origin'], { env });
     }
 
     // Resolve the ref to a concrete commit — the pin. `origin/<ref>` first so a

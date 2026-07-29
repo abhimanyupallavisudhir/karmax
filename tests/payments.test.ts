@@ -95,6 +95,26 @@ describe('BudgetService over the mock rail', () => {
     expect((await provider.getCard(card.id))!.available).toBe(0);
   });
 
+  it('denying an already-settled request does not refund the allowance', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
+    await provider.fund(card.id, 5000);
+    const r = await budget.request({ projectId, taskId: 't-deny' }, { amount: 2000 });
+    expect(r.status).toBe('granted');
+    const spentAfterCharge = Number(store.kvGet('spent:t-deny'));
+    expect(spentAfterCharge).toBe(2000);
+    const availableAfterCharge = (await provider.getCard(card.id))!.available;
+
+    // A reviewer clicks Deny on a stale list, after the immediate rail already
+    // settled the charge. `deny` had no status guard, so it flipped the SETTLED row
+    // to `denied`; `paymentSpent` counts only consumed/settled/authorized rows, so
+    // the money vanished from the allowance while the merchant had really been
+    // paid — the agent got that budget back and could spend it twice.
+    const denied = budget.deny(r.requestId!, 'user:alice');
+    expect(denied.status).not.toBe('denied');
+    expect(Number(store.kvGet('spent:t-deny'))).toBe(spentAfterCharge);
+    expect((await provider.getCard(card.id))!.available).toBe(availableAfterCharge);
+  });
+
   it('needs_approval over the configured allowance', async () => {
     const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Ops', cap: 100000 });
     await provider.fund(card.id, 100000);

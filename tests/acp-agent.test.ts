@@ -186,7 +186,21 @@ describe('generic ACP agent adapter', () => {
     const created = records.find((r) => r.method === 'session/new');
     const prompted = records.find((r) => r.method === 'session/prompt');
     expect(records.some((r) => r.method === 'authenticate' && r.params.methodId === 'cached_token')).toBe(true);
-    expect(created.params.mcpServers.map((s: any) => s.name)).toEqual(['karmax', 'extra']);
+    // `karmax` is the durable gateway MCP; `karmax_control` is the per-turn socket
+    // bridge that carries the TURN-LOCAL controls (confirm/resolve/review-info) an
+    // ACP harness could otherwise never reach — see src/agent/control-bridge.ts.
+    expect(created.params.mcpServers.map((s: any) => s.name)).toEqual(['karmax', 'karmax_control', 'extra']);
+    const control = created.params.mcpServers.find((s: any) => s.name === 'karmax_control');
+    expect(control.command).toBe(process.execPath);
+    expect(control.args[0]).toMatch(/control-mcp\.mjs$/);
+    // The socket path is NOT the credential: same-uid peers can reach it, so the
+    // per-turn token must be plumbed here too (control-bridge.ts security notes).
+    expect(control.env).toEqual([
+      { name: 'KARMAX_CONTROL_SOCKET', value: expect.stringMatching(/\.sock$/) },
+      { name: 'KARMAX_CONTROL_TOKEN', value: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    ]);
+    // The socket must not outlive the turn it mutates.
+    expect(fs.existsSync(control.env[0].value)).toBe(false);
     expect(prompted.params.prompt.filter((block: any) => block.type === 'image')).toHaveLength(1);
     const configured = records.filter((r) => r.method === 'session/set_config_option').map((r) => r.params);
     expect(configured).toEqual(expect.arrayContaining([
@@ -267,5 +281,33 @@ describe('generic ACP agent adapter', () => {
       GROK_HOME: expect.stringContaining('/home'),
     });
     expect(records.some((r) => r.method === 'authenticate' && r.params.methodId === 'xai.api_key')).toBe(true);
+  });
+});
+
+describe('ACP adapters and remote worlds', () => {
+  /**
+   * ACP harnesses run only where krmax runs. `claude.ts`/`codex.ts` branch to
+   * `spawnRemoteAgentProcess` for a cloud world; `acp.ts` has no such path, and
+   * `remote-process.ts` is hardcoded to those two providers' config-home variables
+   * and CLI packages. Before this guard the host `spawn` ran with a cwd that exists
+   * only inside the sandbox: ENOENT was swallowed by the adapter's `error` handler
+   * and the turn hung on the ACP `initialize` handshake with no stated cause.
+   * Hosted deployments force remote worlds, so this is the path every hosted
+   * OpenCode task took.
+   */
+  it('refuses a remote world with an actionable message instead of hanging', async () => {
+    const remoteWorld = {
+      handle: { id: 'w', root: '/home/user/karmax', branch: 'task', base: 'main',
+        version: 2, sealedProviderRef: 'sealed:e2b:abc' },
+    };
+    await expect(new AcpAdapter('opencode').runTurn({
+      profile: { id: 'p', name: 'Agent', provider: 'opencode', modelProvider: 'kimi',
+        model: 'kimi/k3', effort: 'high', maxTurns: 7, role: 'do', capabilities: [] },
+      world: remoteWorld,
+      messages: [{ id: 'm', role: 'user', text: 'hi', ts: 0 }],
+      systemPrompt: '',
+      role: 'do',
+    } as any, { emit() {}, emitActivity() {}, onSession() {} } as any))
+      .rejects.toThrow(/cannot run in a remote \(cloud sandbox\) world/);
   });
 });

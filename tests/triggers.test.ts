@@ -87,6 +87,33 @@ describe('cron parsing + next-fire (UTC)', () => {
     expect(validateTriggers([{ kind: 'schedule', cron: '0 0 29 2 *' } as TaskTrigger])).toEqual([]);
   });
 
+  it('rejects malformed ranges instead of reading them as 0-N', () => {
+    // `Number('') === 0`, so `-5` used to parse as "minutes 0 through 5": the dash
+    // sits at index 0, the low token is empty, and 0 passes Number.isInteger. The
+    // typo then ran the task six times an hour. Same for every field whose min is 0.
+    expect(parseCron('-5 * * * *')).toBeUndefined();
+    expect(parseCron('* -3 * * *')).toBeUndefined();
+    expect(parseCron('5- * * * *')).toBeUndefined(); // empty high token
+    expect(parseCron('* * * * -2')).toBeUndefined();
+    expect(parseCron('+5 * * * *')).toBeUndefined(); // Number('+5') is 5, but this is not cron
+    expect(parseCron('*/ * * * *')).toBeUndefined(); // empty step
+    // Well-formed ranges still parse.
+    expect(parseCron('0-5 * * * *')).toBeTruthy();
+  });
+
+  it('accepts 7 as Sunday in day-of-week (POSIX cron)', () => {
+    expect(parseCron('0 9 * * 7')).toBeTruthy();
+    // 2026-01-04 is a Sunday; from Jan 2 the next `7` (Sunday) 09:00 is Jan 4.
+    const next = nextCronFire('0 9 * * 7', at('2026-01-02T12:00:00Z'));
+    expect(new Date(next!).toISOString()).toBe('2026-01-04T09:00:00.000Z');
+    // 0 and 7 mean the same day.
+    expect(nextCronFire('0 9 * * 0', at('2026-01-02T12:00:00Z'))).toBe(next);
+    // A range spanning into 7 normalizes too (6-7 = Saturday + Sunday).
+    expect(nextCronFire('0 9 * * 6-7', at('2026-01-01T12:00:00Z')))
+      .toBe(at('2026-01-03T09:00:00Z')); // Saturday Jan 3
+    expect(parseCron('0 9 * * 8')).toBeUndefined();
+  });
+
   it('ORs day-of-month and day-of-week when both are set (standard cron rule)', () => {
     // "0 0 13 * 5" = midnight on the 13th OR any Friday.
     const next = nextCronFire('0 0 13 * 5', at('2026-02-01T00:00:00Z')); // Feb 1 2026 is a Sunday
@@ -124,6 +151,47 @@ describe('trigger helpers', () => {
     expect(validateTriggers([{ kind: 'schedule', cron: '0 9 * * *' }])).toHaveLength(0);
     expect(validateTriggers([{ kind: 'event', type: '' }])).toHaveLength(1);
     expect(validateTriggers([{ kind: 'event', type: 'x.y' }])).toHaveLength(0);
+  });
+
+  it('rejects the two zombie schedule shapes', () => {
+    // `at` + recurring: armSchedule sets one timer and fireFor never disarms a
+    // repeatable entry, so it fires once and then sits armed forever with no timer.
+    expect(validateTriggers([{ kind: 'schedule', at: 1_000, recurring: true }]))
+      .toEqual([expect.stringContaining('cannot be recurring')]);
+    expect(validateTriggers([{ kind: 'schedule', at: 1_000 }])).toHaveLength(0);
+    // cron + at: armSchedule checks `at` first and silently drops the cron.
+    expect(validateTriggers([{ kind: 'schedule', cron: '0 9 * * *', at: 1_000 }]))
+      .toEqual([expect.stringContaining('not both')]);
+  });
+
+  it('rejects self-reference, dangling deps, and cycles in the dependency graph', () => {
+    // Graph-shaped errors are invisible at runtime: the dispatcher simply never
+    // fires, so the task sits `armed` forever with no signal.
+    const graph: Record<string, string[]> = { a: [], b: ['a'], c: ['b'] };
+    const dependenciesOf = (id: string) => graph[id];
+
+    // self-reference (the web picker's exclusion is client-side only)
+    expect(validateTriggers([{ kind: 'dependency', tasks: ['me'] }], { taskId: 'me' }))
+      .toEqual([expect.stringContaining('cannot depend on itself')]);
+
+    // dangling / deleted dep id
+    expect(validateTriggers([{ kind: 'dependency', tasks: ['gone'] }], { taskId: 'me', dependenciesOf }))
+      .toEqual([expect.stringContaining('does not exist')]);
+
+    // A→B→A cycle: `a` would depend on `c`, but c→b→a already reaches a.
+    expect(validateTriggers([{ kind: 'dependency', tasks: ['c'] }], { taskId: 'a', dependenciesOf }))
+      .toEqual([expect.stringContaining('cycle')]);
+
+    // A legal edge in the same graph still validates.
+    expect(validateTriggers([{ kind: 'dependency', tasks: ['c'] }], { taskId: 'd', dependenciesOf })).toEqual([]);
+    // Without a resolver, only self-reference is checkable (back-compat).
+    expect(validateTriggers([{ kind: 'dependency', tasks: ['gone'] }])).toEqual([]);
+  });
+
+  it('terminates on a pre-existing cycle elsewhere in the graph', () => {
+    const graph: Record<string, string[]> = { x: ['y'], y: ['x'], z: ['x'] };
+    expect(validateTriggers([{ kind: 'dependency', tasks: ['z'] }],
+      { taskId: 'new', dependenciesOf: (id) => graph[id] })).toEqual([]);
   });
 
   it('normalizes a single trigger or a list, dropping junk', () => {
@@ -393,6 +461,68 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(started).toHaveLength(0); // arming does NOT start the workflow
   });
 
+  /**
+   * Pausing is not missing. `cancelTrigger` stripped `triggerState` but kept
+   * `triggerLastFiredAt`, so a cron task paused for days and then re-queued
+   * looked to `catchUpCron` like one that had slept through an occurrence — and
+   * fired a spurious run the moment it was re-queued. A task deliberately not
+   * armed has nothing to catch up on.
+   */
+  it('re-queuing a paused cron task does not fire a catch-up run', async () => {
+    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
+    const tokens = new TokenAuthority();
+    const token = tokens.mintPrincipal('u', ['*']).token;
+    const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
+    api.setTriggerArmer({ arm: () => {}, disarm: () => {} });
+
+    const t = await api.createTask(token, { projectId, workflow: 'just-do',
+      params: { prompt: 'p', triggers: [{ kind: 'schedule', cron: '0 9 * * *' }] } });
+    // It has fired before, a week ago — the mark a real armed cron carries.
+    store.updateTaskParams(t.id, {
+      ...store.getTask(t.id)!.params, triggerLastFiredAt: Date.parse('2026-01-01T09:00:00Z'),
+    });
+
+    await api.cancelTrigger(token, t.id); // pause it
+    // The stale mark must not survive the pause, or the re-queue below catches up.
+    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBeUndefined();
+
+    await api.queueTask(token, t.id); // re-queue, days later
+    const fired: [string, string][] = [];
+    const s = new TriggerScheduler({ store, bus, fire: async (id, mode) => void fired.push([id, mode]),
+      now: () => Date.parse('2026-01-08T10:00:00Z'), setTimer: clock.set, clearTimer: clock.clear });
+    s.start();
+    expect(fired).toHaveLength(0); // no phantom run for the week it was paused
+    s.stop();
+  });
+
+  it('rejects an invalid trigger graph BEFORE marking the task armed', async () => {
+    store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
+    const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
+    const tokens = new TokenAuthority();
+    const token = tokens.mintPrincipal('u', ['*']).token;
+    const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
+    // A real armer rejects a self-dependency — the graph half of validation, which
+    // only the armer can do because it needs the store to resolve dependency ids.
+    api.setTriggerArmer({
+      arm: () => { throw new Error('invalid trigger(s): a task cannot depend on itself'); },
+      disarm: () => {},
+      validationErrors: () => ['a task cannot depend on itself'],
+    });
+
+    const draft = await api.createTask(token, { projectId, workflow: 'just-do', draft: true,
+      params: { prompt: 'p', triggers: [{ kind: 'event', type: 'x.y' }] } });
+    await expect(api.queueTask(token, draft.id)).rejects.toThrow(/depend on itself/);
+
+    // The decisive part: the rejection left NOTHING behind. Validation used to run
+    // after clearDraft + `triggerState: armed` were already persisted, so a task the
+    // dispatcher had refused sat marked `armed` but unregistered — waiting forever,
+    // indistinguishable from one that is legitimately still waiting.
+    const after = store.getTask(draft.id)!;
+    expect(after.params.triggerState).not.toBe('armed');
+    expect(after.params.draft).toBe(true);
+  });
+
   it('edits a waiting (armed) task in place, re-arming with new triggers', async () => {
     store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] });
     const started: string[] = [];
@@ -471,6 +601,110 @@ describe('TriggerScheduler (dispatcher)', () => {
     clock.advance(60_000);
     await new Promise((r) => setTimeout(r, 0));
     expect(store.runsOf(series.id)).toHaveLength(2);
+  });
+
+  it('does not double-fire a cron occurrence when the clock steps backwards', () => {
+    // The timer callback used to re-arm from `this.now()`, and nextCronFire floors
+    // to the whole minute — so a clock reading even 1 ms BEFORE the instant that
+    // just fired (backward NTP step, VM resume, early libuv timer) returned that
+    // same instant and fired it a second time. Nothing dedupes it: a repeatable
+    // entry never sets `fired`.
+    const lagging = () => Math.max(0, clock.now() - 1);
+    const t = armedTask([{ kind: 'schedule', cron: '* * * * *' }]);
+    const s = new TriggerScheduler({ store, bus, fire: async (id, mode) => void fired.push([id, mode]),
+      now: lagging, setTimer: clock.set, clearTimer: clock.clear });
+    s.start();
+    clock.advance(60_100);
+    expect(fired).toEqual([[t.id, 'clone']]); // exactly one fire for the 60s occurrence
+    s.stop();
+  });
+
+  it('catches up on a cron occurrence missed while karmax was down (exactly once)', () => {
+    const nine = (day: string) => Date.parse(`2026-01-${day}T09:00:00Z`);
+    const t = armedTask([{ kind: 'schedule', cron: '0 9 * * *' }]);
+    // Pretend it last fired on Jan 1 and karmax was then down for a week.
+    store.updateTaskParams(t.id, { ...store.getTask(t.id)!.params, triggerLastFiredAt: nine('01') });
+    clock.time = Date.parse('2026-01-08T10:00:00Z');
+    const s = makeScheduler();
+    s.start();
+    // One catch-up run — not seven, one per missed day.
+    expect(fired).toEqual([[t.id, 'clone']]);
+    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBe(nine('08'));
+    // ...and it is still armed for tomorrow, not re-firing today's.
+    expect(s.size).toBe(1);
+    clock.advance(3600_000);
+    expect(fired).toHaveLength(1);
+    s.stop();
+  });
+
+  it('seeds the catch-up mark on first arm rather than firing retroactively', () => {
+    clock.time = Date.parse('2026-01-08T10:00:00Z');
+    const t = armedTask([{ kind: 'schedule', cron: '0 9 * * *' }]);
+    const s = makeScheduler();
+    s.start();
+    expect(fired).toHaveLength(0); // never fired before ⇒ nothing to catch up on
+    expect(store.getTask(t.id)!.params.triggerLastFiredAt).toBe(clock.time);
+    // A mark with no elapsed occurrence is likewise inert across a restart.
+    s.stop();
+    const again = makeScheduler();
+    again.start();
+    expect(fired).toHaveLength(0);
+    again.stop();
+  });
+
+  it('re-fires a repeatable dependency series each time the dep completes again', () => {
+    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
+    const series = store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } });
+    store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
+    const s = makeScheduler();
+    s.start();
+    emitDone(dep.id, 'done');
+    expect(fired).toHaveLength(1);
+    // The dep genuinely runs again: it reports a non-terminal status first, which
+    // must drop it back out of the satisfied set (which used to be append-only, so
+    // the series fired at most once in its whole life and then sat armed doing nothing).
+    emitDone(dep.id, 'active');
+    emitDone(dep.id, 'done');
+    expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]);
+    // Duplicate terminal events are still deduped.
+    emitDone(dep.id, 'done');
+    expect(fired).toHaveLength(2);
+    s.stop();
+  });
+
+  it('fires a repeatable series once per event, not once per matching trigger', () => {
+    const series = store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0',
+      params: { prompt: 'p', repeatable: true, triggers: [
+        { kind: 'event', type: 'x.y', recurring: true },
+        { kind: 'event', type: 'x.y', where: { a: 1 }, recurring: true },
+      ] } });
+    store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
+    const s = makeScheduler();
+    s.start();
+    bus.emit({ type: 'x.y', taskId: 'z', ts: 0, payload: { a: 1 } } as KarmaxEvent);
+    expect(fired).toEqual([[series.id, 'clone']]); // both triggers matched; one run
+    s.stop();
+  });
+
+  it('refuses to arm an unsatisfiable dependency graph instead of waiting forever', () => {
+    const t = store.createTask({ projectId, title: 'self', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p' } });
+    store.updateTaskParams(t.id, { triggers: [{ kind: 'dependency', tasks: [t.id] }], triggerState: 'armed' } as any);
+    const s = makeScheduler();
+    expect(() => s.arm(store.getTask(t.id)!)).toThrow(/itself/);
+
+    const dangling = armedTask([{ kind: 'dependency', tasks: ['task_deleted'] }]);
+    expect(() => s.arm(store.getTask(dangling.id)!)).toThrow(/does not exist/);
+
+    // Boot must survive a stored row that has gone bad: it logs and arms the rest.
+    const logs: string[] = [];
+    const booted = new TriggerScheduler({ store, bus, fire: async () => {}, now: clock.now,
+      setTimer: clock.set, clearTimer: clock.clear, log: (m) => logs.push(m) });
+    const ok = armedTask([{ kind: 'event', type: 'a.b' }]);
+    booted.start();
+    expect(logs.some((l) => l.includes('refusing to arm'))).toBe(true);
+    expect(booted.size).toBe(1);
+    expect(store.getTask(ok.id)).toBeTruthy();
+    booted.stop();
   });
 
   it('disarm() cancels timers and event routing', () => {

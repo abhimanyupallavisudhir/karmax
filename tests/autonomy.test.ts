@@ -770,6 +770,68 @@ describe('budget coordinator (virtual-card lease, SPEC §7.6)', () => {
     await ping.result();
     await coord.terminate('done');
   });
+
+  it('refuses a redelivered requestSpend whose reqId was already settled (no double spend)', async () => {
+    const grantee = newId('task');
+    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
+    const coord = await h.client.workflow.start('budgetCoordinator', {
+      taskQueue: TASK_QUEUE,
+      workflowId: newId('budget-coord'),
+      args: [{ state: { scopes: {}, defaultCap: 5000, threshold: 300, pending: [], processed: 0 } }],
+    });
+    const budget = () => coord.query('budget') as Promise<any>;
+
+    // Charged once, drained out of the queue.
+    await coord.signal('requestSpend', { reqId: 'dup', taskId: grantee, scope: 'profA', amount: 100 });
+    await expect.poll(async () => (await budget()).scopes.profA?.spent, { timeout: 8000 }).toBe(100);
+
+    // Temporal delivers signals AT LEAST once. The same request arriving again
+    // after it was drained must not be charged a second time — that is precisely
+    // the double spend the reqId dedupe exists to prevent.
+    await coord.signal('requestSpend', { reqId: 'dup', taskId: grantee, scope: 'profA', amount: 100 });
+    await new Promise((r) => setTimeout(r, 1200));
+    expect((await budget()).scopes.profA.spent).toBe(100); // NOT 200
+
+    // The same holds for a request settled at the review gate: once approved and
+    // charged, a redelivery must not re-open it as pending nor charge again.
+    await coord.signal('requestSpend', { reqId: 'gate', taskId: grantee, scope: 'profA', amount: 500 });
+    await expect.poll(async () => (await budget()).pending.length, { timeout: 8000 }).toBe(1);
+    await coord.signal('approveSpend', { reqId: 'gate' });
+    await expect.poll(async () => (await budget()).scopes.profA.spent, { timeout: 8000 }).toBe(600);
+    await coord.signal('requestSpend', { reqId: 'gate', taskId: grantee, scope: 'profA', amount: 500 });
+    await new Promise((r) => setTimeout(r, 1200));
+    const view = await budget();
+    expect(view.scopes.profA.spent).toBe(600); // NOT 1100
+    expect(view.pending.length).toBe(0);
+
+    await ping.signal('finish');
+    await ping.result();
+    await coord.terminate('done');
+  });
+
+  it('carries settled reqIds across a rotation, so dedupe survives continue-as-new', async () => {
+    const grantee = newId('task');
+    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
+    // The state a rotating coordinator hands to its successor. If `settled` is not
+    // part of that carried state the dedupe evaporates exactly when the singleton
+    // continue-as-news, and the redelivery lands on a fresh, forgetful instance.
+    const coord = await h.client.workflow.start('budgetCoordinator', {
+      taskQueue: TASK_QUEUE,
+      workflowId: newId('budget-coord'),
+      args: [{ state: { scopes: { profA: { cap: 5000, spent: 100 } }, defaultCap: 5000, threshold: 300,
+        pending: [], processed: 0, settled: ['carried'] } }],
+    });
+    const budget = () => coord.query('budget') as Promise<any>;
+    await expect.poll(async () => (await budget()).scopes.profA?.spent, { timeout: 8000 }).toBe(100);
+
+    await coord.signal('requestSpend', { reqId: 'carried', taskId: grantee, scope: 'profA', amount: 100 });
+    await new Promise((r) => setTimeout(r, 1200));
+    expect((await budget()).scopes.profA.spent).toBe(100); // NOT 200
+
+    await ping.signal('finish');
+    await ping.result();
+    await coord.terminate('done');
+  });
 });
 
 describe('PTY terminal check-in (SPEC §5.5)', () => {

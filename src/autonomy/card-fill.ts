@@ -21,8 +21,18 @@ export type CardFillSelectors = {
 } & Partial<Record<BillingField, string>>;
 
 /**
- * Fill a card inside a container/remote world's own loopback browser. Secrets
- * travel only in the provider process environment, never argv/stdout/stderr.
+ * Fill a card inside a container/remote world's own loopback browser.
+ *
+ * The card number, CVC, expiry and billing address travel on STDIN; only
+ * non-secret routing config (CDP endpoint, expected domain, field selectors) goes
+ * in the environment. The environment is NOT a safe channel for these:
+ *  - `ContainerWorld.exec` turns `opts.env` into `-e KEY=VALUE` argv entries for
+ *    `docker exec`, so the full PAN and CVC appeared in the HOST's process argv,
+ *    readable by any local user via `ps` / `/proc/<pid>/cmdline`;
+ *  - inside any world, a co-resident process (the agent itself, same uid) can read
+ *    `/proc/<pid>/environ` of the helper for its whole lifetime.
+ * This is the same stdin channel `world-fill.ts` uses for passwords, and the
+ * container/E2B/Daytona providers all implement `ExecOptions.input`.
  */
 export async function fillCardInWorld(world: World, args: {
   cdpUrl: string;
@@ -32,15 +42,17 @@ export async function fillCardInWorld(world: World, args: {
 }): Promise<{ origin: string }> {
   const result = await world.exec('node', ['-e', REMOTE_CARD_FILL], {
     timeoutMs: 30_000,
+    input: JSON.stringify({
+      number: args.details.number,
+      cvc: args.details.cvc,
+      month: String(args.details.expMonth).padStart(2, '0'),
+      year: String(args.details.expYear),
+      billing: args.details.billing ?? {},
+    }),
     env: {
       KARMAX_CARD_CDP: args.cdpUrl,
       KARMAX_CARD_DOMAIN: args.domain,
       KARMAX_CARD_SELECTORS: JSON.stringify(args.selectors),
-      KARMAX_CARD_NUMBER: args.details.number,
-      KARMAX_CARD_CVC: args.details.cvc,
-      KARMAX_CARD_MONTH: String(args.details.expMonth).padStart(2, '0'),
-      KARMAX_CARD_YEAR: String(args.details.expYear),
-      KARMAX_CARD_BILLING: JSON.stringify(args.details.billing ?? {}),
     },
   });
   if (result.code !== 0) throw new Error(`secure card fill failed in the task world: ${result.stderr.trim().slice(0, 500)}`);
@@ -55,6 +67,24 @@ export async function fillCardInWorld(world: World, args: {
 // browser tool already focused (including a cross-origin iframe); @tab advances
 // once before typing, which covers common hosted checkout field sequences.
 const REMOTE_CARD_FILL = String.raw`
+const card = await new Promise((resolve, reject) => {
+  let buf = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', d => { buf += d; });
+  process.stdin.on('end', () => resolve(buf));
+  process.stdin.on('error', reject);
+}).then(text => {
+  // NEVER let a raw JSON parse error escape this process. V8 quotes a fragment of
+  // the offending input in SyntaxError.message ("Unexpected token 'b',
+  // \"ber\":\"4242\"... is not valid JSON") and prints the whole offending source
+  // besides — and fillCardInWorld splices this process's stderr into the error it
+  // throws, which karmax logs and shows in the UI. Stdin can arrive truncated or
+  // partial (E2B streams sendStdin, Daytona uploads a file), so that fragment is
+  // real PAN/CVC digits. The replacement message is fixed and input-independent.
+  try { return JSON.parse(text || '{}'); }
+  catch { throw new Error('card details on stdin were not valid JSON'); }
+});
+if (!card.number || !card.cvc) throw new Error('card details were not delivered on stdin');
 const cdp = new URL(process.env.KARMAX_CARD_CDP);
 if (cdp.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(cdp.hostname))
   throw new Error('CDP endpoint must be loopback inside the task world');
@@ -105,14 +135,14 @@ const focus = async selector => {
   if (result?.result?.value !== true) throw new Error('checkout field selector did not match');
 };
 const type = async (selector, text) => { await focus(selector); await call('Input.insertText', { text }); };
-await type(selectors.number, process.env.KARMAX_CARD_NUMBER);
-if (selectors.expiry) await type(selectors.expiry, process.env.KARMAX_CARD_MONTH + '/' + process.env.KARMAX_CARD_YEAR.slice(-2));
+await type(selectors.number, card.number);
+if (selectors.expiry) await type(selectors.expiry, card.month + '/' + card.year.slice(-2));
 else {
-  await type(selectors.expMonth, process.env.KARMAX_CARD_MONTH);
-  await type(selectors.expYear, process.env.KARMAX_CARD_YEAR);
+  await type(selectors.expMonth, card.month);
+  await type(selectors.expYear, card.year);
 }
-await type(selectors.cvc, process.env.KARMAX_CARD_CVC);
-const billing = JSON.parse(process.env.KARMAX_CARD_BILLING || '{}');
+await type(selectors.cvc, card.cvc);
+const billing = card.billing || {};
 for (const field of ['line1', 'city', 'postalCode', 'country'])
   if (selectors[field] && billing[field]) await type(selectors[field], billing[field]);
 ws.close();

@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
 import { spawn, ChildProcess } from 'node:child_process';
-import { trackProcess, trackedProcesses, sampleProcesses, killTracked } from '../src/util/processes.js';
+import { trackProcess, trackedProcesses, sampleProcesses, killTracked, processStartTick } from '../src/util/processes.js';
 
 // The sampler/killer read Linux procfs; on other platforms they degrade to
 // `supported: false`, which the first test pins down and the rest then skip.
@@ -143,5 +143,23 @@ describe('process registry + /proc sampler (dashboard task manager)', () => {
     } catch {
       expect.unreachable('protected process was killed');
     }
+  });
+
+  itProc('records a start tick so a recycled pid cannot be killed as ours', async () => {
+    const child = sleeper();
+    const pid = child.pid!;
+    untracks.push(trackProcess({ pid, kind: 'agent', label: 'agent', startedAt: Date.now() }));
+    expect(trackedProcesses().find((p) => p.pid === pid)?.startTick).toBe(processStartTick(pid));
+
+    // Simulate pid reuse: the registered process is gone and an unrelated one now
+    // holds that number. Killing it would SIGKILL a stranger — and for a group
+    // leader, the stranger's entire process group.
+    const entry = trackedProcesses().find((p) => p.pid === pid)!;
+    (entry as any).startTick = String(Number(entry.startTick) + 12345);
+    const result = await killTracked(pid, 'SIGTERM');
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('recycled') });
+    // The stale entry is dropped rather than left mislabelling a live stranger.
+    expect(trackedProcesses().some((p) => p.pid === pid)).toBe(false);
+    expect(await waitGone(pid, 300)).toBe(false); // still alive: we did not kill it
   });
 });

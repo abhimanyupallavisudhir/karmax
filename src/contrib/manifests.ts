@@ -352,7 +352,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.9.0',
+    version: '1.10.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -413,7 +413,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.3.0',
+    version: '1.4.0',
     description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
     selectable: false,
     requires: [],
@@ -456,7 +456,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.9.0',
+    version: '1.10.0',
     description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -470,7 +470,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'merge-only',
-    version: '1.5.0',
+    version: '1.6.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],

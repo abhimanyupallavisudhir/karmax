@@ -2,6 +2,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 import { httpOps } from '../src/platform/mcp.js';
+import { MANIFESTS } from '../src/contrib/manifests.js';
+// Derived, not hard-coded: the pinned type moves every time a workflow ships a
+// new replay version, and a literal here just makes an unrelated PR red.
+const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
 
 describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
   let h: Harness;
@@ -79,7 +83,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(h.store.getTask(task.id)).toMatchObject({
       workflow: 'goal',
       executionWorkflow: 'software-dev',
-      workflowVersion: '1.9.0',
+      workflowVersion: bundledVersion('software-dev'),
     });
   });
 

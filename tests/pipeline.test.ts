@@ -1026,7 +1026,12 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       // The agent did its work but ended the turn WITHOUT signalling completion, leaving a
       // backgrounded shell (e.g. `npm test`) running — the exact task-130 shape. It must NOT
       // fall straight through to Review: held in Do (waitingFor 'shell') until the shell drains.
-      args: [input({ taskId, repo, title: 'Shells', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@shells 2\n@incomplete', subagentWaitMs: 1500 })],
+      //
+      // `subagentWaitMs` sets how long the hold lasts (2 shells drain one per turn). It is
+      // deliberately generous: the assertion below polls for a TRANSIENT state, and on a
+      // loaded host the first query can land seconds after the workflow starts. A short hold
+      // let the window close before the first sample and the test flaked as `review/human`.
+      args: [input({ taskId, repo, title: 'Shells', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@shells 2\n@incomplete', subagentWaitMs: 5000 })],
     });
 
     await expect

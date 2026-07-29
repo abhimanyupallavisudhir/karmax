@@ -56,6 +56,114 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('an out-of-order return retires the returning task’s lease, not the oldest one', async () => {
+    // Two concurrent turns on ONE credential. Task A grants first, B second.
+    const coord = await startCoord([A({ id: 'A', maxConcurrent: 2 })]);
+    const gA = await grantee();
+    const gB = await grantee();
+    const leases = (taskId: string) =>
+      coord.query('accountTaskLeases', taskId) as Promise<string[]>;
+    await coord.signal('leaseAccount', { taskId: gA.id, turnId: 'ta', provider: 'claude' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+    await coord.signal('leaseAccount', { taskId: gB.id, turnId: 'tb', provider: 'claude' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(2);
+
+    // B finishes FIRST and returns. The ledger used to drop the OLDEST record for the
+    // credential — A's — because the signal carried no lease identity. `inUse` stayed
+    // right, but attribution inverted: the surviving lease was credited to B.
+    await coord.signal('returnAccount', { accountId: 'A', taskId: gB.id, turnId: 'tb' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+
+    // The decisive assertion. `sweepDeadLeases` reclaims by `lease.taskId`, so a
+    // ledger that credits A's live lease to B means: once B's workflow ends the sweep
+    // frees a credential A is still using (real over-subscription of a login, which is
+    // what trips provider rate-limit lockouts), while `stopTaskActivity` — which reads
+    // exactly this query — cancels the wrong task's turn.
+    expect(await leases(gA.id)).toEqual(['ta']);
+    expect(await leases(gB.id)).toEqual([]);
+
+    await gA.h.signal('finish'); await gB.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  // Signals are applied in order, so once a freshly-registered marker credential is
+  // visible every signal sent before the register has already run. Cheaper and far
+  // more reliable than polling on the value under test (which passes transiently
+  // while the second, buggy decrement is still in flight).
+  const barrier = async (coord: any, extra: any[] = []) => {
+    await coord.signal('registerAccounts', {
+      accounts: [...extra, { id: 'ZZ', configHome: '/tmp/ZZ', provider: 'claude', maxConcurrent: 1 }],
+    });
+    await expect.poll(async () => !!(await acct('ZZ')), { timeout: 10_000 }).toBe(true);
+  };
+  const twoLeases = async () => {
+    // Two concurrent turns on ONE credential (cap 2): A grants first, B second.
+    const coord = await startCoord([A({ id: 'A', maxConcurrent: 2 })]);
+    const gA = await grantee();
+    const gB = await grantee();
+    await coord.signal('leaseAccount', { taskId: gA.id, turnId: 'ta', provider: 'claude' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+    await coord.signal('leaseAccount', { taskId: gB.id, turnId: 'tb', provider: 'claude' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(2);
+    const leases = (taskId: string) => coord.query('accountTaskLeases', taskId) as Promise<string[]>;
+    return { coord, gA, gB, leases };
+  };
+
+  it('a DUPLICATE returnAccount does not double-decrement inUse (over-subscription)', async () => {
+    const { coord, gA, gB, leases } = await twoLeases();
+
+    // B returns twice: an activity retry whose signal landed the first time, or the
+    // workflow's `finally` racing a resend. The ledger lookup below correctly refuses
+    // to evict someone else's record the second time — but `inUse` was decremented
+    // unconditionally *before* that lookup, so capacity came back twice.
+    await coord.signal('returnAccount', { accountId: 'A', taskId: gB.id, turnId: 'tb' });
+    await coord.signal('returnAccount', { accountId: 'A', taskId: gB.id, turnId: 'tb' });
+    await barrier(coord, [{ id: 'A', configHome: '/tmp/A', provider: 'claude', maxConcurrent: 2 }]);
+
+    // A is still actively using the credential, so exactly one slot is owed. Dropping
+    // to 0 hands the login out beyond `maxConcurrent` — the mirror image of the leak
+    // the granted-lease ledger exists to close, and what trips provider lockouts.
+    expect((await acct('A')).inUse).toBe(1);
+    expect(await leases(gA.id)).toEqual(['ta']);
+    expect(await leases(gB.id)).toEqual([]);
+
+    await gA.h.signal('finish'); await gB.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  it('a cancel that reclaims a GRANTED lease is not refunded again by a late return', async () => {
+    const { coord, gA, gB, leases } = await twoLeases();
+
+    // `stopTaskActivity` cancels B's granted lease (terminated workflows never run
+    // their `finally`), and an already-scheduled returnAccount activity lands after.
+    await coord.signal('cancelAccountLease', { taskId: gB.id, turnId: 'tb' });
+    await coord.signal('returnAccount', { accountId: 'A', taskId: gB.id, turnId: 'tb' });
+    await barrier(coord, [{ id: 'A', configHome: '/tmp/A', provider: 'claude', maxConcurrent: 2 }]);
+
+    expect((await acct('A')).inUse).toBe(1); // only B's slot came back
+    expect(await leases(gA.id)).toEqual(['ta']);
+    expect(await leases(gB.id)).toEqual([]);
+
+    await gA.h.signal('finish'); await gB.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  it('still frees capacity for an identity-less (legacy) returnAccount payload', async () => {
+    // Older task-workflow versions send `{ accountId }` with no lease identity; the
+    // oldest-record fallback stays the only option for them and must still release.
+    const coord = await startCoord([A({ id: 'A' })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', provider: 'claude' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+
+    await coord.signal('returnAccount', { accountId: 'A' });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(0);
+    expect(await (coord.query('accountTaskLeases', g.id) as Promise<string[]>)).toEqual([]);
+
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
   it('on exhaustion, re-leasing picks a DIFFERENT available login of the same provider', async () => {
     const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', configHome: '/tmp/B' })]);
     const g1 = await grantee();

@@ -278,7 +278,9 @@ export function createAgentTurnLeaser(
         }
         throw err;
       } finally {
-        if (grant && !passthrough) await coord.returnAccount(grant.accountId).catch(() => undefined);
+        // Name the lease — see the matching note in software-dev.ts.
+        if (grant && !passthrough)
+          await coord.returnAccount(grant.accountId, { taskId: host.taskId, turnId }).catch(() => undefined);
       }
     },
   };

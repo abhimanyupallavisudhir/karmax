@@ -1,9 +1,23 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
-import { taskStatus } from '../domain/search.js';
 import { PLATFORM_API_CATALOG } from './catalog.js';
-import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import {
+  AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
+  PRIORITY_NAMES, compactSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
+  platformRequestPathError,
+  type CompactTask,
+} from './platform-request.js';
+
+// Re-exported so the platform MCP module stays the one place a reader looks for
+// the agent-facing contract; `src/agent/tools.ts` imports the same definitions
+// from the leaf module (see platform-request.ts for why it cannot import here).
+export {
+  AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
+  PRIORITY_NAMES, compactSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
+  platformRequestPathError,
+  type CompactTask,
+};
 
 /**
  * The platform MCP server (SPEC §3.4) — the single API agents use to act on the
@@ -14,7 +28,15 @@ import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
  * gateway over HTTP (a CLI agent reading its config home's mcpServers).
  */
 export interface PlatformOps {
-  createTask(a: { projectId: string; title: string; prompt: string; workflow?: string; wikiContext?: string[] }): Promise<{ id: string }>;
+  createTask(a: { projectId: string; title: string; prompt: string; workflow?: string; wikiContext?: string[];
+    /** Save on the list without starting it (SPEC §10.4 drafts). */
+    draft?: boolean;
+    /** Ordinal priority, index into PRIORITY_NAMES. */
+    priority?: number;
+    /** Tag names or `a/b` paths, created on demand (same rules as tag_task). */
+    tags?: string[];
+    /** Full task-form field values, including trigger definitions. */
+    params?: Record<string, unknown> }): Promise<{ id: string }>;
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
@@ -48,73 +70,24 @@ export interface PlatformOps {
   platformRequest(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<unknown>;
 }
 
-/** The compact task projection agents get back from search (ids + the human-facing bits). */
-export interface CompactTask {
-  num?: number;
-  id: string;
-  title: string;
-  workflow: string;
-  status: string;
-  stage?: string;
-  priority: number;
-  draft: boolean;
-  tags: string[];
-}
-
-/** Ordinal priority names (index = stored value); shared so agents can pass a level name. */
-export const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'] as const;
-
-// ─── shared projections (tag id → `a/b/c` path; full record → compact) ─────────
-function tagPathOf(id: string, byId: Map<string, any>): string {
-  const parts: string[] = [];
-  const seen = new Set<string>();
-  let cur = byId.get(id);
-  while (cur && !seen.has(cur.id)) { seen.add(cur.id); parts.unshift(cur.name); cur = cur.parentId ? byId.get(cur.parentId) : undefined; }
-  return parts.join('/') || id;
-}
-function tagsById(tags: any[]): Map<string, any> {
-  return new Map((tags ?? []).map((t) => [t.id, t]));
-}
-function compactSearch(result: any, tags: any[]): { total: number; tasks: CompactTask[] } {
-  const byId = tagsById(tags);
-  const one = (t: any): CompactTask => ({
-    num: t.num,
-    id: t.id,
-    title: t.title,
-    workflow: t.workflow,
-    status: t.lastView?.status ?? (t.params?.draft ? 'draft' : taskStatus(t)),
-    stage: t.lastView?.stage,
-    priority: Number(t.params?.priority ?? 0),
-    draft: !!t.params?.draft,
-    tags: (t.tags ?? []).map((id: string) => tagPathOf(id, byId)),
-  });
-  return { total: result?.total ?? 0, tasks: (result?.tasks ?? []).map(one) };
-}
-function compactTags(tags: any[]): { path: string; kind?: string; description?: string }[] {
-  const byId = tagsById(tags);
-  return (tags ?? [])
-    .map((t) => ({ path: tagPathOf(t.id, byId), kind: t.kind, description: t.description }))
-    .sort((a, b) => a.path.localeCompare(b.path));
-}
-
 /**
- * Accept a `platform_request` body as either a structured value or a JSON string.
- * The string form is the escape hatch for clients that cannot express a free-form
- * object; a string that is not valid JSON is forwarded verbatim, so an endpoint
- * genuinely expecting a JSON string still receives one.
+ * A gateway response that was not 2xx, carrying the status so the agent-facing
+ * error can say *why* (403 escalate, 404 retry with another id, 5xx back off).
  */
-export function normalizeRequestBody(body: unknown): unknown {
-  if (typeof body !== 'string') return body;
-  try {
-    return JSON.parse(body);
-  } catch {
-    return body;
+export class PlatformHttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = 'PlatformHttpError';
   }
 }
 
 /** In-process ops backed by KarmaxApi + the agent's scoped token (worker side). */
 export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
   return {
+    // `priority`/`tags` go through `createTask` itself rather than as follow-up
+    // edits: the follow-ups needed `task:edit`, which the bundled Do role does
+    // not hold, so a tagged create half-succeeded and then reported a permission
+    // error for a task that already existed.
     createTask: (a) => api.createTask(getToken(), a),
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
     listTasks: async (pid) => (await api.listTasks(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
@@ -166,9 +139,12 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
 export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>)): PlatformOps {
   const resolve = typeof token === 'string' ? async () => token : token;
   let cached: string | undefined = typeof token === 'string' ? token : undefined;
-  const req = async (path: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
-    if (!path.startsWith('/api/') || path.startsWith('/api/login') || path.startsWith('/api/setup') || path.startsWith('/api/signup') || path.startsWith('/api/session'))
-      throw new Error('platform path must be an authenticated /api/* endpoint');
+  const req = async (rawPath: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
+    const rejected = platformRequestPathError(rawPath);
+    if (rejected) throw new Error(rejected);
+    // Dispatch exactly what was screened, never the raw string — see
+    // `normalizePlatformPath` for the traversal this closes.
+    const path = normalizePlatformPath(rawPath);
     if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
@@ -181,11 +157,21 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       if (cached) return req(path, init, false);
     }
     const body = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text();
-    if (!res.ok) throw new Error((body as any)?.error || `HTTP ${res.status}`);
+    // Keep the HTTP status: an agent needs to tell 403 (escalate / ask for a
+    // capability) from 404 (wrong id — retry with a different one) from 5xx
+    // (transient — back off). Flattening everything to the message alone made
+    // every failure look the same.
+    if (!res.ok) throw new PlatformHttpError(res.status, (body as any)?.error || `HTTP ${res.status}`);
     return body;
   };
   return {
-    createTask: (a) => req(`/api/projects/${a.projectId}/tasks`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
+    createTask: async (a) => {
+      const { priority, tags, ...create } = a;
+      const task = await req(`/api/projects/${a.projectId}/tasks`, { method: 'POST', body: JSON.stringify(create) }) as { id: string };
+      if (priority) await req(`/api/tasks/${task.id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) });
+      if (tags?.length) await req(`/api/tasks/${task.id}/tag`, { method: 'POST', body: JSON.stringify({ add: tags }) });
+      return task;
+    },
     getTask: (id) => req(`/api/tasks/${id}`),
     listTasks: (pid) => req(`/api/projects/${pid}/tasks`) as Promise<{ id: string; title: string; workflow: string }[]>,
     searchTasks: async (pid, query) => {
@@ -239,7 +225,16 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       const r = await fn();
       return ok(typeof r === 'string' ? r : JSON.stringify(r));
     } catch (e) {
-      const msg = e instanceof CapabilityError ? `permission denied: ${e.message}` : `error: ${String((e as Error).message ?? e)}`;
+      // Preserve the distinction the agent has to act on: denied (fix the
+      // authorization), not found (fix the identifier), or a server fault (retry).
+      // The status may come from the gateway (PlatformHttpError) or from an
+      // in-process platform error that declares its own (CapabilityError,
+      // NotFoundError, ValidationError) — both surfaces must read alike.
+      const status = e instanceof PlatformHttpError ? e.status
+        : typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
+      const msg = e instanceof CapabilityError || status === 403
+        ? `permission denied: ${(e as Error).message}`
+        : `error${status ? ` (HTTP ${status})` : ''}: ${String((e as Error).message ?? e)}`;
       return { content: [{ type: 'text' as const, text: msg }], isError: true };
     }
   };
@@ -248,10 +243,22 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'create_task',
     {
       description:
-        'Create a new task on a project task list. To inline wiki context into the new task, pass wikiContext: an array of `@proj:…`/`@org:…` tokens — a page (@proj:guides/deploy), a whole label (@proj:tag:security), or a folder (@proj:runbooks/*). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
-      inputSchema: { projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional(), wikiContext: z.array(z.string()).optional() },
+        'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
+        + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
+        + '`tags` accepts names or `a/b` paths and creates missing ones. '
+        + 'To inline wiki context into the new task, pass wikiContext: an array of `@proj:…`/`@org:…` tokens — a page (@proj:guides/deploy), a whole label (@proj:tag:security), or a folder (@proj:runbooks/*). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
+      inputSchema: {
+        projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional(),
+        wikiContext: z.array(z.string()).optional(),
+        draft: z.boolean().optional(),
+        priority: z.enum(PRIORITY_NAMES).optional(),
+        tags: z.array(z.string()).optional(),
+        params: z.record(z.string(), z.unknown()).optional(),
+      },
     },
-    async (a) => wrap(async () => (await ops.createTask(a)).id),
+    async (a) => wrap(async () => (await ops.createTask({
+      ...a, priority: a.priority ? PRIORITY_NAMES.indexOf(a.priority) : undefined,
+    })).id),
   );
   server.registerTool(
     'list_world_providers',
@@ -298,29 +305,64 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
-    async (a) => wrap(() => {
+    async (a) => wrap(async () => {
       const policy: Record<string, unknown> = {};
       if (a.worldProvider !== undefined) policy.worldProvider = a.worldProvider;
       if (a.runnerPoolId !== undefined) policy.runnerPoolId = a.runnerPoolId;
       if (a.environmentFlavor !== undefined) policy.environment = { flavor: a.environmentFlavor };
-      if (a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined)
-        policy.resources = { cpu: a.cpu, memoryMb: a.memoryMb, gpu: a.gpu };
-      if (a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined)
-        policy.network = { unrestricted: a.unrestrictedInternet ?? false, allowDomains: a.allowDomains, allowCidrs: a.allowCidrs };
       if (a.monthlyBudgetUsd !== undefined) policy.monthlyBudgetMicros = a.monthlyBudgetUsd == null ? null : Math.round(a.monthlyBudgetUsd * 1e6);
       if (a.hibernateAfterDays !== undefined) policy.hibernateAfterMs = a.hibernateAfterDays == null ? null : Math.round(a.hibernateAfterDays * 86_400_000);
+
+      // `network` is REPLACED wholesale by the store and `resources` is merged by
+      // spread (so an explicit `undefined` erases the stored value). This tool
+      // advertises *sparse* updates, so a partial change has to be merged against
+      // the policy currently in force: otherwise `{allowDomains}` alone silently
+      // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
+      // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
+      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined;
+      const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
+      if (wantsResources || wantsNetwork) {
+        // Either `{organization, override?, effective?}` or a bare policy — see below.
+        const current = await ops.getExecutionPolicy(a.organizationId, a.projectId).catch(() => undefined) as
+          Record<string, any> | undefined;
+        // A project call edits its own sparse override, never the org defaults.
+        // The org read comes back in one of TWO shapes and both must work:
+        // `apiOps` (and the gateway's project route) wrap it as `{organization}`,
+        // but the gateway's org route — GET /api/organizations/:id/execution-policy
+        // in src/gateway/server.ts — returns the BARE policy object. Reading only
+        // `.organization` made the base `{}` on `httpOps`, which is the only
+        // production wiring (src/mcp/stdio.ts): the merge then silently discarded
+        // the policy in force, so an org-scoped `{allowDomains}` cleared
+        // `unrestricted` and dropped `allowCidrs` (the store replaces `network`
+        // wholesale) — exactly what the sparse merge exists to prevent.
+        const base = (a.projectId ? current?.override : (current?.organization ?? current)) ?? {};
+        if (wantsResources) {
+          const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
+          if (a.cpu !== undefined) resources.cpu = a.cpu;
+          if (a.memoryMb !== undefined) resources.memoryMb = a.memoryMb;
+          if (a.gpu !== undefined) resources.gpu = a.gpu;
+          policy.resources = resources;
+        }
+        if (wantsNetwork) {
+          const network: Record<string, unknown> = { ...(base.network ?? {}) };
+          if (a.unrestrictedInternet !== undefined) network.unrestricted = a.unrestrictedInternet;
+          if (a.allowDomains !== undefined) network.allowDomains = a.allowDomains;
+          if (a.allowCidrs !== undefined) network.allowCidrs = a.allowCidrs;
+          policy.network = network;
+        }
+      }
       return ops.setExecutionPolicy({ organizationId: a.organizationId, projectId: a.projectId, policy });
     }),
   );
   server.registerTool(
     'find_task',
-    { description: 'Find a task by its project and human-facing project-local number (for example projectId + #100).', inputSchema: { projectId: z.string(), number: z.number().int().positive() } },
+    { description: 'Resolve a human-facing project-local task number (for example projectId + #100) to its canonical id. Returns a pointer `{id, num, projectId}` — pass that id to get_task for the task itself.', inputSchema: { projectId: z.string(), number: z.number().int().positive() } },
     async (a) => wrap(() => ops.findTask(a.projectId, a.number)),
   );
   server.registerTool('list_agents', { description: 'Discover every agent role/session attached to a task and its conversation size.', inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.listAgents(a.taskId)));
   server.registerTool(
     'get_conversation',
-    { description: 'Read the durable message history for one agent attached to a task (do, merge, resolve, or confirm).', inputSchema: { taskId: z.string(), role: z.string().default('do') } },
+    { description: `Read the durable message history for one agent attached to a task (${AGENT_ROLE_NAMES.join(', ')}). Call list_agents first to see which roles this task actually has.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do') } },
     async (a) => wrap(() => ops.getConversation(a.taskId, a.role)),
   );
   server.registerTool(
@@ -333,7 +375,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool(
     'message_agent',
-    { description: 'Send a follow-up into an attached agent conversation. This works for original or forked tasks and is delivered live when that agent is running.', inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string() } },
+    { description: `Send a follow-up into an attached agent conversation (${AGENT_ROLE_NAMES.join(', ')}). This works for original or forked tasks and is delivered live when that agent is running.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do'), message: z.string() } },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
   );
   server.registerTool(
@@ -408,9 +450,19 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Read your organization\'s agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Completes "check your email for a code / link" steps: returns the address to register with plus recent messages with any verification code and link already extracted. Mailboxes are per organization; you can only read your own.',
-      inputSchema: { organizationId: z.string(), match: z.string().optional(), since: z.number().optional() },
+      inputSchema: { organizationId: z.string(), match: z.string().optional(),
+        since: z.number().optional(), limit: z.number().int().positive().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${a.match || a.since ? `?${new URLSearchParams({ ...(a.match ? { match: a.match } : {}), ...(a.since ? { since: String(a.since) } : {}) })}` : ''}`)),
+    async (a) => wrap(() => {
+      // `since` and `limit` are compared against undefined, not truthiness:
+      // `since: 0` ("everything since the epoch") is a legitimate value that a
+      // truthiness test silently dropped.
+      const q = new URLSearchParams();
+      if (a.match !== undefined) q.set('match', a.match);
+      if (a.since !== undefined) q.set('since', String(a.since));
+      if (a.limit !== undefined) q.set('limit', String(a.limit));
+      return ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${q.toString() ? `?${q}` : ''}`);
+    }),
   );
   server.registerTool(
     'enroll_passkey',
@@ -446,23 +498,28 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'platform_request',
     {
-      description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization.',
-      // `body` must describe a concrete shape. Declared as `z.unknown()` it serialized
-      // to an *empty* JSON Schema (`{}`), and clients dropped the argument before it
-      // ever reached the gateway — every write silently became a no-op against an
-      // empty body (a POST reached createTag as `{}` and threw on `name.trim()`).
-      // The string arm is a deliberate escape hatch for clients that cannot express
-      // a free-form object; it is parsed as JSON below.
+      description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization, and routes the gateway answers before its session gate (sign-in/sign-up, webhooks, OAuth callbacks) are refused.',
+      // See PLATFORM_REQUEST_BODY_SCHEMA for why `body` must declare a concrete
+      // shape; the zod union below is its zod twin (both are asserted equivalent
+      // in tests/platform-surface.test.ts).
       inputSchema: {
         method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
         path: z.string().startsWith('/api/'),
         body: z.union([z.record(z.string(), z.unknown()), z.array(z.unknown()), z.string()]).optional(),
       },
     },
-    async (a) => wrap(() => ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body))),
+    async (a) => wrap(() => {
+      // Enforced at the tool boundary as well as inside httpOps, so the refusal
+      // is identical whichever ops implementation is wired underneath.
+      const rejected = platformRequestPathError(a.path);
+      if (rejected) throw new Error(rejected);
+      return ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body));
+    }),
   );
   server.registerTool('get_task', { description: "Get a task's current view-model.", inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.getTask(a.taskId)));
-  server.registerTool('list_tasks', { description: 'List tasks in a project.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));
+  // Kept for compatibility, but strictly dominated by search_tasks (which returns
+  // status/stage/priority/tags and accepts a query). Point callers there.
+  server.registerTool('list_tasks', { description: 'List every task in a project as bare {id, title, workflow}. Prefer search_tasks — it takes a query, and its result carries num/status/stage/priority/tags. Pass an empty query for the same "everything" listing.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));
   server.registerTool(
     'search_tasks',
     {
@@ -500,18 +557,21 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'signal_task',
     {
-      description: `Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, \`role\` optionally addresses the ${RESOLVE_AGENT_ENABLED ? 'Do, Merge, or Resolve' : 'Do or Merge'} agent; it defaults to the Do agent.`,
+      description: `Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, \`role\` optionally addresses one of the task's attached agents (${AGENT_ROLE_NAMES.join(', ')}); it defaults to the Do agent.`,
       inputSchema: {
         taskId: z.string(),
         signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']),
         text: z.string().optional(),
-        role: z.enum(RESOLVE_AGENT_ENABLED ? ['do', 'merge', 'resolve'] : ['do', 'merge']).optional(),
+        role: z.enum(AGENT_ROLE_NAMES).optional(),
       },
     },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role); return 'signalled'; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
-  server.registerTool('save_skill', { description: 'Save a reusable skill (markdown) for future tasks.', inputSchema: { name: z.string(), content: z.string() } }, async (a) => wrap(() => ops.saveSkill(a)));
+  server.registerTool('save_skill', {
+    description: 'Save a reusable skill (markdown) for future tasks. This writes INSTALLATION-WIDE global state — the skill is visible to every project and organization on this karmax, and saving the same name overwrites it. For content that belongs to one organization or project, write a wiki page instead (platform_request PUT /api/{organizations|projects}/:id/wiki/page).',
+    inputSchema: { name: z.string(), content: z.string() },
+  }, async (a) => wrap(() => ops.saveSkill(a)));
   server.registerTool(
     'read_wiki',
     {

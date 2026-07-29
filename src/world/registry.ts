@@ -46,6 +46,12 @@ export class WorldRegistry {
       parkable: provider.parkable, capabilities: provider.capabilities }));
   }
 
+  /** Providers that can enumerate the sandboxes this deployment owns, for the
+   *  lifecycle sweep's orphan reaper (`WorldLifecycleManager.sweep`). */
+  enumerable(): WorldProvider[] {
+    return [...this.providers.values()].filter((provider) => typeof provider.listSandboxes === 'function');
+  }
+
   async create(kind: WorldKind, spec: WorldSpec): Promise<World> {
     return this.get(kind).create(spec);
   }

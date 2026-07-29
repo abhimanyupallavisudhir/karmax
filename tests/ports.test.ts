@@ -105,4 +105,17 @@ describe('dynamic port allocation', () => {
       await close(held);
     }
   });
+
+  it('findFreePort closes its server on the error path (no leaked handle)', async () => {
+    // `srv.unref()` stops the socket holding the event loop open; it does NOT
+    // release the handle. The `error` path used to reject and walk away, leaking
+    // one server per failed attempt.
+    const before = (process as any)._getActiveHandles?.().length ?? 0;
+    for (let i = 0; i < 5; i++) {
+      await expect(findFreePort('192.0.2.1')).rejects.toBeTruthy(); // TEST-NET-1: unbindable
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    const after = (process as any)._getActiveHandles?.().length ?? 0;
+    expect(after).toBeLessThanOrEqual(before + 1);
+  });
 });

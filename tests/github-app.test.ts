@@ -357,3 +357,239 @@ describe('GitHub App integration', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('GitHub App failure and suspension handling', () => {
+  const rsa = () => crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+    privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } }).privateKey;
+
+  const harness = (fetcher: (url: URL, init: RequestInit) => Promise<Response>) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-fail-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa());
+    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret');
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const service = new GitHubAppService(store, broker, { appId: '123', appSlug: 'karmax-test',
+      fetch: ((input: any, init: RequestInit = {}) => fetcher(new URL(String(input)), init)) as typeof fetch,
+      sleep: async () => {}, // do not actually wait out the 5xx backoff
+      keyPair: async () => ({ privateKey: 'PRIVATE', publicKey: 'ssh-ed25519 PUBLIC karmax' }) });
+    const deliver = (event: string, id: string, body: unknown) => {
+      const raw = Buffer.from(JSON.stringify(body));
+      return service.handleWebhook(event, id, raw,
+        `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
+    };
+    return { dir, store, broker, organization, service, deliver };
+  };
+
+  it('releases the delivery claim when the reconcile fails, so a redelivery is not discarded', async () => {
+    let failing = true;
+    const h = harness(async (url) => {
+      if (url.pathname === '/app/installations/42') return Response.json({ id: 42, account: { login: 'acme', type: 'Organization' } });
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories')
+        return failing ? new Response('boom', { status: 500 }) : Response.json({ repositories: [] });
+      return new Response('not found', { status: 404 });
+    });
+    h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+
+    const body = { installation: { id: 42 }, action: 'added' };
+    // The claim used to be permanent: the exception became a gateway error, GitHub
+    // redelivered, and the redelivery short-circuited as a duplicate — losing the
+    // reconcile forever.
+    await expect(h.deliver('installation_repositories', 'd-1', body)).rejects.toThrow(/500/);
+    failing = false;
+    const retry = await h.deliver('installation_repositories', 'd-1', body);
+    expect(retry).toMatchObject({ accepted: true, reconciled: 0 });
+    // A successful delivery IS still deduped.
+    expect(await h.deliver('installation_repositories', 'd-1', body)).toMatchObject({ accepted: false });
+    h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  it('un-suspends an installation on the unsuspend webhook', async () => {
+    const h = harness(async (url) => {
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories') return Response.json({ repositories: [] });
+      return new Response('not found', { status: 404 });
+    });
+    const connection = h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    await h.deliver('installation', 'd-suspend', { installation: { id: 42 }, action: 'suspend' });
+    expect(h.store.getGitConnection(connection.id)!.suspendedAt).toBeTruthy();
+    // Before the fix this fell through to reconcile() → installationToken() →
+    // "installation is suspended", and nothing but a browser reinstall cleared it.
+    const resumed = await h.deliver('installation', 'd-unsuspend', { installation: { id: 42 }, action: 'unsuspend' });
+    expect(resumed).toMatchObject({ accepted: true });
+    expect(h.store.getGitConnection(connection.id)!.suspendedAt).toBeUndefined();
+    h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  it('can still delete an organization whose installation is suspended', async () => {
+    const h = harness(async () => new Response('not found', { status: 404 }));
+    const connection = h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization', suspendedAt: Date.now() });
+    const repository = h.store.upsertRepository({ organizationId: h.organization.id, provider: 'github',
+      providerId: '7', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.broker.registerHandle(`repokey:${repository.id}:clone`, 'CLONE');
+    h.broker.registerHandle(`repokey:${repository.id}:write`, 'WRITE');
+    h.store.setRepositoryDeployKeys({ repositoryId: repository.id, cloneKeyId: '1', writeKeyId: '2',
+      cloneHandle: `repokey:${repository.id}:clone`, writeHandle: `repokey:${repository.id}:write` });
+
+    // installationToken() refuses to mint for a suspended installation, so minting
+    // unconditionally made every retry of the org delete fail identically.
+    await expect(h.service.disconnectOrganization(h.organization.id)).resolves.toBeUndefined();
+    expect(h.broker.hasHandle(`repokey:${repository.id}:clone`)).toBe(false);
+    expect(h.broker.hasHandle(`repokey:${repository.id}:write`)).toBe(false);
+    h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  it('honours retry-after and retries 5xx, but never retries a plain 403', async () => {
+    const seen: string[] = [];
+    const waits: number[] = [];
+    let attempt = 0;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-retry-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa());
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const service = new GitHubAppService(store, broker, { appId: '123',
+      sleep: async (ms) => { waits.push(ms); },
+      fetch: (async (input: any) => {
+        const url = new URL(String(input));
+        seen.push(url.pathname);
+        if (url.pathname === '/app/installations/42/access_tokens')
+          return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+        if (url.pathname === '/installation/repositories') {
+          attempt++;
+          // Secondary rate limit, then a transient 5xx, then success.
+          if (attempt === 1) return new Response('slow down', { status: 429, headers: { 'retry-after': '2' } });
+          if (attempt === 2) return new Response('bad gateway', { status: 502 });
+          return Response.json({ repositories: [] });
+        }
+        if (url.pathname === '/installation/repositories/forbidden') return new Response('forbidden', { status: 403 });
+        return new Response('not found', { status: 404 });
+      }) as typeof fetch });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'User' });
+
+    await expect(service.reconcile(connection)).resolves.toEqual([]);
+    expect(waits).toEqual([2000, 2000]); // retry-after honoured, then 5xx backoff
+    // A 403 with NO rate-limit headers is a permissions error, not a limit —
+    // surfaced at once, with no retries and no extra sleeps.
+    const waitsBefore = waits.length;
+    await expect((service as any).request('/installation/repositories/forbidden', 't')).rejects.toThrow(/403/);
+    expect(seen.filter((p) => p === '/installation/repositories/forbidden')).toHaveLength(1);
+    expect(waits).toHaveLength(waitsBefore);
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('never retries a non-idempotent write, so a 5xx cannot duplicate a deploy key', async () => {
+    const creates: string[] = [];
+    let deleteAttempts = 0;
+    const h = harness(async (url, init) => {
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories')
+        return Response.json({ repositories: [{ id: 8, name: 'app', private: true,
+          ssh_url: 'git@github.com:acme/app.git', default_branch: 'main', owner: { login: 'acme' } }] });
+      if (url.pathname === '/repos/acme/app/keys' && init.method === 'POST') {
+        // The dangerous shape: GitHub PROCESSES the create and only then fails
+        // (or the connection drops). A retry enrolls a SECOND write-capable key
+        // whose id karmax never records — orphaned at GitHub forever, since
+        // `removeOrphanDeployKeys` only sweeps when there is no local record.
+        creates.push(String(init.body));
+        return new Response('service unavailable', { status: 503 });
+      }
+      if (url.pathname === '/repos/acme/app/keys') return Response.json([]); // the orphan sweep's GET
+      if (url.pathname.startsWith('/repos/acme/app/keys/') && init.method === 'DELETE')
+        return new Response(null, { status: 204 });
+      return new Response('not found', { status: 404 });
+    });
+    const connection = h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+
+    await expect(h.service.reconcile(connection)).rejects.toThrow(/503/);
+    expect(creates).toHaveLength(1);
+    const repository = h.store.listRepositories(h.organization.id)[0]!;
+    expect(h.store.repositoryDeployKeys(repository.id)).toBeFalsy();
+
+    // DELETE of a specific key id IS retried: the resource is named, so a repeat
+    // either deletes it or 404s (which every caller already tolerates).
+    const request = (h.service as any).request.bind(h.service);
+    const del = async (u: URL, init: RequestInit) => {
+      if (u.pathname === '/repos/acme/app/keys/7' && init.method === 'DELETE')
+        return ++deleteAttempts === 1 ? new Response('boom', { status: 502 }) : new Response(null, { status: 204 });
+      return new Response('not found', { status: 404 });
+    };
+    (h.service as any).fetcher = ((input: any, init: RequestInit = {}) => del(new URL(String(input)), init)) as typeof fetch;
+    await expect(request('/repos/acme/app/keys/7', 't', { method: 'DELETE' })).resolves.toBeUndefined();
+    expect(deleteAttempts).toBe(2);
+    h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  it('bounds the retry budget on the webhook-serving path', async () => {
+    const waits: number[] = [];
+    let attempts = 0;
+    const h = harness(async (url) => {
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories') {
+        attempts++;
+        // A minute-long backoff is honoured on an ordinary call, but GitHub
+        // abandons a webhook delivery after ~10s — sleeping it out holds the HTTP
+        // response open for nothing.
+        return new Response('unavailable', { status: 503, headers: { 'retry-after': '60' } });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    (h.service as any).options.sleep = async (ms: number) => { waits.push(ms); };
+    h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+
+    await expect(h.deliver('installation_repositories', 'd-slow', { installation: { id: 42 }, action: 'added' }))
+      .rejects.toThrow(/503/);
+    expect(waits).toEqual([]); // a 60s wait does not fit the webhook budget
+    expect(attempts).toBe(1);
+    // Off the webhook path the same failure still gets its full retry budget.
+    await expect((h.service as any).request('/installation/repositories', 't')).rejects.toThrow(/503/);
+    expect(waits).toEqual([60_000, 60_000, 60_000]);
+    h.store.close(); fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  it('caches an installation token even when GitHub sends an unparseable expiry', async () => {
+    let mints = 0;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-tokcache-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, rsa());
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const service = new GitHubAppService(store, broker, { appId: '123', fetch: (async (input: any) => {
+      if (new URL(String(input)).pathname.endsWith('/access_tokens')) {
+        mints++;
+        return Response.json({ token: `t-${mints}`, expires_at: 'not-a-date' }); // Date.parse ⇒ NaN
+      }
+      return new Response('not found', { status: 404 });
+    }) as typeof fetch });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'User' });
+
+    // NaN > x is always false, so the cache never hit and every call re-minted.
+    expect(await service.installationToken(connection)).toBe('t-1');
+    expect(await service.installationToken(connection)).toBe('t-1');
+    expect(mints).toBe(1);
+    // Concurrent callers share one in-flight mint.
+    const fresh = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '43', accountLogin: 'acme2', accountType: 'User' });
+    const [a, b, c] = await Promise.all([service.installationToken(fresh), service.installationToken(fresh), service.installationToken(fresh)]);
+    expect([a, b, c]).toEqual([a, a, a]);
+    expect(mints).toBe(2);
+    // A suspended connection is refused even while a valid token is cached.
+    store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'User', suspendedAt: Date.now() });
+    await expect(service.installationToken(store.getGitConnection(connection.id)!)).rejects.toThrow(/suspended/);
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

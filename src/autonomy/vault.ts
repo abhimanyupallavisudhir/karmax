@@ -25,9 +25,30 @@ export class Vault {
     this.key = this.loadOrCreateKey();
   }
 
+  /**
+   * `KARMAX_VAULT_KEY` overrides the on-disk key so a redeployed instance can
+   * reopen an existing vault (a container with no persistent vault dir, a
+   * restore onto a new host).
+   *
+   * INTENDED: the value is hashed, NOT stretched. It is key *material*, not a
+   * password — it must be high-entropy random (`openssl rand -base64 32`). A
+   * KDF here would only buy resistance to guessing a human-chosen phrase, and
+   * would silently change the derived key, making every existing vault
+   * undecryptable — so the hash stays. A short value is warned about rather than
+   * refused: hosted deployments already fail preflight on it
+   * (`config/deployment.ts`), and hard-failing here would lock an existing
+   * self-hosted user out of a vault that opens fine.
+   */
   private loadOrCreateKey(): Buffer {
-    if (process.env.KARMAX_VAULT_KEY) {
-      return crypto.createHash('sha256').update(process.env.KARMAX_VAULT_KEY).digest();
+    const supplied = process.env.KARMAX_VAULT_KEY;
+    if (supplied) {
+      if (supplied.length < 32) {
+        console.warn(
+          '[vault] KARMAX_VAULT_KEY is shorter than 32 characters. It is raw key material, '
+          + 'not a password, and is not stretched — generate one with `openssl rand -base64 32`.',
+        );
+      }
+      return crypto.createHash('sha256').update(supplied).digest();
     }
     if (fs.existsSync(this.keyPath)) return fs.readFileSync(this.keyPath);
     const key = crypto.randomBytes(32);

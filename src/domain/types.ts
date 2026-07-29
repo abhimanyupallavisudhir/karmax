@@ -734,6 +734,16 @@ export interface TaskParams {
   /** Set by the dispatcher: `armed` = waiting on a trigger, `fired` = already started. */
   triggerState?: TriggerState;
   /**
+   * Dispatcher bookkeeping for cron catch-up: the scheduled instant (epoch-ms) of
+   * the most recent cron occurrence this task has fired for, or the moment it was
+   * first armed. `nextCronFire` is strictly-after-now, so without a durable mark
+   * a window missed while karmax was down would be unrepresentable and silently
+   * skipped — `0 9 * * *` would simply lose the day. On boot the dispatcher fires
+   * once if an occurrence elapsed between this mark and now (see
+   * src/platform/trigger-scheduler.ts). Never sent to any agent.
+   */
+  triggerLastFiredAt?: number;
+  /**
    * Repeatable "series" (Model A — template + runs). A repeatable task never runs
    * its own workflow; it spawns independent **run** records (each a normal task
    * with its own history) on each trigger fire or "Run again". A cron trigger

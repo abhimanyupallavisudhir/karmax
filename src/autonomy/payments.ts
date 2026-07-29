@@ -1018,6 +1018,14 @@ export class BudgetService {
   deny(requestId: string, resolvedBy: string): SpendResult {
     const request = this.store.getPaymentSpendRequest(requestId);
     if (!request) return { status: 'denied', reason: 'spend request not found' };
+    // Same terminal-status guard `approve` has, and for a sharper reason: money.
+    // `paymentSpent`/`cardPaymentSpent` total only consumed/settled/live-authorized
+    // rows, so flipping an already-settled request to `denied` erased it from the
+    // task's allowance and the card's cap while the charge had already gone
+    // through — the agent got that budget back and could spend it a second time,
+    // and the transaction ledger disagreed with the allowance from then on.
+    // A reviewer clicking Deny on a stale list is all it took.
+    if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
     return this.result(this.store.updatePaymentSpendRequest(request.id,
       { status: 'denied', reason: 'denied by reviewer', resolvedBy }));
   }

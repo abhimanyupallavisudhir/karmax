@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
+import { Context as activityContext } from '@temporalio/activity';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { WorldCheckpoint, WorldHandleRef } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -11,6 +12,7 @@ import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
+import { RunnerPoolService } from './runners.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -19,14 +21,51 @@ export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 interface DeltaFile { repo: string; path: string; deleted?: boolean; data?: string }
 interface PortableDelta { version: 1; files: DeltaFile[] }
 
+/** How a restoring activity keeps its runner-lease wait alive and cancellable. */
+export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void }
+
+/**
+ * `restore` is only ever reached from inside an activity (the openWorld recovery
+ * path, the registry recovery handler installed in main.ts, the hibernation wake),
+ * so it resolves the runner-lease wait's signal/heartbeat from the **ambient**
+ * activity context it already runs in. Outside an activity (tests, CLI)
+ * `Context.current()` throws and we simply get no hooks — as before.
+ *
+ * Callers may override via `RestoreOptions`, but `recoverVanishedWorld`
+ * deliberately does NOT thread its activity's signal in explicitly. Doing that
+ * made `tests/pipeline.test.ts`'s parent/child cancellation test fail ~2 runs in
+ * 3: the child was terminated "by parent close policy" instead of winding down as
+ * `cancelled`. Recovery runs on teardown paths where that signal is *already
+ * aborted*, and feeding an aborted signal into cleanup changes shutdown ordering.
+ * The ambient lookup reaches the same context without that hazard — prefer it.
+ * The parameter exists for tests and for any caller with a genuinely different
+ * lifetime; measure before adding another explicit call site.
+ */
+function ambientActivityHooks(): RestoreOptions {
+  try {
+    const ctx = activityContext.current();
+    return { signal: ctx.cancellationSignal, heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) };
+  } catch {
+    return {};
+  }
+}
+
 /** Provider-independent disaster-recovery layer. Provider snapshots remain the
  * fast path; this encrypted delta plus the broker-pushed branch is portable. */
 export class WorldCheckpointService {
+  /** Restoring re-provisions a real (billable) sandbox, so it must pass through
+   * the same durable admission as `createWorld`. `RunnerPoolService` is a thin
+   * facade over the store — the lease queue in SQLite is the source of truth —
+   * so it is constructed here by default rather than threaded through every
+   * caller; tests may inject one. */
+  private runners: RunnerPoolService;
+
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
     private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
-    private resources?: import('./resources.js').ProjectResourceService) {
+    private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService) {
     if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
+    this.runners = runners ?? new RunnerPoolService(store);
   }
 
   async checkpoint(handleInput: WorldHandleRef): Promise<WorldCheckpoint> {
@@ -91,7 +130,7 @@ export class WorldCheckpointService {
     return checkpoint;
   }
 
-  async restore(checkpointId: string, provider?: WorldKind): Promise<WorldHandle> {
+  async restore(checkpointId: string, provider?: WorldKind, options?: RestoreOptions): Promise<WorldHandle> {
     const checkpoint = this.store.getWorldCheckpoint(checkpointId);
     if (!checkpoint?.filesystemDelta) throw new Error('checkpoint has no portable filesystem delta');
     const project = this.store.getProject(checkpoint.projectId);
@@ -115,11 +154,40 @@ export class WorldCheckpointService {
     }));
     const cloneCredentials = this.githubApp && repositories.every(Boolean) ? Object.fromEntries(repositories.map((repository) =>
       [repository!.sshUrl, this.githubApp!.repositorySshKey(repository!.id, 'clone')])) : undefined;
-    const world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
-      repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
-      branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
-      ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-      network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
+    // Restoring PROVISIONS A REAL SANDBOX, so it must pass through the same
+    // durable admission as createWorld (activities/core.ts): the runner lease is
+    // what enforces the organization/project `monthlyBudgetMicros`, what produces
+    // the `world.active` usage row cost attribution reads, and — via
+    // `meta.worldLeaseId` — what `destroyWorld` later releases. Restore is reached
+    // from the registry recovery handler (main.ts) and the hibernation wake, i.e.
+    // exactly when a world is silently re-provisioned, so without this a
+    // provider-billed sandbox was invisible to karmax and its capacity was never
+    // returned. Local providers are unmetered and take no lease, matching
+    // createWorld's `remote &&` guard.
+    //
+    // The lease acquisition polls until the pool has room, so it MUST carry the
+    // caller's cancellation signal and heartbeat, exactly as the two call sites in
+    // activities/core.ts do. Without the heartbeat a saturated pool blocks past the
+    // activity heartbeat timeout; without the signal the killed activity strands a
+    // `queued` lease row that nothing ever releases, permanently eating capacity.
+    const remote = this.worlds.get(selected).capabilities?.remote === true;
+    const hooks = options ?? ambientActivityHooks();
+    const acquired = remote
+      ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
+        provider: selected, priority: Number(this.store.getTask(checkpoint.worldId)?.params.priority ?? 0),
+        signal: hooks.signal, heartbeat: hooks.heartbeat })
+      : undefined;
+    let world: World;
+    try {
+      world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
+        repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
+        branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
+        ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
+        network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
+    } catch (error) {
+      if (acquired) this.runners.release(acquired.leaseId, selected);
+      throw error;
+    }
     try {
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
@@ -141,8 +209,11 @@ export class WorldCheckpointService {
       world.handle = runtime.handle;
       if (runtime.warnings.length)
         world.handle.warnings = [...(world.handle.warnings ?? []), ...runtime.warnings];
+      // Stamped exactly as createWorld does, so `destroyWorld` finds the lease to
+      // release and the world's cost is attributed to the right pool.
+      if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
       const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
-        { runnerPoolId: checkpoint.runnerPoolId,
+        { runnerPoolId: acquired?.runnerPoolId ?? checkpoint.runnerPoolId,
           environmentDigest: environment.digest ?? checkpoint.environmentDigest }) as WorldHandle;
       world.handle = registered;
       return registered;
@@ -150,6 +221,7 @@ export class WorldCheckpointService {
       await this.resources?.release(world.handle).catch(() => undefined);
       await destroyWorldServices(checkpoint.worldId).catch(() => undefined);
       await world.destroy().catch(() => undefined);
+      if (acquired) this.runners.release(acquired.leaseId, selected);
       throw error;
     }
   }

@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
-import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldLifecycleState,
-  WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldSpec } from './types.js';
+import type { ExecOptions, ExecResult, ProviderSandboxRef, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
+  WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldSpec } from './types.js';
 import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
+import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 
@@ -33,6 +34,10 @@ export interface DaytonaSandboxLike {
   getSignedPreviewUrl(port: number, expiresInSeconds?: number): Promise<{ url: string; token?: string }>;
   computerUse?: { start(): Promise<unknown>; getStatus?(): Promise<unknown> };
   refreshData?(): Promise<void>;
+  labels?: Record<string, string>;
+  /** Re-arm the auto-stop countdown. Present in current SDKs; when absent the
+   * keep-alive falls back to a no-op command (which is sandbox activity). */
+  setAutostopInterval?(minutes: number): Promise<unknown>;
   start(timeoutSeconds?: number): Promise<void>;
   stop(timeoutSeconds?: number, force?: boolean): Promise<void>;
   archive(): Promise<void>;
@@ -42,6 +47,9 @@ export interface DaytonaSandboxLike {
 export interface DaytonaFactory {
   create(options: Record<string, unknown>): Promise<DaytonaSandboxLike>;
   get(id: string): Promise<DaytonaSandboxLike>;
+  /** Label-filtered enumeration for the lifecycle sweep's orphan reaper.
+   * Absent ⇒ this deployment cannot see leaked sandboxes and reaps nothing. */
+  list?(labels: Record<string, string>): Promise<DaytonaSandboxLike[]>;
 }
 
 /** Daytona is the portability/BYOC adapter. It implements exactly the same
@@ -86,7 +94,14 @@ export class DaytonaWorldProvider implements WorldProvider {
     const sandbox = await factory.create({
       ...(selectedSnapshot ? { snapshot: selectedSnapshot } : {}),
       ...(selectedImage ? { image: selectedImage } : {}),
-      labels: { karmaxTaskId: spec.taskId }, public: false,
+      // `karmaxHome` scopes orphan reaping to sandboxes THIS deployment
+      // created: several karmax instances can share one Daytona account, and
+      // reaping by task id alone would delete another instance's live worlds.
+      labels: { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel() }, public: false,
+      // `autoDeleteInterval: -1` means the provider NEVER reaps this sandbox —
+      // it auto-stops, auto-archives at 24h, then bills archived storage
+      // indefinitely. karmax owns the teardown: the workflow's destroyWorld
+      // plus WorldLifecycleManager's orphan sweep (which finds these by label).
       autoStopInterval: Math.max(1, Math.ceil(this.idleMs / 60_000)), autoArchiveInterval: 24 * 60,
       autoDeleteInterval: -1, ...network,
       ...(spec.resources ? { resources: { cpu: spec.resources.cpu,
@@ -121,7 +136,7 @@ export class DaytonaWorldProvider implements WorldProvider {
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
         ...(provisioned.warnings.length ? { warnings: provisioned.warnings } : {}),
       };
-      return new DaytonaWorld(handle, sandbox);
+      return new DaytonaWorld(handle, sandbox, this.idleMs);
     } catch (error) {
       await sandbox.delete(60).catch(() => undefined);
       this.states.set(sandbox.id, 'missing');
@@ -142,7 +157,7 @@ export class DaytonaWorldProvider implements WorldProvider {
     }
     this.sandboxes.set(id, sandbox);
     this.states.set(id, 'ready');
-    return new DaytonaWorld(handle, sandbox);
+    return new DaytonaWorld(handle, sandbox, this.idleMs);
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -175,6 +190,24 @@ export class DaytonaWorldProvider implements WorldProvider {
     } catch (error) {
       return /not\s*found|does not exist|404/i.test(String((error as Error)?.message ?? error)) ? 'missing' : undefined;
     }
+  }
+
+  /** Every sandbox this deployment owns, for the lifecycle sweep's orphan
+   * reaper. Filtered on the `karmaxHome` label so another karmax instance
+   * sharing the same Daytona account is never enumerated, let alone deleted. */
+  async listSandboxes(organizationId?: string): Promise<ProviderSandboxRef[]> {
+    const factory = this.factoryFor(this.connection(organizationId));
+    if (!factory.list) return [];
+    const sandboxes = await factory.list({ karmaxHome: serviceHomeLabel() });
+    return sandboxes.map((sandbox) => ({
+      sandboxId: sandbox.id,
+      ...(sandbox.labels?.karmaxTaskId ? { taskId: sandbox.labels.karmaxTaskId } : {}),
+      destroy: async () => {
+        await sandbox.delete(60);
+        this.sandboxes.delete(sandbox.id);
+        this.states.set(sandbox.id, 'missing');
+      },
+    }));
   }
 
   private reference(handle: WorldHandle): { sandboxId: string; organizationId?: string } {
@@ -223,17 +256,42 @@ export class DaytonaWorldProvider implements WorldProvider {
 }
 
 class DaytonaWorld implements World {
-  constructor(public handle: WorldHandle, private sandbox: DaytonaSandboxLike) {}
+  constructor(public handle: WorldHandle, private sandbox: DaytonaSandboxLike, private idleMs = DEFAULT_IDLE_MS) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+    const line = [cmd, ...args].map(quote).join(' ');
+    const seconds = Math.max(1, Math.ceil((opts.timeoutMs ?? 120_000) / 1000));
+    let stdinPath: string | undefined;
     try {
-      const result = await this.sandbox.process.executeCommand([cmd, ...args].map(quote).join(' '),
-        this.cwd(opts.cwd), remoteEnv(opts.env), Math.max(1, Math.ceil((opts.timeoutMs ?? 120_000) / 1000)));
+      let command = line;
+      // STDIN path. `ExecOptions.input` exists so a caller can feed a secret to
+      // an in-world helper without it landing in argv or env, which every
+      // co-resident process can read out of /proc for the command's whole
+      // lifetime (the vault's fillInWorld depends on exactly this). Daytona's
+      // command API has no stdin channel, so the payload is uploaded over the
+      // FILE api — never through a shell command line — chmod-ed 0600,
+      // redirected in, and deleted in the same shell whatever the exit status.
+      // A narrow same-uid on-disk window is the best this SDK surface allows,
+      // and is strictly better than silently dropping the secret.
+      if (opts.input !== undefined) {
+        stdinPath = path.posix.join('/tmp', `karmax-stdin-${crypto.randomBytes(12).toString('hex')}`);
+        await this.sandbox.fs.uploadFile(Buffer.from(opts.input), stdinPath);
+        const quoted = quote(stdinPath);
+        command = `chmod 600 ${quoted} 2>/dev/null; ${line} < ${quoted}; __karmax_code=$?; rm -f ${quoted}; exit $__karmax_code`;
+      }
+      const result = await this.sandbox.process.executeCommand(command,
+        this.cwd(opts.cwd), remoteEnv(opts.env), seconds);
+      stdinPath = undefined; // the command's own `rm -f` already removed it
       return { stdout: String(result?.result ?? result?.stdout ?? result?.artifacts?.stdout ?? ''),
         stderr: String(result?.stderr ?? ''), code: Number(result?.exitCode ?? 0) };
     } catch (error: any) {
       return { stdout: String(error?.stdout ?? ''), stderr: String(error?.stderr ?? error?.message ?? error),
         code: Number(error?.exitCode ?? 1) };
+    } finally {
+      // A throw (timeout, transport error) skips the in-shell cleanup; never
+      // leave a secret sitting in the sandbox's /tmp because of it.
+      if (stdinPath) await this.sandbox.process.executeCommand(`rm -f ${quote(stdinPath)}`,
+        undefined, undefined, 15).catch(() => undefined);
     }
   }
 
@@ -271,18 +329,20 @@ class DaytonaWorld implements World {
     void processApi.getSessionCommandLogs(sessionId, commandId, emit, emit).catch((error) => emit(String(error?.message ?? error)));
     let stopped = false;
     let exitCode: number | null = null;
+    const stopKeepAlive = this.keepAlive();
     void (async () => {
       while (!stopped) {
         const status = await processApi.getSessionCommand!(sessionId, commandId);
         if (status.exitCode != null) { exitCode = Number(status.exitCode); break; }
         await delay(250);
       }
+      stopKeepAlive();
       for (const listener of exits) listener(exitCode);
-    })().catch(() => { exitCode = -1; for (const listener of exits) listener(exitCode); });
+    })().catch(() => { stopKeepAlive(); exitCode = -1; for (const listener of exits) listener(exitCode); });
     return {
       onOutput(listener) { output.add(listener); if (!attached) { attached = true; for (const chunk of pending.splice(0)) listener(chunk); } return () => output.delete(listener); },
       onExit(listener) { if (exitCode != null) queueMicrotask(() => listener(exitCode)); else exits.add(listener); return () => exits.delete(listener); },
-      async kill() { stopped = true; await processApi.deleteSession!(sessionId); if (exitCode == null) { exitCode = -1; for (const listener of exits) listener(exitCode); } },
+      async kill() { stopped = true; stopKeepAlive(); await processApi.deleteSession!(sessionId); if (exitCode == null) { exitCode = -1; for (const listener of exits) listener(exitCode); } },
     };
   }
 
@@ -301,12 +361,15 @@ class DaytonaWorld implements World {
         for (const listener of output) listener(chunk);
       } });
     await terminal.waitForConnection?.();
+    const stopKeepAlive = this.keepAlive();
     if (spec.command) await terminal.sendInput(`${spec.command}\n`);
     void Promise.resolve(terminal.wait?.()).then((result) => {
+      stopKeepAlive();
       exited = true;
       exitCode = Number(result?.exitCode ?? 0);
       for (const listener of exits) listener(exitCode);
     }).catch(() => {
+      stopKeepAlive();
       exited = true;
       exitCode = -1;
       for (const listener of exits) listener(exitCode);
@@ -324,7 +387,7 @@ class DaytonaWorld implements World {
       },
       async write(data) { await terminal.sendInput(data); },
       async resize(cols, rows) { await terminal.resize(cols, rows); },
-      async close() { if (terminal.kill) await terminal.kill(); else await terminal.disconnect?.(); },
+      async close() { stopKeepAlive(); if (terminal.kill) await terminal.kill(); else await terminal.disconnect?.(); },
     };
   }
 
@@ -366,6 +429,30 @@ class DaytonaWorld implements World {
   }
 
   async destroy(): Promise<void> { await this.sandbox.delete(60); }
+
+  /**
+   * Daytona's `autoStopInterval` is a wall-clock idle timer set once at create;
+   * unlike E2B's renewable timeout nothing refreshes it, so a long agent turn
+   * that merely holds a PTY or session command open can have its sandbox
+   * stopped underneath it mid-flight (E2B documents the same hazard and solves
+   * it in `keepAlive` — this mirrors it). Re-arm through the control plane when
+   * the SDK exposes it; otherwise run a no-op command, which is itself sandbox
+   * activity. Harmless if Daytona already counts an open session as activity.
+   */
+  private keepAlive(): () => void {
+    let stopped = false;
+    const minutes = Math.max(1, Math.ceil(this.idleMs / 60_000));
+    const refresh = () => {
+      if (stopped) return;
+      void Promise.resolve(this.sandbox.setAutostopInterval
+        ? this.sandbox.setAutostopInterval(minutes)
+        : this.sandbox.process.executeCommand('true', undefined, undefined, 15)).catch(() => undefined);
+    };
+    refresh();
+    const timer = setInterval(refresh, Math.max(30_000, Math.min(60_000, Math.floor(this.idleMs / 3))));
+    timer.unref();
+    return () => { if (!stopped) { stopped = true; clearInterval(timer); } };
+  }
 
   private file(relative: string): string {
     const safe = worldRelativePath(relative);
@@ -432,7 +519,13 @@ function defaultDaytonaFactory(connection?: ResolvedWorldProviderConnection): Da
     return client;
   };
   return { async create(options) { return (await sdk()).create(options, { timeout: 120 }); },
-    async get(id) { return (await sdk()).get(id); } };
+    async get(id) { return (await sdk()).get(id); },
+    async list(labels) {
+      const client = await sdk();
+      // Older SDKs have no label-filtered list; reaping is best-effort and must
+      // degrade to "cannot enumerate" rather than throwing inside the sweep.
+      return typeof client.list === 'function' ? await client.list(labels) : [];
+    } };
 }
 
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }

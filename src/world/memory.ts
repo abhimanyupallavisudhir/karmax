@@ -16,6 +16,8 @@ const pexec = promisify(execFile);
 export class MemoryWorldProvider implements WorldProvider {
   readonly kind = 'memory' as const;
   readonly parkable = false;
+  /** Declared for a uniform `/api/meta` provider catalog; see WorktreeProvider. */
+  readonly capabilities = { remote: false, pty: true, snapshots: false, ports: false, networkPolicy: false } as const;
   private roots = new Map<string, string>();
 
   async create(spec: WorldSpec): Promise<World> {
