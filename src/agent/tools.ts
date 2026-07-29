@@ -377,6 +377,33 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'escalate_to_human',
+    description:
+      'Pause your current task at its exact stage and ask selected people or teams for input. ' +
+      'Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+      'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets"). ' +
+      'Calling this stops your current turn; the task resumes when a selected human responds.',
+    parameters: {
+      type: 'object',
+      properties: {
+        audience: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 32,
+          description: 'One or more human/team routing selectors; any selected person may respond.',
+        },
+        message: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 4_000,
+          description: 'The concrete question or decision the human needs to answer.',
+        },
+      },
+      required: ['audience', 'message'],
+    },
+  },
+  {
     name: 'publish_task_branch',
     description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
     parameters: { type: 'object', properties: {} },
@@ -687,6 +714,12 @@ export function platformToolHandlers(
         role: args?.role ? String(args.role) : 'do',
         action: String(args?.action ?? ''),
         message: args?.message ? String(args.message) : undefined,
+      }));
+    },
+    async escalate_to_human(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/escalate', {
+        audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
+        message: String(args?.message ?? ''),
       }));
     },
     async publish_task_branch() {

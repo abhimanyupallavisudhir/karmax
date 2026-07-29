@@ -63,7 +63,7 @@ function fixture() {
     updatedAt: 1,
   };
   store.saveView(task.id, view);
-  return { store, project, token, api, task, view, starts, terminated, signalled };
+  return { store, project, tokens, token, api, task, view, starts, terminated, signalled };
 }
 
 describe('task stage transitions', () => {
@@ -125,6 +125,91 @@ describe('task stage transitions', () => {
     const restoredHold = await f.api.moveTaskStage(f.token, f.task.id, 'human');
     expect(restoredHold).toMatchObject({ stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } });
     expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'review', pausedForHuman: true });
+  });
+
+  it('lets an agent escalate its own task to a chosen human team and notifies only that audience', async () => {
+    const f = fixture();
+    for (const userId of ['designer', 'developer'])
+      f.store.setOrganizationMembership('org_personal', userId, 'member');
+    const design = f.store.createTeam({ organizationId: 'org_personal', name: 'Design' });
+    f.store.setTeamMembership(design.id, 'designer');
+    f.store.setProjectMembership(f.project.id, { kind: 'team', teamId: design.id }, 'member');
+    f.store.setProjectMembership(f.project.id, { kind: 'user', userId: 'developer' }, 'member');
+    const agentToken = f.tokens.mint({
+      taskId: f.task.id,
+      profileId: 'do',
+      principal: `task-agent:${f.task.id}:do`,
+      projectId: f.project.id,
+      ceiling: ['task:escalate'],
+      grantorCaps: ['task:escalate'],
+    }).token;
+
+    expect(f.api.humanEscalationTargets(agentToken)).toMatchObject({
+      taskId: f.task.id,
+      users: expect.arrayContaining([{ id: 'designer', selector: 'user:designer' }]),
+      teams: [expect.objectContaining({ id: design.id, name: 'Design', selector: '@team:design' })],
+    });
+    const held = await f.api.escalateToHuman(agentToken, {
+      audience: ['@team:design'],
+      message: 'Please choose the final interaction pattern.',
+    });
+
+    expect(held).toMatchObject({
+      stage: 'do',
+      status: 'waiting',
+      waitingFor: {
+        kind: 'human',
+        audience: ['@team:design'],
+        detail: 'Please choose the final interaction pattern.',
+      },
+      state: { humanPauseOrigin: 'do' },
+    });
+    expect(f.terminated.at(-1)).toContain('Escalated to @team:design');
+    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'task.escalated',
+        payload: expect.objectContaining({
+          audience: ['@team:design'],
+          detail: 'Please choose the final interaction pattern.',
+          requestedBy: `task-agent:${f.task.id}:do`,
+        }),
+      }),
+    ]));
+    expect(f.store.listInbox('designer', 'org_personal')).toEqual([
+      expect.objectContaining({ taskId: f.task.id, kind: 'escalated', actionable: true, unread: true }),
+    ]);
+    expect(f.store.listInbox('developer', 'org_personal')).toEqual([]);
+  });
+
+  it('rejects an escalation to a missing audience and prevents an agent escalating another task', async () => {
+    const f = fixture();
+    const agentToken = f.tokens.mint({
+      taskId: f.task.id,
+      profileId: 'do',
+      principal: `task-agent:${f.task.id}:do`,
+      projectId: f.project.id,
+      ceiling: ['task:escalate'],
+      grantorCaps: ['task:escalate'],
+    }).token;
+
+    await expect(f.api.escalateToHuman(agentToken, {
+      audience: ['@team:missing'],
+      message: 'I need a decision.',
+    })).rejects.toThrow(/does not resolve to a human/i);
+
+    const other = f.store.createTask({
+      projectId: f.project.id,
+      title: 'Other',
+      workflow: 'software-dev',
+      workflowVersion: '1.9.0',
+      params: { prompt: 'other' },
+    });
+    f.store.saveView(other.id, { ...f.view, taskId: other.id, title: other.title });
+    await expect(f.api.escalateToHuman(agentToken, {
+      taskId: other.id,
+      audience: ['@creator'],
+      message: 'Stop this other task.',
+    })).rejects.toThrow(/only escalate its own task/i);
   });
 
   it('treats follow-up and Confirm as input that releases a human hold', async () => {

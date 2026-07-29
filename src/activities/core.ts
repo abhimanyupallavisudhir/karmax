@@ -986,7 +986,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
-      const grant = [...(args.task.grant ?? DEFAULT_GRANT), ...orgVaultItems.extensionCaps(args.taskId)];
+      // Requesting human input is a non-removable safety valve for every task
+      // agent. The API restricts task-scoped callers to their own task, so this
+      // cannot be used to interrupt peer work or widen the agent's authority.
+      const grant = [...new Set([
+        ...(args.task.grant ?? DEFAULT_GRANT),
+        ...orgVaultItems.extensionCaps(args.taskId),
+        'task:escalate',
+      ])];
       const ceiling = roleCeiling(args.role);
       const effective = attenuate(ceiling, grant);
       let token: string | undefined;

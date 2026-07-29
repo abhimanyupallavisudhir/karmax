@@ -67,6 +67,13 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(schema.parameters.properties).not.toHaveProperty('html');
   });
 
+  it('advertises human escalation as a gateway-backed tool available to every agent', () => {
+    const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'escalate_to_human')!;
+    expect(schema).toBeDefined();
+    expect(schema.parameters.required).toEqual(['audience', 'message']);
+    expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
+  });
+
   it('enforces the review caption limit in the Agent-SDK input shape', () => {
     const schema = TOOL_SCHEMAS.find((t) => t.name === 'create_review_info')!;
     const obj = z.object(jsonSchemaToZodShape(z, schema.parameters));
