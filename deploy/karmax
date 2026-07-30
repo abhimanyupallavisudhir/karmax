@@ -178,7 +178,12 @@ cmd_backup() {
   chmod 700 "$destination"
   temporary="/tmp/karmax-control-plane-$stamp"
   note 'Taking an online Karmax snapshot…'
-  dc exec -T app npm run backup -- "$temporary"
+  # The app is intentionally live here: SQLite uses its online backup API, and
+  # the remaining components are copied before the PostgreSQL dumps below.
+  # createBackup requires callers to acknowledge that those component snapshots
+  # are not all taken at one instant; without this flag every automated update
+  # fails before it can pull the commit that would fix the updater.
+  dc exec -T app npm run backup -- --allow-running "$temporary"
   dc cp "app:$temporary" "$destination/control-plane"
   dc exec -T app rm -rf "$temporary"
   note 'Dumping Temporal history…'
