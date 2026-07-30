@@ -6517,9 +6517,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       // Compact inline chip: the kind is obvious from the label (a login is
       // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
       const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
-      const label = c.kind === 'ambient'
-        ? (hostLocal() ? ambientHomes[c.provider] : `${c.provider} login on this krmax`) || `ambient ${c.provider}`
-        : c.label;
+      const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
       return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
@@ -9408,10 +9406,17 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
   }
   if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
+    // Worlds inherit the host's git config through git's own cascade
+    // (ensureIdentity only fills blanks), which is true of a worktree world on
+    // the operator's machine and false on a managed cell: there the world is a
+    // remote sandbox with no ~/.gitconfig to inherit, and no single "host" whose
+    // identity a tenant would want anyway.
     box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
-      organizationId === 'org_personal'
-        ? 'personal projects use the host’s own Git setup.'
-        : 'projects remain isolated from the host’s Git identity and credentials.'
+      S.meta?.hosted
+        ? 'add one to give this organization’s commits an identity.'
+        : organizationId === 'org_personal'
+          ? 'personal projects use the host’s own Git setup.'
+          : 'projects remain isolated from the host’s Git identity and credentials.'
     }</span>`;
     return;
   }

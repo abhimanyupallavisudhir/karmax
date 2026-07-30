@@ -91,16 +91,18 @@ ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess
 for (const l of lines.filter((l) => l.includes('On localhost, setup works')))
   ok(l.includes('hostLocal()'), 'the GitHub App localhost note is gated on hostLocal()');
 
-// An ambient login is the config home karmax itself found. Naming it `~/.claude`
-// is only meaningful to someone looking at that filesystem.
-ok(lines.some((l) => l.includes('ambientHomes[c.provider]') && l.includes('hostLocal()')),
-  'an ambient login is labelled by host path only on the host');
-
 // Neither of these should still say "host path"/"this host" as if the reader
 // were sitting at it.
 for (const [marker, what] of [['Choose a host path', 'the data-import conflict toast'],
   ['Connect the store CLI on this host', 'the password-manager tooltip']])
   ok(!src.includes(marker), `${what} no longer addresses the reader as the host`);
+
+// ── content that assumes one machine everyone shares (the SaaS axis) ────────
+// Distinct from hostLocal: a self-host on a public URL still has exactly one
+// operator, and its worlds really do inherit that machine's git config.
+for (const l of lines.filter((l) => l.includes('use the host’s own Git setup')))
+  ok(/S\.meta\?\.hosted/.test(src.slice(src.indexOf(l) - 400, src.indexOf(l) + 200)),
+    'the "inherits the host git setup" empty state is not claimed on a managed cell');
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
