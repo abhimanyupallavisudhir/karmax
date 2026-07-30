@@ -26,6 +26,7 @@ import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun,
 const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
 const DEFAULT_IDLE_MS = 10 * 60_000;
+const DEFAULT_TEMPLATE = 'codex';
 
 /** Minimal SDK surface kept structural so the provider can be unit-tested with
  * no E2B account and upgraded independently from Temporal workflow contracts. */
@@ -90,7 +91,7 @@ export class E2BWorldProvider implements WorldProvider {
   constructor(
     private factory: E2BFactory = defaultE2BFactory(),
     private idleMs = envPositiveInt('KARMAX_E2B_IDLE_MS', DEFAULT_IDLE_MS),
-    private template = process.env.KARMAX_E2B_TEMPLATE,
+    private template = process.env.KARMAX_E2B_TEMPLATE?.trim() || DEFAULT_TEMPLATE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection,
     private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
   ) {
