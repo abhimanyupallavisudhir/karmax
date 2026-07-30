@@ -9164,10 +9164,10 @@ function globalSettingsView(embedded = false) {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
     </div>
-    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
+    ${hostLocal() ? `<div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
-    </div>`;
+    </div>` : ''}`;
 }
 
 function phoneInstallHelp() {
@@ -9186,7 +9186,6 @@ function renderPhoneAccess(status) {
   const box = $('#phone-access-status');
   if (!box) return;
   const ready = status.state === 'ready';
-  const hosted = status.method === 'hosted';
   const label = status.setupInProgress ? 'Setting up…' : ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
     : status.state === 'needs-login' ? 'Sign-in needed'
       : status.state === 'conflict' ? 'Another service is connected' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
@@ -9196,12 +9195,10 @@ function renderPhoneAccess(status) {
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
     ? `<div class="phone-access-address"><span>Access your krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
-  const phoneSteps = hosted
-    ? '<li>Open this same HTTPS address on your phone.</li>'
-    : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
+    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>Tailscale not set up</b></div>`;
+  const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private krmax address shown here in your phone’s browser.</li>`;
-  const recovery = ready && !hosted
+  const recovery = ready
     ? `<details class="phone-troubleshooting">
         <summary>Address won’t open?</summary>
         <ol>
@@ -9226,15 +9223,14 @@ function renderPhoneAccess(status) {
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
         Sign in to the same Tailscale account on both.</p>`;
   const fallbackCommands = status.fallbackCommands || [];
-  const fallback = !hosted && fallbackCommands.length
+  const fallback = fallbackCommands.length
     ? `<details class="phone-terminal-fallback">
         <summary>Doesn’t work? Use the terminal instead</summary>
         <pre><code>${esc(fallbackCommands.join('\n'))}</code></pre>
         <button class="btn sm" id="remote-copy-fallback">Copy commands</button>
        </details>`
     : '';
-  const setupPanel = !hosted
-    ? `<details class="phone-setup" ${ready ? '' : 'open'}>
+  const setupPanel = `<details class="phone-setup" ${ready ? '' : 'open'}>
         <summary>${setupSummary}</summary>
         <div class="phone-setup-body">
           ${setupIntro}
@@ -9250,13 +9246,12 @@ function renderPhoneAccess(status) {
           ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. krmax never sees your OS or Tailscale password.</p>' : ''}
           ${fallback}
         </div>
-       </details>`
-    : `<p>${esc(status.detail)}</p>`;
+       </details>`;
   box.innerHTML = `${address}
     ${setupPanel}
     ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
       <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">${hosted ? 'krmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.'}</p>`;
+    <p class="phone-security">This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.</p>`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
@@ -10672,7 +10667,7 @@ async function hydrateAuthorization(scope, projectId) {
 }
 
 function wireGlobalSettings(organizationId) {
-  hydratePhoneAccess();
+  if (hostLocal()) hydratePhoneAccess();
   wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
@@ -11187,7 +11182,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Phone Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>

@@ -66,5 +66,23 @@ for (const l of lines.filter((l) => l.includes('cd ${v.worldPath}')))
 for (const l of lines.filter((l) => /localPath:/.test(l)))
   ok(l.includes('localWorldPath(v)'), 'a rendered world localPath goes through localWorldPath');
 
+// ── Phone Access is setup for reaching a loopback karmax from elsewhere ──────
+// Off-machine there is nothing to set up: you are already reading this page at
+// the URL the section would help you obtain, and /api/remote-access 503s (it
+// drives tailscale/pkexec on the host), so rendering the card only produces a
+// permanent "Needs attention" error.
+for (const marker of ['id="settings-access"', '#settings-access'])
+  for (const l of lines.filter((l) => l.includes(marker)))
+    ok(l.includes('hostLocal()'), `the Phone Access ${marker} is gated on hostLocal()`);
+// The card itself sits on its own line inside that gated template, so check it
+// structurally: it must fall between the gate's `${hostLocal() ?` and its `: ''}`.
+const gateStart = src.indexOf('${hostLocal() ? `<div class="settings-section-title" id="settings-access"');
+const gateEnd = src.indexOf(": ''}", gateStart);
+ok(gateStart > 0 && gateEnd > gateStart, 'the Phone Access section is wrapped in a hostLocal() gate');
+ok(src.indexOf('id="phone-access-card"') > gateStart && src.indexOf('id="phone-access-card"') < gateEnd,
+  'the Phone Access card renders only inside that gate');
+ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess()')),
+  'the Phone Access status is not fetched when the endpoint is withdrawn');
+
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
