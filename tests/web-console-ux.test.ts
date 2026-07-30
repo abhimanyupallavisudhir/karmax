@@ -245,7 +245,7 @@ describe('copy', () => {
   });
 
   it('states each failure once and briefly', () => {
-    expect(app).toContain("const EMAIL_SEND_FAILED = 'Couldn’t send the email. Outbound email may not be set up.';");
+    expect(app).toContain("const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';");
     expect(app).not.toContain('Could not send confirmation email');
     expect(app).not.toContain('Precedence + enable/disable');
     expect(app).toContain('Drag to reorder, toggle to disable — for this task only.');
