@@ -1721,8 +1721,14 @@ async function boot() {
     S.justVerified = true;
     history.replaceState({ kx: 1 }, '', location.pathname);
   }
+  // A social sign-in that Better Auth rejected comes back here with `?error=`
+  // (see wireGoogleBtn's errorCallbackURL). Same shape as `verified` above:
+  // read it, clear it from the URL, and let the card say what happened.
+  S.signInError = googleSignInError(new URLSearchParams(location.search));
+  if (S.signInError) history.replaceState({ kx: 1 }, '', location.pathname);
   const session = await (await fetch('/api/session')).json();
   S.sso = session.sso || null;
+  S.google = session.google || false;
   if (session.setupRequired) return renderSetup();
   // An invite link opened while signed out: keep the token in the URL (boot
   // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
@@ -11708,6 +11714,53 @@ function openHelp() {
 }
 
 // ── login ────────────────────────────────────────────────────────────────────
+
+// "Continue with Google" — Better Auth's own social endpoint (the gateway proxies
+// /api/auth/* verbatim, so there is no karmax route here). Sign-in and sign-up are
+// the same call: Google either matches an existing account or creates one.
+// Deliberately not Google's stock branded button — it would be the only foreign
+// visual element on the card. A plain `.btn` keeps the sign-in card coherent, and
+// the wordmark in the label is what actually tells the user where they're going.
+const googleBtn = (id) => S.google
+  ? `<button class="btn" id="${id}" style="width:100%;margin-top:8px">Continue with Google</button>`
+  : '';
+
+// What a failed round trip to Google means, in the user's terms. Better Auth
+// would otherwise land them on its own `/api/auth/error` page — a bare error
+// code and an "Ask AI" button, off karmax entirely, with no way back.
+//
+// `account_not_linked` is the one that is neither a bug nor a dead end, and it
+// has a real cause: karmax's email+password signup does not verify addresses, so
+// Better Auth refuses to merge a Google identity into a local account that only
+// *claims* that address (otherwise registering someone else's address here would
+// capture their Google sign-in). The password still works — say so.
+const GOOGLE_SIGN_IN_ERRORS = {
+  account_not_linked: 'An account already exists for that email address with a password. '
+    + 'Sign in with that password instead — signing in with Google would require confirming the address first.',
+};
+
+function googleSignInError(params) {
+  const code = params.get('error');
+  if (!code) return undefined;
+  return GOOGLE_SIGN_IN_ERRORS[code] ?? `Google sign-in failed (${code}).`;
+}
+
+function wireGoogleBtn(id, errSelector) {
+  $(`#${id}`)?.addEventListener('click', async () => {
+    try {
+      // errorCallbackURL keeps a rejected sign-in on karmax's own card: Better
+      // Auth appends `?error=<code>`, which boot() reads back on the way in.
+      const back = new URL(location.href);
+      back.searchParams.delete('error');
+      const response = await fetch('/api/auth/sign-in/social', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: 'google', callbackURL: back.href, errorCallbackURL: back.href }) });
+      const result = await response.json();
+      if (!response.ok || !result.url) throw new Error(result.error || result.message || 'Google sign-in unavailable');
+      location.href = result.url;
+    } catch (error) { $(errSelector).textContent = error.message; }
+  });
+}
+
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
@@ -11716,10 +11769,11 @@ function renderLogin() {
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
+    ${googleBtn('google-btn')}
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
-    <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
+    <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
   </div></div>`;
   const go = async () => {
     try {
@@ -11728,6 +11782,7 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  wireGoogleBtn('google-btn', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
     try {
       const response = await fetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
@@ -11815,6 +11870,7 @@ function renderSignup() {
     <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
+    ${googleBtn('signup-google-btn')}
     <button class="btn" id="signup-back" style="width:100%;margin-top:8px">Back to sign in</button>
     <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
@@ -11836,6 +11892,7 @@ function renderSignup() {
     }
   };
   $('#signup-btn').addEventListener('click', go);
+  wireGoogleBtn('signup-google-btn', '#signup-err');
   $('#signup-back').addEventListener('click', renderLogin);
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }

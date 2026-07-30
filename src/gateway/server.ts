@@ -765,13 +765,15 @@ export class Gateway {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
         if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user,
-          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null });
+          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+          google: this.deps.identity.googleEnabled });
         return this.json(res, 200, {
           authRequired: true,
           authenticated: false,
           setupRequired: !this.deps.identity.hasUsers(),
           signupAvailable: this.deps.identity.hasUsers(),
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+          google: this.deps.identity.googleEnabled,
         });
       }
       // Legacy sessions are single-user by construction; minting one on a
@@ -1043,6 +1045,7 @@ export class Gateway {
         // the UI disable what cannot work.
         deliveryChannels: this.deps.deliveryChannels ?? ['browser'],
         sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+        google: this.deps.identity?.googleEnabled ?? false,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });

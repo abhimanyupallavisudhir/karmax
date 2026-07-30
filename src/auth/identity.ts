@@ -58,6 +58,13 @@ function secretFor(dbFile: string, supplied?: string): string {
   return value;
 }
 
+export interface IdentityOptions {
+  baseURL?: string | { allowedHosts: string[]; fallback?: string };
+  secret?: string;
+  oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
+  google?: { clientId: string; clientSecret: string };
+}
+
 /**
  * Authentication boundary. Better Auth owns passwords, hashing, cookies,
  * sessions, rate limits, and account records; karmax only consumes the verified
@@ -75,8 +82,11 @@ export class IdentityService {
   mailer?: Mailer;
 
   readonly oidcProviderId?: string;
-  private constructor(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string;
-    oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] } } = {}) {
+  /** Whether "Continue with Google" is offered. Google is a *consumer* identity
+   *  option and deliberately does not consume the single generic-OIDC enterprise
+   *  slot above — an installation pointed at Okta must still be able to offer it. */
+  readonly googleEnabled: boolean;
+  private constructor(dbFile: string, opts: IdentityOptions = {}) {
     this.db = new DatabaseSync(dbFile);
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
     // runs the gateway, the worker and every activity in one process, so a
@@ -89,11 +99,43 @@ export class IdentityService {
       } catch { /* a read-only or non-file database keeps its defaults */ }
     }
     this.oidcProviderId = opts.oidc?.providerId;
+    this.googleEnabled = !!opts.google;
     this.auth = betterAuth({
       appName: 'krmax',
       database: this.db,
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
+      // Native Better Auth social sign-in. No gateway route is needed: the
+      // gateway proxies /api/auth/* verbatim, so Better Auth's own
+      // POST /api/auth/sign-in/social and GET /api/auth/callback/google work as
+      // soon as this is present. Register that callback path with Google.
+      ...(opts.google ? { socialProviders: { google: {
+        clientId: opts.google.clientId,
+        clientSecret: opts.google.clientSecret,
+        // Only the default openid/email/profile scopes, and no `access_type:
+        // offline`: Google returns a refresh token only when explicitly asked,
+        // karmax needs identity and nothing else, and an unused refresh token is
+        // a long-lived secret to store and leak for no benefit.
+      } } } : {}),
+      // Account linking. A user who signed up with email+password and later
+      // clicks "Continue with Google" on the same address should land in the SAME
+      // account, not a duplicate. The merge key is the email address, so BOTH
+      // sides of it have to be trustworthy, and only one of them is settled here:
+      //
+      //  - the incoming side, via `trustedProviders`. Google asserts a verified
+      //    `email_verified`, so an address it hands us is one the signer-in
+      //    demonstrably controls. A provider that does NOT verify addresses in
+      //    this list would be an account-takeover path — a stranger registers the
+      //    victim's address there and is merged into the victim's karmax account.
+      //  - the LOCAL side is Better Auth's `requireLocalEmailVerified`, left at
+      //    its default (true) deliberately. karmax's own signup never verified
+      //    the address, so an unverified local account merely *claims* it; if
+      //    that were allowed to absorb a Google login, registering someone else's
+      //    address here would capture their Google sign-in. Which means linking
+      //    happens for a verified local account and is refused (`account_not_linked`)
+      //    otherwise — a real user-facing case that web/app.js explains on the
+      //    sign-in card rather than leaving on Better Auth's bare error page.
+      ...(opts.google ? { account: { accountLinking: { enabled: true, trustedProviders: ['google' as const] } } } : {}),
       emailAndPassword: {
         enabled: true, minPasswordLength: 10,
         // Password reset is delivered by the installation's outbound mailer. A
@@ -147,8 +189,7 @@ export class IdentityService {
     });
   }
 
-  static async open(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string;
-    oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] } } = {}): Promise<IdentityService> {
+  static async open(dbFile: string, opts: IdentityOptions = {}): Promise<IdentityService> {
     const service = new IdentityService(dbFile, opts);
     const { runMigrations } = await getMigrations(service.auth.options);
     await runMigrations();

@@ -1,0 +1,166 @@
+// "Continue with Google" is a *consumer* identity option, deliberately separate
+// from the single generic-OIDC enterprise slot (`KARMAX_OIDC_*`): that slot holds
+// exactly one provider, and an installation that points it at Okta must still be
+// able to offer Google. Native Better Auth `socialProviders.google` needs no new
+// gateway route — `/api/auth/*` is already proxied verbatim — so what actually
+// needs pinning is (a) the capability flag the console reads off /api/session,
+// (b) the authorize URL Better Auth builds, and (c) the account-linking policy,
+// which is the one setting here that can silently create a takeover path.
+//
+// A cheap file by design: no Temporal server, no worker — an in-memory identity
+// plus a directly constructed Gateway (see tests/fixtures/identity-smoke.ts).
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { describe, it, expect, afterAll } from 'vitest';
+import { IdentityService } from '../src/auth/identity.js';
+import { AuthorizationService } from '../src/platform/authorization.js';
+import { Gateway } from '../src/gateway/server.js';
+import { Store } from '../src/store/db.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
+import { KarmaxBus } from '../src/contrib/bus.js';
+import { ContributionRegistry } from '../src/contrib/registry.js';
+import { Overlays } from '../src/store/overlays.js';
+import { findFreePortFrom } from '../src/util/ports.js';
+import { WorldRegistry } from '../src/world/registry.js';
+
+const GOOGLE = { clientId: 'test-google-client-id.apps.googleusercontent.com', clientSecret: 'test-google-client-secret' };
+const OIDC = {
+  providerId: 'enterprise',
+  discoveryUrl: 'https://idp.example.com/.well-known/openid-configuration',
+  clientId: 'enterprise-client', clientSecret: 'enterprise-secret',
+};
+
+const closers: Array<() => Promise<void>> = [];
+afterAll(async () => { for (const close of closers) await close().catch(() => {}); });
+
+/** An identity + a minimally wired gateway on a free loopback port. */
+async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
+  const port = await findFreePortFrom(47990);
+  const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}`, ...opts });
+  const store = new Store(':memory:');
+  const gateway = new Gateway({
+    api: {} as any,
+    store,
+    bus: new KarmaxBus(),
+    tokens: new TokenAuthority(),
+    contributions: new ContributionRegistry(),
+    overlays: new Overlays(),
+    client: {} as any,
+    taskQueue: 'test',
+    staticDir: process.cwd(),
+    agentInfo: { provider: 'mock', reason: 'google sign-in test' },
+    identity,
+    authorization: new AuthorizationService(store),
+    worlds: new WorldRegistry(),
+  });
+  const running = await gateway.listen(port);
+  closers.push(() => running.close());
+  return { identity, base: running.url };
+}
+
+describe('Google sign-in is off unless configured', () => {
+  it('reports googleEnabled=false and google:false on /api/session', async () => {
+    const { identity, base } = await boot();
+    expect(identity.googleEnabled).toBe(false);
+    const session = await (await fetch(`${base}/api/session`)).json() as any;
+    expect(session.google).toBe(false);
+  });
+});
+
+describe('Google sign-in when configured', () => {
+  it('advertises itself on /api/session', async () => {
+    const { identity, base } = await boot({ google: GOOGLE });
+    expect(identity.googleEnabled).toBe(true);
+    const session = await (await fetch(`${base}/api/session`)).json() as any;
+    expect(session.google).toBe(true);
+  });
+
+  it('builds a Google authorize URL from the proxied Better Auth route', async () => {
+    const { base } = await boot({ google: GOOGLE });
+    // Better Auth's own endpoint — no karmax route was added for this.
+    const res = await fetch(`${base}/api/auth/sign-in/social`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'google', callbackURL: '/' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(typeof body.url).toBe('string');
+    // Assert on the URL only. Following it would be a live call to Google.
+    const url = new URL(body.url);
+    expect(url.hostname).toBe('accounts.google.com');
+    expect(url.searchParams.get('client_id')).toBe(GOOGLE.clientId);
+    expect(url.searchParams.get('state')).toBeTruthy();
+    expect(url.searchParams.get('redirect_uri')).toMatch(/\/api\/auth\/callback\/google$/);
+    // Identity only: no Drive/Calendar scope creep, and no offline access (a
+    // refresh token karmax would have to store and never uses).
+    const scopes = (url.searchParams.get('scope') ?? '').split(/[+\s]/).filter(Boolean);
+    expect(scopes.every((s) => ['openid', 'email', 'profile'].includes(s))).toBe(true);
+    expect(url.searchParams.get('access_type')).not.toBe('offline');
+  });
+
+  // Linking a Google login onto an existing email+password account is
+  // deliberately NOT unconditional, and the reason runs in BOTH directions.
+  // Google is trusted as a *source* (it asserts a verified `email_verified`, so
+  // the address it hands us is one the signer-in controls) — but the local
+  // account is the merge *target*, and karmax's own signup never verified its
+  // address. Better Auth's `requireLocalEmailVerified` default (true) is what
+  // closes that: without it a stranger could register the victim's address as a
+  // karmax password account and then absorb the victim's Google sign-in into it.
+  // So this asserts the guard is intact, not that linking always happens.
+  it('trusts Google as a link source but still requires the local address to be verified', async () => {
+    const { identity } = await boot({ google: GOOGLE });
+    const linking = identity.auth.options.account?.accountLinking;
+    expect(linking?.enabled).toBe(true);
+    expect(linking?.trustedProviders).toEqual(['google']);
+    // Not disabled: an unverified local account must not swallow a Google login.
+    expect(linking?.requireLocalEmailVerified).not.toBe(false);
+
+    // And the local half is real: karmax's signup mints a lone `credential` row
+    // and never verifies the address, so the collision case above is reachable
+    // and has to be explained to the user rather than 500-ing at them.
+    await identity.signUp({ name: 'Ada', email: 'ada@example.com', password: 'long-enough-password' });
+    const user = identity.listUsers().find((u) => u.email === 'ada@example.com');
+    expect(user).toBeTruthy();
+    expect(identity.providersForUser(user!.id)).toEqual(['credential']);
+  });
+
+  // Because that collision is reachable, the failure must land back on karmax's
+  // own sign-in card. Better Auth's default is its bare `/api/auth/error` page
+  // ("CODE: account_not_linked", plus an "Ask AI" button) — a dead end that
+  // tells the user nothing about what to do next.
+  it('sends Google failures back to the sign-in card instead of Better Auth error page', () => {
+    const app = readFileSync(fileURLToPath(new URL('../web/app.js', import.meta.url)), 'utf8');
+    expect(app).toMatch(/errorCallbackURL/);
+    // …and the card actually says what happened, naming the recoverable case.
+    expect(app).toMatch(/account_not_linked/);
+  });
+});
+
+describe('Google and enterprise OIDC coexist', () => {
+  it('keeps both slots working when both are configured', async () => {
+    const { identity, base } = await boot({ google: GOOGLE, oidc: OIDC });
+    expect(identity.googleEnabled).toBe(true);
+    expect(identity.oidcProviderId).toBe('enterprise');
+
+    const session = await (await fetch(`${base}/api/session`)).json() as any;
+    expect(session.google).toBe(true);
+    expect(session.sso).toEqual({ providerId: 'enterprise' });
+
+    // The generic-OAuth plugin is still installed and still owns its own
+    // provider id — the native Google provider did not displace it.
+    const res = await fetch(`${base}/api/auth/sign-in/social`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'google', callbackURL: '/' }),
+    });
+    expect(new URL((await res.json() as any).url).hostname).toBe('accounts.google.com');
+    // …and it still carries the enterprise client, with PKCE and issuer
+    // validation. Checked on the options rather than by calling beginSso(),
+    // because that would resolve the IdP's discovery document over the network.
+    const generic = (identity.auth.options.plugins as any[]).find((plugin) => plugin?.id === 'generic-oauth');
+    expect(generic).toBeTruthy();
+    const configured = generic.options?.config ?? generic.config;
+    expect(configured).toEqual([expect.objectContaining({
+      providerId: 'enterprise', clientId: OIDC.clientId, pkce: true, requireIssuerValidation: true,
+    })]);
+  });
+});

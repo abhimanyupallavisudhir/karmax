@@ -17,12 +17,20 @@ For the deployment topologies themselves, see `deploy/compose.turnkey.yml`
   encrypted vault keyed by `organizationId`, never in process env, or one
   tenant's setting becomes everyone's.
 
+Operator variables can also be written once to **`$KARMAX_HOME/karmax.env`**
+(`hydrateEnvFile()`, same file format as `node --env-file`; the real environment
+always wins). A managed cell gets its variables from compose and a secret
+manager, but a self-host is booted by hand with a bare `npm start` — without that
+file an operator setting lives only as long as the shell that exported it, and
+"configured" quietly means "until the next reboot".
+
 | Env var | Bucket | Notes |
 |---|---|---|
 | `KARMAX_HOME`, `KARMAX_HOST`, `KARMAX_PORT`, `KARMAX_PUBLIC_URL`, `KARMAX_PREVIEW_ORIGIN` | operator | Infrastructure and origins. |
 | `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
 | `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires a real Temporal address; managed multi-node requires S3. |
 | `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). |
+| `KARMAX_GOOGLE_CLIENT_ID`, `KARMAX_GOOGLE_CLIENT_SECRET` | operator | Optional "Continue with Google". Separate from `KARMAX_OIDC_*` deliberately: that slot holds exactly one provider, so an install pointed at its company IdP would otherwise have to choose between the two. Set both or neither — the button appears only when both are non-empty. Register `https://<your-karmax-origin>/api/auth/callback/google` as the authorized redirect URI in the Google Cloud console; Better Auth serves that path itself, so it must match `KARMAX_PUBLIC_URL` exactly. Only the default `openid`/`email`/`profile` scopes are requested and no refresh token is asked for: karmax wants an identity, not access to the user's Google data, and an unused refresh token is only a long-lived secret to leak. A Google login on an address that already has a **verified** email+password account links into it rather than creating a duplicate; on an *unverified* one it is refused (the sign-in card explains why), because karmax's signup never proved that account owns the address. Read the comment in `src/auth/identity.ts` before relaxing either half of that. |
 | `KARMAX_MAX_WFT` / `_ACT` / `_CACHED_WORKFLOWS`, `KARMAX_AGENT_*` | operator | Worker and host-admission capacity. |
 | `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | Platform defaults; already overridable per-tenant via profiles. |
 | `KARMAX_SAFE_MODE` | operator | Also a UI toggle. |
