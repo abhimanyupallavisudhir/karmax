@@ -212,6 +212,14 @@ export class IdentityService {
     return this.auth.api.changeEmail({ body: { newEmail, callbackURL }, headers, asResponse: true });
   }
 
+  async changePassword(currentPassword: string, newPassword: string, headers: Headers): Promise<Response> {
+    return this.auth.api.changePassword({
+      body: { currentPassword, newPassword, revokeOtherSessions: false },
+      headers,
+      asResponse: true,
+    });
+  }
+
   async beginSso(callbackURL: string, headers?: Headers): Promise<Response> {
     if (!this.oidcProviderId) throw new Error('enterprise SSO is not configured');
     return this.auth.api.signInWithOAuth2({ body: { providerId: this.oidcProviderId, callbackURL }, headers, asResponse: true });

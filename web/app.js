@@ -10820,9 +10820,6 @@ function profileView() {
   const email = u?.email || '';
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
   const orgs = S.organizations || [];
-  const row = (label, value) => value
-    ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
-    : '';
   // Every organization the user belongs to (owns or was added to), each linking
   // to its dashboard. Role comes from the membership loaded alongside the org.
   const orgList = orgs.length
@@ -10839,34 +10836,83 @@ function profileView() {
         <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
         <div class="profile-meta">
           <div class="profile-name">${esc(name)}</div>
-          ${email ? `<div class="profile-email">${esc(email)}</div>` : ''}
+          <div class="profile-email">Your krmax profile</div>
         </div>
       </div>
       <div class="profile-rows">
-        ${row('Name', u?.name || '')}
-        ${row('Email', email)}
-        ${row('Account', u?.id || '')}
+        ${u?.name ? `<div class="profile-row">
+          <span class="profile-row-label">Name</span>
+          <span class="profile-row-value">${esc(u.name)}</span>
+        </div>` : ''}
+        ${u ? `<div class="profile-row profile-row-action">
+          <span class="profile-row-label">Email</span>
+          <div class="profile-row-control">
+            <span class="profile-row-value">${esc(email)}</span>
+            <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
+              aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
+          </div>
+        </div>
+        <div class="profile-edit-panel" id="profile-email-panel" hidden>
+          <form id="profile-email-form">
+            <div class="profile-edit-heading">
+              <div>
+                <div class="section-h">Change email</div>
+                <p class="task-sub">Used to sign in and receive account emails.</p>
+              </div>
+            </div>
+            <label class="form-row" for="profile-email">
+              <span>New email address</span>
+              <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
+            </label>
+            <p class="profile-edit-help">${u.emailVerified
+              ? 'Your current address stays active until you confirm the link sent to the new one.'
+              : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
+            <div class="profile-edit-actions">
+              <button class="btn primary" id="profile-email-save" type="submit">Save email</button>
+              <button class="btn" type="button" data-profile-cancel>Cancel</button>
+            </div>
+          </form>
+        </div>
+        <div class="profile-row profile-row-action">
+          <span class="profile-row-label">Password</span>
+          <div class="profile-row-control">
+            <span class="profile-row-value profile-password-mask" aria-label="Password is set">********</span>
+            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="password"
+              aria-expanded="false" aria-controls="profile-password-panel">Edit</button>
+          </div>
+        </div>
+        <div class="profile-edit-panel" id="profile-password-panel" hidden>
+          <form id="profile-password-form">
+            <div class="profile-edit-heading">
+              <div>
+                <div class="section-h">Change password</div>
+                <p class="task-sub">Use at least 10 characters. Other signed-in sessions will be closed.</p>
+              </div>
+            </div>
+            <div class="profile-password-fields">
+              <label class="form-row" for="profile-current-password">
+                <span>Current password</span>
+                <input id="profile-current-password" type="password" autocomplete="current-password" required />
+              </label>
+              <label class="form-row" for="profile-new-password">
+                <span>New password</span>
+                <input id="profile-new-password" type="password" autocomplete="new-password" minlength="10" required />
+              </label>
+              <label class="form-row" for="profile-confirm-password">
+                <span>Confirm new password</span>
+                <input id="profile-confirm-password" type="password" autocomplete="new-password" minlength="10" required />
+              </label>
+            </div>
+            <p class="profile-password-error" id="profile-password-error" role="alert" aria-live="polite"></p>
+            <div class="profile-edit-actions">
+              <button class="btn primary" id="profile-password-save" type="submit">Update password</button>
+              <button class="btn" type="button" data-profile-cancel>Cancel</button>
+            </div>
+          </form>
+        </div>` : ''}
       </div>
     </div>
-    ${u ? `<div class="card">
-      <div class="profile-email-heading">
-        <div>
-          <div class="section-h">Email address</div>
-          <p class="task-sub">Used to sign in and receive account emails.</p>
-        </div>
-        <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
-      </div>
-      <div class="profile-email-form">
-        <label class="form-row" for="profile-email">
-          <span>New email</span>
-          <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
-        </label>
-        <button class="btn primary" id="profile-email-save">Change email</button>
-      </div>
-      <p class="profile-email-help">${u.emailVerified
-        ? 'Your current address stays active until you confirm the link sent to the new one.'
-        : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
-    </div>` : ''}
     <div class="card">
       <div class="section-h">Organizations</div>
       <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
@@ -10889,7 +10935,23 @@ function profileView() {
 }
 
 function wireProfileView() {
-  $('#profile-email-save')?.addEventListener('click', async () => {
+  const setProfileEditor = (kind) => {
+    document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
+      panel.hidden = panel.id !== `profile-${kind}-panel`;
+    });
+    document.querySelectorAll('[data-profile-edit]').forEach((button) => {
+      button.setAttribute('aria-expanded', button.dataset.profileEdit === kind ? 'true' : 'false');
+    });
+    if (kind) requestAnimationFrame(() => $(`#profile-${kind}-panel input`)?.focus());
+  };
+  document.querySelectorAll('[data-profile-edit]').forEach((button) => button.addEventListener('click', () => {
+    const opening = button.getAttribute('aria-expanded') !== 'true';
+    setProfileEditor(opening ? button.dataset.profileEdit : null);
+  }));
+  document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
+
+  $('#profile-email-form')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
     const input = $('#profile-email');
     const newEmail = input.value.trim();
     if (!newEmail || !input.checkValidity()) {
@@ -10920,6 +10982,50 @@ function wireProfileView() {
         : `Confirmation link sent to ${newEmail}. Your email will change after you confirm it.`);
     } catch (error) {
       toast(error.message || 'Couldn’t change the email address.', true);
+      button.disabled = false;
+    }
+  });
+  $('#profile-password-form')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const currentPassword = $('#profile-current-password').value;
+    const newPassword = $('#profile-new-password').value;
+    const confirmPassword = $('#profile-confirm-password').value;
+    const error = $('#profile-password-error');
+    error.textContent = '';
+    if (newPassword.length < 10) {
+      error.textContent = 'New password must be at least 10 characters.';
+      $('#profile-new-password').focus();
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      error.textContent = 'New passwords do not match.';
+      $('#profile-confirm-password').focus();
+      return;
+    }
+    if (newPassword === currentPassword) {
+      error.textContent = 'Choose a password different from your current one.';
+      $('#profile-new-password').focus();
+      return;
+    }
+    const button = $('#profile-password-save');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword, revokeOtherSessions: true }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || body.error || 'Couldn’t change the password.');
+      }
+      form.reset();
+      setProfileEditor(null);
+      toast('Password changed. Other signed-in sessions were closed.');
+    } catch (cause) {
+      error.textContent = cause.message || 'Couldn’t change the password.';
+    } finally {
       button.disabled = false;
     }
   });
