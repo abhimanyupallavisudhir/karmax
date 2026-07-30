@@ -931,6 +931,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
       let resumedActivityAttempt = false;
+      let activityAttempt = 1;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -938,6 +939,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let liveChannel = true;
       try {
         const actx = activityContext.current();
+        activityAttempt = actx.info.attempt;
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
         // v1 workflows cannot add the new agentTurnId argument without changing
@@ -1467,6 +1469,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             record(args.taskId, 'agent.activity', {
               ...activity,
               role: args.role,
+              attempt: activityAttempt,
               ...(args.agentTurnId ? { turnId: args.agentTurnId } : {}),
             });
           },

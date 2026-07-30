@@ -56,6 +56,29 @@ describe('websocket reconnect', () => {
   });
 });
 
+describe('profile account controls', () => {
+  it('edits the existing email row instead of rendering a second email card', () => {
+    expect(app).toContain('data-profile-edit="email"');
+    expect(app).toContain('id="profile-email-panel"');
+    expect(app).toContain('id="profile-email"');
+    expect(app).toContain("fetch('/api/auth/change-email'");
+    expect(app).toContain('Confirmation link sent to');
+    expect(app).not.toContain("row('Account'");
+    expect(css).toContain('.profile-edit-panel');
+    expect(css).not.toContain('.profile-email-form');
+  });
+
+  it('offers a masked password row and a complete change-password panel', () => {
+    expect(app).toContain('********');
+    expect(app).toContain('data-profile-edit="password"');
+    expect(app).toContain('id="profile-password-panel"');
+    expect(app).toContain('id="profile-current-password"');
+    expect(app).toContain('id="profile-new-password"');
+    expect(app).toContain('id="profile-confirm-password"');
+    expect(app).toContain("fetch('/api/auth/change-password'");
+  });
+});
+
 describe('animations', () => {
   it('defines @keyframes pulse exactly once', () => {
     expect([...css.matchAll(/@keyframes pulse(?![-\w])/g)]).toHaveLength(1);

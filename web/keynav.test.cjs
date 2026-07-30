@@ -46,6 +46,12 @@ let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
 const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
 
+// ── Quick-add guidance ──
+ok(
+  src.includes('placeholder="New Task · ↵ for full task form · Ctrl+↵ to send · Ctrl+V to paste image · (n)"'),
+  'quick-add placeholder explains its keyboard and paste shortcuts',
+);
+
 // ── parseKeybinding ──
 ok(JSON.stringify(parseKeybinding('n')) === JSON.stringify([{ key: 'n' }]), 'single key');
 ok(JSON.stringify(parseKeybinding('g t')) === JSON.stringify([{ key: 'g' }, { key: 't' }]), 'two-step chord');
