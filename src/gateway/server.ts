@@ -176,7 +176,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/agent-mail/ingest') return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
-  if (p === '/api/safe-mode') return 'safe-mode:write';
+  if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
   // like the mailbox provider. The connected secret never leaves the vault.
   if (p === '/api/email' || p.startsWith('/api/email/')) return read ? 'settings:read' : 'settings:write';
@@ -3824,6 +3824,7 @@ export class Gateway {
         return this.json(res, 200, {
           provider: config.provider, from: config.from,
           configured: this.deps.email?.configured() ?? false,
+          canManage: this.deps.tokens.check(token, 'settings:write').ok,
           providers: describeOutboundProviders(config),
         });
       }
@@ -4422,6 +4423,13 @@ export class Gateway {
       }
 
       // safe mode toggle
+      // Installation-wide: safe mode reboots the whole cell. The console renders
+      // every card for everyone, so the server has to say who may manage this —
+      // the same server-derived `canManage` the Stripe Connect card takes.
+      if (p === '/api/safe-mode' && method === 'GET') {
+        return this.json(res, 200, { safeMode: this.safeMode,
+          canManage: this.deps.tokens.check(token, 'safe-mode:write').ok });
+      }
       if (p === '/api/safe-mode' && method === 'POST') {
         const b = await this.body(req);
         this.safeMode = !!b.enabled;

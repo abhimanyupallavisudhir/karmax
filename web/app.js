@@ -9160,10 +9160,7 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
     </div>
-    <div class="card" id="resilience-card">
-      <div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
-    </div>
+    <div class="card" id="resilience-card" hidden></div>
     ${hostLocal() ? `<div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
@@ -9615,7 +9612,10 @@ async function wirePaymentProviders(box, organizationId) {
     try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
   }
   const platformBox = box.querySelector('.pay-stripe-platform');
-  if (platformBox && platform) {
+  // The shared Connect application is installation-wide. A tenant who cannot
+  // manage it has no use for a disabled copy of the operator's form.
+  if (platformBox && platform && !platform.canManage) platformBox.remove();
+  else if (platformBox && platform) {
     const status = platform.configured
       ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
       : '<span class="chip">setup required</span>';
@@ -9627,13 +9627,13 @@ async function wirePaymentProviders(box, organizationId) {
       <p class="task-sub">One Stripe Connect application identifies this krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
       <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
       <div class="settings-grid">
-        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
-        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
-        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" /></label>
+        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" /></label>
+        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
         <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
         <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
       </div>
-      ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
+      <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
       ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in krmax’s encrypted vault and makes them take precedence.</p>' : ''}
     </details>`;
     platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
@@ -10340,6 +10340,35 @@ async function wireAgentMailCard(organizationId) {
 }
 
 // ── installation-wide OUTBOUND email (operator-only; server enforces settings:write)
+// Installation-wide settings belong to whoever runs the installation. The
+// console has no capability model of its own, so each card asks its endpoint:
+// a refusal (or canManage:false) means the reader is a tenant here, and the
+// card stays absent rather than rendering a control they cannot use.
+async function hydrateInstallationCard(selector, url, fill) {
+  const card = document.querySelector(selector);
+  if (!card) return;
+  try {
+    const data = await api(url);
+    if (!data.canManage) return;
+    card.hidden = false;
+    fill(card, data);
+  } catch { /* refused: leave the card absent */ }
+}
+
+function hydrateResilienceCard() {
+  return hydrateInstallationCard('#resilience-card', '/api/safe-mode', (card, data) => {
+    S.meta.safeMode = data.safeMode;
+    card.innerHTML = `<div class="section-h">Resilience</div>
+      <div class="switch"><input type="checkbox" id="safe-mode" ${data.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>`;
+    card.querySelector('#safe-mode').addEventListener('change', async (e) => {
+      try {
+        const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
+        S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
+      } catch (err) { toast(err.message, true); }
+    });
+  });
+}
+
 function outboundEmailCard() {
   return `<div class="card" id="outbound-email-card">
     <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
@@ -10369,7 +10398,8 @@ async function wireOutboundEmailCard() {
   if (!card) return;
   let data;
   try { data = await api('/api/email'); }
-  catch { card.style.display = 'none'; return; } // no settings:write → hide entirely
+  catch { card.remove(); return; } // refused the read → not this reader's setting
+  if (!data.canManage) return void card.remove(); // installation-wide: operator only
   const providerSel = $('#oe-provider');
   const helpEl = $('#oe-help');
   const applyProvider = () => {
@@ -10675,6 +10705,7 @@ async function hydrateAuthorization(scope, projectId) {
 
 function wireGlobalSettings(organizationId) {
   if (hostLocal()) hydratePhoneAccess();
+  hydrateResilienceCard();
   wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
@@ -10798,9 +10829,6 @@ function wireGlobalSettings(organizationId) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#safe-mode')?.addEventListener('change', async (e) => {
-    try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
-  });
 }
 
 // ── inbox + collaboration ───────────────────────────────────────────────────

@@ -104,5 +104,20 @@ for (const l of lines.filter((l) => l.includes('use the host’s own Git setup')
   ok(/S\.meta\?\.hosted/.test(src.slice(src.indexOf(l) - 400, src.indexOf(l) + 200)),
     'the "inherits the host git setup" empty state is not claimed on a managed cell');
 
+// ── installation-wide settings are absent unless the server says you own them ─
+// The console has no capability model, so each of these asks its endpoint and
+// stays absent on a refusal or canManage:false. Deployment mode is NOT the lever:
+// outbound email has no env path, so hiding it on `hosted` would leave a SaaS
+// operator no way to configure email at all.
+ok(/id="resilience-card" hidden/.test(src), 'the safe-mode card starts hidden and is revealed by the server');
+ok(/hydrateInstallationCard\('#resilience-card', '\/api\/safe-mode'/.test(src),
+  'safe mode is hydrated through the shared installation-card helper');
+ok(/if \(!data\.canManage\) return void card\.remove\(\)/.test(src),
+  'outbound email is removed when the reader may not manage it');
+ok(/!platform\.canManage\) platformBox\.remove\(\)/.test(src),
+  'the shared Stripe Connect card is removed rather than shown disabled');
+// The disabled-input fallbacks are unreachable once the card is removed.
+ok(!src.includes("platform.canManage ? '' : 'disabled'"), 'no dead disabled-input branches remain');
+
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
