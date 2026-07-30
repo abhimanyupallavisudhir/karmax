@@ -60,6 +60,7 @@ const S = {
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
   approvalRequests: [], // credential decisions for the selected task
+  permissionRequests: [], // exact capability elevations requested by the selected task
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
@@ -4517,6 +4518,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.paramDefaults = {};
   S.attemptGroup = null;
   S.approvalRequests = [];
+  S.permissionRequests = [];
   S.approvalItems = [];
   try {
     // Start secondary resources in parallel, but let the compact task projection
@@ -4533,6 +4535,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
       draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
+      draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
@@ -4544,7 +4547,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts, approvalRequests, approvalItems] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems] = await details;
     if (S.selected !== taskId) return;
     // Events may have arrived over the websocket while the bounded durable window
     // was loading. Preserve those instead of replacing them with the older response.
@@ -4557,6 +4560,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.sessions = sessions;
     S.attemptGroup = attempts;
     S.approvalRequests = approvalRequests;
+    S.permissionRequests = permissionRequests;
     S.approvalItems = approvalItems;
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
@@ -4585,12 +4589,13 @@ async function refreshTask() {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const [view, widgets, sessions, attempts, approvalRequests, approvalItems] = await Promise.all([
+    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
+      api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
     // The user may have opened another task while this websocket-driven refresh
@@ -4605,6 +4610,7 @@ async function refreshTask() {
     S.sessions = sessions;
     S.attemptGroup = attempts;
     S.approvalRequests = approvalRequests;
+    S.permissionRequests = permissionRequests;
     S.approvalItems = approvalItems;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
@@ -5022,14 +5028,21 @@ function taskTabBody(v, tab) {
 }
 
 function approvalRequestsTab(v) {
-  const pending = S.approvalRequests.filter((request) => request.status === 'pending').length;
+  const pending = [...S.approvalRequests, ...S.permissionRequests]
+    .filter((request) => request.status === 'pending').length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
-        <p class="task-sub">Credential decisions raised by this task. Approving or denying one automatically resumes the agent.</p></div>
+        <p class="task-sub">Credential and permission decisions raised by this task. A decision automatically resumes the agent.</p></div>
       ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
     </div>
-    <div class="approval-list">${credentialRequestRows(S.approvalRequests, S.approvalItems, { historyLimit: 20 })}</div>
+    <div class="approval-list">
+      ${permissionRequestRows(S.permissionRequests)}
+      ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
+        historyLimit: 20,
+        showEmpty: !S.permissionRequests.length,
+      })}
+    </div>
   </div>`;
 }
 
@@ -5037,6 +5050,9 @@ function wireTaskApprovalRequests(v) {
   const rec = taskRecord(v.taskId);
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
   wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+  });
+  wirePermissionRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
     await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
   });
 }
@@ -9786,7 +9802,7 @@ function credentialRequestTaskLink(request) {
     : `<span>${esc(label)}</span>`;
 }
 
-function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
+function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
@@ -9809,7 +9825,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
           <button class="btn sm" data-vreq-act="deny">Deny</button>
         </div>
       </div>`).join('')
-    : '<div class="approval-empty">No pending approval requests.</div>';
+    : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
@@ -9817,6 +9833,55 @@ function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
+}
+
+function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const pendingHtml = pending.map((request) => `<div class="approval-request" data-preq="${esc(request.id)}">
+    <div class="approval-request-main">
+      <div class="approval-request-title">${esc(request.role || 'task')} agent permission
+        <span class="chip approval-needed">approval needed</span>
+      </div>
+      <div class="approval-request-caps">${request.capabilities.map((capability) =>
+        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
+      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.</div>
+    </div>
+    <div class="approval-request-actions">
+      <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
+      <button class="btn sm" data-preq-act="deny">Deny</button>
+    </div>
+  </div>`).join('');
+  const history = recent.length
+    ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+        <span class="mono">${request.capabilities.map(esc).join(', ')}</span>
+        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+    : '';
+  return pendingHtml + history;
+}
+
+function wirePermissionRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-preq]').forEach((row) => row.querySelectorAll('[data-preq-act]').forEach((button) =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const result = await api(`/api/permission-requests/${row.dataset.preq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+          method: 'POST',
+          body: JSON.stringify({ action: button.dataset.preqAct }),
+        });
+        const decision = button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+          : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
+        !result.resume?.resumed && !!result.resume?.reason);
+        await onResolved?.(result);
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message, true);
+      }
+    })));
 }
 
 function wireCredentialRequestActions(root, organizationId, onResolved) {

@@ -45,6 +45,7 @@ export interface PlatformOps {
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
   escalateToHuman(a: { audience: string[]; message: string }): Promise<unknown>;
+  requestPermission(a: { capabilities: string[]; audience: string[]; reason: string }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
@@ -101,6 +102,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role) => void (await api.signalTask(getToken(), id, sig as any, text, role)),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
+    requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
@@ -185,6 +187,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
+    requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
@@ -395,6 +398,23 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       },
     },
     async (a) => wrap(() => ops.escalateToHuman(a)),
+  );
+  server.registerTool(
+    'request_permission',
+    {
+      description:
+        'Request exact missing Karmax capabilities for this task. The request appears in the task Approval Requests tab ' +
+        'and is routed to selected people or teams. Audience selectors: user:<id>, @team:<slug>, @creator, @owners, ' +
+        '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
+        'Only a selected human who already holds every requested capability can approve; approval resumes the task ' +
+        'with a newly scoped token. Do not request wildcards.',
+      inputSchema: {
+        capabilities: z.array(z.string().trim().min(1)).min(1).max(32),
+        audience: z.array(z.string().trim().min(1)).min(1).max(32),
+        reason: z.string().trim().min(1).max(4_000),
+      },
+    },
+    async (a) => wrap(() => ops.requestPermission(a)),
   );
   server.registerTool(
     'request_agent_action',

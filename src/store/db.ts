@@ -866,7 +866,8 @@ export class Store {
    * have been removed by the service layer. Billing rows are retained but
    * detached from deleted resource identifiers. */
   deleteProject(id: string): void {
-    if (!this.getProject(id)) throw new Error('project not found');
+    const project = this.getProject(id);
+    if (!project) throw new Error('project not found');
     const tasks = selectRows(this.db, 'tasks', 'projectId=?', [id]);
     const taskIds = tasks.map((row) => String(row.id));
     const intentIds = tasks.map((row) => String(row.intentId)).filter(Boolean);
@@ -909,6 +910,7 @@ export class Store {
       deleteRows(this.db, 'resource_leases', 'attachmentId', resourceIds);
       deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
       this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
+      this.deletePermissionRequestKv(project.organizationId, taskIds);
       this.deleteProjectKv([id], taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id);
@@ -1128,6 +1130,7 @@ export class Store {
       deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'attachment_scopes', 'projectId', projectIds);
+      this.deletePermissionRequestKv(organizationId, taskIds);
       this.deleteProjectKv(projectIds, taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         deleteRows(this.db, table, 'projectId', projectIds);
@@ -2229,6 +2232,10 @@ export class Store {
       this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId);
       this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId);
       this.db.prepare('DELETE FROM world_instances WHERE worldId = ?').run(taskId);
+      this.deletePermissionRequestKv(
+        prior ? this.getProject(prior.projectId)?.organizationId : undefined,
+        [taskId],
+      );
       this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
       this.db.exec('COMMIT');
     } catch (error) {
@@ -2457,12 +2464,12 @@ export class Store {
     const task = this.getTaskShallow(ev.taskId);
     const project = task && this.getProject(task.projectId);
     if (!task || !project?.organizationId) return;
-    if (ev.type === 'credential.approval-resolved') {
+    if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved') {
       const requestId = String(ev.payload.requestId ?? '');
       if (requestId) {
         this.db.prepare(`UPDATE inbox SET unread=0, actionable=0, readAt=?
           WHERE taskId=? AND kind='approval-requested' AND eventSeq IN (
-            SELECT seq FROM events WHERE taskId=? AND type='credential.approval-requested'
+            SELECT seq FROM events WHERE taskId=? AND type IN ('credential.approval-requested', 'permission.approval-requested')
               AND json_extract(payload, '$.requestId')=?
           )`).run(ev.ts, task.id, task.id, requestId);
       }
@@ -2485,6 +2492,9 @@ export class Store {
       // remain a deterministic resolver for automated/delegated tasks.
       for (const member of this.listOrganizationMemberships(project.organizationId))
         if (member.role === 'owner') users.push(member.userId);
+    } else if (ev.type === 'permission.approval-requested') {
+      kind = 'approval-requested'; actionable = true;
+      users = Array.isArray(ev.payload.recipients) ? ev.payload.recipients.map(String) : [];
     } else if (isReviewEvent(ev.type) || (ev.type === 'view.updated' && (ev.payload.status === 'waiting' || ev.payload.stage === 'review'))) {
       kind = 'review-requested'; actionable = true; users = this.reviewAudience(task);
     } else if (ev.type.includes('escalat') || ev.payload.waitingFor === 'human') {
@@ -2898,8 +2908,30 @@ export class Store {
       prefix.run(workflowPrefix, workflowPrefix);
     }
     for (const taskId of taskIds) {
-      for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`]) exact.run(key);
+      for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
+        `permission:grant:${taskId}`]) exact.run(key);
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`]) prefix.run(value, value);
+    }
+  }
+
+  private deletePermissionRequestKv(organizationId: string | undefined, taskIds: string[]): void {
+    if (!taskIds.length) return;
+    const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
+    for (const taskId of taskIds) exact.run(`permission:grant:${taskId}`);
+    if (!organizationId) return;
+    const key = `permission:requests:${organizationId}`;
+    const raw = this.kvGet(key);
+    if (!raw) return;
+    try {
+      const removed = new Set(taskIds);
+      const requests = JSON.parse(raw);
+      if (!Array.isArray(requests)) return;
+      const remaining = requests.filter((request) => !removed.has(String(request?.taskId ?? '')));
+      if (remaining.length) this.kvSet(key, JSON.stringify(remaining));
+      else exact.run(key);
+    } catch {
+      // Leave malformed metadata available for diagnostics instead of masking it
+      // with an unrelated task/project deletion.
     }
   }
 

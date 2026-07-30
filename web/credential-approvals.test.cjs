@@ -33,7 +33,7 @@ global.taskRecord = () => undefined;
 global.projectById = (id) => id === 'project_1' ? { id, name: 'App' } : undefined;
 global.projectBase = () => '/personal/app';
 
-for (const name of ['credentialRequestTaskLink', 'credentialRequestRows', 'defaultTaskTab']) eval(extractFn(name));
+for (const name of ['credentialRequestTaskLink', 'credentialRequestRows', 'permissionRequestRows', 'defaultTaskTab']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -57,6 +57,24 @@ const rows = credentialRequestRows([request], [{ id: 'vi_1', label: 'Example log
 ok(rows.includes('Example login') && rows.includes('sign in'), 'request row explains the item and reason');
 ok(rows.includes('data-vreq-act="once"') && rows.includes('data-vreq-act="always"'), 'request row exposes the decision scopes');
 ok(!rows.includes('tell the agent'), 'request UI never asks the human to perform a mechanical retry');
+
+const permission = {
+  id: 'preq_1',
+  type: 'permission',
+  taskId: 'task_opaque',
+  capabilities: ['settings:read', 'settings:write'],
+  audience: ['@team:operators'],
+  reason: 'configure outbound email',
+  status: 'pending',
+  task: request.task,
+};
+const permissionRows = permissionRequestRows([permission]);
+ok(permissionRows.includes('settings:read') && permissionRows.includes('settings:write'),
+  'permission request row names every exact capability');
+ok(permissionRows.includes('@team:operators') && permissionRows.includes('configure outbound email'),
+  'permission request row explains its audience and reason');
+ok(permissionRows.includes('data-preq-act="approve"') && permissionRows.includes('data-preq-act="deny"'),
+  'permission request row exposes approve and deny decisions');
 
 ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'approvals', 'a task needing approval opens its dedicated tab');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');

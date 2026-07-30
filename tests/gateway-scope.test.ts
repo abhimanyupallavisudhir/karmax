@@ -12,6 +12,7 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
+import { PermissionRequests } from '../src/platform/permission-requests.js';
 
 /**
  * The gateway half of the tag/view scope hole.
@@ -29,6 +30,7 @@ import { findFreePortFrom } from '../src/util/ports.js';
 describe('gateway request scope for bare-id routes', () => {
   let home: string;
   let store: Store;
+  let tokens: TokenAuthority;
   let base: string;
   let close: () => Promise<void>;
   let mine: string;
@@ -42,7 +44,7 @@ describe('gateway request scope for bare-id routes', () => {
   beforeAll(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-scope-'));
     store = new Store(':memory:');
-    const tokens = new TokenAuthority();
+    tokens = new TokenAuthority();
     const acme = store.createOrganization({ name: 'Acme', ownerUserId: 'a' });
     const other = store.createOrganization({ name: 'Other', ownerUserId: 'b' });
     mine = store.createProject('Mine', {}, acme.id).id;
@@ -98,6 +100,80 @@ describe('gateway request scope for bare-id routes', () => {
     });
     expect(ok.status).toBe(200);
     expect(store.getTag(own.id)?.name).toBe('defect');
+  });
+
+  it('serves routed permission requests in Approval Requests and enforces the approver capability', async () => {
+    const task = store.createTask({
+      projectId: mine,
+      title: 'Configure email',
+      workflow: 'software-dev',
+      workflowVersion: '1.9.0',
+      params: { prompt: 'inspect email' },
+      createdBy: { kind: 'user', userId: 'a' },
+    });
+    store.saveView(task.id, {
+      taskId: task.id,
+      title: task.title,
+      workflow: task.workflow,
+      stage: 'do',
+      status: 'active',
+      messages: [],
+      actions: [],
+      state: {},
+      updatedAt: Date.now(),
+    });
+    const agent = tokens.mint({
+      taskId: task.id,
+      profileId: 'do-default',
+      role: 'do',
+      principal: 'user:a',
+      projectId: mine,
+      organizationId: store.getProject(mine)!.organizationId,
+      ceiling: ['task:escalate'],
+      grantorCaps: ['task:escalate'],
+    }).token;
+    const requested: any = await (await fetch(`${base}/api/agent/permission-requests`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        capabilities: ['settings:read'],
+        audience: ['@creator'],
+        reason: 'Inspect outbound email configuration.',
+      }),
+    })).json();
+    expect(requested).toMatchObject({ status: 'needs_approval', capabilities: ['settings:read'] });
+
+    const approver = tokens.mintPrincipal(
+      'user:a',
+      ['task:read', 'settings:read'],
+      mine,
+      60_000,
+      store.getProject(mine)!.organizationId,
+    ).token;
+    const listed: any = await (await fetch(
+      `${base}/api/permission-requests?taskId=${task.id}&organizationId=${store.getProject(mine)!.organizationId}`,
+      { headers: { authorization: `Bearer ${approver}` } },
+    )).json();
+    expect(listed).toEqual([
+      expect.objectContaining({
+        id: requested.requestId,
+        type: 'permission',
+        role: 'do',
+        task: expect.objectContaining({ id: task.id, title: task.title }),
+      }),
+    ]);
+
+    const resolved = await fetch(
+      `${base}/api/permission-requests/${requested.requestId}/resolve?organizationId=${store.getProject(mine)!.organizationId}`,
+      {
+        method: 'POST',
+        headers: { authorization: `Bearer ${approver}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'approve' }),
+      },
+    );
+    expect(resolved.status).toBe(200);
+    expect(new PermissionRequests(store, store.getProject(mine)!.organizationId!).extensionCaps(task.id, 'do'))
+      .toEqual(['settings:read']);
   });
 
   it('refuses PATCH/DELETE/reorder /api/views/:id across a project and tenant boundary', async () => {
