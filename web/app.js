@@ -6517,7 +6517,9 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       // Compact inline chip: the kind is obvious from the label (a login is
       // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
       const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
-      const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
+      const label = c.kind === 'ambient'
+        ? (hostLocal() ? ambientHomes[c.provider] : `${c.provider} login on this krmax`) || `ambient ${c.provider}`
+        : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
       return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
@@ -8542,7 +8544,7 @@ async function hydrateProjectData(proj) {
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
       const files = [...$('#data-files').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a host path or a browser folder, not both', true);
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a path or a browser folder, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
@@ -10022,7 +10024,7 @@ function passwordsCard() {
     </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
-      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on the machine running krmax, then Import.')}</div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
     <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
@@ -11252,7 +11254,7 @@ async function hydrateOrganizationView() {
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so krmax refreshes repository access when you ask instead of using webhooks.'}</p>
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
+    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access.${hostLocal() ? ' On localhost, setup works without a webhook and repository access is refreshed on demand.' : ''}</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);

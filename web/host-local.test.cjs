@@ -84,5 +84,23 @@ ok(src.indexOf('id="phone-access-card"') > gateStart && src.indexOf('id="phone-a
 ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess()')),
   'the Phone Access status is not fetched when the endpoint is withdrawn');
 
+// ── wording that only holds on the machine running karmax ───────────────────
+// "On localhost, setup works without a webhook" is a claim about THIS install's
+// reachability. It is stated before the GitHub App exists, so the server's
+// derived syncMode is still 'on-demand' either way and cannot carry it.
+for (const l of lines.filter((l) => l.includes('On localhost, setup works')))
+  ok(l.includes('hostLocal()'), 'the GitHub App localhost note is gated on hostLocal()');
+
+// An ambient login is the config home karmax itself found. Naming it `~/.claude`
+// is only meaningful to someone looking at that filesystem.
+ok(lines.some((l) => l.includes('ambientHomes[c.provider]') && l.includes('hostLocal()')),
+  'an ambient login is labelled by host path only on the host');
+
+// Neither of these should still say "host path"/"this host" as if the reader
+// were sitting at it.
+for (const [marker, what] of [['Choose a host path', 'the data-import conflict toast'],
+  ['Connect the store CLI on this host', 'the password-manager tooltip']])
+  ok(!src.includes(marker), `${what} no longer addresses the reader as the host`);
+
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
