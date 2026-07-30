@@ -60,6 +60,7 @@ const S = {
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
   approvalRequests: [], // credential decisions for the selected task
+  permissionRequests: [], // exact capability elevations requested by the selected task
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
@@ -1410,7 +1411,8 @@ function renderMarkdown(src, opts = {}) {
   const withMath = !!opts.math;
   const stash = [];
   const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
-  let s = String(src ?? '').replace(/\r\n?/g, '\n');
+  const source = String(src ?? '').replace(/\r\n?/g, '\n');
+  let s = source;
   // Fenced code blocks first (a blank line around the placeholder keeps it its
   // own block).
   s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
@@ -1419,7 +1421,51 @@ function renderMarkdown(src, opts = {}) {
   s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
   if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
   let html = mdBlocks(s, stash);
-  return html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+  html = html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+  return sanitizeMarkdownHtml(html, source);
+}
+
+// Parse the renderer's output in a detached fragment before it becomes part of
+// the page. Besides enforcing the renderer's small element/attribute allowlist,
+// this makes the browser repair and close any accidentally malformed formatting
+// tags *inside this message*. Formatting-element recovery can otherwise carry an
+// unclosed <strong>/<em> through later siblings, affecting subsequent messages
+// and even controls outside the conversation. Raw message text was escaped
+// before rendering; if the allowlist ever fails, fall back to escaped text.
+function sanitizeMarkdownHtml(html, source) {
+  if (typeof document === 'undefined' || !document.createElement) return html;
+  const fallback = () => esc(source).replace(/\n/g, '<br>');
+  try {
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    const allowedTags = new Set([
+      'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+      'HR', 'LI', 'OL', 'P', 'PRE', 'SPAN', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH',
+      'THEAD', 'TR', 'UL',
+    ]);
+    for (const el of template.content.querySelectorAll('*')) {
+      if (!allowedTags.has(el.tagName)) return fallback();
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value;
+        if (name === 'class') continue;
+        if (el.tagName === 'A' && name === 'href') {
+          if (!/^(?:https?:|mailto:|\/|#)/i.test(value)) return fallback();
+          continue;
+        }
+        if (el.tagName === 'A' && name === 'target' && value === '_blank') continue;
+        if (el.tagName === 'A' && name === 'rel' && value === 'noopener noreferrer') continue;
+        if (el.tagName === 'A' && name === 'data-md-local') continue;
+        if (el.tagName === 'OL' && name === 'start' && /^-?\d+$/.test(value)) continue;
+        if ((el.tagName === 'TH' || el.tagName === 'TD') && name === 'style'
+          && /^text-align:\s*(?:left|center|right);?$/i.test(value)) continue;
+        return fallback();
+      }
+    }
+    return template.innerHTML;
+  } catch {
+    return fallback();
+  }
 }
 
 function mdBlocks(s, stash) {
@@ -1614,6 +1660,21 @@ function mdInline(t) {
   // emphasis/link passes treat it as a literal, then restore it at the very end.
   const lit = [];
   x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+  // Generated anchors must not go through the emphasis regexes: doing so lets
+  // Markdown punctuation in a URL rewrite the generated href attribute. Keep
+  // each complete anchor behind an opaque placeholder until formatting is done.
+  const links = [];
+  const keepLink = (html) => `\u0002${links.push(html) - 1}\u0002`;
+  const format = (value) => {
+    let out = value;
+    out = out.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+    out = out.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+    out = out.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
+    return out.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  };
   // Inline links [text](url "optional title") — safe schemes only; the title is
   // dropped. Runs before autolinking so a bare URL inside a link is left alone.
   // A scheme-less relative target (no ":" — so `javascript:`/`data:` are
@@ -1622,26 +1683,30 @@ function mdInline(t) {
   // page, while it stays inert (href="#") everywhere else.
   x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
     if (/^(https?:|mailto:|\/)/i.test(href))
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
-    if (href[0] === '#') return `<a href="${href}">${txt}</a>`;
-    if (!/:/.test(href)) return `<a href="#" data-md-local="${href}">${txt}</a>`;
-    return `<a href="#" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+      return keepLink(`<a href="${href}" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
+    if (href[0] === '#') return keepLink(`<a href="${href}">${format(txt)}</a>`);
+    if (!/:/.test(href)) return keepLink(`<a href="#" data-md-local="${href}">${format(txt)}</a>`);
+    return keepLink(`<a href="#" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
   });
-  // Autolink bare http(s) URLs not already part of a link/attribute (only when
-  // preceded by start-of-string, whitespace or an opening paren). Trailing
-  // sentence punctuation is left outside the link.
-  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, url) => {
+  // Autolink bare http(s) URLs (explicit links are opaque placeholders now).
+  // A closing emphasis marker adjacent to the URL belongs to the surrounding
+  // Markdown when the matching opener occurs before it. Strip that delimiter
+  // first, then ordinary sentence punctuation, and keep both outside the anchor.
+  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, matchedUrl, offset, input) => {
+    let url = matchedUrl;
+    let markdownTail = '';
+    const marker = (url.match(/(\*{1,3}|_{1,3}|~~)$/) || [])[1];
+    const before = input.slice(0, offset + pre.length);
+    if (marker && before.includes(marker)) {
+      url = url.slice(0, -marker.length);
+      markdownTail = marker;
+    }
     const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
     const bare = url.slice(0, url.length - tail.length);
-    return `${pre}<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>${tail}`;
+    return `${pre}${keepLink(`<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>`)}${tail}${markdownTail}`;
   });
-  x = x.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
-  x = x.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
-  x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
-  x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
-  x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
-  x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
-  x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  x = format(x);
+  x = x.replace(/\u0002(\d+)\u0002/g, (_, n) => links[Number(n)] ?? '');
   x = x.replace(/\u0001(\d+)\u0001/g, (_, n) => lit[Number(n)]);
   return x;
 }
@@ -2174,13 +2239,17 @@ function verificationBanner() {
   return `<div class="verify-banner" id="verify-banner">
     <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
     <button class="btn sm" id="verify-resend">Resend link</button>
+    <a class="btn sm" data-spa href="${globalRoute('profile')}">Change email</a>
     <button class="verify-dismiss" id="verify-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
   </div>`;
 }
 
 // One failure, one message: a network error and a rejecting server are the same
-// thing to the person clicking Resend.
-const EMAIL_SEND_FAILED = 'Couldn’t send the email. Outbound email may not be set up.';
+// thing to the person clicking Resend. Cause-neutral on purpose — this used to
+// blame outbound email not being set up, which sent someone hunting through
+// settings that were already correct when the real answer was that the sending
+// domain was unverified at the provider. The server log names the cause.
+const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';
 
 function wireVerificationBanner() {
   $('#verify-resend')?.addEventListener('click', async () => {
@@ -2747,7 +2816,7 @@ function tasksView() {
       : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
+      <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send · Ctrl+V to paste image · (n)" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.draft}</button>
       <button class="btn icon-only" id="expand-task" title="More fields ( N or ↵ )" aria-label="More fields">${ICON.more}</button>
@@ -4523,6 +4592,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.paramDefaults = {};
   S.attemptGroup = null;
   S.approvalRequests = [];
+  S.permissionRequests = [];
   S.approvalItems = [];
   try {
     // Start secondary resources in parallel, but let the compact task projection
@@ -4539,6 +4609,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
       draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
+      draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
@@ -4550,7 +4621,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts, approvalRequests, approvalItems] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems] = await details;
     if (S.selected !== taskId) return;
     // Events may have arrived over the websocket while the bounded durable window
     // was loading. Preserve those instead of replacing them with the older response.
@@ -4563,6 +4634,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.sessions = sessions;
     S.attemptGroup = attempts;
     S.approvalRequests = approvalRequests;
+    S.permissionRequests = permissionRequests;
     S.approvalItems = approvalItems;
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
@@ -4591,12 +4663,13 @@ async function refreshTask() {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const [view, widgets, sessions, attempts, approvalRequests, approvalItems] = await Promise.all([
+    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
+      api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
     // The user may have opened another task while this websocket-driven refresh
@@ -4611,6 +4684,7 @@ async function refreshTask() {
     S.sessions = sessions;
     S.attemptGroup = attempts;
     S.approvalRequests = approvalRequests;
+    S.permissionRequests = permissionRequests;
     S.approvalItems = approvalItems;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
@@ -5028,14 +5102,21 @@ function taskTabBody(v, tab) {
 }
 
 function approvalRequestsTab(v) {
-  const pending = S.approvalRequests.filter((request) => request.status === 'pending').length;
+  const pending = [...S.approvalRequests, ...S.permissionRequests]
+    .filter((request) => request.status === 'pending').length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
-        <p class="task-sub">Credential decisions raised by this task. Approving or denying one automatically resumes the agent.</p></div>
+        <p class="task-sub">Credential and permission decisions raised by this task. A decision automatically resumes the agent.</p></div>
       ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
     </div>
-    <div class="approval-list">${credentialRequestRows(S.approvalRequests, S.approvalItems, { historyLimit: 20 })}</div>
+    <div class="approval-list">
+      ${permissionRequestRows(S.permissionRequests)}
+      ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
+        historyLimit: 20,
+        showEmpty: !S.permissionRequests.length,
+      })}
+    </div>
   </div>`;
 }
 
@@ -5043,6 +5124,9 @@ function wireTaskApprovalRequests(v) {
   const rec = taskRecord(v.taskId);
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
   wireCredentialRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+  });
+  wirePermissionRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
     await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
   });
 }
@@ -5827,14 +5911,38 @@ function conversationPane(v, t) {
 function conversationEntries(t) {
   const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
+  // A Temporal activity retry continues the same logical turn, so provider item
+  // ids (especially the synthetic `turn` id) repeat. Keep attempts distinct:
+  // otherwise the resumed `started` event overwrites the prior `failed` event
+  // and inherits its error detail, producing the contradictory
+  // "Agent started working · API Error: 529" row seen on task #353.
+  //
+  // New events carry an explicit attempt number. Infer a generation for older
+  // histories so already-running tasks repair themselves after this UI ships.
+  const legacyGenerations = new Map();
   for (const event of updates) {
     const activity = event.payload || {};
     const turn = activity.turnId || `legacy-${event.seq || event.ts}`;
-    const key = `${turn}/${activity.id || event.seq || event.ts}`;
+    const item = activity.id || event.seq || event.ts;
+    const base = `${turn}/${item}`;
+    let attempt = activity.attempt;
+    let retry = Number(attempt) > 1;
+    if (attempt == null) {
+      let generation = legacyGenerations.get(base) || 1;
+      const prior = activities.get(`${base}/legacy-${generation}`);
+      if (activity.phase === 'started' && ['completed', 'failed'].includes(prior?.activity?.phase)) generation++;
+      legacyGenerations.set(base, generation);
+      attempt = `legacy-${generation}`;
+      retry = generation > 1;
+    }
+    const key = `${base}/${attempt}`;
     const prior = activities.get(key);
+    const displayed = retry && activity.kind === 'turn' && activity.phase === 'started'
+      ? { ...activity, title: 'Agent retry started', detail: undefined }
+      : activity;
     activities.set(key, {
       type: 'activity',
-      activity: { ...(prior?.activity || {}), ...activity },
+      activity: { ...(prior?.activity || {}), ...displayed },
       ts: prior?.ts || event.ts,
       sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,
@@ -9792,7 +9900,7 @@ function credentialRequestTaskLink(request) {
     : `<span>${esc(label)}</span>`;
 }
 
-function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
+function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
@@ -9815,7 +9923,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
           <button class="btn sm" data-vreq-act="deny">Deny</button>
         </div>
       </div>`).join('')
-    : '<div class="approval-empty">No pending approval requests.</div>';
+    : showEmpty ? '<div class="approval-empty">No pending approval requests.</div>' : '';
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
@@ -9823,6 +9931,55 @@ function credentialRequestRows(requests, items, { historyLimit = 5 } = {}) {
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;
+}
+
+function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const pendingHtml = pending.map((request) => `<div class="approval-request" data-preq="${esc(request.id)}">
+    <div class="approval-request-main">
+      <div class="approval-request-title">${esc(request.role || 'task')} agent permission
+        <span class="chip approval-needed">approval needed</span>
+      </div>
+      <div class="approval-request-caps">${request.capabilities.map((capability) =>
+        `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
+      <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
+      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.</div>
+    </div>
+    <div class="approval-request-actions">
+      <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
+      <button class="btn sm" data-preq-act="deny">Deny</button>
+    </div>
+  </div>`).join('');
+  const history = recent.length
+    ? `<div class="approval-history"><div class="section-h">Recent permission decisions</div>${recent.map((request) =>
+      `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+        <span class="mono">${request.capabilities.map(esc).join(', ')}</span>
+        <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
+    : '';
+  return pendingHtml + history;
+}
+
+function wirePermissionRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-preq]').forEach((row) => row.querySelectorAll('[data-preq-act]').forEach((button) =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const result = await api(`/api/permission-requests/${row.dataset.preq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+          method: 'POST',
+          body: JSON.stringify({ action: button.dataset.preqAct }),
+        });
+        const decision = button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        toast(result.resume?.resumed ? `${decision} — task resumed automatically`
+          : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
+        !result.resume?.resumed && !!result.resume?.reason);
+        await onResolved?.(result);
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message, true);
+      }
+    })));
 }
 
 function wireCredentialRequestActions(root, organizationId, onResolved) {
@@ -10734,9 +10891,6 @@ function profileView() {
   const email = u?.email || '';
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
   const orgs = S.organizations || [];
-  const row = (label, value) => value
-    ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
-    : '';
   // Every organization the user belongs to (owns or was added to), each linking
   // to its dashboard. Role comes from the membership loaded alongside the org.
   const orgList = orgs.length
@@ -10753,13 +10907,81 @@ function profileView() {
         <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
         <div class="profile-meta">
           <div class="profile-name">${esc(name)}</div>
-          ${email ? `<div class="profile-email">${esc(email)}</div>` : ''}
+          <div class="profile-email">Your krmax profile</div>
         </div>
       </div>
       <div class="profile-rows">
-        ${row('Name', u?.name || '')}
-        ${row('Email', email)}
-        ${row('Account', u?.id || '')}
+        ${u?.name ? `<div class="profile-row">
+          <span class="profile-row-label">Name</span>
+          <span class="profile-row-value">${esc(u.name)}</span>
+        </div>` : ''}
+        ${u ? `<div class="profile-row profile-row-action">
+          <span class="profile-row-label">Email</span>
+          <div class="profile-row-control">
+            <span class="profile-row-value">${esc(email)}</span>
+            <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
+              aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
+          </div>
+        </div>
+        <div class="profile-edit-panel" id="profile-email-panel" hidden>
+          <form id="profile-email-form">
+            <div class="profile-edit-heading">
+              <div>
+                <div class="section-h">Change email</div>
+                <p class="task-sub">Used to sign in and receive account emails.</p>
+              </div>
+            </div>
+            <label class="form-row" for="profile-email">
+              <span>New email address</span>
+              <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
+            </label>
+            <p class="profile-edit-help">${u.emailVerified
+              ? 'Your current address stays active until you confirm the link sent to the new one.'
+              : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
+            <div class="profile-edit-actions">
+              <button class="btn primary" id="profile-email-save" type="submit">Save email</button>
+              <button class="btn" type="button" data-profile-cancel>Cancel</button>
+            </div>
+          </form>
+        </div>
+        <div class="profile-row profile-row-action">
+          <span class="profile-row-label">Password</span>
+          <div class="profile-row-control">
+            <span class="profile-row-value profile-password-mask" aria-label="Password is set">********</span>
+            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="password"
+              aria-expanded="false" aria-controls="profile-password-panel">Edit</button>
+          </div>
+        </div>
+        <div class="profile-edit-panel" id="profile-password-panel" hidden>
+          <form id="profile-password-form">
+            <div class="profile-edit-heading">
+              <div>
+                <div class="section-h">Change password</div>
+                <p class="task-sub">Use at least 10 characters. Other signed-in sessions will be closed.</p>
+              </div>
+            </div>
+            <div class="profile-password-fields">
+              <label class="form-row" for="profile-current-password">
+                <span>Current password</span>
+                <input id="profile-current-password" type="password" autocomplete="current-password" required />
+              </label>
+              <label class="form-row" for="profile-new-password">
+                <span>New password</span>
+                <input id="profile-new-password" type="password" autocomplete="new-password" minlength="10" required />
+              </label>
+              <label class="form-row" for="profile-confirm-password">
+                <span>Confirm new password</span>
+                <input id="profile-confirm-password" type="password" autocomplete="new-password" minlength="10" required />
+              </label>
+            </div>
+            <p class="profile-password-error" id="profile-password-error" role="alert" aria-live="polite"></p>
+            <div class="profile-edit-actions">
+              <button class="btn primary" id="profile-password-save" type="submit">Update password</button>
+              <button class="btn" type="button" data-profile-cancel>Cancel</button>
+            </div>
+          </form>
+        </div>` : ''}
       </div>
     </div>
     <div class="card">
@@ -10784,6 +11006,100 @@ function profileView() {
 }
 
 function wireProfileView() {
+  const setProfileEditor = (kind) => {
+    document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
+      panel.hidden = panel.id !== `profile-${kind}-panel`;
+    });
+    document.querySelectorAll('[data-profile-edit]').forEach((button) => {
+      button.setAttribute('aria-expanded', button.dataset.profileEdit === kind ? 'true' : 'false');
+    });
+    if (kind) requestAnimationFrame(() => $(`#profile-${kind}-panel input`)?.focus());
+  };
+  document.querySelectorAll('[data-profile-edit]').forEach((button) => button.addEventListener('click', () => {
+    const opening = button.getAttribute('aria-expanded') !== 'true';
+    setProfileEditor(opening ? button.dataset.profileEdit : null);
+  }));
+  document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
+
+  $('#profile-email-form')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('#profile-email');
+    const newEmail = input.value.trim();
+    if (!newEmail || !input.checkValidity()) {
+      input.reportValidity();
+      return;
+    }
+    if (newEmail.toLowerCase() === String(S.user?.email || '').toLowerCase())
+      return toast('Enter a different email address.', true);
+    const button = $('#profile-email-save');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/auth/change-email', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ newEmail, callbackURL: `${location.origin}/?verified=1` }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || body.error || 'Couldn’t change the email address.');
+      }
+      const wasUnverified = S.user?.emailVerified === false;
+      const session = await fetch('/api/session').then((result) => result.json());
+      if (session.user) S.user = session.user;
+      renderShell();
+      await applyRoute();
+      toast(wasUnverified
+        ? `Email changed. Confirmation link sent to ${newEmail}.`
+        : `Confirmation link sent to ${newEmail}. Your email will change after you confirm it.`);
+    } catch (error) {
+      toast(error.message || 'Couldn’t change the email address.', true);
+      button.disabled = false;
+    }
+  });
+  $('#profile-password-form')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const currentPassword = $('#profile-current-password').value;
+    const newPassword = $('#profile-new-password').value;
+    const confirmPassword = $('#profile-confirm-password').value;
+    const error = $('#profile-password-error');
+    error.textContent = '';
+    if (newPassword.length < 10) {
+      error.textContent = 'New password must be at least 10 characters.';
+      $('#profile-new-password').focus();
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      error.textContent = 'New passwords do not match.';
+      $('#profile-confirm-password').focus();
+      return;
+    }
+    if (newPassword === currentPassword) {
+      error.textContent = 'Choose a password different from your current one.';
+      $('#profile-new-password').focus();
+      return;
+    }
+    const button = $('#profile-password-save');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword, revokeOtherSessions: true }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || body.error || 'Couldn’t change the password.');
+      }
+      form.reset();
+      setProfileEditor(null);
+      toast('Password changed. Other signed-in sessions were closed.');
+    } catch (cause) {
+      error.textContent = cause.message || 'Couldn’t change the password.';
+    } finally {
+      button.disabled = false;
+    }
+  });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}

@@ -76,6 +76,32 @@ describe('public edge (Caddy) rate limiting', () => {
   });
 });
 
+describe('public edge (Caddy) canonical host', () => {
+  const caddyfile = read('Caddyfile');
+  const wwwBlock = caddyfile.split('www.{$KARMAX_DOMAIN} {')[1]?.split('\n}')[0] ?? '';
+
+  // Without a site block of its own, the www host has no certificate, so a
+  // visitor who types it gets a TLS error rather than the console.
+  it('answers on the www host', () => {
+    expect(wwwBlock, 'no www site block').not.toBe('');
+  });
+
+  it('redirects to the apex rather than serving a second origin', () => {
+    // Two origins serving the same app would split sessions and quietly widen
+    // what the preview-origin separation is supposed to keep apart.
+    expect(wwwBlock).toContain('redir https://{$KARMAX_DOMAIN}{uri}');
+    expect(wwwBlock).not.toContain('reverse_proxy');
+  });
+
+  it('preserves the path and query so a deep link still lands', () => {
+    expect(wwwBlock).toMatch(/redir\s+\S*\{uri\}/);
+  });
+
+  it('meters the redirect too, so it is not a free unbounded endpoint', () => {
+    expect(wwwBlock).toContain('import karmax_ratelimit');
+  });
+});
+
 describe('public edge (Caddy) image', () => {
   // rate_limit is a third-party module: the stock caddy image does not have it
   // and refuses to start on an unrecognised directive. Building it is what

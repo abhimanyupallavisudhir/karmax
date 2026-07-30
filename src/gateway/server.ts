@@ -55,6 +55,7 @@ import { enumerateCredentials } from '../platform/credentials.js';
 import { gatherCredentialSources } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -219,7 +220,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
-  if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets') return 'task:escalate';
+  if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
+    || p === '/api/agent/permission-requests') return 'task:escalate';
+  if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p === '/api/agent/collaboration/request') return 'task:conversation:message';
   if (/\/file$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
@@ -448,9 +451,17 @@ export class Gateway {
       .requests({ taskId, status: 'pending' });
   }
 
+  private pendingPermissionRequests(taskId: string) {
+    const task = this.deps.store.getTask(taskId);
+    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
+    if (!organizationId) return [];
+    return new PermissionRequests(this.deps.store, organizationId)
+      .requests({ taskId, status: 'pending' });
+  }
+
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
     if (!view) return view;
-    const count = this.pendingCredentialRequests(taskId).length;
+    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length;
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -2716,9 +2727,56 @@ export class Gateway {
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }
       }
+      if (p === '/api/agent/permission-requests' && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.requestPermission(token, {
+            capabilities: Array.isArray(b.capabilities) ? b.capabilities.map(String) : [],
+            audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
+            reason: String(b.reason ?? ''),
+          }));
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       if (p === '/api/agent/escalation-targets' && method === 'GET') {
         try { return this.json(res, 200, api.humanEscalationTargets(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/permission-requests' && method === 'GET') {
+        const organizationId = String(url.searchParams.get('organizationId') ?? '');
+        const taskId = String(url.searchParams.get('taskId') ?? '');
+        if (!organizationId || !taskId)
+          return this.json(res, 400, { error: 'organizationId and taskId are required' });
+        try {
+          return this.json(res, 200, api.listPermissionRequests(token, {
+            organizationId,
+            taskId,
+            status: (url.searchParams.get('status') as any) ?? undefined,
+          }));
+        } catch (error) {
+          return this.json(res, error instanceof CapabilityError ? 403 : 400,
+            { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const permissionResolution = p.match(/^\/api\/permission-requests\/([^/]+)\/resolve$/);
+      if (permissionResolution && method === 'POST') {
+        const organizationId = String(url.searchParams.get('organizationId') ?? '');
+        const b = await this.body(req);
+        const action = String(b.action ?? '');
+        if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (action !== 'approve' && action !== 'deny')
+          return this.json(res, 400, { error: 'action must be approve | deny' });
+        try {
+          return this.json(res, 200, await api.resolvePermissionRequest(token, {
+            organizationId,
+            requestId: permissionResolution[1]!,
+            action,
+          }));
+        } catch (error) {
+          return this.json(res, error instanceof CapabilityError ? 403 : 400,
+            { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       if (p === '/api/agent/collaboration/request' && method === 'POST') {
         const b = await this.body(req);

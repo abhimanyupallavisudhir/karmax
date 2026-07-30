@@ -26,6 +26,8 @@ describe('remote subscription agents', () => {
     fs.mkdirSync(path.join(localHome, 'plugins', 'cache', 'large'), { recursive: true });
     fs.writeFileSync(path.join(localHome, 'logs_2.sqlite'), Buffer.alloc(1024));
     fs.writeFileSync(path.join(localHome, 'plugins', 'cache', 'large', 'asset.bin'), Buffer.alloc(1024));
+    fs.mkdirSync(path.join(localHome, '.tmp', 'plugins', 'marketplace'), { recursive: true });
+    fs.writeFileSync(path.join(localHome, '.tmp', 'plugins', 'marketplace', 'catalog.bin'), Buffer.alloc(1024));
     fs.writeFileSync(path.join(localHome, 'config.toml'), '[mcp_servers.karmax]\ncommand = "/host/node"\n\n[notice]\nkeep = true\n');
     const world = fakeWorld();
 
@@ -38,6 +40,7 @@ describe('remote subscription agents', () => {
     expect(world.files.has(`${remoteHome}/sessions/host-task.jsonl`)).toBe(false);
     expect(world.files.has(`${remoteHome}/logs_2.sqlite`)).toBe(false);
     expect(world.files.has(`${remoteHome}/plugins/cache/large/asset.bin`)).toBe(false);
+    expect(world.files.has(`${remoteHome}/.tmp/plugins/marketplace/catalog.bin`)).toBe(false);
     const config = world.files.get(`${remoteHome}/config.toml`)?.toString() ?? '';
     expect(config).toContain('[notice]');
     expect(config).not.toContain('/host/node');

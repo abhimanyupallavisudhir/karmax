@@ -11,6 +11,11 @@ describe('Better Auth identity boundary', () => {
     expect(JSON.parse(raw.trim())).toEqual({
       firstRole: 'admin',
       sessionEmail: 'admin@example.com',
+      emailChangeOk: true,
+      verificationSentToCorrectedEmail: true,
+      passwordChangeOk: true,
+      oldPasswordRejected: true,
+      newPasswordAccepted: true,
       users: 2,
       bootstrapBlocked: true,
       setupRequired: true,

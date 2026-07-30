@@ -38,6 +38,7 @@ import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiP
 import { commitProjectWiki, ensureProjectWikiRepository, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
+import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import type { KarmaxBus } from '../contrib/bus.js';
@@ -2046,6 +2047,156 @@ export class KarmaxApi {
     const seq = this.deps.store.appendEvent(event);
     this.deps.bus?.emit({ ...event, seq });
     return held;
+  }
+
+  /**
+   * Ask selected humans to add exact capabilities to this task. This is a
+   * request primitive, not an elevation primitive: only a selected human who
+   * independently holds every requested capability can approve it.
+   */
+  async requestPermission(
+    token: string,
+    args: { capabilities: string[]; audience: string[]; reason: string },
+  ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; audience?: string[] }> {
+    const caller = this.require(token, 'request_permission');
+    if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
+    const task = this.deps.store.getTask(caller.taskId);
+    this.require(token, 'request_permission', { projectId: task?.projectId, taskId: caller.taskId });
+    if (!task) throw new Error(`no task ${caller.taskId}`);
+    const project = this.deps.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new Error('task project has no organization');
+
+    const capabilities = [...new Set((args.capabilities ?? []).map(exactCapability))];
+    if (!capabilities.length) throw new Error('choose at least one capability');
+    if (capabilities.length > 32) throw new Error('at most 32 capabilities may be requested');
+    const missing = capabilities.filter((capability) => !allows(caller.caps, capability));
+    if (!missing.length) return { status: 'granted', capabilities };
+
+    const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
+    if (!audience.length) throw new Error('choose at least one human or team');
+    if (audience.length > 32) throw new Error('at most 32 human audience selectors may be used');
+    const recipients = new Set<string>();
+    for (const selector of audience) {
+      const resolved = this.deps.store.humanAudience(task.id, [selector]);
+      if (!resolved.length) throw new Error(`Human route ${selector} does not resolve to a human in this organization`);
+      resolved.forEach((userId) => recipients.add(userId));
+    }
+    const service = new PermissionRequests(this.deps.store, project.organizationId);
+    const role = caller.role
+      ?? this.deps.store.getProfile(caller.profileId)?.role
+      ?? caller.profileId.replace(/-default$/, '');
+    const prior = new Set(service.requests({ taskId: task.id, status: 'pending' }).map((request) => request.id));
+    const request = service.request({
+      taskId: task.id,
+      projectId: task.projectId,
+      role,
+      capabilities: missing,
+      audience,
+      recipients: [...recipients],
+      reason: args.reason,
+      requestedBy: `task-agent:${task.id}:${caller.profileId}`,
+    });
+    if (!prior.has(request.id)) {
+      const event = {
+        taskId: task.id,
+        type: 'permission.approval-requested',
+        ts: Date.now(),
+        payload: {
+          requestId: request.id,
+          role: request.role,
+          capabilities: request.capabilities,
+          audience: request.audience,
+          recipients: request.recipients,
+          reason: request.reason,
+          requestedBy: request.requestedBy,
+        },
+      };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+    }
+    return {
+      status: 'needs_approval',
+      requestId: request.id,
+      capabilities: request.capabilities,
+      audience: request.audience,
+    };
+  }
+
+  listPermissionRequests(
+    token: string,
+    input: { organizationId: string; taskId: string; status?: PermissionRequest['status'] },
+  ): PermissionRequest[] {
+    const task = this.deps.store.getTask(input.taskId);
+    const project = task && this.deps.store.getProject(task.projectId);
+    this.require(token, 'task:read', {
+      taskId: input.taskId,
+      projectId: task?.projectId,
+      organizationId: input.organizationId,
+    });
+    if (!task || project?.organizationId !== input.organizationId) return [];
+    return new PermissionRequests(this.deps.store, input.organizationId)
+      .requests({ taskId: input.taskId, status: input.status })
+      .map((request) => ({
+        ...request,
+        task: {
+          id: task.id,
+          ...(task.num != null ? { num: task.num } : {}),
+          title: task.title,
+          projectId: task.projectId,
+        },
+      }));
+  }
+
+  async resolvePermissionRequest(
+    token: string,
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
+  ): Promise<PermissionRequest & { resume: Awaited<ReturnType<KarmaxApi['resumeAfterCredentialDecision']>> }> {
+    const service = new PermissionRequests(this.deps.store, input.organizationId);
+    const request = service.requests().find((candidate) => candidate.id === input.requestId);
+    if (!request) throw new NotFoundError(`no permission request ${input.requestId}`);
+    const task = this.deps.store.getTask(request.taskId);
+    const caller = this.require(token, 'task:read', {
+      taskId: request.taskId,
+      projectId: request.projectId,
+      organizationId: input.organizationId,
+    });
+    if (caller.kind !== 'human' || !caller.principal.startsWith('user:'))
+      throw new CapabilityError('a human account is required to resolve a permission request');
+    const userId = caller.principal.slice(5);
+    if (!request.recipients.includes(userId))
+      throw new CapabilityError('this permission request was not routed to you');
+    if (input.action === 'approve') {
+      for (const capability of request.capabilities) {
+        const checked = this.deps.tokens.check(token, capability, {
+          taskId: request.taskId,
+          projectId: request.projectId,
+          organizationId: input.organizationId,
+        });
+        if (!checked.ok)
+          throw new CapabilityError(`you cannot grant ${capability}: ${checked.reason ?? 'permission denied'}`);
+      }
+    }
+    const resolved = service.resolve(request.id, { action: input.action, by: caller.principal });
+    const message = input.action === 'approve'
+      ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}. Retry the blocked operation now; a newly scoped token will carry the grant.`
+      : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
+    const resume = await this.resumeAfterCredentialDecision(request.taskId, message);
+    const event = {
+      taskId: request.taskId,
+      type: 'permission.approval-resolved',
+      ts: Date.now(),
+      payload: {
+        requestId: request.id,
+        role: request.role,
+        capabilities: request.capabilities,
+        action: input.action,
+        resolvedBy: caller.principal,
+        resumed: resume.resumed,
+      },
+    };
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus?.emit({ ...event, seq });
+    return { ...resolved, resume };
   }
 
   /** Discover only the people and teams that can receive an escalation for the

@@ -63,6 +63,16 @@
 	reverse_proxy app:4505
 }
 
+# People type the www host out of habit, and without this they get a
+# certificate error — worse than the registrar's parking page it replaces.
+# Redirecting rather than serving keeps one canonical origin, so sessions,
+# CORS, and the preview-origin separation stay unambiguous.
+www.{$KARMAX_DOMAIN} {
+	import karmax_security
+	import karmax_ratelimit
+	redir https://{$KARMAX_DOMAIN}{uri} permanent
+}
+
 # Each live preview gets an opaque, isolated origin. Caddy asks Karmax whether
 # the lease is currently valid before obtaining a certificate, so this catch-all
 # cannot be abused to mint certificates for arbitrary names.

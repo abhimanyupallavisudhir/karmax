@@ -27,6 +27,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems } from '../autonomy/vault-items.js';
+import { PermissionRequests } from '../platform/permission-requests.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
@@ -930,6 +931,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
       let resumedActivityAttempt = false;
+      let activityAttempt = 1;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -937,6 +939,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let liveChannel = true;
       try {
         const actx = activityContext.current();
+        activityAttempt = actx.info.attempt;
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
         // v1 workflows cannot add the new agentTurnId argument without changing
@@ -988,21 +991,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
+      const approvedPermissions = new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role);
       // Requesting human input is a non-removable safety valve for every task
       // agent. The API restricts task-scoped callers to their own task, so this
       // cannot be used to interrupt peer work or widen the agent's authority.
       const grant = [...new Set([
         ...(args.task.grant ?? DEFAULT_GRANT),
         ...orgVaultItems.extensionCaps(args.taskId),
+        ...approvedPermissions,
         'task:escalate',
       ])];
-      const ceiling = roleCeiling(args.role);
+      // An explicit human approval is the only way to extend the task beyond
+      // the workflow role's ordinary ceiling. Fold it into both token axes: the
+      // normal stored task grant remains least-privilege, while the approved
+      // exception is exact, task-scoped, durable, and audited.
+      const ceiling = [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
       const effective = attenuate(ceiling, grant);
       let token: string | undefined;
       if (deps.tokens) {
         const minted = deps.tokens.mint({
           taskId: args.taskId,
           profileId: profile.id,
+          role: args.role,
           principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: args.task.projectId,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
@@ -1459,6 +1469,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             record(args.taskId, 'agent.activity', {
               ...activity,
               role: args.role,
+              attempt: activityAttempt,
               ...(args.agentTurnId ? { turnId: args.agentTurnId } : {}),
             });
           },

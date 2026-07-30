@@ -9,6 +9,7 @@ import path from 'node:path';
 export interface IdentityUser {
   id: string;
   email: string;
+  emailVerified?: boolean;
   name: string;
   role?: string | null;
   createdAt: Date | string;
@@ -167,7 +168,27 @@ export class IdentityService {
               `Confirm this email address to finish setting up your krmax account.`,
               'Confirm email', url,
               `If you didn't create this account, you can ignore this email.`),
-          }).catch((e) => console.error('[email] verification send failed:', e instanceof Error ? e.message : e));
+          }).catch((e) => {
+            // Deliberately rethrown, unlike the password-reset send above.
+            // Swallowing this answered the explicit "Resend link" button with
+            // 200, so the console said "check your inbox" while Resend had
+            // refused the message — the reason (an unverified domain) was
+            // visible only in the container log. Better Auth swallows a throw
+            // on the sign-up path itself, so a broken mailer still cannot stop
+            // an account being created; see tests/identity-email.test.ts.
+            console.error('[email] verification send failed:', e instanceof Error ? e.message : e);
+            throw e;
+          });
+        },
+      },
+      // An address typo must not strand a new account behind a verification
+      // email it can never receive. Better Auth updates an unverified account
+      // immediately and sends a fresh link to the corrected address; an already
+      // verified account keeps its current address until the new one is verified.
+      user: {
+        changeEmail: {
+          enabled: true,
+          updateEmailWithoutVerification: true,
         },
       },
       session: { expiresIn: 60 * 60 * 24 * 14, updateAge: 60 * 60 * 24 },
@@ -226,6 +247,18 @@ export class IdentityService {
 
   async signOut(headers: Headers): Promise<Response> {
     return this.auth.api.signOut({ headers, asResponse: true });
+  }
+
+  async changeEmail(newEmail: string, callbackURL: string, headers: Headers): Promise<Response> {
+    return this.auth.api.changeEmail({ body: { newEmail, callbackURL }, headers, asResponse: true });
+  }
+
+  async changePassword(currentPassword: string, newPassword: string, headers: Headers): Promise<Response> {
+    return this.auth.api.changePassword({
+      body: { currentPassword, newPassword, revokeOtherSessions: false },
+      headers,
+      asResponse: true,
+    });
   }
 
   async beginSso(callbackURL: string, headers?: Headers): Promise<Response> {

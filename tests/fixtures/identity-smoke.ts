@@ -10,10 +10,24 @@ import { findFreePortFrom } from '../../src/util/ports.js';
 import { WorldRegistry } from '../../src/world/registry.js';
 
 const identity = await IdentityService.open(':memory:', { baseURL: 'http://localhost:4505' });
-const first = await identity.bootstrap({ name: 'Admin', email: 'admin@example.com', password: 'long-enough-password' });
+const verificationRecipients: string[] = [];
+identity.mailer = {
+  configured: () => true,
+  send: async (message) => { verificationRecipients.push(message.to); },
+};
+const first = await identity.bootstrap({ name: 'Admin', email: 'admin@example.come', password: 'long-enough-password' });
 const cookie = first.response.headers.get('set-cookie') ?? '';
 if (!/HttpOnly/i.test(cookie)) throw new Error('session cookie is not HttpOnly');
-const session = await identity.session(new Headers({ cookie }));
+const changed = await identity.changeEmail('admin@example.com', 'http://localhost:4505/?verified=1', new Headers({ cookie }));
+const changedCookie = changed.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? cookie;
+const session = await identity.session(new Headers({ cookie: changedCookie }));
+const changedPassword = await identity.changePassword(
+  'long-enough-password',
+  'new-long-enough-password',
+  new Headers({ cookie: changedCookie }),
+);
+const oldPasswordLogin = await identity.signIn('admin@example.com', 'long-enough-password');
+const newPasswordLogin = await identity.signIn('admin@example.com', 'new-long-enough-password');
 await identity.createUser({ name: 'Dev', email: 'dev@example.com', password: 'another-long-password' });
 let bootstrapBlocked = false;
 try { await identity.bootstrap({ name: 'Again', email: 'again@example.com', password: 'another-long-password' }); }
@@ -102,6 +116,11 @@ await running.close();
 process.stdout.write(JSON.stringify({
   firstRole: first.user.role,
   sessionEmail: session?.user.email,
+  emailChangeOk: changed.ok,
+  verificationSentToCorrectedEmail: verificationRecipients.includes('admin@example.com'),
+  passwordChangeOk: changedPassword.ok,
+  oldPasswordRejected: !oldPasswordLogin.ok,
+  newPasswordAccepted: newPasswordLogin.ok,
   users: identity.listUsers().length,
   bootstrapBlocked,
   setupRequired: setupBefore.setupRequired,

@@ -579,6 +579,40 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'request_permission',
+    description:
+      'Request exact missing Karmax capabilities for this task. The request appears in Approval Requests and is routed ' +
+      'to selected people or teams. Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+      'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected human who already ' +
+      'holds every requested capability can approve. Do not request wildcards. An approval or denial resumes the task.',
+    parameters: {
+      type: 'object',
+      properties: {
+        capabilities: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 32,
+          description: 'Exact capability names to add to this task, for example settings:read.',
+        },
+        audience: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 32,
+          description: 'One or more human/team routing selectors; any selected capable person may decide.',
+        },
+        reason: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 4_000,
+          description: 'Why the task needs these capabilities (shown to the human).',
+        },
+      },
+      required: ['capabilities', 'audience', 'reason'],
+    },
+  },
+  {
     name: 'publish_task_branch',
     description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
     parameters: { type: 'object', properties: {} },
@@ -1032,6 +1066,13 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest('POST', '/api/agent/escalate', {
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         message: String(args?.message ?? ''),
+      }));
+    },
+    async request_permission(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {
+        capabilities: Array.isArray(args?.capabilities) ? args.capabilities.map(String) : [],
+        audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
+        reason: String(args?.reason ?? ''),
       }));
     },
     async publish_task_branch() {

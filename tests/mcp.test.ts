@@ -48,7 +48,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action',
-        'escalate_to_human',
+        'escalate_to_human', 'request_permission',
         'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'describe_platform', 'platform_request', 'list_world_providers',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
@@ -93,6 +93,37 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(seen).toEqual([{
       audience: ['user:designer', '@team:leaders'],
       message: 'Which launch option should I use?',
+    }]);
+  });
+
+  it('forwards an exact permission request with its chosen audience and reason', async () => {
+    const seen: unknown[] = [];
+    const stub = {
+      requestPermission: async (args: unknown) => {
+        seen.push(args);
+        return { status: 'needs_approval', requestId: 'preq_1' };
+      },
+    } as any;
+    const server = createPlatformMcpServer(stub);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const c = new Client({ name: 'permission-test', version: '1.0.0' });
+    await c.connect(clientT);
+
+    const result: any = await c.callTool({
+      name: 'request_permission',
+      arguments: {
+        capabilities: ['settings:read'],
+        audience: ['@creator', '@team:operators'],
+        reason: 'Inspect the outbound email configuration.',
+      },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([{
+      capabilities: ['settings:read'],
+      audience: ['@creator', '@team:operators'],
+      reason: 'Inspect the outbound email configuration.',
     }]);
   });
 
