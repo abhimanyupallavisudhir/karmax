@@ -8,8 +8,13 @@ dist/
 # karmax runtime data (workflow repos, worlds, config homes, vault, temporal db, state)
 .karmax/
 .karmax-data/
-deploy/.turnkey.env
-deploy/.secrets/
+# Unanchored on purpose. deploy/karmax derives its own directory from $0, so
+# invoking it any way other than `./deploy/karmax` — sourcing it, for instance —
+# writes the generated secrets relative to the caller instead. That put a real
+# auth_secret and vault_key at the repo root once, one `git add -A` away from
+# being committed. Matching at any depth costs nothing.
+.turnkey.env
+.secrets/
 deploy/backups/
 
 # logs / coverage / caches

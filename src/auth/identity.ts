@@ -126,7 +126,17 @@ export class IdentityService {
               `Confirm this email address to finish setting up your krmax account.`,
               'Confirm email', url,
               `If you didn't create this account, you can ignore this email.`),
-          }).catch((e) => console.error('[email] verification send failed:', e instanceof Error ? e.message : e));
+          }).catch((e) => {
+            // Deliberately rethrown, unlike the password-reset send above.
+            // Swallowing this answered the explicit "Resend link" button with
+            // 200, so the console said "check your inbox" while Resend had
+            // refused the message — the reason (an unverified domain) was
+            // visible only in the container log. Better Auth swallows a throw
+            // on the sign-up path itself, so a broken mailer still cannot stop
+            // an account being created; see tests/identity-email.test.ts.
+            console.error('[email] verification send failed:', e instanceof Error ? e.message : e);
+            throw e;
+          });
         },
       },
       // An address typo must not strand a new account behind a verification
