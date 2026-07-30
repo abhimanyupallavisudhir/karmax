@@ -66,6 +66,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|DELETE /api/tasks/:taskId', 'POST /api/tasks/:taskId/queue',
     'PATCH /api/tasks/:taskId/params|notes|authorization',
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
+    'POST /api/tasks/:taskId/escalate (body {audience, message}; pauses at the current stage and notifies the selected humans)',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
     'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local',
     'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
@@ -77,6 +78,8 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST|DELETE /api/tasks/:taskId/subscribers (task:subscribe)',
     'GET /api/search/fields (the searchable-field registry behind the query grammar)',
     'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
+    'POST /api/agent/escalate (calling task inferred from its token; body {audience, message})',
+    'GET /api/agent/escalation-targets (people, teams, and special audience selectors available to the calling task)',
     'POST /api/agent/collaboration/request',
   ],
   conversations: [

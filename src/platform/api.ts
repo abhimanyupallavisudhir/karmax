@@ -1852,7 +1852,13 @@ export class KarmaxApi {
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
   }
 
-  private async startTransitionReplacement(task: TaskRecord, view: TaskView, resumeStage: Stage, pausedForHuman = false): Promise<TaskView> {
+  private async startTransitionReplacement(
+    task: TaskRecord,
+    view: TaskView,
+    resumeStage: Stage,
+    pausedForHuman = false,
+    humanWait?: { audience: string[]; detail: string },
+  ): Promise<TaskView> {
     const { startType, input, version } = await this.buildStart(task, true);
     input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman);
     await withTimeout(this.deps.client.workflow.start(startType, {
@@ -1877,7 +1883,13 @@ export class KarmaxApi {
       stage: resumeStage,
       status: pausedForHuman ? 'waiting' : 'active',
       actions: pausedForHuman ? this.lifecycleActions(view) : this.resumedActions(view.actions, resumeStage),
-      waitingFor: pausedForHuman ? { kind: 'human', audience: ['@creator'], detail: `Paused during ${resumeStage}` } : undefined,
+      waitingFor: pausedForHuman
+        ? {
+            kind: 'human',
+            audience: humanWait?.audience ?? ['@creator'],
+            detail: humanWait?.detail ?? `Paused during ${resumeStage}`,
+          }
+        : undefined,
       agentTurn: undefined,
       error: undefined,
       state: {
@@ -1984,6 +1996,91 @@ export class KarmaxApi {
       await this.stopTaskActivity(task, view, target === 'human' ? 'Task paused for human input' : `Task moved to ${target}`);
     const resumeStage = target === 'human' ? view.stage : target as Stage;
     return this.startTransitionReplacement(task, view, resumeStage, target === 'human');
+  }
+
+  /**
+   * Pause the calling task at its exact current stage and route a concrete
+   * question to selected humans. Task-scoped callers may only escalate
+   * themselves; this makes the capability safe to grant to every agent role.
+   */
+  async escalateToHuman(
+    token: string,
+    args: { taskId?: string; audience: string[]; message: string },
+  ): Promise<TaskView> {
+    const caller = this.require(token, 'escalate_to_human');
+    const taskId = args.taskId ?? (caller.taskId !== '*' ? caller.taskId : undefined);
+    if (!taskId) throw new Error('taskId is required for a non-task caller');
+    if (caller.taskId !== '*' && caller.taskId !== taskId)
+      throw new CapabilityError('a task agent may only escalate its own task');
+
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId });
+    if (!task) throw new Error(`no task ${taskId}`);
+    const view = task.lastView;
+    if (!view) throw new Error('task has no lifecycle state yet');
+    if (!this.availableStageTransitions(task, view).some((move) => move.target === 'human'))
+      throw new Error(`cannot request human input from ${stageName(view.stage)}`);
+
+    const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
+    if (!audience.length) throw new Error('choose at least one human or team');
+    if (audience.length > 32) throw new Error('at most 32 human audience selectors may be used');
+    for (const selector of audience) {
+      if (!this.deps.store.humanAudience(task.id, [selector]).length)
+        throw new Error(`Human route ${selector} does not resolve to a human in this organization`);
+    }
+    const detail = String(args.message ?? '').trim();
+    if (!detail) throw new Error('message is required');
+    if ([...detail].length > 4_000) throw new Error('message must be at most 4000 characters');
+
+    await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
+    const held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });
+    const requestedBy = caller.taskId !== '*'
+      ? `task-agent:${caller.taskId}:${caller.profileId}`
+      : caller.principal;
+    const event = {
+      taskId,
+      type: 'task.escalated',
+      ts: Date.now(),
+      payload: { audience, detail, requestedBy, originStage: view.stage },
+    };
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus?.emit({ ...event, seq });
+    return held;
+  }
+
+  /** Discover only the people and teams that can receive an escalation for the
+   * calling task. Kept behind the same narrow capability so Merge/Confirm and
+   * custom roles do not need broad organization-directory access. */
+  humanEscalationTargets(token: string): {
+    taskId: string;
+    users: Array<{ id: string; selector: string }>;
+    teams: Array<{ id: string; name: string; slug: string; selector: string }>;
+    special: Array<{ selector: string; description: string }>;
+  } {
+    const caller = this.require(token, 'escalate_to_human');
+    if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
+    const task = this.deps.store.getTask(caller.taskId);
+    this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId: caller.taskId });
+    if (!task) throw new Error(`no task ${caller.taskId}`);
+    const project = this.deps.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new Error('task project has no organization');
+
+    const projectUsers = this.deps.store.humanAudience(task.id, ['@project']);
+    const users = projectUsers.map((id) => ({ id, selector: `user:${id}` }));
+    const teams = this.deps.store.listTeams(project.organizationId, project.id)
+      .filter((team) => this.deps.store.listTeamMemberships(team.id)
+        .some((member) => projectUsers.includes(member.userId)))
+      .map((team) => ({ id: team.id, name: team.name, slug: team.slug, selector: `@team:${team.slug}` }));
+    const descriptions: Record<string, string> = {
+      '@creator': 'The human who initiated this task (following its parent chain).',
+      '@owners': 'Organization owners.',
+      '@project': 'Everyone with access to this project.',
+      '@all': 'Every member of this organization.',
+    };
+    const special = Object.entries(descriptions)
+      .filter(([selector]) => this.deps.store.humanAudience(task.id, [selector]).length > 0)
+      .map(([selector, description]) => ({ selector, description }));
+    return { taskId: task.id, users, teams, special };
   }
 
   /** Resolve the human-facing project-local number (#100) without guessing ids. */

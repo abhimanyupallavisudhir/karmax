@@ -930,6 +930,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let legacyAgentTurnId: string | undefined;
       let turnSessionKey: string | undefined;
       let resumedActivityAttempt = false;
+      let activityAttempt = 1;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -937,6 +938,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let liveChannel = true;
       try {
         const actx = activityContext.current();
+        activityAttempt = actx.info.attempt;
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
         // v1 workflows cannot add the new agentTurnId argument without changing
@@ -988,7 +990,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
-      const grant = [...(args.task.grant ?? DEFAULT_GRANT), ...orgVaultItems.extensionCaps(args.taskId)];
+      // Requesting human input is a non-removable safety valve for every task
+      // agent. The API restricts task-scoped callers to their own task, so this
+      // cannot be used to interrupt peer work or widen the agent's authority.
+      const grant = [...new Set([
+        ...(args.task.grant ?? DEFAULT_GRANT),
+        ...orgVaultItems.extensionCaps(args.taskId),
+        'task:escalate',
+      ])];
       const ceiling = roleCeiling(args.role);
       const effective = attenuate(ceiling, grant);
       let token: string | undefined;
@@ -1452,6 +1461,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             record(args.taskId, 'agent.activity', {
               ...activity,
               role: args.role,
+              attempt: activityAttempt,
               ...(args.agentTurnId ? { turnId: args.agentTurnId } : {}),
             });
           },

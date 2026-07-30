@@ -217,6 +217,96 @@ describe('Stripe Issuing organization rail', () => {
       .toEqual(['authorization', 'transaction']);
   });
 
+  /**
+   * A reservation is an upper bound — the agent asks for "up to $100" because the
+   * price is not known until checkout. What must count against a virtual card's
+   * cap is the money the rail actually moved, which is why `findPaymentAuthorization`
+   * deliberately matches an authorization *smaller* than the reservation. Counting
+   * the reservation instead burns the card's ceiling (and the task's allowance) for
+   * money nobody ever spent, permanently.
+   */
+  describe('the cap counts what the rail charged, not what was reserved', () => {
+    async function reserved(amount = 10_000) {
+      await connect();
+      const card = await stripe.provisionCard({
+        scope: 'project', scopeId: projectId, organizationId, label: 'Agent card',
+        cap: 12_345, cardholderId: 'ich_tenant_a',
+      });
+      const registry = new PaymentRegistry(store);
+      registry.register(stripe);
+      const budget = new BudgetService(store, registry);
+      const spend = await budget.request({ organizationId, projectId, taskId: 'task_a' },
+        { amount, merchant: 'shop.example', why: 'up to $100', cardId: card.id });
+      expect(spend.status).toBe('granted');
+      return { card, budget, spend };
+    }
+    const authorize = (amount: number) => signed({
+      id: 'evt_auth', account: 'acct_tenant_a', type: 'issuing_authorization.request',
+      data: { object: { id: 'iauth_1', card: 'ic_tenant_a', pending_request: { amount },
+        currency: 'usd', merchant_data: { name: 'shop.example' } } },
+    });
+    // Stripe signs an issuing transaction from the cardholder's side: a capture is
+    // negative (money out), a refund positive.
+    const settle = (id: string, type: 'capture' | 'refund', amount: number) => signed({
+      id: `evt_${id}`, account: 'acct_tenant_a', type: 'issuing_transaction.created',
+      data: { object: { id, type, card: 'ic_tenant_a', authorization: 'iauth_1',
+        amount, currency: 'usd', merchant_data: { name: 'shop.example' } } },
+    });
+
+    it('reconciles the reservation down to the authorized and captured amount', async () => {
+      const { card, budget, spend } = await reserved();
+      const auth = authorize(4_000);
+      expect(stripe.handleWebhook(auth.raw, auth.signature).body).toEqual({ approved: true });
+      expect(store.cardPaymentSpent(card.id)).toBe(4_000);
+      expect(store.paymentSpent('task_a')).toBe(4_000);
+
+      const capture = settle('itxn_1', 'capture', -4_000);
+      expect(stripe.handleWebhook(capture.raw, capture.signature).status).toBe(200);
+      expect(store.getPaymentSpendRequest(spend.requestId!)).toMatchObject({ status: 'settled', amount: 4_000 });
+      // The 60 dollars the merchant never took are spendable again.
+      expect((await budget.request({ organizationId, projectId, taskId: 'task_b' },
+        { amount: 8_000, cardId: card.id, why: 'second' })).status).toBe('granted');
+    });
+
+    it('frees only the refunded part of a settled spend', async () => {
+      const { card, spend } = await reserved(4_000);
+      const auth = authorize(4_000);
+      stripe.handleWebhook(auth.raw, auth.signature);
+      const capture = settle('itxn_1', 'capture', -4_000);
+      stripe.handleWebhook(capture.raw, capture.signature);
+      const partial = settle('itxn_2', 'refund', 1_500);
+      stripe.handleWebhook(partial.raw, partial.signature);
+      expect(store.getPaymentSpendRequest(spend.requestId!)).toMatchObject({ status: 'settled', amount: 2_500 });
+      expect(store.cardPaymentSpent(card.id)).toBe(2_500);
+      const rest = settle('itxn_3', 'refund', 2_500);
+      stripe.handleWebhook(rest.raw, rest.signature);
+      expect(store.getPaymentSpendRequest(spend.requestId!).status).toBe('reversed');
+      expect(store.cardPaymentSpent(card.id)).toBe(0);
+    });
+
+    it('re-counts the cap when a queued spend is approved on the webhook rail', async () => {
+      await connect();
+      const card = await stripe.provisionCard({
+        scope: 'project', scopeId: projectId, organizationId, label: 'Agent card',
+        cap: 12_345, cardholderId: 'ich_tenant_a',
+      });
+      const registry = new PaymentRegistry(store);
+      registry.register(stripe);
+      const budget = new BudgetService(store, registry);
+      store.setSettings(`organization:${organizationId}`, 'payments', { provider: 'stripe', threshold: 1_000 });
+      const ctx = { organizationId, projectId, taskId: 'task_gate' };
+      const first = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'first' });
+      const second = await budget.request(ctx, { amount: 8_000, cardId: card.id, why: 'second' });
+      expect([first.status, second.status]).toEqual(['needs_approval', 'needs_approval']);
+      expect((await budget.approve(first.requestId!, 'user:a')).status).toBe('granted');
+      // The webhook rail never calls `authorize()`, so approval was the only place
+      // this could be caught — and it was not looking. 16 000 on a 12 345 card.
+      expect(await budget.approve(second.requestId!, 'user:a'))
+        .toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
+      expect(store.cardPaymentSpent(card.id)).toBe(8_000);
+    });
+  });
+
   it('rejects unsigned webhooks and authorizations without a matching reservation', async () => {
     await connect();
     await stripe.provisionCard({

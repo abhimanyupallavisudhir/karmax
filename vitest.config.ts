@@ -3,6 +3,13 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts', 'src/**/*.test.ts'],
+    // Integration tests run mock agents inside the Vitest worker. Production
+    // host pressure must not park them based on the CI runner's live RAM/load;
+    // agent-slots.test.ts enables each gate explicitly when exercising it.
+    env: {
+      KARMAX_AGENT_MIN_FREE_MB: '0',
+      KARMAX_AGENT_MAX_LOAD_FACTOR: '0',
+    },
     testTimeout: 30_000,
     hookTimeout: 60_000,
     // Each integration test file boots a real Temporal dev server + Worker.

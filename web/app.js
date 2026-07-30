@@ -1410,7 +1410,8 @@ function renderMarkdown(src, opts = {}) {
   const withMath = !!opts.math;
   const stash = [];
   const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
-  let s = String(src ?? '').replace(/\r\n?/g, '\n');
+  const source = String(src ?? '').replace(/\r\n?/g, '\n');
+  let s = source;
   // Fenced code blocks first (a blank line around the placeholder keeps it its
   // own block).
   s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
@@ -1419,7 +1420,51 @@ function renderMarkdown(src, opts = {}) {
   s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
   if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
   let html = mdBlocks(s, stash);
-  return html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+  html = html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+  return sanitizeMarkdownHtml(html, source);
+}
+
+// Parse the renderer's output in a detached fragment before it becomes part of
+// the page. Besides enforcing the renderer's small element/attribute allowlist,
+// this makes the browser repair and close any accidentally malformed formatting
+// tags *inside this message*. Formatting-element recovery can otherwise carry an
+// unclosed <strong>/<em> through later siblings, affecting subsequent messages
+// and even controls outside the conversation. Raw message text was escaped
+// before rendering; if the allowlist ever fails, fall back to escaped text.
+function sanitizeMarkdownHtml(html, source) {
+  if (typeof document === 'undefined' || !document.createElement) return html;
+  const fallback = () => esc(source).replace(/\n/g, '<br>');
+  try {
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    const allowedTags = new Set([
+      'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+      'HR', 'LI', 'OL', 'P', 'PRE', 'SPAN', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH',
+      'THEAD', 'TR', 'UL',
+    ]);
+    for (const el of template.content.querySelectorAll('*')) {
+      if (!allowedTags.has(el.tagName)) return fallback();
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value;
+        if (name === 'class') continue;
+        if (el.tagName === 'A' && name === 'href') {
+          if (!/^(?:https?:|mailto:|\/|#)/i.test(value)) return fallback();
+          continue;
+        }
+        if (el.tagName === 'A' && name === 'target' && value === '_blank') continue;
+        if (el.tagName === 'A' && name === 'rel' && value === 'noopener noreferrer') continue;
+        if (el.tagName === 'A' && name === 'data-md-local') continue;
+        if (el.tagName === 'OL' && name === 'start' && /^-?\d+$/.test(value)) continue;
+        if ((el.tagName === 'TH' || el.tagName === 'TD') && name === 'style'
+          && /^text-align:\s*(?:left|center|right);?$/i.test(value)) continue;
+        return fallback();
+      }
+    }
+    return template.innerHTML;
+  } catch {
+    return fallback();
+  }
 }
 
 function mdBlocks(s, stash) {
@@ -1614,6 +1659,21 @@ function mdInline(t) {
   // emphasis/link passes treat it as a literal, then restore it at the very end.
   const lit = [];
   x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+  // Generated anchors must not go through the emphasis regexes: doing so lets
+  // Markdown punctuation in a URL rewrite the generated href attribute. Keep
+  // each complete anchor behind an opaque placeholder until formatting is done.
+  const links = [];
+  const keepLink = (html) => `\u0002${links.push(html) - 1}\u0002`;
+  const format = (value) => {
+    let out = value;
+    out = out.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+    out = out.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+    out = out.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
+    return out.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  };
   // Inline links [text](url "optional title") — safe schemes only; the title is
   // dropped. Runs before autolinking so a bare URL inside a link is left alone.
   // A scheme-less relative target (no ":" — so `javascript:`/`data:` are
@@ -1622,26 +1682,30 @@ function mdInline(t) {
   // page, while it stays inert (href="#") everywhere else.
   x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
     if (/^(https?:|mailto:|\/)/i.test(href))
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
-    if (href[0] === '#') return `<a href="${href}">${txt}</a>`;
-    if (!/:/.test(href)) return `<a href="#" data-md-local="${href}">${txt}</a>`;
-    return `<a href="#" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+      return keepLink(`<a href="${href}" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
+    if (href[0] === '#') return keepLink(`<a href="${href}">${format(txt)}</a>`);
+    if (!/:/.test(href)) return keepLink(`<a href="#" data-md-local="${href}">${format(txt)}</a>`);
+    return keepLink(`<a href="#" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
   });
-  // Autolink bare http(s) URLs not already part of a link/attribute (only when
-  // preceded by start-of-string, whitespace or an opening paren). Trailing
-  // sentence punctuation is left outside the link.
-  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, url) => {
+  // Autolink bare http(s) URLs (explicit links are opaque placeholders now).
+  // A closing emphasis marker adjacent to the URL belongs to the surrounding
+  // Markdown when the matching opener occurs before it. Strip that delimiter
+  // first, then ordinary sentence punctuation, and keep both outside the anchor.
+  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, matchedUrl, offset, input) => {
+    let url = matchedUrl;
+    let markdownTail = '';
+    const marker = (url.match(/(\*{1,3}|_{1,3}|~~)$/) || [])[1];
+    const before = input.slice(0, offset + pre.length);
+    if (marker && before.includes(marker)) {
+      url = url.slice(0, -marker.length);
+      markdownTail = marker;
+    }
     const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
     const bare = url.slice(0, url.length - tail.length);
-    return `${pre}<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>${tail}`;
+    return `${pre}${keepLink(`<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>`)}${tail}${markdownTail}`;
   });
-  x = x.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
-  x = x.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
-  x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
-  x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
-  x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
-  x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
-  x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  x = format(x);
+  x = x.replace(/\u0002(\d+)\u0002/g, (_, n) => links[Number(n)] ?? '');
   x = x.replace(/\u0001(\d+)\u0001/g, (_, n) => lit[Number(n)]);
   return x;
 }
@@ -2168,6 +2232,7 @@ function verificationBanner() {
   return `<div class="verify-banner" id="verify-banner">
     <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
     <button class="btn sm" id="verify-resend">Resend link</button>
+    <a class="btn sm" data-spa href="${globalRoute('profile')}">Change email</a>
     <button class="verify-dismiss" id="verify-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
   </div>`;
 }
@@ -2744,7 +2809,7 @@ function tasksView() {
       : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
+      <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send · Ctrl+V to paste image · (n)" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.draft}</button>
       <button class="btn icon-only" id="expand-task" title="More fields ( N or ↵ )" aria-label="More fields">${ICON.more}</button>
@@ -2810,13 +2875,30 @@ function priorityFlag(t) {
   return `<span class="prio p${p}" title="Priority: ${PRIORITY_NAMES[p]}">${'▲'}${p >= 3 ? '' : ''} ${PRIORITY_NAMES[p]}</span>`;
 }
 
+// Is one dependency of a dependency trigger already satisfied? Mirrors
+// statusSatisfiesDependency() in src/domain/triggers.ts. A dep the task pool does
+// not hold (deleted, or not yet loaded) counts as unsatisfied — the honest guess,
+// since the dispatcher is still waiting on it.
+function dependencySatisfied(trigger, taskId) {
+  const status = (S.tasks || []).find((t) => t.id === taskId)?.lastView?.status;
+  if (!status) return false;
+  switch (trigger.on || 'success') {
+    case 'failed': return status === 'failed';
+    case 'settled': return status === 'done' || status === 'failed' || status === 'cancelled';
+    default: return status === 'done'; // 'done' | 'success'
+  }
+}
+
 // A one-line human summary of a task's triggers (armed-row subtitle).
 function triggerSummary(triggers) {
   const arr = Array.isArray(triggers) ? triggers : [];
   return arr
     .map((t) => {
       if (t.kind === 'dependency') {
-        const n = (t.tasks || []).length;
+        // What's still outstanding, not the whole list: a task declared "after 3
+        // tasks" with two of them done is waiting on one.
+        const n = (t.tasks || []).filter((id) => !dependencySatisfied(t, id)).length;
+        if (!n) return 'dependencies met';
         return `after ${n} task${n === 1 ? '' : 's'}`;
       }
       if (t.kind === 'schedule') return t.cron ? `cron ${t.cron}` : t.at ? `at ${new Date(t.at).toLocaleString()}` : 'schedule';
@@ -5807,14 +5889,38 @@ function conversationPane(v, t) {
 function conversationEntries(t) {
   const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
+  // A Temporal activity retry continues the same logical turn, so provider item
+  // ids (especially the synthetic `turn` id) repeat. Keep attempts distinct:
+  // otherwise the resumed `started` event overwrites the prior `failed` event
+  // and inherits its error detail, producing the contradictory
+  // "Agent started working · API Error: 529" row seen on task #353.
+  //
+  // New events carry an explicit attempt number. Infer a generation for older
+  // histories so already-running tasks repair themselves after this UI ships.
+  const legacyGenerations = new Map();
   for (const event of updates) {
     const activity = event.payload || {};
     const turn = activity.turnId || `legacy-${event.seq || event.ts}`;
-    const key = `${turn}/${activity.id || event.seq || event.ts}`;
+    const item = activity.id || event.seq || event.ts;
+    const base = `${turn}/${item}`;
+    let attempt = activity.attempt;
+    let retry = Number(attempt) > 1;
+    if (attempt == null) {
+      let generation = legacyGenerations.get(base) || 1;
+      const prior = activities.get(`${base}/legacy-${generation}`);
+      if (activity.phase === 'started' && ['completed', 'failed'].includes(prior?.activity?.phase)) generation++;
+      legacyGenerations.set(base, generation);
+      attempt = `legacy-${generation}`;
+      retry = generation > 1;
+    }
+    const key = `${base}/${attempt}`;
     const prior = activities.get(key);
+    const displayed = retry && activity.kind === 'turn' && activity.phase === 'started'
+      ? { ...activity, title: 'Agent retry started', detail: undefined }
+      : activity;
     activities.set(key, {
       type: 'activity',
-      activity: { ...(prior?.activity || {}), ...activity },
+      activity: { ...(prior?.activity || {}), ...displayed },
       ts: prior?.ts || event.ts,
       sortTs: Number(prior?.ts || event.ts),
       order: prior?.order ?? event.seq ?? event.ts,
@@ -9344,7 +9450,7 @@ function paymentsCard(scope) {
       <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
       <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
       <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
-      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" placeholder="MM/YY" /></label>
+      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" inputmode="numeric" placeholder="MM/YY" /></label>
       <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
       <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
       <label class="form-row">City<input class="card-city" /></label>
@@ -9395,6 +9501,80 @@ function paymentsCard(scope) {
     ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
       <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
+}
+// ── card fields ──────────────────────────────────────────────────────────────
+// Card number, expiry and CVC behave like any checkout form: separators appear
+// as you type, a pasted number is regrouped whatever it was punctuated with,
+// and Backspace over a separator takes the digit behind it. Only `format` is
+// per-field; the caret bookkeeping below is shared.
+/** Digit groups as the brand prints them on the card; the last entry is the default. */
+const CARD_NUMBER_GROUPS = [
+  { test: /^3[47]/, groups: [4, 6, 5] },              // American Express
+  { test: /^3(?:0[0-59]|[689])/, groups: [4, 6, 4] }, // Diners Club / Carte Blanche
+  { test: /^/, groups: [4, 4, 4, 4, 3] },             // everything else, up to 19 digits
+];
+/** "4242-4242 42424242" → "4242 4242 4242 4242"; Amex → "3782 822463 10005". */
+function formatCardNumber(raw) {
+  const all = String(raw ?? '').replace(/\D/g, '');
+  const { groups } = CARD_NUMBER_GROUPS.find((brand) => brand.test.test(all));
+  const digits = all.slice(0, groups.reduce((sum, size) => sum + size, 0));
+  const out = [];
+  for (let at = 0, g = 0; at < digits.length; at += groups[g++]) out.push(digits.slice(at, at + groups[g]));
+  return out.join(' ');
+}
+/** Anything from "5" to "12 - 2026" → "MM/YY", inserting the slash as soon as the month is known. */
+function formatExpiry(raw) {
+  const s = String(raw ?? '').trim();
+  // A month can only be one digit if it cannot start a two-digit month ("5"),
+  // or if the user closed it with a separator themselves ("1/").
+  let digits = (/^[1-9]/.test(s) && (s[0] > '1' || /^\d\D/.test(s)) ? '0' : '') + s.replace(/\D/g, '');
+  if (digits.length > 4) digits = digits.slice(0, 2) + digits.slice(-2); // a 4-digit year
+  const month = digits.slice(0, 2);
+  return month.length < 2 ? month : `${month}/${digits.slice(2, 4)}`;
+}
+/** CVC: digits only, up to the four American Express prints (three elsewhere). */
+function formatCvc(raw) {
+  return String(raw ?? '').replace(/\D/g, '').slice(0, 4);
+}
+/** Offset in `value` just past its `count`-th digit — where the caret belongs. */
+function caretAfterDigits(value, count) {
+  if (count <= 0) return 0;
+  let seen = 0;
+  for (let i = 0; i < value.length; i++)
+    if (value[i] >= '0' && value[i] <= '9' && ++seen === count) return i + 1;
+  return value.length;
+}
+/** Reformat `raw`, keeping the caret on the same digit the user left it after. */
+function applyDigitFormat(raw, caret, format) {
+  const value = format(raw);
+  // Typing at the end is the common case, and the only one where the format may
+  // legitimately insert a digit ahead of the caret (a padded month).
+  if (caret >= raw.length) return { value, caret: value.length };
+  return { value, caret: caretAfterDigits(value, raw.slice(0, caret).replace(/\D/g, '').length) };
+}
+/** The span a delete should really cover: a separator drags its neighbouring digit along. */
+function separatorDeletion(value, start, end, inputType) {
+  if (start !== end) return null;
+  if (inputType === 'deleteContentBackward' && start > 0 && !/\d/.test(value[start - 1]))
+    return [Math.max(0, start - 2), start];
+  if (inputType === 'deleteContentForward' && start < value.length && !/\d/.test(value[start]))
+    return [start, start + 2];
+  return null;
+}
+function wireCardField(input, format) {
+  if (!input) return;
+  const rewrite = (raw, caret) => {
+    const next = applyDigitFormat(raw, caret, format);
+    input.value = next.value;
+    input.setSelectionRange(next.caret, next.caret);
+  };
+  input.addEventListener('beforeinput', (e) => {
+    const span = separatorDeletion(input.value, input.selectionStart, input.selectionEnd, e.inputType);
+    if (!span) return;
+    e.preventDefault();
+    rewrite(input.value.slice(0, span[0]) + input.value.slice(span[1]), span[0]);
+  });
+  input.addEventListener('input', () => rewrite(input.value, input.selectionStart ?? input.value.length));
 }
 /** "MM/YY", "MM/YYYY", or "MMYY" → {expMonth, expYear}; null when unparseable. */
 function parseExpiry(raw) {
@@ -9492,6 +9672,11 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   // Non-project cards belong to the organization (tenant boundary), not the
   // whole installation. `scope==='global'` here is the org-settings surface.
   const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
+  // Before any await: the card fields must format from the first keystroke even
+  // if the provider lookup below is slow or fails.
+  wireCardField(box.querySelector('.card-number'), formatCardNumber);
+  wireCardField(box.querySelector('.card-expiry'), formatExpiry);
+  wireCardField(box.querySelector('.card-cvc'), formatCvc);
   const paymentsBase = organizationId
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
@@ -9568,7 +9753,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
-          <div class="task-sub">${usd(c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
+          <div class="task-sub">${usd(c.remaining ?? c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
         ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
@@ -10663,6 +10848,25 @@ function profileView() {
         ${row('Account', u?.id || '')}
       </div>
     </div>
+    ${u ? `<div class="card">
+      <div class="profile-email-heading">
+        <div>
+          <div class="section-h">Email address</div>
+          <p class="task-sub">Used to sign in and receive account emails.</p>
+        </div>
+        <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+      </div>
+      <div class="profile-email-form">
+        <label class="form-row" for="profile-email">
+          <span>New email</span>
+          <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
+        </label>
+        <button class="btn primary" id="profile-email-save">Change email</button>
+      </div>
+      <p class="profile-email-help">${u.emailVerified
+        ? 'Your current address stays active until you confirm the link sent to the new one.'
+        : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
+    </div>` : ''}
     <div class="card">
       <div class="section-h">Organizations</div>
       <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
@@ -10685,6 +10889,40 @@ function profileView() {
 }
 
 function wireProfileView() {
+  $('#profile-email-save')?.addEventListener('click', async () => {
+    const input = $('#profile-email');
+    const newEmail = input.value.trim();
+    if (!newEmail || !input.checkValidity()) {
+      input.reportValidity();
+      return;
+    }
+    if (newEmail.toLowerCase() === String(S.user?.email || '').toLowerCase())
+      return toast('Enter a different email address.', true);
+    const button = $('#profile-email-save');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/auth/change-email', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ newEmail, callbackURL: `${location.origin}/?verified=1` }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || body.error || 'Couldn’t change the email address.');
+      }
+      const wasUnverified = S.user?.emailVerified === false;
+      const session = await fetch('/api/session').then((result) => result.json());
+      if (session.user) S.user = session.user;
+      renderShell();
+      await applyRoute();
+      toast(wasUnverified
+        ? `Email changed. Confirmation link sent to ${newEmail}.`
+        : `Confirmation link sent to ${newEmail}. Your email will change after you confirm it.`);
+    } catch (error) {
+      toast(error.message || 'Couldn’t change the email address.', true);
+      button.disabled = false;
+    }
+  });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}

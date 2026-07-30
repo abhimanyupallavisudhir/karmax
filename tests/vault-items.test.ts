@@ -386,4 +386,17 @@ describe('zero-exposure CDP fill (§5B)', () => {
   it('rejects non-loopback endpoints', async () => {
     await expect(fillViaCdp({ cdpUrl: 'http://example.com:9222', selector: 'x', text: 'y' })).rejects.toThrow(/loopback/);
   });
+
+  it('explains how to recover when the browser has no reachable CDP endpoint', async () => {
+    const server = http.createServer();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as any).port;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    await expect(fillViaCdp({
+      cdpUrl: `http://127.0.0.1:${port}`,
+      selector: '#password',
+      text: 's3cret',
+    })).rejects.toThrow(/Karmax-managed chrome-devtools browser.*cdpUrl/);
+  });
 });

@@ -128,27 +128,43 @@ export class ConfigHomeManager {
   }
 
   /**
-   * Refresh only karmax's platform bridge in every existing config home.
+   * Refresh karmax's managed MCPs in every existing config home.
    *
    * Account homes outlive application versions, so limiting MCP configuration to
-   * the one-time login flow strands old launch commands forever. In particular,
-   * the historical `npx tsx` bridge depended on the agent's current worktree and
-   * did not ask Codex to forward the per-turn KARMAX_TOKEN. Refreshing at boot
-   * upgrades those durable homes while preserving their browser and user servers.
+   * the one-time login flow strands old launch commands forever. This upgrades
+   * both the platform bridge and any already-selected browser: notably, bare
+   * `chrome-devtools-mcp` launches Chrome over a private pipe that zero-exposure
+   * credential fill cannot reach, while the current launcher exposes the guarded
+   * loopback CDP endpoint. Browser MCPs are never added to profiles that did not
+   * already select one, and unrelated user servers are preserved.
    */
-  refreshPlatformMcp(gatewayUrl: string): void {
+  refreshManagedMcp(gatewayUrl: string): void {
     const platform = platformMcpSpec(gatewayUrl);
+    const managedBrowsers = mcpServerMap({ browser: 'chrome-devtools' });
+    Object.assign(managedBrowsers, mcpServerMap({ browser: 'playwright' }));
     for (const { provider, path: home } of this.allHomes()) {
       if (provider === 'claude') {
         const file = path.join(home, '.claude.json');
         const cur = readJson(file);
-        cur.mcpServers = { ...(cur.mcpServers ?? {}), karmax: claudeMcpServer(platform) };
+        const existing = cur.mcpServers ?? {};
+        const refreshed = Object.fromEntries(
+          Object.entries(managedBrowsers)
+            .filter(([name]) => existing[name])
+            .map(([name, server]) => [name, claudeMcpServer(server)]),
+        );
+        cur.mcpServers = { ...existing, ...refreshed, karmax: claudeMcpServer(platform) };
         fs.writeFileSync(file, JSON.stringify(cur, null, 2));
       } else if (provider === 'codex') {
         const file = path.join(home, 'config.toml');
         const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-        const preserved = removeTomlTables(existing, ['mcp_servers.karmax']);
-        fs.writeFileSync(file, preserved.trimEnd() + codexMcpServer('karmax', platform));
+        const selectedBrowsers = Object.entries(managedBrowsers)
+          .filter(([name]) => new RegExp(`^\\s*\\[mcp_servers\\.${name}]\\s*$`, 'm').test(existing));
+        const preserved = removeTomlTables(existing, [
+          'mcp_servers.karmax',
+          ...selectedBrowsers.map(([name]) => `mcp_servers.${name}`),
+        ]);
+        const browserToml = selectedBrowsers.map(([name, server]) => codexMcpServer(name, server)).join('');
+        fs.writeFileSync(file, preserved.trimEnd() + browserToml + codexMcpServer('karmax', platform));
       }
     }
   }

@@ -3830,17 +3830,21 @@ export class Store {
     return this.db.prepare(`SELECT * FROM payment_spend_requests${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY createdAt DESC`).all(...values) as any[];
   }
+  /** `amount` is patchable because a request starts life as a *reservation* — an
+   * upper bound the agent asked for — and the rail later reports what it really
+   * moved. Everything that counts against a cap or an allowance sums this column,
+   * so reconciling it is how the ceiling comes to reflect real money. */
   updatePaymentSpendRequest(id: string, patch: { status?: string; reason?: string; shortfall?: number;
-    providerAuthorizationId?: string; resolvedBy?: string; expiresAt?: number }): any {
+    providerAuthorizationId?: string; resolvedBy?: string; expiresAt?: number; amount?: number }): any {
     const current = this.getPaymentSpendRequest(id);
     if (!current) return undefined;
     this.db.prepare(`UPDATE payment_spend_requests SET status=?, reason=?, shortfall=?,
-      providerAuthorizationId=?, resolvedBy=?, expiresAt=?, updatedAt=? WHERE id=?`)
+      providerAuthorizationId=?, resolvedBy=?, expiresAt=?, amount=?, updatedAt=? WHERE id=?`)
       .run(patch.status ?? current.status, patch.reason ?? current.reason ?? null,
         patch.shortfall ?? current.shortfall ?? null,
         patch.providerAuthorizationId ?? current.providerAuthorizationId ?? null,
         patch.resolvedBy ?? current.resolvedBy ?? null, patch.expiresAt ?? current.expiresAt,
-        Date.now(), id);
+        patch.amount ?? current.amount, Date.now(), id);
     const updated = this.getPaymentSpendRequest(id);
     this.kvSet(`spent:${current.taskId}`, String(this.paymentSpent(current.taskId))); // see the note above
     return updated;
@@ -3876,10 +3880,15 @@ export class Store {
       WHERE expiresAt<=? AND status IN ('authorized','pending_approval','needs_funding')`)
       .run(now, now).changes);
   }
-  consumePaymentAuthorization(id: string, providerAuthorizationId: string): any {
+  /** `amount` is what the rail actually authorized, which `findPaymentAuthorization`
+   * allows to be *less* than the reservation. Recording it here is what stops an
+   * over-estimated reservation from burning the card's cap for money nobody spent. */
+  consumePaymentAuthorization(id: string, providerAuthorizationId: string, amount?: number): any {
     const result = this.db.prepare(`UPDATE payment_spend_requests SET status='consumed',
-      providerAuthorizationId=?, updatedAt=? WHERE id=? AND status='authorized' AND expiresAt>?`)
-      .run(providerAuthorizationId, Date.now(), id, Date.now());
+      providerAuthorizationId=?, amount=?, updatedAt=? WHERE id=? AND status='authorized' AND expiresAt>?`)
+      .run(providerAuthorizationId,
+        Number.isSafeInteger(amount) && amount! > 0 ? amount : this.getPaymentSpendRequest(id)?.amount,
+        Date.now(), id, Date.now());
     return Number(result.changes) === 1 ? this.getPaymentSpendRequest(id) : undefined;
   }
 

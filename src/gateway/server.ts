@@ -219,12 +219,14 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets') return 'task:escalate';
   if (p === '/api/agent/collaboration/request') return 'task:conversation:message';
   if (/\/file$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p)) return 'task:signal';
+  if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
   if (p === '/api/skills') return 'skill:write';
   return undefined;
@@ -2606,6 +2608,19 @@ export class Gateway {
         const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
+      const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);
+      if (escalateMatch && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.escalateToHuman(token, {
+            taskId: escalateMatch[1]!,
+            audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
+            message: String(b.message ?? ''),
+          }));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const stageMatch = p.match(/^\/api\/tasks\/([^/]+)\/stage$/);
       if (stageMatch && method === 'POST') {
         const b = await this.body(req);
@@ -2685,6 +2700,21 @@ export class Gateway {
       if (p === '/api/agent/git/refresh-upstream' && method === 'POST') {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/escalate' && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.escalateToHuman(token, {
+            audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
+            message: String(b.message ?? ''),
+          }));
+        } catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (p === '/api/agent/escalation-targets' && method === 'GET') {
+        try { return this.json(res, 200, api.humanEscalationTargets(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/collaboration/request' && method === 'POST') {
@@ -3778,7 +3808,18 @@ export class Gateway {
         const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
         if (pid && cardOrg && store.getProject(pid)?.organizationId !== cardOrg)
           return this.json(res, 404, { error: 'project not found in this organization' });
-        return this.json(res, 200, store.listCards(pid, cardOrg));
+        const { cardRemaining } = await import('../autonomy/payments.js');
+        // `available` is not what is left on the card — on an issuing rail it is
+        // the organization's whole balance. Report the ceiling and what has been
+        // counted against it, so the surface cannot claim more than the cap.
+        return this.json(res, 200, store.listCards(pid, cardOrg).map((card) => {
+          const spent = store.cardPaymentSpent(card.id);
+          // An unregistered rail (a card left behind by a provider this
+          // deployment no longer loads) still has a cap worth reporting.
+          let enforces = true;
+          try { enforces = this.deps.paymentRegistry?.forCard(card).enforcesCardCap !== false; } catch {}
+          return { ...card, spent, remaining: cardRemaining(card, spent, enforces) };
+        }));
       }
       if (p === '/api/cards' && method === 'POST') {
         if (!this.deps.paymentRegistry && !this.deps.payments)

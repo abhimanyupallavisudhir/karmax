@@ -23,7 +23,7 @@ global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 // eval'd functions can see them in this scope).
 const MD_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
 const mdListKind = (marker) => (/^\d/.test(marker) ? 'ol' : 'ul');
-for (const fn of ['renderMarkdown', 'mdBlocks', 'mdInline', 'mdIndent', 'mdParseList', 'mdSplitRow', 'mdIsDelimiterRow', 'mdCellAlign']) eval(extractFn(fn));
+for (const fn of ['renderMarkdown', 'sanitizeMarkdownHtml', 'mdBlocks', 'mdInline', 'mdIndent', 'mdParseList', 'mdSplitRow', 'mdIsDelimiterRow', 'mdCellAlign']) eval(extractFn(fn));
 
 let pass = 0, fail = 0;
 const ok = (c, m) => c ? pass++ : (fail++, console.error('FAIL:', m));
@@ -97,6 +97,39 @@ ok(renderMarkdown('***wow***', {}).includes('<strong><em>wow</em></strong>'), 't
 ok(renderMarkdown('\\*not italic\\*', {}).includes('*not italic*') && !renderMarkdown('\\*not italic\\*', {}).includes('<em>'), 'backslash-escaped asterisks are literal');
 ok(renderMarkdown('**a\\*b**', {}).includes('<strong>a*b</strong>'), 'escaped asterisk survives inside bold');
 ok(renderMarkdown('some_var_name here', {}).includes('some_var_name'), 'mid-word underscores are not emphasis');
+
+// Regression (Task 353): inline markup around a bare URL must not be consumed
+// into the generated anchor. The old autolink-first pipeline let the closing
+// `**` become part of href, then the bold pass inserted `</strong>` inside the
+// attribute. Browsers repair that malformed formatting element across later
+// siblings, bolding the follow-up field and subsequent messages.
+const boldUrl = renderMarkdown('**karmax is live at https://krmax.io.**', {});
+ok(
+  boldUrl.includes('<strong>karmax is live at <a href="https://krmax.io"') &&
+    boldUrl.includes('>https://krmax.io</a>.</strong>'),
+  'bold delimiters around a bare URL remain outside the generated anchor',
+);
+ok(!/<a\b[^>]*<(?:strong|em|del)\b/i.test(boldUrl), 'formatting tags never appear inside anchor attributes');
+ok(
+  renderMarkdown('*see https://example.test/path*', {}).includes('<em>see <a href="https://example.test/path"') &&
+    renderMarkdown('~~see https://example.test/path~~', {}).includes('<del>see <a href="https://example.test/path"'),
+  'italic and strike delimiters around bare URLs remain outside the anchor',
+);
+const underscoredUrl = renderMarkdown('https://example.test/_private_', {});
+ok(
+  underscoredUrl.includes('href="https://example.test/_private_"') && !/<a\b[^>]*<em\b/i.test(underscoredUrl),
+  'underscores in a URL cannot turn into markup inside href',
+);
+const markdownLinkUrl = renderMarkdown('[link](https://example.test/_private_)', {});
+ok(
+  markdownLinkUrl.includes('href="https://example.test/_private_"') &&
+    !/<a\b[^>]*<em\b/i.test(markdownLinkUrl),
+  'underscores in an explicit Markdown-link destination stay inert',
+);
+ok(
+  !renderMarkdown('**unclosed formatting', {}).includes('<strong>'),
+  'unclosed emphasis is rendered literally rather than leaking an open tag',
+);
 
 // Math: left intact for MathJax when enabled; treated as plain text when off.
 const withMath = renderMarkdown('inline $a_b=c^2$ and $$x+y$$', { math: true });

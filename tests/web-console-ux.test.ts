@@ -56,6 +56,16 @@ describe('websocket reconnect', () => {
   });
 });
 
+describe('account email correction', () => {
+  it('lets an unverified person replace a mistyped address from their profile', () => {
+    expect(app).toContain('id="profile-email"');
+    expect(app).toContain("fetch('/api/auth/change-email'");
+    expect(app).toContain('Change email');
+    expect(app).toContain('Confirmation link sent to');
+    expect(css).toContain('.profile-email-form');
+  });
+});
+
 describe('animations', () => {
   it('defines @keyframes pulse exactly once', () => {
     expect([...css.matchAll(/@keyframes pulse(?![-\w])/g)]).toHaveLength(1);
