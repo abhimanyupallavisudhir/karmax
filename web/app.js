@@ -2173,8 +2173,11 @@ function verificationBanner() {
 }
 
 // One failure, one message: a network error and a rejecting server are the same
-// thing to the person clicking Resend.
-const EMAIL_SEND_FAILED = 'Couldn’t send the email. Outbound email may not be set up.';
+// thing to the person clicking Resend. Cause-neutral on purpose — this used to
+// blame outbound email not being set up, which sent someone hunting through
+// settings that were already correct when the real answer was that the sending
+// domain was unverified at the provider. The server log names the cause.
+const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';
 
 function wireVerificationBanner() {
   $('#verify-resend')?.addEventListener('click', async () => {
