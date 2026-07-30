@@ -55,6 +55,31 @@ to:
    registered businesses can instead connect Stripe Issuing (see `HOSTING.md`)
    to have Karmax mint capped, merchant-locked cards per agent or per task.
 
+### Optional: "Continue with Google"
+
+Unlike the items above, this one is not a settings screen — it is a pair of
+variables, because the OAuth client belongs to the *installation*, not to a
+tenant. In the [Google Cloud console](https://console.cloud.google.com/auth/clients)
+create a **Web application** client whose authorized redirect URI is exactly
+
+```text
+https://karmax.example.com/api/auth/callback/google
+```
+
+Better Auth serves that path itself, so the host must match the domain you
+deployed on. Then add the pair to `deploy/.turnkey.env` and restart:
+
+```bash
+KARMAX_GOOGLE_CLIENT_ID=....apps.googleusercontent.com
+KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-...
+```
+
+Only the basic `openid`/`email`/`profile` scopes are requested, which is why the
+consent screen can be published without Google's verification review. Set both
+or neither — the button appears only when both are non-empty. `KARMAX_OIDC_*`
+(enterprise SSO) works the same way and is a separate slot, so an installation
+can offer both.
+
 That same HTTPS URL works from a phone—no VPN and no Karmax-specific native app
 are required. **Organization settings → Phone Access** offers an
 **Add Karmax to this phone** action; the browser installs the responsive web app

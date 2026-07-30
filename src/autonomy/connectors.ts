@@ -405,6 +405,12 @@ export function parsePassFiles(raw: string, storeDir: string): string[] {
 const kvConfig = (org: string, name: string) => `vault:connector:${org}:${name}`;
 const connectorAuthHandle = (org: string, name: string) => `connector:${org}:${name}:auth`;
 
+/** Truncate an epoch-milliseconds value to a whole millisecond, so timestamps of
+ *  different precision (a float file mtime, an integer `Date.now()`) can be
+ *  ordered against each other. See the comparison in {@link Connectors.sync}. */
+const floorMs = (value: number | undefined): number | undefined =>
+  value === undefined ? undefined : Math.floor(value);
+
 export interface ConnectorConfig {
   /** Opt-in write-back of agent-created items. */
   writeBack?: boolean;
@@ -507,12 +513,19 @@ export class Connectors {
     if (mirrored.size) {
       const changedAt = new Map((await connector.list()).map((i) => [i.externalId, i.changedAt]));
       wanted = externalIds.filter((id) => {
-        const at = changedAt.get(id);
+        // Whole milliseconds on BOTH sides. A source's change marker can be
+        // finer-grained than the mirror clock it is compared against — a file
+        // mtime carries sub-millisecond precision while `Date.now()` does not —
+        // so an entry touched in the same millisecond the sync recorded reads
+        // back as `clock + 0.31…`: strictly greater, hence "changed", hence
+        // re-decrypted on every sync from then on. Comparing at the coarser of
+        // the two resolutions is what makes the two numbers comparable at all.
+        const at = floorMs(changedAt.get(id));
         const item = mirrored.get(id);
         // Items mirrored before `syncedAt` existed fall back to `updatedAt`,
         // so an upgrade does not force one more full-store re-read; they get a
         // real mirror clock the first time they are pulled again.
-        const since = item && (item.provenance.syncedAt ?? item.updatedAt);
+        const since = floorMs(item && (item.provenance.syncedAt ?? item.updatedAt));
         return !(at !== undefined && since !== undefined && at <= since);
       });
     }

@@ -11,7 +11,21 @@ export default defineConfig({
       KARMAX_AGENT_MAX_LOAD_FACTOR: '0',
     },
     testTimeout: 30_000,
-    hookTimeout: 60_000,
+    // A hook here is not "some setup" — for every integration file it boots or
+    // tears down a REAL Temporal dev server, Worker and gateway. Teardown drains
+    // the worker, and `shutdownGraceTime` only cancels in-flight activities: one
+    // already inside a git subprocess still runs to completion. Measured ~1s
+    // idle, ~30s with other Temporal servers competing for the CPU, so the old
+    // 60s was tight enough that runner contention alone could fail a suite whose
+    // 1486 tests had all passed.
+    //
+    // It is NOT only contention, though, and this budget is not a fix for the
+    // other half: a teardown has also been seen to exceed even 180s, which is a
+    // hang rather than slowness. That case is meant to be *identified* rather
+    // than absorbed — `stopPhase()` in tests/helpers/harness.ts names the step
+    // that is still running, so the CI log says which one instead of only
+    // "Hook timed out".
+    hookTimeout: 180_000,
     // Each integration test file boots a real Temporal dev server + Worker.
     // Run them ONE AT A TIME in a SINGLE process so we never have several heavy
     // servers/workers alive at once (which can exhaust RAM). See TESTING.md.

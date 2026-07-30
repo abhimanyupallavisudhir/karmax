@@ -281,6 +281,35 @@ describe('Connectors sync into the vault (§9)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // A file's mtime carries sub-millisecond precision; `Date.now()` does not. So
+  // an entry written in the SAME millisecond the sync records its mirror clock
+  // reads back as `mtimeMs = clock + 0.31…`, i.e. strictly greater — and the
+  // entry is re-decrypted on every subsequent sync until something else touches
+  // the clock. That is the exact cost this skip exists to avoid ("decrypting the
+  // whole store costs seconds per entry"), and it made the suite flaky: whether
+  // the write and the sync landed in the same millisecond decided the result.
+  it('skips an entry whose mtime is the mirror clock plus a sub-millisecond fraction', async () => {
+    const { shown, write, connector, dir } = passStore();
+    write('sites/a.com', 'pw-a');
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    await connectors.sync('pass', ['sites/a.com']);
+
+    // Reproduce that race deterministically rather than hoping for the timing:
+    // put the file's mtime inside the very millisecond the mirror clock names.
+    const syncedAt = items.list()[0]!.provenance.syncedAt!;
+    const withinSameMs = (syncedAt + 0.5) / 1000;
+    fs.utimesSync(path.join(dir, 'sites/a.com.gpg'), withinSameMs, withinSameMs);
+    expect(fs.statSync(path.join(dir, 'sites/a.com.gpg')).mtimeMs).toBeGreaterThan(syncedAt);
+
+    shown.length = 0;
+    const again = await connectors.sync('pass', ['sites/a.com']);
+    expect(shown).toEqual([]);
+    expect(again).toMatchObject({ count: 0, skipped: 1 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('a policy edit on a mirrored item does not make it look up to date', async () => {
     const { shown, write, connector } = passStore();
     write('sites/a.com', 'pw-a');

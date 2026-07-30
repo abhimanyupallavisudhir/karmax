@@ -1,3 +1,7 @@
+import os from 'node:os';
+import path from 'node:path';
+import { parseEnv } from 'node:util';
+
 export interface DeploymentConfig {
   hosted: boolean;
   singleNode: boolean;
@@ -41,7 +45,8 @@ export function hostLocal(env: NodeJS.ProcessEnv = process.env): boolean {
 const SECRET_FILE_ENV = [
   'KARMAX_AUTH_SECRET', 'KARMAX_VAULT_KEY', 'KARMAX_WORLD_REF_KEY',
   'KARMAX_TEMPORAL_API_KEY', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY',
-  'KARMAX_S3_SESSION_TOKEN', 'KARMAX_OIDC_CLIENT_SECRET', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
+  'KARMAX_S3_SESSION_TOKEN', 'KARMAX_OIDC_CLIENT_SECRET', 'KARMAX_GOOGLE_CLIENT_SECRET',
+  'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
   'KARMAX_GITHUB_APP_PRIVATE_KEY', 'KARMAX_GITHUB_WEBHOOK_SECRET',
   'KARMAX_GITHUB_CLIENT_SECRET',
   'E2B_API_KEY', 'DAYTONA_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
@@ -57,6 +62,34 @@ export function hydrateSecretFiles(env: NodeJS.ProcessEnv = process.env,
     const filename = env[`${name}_FILE`]?.trim();
     if (filename) env[name] = read(filename).trimEnd();
   }
+}
+
+/**
+ * Durable operator settings for a self-host: `$KARMAX_HOME/karmax.env`.
+ *
+ * A managed cell gets its variables from compose and a secret manager. A
+ * self-host is booted by hand with a bare `npm start`, so there was nowhere to
+ * put an operator setting that has to outlive the shell — a Google OAuth client,
+ * a mailer, a public URL survived only until the next reboot, and "configured"
+ * silently meant "configured until you close the terminal".
+ *
+ * Same file format as `node --env-file` (`parseEnv` is Node's own parser, so
+ * there is no second dialect to learn). The real environment always wins, which
+ * keeps `KARMAX_X=… npm start` an override rather than a surprise, and keeps
+ * every test's explicit env authoritative. Absent file → zero-config default:
+ * this is an affordance, never a requirement.
+ *
+ * @returns the file that was loaded, or undefined if there was none.
+ */
+export function hydrateEnvFile(env: NodeJS.ProcessEnv = process.env,
+  read: (filename: string) => string = () => { throw new Error('no reader'); }): string | undefined {
+  const file = path.join(env.KARMAX_HOME ?? path.join(os.homedir(), '.karmax'), 'karmax.env');
+  let contents: string;
+  try { contents = read(file); } catch { return undefined; }
+  for (const [name, value] of Object.entries(parseEnv(contents))) {
+    if (env[name] === undefined) env[name] = value;
+  }
+  return file;
 }
 
 /** Hosted Karmax is a single-writer control-plane cell with execution forced
