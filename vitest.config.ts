@@ -11,7 +11,15 @@ export default defineConfig({
       KARMAX_AGENT_MAX_LOAD_FACTOR: '0',
     },
     testTimeout: 30_000,
-    hookTimeout: 60_000,
+    // A hook here is not "some setup" — for every integration file it boots or
+    // tears down a REAL Temporal dev server, Worker and gateway. Teardown drains
+    // the worker, and `shutdownGraceTime` only cancels in-flight activities: one
+    // already inside a git subprocess still runs to completion. That is ~30ms on
+    // an idle machine and tens of seconds on a loaded 2-core CI runner, so 60s
+    // turned runner contention into a red build (a green suite — 1486 passed —
+    // failed on "Hook timed out" in gateway.test.ts's afterAll). Generous, but
+    // still bounded, so a genuinely wedged hook fails instead of hanging.
+    hookTimeout: 180_000,
     // Each integration test file boots a real Temporal dev server + Worker.
     // Run them ONE AT A TIME in a SINGLE process so we never have several heavy
     // servers/workers alive at once (which can exhaust RAM). See TESTING.md.
