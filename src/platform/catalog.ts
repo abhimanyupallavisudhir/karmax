@@ -79,7 +79,10 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/search/fields (the searchable-field registry behind the query grammar)',
     'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
     'POST /api/agent/escalate (calling task inferred from its token; body {audience, message})',
+    'POST /api/agent/permission-requests (body {capabilities, audience, reason}; exact task elevation routed for human approval)',
     'GET /api/agent/escalation-targets (people, teams, and special audience selectors available to the calling task)',
+    'GET /api/permission-requests?taskId=&organizationId=',
+    'POST /api/permission-requests/:id/resolve?organizationId= (human: body {action: approve|deny})',
     'POST /api/agent/collaboration/request',
   ],
   conversations: [

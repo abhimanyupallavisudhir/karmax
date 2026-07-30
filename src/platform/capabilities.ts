@@ -214,7 +214,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   create_task: 'task:create', edit_task: 'task:edit', delete_task: 'task:delete',
   create_sub_task: 'task:create', respond_to_sub_task: 'task:signal', wait_for_subtasks: 'task:read',
   raise_to_parent: 'task:signal', create_review_info: 'task:review:write', signal_completion: 'task:signal',
-  escalate_to_human: 'task:escalate',
+  escalate_to_human: 'task:escalate', request_permission: 'task:escalate',
   save_skill: 'skill:write', signal_task: 'task:signal', reorder_queue: 'queue:write',
   get_task: 'task:read', find_task: 'task:read', list_tasks: 'task:read', search_tasks: 'task:read',
   list_tags: 'task:read', list_views: 'task:read', search_fields: 'task:read',

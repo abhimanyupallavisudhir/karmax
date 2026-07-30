@@ -8,6 +8,7 @@ import { MANIFESTS } from '../src/contrib/manifests.js';
 const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
 import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
+import { PermissionRequests } from '../src/platform/permission-requests.js';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -142,6 +143,7 @@ describe('task stage transitions', () => {
     const agentToken = f.tokens.mint({
       taskId: f.task.id,
       profileId: 'do',
+      role: 'do',
       principal: `task-agent:${f.task.id}:do`,
       projectId: f.project.id,
       ceiling: ['task:escalate'],
@@ -190,6 +192,7 @@ describe('task stage transitions', () => {
     const agentToken = f.tokens.mint({
       taskId: f.task.id,
       profileId: 'do',
+      role: 'do',
       principal: `task-agent:${f.task.id}:do`,
       projectId: f.project.id,
       ceiling: ['task:escalate'],
@@ -214,6 +217,88 @@ describe('task stage transitions', () => {
       audience: ['@creator'],
       message: 'Stop this other task.',
     })).rejects.toThrow(/only escalate its own task/i);
+  });
+
+  it('routes an exact permission elevation to selected humans and only a capable recipient may approve', async () => {
+    const f = fixture();
+    f.store.setOrganizationMembership('org_personal', 'outsider', 'member');
+    const agentToken = f.tokens.mint({
+      taskId: f.task.id,
+      profileId: 'do',
+      role: 'do',
+      principal: `task-agent:${f.task.id}:do`,
+      projectId: f.project.id,
+      organizationId: 'org_personal',
+      ceiling: ['task:escalate'],
+      grantorCaps: ['task:escalate'],
+    }).token;
+
+    const requested = await f.api.requestPermission(agentToken, {
+      capabilities: ['settings:read'],
+      audience: ['@owners'],
+      reason: 'Inspect the outbound email configuration.',
+    });
+    expect(requested).toMatchObject({
+      status: 'needs_approval',
+      capabilities: ['settings:read'],
+      audience: ['@owners'],
+    });
+    expect(f.store.listInbox('test', 'org_personal')).toEqual([
+      expect.objectContaining({ taskId: f.task.id, kind: 'approval-requested', actionable: true }),
+    ]);
+    expect(f.store.listInbox('outsider', 'org_personal')).toEqual([]);
+
+    const outsider = f.tokens.mintPrincipal(
+      'user:outsider',
+      ['task:read', 'settings:read'],
+      f.project.id,
+      undefined,
+      'org_personal',
+    ).token;
+    await expect(f.api.resolvePermissionRequest(outsider, {
+      organizationId: 'org_personal',
+      requestId: requested.requestId!,
+      action: 'approve',
+    })).rejects.toThrow(/not routed to you/i);
+
+    const resolved = await f.api.resolvePermissionRequest(f.token, {
+      organizationId: 'org_personal',
+      requestId: requested.requestId!,
+      action: 'approve',
+    });
+    expect(resolved).toMatchObject({ status: 'granted', resume: { resumed: true } });
+    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'do'))
+      .toEqual(['settings:read']);
+    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge'))
+      .toEqual([]);
+    expect(f.store.listInbox('test', 'org_personal')[0]).toMatchObject({
+      unread: false,
+      actionable: false,
+    });
+
+    f.store.setOrganizationMembership('org_personal', 'reviewer', 'member');
+    const second = await f.api.requestPermission(agentToken, {
+      capabilities: ['settings:write'],
+      audience: ['user:reviewer'],
+      reason: 'Configure outbound email.',
+    });
+    const reviewer = f.tokens.mintPrincipal(
+      'user:reviewer',
+      ['task:read'],
+      f.project.id,
+      undefined,
+      'org_personal',
+    ).token;
+    await expect(f.api.resolvePermissionRequest(reviewer, {
+      organizationId: 'org_personal',
+      requestId: second.requestId!,
+      action: 'approve',
+    })).rejects.toThrow(/cannot grant settings:write/i);
+    await expect(f.api.resolvePermissionRequest(reviewer, {
+      organizationId: 'org_personal',
+      requestId: second.requestId!,
+      action: 'deny',
+    })).resolves.toMatchObject({ status: 'denied' });
   });
 
   it('treats follow-up and Confirm as input that releases a human hold', async () => {

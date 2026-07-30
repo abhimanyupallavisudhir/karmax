@@ -12,6 +12,8 @@ export interface ScopedToken {
   id: string;
   taskId: string;
   profileId: string;
+  /** Workflow role whose ceiling shaped this agent token. */
+  role?: string;
   principal: string; // the granting user/principal id
   projectId?: string;
   organizationId?: string;
@@ -31,6 +33,7 @@ export interface ScopedToken {
 export interface MintArgs {
   taskId: string;
   profileId: string;
+  role?: string;
   principal: string;
   projectId?: string;
   organizationId?: string;
@@ -68,6 +71,7 @@ export class TokenAuthority {
       id,
       taskId: args.taskId,
       profileId: args.profileId,
+      role: args.role,
       principal: args.principal,
       projectId: args.projectId,
       organizationId: args.organizationId,

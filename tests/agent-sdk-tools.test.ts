@@ -74,6 +74,18 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
   });
 
+  it('advertises exact permission elevation as a routed approval request', () => {
+    const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'request_permission')!;
+    expect(schema).toBeDefined();
+    expect(schema.parameters.required).toEqual(['capabilities', 'audience', 'reason']);
+    expect(schema.parameters.properties.capabilities).toMatchObject({
+      type: 'array',
+      minItems: 1,
+      maxItems: 32,
+    });
+    expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('request_permission');
+  });
+
   it('enforces the review caption limit in the Agent-SDK input shape', () => {
     const schema = TOOL_SCHEMAS.find((t) => t.name === 'create_review_info')!;
     const obj = z.object(jsonSchemaToZodShape(z, schema.parameters));
