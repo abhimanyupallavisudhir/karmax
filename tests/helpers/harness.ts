@@ -27,6 +27,23 @@ import { LoginManager } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/resources.js';
 
+/** How long a teardown step may run before it is worth saying so out loud. Well
+ *  clear of the ~1s a healthy teardown takes, so a normal run stays silent. */
+const SLOW_PHASE_MS = 20_000;
+
+/** Run one teardown step, announcing it on stderr if it outlives
+ *  {@link SLOW_PHASE_MS}. Purely diagnostic: the step is still awaited to
+ *  completion, because abandoning a worker drain leaves the Temporal Runtime
+ *  installed and breaks every later harness boot in the same process. */
+async function stopPhase(name: string, run: () => Promise<unknown>): Promise<void> {
+  const started = Date.now();
+  const warn = setInterval(
+    () => process.stderr.write(`[harness.stop] "${name}" still running after ${Math.round((Date.now() - started) / 1000)}s\n`),
+    SLOW_PHASE_MS,
+  );
+  try { await run(); } finally { clearInterval(warn); }
+}
+
 export interface Harness {
   server: DevServer;
   client: Client;
@@ -163,15 +180,21 @@ export async function bootHarness(
       return started;
     },
     async stop() {
-      for (const close of gateways) await close().catch(() => {});
-      worker.shutdown();
-      await runPromise.catch(() => {});
-      await c.close();
-      await server.stop();
-      fs.rmSync(worldsHome, { recursive: true, force: true });
-      fs.rmSync(vaultHome, { recursive: true, force: true });
-      fs.rmSync(objectHome, { recursive: true, force: true });
-      fs.rmSync(contentDir, { recursive: true, force: true });
+      // Teardown is five blocking steps against real infrastructure. When one of
+      // them wedges, Vitest reports only "Hook timed out in Nms" against the
+      // describe block — which step, and therefore what to look at, is exactly
+      // the information missing (it cost a bisect across three CI runs). Name
+      // each step while it is still running, so a hang identifies itself.
+      await stopPhase('gateways', async () => { for (const close of gateways) await close().catch(() => {}); });
+      await stopPhase('workerDrain', async () => { worker.shutdown(); await runPromise.catch(() => {}); });
+      await stopPhase('clientClose', () => c.close());
+      await stopPhase('serverStop', () => server.stop());
+      await stopPhase('rmTempDirs', async () => {
+        fs.rmSync(worldsHome, { recursive: true, force: true });
+        fs.rmSync(vaultHome, { recursive: true, force: true });
+        fs.rmSync(objectHome, { recursive: true, force: true });
+        fs.rmSync(contentDir, { recursive: true, force: true });
+      });
     },
     async makeRepo(name: string) {
       const repo = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-repo-${name}-`));
