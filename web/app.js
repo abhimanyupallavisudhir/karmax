@@ -2232,6 +2232,7 @@ function verificationBanner() {
   return `<div class="verify-banner" id="verify-banner">
     <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
     <button class="btn sm" id="verify-resend">Resend link</button>
+    <a class="btn sm" data-spa href="${globalRoute('profile')}">Change email</a>
     <button class="verify-dismiss" id="verify-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
   </div>`;
 }
@@ -10844,6 +10845,25 @@ function profileView() {
         ${row('Account', u?.id || '')}
       </div>
     </div>
+    ${u ? `<div class="card">
+      <div class="profile-email-heading">
+        <div>
+          <div class="section-h">Email address</div>
+          <p class="task-sub">Used to sign in and receive account emails.</p>
+        </div>
+        <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+      </div>
+      <div class="profile-email-form">
+        <label class="form-row" for="profile-email">
+          <span>New email</span>
+          <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
+        </label>
+        <button class="btn primary" id="profile-email-save">Change email</button>
+      </div>
+      <p class="profile-email-help">${u.emailVerified
+        ? 'Your current address stays active until you confirm the link sent to the new one.'
+        : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
+    </div>` : ''}
     <div class="card">
       <div class="section-h">Organizations</div>
       <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
@@ -10866,6 +10886,40 @@ function profileView() {
 }
 
 function wireProfileView() {
+  $('#profile-email-save')?.addEventListener('click', async () => {
+    const input = $('#profile-email');
+    const newEmail = input.value.trim();
+    if (!newEmail || !input.checkValidity()) {
+      input.reportValidity();
+      return;
+    }
+    if (newEmail.toLowerCase() === String(S.user?.email || '').toLowerCase())
+      return toast('Enter a different email address.', true);
+    const button = $('#profile-email-save');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/auth/change-email', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ newEmail, callbackURL: `${location.origin}/?verified=1` }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || body.error || 'Couldn’t change the email address.');
+      }
+      const wasUnverified = S.user?.emailVerified === false;
+      const session = await fetch('/api/session').then((result) => result.json());
+      if (session.user) S.user = session.user;
+      renderShell();
+      await applyRoute();
+      toast(wasUnverified
+        ? `Email changed. Confirmation link sent to ${newEmail}.`
+        : `Confirmation link sent to ${newEmail}. Your email will change after you confirm it.`);
+    } catch (error) {
+      toast(error.message || 'Couldn’t change the email address.', true);
+      button.disabled = false;
+    }
+  });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
