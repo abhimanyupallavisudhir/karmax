@@ -8,6 +8,7 @@ const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
 const deploy = workflow.jobs.deploy;
 const script: string = JSON.stringify(deploy.steps);
+const operator = fs.readFileSync(path.join(repoRoot, 'deploy', 'karmax'), 'utf8');
 
 describe('post-push deployment to the public instance', () => {
   it('exists, so a landed commit reaches the VPS without anyone SSHing in by hand', () => {
@@ -51,5 +52,12 @@ describe('post-push deployment to the public instance', () => {
   it('prunes old pre-deploy backups', () => {
     expect(script).toContain('deploy/backups');
     expect(script).toMatch(/-mtime \+\d+/);
+  });
+
+  // `cmd_backup` runs inside the live app container. The backup API rejects a
+  // live instance unless that choice is explicit; omitting the flag made every
+  // post-push deploy fail before `git pull`, permanently stranding production.
+  it('explicitly permits the pre-deploy online snapshot', () => {
+    expect(operator).toContain('npm run backup -- --allow-running "$temporary"');
   });
 });
