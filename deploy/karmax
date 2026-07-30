@@ -67,6 +67,22 @@ configure() {
   old_postgres=$(env_value POSTGRES_VERSION)
   postgres=${old_postgres:-16}
 
+  # This file is rewritten wholesale below, so anything the six managed keys
+  # above do not carry over is deleted. Operators legitimately add their own
+  # settings here (a Google OAuth client, a mailer), and losing one at the next
+  # `up` is invisible: no error, the feature just quietly stops existing. So
+  # capture every other assignment now, before the truncation, and re-emit it.
+  carried=''
+  if [ -f "$ENV_FILE" ]; then
+    carried=$(awk '
+      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
+        POSTGRES_PASSWORD TEMPORAL_VERSION POSTGRES_VERSION", m, " ")
+        for (i in m) managed[m[i]] = 1 }
+      /^[A-Za-z_][A-Za-z0-9_]*=/ {
+        if (!((key = substr($0, 1, index($0, "=") - 1)) in managed)) print
+      }' "$ENV_FILE")
+  fi
+
   umask 077
   mkdir -p "$SECRETS_DIR"
   chmod 700 "$SECRETS_DIR"
@@ -80,6 +96,7 @@ configure() {
     printf 'POSTGRES_PASSWORD=%s\n' "$password"
     printf 'TEMPORAL_VERSION=%s\n' "$temporal"
     printf 'POSTGRES_VERSION=%s\n' "$postgres"
+    [ -z "$carried" ] || printf '%s\n' "$carried"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 }
