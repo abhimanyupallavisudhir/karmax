@@ -15,6 +15,13 @@ jobs:
   test:
     name: typecheck + tests
     runs-on: ubuntu-latest
+    # TEMPORARY (flake hunt, do not merge): six independent full-suite runs on
+    # real runners, in parallel, to provoke the intermittent teardown hang and
+    # capture which harness.stop() phase it wedges in.
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6]
     # The suite is sequential by design (vitest.config.ts forces singleFork):
     # several concurrent Temporal servers would exhaust the runner. ~10 min of
     # real work, with headroom for a slow runner.
