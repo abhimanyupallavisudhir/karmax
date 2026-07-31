@@ -152,8 +152,9 @@ export class WorldCheckpointService {
       const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
       return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
     }));
-    const cloneCredentials = this.githubApp && repositories.every(Boolean) ? Object.fromEntries(repositories.map((repository) =>
-      [repository!.sshUrl, this.githubApp!.repositorySshKey(repository!.id, 'clone')])) : undefined;
+    const cloneCredentials = this.githubApp && repositories.every(Boolean) ? Object.fromEntries(await Promise.all(
+      repositories.map(async (repository) => [repository!.sshUrl, await this.githubApp!.repositoryCloneToken(repository!)]),
+    )) : undefined;
     // Restoring PROVISIONS A REAL SANDBOX, so it must pass through the same
     // durable admission as createWorld (activities/core.ts): the runner lease is
     // what enforces the organization/project `monthlyBudgetMicros`, what produces
@@ -181,7 +182,7 @@ export class WorldCheckpointService {
     try {
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
         repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
-        branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
+        branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
         network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     } catch (error) {

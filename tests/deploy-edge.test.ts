@@ -1,10 +1,30 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const deployDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'deploy');
 const read = (name: string) => fs.readFileSync(path.join(deployDir, name), 'utf8');
+
+/**
+ * Run `deploy/karmax`'s `configure()` against a throwaway deployment directory.
+ *
+ * Sourcing the script with no arguments makes its dispatcher print usage and
+ * return, which leaves the functions defined; the path variables it derived from
+ * its own location are then repointed at the temp dir. No Docker involved.
+ */
+function runConfigure(seed: string | undefined, domain = 'krmax.example.com'): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-'));
+  if (seed !== undefined) fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
+  execFileSync('sh', ['-c',
+    `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
+    + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n`
+    + `configure "${domain}"`,
+  ], { encoding: 'utf8' });
+  return fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8');
+}
 
 /** The `path` patterns of every rate-limit zone declared in the Caddyfile. */
 function zonePaths(caddyfile: string): string[] {
@@ -100,4 +120,63 @@ describe('public edge (Caddy) image', () => {
       expect(caddyService).not.toMatch(/^\s+image:\s*caddy:/m);
     });
   }
+});
+
+// A compose `environment:` block is a whitelist: a variable an operator sets in
+// .turnkey.env reaches the app ONLY if it is named here. Anything absent fails
+// silently and looks exactly like a bug in the feature — the operator sets a
+// Google OAuth client, restarts, and the sign-in button never appears.
+describe('compose forwards optional identity providers', () => {
+  const appService = (compose: string) => read(compose).split('\n  app:')[1]?.split('\n  caddy:')[0] ?? '';
+
+  for (const compose of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    for (const name of ['KARMAX_GOOGLE_CLIENT_ID', 'KARMAX_GOOGLE_CLIENT_SECRET',
+      'KARMAX_OIDC_ISSUER', 'KARMAX_OIDC_DISCOVERY_URL', 'KARMAX_OIDC_CLIENT_ID', 'KARMAX_OIDC_CLIENT_SECRET']) {
+      it(`${compose} passes ${name} through from the env file`, () => {
+        expect(appService(compose)).toMatch(new RegExp(`^\\s+${name}:`, 'm'));
+      });
+    }
+
+    // Empty default, not `:?` — these are optional. An install with no Google
+    // client must still boot, with the button simply absent.
+    it(`${compose} keeps them optional so an install without them still boots`, () => {
+      for (const line of appService(compose).split('\n').filter((l) => /KARMAX_(GOOGLE|OIDC)_/.test(l))) {
+        expect(line, line).not.toContain(':?');
+      }
+    });
+  }
+});
+
+// `./deploy/karmax up` is documented as "Configure or start", so operators re-run
+// it — and it regenerates .turnkey.env from scratch. Anything it does not know to
+// carry over is deleted, which is how a working Google sign-in disappears at the
+// next deploy with no error anywhere: the var is gone, so the button is gone.
+describe('deploy/karmax preserves operator settings across a re-run', () => {
+  it('keeps variables it does not manage itself', () => {
+    const seeded = [
+      'KARMAX_DOMAIN=krmax.example.com',
+      'KARMAX_PREVIEW_DOMAIN=preview.krmax.example.com',
+      'KARMAX_CLOUD_WORLD_PROVIDER=daytona',
+      'POSTGRES_PASSWORD=keep-me',
+      'KARMAX_GOOGLE_CLIENT_ID=123.apps.googleusercontent.com',
+      'KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-shh',
+      '',
+    ].join('\n');
+    const result = runConfigure(seeded);
+    expect(result).toContain('KARMAX_GOOGLE_CLIENT_ID=123.apps.googleusercontent.com');
+    expect(result).toContain('KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-shh');
+    // Without regressing what it already carried over.
+    expect(result).toContain('POSTGRES_PASSWORD=keep-me');
+    expect(result).toContain('KARMAX_CLOUD_WORLD_PROVIDER=daytona');
+    // And exactly once each — a re-run must not append duplicates.
+    expect(result.match(/^KARMAX_GOOGLE_CLIENT_ID=/gm)).toHaveLength(1);
+    expect(result.match(/^KARMAX_DOMAIN=/gm)).toHaveLength(1);
+  });
+
+  it('still writes a complete file for a first install', () => {
+    const result = runConfigure(undefined);
+    expect(result).toContain('KARMAX_DOMAIN=krmax.example.com');
+    expect(result).toContain('KARMAX_PREVIEW_DOMAIN=preview.krmax.example.com');
+    expect(result).toMatch(/^POSTGRES_PASSWORD=.+$/m);
+  });
 });

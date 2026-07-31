@@ -1786,8 +1786,14 @@ async function boot() {
     S.justVerified = true;
     history.replaceState({ kx: 1 }, '', location.pathname);
   }
+  // A social sign-in that Better Auth rejected comes back here with `?error=`
+  // (see wireGoogleBtn's errorCallbackURL). Same shape as `verified` above:
+  // read it, clear it from the URL, and let the card say what happened.
+  S.signInError = googleSignInError(new URLSearchParams(location.search));
+  if (S.signInError) history.replaceState({ kx: 1 }, '', location.pathname);
   const session = await (await fetch('/api/session')).json();
   S.sso = session.sso || null;
+  S.google = session.google || false;
   if (session.setupRequired) return renderSetup();
   // An invite link opened while signed out: keep the token in the URL (boot
   // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
@@ -11219,7 +11225,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -11289,7 +11295,7 @@ async function hydrateOrganizationView() {
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so krmax refreshes repository access when you ask instead of using webhooks.'}</p>
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access.${hostLocal() ? ' On localhost, setup works without a webhook and repository access is refreshed on demand.' : ''}</p>
+    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. Git uses short-lived App tokens, so connecting many repositories does not add a deploy key to each one.${hostLocal() ? ' On localhost, setup works without a webhook and repository access is refreshed on demand.' : ''}</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
@@ -11324,7 +11330,7 @@ async function hydrateOrganizationView() {
       <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-browser-v1" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
         : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
@@ -12056,6 +12062,53 @@ function openHelp() {
 }
 
 // ── login ────────────────────────────────────────────────────────────────────
+
+// "Continue with Google" — Better Auth's own social endpoint (the gateway proxies
+// /api/auth/* verbatim, so there is no karmax route here). Sign-in and sign-up are
+// the same call: Google either matches an existing account or creates one.
+// Deliberately not Google's stock branded button — it would be the only foreign
+// visual element on the card. A plain `.btn` keeps the sign-in card coherent, and
+// the wordmark in the label is what actually tells the user where they're going.
+const googleBtn = (id) => S.google
+  ? `<button class="btn" id="${id}" style="width:100%;margin-top:8px">Continue with Google</button>`
+  : '';
+
+// What a failed round trip to Google means, in the user's terms. Better Auth
+// would otherwise land them on its own `/api/auth/error` page — a bare error
+// code and an "Ask AI" button, off karmax entirely, with no way back.
+//
+// `account_not_linked` is the one that is neither a bug nor a dead end, and it
+// has a real cause: karmax's email+password signup does not verify addresses, so
+// Better Auth refuses to merge a Google identity into a local account that only
+// *claims* that address (otherwise registering someone else's address here would
+// capture their Google sign-in). The password still works — say so.
+const GOOGLE_SIGN_IN_ERRORS = {
+  account_not_linked: 'An account already exists for that email address with a password. '
+    + 'Sign in with that password instead — signing in with Google would require confirming the address first.',
+};
+
+function googleSignInError(params) {
+  const code = params.get('error');
+  if (!code) return undefined;
+  return GOOGLE_SIGN_IN_ERRORS[code] ?? `Google sign-in failed (${code}).`;
+}
+
+function wireGoogleBtn(id, errSelector) {
+  $(`#${id}`)?.addEventListener('click', async () => {
+    try {
+      // errorCallbackURL keeps a rejected sign-in on karmax's own card: Better
+      // Auth appends `?error=<code>`, which boot() reads back on the way in.
+      const back = new URL(location.href);
+      back.searchParams.delete('error');
+      const response = await fetch('/api/auth/sign-in/social', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: 'google', callbackURL: back.href, errorCallbackURL: back.href }) });
+      const result = await response.json();
+      if (!response.ok || !result.url) throw new Error(result.error || result.message || 'Google sign-in unavailable');
+      location.href = result.url;
+    } catch (error) { $(errSelector).textContent = error.message; }
+  });
+}
+
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
@@ -12064,10 +12117,11 @@ function renderLogin() {
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
+    ${googleBtn('google-btn')}
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
-    <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
+    <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
   </div></div>`;
   const go = async () => {
     try {
@@ -12076,6 +12130,7 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  wireGoogleBtn('google-btn', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
     try {
       const response = await fetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
@@ -12163,6 +12218,7 @@ function renderSignup() {
     <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
+    ${googleBtn('signup-google-btn')}
     <button class="btn" id="signup-back" style="width:100%;margin-top:8px">Back to sign in</button>
     <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
@@ -12184,6 +12240,7 @@ function renderSignup() {
     }
   };
   $('#signup-btn').addEventListener('click', go);
+  wireGoogleBtn('signup-google-btn', '#signup-err');
   $('#signup-back').addEventListener('click', renderLogin);
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deploymentConfig, hostLocal, hydrateSecretFiles, validateDeployment } from '../src/config/deployment.js';
+import { deploymentConfig, hostLocal, hydrateEnvFile, hydrateSecretFiles, validateDeployment } from '../src/config/deployment.js';
 
 describe('deployment profiles', () => {
   it('keeps local development zero-config', () => {
@@ -97,5 +97,27 @@ describe('deployment profiles', () => {
     hydrateSecretFiles(env, (filename) => `${filename}-value\n`);
     expect(env.KARMAX_AUTH_SECRET).toBe('/auth-value');
     expect(env.KARMAX_VAULT_KEY).toBe('explicit');
+  });
+
+  // A self-host is booted by hand (`npm start`) with no compose file and no
+  // secret manager, so without this an operator setting — an OAuth client, a
+  // mailer — lives only as long as the shell that exported it.
+  it('loads durable operator settings from the env file, real env winning', () => {
+    const env: NodeJS.ProcessEnv = { KARMAX_HOME: '/home', KARMAX_GOOGLE_CLIENT_ID: 'from-shell' };
+    const read = () => [
+      '# krmax operator settings',
+      'KARMAX_GOOGLE_CLIENT_ID=from-file',
+      'KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-secret',
+      '',
+    ].join('\n');
+    expect(hydrateEnvFile(env, read)).toBe('/home/karmax.env');
+    expect(env.KARMAX_GOOGLE_CLIENT_SECRET).toBe('GOCSPX-secret');
+    expect(env.KARMAX_GOOGLE_CLIENT_ID).toBe('from-shell');
+  });
+
+  it('treats a missing env file as the zero-config default', () => {
+    const env: NodeJS.ProcessEnv = { KARMAX_HOME: '/home' };
+    expect(hydrateEnvFile(env, () => { throw Object.assign(new Error('nope'), { code: 'ENOENT' }); })).toBeUndefined();
+    expect(Object.keys(env)).toEqual(['KARMAX_HOME']);
   });
 });

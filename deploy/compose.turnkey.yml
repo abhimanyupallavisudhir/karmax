@@ -94,6 +94,16 @@ services:
       KARMAX_TEMPORAL_NAMESPACE: karmax
       KARMAX_OBJECT_STORE: local
       KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
+      # Optional sign-in providers, empty unless set in .turnkey.env. This block
+      # is a whitelist, so a variable missing from it never reaches the app —
+      # the operator configures an OAuth client, restarts, and nothing happens.
+      # Empty defaults keep both optional: absent means the button is absent.
+      KARMAX_GOOGLE_CLIENT_ID: ${KARMAX_GOOGLE_CLIENT_ID:-}
+      KARMAX_GOOGLE_CLIENT_SECRET: ${KARMAX_GOOGLE_CLIENT_SECRET:-}
+      KARMAX_OIDC_ISSUER: ${KARMAX_OIDC_ISSUER:-}
+      KARMAX_OIDC_DISCOVERY_URL: ${KARMAX_OIDC_DISCOVERY_URL:-}
+      KARMAX_OIDC_CLIENT_ID: ${KARMAX_OIDC_CLIENT_ID:-}
+      KARMAX_OIDC_CLIENT_SECRET: ${KARMAX_OIDC_CLIENT_SECRET:-}
     secrets:
       - auth_secret
       - vault_key

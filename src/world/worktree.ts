@@ -11,6 +11,7 @@ import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
 import { addCheckoutWith } from './checkout.js';
+import { materializeGitCredential } from './git-credential.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -199,13 +200,15 @@ export class WorktreeProvider implements WorldProvider {
     const temporary = `${destination}.tmp-${process.pid}-${crypto.randomUUID()}`;
     const credentialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-clone-'));
     const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
-    const env: Record<string, string> = spec.gitCredentials?.isolated ? isolatedGitEnvironment() : {};
+    const httpsToken = spec.gitCredentials?.httpsTokens?.[source];
+    const baseEnv: Record<string, string> = spec.gitCredentials?.isolated ? isolatedGitEnvironment() : {};
+    const { env } = materializeGitCredential(credentialDir, {
+      ...(key ? { sshKey: key } : {}),
+      ...(httpsToken ? { httpsToken } : {}),
+      env: baseEnv,
+    });
     try {
-      if (key) {
-        const keyPath = path.join(credentialDir, 'repository.key');
-        fs.writeFileSync(keyPath, key.endsWith('\n') ? key : `${key}\n`, { mode: 0o600 });
-        env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-      } else if (/^(?:ssh:\/\/|[^\s/@]+@[^\s/:]+:)/i.test(source) && !process.env.GIT_SSH_COMMAND) {
+      if (!key && !httpsToken && /^(?:ssh:\/\/|[^\s/@]+@[^\s/:]+:)/i.test(source) && !process.env.GIT_SSH_COMMAND) {
         // A first-ever GitHub clone must not stop on an interactive host-key
         // question; accept-new preserves mismatch protection on later connects.
         env.GIT_SSH_COMMAND = 'ssh -o StrictHostKeyChecking=accept-new';

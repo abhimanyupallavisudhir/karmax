@@ -34,7 +34,7 @@ import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
 import { WorldCheckpointService } from './world/checkpoint.js';
 import { RunnerPoolService, WorldLifecycleManager } from './world/runners.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
-import { hydrateSecretFiles, validateDeployment } from './config/deployment.js';
+import { hydrateEnvFile, hydrateSecretFiles, validateDeployment } from './config/deployment.js';
 import { WorldProviderConnectionService } from './world/connections.js';
 import { E2BWorldProvider } from './world/e2b.js';
 import { DaytonaWorldProvider } from './world/daytona.js';
@@ -75,12 +75,16 @@ const RECONCILE_INTERVAL_MS = 60_000;
 
 async function main() {
   installProcessGuards();
+  // Both before anything reads process.env, and in this order: the env file may
+  // itself name a NAME_FILE secret.
+  const envFile = hydrateEnvFile(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
   hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
   const deployment = validateDeployment();
   const p = ensurePaths();
   const { provider, reason } = defaultProvider();
 
   console.log('\n  krmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
+  if (envFile) console.log(`  • Operator settings from ${envFile}`);
 
   // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
   // running against one KARMAX_HOME — each with its own worker fanning out agent
@@ -152,6 +156,10 @@ async function main() {
           discoveryUrl: process.env.KARMAX_OIDC_DISCOVERY_URL, issuer: process.env.KARMAX_OIDC_ISSUER,
           clientId: process.env.KARMAX_OIDC_CLIENT_ID, clientSecret: process.env.KARMAX_OIDC_CLIENT_SECRET,
           scopes: process.env.KARMAX_OIDC_SCOPES?.split(',').map((value) => value.trim()).filter(Boolean) } }
+      : {}),
+    ...(process.env.KARMAX_GOOGLE_CLIENT_ID?.trim() && process.env.KARMAX_GOOGLE_CLIENT_SECRET?.trim()
+      ? { google: { clientId: process.env.KARMAX_GOOGLE_CLIENT_ID.trim(),
+          clientSecret: process.env.KARMAX_GOOGLE_CLIENT_SECRET.trim() } }
       : {}),
   });
   const installationOwner = identity.listUsers()[0];

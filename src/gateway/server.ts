@@ -776,13 +776,15 @@ export class Gateway {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
         if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user,
-          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null });
+          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+          google: this.deps.identity.googleEnabled });
         return this.json(res, 200, {
           authRequired: true,
           authenticated: false,
           setupRequired: !this.deps.identity.hasUsers(),
           signupAvailable: this.deps.identity.hasUsers(),
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+          google: this.deps.identity.googleEnabled,
         });
       }
       // Legacy sessions are single-user by construction; minting one on a
@@ -1054,6 +1056,7 @@ export class Gateway {
         // the UI disable what cannot work.
         deliveryChannels: this.deps.deliveryChannels ?? ['browser'],
         sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+        google: this.deps.identity?.googleEnabled ?? false,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -4485,18 +4488,16 @@ export class Gateway {
     if (!this.deps.githubApp) return;
     if ((this.wikiRemoteRetryAfter.get(project.id) ?? 0) > Date.now()) return;
     const githubApp = this.deps.githubApp;
-    // Already provisioned in a previous run: the durable repository record and
-    // its isolated deploy keys exist. Wiring (and re-pushing) the local remote
-    // needs only the repository's write deploy key — never the operator's user
-    // OAuth token. Re-running GitHub provisioning on every boot re-hit the REST
-    // API with a possibly-expired operator token, producing a recurring "Bad
-    // credentials" 401 for wikis that were already fully set up.
-    if (current?.private && this.deps.store.repositoryDeployKeys(current.id)) {
+    // Already provisioned in a previous run: mint a short-lived installation
+    // token and wire the remote without touching the operator's user OAuth
+    // token. Re-running repository creation on every boot would re-hit the API
+    // with a possibly-expired user authorization.
+    if (current?.private && current.gitConnectionId) {
       if (this.wikiRemotesProvisioning.has(project.id)) return;
       this.wikiRemotesProvisioning.add(project.id);
       void (async () => {
         try {
-          await setProjectWikiRemote(root, current.sshUrl, githubApp.repositorySshKey(current.id, 'write'));
+          await setProjectWikiRemote(root, current.sshUrl, await githubApp.brokerCredentials(current));
           this.wikiRemotesReady.add(project.id);
           this.wikiRemoteRetryAfter.delete(project.id);
         } catch (error) {
@@ -4541,7 +4542,7 @@ export class Gateway {
         // Link before the push so even a transient network failure keeps this
         // platform-owned repository out of the ordinary project repo picker.
         this.deps.store.setProjectWikiRepository(project.id, repository.id);
-        await setProjectWikiRemote(root, repository.sshUrl, githubApp.repositorySshKey(repository.id, 'write'));
+        await setProjectWikiRemote(root, repository.sshUrl, await githubApp.brokerCredentials(repository));
         this.wikiRemotesReady.add(project.id);
         this.wikiRemoteRetryAfter.delete(project.id);
       } catch (error) {
