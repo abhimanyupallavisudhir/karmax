@@ -2,6 +2,25 @@ import { describe, expect, it } from 'vitest';
 import { E2BWorldProvider, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 
 describe('E2B cloud world provider', () => {
+  it('uses E2B\'s built-in codex template when no headless template is configured', async () => {
+    let createdOptions: Parameters<E2BFactory['create']>[0] | undefined;
+    const sandbox = fakeSandbox(() => undefined);
+    const factory: E2BFactory = {
+      async create(options) { createdOptions = options; return sandbox; },
+      async connect() { return sandbox; },
+    };
+    const prior = process.env.KARMAX_E2B_TEMPLATE;
+    delete process.env.KARMAX_E2B_TEMPLATE;
+    try {
+      const provider = new E2BWorldProvider(factory);
+      await provider.create({ taskId: 'default-template', base: 'main' });
+      expect(createdOptions?.template).toBe('codex');
+    } finally {
+      if (prior === undefined) delete process.env.KARMAX_E2B_TEMPLATE;
+      else process.env.KARMAX_E2B_TEMPLATE = prior;
+    }
+  });
+
   it('creates an auto-pausing world and routes files, processes, PTYs, park, and resume through the SDK', async () => {
     const files = new Map<string, string | Uint8Array>();
     let paused = 0;
