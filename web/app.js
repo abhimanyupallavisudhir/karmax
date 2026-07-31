@@ -9477,7 +9477,7 @@ function paymentsCard(scope) {
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
-      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
+      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px" hidden></div>
       <div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
       <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
@@ -9612,10 +9612,11 @@ async function wirePaymentProviders(box, organizationId) {
     try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
   }
   const platformBox = box.querySelector('.pay-stripe-platform');
-  // The shared Connect application is installation-wide. A tenant who cannot
-  // manage it has no use for a disabled copy of the operator's form.
-  if (platformBox && platform && !platform.canManage) platformBox.remove();
-  else if (platformBox && platform) {
+  // The shared Connect application is installation-wide, so the box ships hidden
+  // and only `canManage` reveals it — a tenant is never shown the operator's form,
+  // not even for the frame between render and the answer coming back.
+  if (platformBox && platform?.canManage) {
+    platformBox.hidden = false;
     const status = platform.configured
       ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
       : '<span class="chip">setup required</span>';
@@ -10339,11 +10340,14 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// ── installation-wide OUTBOUND email (operator-only; server enforces settings:write)
-// Installation-wide settings belong to whoever runs the installation. The
-// console has no capability model of its own, so each card asks its endpoint:
-// a refusal (or canManage:false) means the reader is a tenant here, and the
-// card stays absent rather than rendering a control they cannot use.
+// ── installation-wide settings (safe mode, outbound email, Stripe platform) ──
+// These belong to whoever runs the installation, and the console has no
+// capability model of its own, so each card asks its endpoint: a refusal (or
+// canManage:false) means the reader is a tenant here.
+//
+// The card ships EMPTY and `hidden`, and is filled only once the server has
+// allowed it. Rendering first and removing on refusal would flash an operator
+// control at a tenant for however long the request takes.
 async function hydrateInstallationCard(selector, url, fill) {
   const card = document.querySelector(selector);
   if (!card) return;
@@ -10370,7 +10374,12 @@ function hydrateResilienceCard() {
 }
 
 function outboundEmailCard() {
-  return `<div class="card" id="outbound-email-card">
+  return '<div class="card" id="outbound-email-card" hidden></div>';
+}
+
+async function wireOutboundEmailCard() {
+  return hydrateInstallationCard('#outbound-email-card', '/api/email', (card, data) => {
+    card.innerHTML = `
     <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
     <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let krmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
     <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
@@ -10391,57 +10400,50 @@ function outboundEmailCard() {
     <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
     <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
     <div id="oe-result" class="task-sub" style="margin-top:6px"></div>
-  </div>`;
-}
-async function wireOutboundEmailCard() {
-  const card = $('#outbound-email-card');
-  if (!card) return;
-  let data;
-  try { data = await api('/api/email'); }
-  catch { card.remove(); return; } // refused the read → not this reader's setting
-  if (!data.canManage) return void card.remove(); // installation-wide: operator only
-  const providerSel = $('#oe-provider');
-  const helpEl = $('#oe-help');
-  const applyProvider = () => {
-    const name = providerSel.value;
-    const info = (data.providers || []).find((p) => p.name === name);
-    $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
-    $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
-    $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-    const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
-    helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
-  };
-  if (data.provider) providerSel.value = data.provider;
-  if (data.from) $('#oe-from').value = data.from;
-  $('#oe-status').innerHTML = data.configured
-    ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
-    : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
-  applyProvider();
-  providerSel.addEventListener('change', applyProvider);
-  $('#oe-connect').addEventListener('click', async () => {
-    const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
-    if (providerSel.value === 'smtp') {
-      body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
-      body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
-    }
-    const btn = $('#oe-connect'); btn.disabled = true;
-    try {
-      const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
-      $('#oe-secret').value = '';
-      $('#oe-result').style.color = 'var(--ink-2)';
-      $('#oe-result').textContent = result.detail || 'Connected';
-      toast('Outbound email connected');
-      await wireOutboundEmailCard();
-    } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
-    finally { btn.disabled = false; }
-  });
-  $('#oe-test').addEventListener('click', async () => {
-    const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
-    if (!to) return;
-    const btn = $('#oe-test'); btn.disabled = true;
-    try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
-    catch (e) { toast(e.message, true); }
-    finally { btn.disabled = false; }
+  `;
+    const providerSel = $('#oe-provider');
+    const helpEl = $('#oe-help');
+    const applyProvider = () => {
+      const name = providerSel.value;
+      const info = (data.providers || []).find((p) => p.name === name);
+      $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
+      $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
+      $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
+      const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+      helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
+    };
+    if (data.provider) providerSel.value = data.provider;
+    if (data.from) $('#oe-from').value = data.from;
+    $('#oe-status').innerHTML = data.configured
+      ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
+      : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
+    applyProvider();
+    providerSel.addEventListener('change', applyProvider);
+    $('#oe-connect').addEventListener('click', async () => {
+      const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
+      if (providerSel.value === 'smtp') {
+        body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
+        body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
+      }
+      const btn = $('#oe-connect'); btn.disabled = true;
+      try {
+        const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
+        $('#oe-secret').value = '';
+        $('#oe-result').style.color = 'var(--ink-2)';
+        $('#oe-result').textContent = result.detail || 'Connected';
+        toast('Outbound email connected');
+        await wireOutboundEmailCard();
+      } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
+      finally { btn.disabled = false; }
+    });
+    $('#oe-test').addEventListener('click', async () => {
+      const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+      if (!to) return;
+      const btn = $('#oe-test'); btn.disabled = true;
+      try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
+      catch (e) { toast(e.message, true); }
+      finally { btn.disabled = false; }
+    });
   });
 }
 

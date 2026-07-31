@@ -12,6 +12,17 @@ let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
 // `const` inside eval is block-scoped, so hoist the declaration onto global.
 const load = (name) => eval(lines.find((l) => l.startsWith(`const ${name} = `)).replace(`const ${name} =`, `global.${name} =`));
+// Same idea for a multi-line function declaration: brace-match it, then hoist.
+const loadFn = (name) => {
+  const start = src.indexOf(`async function ${name}(`);
+  let depth = 0;
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0)
+      return eval(`global.${name} = ${src.slice(start, i + 1)}`);
+  }
+  throw new Error(`unterminated ${name}`);
+};
 
 // ── the helper itself ────────────────────────────────────────────────────────
 ok(lines.some((l) => l.startsWith('const hostLocal = ')), 'app.js defines a hostLocal() helper');
@@ -109,15 +120,38 @@ for (const l of lines.filter((l) => l.includes('use the host’s own Git setup')
 // stays absent on a refusal or canManage:false. Deployment mode is NOT the lever:
 // outbound email has no env path, so hiding it on `hosted` would leave a SaaS
 // operator no way to configure email at all.
-ok(/id="resilience-card" hidden/.test(src), 'the safe-mode card starts hidden and is revealed by the server');
-ok(/hydrateInstallationCard\('#resilience-card', '\/api\/safe-mode'/.test(src),
-  'safe mode is hydrated through the shared installation-card helper');
-ok(/if \(!data\.canManage\) return void card\.remove\(\)/.test(src),
-  'outbound email is removed when the reader may not manage it');
-ok(/!platform\.canManage\) platformBox\.remove\(\)/.test(src),
-  'the shared Stripe Connect card is removed rather than shown disabled');
-// The disabled-input fallbacks are unreachable once the card is removed.
-ok(!src.includes("platform.canManage ? '' : 'disabled'"), 'no dead disabled-input branches remain');
+// All three fail closed the same way: the markup ships empty and `hidden`, and
+// only the server's `canManage` reveals it. Rendering first and removing later
+// would flash an operator control at a tenant on a slow connection.
+for (const [id, endpoint] of [['resilience-card', '/api/safe-mode'], ['outbound-email-card', '/api/email']]) {
+  ok(new RegExp(`id="${id}" hidden></div>`).test(src), `#${id} ships empty and hidden`);
+  ok(new RegExp(`hydrateInstallationCard\\('#${id}', '${endpoint.replace(/\//g, '\\/')}'`).test(src),
+    `#${id} is hydrated through the shared installation-card helper`);
+}
+ok(/class="pay-stripe-platform"[^>]*\shidden>/.test(src), 'the shared Stripe Connect box ships hidden too');
+ok(/platformBox\.hidden = false/.test(src), 'the Stripe box is revealed only once the server allows managing it');
 
-console.log(`${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+// Nothing may render an installation control and take it away afterwards.
+for (const dead of ['card.remove()', 'platformBox.remove()', "platform.canManage ? '' : 'disabled'"])
+  ok(!src.includes(dead), `no reveal-then-retract or disabled-input fallback remains (${dead})`);
+
+// The helper itself, exercised rather than grepped: a card must stay hidden and
+// unfilled for anyone the server does not vouch for.
+loadFn('hydrateInstallationCard');
+const runHydrate = async (answer) => {
+  const card = { hidden: true, filled: false };
+  global.document = { querySelector: () => card };
+  global.api = async () => { if (answer instanceof Error) throw answer; return answer; };
+  await hydrateInstallationCard('#x', '/api/x', (c) => { c.filled = true; });
+  return card;
+};
+(async () => {
+  const operator = await runHydrate({ canManage: true });
+  ok(operator.hidden === false && operator.filled, 'an operator gets the card revealed and filled');
+  for (const [label, answer] of [['canManage:false', { canManage: false }], ['a refused read', new Error('403')]]) {
+    const tenant = await runHydrate(answer);
+    ok(tenant.hidden === true && !tenant.filled, `${label} leaves the card hidden and unfilled`);
+  }
+  console.log(`${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+})();
