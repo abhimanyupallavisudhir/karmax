@@ -1,7 +1,44 @@
 import { describe, expect, it } from 'vitest';
 import { E2BWorldProvider, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
+import { serviceHomeLabel } from '../src/world/services.js';
 
 describe('E2B cloud world provider', () => {
+  it('normalizes only this deployment\'s completed provider executions for billing', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const factory: E2BFactory = {
+      async create() { return sandbox; },
+      async connect() { return sandbox; },
+      async events() {
+        return [
+          { id: 'pause-1', type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z',
+            sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-1', event_data: {
+              sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
+              execution: { started_at: '2026-07-31T10:00:00Z', execution_time: 300_000,
+                vcpu_count: 2, memory_mb: 512 },
+            } },
+          { id: 'foreign', type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z',
+            sandbox_id: 'sandbox-2', sandbox_execution_id: 'execution-2', event_data: {
+              sandbox_metadata: { karmaxHome: 'another-install', karmaxTaskId: 'task-2' },
+              execution: { started_at: '2026-07-31T10:00:00Z', execution_time: 300_000,
+                vcpu_count: 8, memory_mb: 8192 },
+            } },
+          { id: 'resume', type: 'sandbox.lifecycle.resumed', timestamp: '2026-07-31T10:06:00Z',
+            sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-3', event_data: {
+              sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
+            } },
+        ];
+      },
+    };
+    const provider = new E2BWorldProvider(factory, undefined, undefined,
+      () => ({ organizationId: 'org-1', provider: 'e2b', apiKey: 'secret', config: {} }));
+
+    expect(await provider.listUsageEvents!('org-1')).toEqual([{
+      id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1',
+      startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
+      activeMs: 300_000, cpu: 2, memoryMb: 512,
+    }]);
+  });
+
   it('uses E2B\'s built-in codex template when no headless template is configured', async () => {
     let createdOptions: Parameters<E2BFactory['create']>[0] | undefined;
     const sandbox = fakeSandbox(() => undefined);

@@ -11304,7 +11304,15 @@ async function hydrateOrganizationView() {
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
     <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select><input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds"><button class="btn sm" id="runner-create">Add pool</button></div>`;
-  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">This query period · ${usage.events} metered events</div></div>` : 'Usage unavailable.';
+  const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
+  const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
+    : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
+      : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
+  const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
+  const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
+    : coverageFrom > Number(usage?.from || 0)
+      ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
+  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Provider-reconciled compute · ${usagePeriod} · ${usage.events} completed executions${usageSyncLabel}</div></div>` : 'Usage unavailable.';
   if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
     <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>

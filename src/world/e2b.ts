@@ -9,6 +9,7 @@ import type {
   WorldHttpResponse,
   WorldHttpRequest,
   WorldLifecycleState,
+  ProviderUsageEvent,
   WorldProcess,
   WorldProcessSpec,
   WorldProvider,
@@ -76,6 +77,8 @@ export interface E2BFactory {
   /** Control-plane teardown by id, so an orphan can be killed without a
    * handle — and, again, without resuming it first. */
   kill?(id: string, options: { apiKey?: string }): Promise<unknown>;
+  /** Completed lifecycle executions from E2B's seven-day event feed. */
+  events?(options: { apiKey?: string }): Promise<unknown[]>;
 }
 
 /** E2B cloud worlds: one isolated sandbox per task attempt, automatically paused
@@ -253,6 +256,40 @@ export class E2BWorldProvider implements WorldProvider {
         this.states.set(sandbox.sandboxId, 'missing');
       },
     }));
+  }
+
+  /** E2B pause/kill events carry the exact execution time and actual template
+   * resources. Those are the billable intervals; a karmax runner lease is only
+   * admission capacity and can outlive an auto-paused sandbox by days. */
+  async listUsageEvents(organizationId: string): Promise<ProviderUsageEvent[]> {
+    if (!this.factory.events) return [];
+    const connection = this.connection(organizationId);
+    const events = await this.factory.events(connection?.apiKey ? { apiKey: connection.apiKey } : {});
+    const home = serviceHomeLabel();
+    const normalized: ProviderUsageEvent[] = [];
+    for (const raw of events) {
+      const event = raw as any;
+      if (!['sandbox.lifecycle.paused', 'sandbox.lifecycle.killed'].includes(String(event.type ?? ''))) continue;
+      const data = event.event_data ?? event.eventData;
+      const execution = data?.execution;
+      const metadata = data?.sandbox_metadata ?? data?.sandboxMetadata;
+      if (!execution || metadata?.karmaxHome !== home) continue;
+      const id = String(event.sandbox_execution_id ?? event.sandboxExecutionId ?? '');
+      const sandboxId = String(event.sandbox_id ?? event.sandboxId ?? '');
+      const activeMs = Number(execution.execution_time ?? execution.executionTime);
+      const startedAt = Date.parse(String(execution.started_at ?? execution.startedAt ?? ''));
+      const eventAt = Date.parse(String(event.timestamp ?? ''));
+      const cpu = Number(execution.vcpu_count ?? execution.vcpuCount);
+      const memoryMb = Number(execution.memory_mb ?? execution.memoryMb);
+      if (!id || !sandboxId || !Number.isFinite(activeMs) || activeMs < 0
+        || !Number.isFinite(startedAt) || !Number.isFinite(eventAt)
+        || !Number.isFinite(cpu) || cpu <= 0 || !Number.isFinite(memoryMb) || memoryMb < 0) continue;
+      normalized.push({ id, sandboxId,
+        ...(typeof metadata?.karmaxTaskId === 'string' && metadata.karmaxTaskId
+          ? { taskId: metadata.karmaxTaskId } : {}),
+        startedAt, endedAt: startedAt + activeMs, activeMs, cpu, memoryMb });
+    }
+    return normalized;
   }
 
   private sealRef(value: Record<string, string>): string {
@@ -632,6 +669,26 @@ function defaultE2BFactory(): E2BFactory {
     async kill(id, options) {
       const { Sandbox } = await sdk();
       return Sandbox.kill(id, options);
+    },
+    async events(options) {
+      const result: unknown[] = [];
+      // E2B retains seven days. Drain every page on each sweep; the store's
+      // provider-execution key makes overlap/restarts harmless and avoids a
+      // fragile offset cursor while new events are arriving at the front.
+      for (let offset = 0; offset < 50_000; offset += 100) {
+        const query = new URLSearchParams({ limit: '100', offset: String(offset), orderAsc: 'false' });
+        query.append('types', 'sandbox.lifecycle.paused');
+        query.append('types', 'sandbox.lifecycle.killed');
+        const response = await fetch(`https://api.e2b.app/events/sandboxes?${query}`, {
+          headers: options.apiKey ? { 'X-API-Key': options.apiKey } : {},
+        });
+        if (!response.ok) throw new Error(`E2B lifecycle events failed (${response.status})`);
+        const body: any = await response.json();
+        const page = Array.isArray(body) ? body : Array.isArray(body?.events) ? body.events : [];
+        result.push(...page);
+        if (page.length < 100) break;
+      }
+      return result;
     },
   };
 }
