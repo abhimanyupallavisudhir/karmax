@@ -28,7 +28,9 @@ function ok(condition, message) {
 
 global.S = {
   tasks: [{ id: '308', lastView: { stage: 'do', status: 'active' } }],
+  cancelling: new Set(),
 };
+eval(extractFn('pendingCancellationView'));
 eval(extractFn('patchTaskListFromEvent'));
 ok(
   patchTaskListFromEvent({

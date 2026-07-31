@@ -52,6 +52,7 @@ const S = {
   attemptGroup: null, // logical-task group for the open task page
   deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
   // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
+  cancelling: new Set(), // accepted cancel signals awaiting a durable terminal view
   tab: 'tasks',
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
@@ -2054,7 +2055,7 @@ async function loadTasks() {
   // longer contains a tombstoned id, the server has caught up — retire it so the
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
-  S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+  S.tasks = fetched.filter((t) => !S.deleted.has(t.id)).map(pendingCancellationTask);
   return true;
 }
 
@@ -2123,6 +2124,50 @@ function filterDeletedFromSearchResult(result) {
   };
 }
 
+function removeDeletedTaskLocally(id) {
+  S.deleted.add(id);
+  S.tasks = S.tasks.filter((task) => task.id !== id);
+  S.searchResult = filterDeletedFromSearchResult(S.searchResult);
+}
+
+function pendingCancellationView(view, taskId = view?.taskId) {
+  if (!view || !taskId || !S.cancelling.has(taskId)) return view;
+  if (['done', 'cancelled', 'failed'].includes(view.status)) {
+    S.cancelling.delete(taskId);
+    return view;
+  }
+  return {
+    ...view,
+    status: 'waiting',
+    waitingFor: { kind: 'shell', detail: 'Waiting for cancellation' },
+    actions: (view.actions || []).map((action) => ({ ...action, enabled: false })),
+    state: { ...(view.state || {}), cancelling: true },
+  };
+}
+
+function pendingCancellationTask(task) {
+  return task?.lastView
+    ? { ...task, lastView: pendingCancellationView(task.lastView, task.id) }
+    : task;
+}
+
+function markTaskCancelling(taskId) {
+  S.cancelling.add(taskId);
+  const patchTask = (task) => task?.id === taskId ? pendingCancellationTask(task) : task;
+  const patchGroups = (groups) => (groups || []).map((group) => ({
+    ...group,
+    tasks: (group.tasks || []).map(patchTask),
+    ...(group.children ? { children: patchGroups(group.children) } : {}),
+  }));
+  S.tasks = (S.tasks || []).map(patchTask);
+  if (S.searchResult) S.searchResult = {
+    ...S.searchResult,
+    tasks: (S.searchResult.tasks || []).map(patchTask),
+    ...(S.searchResult.groups ? { groups: patchGroups(S.searchResult.groups) } : {}),
+  };
+  if (S.view?.taskId === taskId) S.view = pendingCancellationView(S.view, taskId);
+}
+
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
@@ -2135,7 +2180,7 @@ async function runSearch() {
     const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
     if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
     const live = new Map(S.tasks.map((t) => [t.id, t]));
-    const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
+    const overlay = (t) => pendingCancellationTask({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
     const overlayGroups = (groups) => (groups || []).map((g) => ({
       ...g,
@@ -2282,13 +2327,13 @@ function patchTaskListFromEvent(ev) {
         ...(payload.agentRole ? { role: payload.agentRole } : {}),
       }
     : undefined;
-  task.lastView = {
+  task.lastView = pendingCancellationView({
     ...previous,
     ...(payload.stage ? { stage: payload.stage } : {}),
     ...(payload.status ? { status: payload.status } : {}),
     waitingFor,
     agentTurn,
-  };
+  }, ev.taskId);
   return true;
 }
 
@@ -3854,9 +3899,7 @@ async function deleteDraft(id) {
   catch (e) {
     if (!/no such task|HTTP 404/i.test(e.message || '')) { toast(e.message, true); return false; }
   }
-  S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
-  S.tasks = S.tasks.filter((t) => t.id !== id);
-  S.searchResult = filterDeletedFromSearchResult(S.searchResult);
+  removeDeletedTaskLocally(id); // tombstone before a debounced refresh can re-fetch the stale list
   renderMain();
   return true;
 }
@@ -4237,7 +4280,21 @@ async function openTaskForm(workflow, draft, seedText) {
     // materialise its draft AFTER this delete and orphan it.
     clearTimeout(saveTimer);
     await saveChain;
-    if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
+    if (localCred && draftId) {
+      const id = draftId;
+      try {
+        await api(`/api/tasks/${id}`, { method: 'DELETE' });
+        removeDeletedTaskLocally(id);
+        draftId = null;
+      } catch (error) {
+        if (!/no such task|HTTP 404/i.test(error.message || '')) {
+          toast(error.message, true);
+          return;
+        }
+        removeDeletedTaskLocally(id);
+        draftId = null;
+      }
+    }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
   $('#tf-close').addEventListener('click', () => closeForm());
@@ -4786,11 +4843,11 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId) return;
-    S.view = view;
+    S.view = pendingCancellationView(view, taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
-    if (!S.taskTab) S.taskTab = defaultTaskTab(view);
+    if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
 
     const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems] = await details;
@@ -4851,7 +4908,7 @@ async function refreshTask() {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
     }
-    S.view = view;
+    S.view = pendingCancellationView(view, id);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
@@ -4933,7 +4990,10 @@ function wireOrgEditor(rootEl, rec, opts) {
       if (S.tab === 'tasks') await runSearch();
       afterChange();
       toast('Priority updated');
-    } catch (err) { toast(err.message, true); }
+    } catch (err) {
+      e.target.value = String(rec.params?.priority || 0);
+      toast(err.message, true);
+    }
   });
   const setTags = async (ids) => {
     const id = await ensureId(); if (!id) return;
@@ -7092,16 +7152,31 @@ function actionToast(signal, label) {
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 
+function reflectAcceptedTaskAction(taskId, action) {
+  if (action !== 'cancel') return;
+  markTaskCancelling(taskId);
+  if (S.selected === taskId) renderTaskPage();
+  else if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
+  renderRail();
+}
+
 function wireActions(v) {
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
+      const cancelling = act === 'cancel';
+      const label = btn.innerHTML;
+      if (cancelling) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
       try {
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        reflectAcceptedTaskAction(v.taskId, act);
         toast(actionToast(act, btn.dataset.label));
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
-      } catch (e) { toast(e.message, true); }
+      } catch (e) {
+        if (cancelling) { btn.disabled = false; btn.innerHTML = label; }
+        toast(e.message, true);
+      }
     }),
   );
   $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
@@ -9055,14 +9130,15 @@ async function hydrateWorkflowPins(projectId) {
       .join('');
     return `<div class="queue-item">
       <div style="flex:1"><b>${esc(w.name)}</b> <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span></div>
-      <select class="wf-pin" data-wf="${esc(w.name)}" ${w.versions.length <= 1 ? 'disabled title="only one version"' : ''}>${opts}</select>
+      <select class="wf-pin" data-wf="${esc(w.name)}" data-saved="${esc(pinned)}" ${w.versions.length <= 1 ? 'disabled title="only one version"' : ''}>${opts}</select>
     </div>`;
   }).join('');
   box.querySelectorAll('.wf-pin').forEach((sel) => sel.addEventListener('change', async () => {
     try {
       await api(`/api/projects/${projectId}/workflow-pins`, { method: 'POST', body: JSON.stringify({ workflow: sel.dataset.wf, version: sel.value }) });
+      sel.dataset.saved = sel.value;
       toast(`${sel.dataset.wf} pinned to ${sel.value}`);
-    } catch (e) { toast(e.message, true); }
+    } catch (e) { sel.value = sel.dataset.saved; toast(e.message, true); }
   }));
 }
 function wireSettingsView(proj) {
@@ -9763,7 +9839,7 @@ function parseExpiry(raw) {
   return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-async function wirePaymentProviders(box, organizationId) {
+async function wirePaymentProviders(box, organizationId, onChange) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
@@ -9809,7 +9885,7 @@ async function wirePaymentProviders(box, organizationId) {
           webhookSecret: platformBox.querySelector('.stripe-platform-webhook-secret').value || undefined,
         }) });
         toast('Stripe platform setup saved securely');
-        await wirePaymentProviders(box, organizationId);
+        await wirePaymentProviders(box, organizationId, onChange);
       } catch (e) { toast(e.message, true); }
     });
   }
@@ -9826,7 +9902,7 @@ async function wirePaymentProviders(box, organizationId) {
       const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
       if (r.status === 'awaiting_oauth' && r.url) {
         location.assign(r.url);
-      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box, organizationId); }
+      } else if (r.status === 'connected') { toast('Connected'); await wirePaymentProviders(box, organizationId, onChange); }
       else { toast(r.detail || 'Not available', true); }
     } catch (e) { toast(e.message, true); }
   }));
@@ -9835,7 +9911,7 @@ async function wirePaymentProviders(box, organizationId) {
     try {
       await api(`${paymentsBase}/connections/${encodeURIComponent(b.dataset.disconnectpay)}`, { method: 'DELETE' });
       toast('Payment provider disconnected');
-      wirePaymentProviders(box, organizationId);
+      await wirePaymentProviders(box, organizationId, onChange);
     } catch (e) { toast(e.message, true); }
   }));
   // Only a rail with a balance karmax can read has one worth showing.
@@ -9847,8 +9923,32 @@ async function wirePaymentProviders(box, organizationId) {
       if (el) el.innerHTML = `<b>Issuing balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
     } catch {}
   }
+  if (onChange) await onChange(data);
   return data;
 }
+
+async function syncPaymentProviderControls(box, providerData, paymentsBase) {
+  const holderSelect = box.querySelector('.card-cardholder');
+  const stripeConnected = (providerData?.providers || []).some((provider) => provider.name === 'stripe' && provider.connected);
+  box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
+  box.querySelector('.stripe-issue')?.classList.toggle('hidden', !stripeConnected);
+  if (!holderSelect) return;
+  if (!stripeConnected) {
+    holderSelect.innerHTML = '<option value="">Connect Stripe to load cardholders</option>';
+    return;
+  }
+  try {
+    const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
+    holderSelect.innerHTML = `<option value="">Choose cardholder</option>${holders.map((holder) => {
+      const requirements = holder.requirements?.past_due || [];
+      const ready = holder.status === 'active' && requirements.length === 0;
+      return `<option value="${ready ? esc(holder.id) : ''}" ${ready ? '' : 'disabled'}>${esc(holder.name)} · ${esc(holder.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || holder.status)})`}</option>`;
+    }).join('')}`;
+  } catch {
+    holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
+  }
+}
+
 async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
   if (!box) return;
@@ -9864,28 +9964,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
   let providerData;
-  if (scope === 'global') providerData = await wirePaymentProviders(box, organizationId);
+  if (scope === 'global') providerData = await wirePaymentProviders(box, organizationId, async (data) => {
+    providerData = data;
+    await syncPaymentProviderControls(box, data, paymentsBase);
+  });
   else {
     try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
+    await syncPaymentProviderControls(box, providerData, paymentsBase);
   }
   const holderSelect = box.querySelector('.card-cardholder');
-  const stripeConnected = (providerData?.providers || []).some((p) => p.name === 'stripe' && p.connected);
-  box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
-  box.querySelector('.stripe-issue')?.classList.toggle('hidden', !stripeConnected);
-  const loadCardholders = async () => {
-    if (!stripeConnected || !holderSelect) return;
-    try {
-      const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose cardholder</option>${holders.map((h) => {
-        const requirements = h.requirements?.past_due || [];
-        const ready = h.status === 'active' && requirements.length === 0;
-        return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
-      }).join('')}`;
-    } catch (e) {
-      holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
-    }
-  };
-  await loadCardholders();
   box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
     const dobValue = box.querySelector('.holder-dob').value;
     const dob = dobValue ? new Date(`${dobValue}T00:00:00Z`) : undefined;
@@ -9908,7 +9995,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         },
       }) });
       toast('Stripe cardholder created');
-      await loadCardholders();
+      await syncPaymentProviderControls(box, providerData, paymentsBase);
     } catch (e) { toast(e.message, true); }
   });
   const sUrl = scope === 'global' && organizationId
@@ -10643,8 +10730,10 @@ function hydrateResilienceCard() {
     card.querySelector('#safe-mode').addEventListener('change', async (e) => {
       try {
         const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
-        S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
-      } catch (err) { toast(err.message, true); }
+        S.meta.safeMode = r.safeMode;
+        e.target.checked = r.safeMode;
+        toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
+      } catch (err) { e.target.checked = S.meta.safeMode; toast(err.message, true); }
     });
   });
 }
@@ -11005,6 +11094,11 @@ function updateBell() {
   badge.classList.toggle('hidden', n === 0);
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
 }
+function markInboxItemReadLocally(item) {
+  if (!item?.unread) return;
+  item.unread = false;
+  updateBell();
+}
 function inboxView() {
   const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
   return `<h1 class="page-title">Inbox</h1>
@@ -11056,7 +11150,12 @@ function wireInboxView() {
 
 async function openInboxItem(item) {
   if (!item?.task) return;
-  if (item.unread) await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
+  if (item.unread) {
+    try {
+      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) });
+      markInboxItemReadLocally(item);
+    } catch {}
+  }
   const project = projectById(item.task.projectId); if (!project) return;
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
@@ -11406,6 +11505,20 @@ function organizationView() {
     </div></div></div>`;
 }
 
+function pendingInvitationRow(invitation, projects) {
+  const authorization = invitation.authorization || { level: invitation.profileId || 'developer', scope: 'organization' };
+  return `<div class="member-row" data-invitation="${esc(invitation.id)}"><span>${esc(invitation.email)}</span><span class="chip">${esc(authorizationSummary(authorization, projects))}</span></div>`;
+}
+
+function appendPendingInvitation(invitation, projects) {
+  const box = $('#pending-invitations');
+  if (!box || !invitation) return;
+  if ([...(box.querySelectorAll?.('[data-invitation]') || [])]
+    .some((row) => row.dataset.invitation === invitation.id)) return;
+  box.hidden = false;
+  box.insertAdjacentHTML('beforeend', pendingInvitationRow(invitation, projects));
+}
+
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   const organizationId = S.organizationId;
@@ -11443,7 +11556,8 @@ async function hydrateOrganizationView() {
     Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
   if (!renderIsCurrent()) return;
-  if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(authorizationSummary(invitation.authorization || { level: invitation.profileId || 'developer', scope: 'organization' }, authorizationProjects))}</span></div>`).join('')}`);
+  const pendingInvitations = invitations.filter((invitation) => !invitation.acceptedAt);
+  $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
   $('#org-github').innerHTML = githubApp.configured ? `
@@ -11507,7 +11621,16 @@ async function hydrateOrganizationView() {
     <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
     <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
   wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
-  $('#invite-member')?.addEventListener('click', async () => { try { const email = $('#invite-email').value; const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#invite-member')?.addEventListener('click', async () => {
+    try {
+      const email = $('#invite-email').value;
+      const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) });
+      const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`;
+      $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`;
+      appendPendingInvitation(result.invitation, authorizationProjects);
+      $('#invite-email').value = '';
+    } catch (e) { toast(e.message, true); }
+  });
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#setup-github-app')?.addEventListener('click', async () => {
     try {
@@ -11824,8 +11947,10 @@ async function runDeclaredAction(a) {
   if (!S.selected) return;
   if (a.name === 'followUp') return focusFollowup();
   if (a.args && a.args.length) return openActionForm(a);
+  const taskId = S.selected;
   try {
-    await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    reflectAcceptedTaskAction(taskId, a.name);
     toast(actionToast(a.name, a.label || a.name));
     setTimeout(refreshTask, 250);
     setTimeout(refreshTasks, 400);
