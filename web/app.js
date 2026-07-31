@@ -1958,6 +1958,38 @@ function tagPathStr(id) {
 function tagSectionId(id) { return `tag-section-${id}`; }
 const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 
+function filterDeletedFromSearchResult(result) {
+  if (!result || !S.deleted.size) return result;
+  const keep = (tasks) => (tasks || []).filter((task) => !S.deleted.has(task.id));
+  const pruneGroup = (group) => {
+    const tasks = keep(group.tasks);
+    const childResults = (group.children || []).map(pruneGroup).filter(Boolean);
+    // Hierarchical tag-group counts cover the whole subtree and deduplicate tasks
+    // assigned to more than one tag. Flat groups have no children, so the same
+    // calculation naturally produces their bucket size.
+    const ids = new Set(tasks.map((task) => task.id));
+    for (const child of childResults) for (const id of child.ids) ids.add(id);
+    if (!ids.size) return null;
+    return {
+      ids,
+      group: {
+        ...group,
+        tasks,
+        ...(group.children ? { children: childResults.map((child) => child.group) } : {}),
+        count: ids.size,
+      },
+    };
+  };
+  const pruneGroups = (groups) => (groups || []).map(pruneGroup).filter(Boolean).map((entry) => entry.group);
+  const tasks = keep(result.tasks);
+  return {
+    ...result,
+    tasks,
+    ...(result.groups ? { groups: pruneGroups(result.groups) } : {}),
+    total: tasks.length,
+  };
+}
+
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
@@ -1978,7 +2010,9 @@ async function runSearch() {
       ...(g.children ? { children: overlayGroups(g.children) } : {}),
     }));
     if (r.groups) r.groups = overlayGroups(r.groups);
-    S.searchResult = r;
+    // A search issued before a draft DELETE may resolve afterwards. Apply the same
+    // session tombstones as loadTasks so that late response cannot restore its row.
+    S.searchResult = filterDeletedFromSearchResult(r);
     S.searchFailed = false;
     return true;
   } catch {
@@ -3689,6 +3723,7 @@ async function deleteDraft(id) {
   }
   S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
   S.tasks = S.tasks.filter((t) => t.id !== id);
+  S.searchResult = filterDeletedFromSearchResult(S.searchResult);
   renderMain();
   return true;
 }

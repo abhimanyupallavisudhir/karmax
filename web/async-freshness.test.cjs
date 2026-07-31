@@ -58,6 +58,7 @@ global.taskRefreshPromise = null;
 global.taskRefreshQueued = false;
 
 eval(extractFn('loadTasks'));
+eval(extractFn('filterDeletedFromSearchResult'));
 eval(extractFn('runSearch'));
 eval(extractFn('refreshTasks'));
 eval(extractFn('refreshTask'));
@@ -101,6 +102,19 @@ eval(extractFn('refreshTask'));
   oldSearch.resolve({ tasks: [{ id: 'old-result' }] });
   await searchingOld;
   ok(S.searchResult.tasks[0].id === 'new-result', 'the latest search query wins when responses arrive out of order');
+
+  // A search response already in flight when a draft is deleted must honor the
+  // deletion tombstone instead of restoring the stale row after it resolves.
+  const staleDeletedSearch = deferred();
+  global.api = () => staleDeletedSearch.promise;
+  S.deleted.add('deleted-draft');
+  const searchingAcrossDelete = runSearch();
+  staleDeletedSearch.resolve({ tasks: [{ id: 'deleted-draft' }, { id: 'kept-task' }], total: 2 });
+  await searchingAcrossDelete;
+  ok(S.searchResult.tasks.length === 1 && S.searchResult.tasks[0].id === 'kept-task',
+    'an in-flight search cannot restore a deleted draft');
+  ok(S.searchResult.total === 1, 'an in-flight search updates its total after filtering a deleted draft');
+  S.deleted.clear();
 
   // A mutation-triggered refresh that arrives during an existing list refresh
   // must queue one follow-up read, otherwise it can only replay the pre-mutation
