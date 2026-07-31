@@ -914,6 +914,139 @@ function normalizeComboOption(option) {
   };
 }
 
+function authorizationLevels() {
+  return [
+    { id: 'viewer', name: 'Viewer', scope: 'selectable' },
+    { id: 'developer', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'administrator', name: 'Administrator', scope: 'organization' },
+    { id: 'god', name: 'God', scope: 'global' },
+  ];
+}
+
+function authorizationScopeSuggestions(projects, query) {
+  const q = String(query || '').trim().toLowerCase();
+  return [
+    { value: '@organization', label: '@organization' },
+    ...(projects || []).slice().sort((a, b) => a.name.localeCompare(b.name))
+      .map((project) => ({ value: project.id, label: project.name })),
+  ].filter((option) => !q || `${option.value} ${option.label}`.toLowerCase().includes(q));
+}
+
+function normalizedAuthorization(value, fallbackProjectId) {
+  const level = authorizationLevels().some((candidate) => candidate.id === value?.level) ? value.level : 'developer';
+  const levelDef = authorizationLevels().find((candidate) => candidate.id === level);
+  if (levelDef.scope === 'organization') return { level, scope: 'organization' };
+  if (levelDef.scope === 'global') return { level, scope: 'global' };
+  if (value?.scope === 'organization') return { level, scope: 'organization' };
+  const projectIds = [...new Set((value?.projectIds || (fallbackProjectId ? [fallbackProjectId] : [])).filter(Boolean))];
+  return { level, scope: 'projects', projectIds };
+}
+
+function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
+  const selected = normalizedAuthorization(value, fallbackProjectId);
+  const level = authorizationLevels().find((candidate) => candidate.id === selected.level);
+  const names = new Map((projects || []).map((project) => [project.id, project.name]));
+  const chips = selected.scope === 'organization' ? ['@organization'] : (selected.projectIds || []);
+  return `<div class="authz-editor" id="${esc(id)}" data-authorization="${esc(JSON.stringify(selected))}">
+    <select class="authz-level-select" aria-label="Authorization level">${authorizationLevels().map((candidate) =>
+      `<option value="${candidate.id}" ${candidate.id === selected.level ? 'selected' : ''}>${candidate.name}</option>`).join('')}</select>
+    <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
+      <div class="authz-scope-field">
+        <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('')}</span>
+        <input class="authz-scope-input" aria-label="Authorization scope" autocomplete="off" spellcheck="false" placeholder="@organization or project name">
+        <button type="button" class="authz-scope-caret" aria-label="Show authorization scopes" tabindex="-1">⌄</button>
+      </div>
+      <div class="authz-scope-menu" role="listbox" hidden></div>
+    </div>
+  </div>`;
+}
+
+function readAuthorizationEditor(root) {
+  return root?._authorizationValue || normalizedAuthorization(JSON.parse(root?.dataset.authorization || '{}'));
+}
+
+function authorizationSummary(value, projects) {
+  const selected = normalizedAuthorization(value);
+  const level = authorizationLevels().find((candidate) => candidate.id === selected.level)?.name || selected.level;
+  if (selected.scope === 'global') return level;
+  if (selected.scope === 'organization') return `${level} · @organization`;
+  const names = new Map((projects || []).map((project) => [project.id, project.name]));
+  return `${level} · ${(selected.projectIds || []).map((id) => names.get(id) || id).join(', ')}`;
+}
+
+function wireAuthorizationEditor(root, projects, onChange) {
+  if (!root) return;
+  const levelSelect = root.querySelector('.authz-level-select');
+  const combo = root.querySelector('.authz-scope-combo');
+  const input = root.querySelector('.authz-scope-input');
+  const menu = root.querySelector('.authz-scope-menu');
+  const caret = root.querySelector('.authz-scope-caret');
+  const chips = root.querySelector('.authz-scope-chips');
+  let value = normalizedAuthorization(JSON.parse(root.dataset.authorization || '{}'));
+  let active = -1;
+  const projectById = new Map((projects || []).map((project) => [project.id, project]));
+  const levelOf = () => authorizationLevels().find((candidate) => candidate.id === value.level);
+  const emit = () => { root._authorizationValue = value; root.dataset.authorization = JSON.stringify(value); onChange?.(value); };
+  const drawChips = () => {
+    const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
+    chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
+    chips.querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
+      const scope = button.closest('[data-scope]').dataset.scope;
+      value = scope === '@organization' ? { level: value.level, scope: 'projects', projectIds: [] }
+        : { ...value, projectIds: (value.projectIds || []).filter((id) => id !== scope) };
+      drawChips(); emit(); input.focus(); drawMenu();
+    }));
+  };
+  const options = () => authorizationScopeSuggestions(projects, input.value)
+    .filter((option) => value.scope !== 'organization' && !(value.projectIds || []).includes(option.value));
+  const drawMenu = () => {
+    const available = options();
+    menu.innerHTML = available.length ? available.map((option, index) =>
+      `<button type="button" class="authz-scope-option ${index === active ? 'active' : ''}" role="option" data-value="${esc(option.value)}"><span>${esc(option.label)}</span>${option.value === '@organization' ? '<small>Every project</small>' : ''}</button>`).join('')
+      : '<span class="authz-scope-empty">No matching project</span>';
+    menu.querySelectorAll('[data-value]').forEach((option) => option.addEventListener('mousedown', (event) => {
+      event.preventDefault(); choose(option.dataset.value);
+    }));
+  };
+  const show = () => { active = -1; drawMenu(); menu.hidden = false; };
+  const hide = () => { menu.hidden = true; active = -1; };
+  const choose = (scope) => {
+    value = scope === '@organization' ? { level: value.level, scope: 'organization' }
+      : { level: value.level, scope: 'projects', projectIds: [...new Set([...(value.projectIds || []), scope])] };
+    input.value = ''; drawChips(); emit(); show();
+  };
+  levelSelect.addEventListener('change', () => {
+    const level = authorizationLevels().find((candidate) => candidate.id === levelSelect.value);
+    value = level.scope === 'selectable'
+      ? normalizedAuthorization({ ...value, level: level.id })
+      : { level: level.id, scope: level.scope };
+    combo.hidden = level.scope !== 'selectable';
+    drawChips(); emit();
+  });
+  input.addEventListener('focus', show);
+  input.addEventListener('input', show);
+  input.addEventListener('blur', () => setTimeout(hide, 120));
+  input.addEventListener('keydown', (event) => {
+    const available = options();
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      active = available.length ? (active + (event.key === 'ArrowDown' ? 1 : -1) + available.length) % available.length : -1;
+      drawMenu();
+    } else if (event.key === 'Enter' && available.length) {
+      event.preventDefault(); choose(available[Math.max(0, active)]?.value);
+    } else if (event.key === 'Backspace' && !input.value && (value.scope === 'organization' || value.projectIds?.length)) {
+      const scope = value.scope === 'organization' ? '@organization' : value.projectIds.at(-1);
+      value = scope === '@organization' ? { level: value.level, scope: 'projects', projectIds: [] }
+        : { ...value, projectIds: value.projectIds.slice(0, -1) };
+      drawChips(); emit(); show();
+    } else if (event.key === 'Escape') hide();
+  });
+  caret.addEventListener('mousedown', (event) => { event.preventDefault(); input.focus(); menu.hidden ? show() : hide(); });
+  root._authorizationValue = value;
+  drawChips();
+}
+
 function wireCombo(combo, getOptions, onChange) {
   const input = combo.querySelector('input');
   const menu = combo.querySelector('.combo-menu');
@@ -4006,11 +4139,14 @@ async function openTaskForm(workflow, draft, seedText) {
   }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${projectId}/${wf}`)).task.inherited; } catch {}
-  let authorization = { profiles: [], defaultProfile: 'developer' };
-  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(projectId)}`); } catch {}
-  const selectedAuthorization = draft?.params?._authorization?.profileId || authorization.defaultProfile;
-  const authorizationOptions = (authorization.profiles || []).map((p) =>
-    `<option value="${esc(p.id)}" ${p.id === selectedAuthorization ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+  const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
+  const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
+  const storedAuthorization = draft?.params?._authorization || {};
+  const selectedAuthorization = normalizedAuthorization({
+    level: storedAuthorization.level || storedAuthorization.profileId || 'developer',
+    scope: storedAuthorization.scope || 'projects',
+    projectIds: storedAuthorization.projectIds || [projectId],
+  }, projectId);
   // A draft can open directly from the list, without its task page having loaded
   // the intent. Fetch the group so the shared confirmer freezes after any sibling
   // queues, while remaining editable (and propagated) when every sibling is a draft.
@@ -4054,10 +4190,10 @@ async function openTaskForm(workflow, draft, seedText) {
               <div class="label-row"><label>Priority &amp; tags</label></div>
               ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
             </div>
-            ${authorizationOptions ? `<div class="form-row" data-row="__authorization">
-              <div class="label-row"><label title="Applies to every agent and retry in this workflow, capped by your own permissions.">Agent authorization</label></div>
-              <select id="tf-authorization">${authorizationOptions}</select>
-            </div>` : ''}
+            <div class="form-row" data-row="__authorization">
+              <div class="label-row"><label>Authorization</label></div>
+              ${authorizationEditorHtml('tf-authorization', selectedAuthorization, authorizationProjects, projectId)}
+            </div>
             ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
@@ -4160,6 +4296,7 @@ async function openTaskForm(workflow, draft, seedText) {
   const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  wireAuthorizationEditor($('#tf-authorization'), authorizationProjects, () => autoSaveSoon());
   // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
   // the authorization package. Keep selection in form-local state so the task
   // sidebar stays one compact button; the full checkbox list lives in a modal.
@@ -4221,7 +4358,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
     return {
       body, notes: $('#tf-notes')?.value ?? '',
-      authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
+      authorization: readAuthorizationEditor($('#tf-authorization')),
       // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
       credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
       credentialPolicies: vaultCredentialPolicies,
@@ -4268,12 +4405,12 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
         }
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
@@ -4309,7 +4446,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorization: state.authorization, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -4345,12 +4482,12 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -4360,13 +4497,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -6347,11 +6484,16 @@ function authorizationSection(v) {
   const rec = taskRecord(v.taskId);
   if (rec?.params?.draft) return '';
   if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) return '';
+  const organizationId = S.projects.find((project) => project.id === rec?.projectId)?.organizationId;
+  const projects = S.projects.filter((project) => project.organizationId === organizationId);
+  const stored = rec?.params?._authorization || {};
+  const selected = { level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
+    projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) };
   return `<div class="section-h">Authorization</div>
     <div id="tp-auth" class="parameter-fields">
       <div class="form-row" data-row="__authorization">
-        <div class="label-row"><label title="Applies to every agent and retry in this workflow, capped by your own permissions. Takes effect at the next agent turn.">Agent authorization</label></div>
-        <select id="tp-authorization"><option>Loading…</option></select>
+        <div class="label-row"><label>Authorization</label></div>
+        ${authorizationEditorHtml('tp-authorization', selected, projects, rec?.projectId)}
       </div>
       <div class="form-row" data-row="__vault">
         <button type="button" class="btn tf-vault-button" id="tp-vault-open" disabled
@@ -6372,13 +6514,10 @@ async function wireTaskAuthorization(v) {
   if (!select || !saveBtn) return;
   const rec = taskRecord(v.taskId);
   const projectId = rec?.projectId || S.projectId;
+  const organizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
+  const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const auth0 = rec?.params?._authorization || {};
-  let authorization = { profiles: [], defaultProfile: 'developer' };
-  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(projectId)}`); } catch {}
-  const selected = auth0.profileId || authorization.defaultProfile;
-  select.innerHTML = (authorization.profiles || []).map((p) =>
-    `<option value="${esc(p.id)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name)}</option>`).join('')
-    || `<option value="${esc(selected)}" selected>${esc(selected)}</option>`;
+  wireAuthorizationEditor(select, projects);
   // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
   const vaultGrantIds = new Set((auth0.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
@@ -6403,7 +6542,7 @@ async function wireTaskAuthorization(v) {
   saveBtn.addEventListener('click', async () => {
     try {
       await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({
-        profileId: select.value,
+        authorization: readAuthorizationEditor(select),
         credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
         credentialPolicies: vaultCredentialPolicies,
       }) });
@@ -8435,7 +8574,6 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
     <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
-    ${authorizationCard('project')}
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
@@ -8865,15 +9003,9 @@ async function hydrateProjectAccess(proj) {
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
       : principal.kind === 'organization' ? '@all'
       : `@team:${S.teams.find((team) => team.id === principal.teamId)?.slug || principal.teamId}`;
-    const candidates = [
-      { value: '@all', aliases: ['@all'], principal: { kind: 'organization', organizationId: proj.organizationId } },
-      ...S.teams.map((team) => ({ value: `@team:${team.slug}`, aliases: [`@team:${team.slug}`, team.name], principal: { kind: 'team', teamId: team.id } })),
-      ...S.organizationMembers.map((member) => { const record = userRecord(member.userId); const name = userName(member.userId); const value = record?.email ? `${name} — ${record.email}` : name; return { value, aliases: [value, name, record?.email, `user:${member.userId}`].filter(Boolean), principal: { kind: 'user', userId: member.userId } }; }),
-    ];
     accessBox.innerHTML = `<div class="section-h">Project access</div>
       ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
-      <datalist id="project-principal-options">${candidates.map((candidate) => `<option value="${esc(candidate.value)}"></option>`).join('')}</datalist>
-      <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
+      <a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people and authorization</a>`;
     repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
@@ -8882,13 +9014,6 @@ async function hydrateProjectAccess(proj) {
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
         : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>
           ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
-    $('#project-member-add')?.addEventListener('click', async () => {
-      const entered = $('#project-member-principal')?.value.trim().toLowerCase();
-      const candidate = candidates.find((item) => item.aliases.some((alias) => alias.toLowerCase() === entered));
-      if (!candidate) return toast('Choose a person, @team:…, or @all', true);
-      try { await api(`/api/projects/${proj.id}/members`, { method: 'POST', body: JSON.stringify({ principal: candidate.principal, profileId: $('#project-member-profile').value }) }); await hydrateProjectAccess(proj); }
-      catch (error) { toast(error.message, true); }
-    });
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
@@ -8959,7 +9084,6 @@ function wireSettingsView(proj) {
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
   hydrateReviewRoute('project', proj.id);
-  hydrateAuthorization('project', proj.id);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
@@ -9118,7 +9242,6 @@ function globalSettingsView(embedded = false) {
     ${profilesCard('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
-    ${authorizationCard('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
@@ -10746,118 +10869,6 @@ function profilesCard(scope) {
   </div>`;
 }
 
-function authorizationCard(scope) {
-  return `<div class="card" id="authorization-card-${scope}">
-    <div class="section-h">Authorization profiles</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">The same job-shaped profiles authorize people and task agents. Agents remain capped by their creator.</p>
-    <div id="authorization-${scope}">Loading…</div>
-  </div>`;
-}
-
-function capabilityPatternAllows(pattern, capability) {
-  if (pattern === '*' || pattern === capability) return true;
-  if (pattern.endsWith(':*')) return capability.startsWith(pattern.slice(0, -1));
-  const p = pattern.split(':');
-  const c = capability.split(':');
-  return p.length === c.length && p.every((part, i) => part === '*' || part === c[i]);
-}
-
-function capabilityChecklist(profile, groups) {
-  const granted = profile.capabilities || [];
-  const has = (cap) => granted.some((pattern) => capabilityPatternAllows(pattern, cap));
-  const known = new Set(groups.flatMap((group) => group.capabilities.map((cap) => cap.id)));
-  // Concrete target-scoped grants cannot be enumerated in a finite checklist.
-  // Preserve those in a clearly secondary expert field; ordinary users only
-  // ever need the complete checklist above it.
-  const scoped = granted.filter((cap) => cap !== '*' && !known.has(cap) && !cap.endsWith(':*'));
-  return `<label class="authz-all"><input type="checkbox" class="authz-all-future" ${granted.includes('*') ? 'checked' : ''}> <span><b>All current and future capabilities</b><small>Administrator wildcard — automatically includes capabilities added in later releases.</small></span></label>
-    <div class="authz-checklist">${groups.map((group, index) => `<details class="authz-cap-group" ${index < 2 ? 'open' : ''}>
-      <summary><input type="checkbox" class="authz-group-toggle" tabindex="-1"> <span><b>${esc(group.label)}</b><small>${esc(group.description)}</small></span></summary>
-      <div class="authz-cap-items">${group.capabilities.map((cap) => `<label class="authz-cap-item"><input type="checkbox" class="authz-capability" value="${esc(cap.id)}" ${has(cap.id) ? 'checked' : ''}> <span><b>${esc(cap.label)}</b><code>${esc(cap.id)}</code><small>${esc(cap.description)}</small></span></label>`).join('')}</div>
-    </details>`).join('')}</div>
-    <details class="advanced authz-scoped"><summary>Advanced target-scoped capabilities</summary>
-      <p class="task-sub">Only capabilities tied to a concrete dynamic resource belong here. Most profiles should leave this empty.</p>
-      <textarea class="authz-scoped-capabilities mono" rows="2" placeholder="merge-into:/repo:branch">${esc(scoped.join('\n'))}</textarea>
-    </details>`;
-}
-
-function wireCapabilityChecklist(row) {
-  const all = row.querySelector('.authz-all-future');
-  const caps = [...row.querySelectorAll('.authz-capability')];
-  const syncGroup = (group) => {
-    const toggle = group.querySelector('.authz-group-toggle');
-    const members = [...group.querySelectorAll('.authz-capability')];
-    const n = members.filter((cap) => cap.checked).length;
-    toggle.checked = n === members.length;
-    toggle.indeterminate = n > 0 && n < members.length;
-  };
-  row.querySelectorAll('.authz-cap-group').forEach((group) => {
-    syncGroup(group);
-    const toggle = group.querySelector('.authz-group-toggle');
-    toggle.addEventListener('click', (event) => {
-      event.stopPropagation();
-      group.querySelectorAll('.authz-capability').forEach((cap) => { cap.checked = toggle.checked; });
-      all.checked = false;
-      syncGroup(group);
-    });
-  });
-  caps.forEach((cap) => cap.addEventListener('change', () => {
-    all.checked = false;
-    syncGroup(cap.closest('.authz-cap-group'));
-  }));
-  all.addEventListener('change', () => {
-    if (all.checked) caps.forEach((cap) => { cap.checked = true; });
-    row.querySelectorAll('.authz-cap-group').forEach(syncGroup);
-  });
-}
-
-async function hydrateAuthorization(scope, projectId) {
-  const box = $(`#authorization-${scope}`);
-  if (!box) return;
-  const renderIsCurrent = beginAsyncElementRender(box);
-  try {
-    const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
-    const data = await api(`/api/authorization/profiles${suffix}`);
-    if (!renderIsCurrent()) return;
-    const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
-    box.innerHTML = `<p class="task-sub">These profiles limit what task agents may do. Human membership and project access are managed in People and each project's Access section.</p>
-      <div class="form-row"><label>Default for new task agents</label><select class="authz-default">${options}</select></div>
-      <div style="display:grid;gap:6px">${data.profiles.map((p) => `<details class="advanced authz-profile" data-profile-id="${esc(p.id)}">
-        <summary><b>${esc(p.name)}</b> — ${esc(p.description)}</summary>
-        <div class="form-row"><label>Description</label><input class="authz-description" value="${esc(p.description)}"></div>
-        ${capabilityChecklist(p, data.capabilityGroups || [])}
-        <button class="btn sm authz-save-profile">Save ${scope === 'project' ? 'project override' : 'profile'}</button>
-      </details>`).join('')}</div>`;
-    box.querySelector('.authz-default')?.addEventListener('change', async (e) => {
-      await api('/api/authorization/default', { method: 'PUT', body: JSON.stringify({ profileId: e.target.value, ...(projectId ? { projectId } : {}) }) });
-      toast('Authorization default saved');
-    });
-    box.querySelectorAll('.authz-profile').forEach(wireCapabilityChecklist);
-    box.querySelectorAll('.authz-save-profile').forEach((button) => button.addEventListener('click', async () => {
-      const row = button.closest('.authz-profile');
-      const original = data.profiles.find((p) => p.id === row.dataset.profileId);
-      try {
-        const capabilities = row.querySelector('.authz-all-future').checked
-          ? ['*']
-          : [...row.querySelectorAll('.authz-capability:checked')].map((cap) => cap.value)
-              .concat(row.querySelector('.authz-scoped-capabilities').value.split(/[,\n]/).map((x) => x.trim()).filter(Boolean));
-        await api('/api/authorization/profiles', { method: 'PUT', body: JSON.stringify({
-          ...(projectId ? { projectId } : {}),
-          profile: {
-            ...original,
-            description: row.querySelector('.authz-description').value.trim(),
-            capabilities,
-          },
-        }) });
-        toast('Authorization profile saved');
-        hydrateAuthorization(scope, projectId);
-      } catch (e) { toast(e.message, true); }
-    }));
-  } catch (e) {
-    if (renderIsCurrent()) box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`;
-  }
-}
-
 function wireGlobalSettings(organizationId) {
   if (hostLocal()) hydratePhoneAccess();
   hydrateResilienceCard();
@@ -10868,7 +10879,6 @@ function wireGlobalSettings(organizationId) {
   renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
-  hydrateAuthorization('global');
   hydrateWorkflows(organizationId);
   hydrateGitProfiles(organizationId);
   wireVaultCards(organizationId);
@@ -11368,6 +11378,7 @@ function cycleSettingsPane(delta) {
 
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
+  const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">Settings</h1>
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
@@ -11377,8 +11388,8 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
-      <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
-      <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div><div id="org-authorization-slot"></div></div>
+      <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
+      <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
     ${outboundEmailCard()}
 
     <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>The GitHub connection and commit identities your projects share</small></div></div>
@@ -11404,8 +11415,6 @@ async function hydrateOrganizationView() {
     && !!$('#org-members');
   const gitAccounts = $('#git-accounts-card');
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
-  const authorization = $('#authorization-card-global');
-  if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
   // Instance-wide cards render inside globalSettingsView but belong under
   // Advanced, not among the task defaults. Moving the node keeps its listeners.
   for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
@@ -11417,10 +11426,10 @@ async function hydrateOrganizationView() {
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
   const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name"><b>${esc(userName(id, embedded))}</b>${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
-  const memberRoles = [['developer', 'Developer'], ['maintainer', 'Project maintainer'], ['operator', 'Automation operator'], ['administrator', 'Administrator']];
+  const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
-    const current = m.profileId || 'developer';
-    return `<div class="member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; permissions still come from the selected profile">protected owner</span>' : ''}<select class="q-sel org-member-profile">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
+    const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
+    return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
   const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
     api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
@@ -11434,7 +11443,7 @@ async function hydrateOrganizationView() {
     Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
   if (!renderIsCurrent()) return;
-  if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.profileId || 'developer')}</span></div>`).join('')}`);
+  if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(authorizationSummary(invitation.authorization || { level: invitation.profileId || 'developer', scope: 'organization' }, authorizationProjects))}</span></div>`).join('')}`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
   $('#org-github').innerHTML = githubApp.configured ? `
@@ -11497,7 +11506,8 @@ async function hydrateOrganizationView() {
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
     <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
     <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-  $('#invite-member')?.addEventListener('click', async () => { try { const email = $('#invite-email').value; const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, profileId: $('#invite-profile').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
+  wireAuthorizationEditor($('#invite-authorization'), authorizationProjects);
+  $('#invite-member')?.addEventListener('click', async () => { try { const email = $('#invite-email').value; const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, authorization: readAuthorizationEditor($('#invite-authorization')) }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#setup-github-app')?.addEventListener('click', async () => {
     try {
@@ -11555,7 +11565,12 @@ async function hydrateOrganizationView() {
   $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
   $('#create-organization')?.addEventListener('click', createOrganization);
   $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
-    row.querySelector('.org-member-profile')?.addEventListener('change', async (event) => { try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, profileId: event.target.value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+    const editor = row.querySelector('.authz-editor');
+    wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
+      if (authorization.scope === 'projects' && !authorization.projectIds?.length) return;
+      try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, authorization }) }); }
+      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
+    });
     row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
   $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {

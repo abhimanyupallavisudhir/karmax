@@ -994,8 +994,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Requesting human input is a non-removable safety valve for every task
       // agent. The API restricts task-scoped callers to their own task, so this
       // cannot be used to interrupt peer work or widen the agent's authority.
+      const storedAuthorization = store.getTask(args.taskId)?.params?._authorization as {
+        capabilities?: string[];
+        scope?: 'projects' | 'organization' | 'global';
+        projectIds?: string[];
+        organizationId?: string;
+      } | undefined;
       const grant = [...new Set([
-        ...(args.task.grant ?? DEFAULT_GRANT),
+        ...(storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT),
         ...orgVaultItems.extensionCaps(args.taskId),
         ...approvedPermissions,
         'task:escalate',
@@ -1008,13 +1014,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const effective = attenuate(ceiling, grant);
       let token: string | undefined;
       if (deps.tokens) {
+        const authorizationScope = storedAuthorization?.scope;
         const minted = deps.tokens.mint({
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
           principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
-          projectId: args.task.projectId,
-          organizationId: store.getProject(args.task.projectId)?.organizationId,
+          projectId: authorizationScope ? undefined : args.task.projectId,
+          projectIds: authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
+          organizationId: authorizationScope === 'global' ? undefined
+            : (storedAuthorization?.organizationId ?? store.getProject(args.task.projectId)?.organizationId),
           audience: 'karmax-platform',
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           worldGeneration: args.worldHandle.generation,

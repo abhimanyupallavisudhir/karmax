@@ -52,6 +52,12 @@ export interface OrganizationMembership {
   joinedAt: number;
 }
 
+export interface AuthorizationSelection {
+  level: string;
+  scope: 'projects' | 'organization' | 'global';
+  projectIds?: string[];
+}
+
 export interface OrganizationInvitation {
   id: string;
   organizationId: string;
@@ -60,6 +66,7 @@ export interface OrganizationInvitation {
   /** Authorization is selected explicitly; membership role is an internal
    * ownership invariant, not a second permissions system. */
   profileId?: string;
+  authorization?: AuthorizationSelection;
   invitedBy: string;
   createdAt: number;
   expiresAt: number;
