@@ -104,8 +104,9 @@ describe('organization and collaboration domain', () => {
     ]));
     store.appendEvent({ taskId: task.id, type: 'credential.approval-resolved', ts: Date.now(),
       payload: { requestId: 'vreq_1', action: 'task', resumed: true } });
+    // An answered ask leaves the inbox entirely rather than lingering as a read row.
     expect(store.listInbox('owner', organization.id).find((item) => item.kind === 'approval-requested'))
-      .toMatchObject({ actionable: false, unread: false });
+      .toBeUndefined();
   });
 
   it('stores only an invitation hash and enforces email, expiry, and single use', () => {

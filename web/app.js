@@ -46,6 +46,7 @@ const S = {
   teams: [],
   users: [],
   inbox: [],
+  inboxFilter: 'all', // which kind of notification the inbox is pinned to (URL-owned)
   deliveryPreferences: null,
   projectId: null,
   tasks: [],
@@ -176,7 +177,7 @@ function parseRoute(url) {
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
-  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', legacy: true };
+  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
     const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -186,6 +187,8 @@ function parseRoute(url) {
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
   if (!seg[1]) return { name: 'global', org, tab: null };            // /<org> → org home
+  // The inbox is the one org view with a sub-view (which kind of notification).
+  if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
   const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -224,6 +227,14 @@ function encodeQuery(q) {
 function globalRoute(tab, org = currentOrg()) {
   const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab;
   return `${orgBase(org)}/${seg}`;
+}
+
+// The inbox pinned to one kind of notification: /<org>/inbox/<kind> ('all' is
+// the bare route). Which sub-tab you are on is part of the page, so it lives in
+// the URL like every other view; whether READ items show is a display
+// preference, so it lives in localStorage like the theme.
+function inboxRoute(filter = S.inboxFilter) {
+  return `${globalRoute('inbox')}${filter && filter !== 'all' ? `/${filter}` : ''}`;
 }
 
 // The URL we are on, query string included — the full identity of the current
@@ -291,8 +302,11 @@ async function applyRoute() {
       if (dest !== currentPath()) return go(dest, { replace: true });
       r.tab = 'dashboard'; // fall through to a real page
     }
+    if (r.tab === 'inbox') {
+      S.inboxFilter = INBOX_TABS.some((tab) => tab.key === r.sub) ? r.sub : 'all';
+    }
     if (r.legacy) {
-      const dest = globalRoute(r.tab);
+      const dest = r.tab === 'inbox' ? inboxRoute() : globalRoute(r.tab);
       if (dest !== location.pathname) return go(dest, { replace: true });
     }
     closeTaskDom();
@@ -11099,14 +11113,48 @@ function markInboxItemReadLocally(item) {
   item.unread = false;
   updateBell();
 }
+// The inbox is one list of live asks, split by what is being asked. Every kind
+// the server can route has a sub-tab; a kind with nothing in it has no tab, so
+// the header shows the shape of the actual backlog rather than a fixed menu.
+const INBOX_TABS = [
+  { key: 'approval-requested', label: 'Approvals' },
+  { key: 'review-requested', label: 'Review' },
+  { key: 'escalated', label: 'Escalated' },
+  { key: 'assigned', label: 'Assigned' },
+  { key: 'mentioned', label: 'Mentions' },
+  { key: 'update', label: 'Updates' },
+];
+// Read items are hidden by default — an answered notification should stop taking
+// up space. A per-browser display choice, like the theme (see renderFlag).
+function inboxShowRead() { return renderFlag('karmax-inbox-show-read', false); }
+function inboxItems() {
+  const showRead = inboxShowRead();
+  return S.inbox.filter((item) => (showRead || item.unread)
+    && (S.inboxFilter === 'all' || item.kind === S.inboxFilter));
+}
+function inboxTabs() {
+  const unread = (match) => S.inbox.filter((item) => item.unread && match(item)).length;
+  return [{ key: 'all', label: 'All', unread: unread(() => true) }].concat(
+    INBOX_TABS.filter((tab) => S.inbox.some((item) => item.kind === tab.key))
+      .map((tab) => ({ ...tab, unread: unread((item) => item.kind === tab.key) })));
+}
+// What a row is about. An ask names itself ("review requested"); an update's
+// news is the outcome it is reporting, so it names the task's status instead.
+function inboxRowLabel(item) {
+  return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
+}
 function inboxView() {
   const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
+  const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
-    <div class="inbox-toolbar"><span>${S.inbox.filter((x) => x.unread).length} unread</span><button class="btn sm" id="inbox-read-all">Mark all read</button></div>
-    <div class="inbox-list">${S.inbox.length ? S.inbox.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
+    <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
+    <div class="inbox-toolbar"><span>${S.inbox.filter((x) => x.unread).length} unread</span>
+      <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
+      <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
       <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.kind)}</b>
-      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(item.kind.replaceAll('-', ' '))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
-      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : '<div class="empty"><div class="big">Inbox zero</div>Only updates meant for you appear here.</div>'}</div>
+      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
+      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
     <div class="card delivery-card"><div class="section-h">Delivery</div>
       ${['browser', 'email', 'slack'].map((key) => {
     // A channel with no adapter cannot deliver anything. Offering the switch anyway
@@ -11133,9 +11181,13 @@ function wireInboxView() {
       item.unread = !item.unread; renderMain(); renderRail();
     } catch (error) { toast(error.message, true); }
   }));
+  $('#inbox-show-read')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-inbox-show-read', e.target.checked ? '1' : '0'); } catch {}
+    renderMain();
+  });
   $('#inbox-read-all')?.addEventListener('click', async () => {
     try {
-      await Promise.all(S.inbox.filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
+      await Promise.all(inboxItems().filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
       await loadCollaboration(); renderMain(); renderRail();
     } catch (error) { toast(error.message, true); }
   });

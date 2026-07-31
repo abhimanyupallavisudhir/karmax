@@ -282,10 +282,8 @@ describe('task stage transitions', () => {
       .toEqual(['settings:read']);
     expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge'))
       .toEqual([]);
-    expect(f.store.listInbox('test', 'org_personal')[0]).toMatchObject({
-      unread: false,
-      actionable: false,
-    });
+    // The approval was answered, so it stops being an ask sitting in the inbox.
+    expect(f.store.listInbox('test', 'org_personal')).toEqual([]);
 
     f.store.setOrganizationMembership('org_personal', 'reviewer', 'member');
     const second = await f.api.requestPermission(agentToken, {
