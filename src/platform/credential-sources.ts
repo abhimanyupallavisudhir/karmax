@@ -2,6 +2,7 @@ import { ClaudeAdapter } from '../agent/claude.js';
 import { CodexAdapter } from '../agent/codex.js';
 import { apiKeyEnv, hasAcpAmbientLogin, LOGIN_PROVIDERS, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { openCodeAuthProvider, type ConfigHomeManager } from '../autonomy/config-homes.js';
+import { deploymentConfig } from '../config/deployment.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { CredentialSources, CredPolicy } from './credentials.js';
 import os from 'node:os';
@@ -19,7 +20,14 @@ export function gatherCredentialSources(deps: {
   organizationId?: string;
 }): CredentialSources {
   const organizationId = deps.organizationId ?? 'org_personal';
-  const hostCredentials = organizationId === 'org_personal';
+  // The operator's own machine credentials — the `claude login` in karmax's config
+  // home, the API keys in its environment. `org_personal` is bootstrapped into every
+  // install and is the fallback organization id throughout the store, so membership
+  // alone must not be what stands between a tenant and them: a managed cell has many
+  // tenants and one control plane, and its environment belongs to the platform, not
+  // to whoever is browsing. A self-host stays as it was — there the operator IS the
+  // user, and running on the box's own login is the point.
+  const hostCredentials = !deploymentConfig().hosted && organizationId === 'org_personal';
   const claudeHome = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
   const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
   const openCodeDataHome = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), '.local', 'share');

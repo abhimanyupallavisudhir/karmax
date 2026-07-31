@@ -8548,7 +8548,7 @@ async function hydrateProjectData(proj) {
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
       const files = [...$('#data-files').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a host path or a browser folder, not both', true);
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a path or a browser folder, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
@@ -9166,14 +9166,11 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
     </div>
-    <div class="card" id="resilience-card">
-      <div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
-    </div>
-    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
+    <div class="card" id="resilience-card" hidden></div>
+    ${hostLocal() ? `<div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
-    </div>`;
+    </div>` : ''}`;
 }
 
 function phoneInstallHelp() {
@@ -9192,7 +9189,6 @@ function renderPhoneAccess(status) {
   const box = $('#phone-access-status');
   if (!box) return;
   const ready = status.state === 'ready';
-  const hosted = status.method === 'hosted';
   const label = status.setupInProgress ? 'Setting up…' : ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
     : status.state === 'needs-login' ? 'Sign-in needed'
       : status.state === 'conflict' ? 'Another service is connected' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
@@ -9202,12 +9198,10 @@ function renderPhoneAccess(status) {
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
     ? `<div class="phone-access-address"><span>Access your krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
-  const phoneSteps = hosted
-    ? '<li>Open this same HTTPS address on your phone.</li>'
-    : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
+    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>Tailscale not set up</b></div>`;
+  const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private krmax address shown here in your phone’s browser.</li>`;
-  const recovery = ready && !hosted
+  const recovery = ready
     ? `<details class="phone-troubleshooting">
         <summary>Address won’t open?</summary>
         <ol>
@@ -9232,15 +9226,14 @@ function renderPhoneAccess(status) {
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
         Sign in to the same Tailscale account on both.</p>`;
   const fallbackCommands = status.fallbackCommands || [];
-  const fallback = !hosted && fallbackCommands.length
+  const fallback = fallbackCommands.length
     ? `<details class="phone-terminal-fallback">
         <summary>Doesn’t work? Use the terminal instead</summary>
         <pre><code>${esc(fallbackCommands.join('\n'))}</code></pre>
         <button class="btn sm" id="remote-copy-fallback">Copy commands</button>
        </details>`
     : '';
-  const setupPanel = !hosted
-    ? `<details class="phone-setup" ${ready ? '' : 'open'}>
+  const setupPanel = `<details class="phone-setup" ${ready ? '' : 'open'}>
         <summary>${setupSummary}</summary>
         <div class="phone-setup-body">
           ${setupIntro}
@@ -9256,13 +9249,12 @@ function renderPhoneAccess(status) {
           ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. krmax never sees your OS or Tailscale password.</p>' : ''}
           ${fallback}
         </div>
-       </details>`
-    : `<p>${esc(status.detail)}</p>`;
+       </details>`;
   box.innerHTML = `${address}
     ${setupPanel}
     ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
       <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">${hosted ? 'krmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.'}</p>`;
+    <p class="phone-security">This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.</p>`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
@@ -9417,10 +9409,17 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
   }
   if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
+    // Worlds inherit the host's git config through git's own cascade
+    // (ensureIdentity only fills blanks), which is true of a worktree world on
+    // the operator's machine and false on a managed cell: there the world is a
+    // remote sandbox with no ~/.gitconfig to inherit, and no single "host" whose
+    // identity a tenant would want anyway.
     box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
-      organizationId === 'org_personal'
-        ? 'personal projects use the host’s own Git setup.'
-        : 'projects remain isolated from the host’s Git identity and credentials.'
+      S.meta?.hosted
+        ? 'add one to give this organization’s commits an identity.'
+        : organizationId === 'org_personal'
+          ? 'personal projects use the host’s own Git setup.'
+          : 'projects remain isolated from the host’s Git identity and credentials.'
     }</span>`;
     return;
   }
@@ -9484,7 +9483,7 @@ function paymentsCard(scope) {
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
-      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
+      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px" hidden></div>
       <div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
       <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
@@ -9619,7 +9618,11 @@ async function wirePaymentProviders(box, organizationId) {
     try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
   }
   const platformBox = box.querySelector('.pay-stripe-platform');
-  if (platformBox && platform) {
+  // The shared Connect application is installation-wide, so the box ships hidden
+  // and only `canManage` reveals it — a tenant is never shown the operator's form,
+  // not even for the frame between render and the answer coming back.
+  if (platformBox && platform?.canManage) {
+    platformBox.hidden = false;
     const status = platform.configured
       ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
       : '<span class="chip">setup required</span>';
@@ -9631,13 +9634,13 @@ async function wirePaymentProviders(box, organizationId) {
       <p class="task-sub">One Stripe Connect application identifies this krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
       <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
       <div class="settings-grid">
-        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
-        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
-        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" /></label>
+        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" /></label>
+        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
         <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
         <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
       </div>
-      ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
+      <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
       ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in krmax’s encrypted vault and makes them take precedence.</p>' : ''}
     </details>`;
     platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
@@ -10033,7 +10036,7 @@ function passwordsCard() {
     </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
-      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on the machine running krmax, then Import.')}</div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
     <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
@@ -10343,9 +10346,46 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// ── installation-wide OUTBOUND email (operator-only; server enforces settings:write)
+// ── installation-wide settings (safe mode, outbound email, Stripe platform) ──
+// These belong to whoever runs the installation, and the console has no
+// capability model of its own, so each card asks its endpoint: a refusal (or
+// canManage:false) means the reader is a tenant here.
+//
+// The card ships EMPTY and `hidden`, and is filled only once the server has
+// allowed it. Rendering first and removing on refusal would flash an operator
+// control at a tenant for however long the request takes.
+async function hydrateInstallationCard(selector, url, fill) {
+  const card = document.querySelector(selector);
+  if (!card) return;
+  try {
+    const data = await api(url);
+    if (!data.canManage) return;
+    card.hidden = false;
+    fill(card, data);
+  } catch { /* refused: leave the card absent */ }
+}
+
+function hydrateResilienceCard() {
+  return hydrateInstallationCard('#resilience-card', '/api/safe-mode', (card, data) => {
+    S.meta.safeMode = data.safeMode;
+    card.innerHTML = `<div class="section-h">Resilience</div>
+      <div class="switch"><input type="checkbox" id="safe-mode" ${data.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>`;
+    card.querySelector('#safe-mode').addEventListener('change', async (e) => {
+      try {
+        const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
+        S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
+      } catch (err) { toast(err.message, true); }
+    });
+  });
+}
+
 function outboundEmailCard() {
-  return `<div class="card" id="outbound-email-card">
+  return '<div class="card" id="outbound-email-card" hidden></div>';
+}
+
+async function wireOutboundEmailCard() {
+  return hydrateInstallationCard('#outbound-email-card', '/api/email', (card, data) => {
+    card.innerHTML = `
     <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
     <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let krmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
     <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
@@ -10366,56 +10406,50 @@ function outboundEmailCard() {
     <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
     <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
     <div id="oe-result" class="task-sub" style="margin-top:6px"></div>
-  </div>`;
-}
-async function wireOutboundEmailCard() {
-  const card = $('#outbound-email-card');
-  if (!card) return;
-  let data;
-  try { data = await api('/api/email'); }
-  catch { card.style.display = 'none'; return; } // no settings:write → hide entirely
-  const providerSel = $('#oe-provider');
-  const helpEl = $('#oe-help');
-  const applyProvider = () => {
-    const name = providerSel.value;
-    const info = (data.providers || []).find((p) => p.name === name);
-    $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
-    $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
-    $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-    const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
-    helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
-  };
-  if (data.provider) providerSel.value = data.provider;
-  if (data.from) $('#oe-from').value = data.from;
-  $('#oe-status').innerHTML = data.configured
-    ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
-    : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
-  applyProvider();
-  providerSel.addEventListener('change', applyProvider);
-  $('#oe-connect').addEventListener('click', async () => {
-    const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
-    if (providerSel.value === 'smtp') {
-      body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
-      body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
-    }
-    const btn = $('#oe-connect'); btn.disabled = true;
-    try {
-      const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
-      $('#oe-secret').value = '';
-      $('#oe-result').style.color = 'var(--ink-2)';
-      $('#oe-result').textContent = result.detail || 'Connected';
-      toast('Outbound email connected');
-      await wireOutboundEmailCard();
-    } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
-    finally { btn.disabled = false; }
-  });
-  $('#oe-test').addEventListener('click', async () => {
-    const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
-    if (!to) return;
-    const btn = $('#oe-test'); btn.disabled = true;
-    try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
-    catch (e) { toast(e.message, true); }
-    finally { btn.disabled = false; }
+  `;
+    const providerSel = $('#oe-provider');
+    const helpEl = $('#oe-help');
+    const applyProvider = () => {
+      const name = providerSel.value;
+      const info = (data.providers || []).find((p) => p.name === name);
+      $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
+      $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
+      $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
+      const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+      helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
+    };
+    if (data.provider) providerSel.value = data.provider;
+    if (data.from) $('#oe-from').value = data.from;
+    $('#oe-status').innerHTML = data.configured
+      ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
+      : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
+    applyProvider();
+    providerSel.addEventListener('change', applyProvider);
+    $('#oe-connect').addEventListener('click', async () => {
+      const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
+      if (providerSel.value === 'smtp') {
+        body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
+        body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
+      }
+      const btn = $('#oe-connect'); btn.disabled = true;
+      try {
+        const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
+        $('#oe-secret').value = '';
+        $('#oe-result').style.color = 'var(--ink-2)';
+        $('#oe-result').textContent = result.detail || 'Connected';
+        toast('Outbound email connected');
+        await wireOutboundEmailCard();
+      } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
+      finally { btn.disabled = false; }
+    });
+    $('#oe-test').addEventListener('click', async () => {
+      const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+      if (!to) return;
+      const btn = $('#oe-test'); btn.disabled = true;
+      try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
+      catch (e) { toast(e.message, true); }
+      finally { btn.disabled = false; }
+    });
   });
 }
 
@@ -10678,7 +10712,8 @@ async function hydrateAuthorization(scope, projectId) {
 }
 
 function wireGlobalSettings(organizationId) {
-  hydratePhoneAccess();
+  if (hostLocal()) hydratePhoneAccess();
+  hydrateResilienceCard();
   wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
@@ -10802,9 +10837,6 @@ function wireGlobalSettings(organizationId) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#safe-mode')?.addEventListener('change', async (e) => {
-    try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
-  });
 }
 
 // ── inbox + collaboration ───────────────────────────────────────────────────
@@ -11193,7 +11225,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-access">Phone Access</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -11263,7 +11295,7 @@ async function hydrateOrganizationView() {
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so krmax refreshes repository access when you ask instead of using webhooks.'}</p>
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. Git uses short-lived App tokens, so connecting many repositories does not add a deploy key to each one. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
+    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. Git uses short-lived App tokens, so connecting many repositories does not add a deploy key to each one.${hostLocal() ? ' On localhost, setup works without a webhook and repository access is refreshed on demand.' : ''}</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
