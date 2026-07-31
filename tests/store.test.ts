@@ -11,6 +11,36 @@ describe('Store', () => {
     store = new Store(':memory:');
   });
 
+  it('removes legacy E2B lease estimates while preserving reconciled executions', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-e2b-usage-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = new Store(dbPath);
+    legacy.recordUsage({ id: 'legacy-lease', organizationId: 'org_personal', provider: 'e2b',
+      kind: 'world.active', quantity: 10 * 24 * 60 * 60, unit: 'second', costMicros: 29_911_680,
+      startedAt: 1, endedAt: 2, metadata: { runnerPoolId: 'old' } });
+    legacy.recordUsage({ id: 'provider-execution', organizationId: 'org_personal', provider: 'e2b',
+      kind: 'world.active', quantity: 300, unit: 'second', costMicros: 9_075,
+      startedAt: 1, endedAt: 2, metadata: { source: 'provider-lifecycle', executionId: 'execution-1' } });
+    legacy.close();
+
+    const migrated = new Store(dbPath);
+    expect(migrated.usageSummary('org_personal')).toEqual({
+      costMicros: 9_075, events: 1, byKind: { 'world.active': 9_075 },
+    });
+    migrated.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('prorates provider executions that cross a monthly query boundary', () => {
+    const boundary = Date.UTC(2026, 7, 1);
+    store.recordUsage({ organizationId: 'org_personal', provider: 'e2b', kind: 'world.active',
+      quantity: 10, unit: 'second', costMicros: 100, startedAt: boundary - 5_000,
+      endedAt: boundary + 5_000, metadata: { source: 'provider-lifecycle' } });
+
+    expect(store.usageSummary('org_personal', boundary - 10_000, boundary).costMicros).toBe(50);
+    expect(store.usageSummary('org_personal', boundary, boundary + 10_000).costMicros).toBe(50);
+  });
+
   it('migrates away legacy turn caps on role-default profiles (task 1a)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
     const dbPath = path.join(dir, 'karmax.db');

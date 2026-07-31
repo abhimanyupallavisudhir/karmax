@@ -241,6 +241,14 @@ export class Store {
     // Untagged. Adopt that same reading explicitly. Idempotent: creation now always
     // sets a kind, so a re-run matches nothing.
     this.db.prepare("UPDATE tags SET kind = 'topic' WHERE kind IS NULL OR kind = ''").run();
+
+    // Before provider reconciliation, E2B cost was derived from runner-lease
+    // wall time. Auto-paused sandboxes stop billing while those leases can remain
+    // stale for days, so every such historical row is known-bad. Reconciled rows
+    // carry their source explicitly and survive this idempotent cleanup.
+    this.db.prepare(`DELETE FROM usage_events WHERE provider='e2b' AND kind='world.active'
+      AND (metadata IS NULL OR json_extract(metadata, '$.source') IS NULL
+        OR json_extract(metadata, '$.source') != 'provider-lifecycle')`).run();
   }
 
   private migrate() {
@@ -3555,13 +3563,26 @@ export class Store {
 
   usageSummary(organizationId: string, from = 0, to = Date.now(), projectId?: string): { costMicros: number; events: number; byKind: Record<string, number> } {
     const rows = (projectId
-      ? this.db.prepare('SELECT kind, costMicros FROM usage_events WHERE organizationId=? AND projectId=? AND startedAt>=? AND startedAt<?')
-        .all(organizationId, projectId, from, to)
-      : this.db.prepare('SELECT kind, costMicros FROM usage_events WHERE organizationId=? AND startedAt>=? AND startedAt<?')
-        .all(organizationId, from, to)) as any[];
+      ? this.db.prepare(`SELECT kind, costMicros, startedAt, endedAt FROM usage_events
+          WHERE organizationId=? AND projectId=? AND startedAt<?
+            AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
+        .all(organizationId, projectId, to, from, from)
+      : this.db.prepare(`SELECT kind, costMicros, startedAt, endedAt FROM usage_events
+          WHERE organizationId=? AND startedAt<?
+            AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
+        .all(organizationId, to, from, from)) as any[];
     const byKind: Record<string, number> = {};
-    for (const row of rows) byKind[row.kind] = (byKind[row.kind] ?? 0) + Number(row.costMicros);
-    return { costMicros: rows.reduce((sum, row) => sum + Number(row.costMicros), 0), events: rows.length, byKind };
+    let costMicros = 0;
+    for (const row of rows) {
+      const startedAt = Number(row.startedAt);
+      const endedAt = Number(row.endedAt);
+      const duration = endedAt - startedAt;
+      const overlap = duration > 0 ? Math.max(0, Math.min(endedAt, to) - Math.max(startedAt, from)) : 0;
+      const cost = duration > 0 ? Math.round(Number(row.costMicros) * overlap / duration) : Number(row.costMicros);
+      byKind[row.kind] = (byKind[row.kind] ?? 0) + cost;
+      costMicros += cost;
+    }
+    return { costMicros, events: rows.length, byKind };
   }
 
   savePromotedArtifact(artifact: PromotedArtifact): PromotedArtifact {

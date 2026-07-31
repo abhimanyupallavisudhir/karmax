@@ -1581,8 +1581,19 @@ export class Gateway {
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
-      if (usage && method === 'GET') return this.json(res, 200, store.usageSummary(usage[1]!,
-        Number(url.searchParams.get('from') ?? 0), Number(url.searchParams.get('to') ?? Date.now())));
+      if (usage && method === 'GET') {
+        const now = Date.now();
+        const date = new Date(now);
+        const monthStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+        const from = Number(url.searchParams.get('from') ?? monthStart);
+        const to = Number(url.searchParams.get('to') ?? now);
+        const sync = store.listWorldProviderConnections(usage[1]!).map((connection) => {
+          try { return { provider: connection.provider,
+            ...JSON.parse(store.kvGet(`usage-sync:${usage[1]}:${connection.provider}`) ?? '{"status":"pending"}') }; }
+          catch { return { provider: connection.provider, status: 'pending' }; }
+        });
+        return this.json(res, 200, { ...store.usageSummary(usage[1]!, from, to), from, to, sync });
+      }
 
       if (p === '/api/inbox' && method === 'GET') {
         if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
