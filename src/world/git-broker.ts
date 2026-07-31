@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
-import { sharesHostRefDatabase, worldRepos, worldRepoTarget } from './types.js';
+import { sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
+import { canonicalRepositoryIdentity } from './repository-identity.js';
 
 export interface GitBrokerCredential extends GitCredential {}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
@@ -183,16 +184,23 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
 }
 
 export interface ImportedGitRef { repo: string; branch: string; ref: string; sha: string }
+export interface GitBrokerRefreshResult {
+  refs: ImportedGitRef[];
+  skipped: string[];
+  /** Per-repository diagnostics when other repositories refreshed successfully. */
+  errors?: Record<string, string>;
+}
 
 /** Fetch another task branch through the trusted broker and expose it as a
  * namespaced local ref. Nothing is merged automatically: the receiving agent
  * can inspect, test, cherry-pick, or merge it using ordinary local Git. */
 export async function brokerImportTaskBranch(destination: World, source: import('./types.js').WorldHandle,
   sourceTaskId: string, auth: GitBrokerAuth): Promise<ImportedGitRef[]> {
-  const sourceByRemote = new Map(worldRepos(source).map((repo) => [repo.repo, repo]));
+  const sourceByRemote = new Map(worldRepos(source)
+    .map((repo) => [canonicalRepositoryIdentity(worldRepoSource(repo)), repo]));
   const imported: ImportedGitRef[] = [];
   for (const repo of worldRepos(destination.handle)) {
-    const sourceRepo = sourceByRemote.get(repo.repo);
+    const sourceRepo = sourceByRemote.get(canonicalRepositoryIdentity(worldRepoSource(repo)));
     if (!sourceRepo) continue;
     const suffix = sourceTaskId.replace(/[^A-Za-z0-9._-]/g, '-');
     const ref = `refs/karmax/tasks/${suffix}/${repo.name.replace(/[^A-Za-z0-9._-]/g, '-')}`;
@@ -206,17 +214,24 @@ export async function brokerImportTaskBranch(destination: World, source: import(
 /** Refresh an upstream branch without putting a clone key in the sandbox. The
  * resulting origin/* ref behaves exactly like a normal git fetch to the agent. */
 export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
-  requestedBranch?: string): Promise<ImportedGitRef[]> {
+  requestedBranch?: string): Promise<GitBrokerRefreshResult> {
   const refreshed: ImportedGitRef[] = [];
+  const skipped: string[] = [];
+  const errors: Record<string, string> = {};
   for (const repo of worldRepos(world.handle)) {
-    const branch = requestedBranch ?? repo.target ?? repo.base;
-    if (!safeBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
-    const ref = `refs/remotes/origin/${branch}`;
-    const sha = await brokerFetchRef(world, repo, branch, ref, auth);
-    refreshed.push({ repo: repo.name, branch, ref, sha });
+    try {
+      const branch = requestedBranch ?? repo.target ?? repo.base;
+      if (!safeBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
+      const ref = `refs/remotes/origin/${branch}`;
+      const sha = await brokerFetchRef(world, repo, branch, ref, auth);
+      refreshed.push({ repo: repo.name, branch, ref, sha });
+    } catch (error) {
+      skipped.push(repo.name);
+      errors[repo.name] = error instanceof Error ? error.message : String(error);
+    }
   }
-  if (!refreshed.length) throw new Error('task world has no remote repository');
-  return refreshed;
+  if (!refreshed.length && !skipped.length) throw new Error('task world has no remote repository');
+  return { refs: refreshed, skipped, ...(skipped.length ? { errors } : {}) };
 }
 
 async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: string, destinationRef: string,

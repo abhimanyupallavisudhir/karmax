@@ -4,6 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
+import { sameRepository } from '../world/repository-identity.js';
 
 // node:sqlite is a newer builtin that bundlers (vite/vitest) cannot statically
 // resolve, so load it through createRequire at runtime.
@@ -1773,7 +1774,9 @@ export class Store {
     const catalog = projectBefore.organizationId
       ? this.listRepositories(projectBefore.organizationId).filter((repository) => !this.repositoryIsProjectWiki(repository.id))
       : [];
-    const wanted = new Map(catalog.filter((repository) => sources.includes(repository.sshUrl)).map((repository) => [repository.id, repository]));
+    const wanted = new Map(catalog
+      .filter((repository) => sources.some((source) => sameRepository(source, repository.sshUrl)))
+      .map((repository) => [repository.id, repository]));
     for (const attachment of this.listProjectRepositories(projectId))
       if (!wanted.has(attachment.repositoryId)) this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, attachment.repositoryId);
     let order = 0;

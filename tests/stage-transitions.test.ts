@@ -243,6 +243,16 @@ describe('task stage transitions', () => {
       capabilities: ['settings:read'],
       audience: ['@owners'],
     });
+    expect(f.terminated.at(-1)).toContain('Waiting for permission approval');
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'do',
+      pausedForHuman: true,
+    });
+    expect(f.store.getTask(f.task.id)!.lastView).toMatchObject({
+      stage: 'do',
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@owners'] },
+    });
     expect(f.store.listInbox('test', 'org_personal')).toEqual([
       expect.objectContaining({ taskId: f.task.id, kind: 'approval-requested', actionable: true }),
     ]);
@@ -267,6 +277,7 @@ describe('task stage transitions', () => {
       action: 'approve',
     });
     expect(resolved).toMatchObject({ status: 'granted', resume: { resumed: true } });
+    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, args: [expect.any(Object), 'do'] });
     expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'do'))
       .toEqual(['settings:read']);
     expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge'))
@@ -299,6 +310,40 @@ describe('task stage transitions', () => {
       requestId: second.requestId!,
       action: 'deny',
     })).resolves.toMatchObject({ status: 'denied' });
+  });
+
+  it('parks and resumes the requesting Merge role so the next turn receives the grant', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, { ...f.view, stage: 'merge' });
+    const agentToken = f.tokens.mint({
+      taskId: f.task.id,
+      profileId: 'merge-default',
+      role: 'merge',
+      principal: `task-agent:${f.task.id}:merge-default`,
+      projectId: f.project.id,
+      organizationId: 'org_personal',
+      ceiling: ['task:escalate'],
+      grantorCaps: ['task:escalate'],
+    }).token;
+
+    const requested = await f.api.requestPermission(agentToken, {
+      capabilities: ['task:git:import'],
+      audience: ['@owners'],
+      reason: 'Refresh the protected target before resolving conflicts.',
+    });
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'merge',
+      pausedForHuman: true,
+    });
+
+    await expect(f.api.resolvePermissionRequest(f.token, {
+      organizationId: 'org_personal',
+      requestId: requested.requestId!,
+      action: 'approve',
+    })).resolves.toMatchObject({ status: 'granted', role: 'merge', resume: { resumed: true } });
+    expect(new PermissionRequests(f.store, 'org_personal').extensionCaps(f.task.id, 'merge'))
+      .toEqual(['task:git:import']);
+    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, args: [expect.any(Object), 'merge'] });
   });
 
   it('treats follow-up and Confirm as input that releases a human hold', async () => {

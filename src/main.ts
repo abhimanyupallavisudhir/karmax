@@ -42,6 +42,8 @@ import { WorldHandoffService } from './world/handoff.js';
 import { WorldAccessService } from './world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.js';
 import { sweepOrphanedServiceContainers } from './world/services.js';
+import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-restart.js';
+import type { WorldHandle } from './world/types.js';
 
 const VERSION = '1.0.0';
 
@@ -551,14 +553,25 @@ async function main() {
   }
 
   let shuttingDown = false;
-  const shutdown = async () => {
+  let replacementStarted = false;
+  const shutdown = async (restart = false) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log('\n  shutting down…');
+    console.log(restart ? '\n  merged source changed; restarting…' : '\n  shutting down…');
+    const exit = () => {
+      if (restart && !replacementStarted) {
+        replacementStarted = true;
+        try { spawnReplacementProcess(); }
+        catch (error) {
+          console.error('  ! Could not start the replacement process:', error instanceof Error ? error.message : error);
+        }
+      }
+      process.exit(0);
+    };
     // Backstop: never let a hung dependency (e.g. a slow worker drain) block exit.
     // Must beat tsx-watch's 5s force-kill: a SIGKILLed worker dies mid-activity,
     // orphaning agent subprocesses (and karmax's own merges trigger tsx reloads).
-    setTimeout(() => process.exit(0), 4500).unref();
+    setTimeout(exit, 4500).unref();
     // Bound every step so one wedged call can't strand the whole shutdown. The
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
@@ -577,10 +590,30 @@ async function main() {
       await step(server.stop()); // no-op for the shared server — it persists for a fast restart
       console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');
     }
-    process.exit(0);
+    exit();
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => { void shutdown(); });
+  process.on('SIGTERM', () => { void shutdown(); });
+
+  // `npm start` intentionally has no source watcher. When Karmax merges a task
+  // into the very checkout this process loaded, hand off to an identical fresh
+  // Node invocation after the task has had time to settle in Temporal. Dev mode
+  // already has tsx's watcher and must not spawn a second successor.
+  let sourceRestartScheduled = false;
+  bus.onAny((event) => {
+    if (sourceRestartScheduled || process.env.npm_lifecycle_event === 'dev'
+      || event.type !== 'view.updated'
+      || (event.payload as { status?: string } | undefined)?.status !== 'done') return;
+    const landed = store.eventsSince(event.taskId, 0).some((candidate) => candidate.type === 'merge.result'
+      && (candidate.payload as { merged?: boolean } | undefined)?.merged === true);
+    if (!landed) return; // manual Done and no-merge workflows changed no live source
+    const task = store.getTask(event.taskId);
+    const handle = (store.currentWorld(event.taskId) ?? task?.lastView?.world) as WorldHandle | undefined;
+    if (!worldLandedInCheckout(handle, process.cwd())) return;
+    sourceRestartScheduled = true;
+    console.log(`  • Task ${event.taskId} updated the live checkout; scheduling a graceful restart`);
+    setTimeout(() => { void shutdown(true); }, 1500).unref();
+  });
 }
 
 main().catch((e) => {

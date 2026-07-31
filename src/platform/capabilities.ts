@@ -40,6 +40,15 @@ export const CAPABILITIES = [
 
 export type KnownCapability = (typeof CAPABILITIES)[number];
 
+/** Ordinary developer operations shared by every role that works in a task
+ * world. Workflow-internal decisions are added by concrete role declarations. */
+export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
+  'project:read', 'project:settings:read', 'task:*',
+  'queue:read', 'workflow:read', 'profile:read',
+  'organization:read', 'organization:member:read', 'team:read', 'repository:read',
+  'credential:read', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
+];
+
 export interface CapabilityDefinition {
   id: KnownCapability;
   label: string;

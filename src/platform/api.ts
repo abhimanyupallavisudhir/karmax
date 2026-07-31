@@ -44,8 +44,9 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
-import { worldRepos } from '../world/types.js';
+import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
+import { sameRepository } from '../world/repository-identity.js';
 import type { WorldAccessService } from '../world/access.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 
@@ -281,8 +282,9 @@ export class KarmaxApi {
     const wiki = this.deps.store.projectWiki(projectId)?.repository;
     return async (repo) => {
       if (!this.deps.githubApp) throw new Error('Git collaboration for a remote repository requires a connected GitHub App');
-      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository
-        ?? (wiki?.sshUrl === repo.repo ? wiki : undefined);
+      const source = worldRepoSource(repo);
+      const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
+        ?? (wiki && sameRepository(wiki.sshUrl, source) ? wiki : undefined);
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       return this.deps.githubApp!.brokerCredentials(repository);
     };
@@ -376,7 +378,7 @@ export class KarmaxApi {
    * by the gateway; this method only delivers the durable workflow message that
    * makes the blocked agent retry (or continue after a denial).
    */
-  async resumeAfterCredentialDecision(taskId: string, text: string): Promise<
+  async resumeAfterCredentialDecision(taskId: string, text: string, role = 'do'): Promise<
     { resumed: true; messageId: string } | { resumed: false; reason: string }
   > {
     const task = this.deps.store.getTask(taskId);
@@ -384,7 +386,7 @@ export class KarmaxApi {
     if (['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
       return { resumed: false, reason: `task is already ${task.lastView!.status}` };
     try {
-      const message = await this.deliverWorkflowMessage(taskId, text, 'do');
+      const message = await this.deliverWorkflowMessage(taskId, text, role);
       return { resumed: true, messageId: message.id };
     } catch (error) {
       return { resumed: false, reason: `could not resume the task: ${unwrapCause(error)}` };
@@ -433,7 +435,7 @@ export class KarmaxApi {
     const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
-      return { refs: await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch) };
+      return await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch);
     } finally { await access.release(); }
   }
 
@@ -566,8 +568,9 @@ export class KarmaxApi {
             `GitHub repository. Connect the organization GitHub App and attach a repository to this project before running the task.`,
         );
       }
-      const enrolled = new Set(linked.map((candidate) => candidate.repository.sshUrl));
-      const outside = effectiveRepos(resolved, project.config).filter((repository) => !enrolled.has(repository));
+      const enrolled = linked.map((candidate) => candidate.repository.sshUrl);
+      const outside = effectiveRepos(resolved, project.config)
+        .filter((repository) => !enrolled.some((candidate) => sameRepository(candidate, repository)));
       if (outside.length) throw new Error(`Hosted project "${project.name}" references a repository that is not attached to it: ${outside[0]}`);
     }
     // Guard on the EFFECTIVE repo list the world will be built from (the resolved
@@ -2148,6 +2151,17 @@ export class KarmaxApi {
       };
       const seq = this.deps.store.appendEvent(event);
       this.deps.bus?.emit({ ...event, seq });
+      // A scoped token is immutable. End the requesting turn and park the exact
+      // workflow stage so an approval can wake this role in a fresh turn whose
+      // normally minted token includes the durable extension.
+      const view = task.lastView;
+      if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
+        await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
+        await this.startTransitionReplacement(task, view, view.stage, true, {
+          audience: request.audience,
+          detail: `Permission requested: ${request.capabilities.join(', ')} — ${request.reason}`,
+        });
+      }
     }
     return {
       status: 'needs_approval',
@@ -2215,7 +2229,7 @@ export class KarmaxApi {
     const message = input.action === 'approve'
       ? `[Krmax permission decision]\n\nApproved for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}. Retry the blocked operation now; a newly scoped token will carry the grant.`
       : `[Krmax permission decision]\n\nDenied for this task's ${resolved.role} agent: ${resolved.capabilities.join(', ')}. Do not request these permissions again; continue without them or explain why the task cannot proceed.`;
-    const resume = await this.resumeAfterCredentialDecision(request.taskId, message);
+    const resume = await this.resumeAfterCredentialDecision(request.taskId, message, request.role);
     const event = {
       taskId: request.taskId,
       type: 'permission.approval-resolved',

@@ -13,6 +13,7 @@ import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
+import { sameRepository } from './repository-identity.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -101,7 +102,7 @@ export class WorldCheckpointService {
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
       const source = worldRepoSource(repo);
-      const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository;
+      const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository;
       repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(source)).slice(0, 24)}`,
         checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined });

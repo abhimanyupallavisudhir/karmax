@@ -1150,7 +1150,7 @@ esac
 
   it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {
     const conns: any = await (await fetch(`${base}/api/vault/connectors`, { headers: auth() })).json();
-    expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass']);
+    expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass', 'pass-git']);
     // In CI none of the CLIs are configured, so each reports a clear reason.
     for (const c of conns) { expect(typeof c.available).toBe('boolean'); expect(c.detail).toBeTruthy(); }
   });
