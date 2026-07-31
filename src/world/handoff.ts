@@ -18,6 +18,7 @@ import type { WorldAccessService } from './access.js';
 import { git } from './git.js';
 import { paths } from '../config/paths.js';
 import { materializeGitCredential } from './git-credential.js';
+import { sameRepository } from './repository-identity.js';
 
 export interface LocalCheckoutPlan {
   taskId: string;
@@ -64,10 +65,9 @@ export class WorldHandoffService {
     const worldRepositories = worldRepos(handle);
     if (!worldRepositories.length) throw new Error('task world has no Git repositories to materialize');
     const linked = this.store.listProjectRepositories(project.id);
-    const byUrl = new Map(linked.map((entry) => [entry.repository.sshUrl, entry.repository]));
     const auth: GitBrokerAuth = async (repo) => {
       if (repo.localPath) return {};
-      const repository = byUrl.get(worldRepoSource(repo));
+      const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       return this.githubApp.brokerCredentials(repository);
     };
@@ -88,7 +88,8 @@ export class WorldHandoffService {
     fs.mkdirSync(root, { recursive: true });
     const repositories: MaterializedLocalCheckout['repositories'] = [];
     for (const repo of worldRepositories) {
-      const record = repo.localPath ? undefined : byUrl.get(worldRepoSource(repo));
+      const record = repo.localPath ? undefined
+        : linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repo.localPath && !record) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       const source = repo.localPath ?? repo.repo;
       const credential = record ? await this.githubApp.brokerCredentials(record) : {};
@@ -138,10 +139,10 @@ export class WorldHandoffService {
     }
     const linked = this.store.listProjectRepositories(project.id);
     if (!linked.length) throw new Error('project has no GitHub repositories');
-    const handleRepos = new Map(worldRepos(handle ?? ({ id: taskId, kind: 'unknown', root: '.', branch,
-      base: task.lastView?.base ?? 'main' } as WorldHandle)).map((repo) => [worldRepoSource(repo), repo]));
+    const handleRepos = worldRepos(handle ?? ({ id: taskId, kind: 'unknown', root: '.', branch,
+      base: task.lastView?.base ?? 'main' } as WorldHandle));
     const repositories = linked.map((entry) => {
-      const inWorld = handleRepos.get(entry.repository.sshUrl);
+      const inWorld = handleRepos.find((repo) => sameRepository(worldRepoSource(repo), entry.repository.sshUrl));
       const base = inWorld?.base ?? entry.baseBranch ?? entry.repository.defaultBranch;
       return { id: entry.repository.id, name: inWorld?.name ?? entry.repository.name, sshUrl: entry.repository.sshUrl,
         branch: inWorld?.branch ?? branch, base, target: inWorld?.target ?? entry.targetBranch ?? base };
@@ -177,9 +178,8 @@ export class WorldHandoffService {
     if (!this.worlds.get(handle.kind).capabilities?.remote) throw new Error('local projects already use their on-disk world directly');
     const linked = this.store.listProjectRepositories(project.id);
     if (!linked.length) throw new Error('project has no GitHub repositories');
-    const byUrl = new Map(linked.map((entry) => [entry.repository.sshUrl, entry.repository]));
     const auth: GitBrokerAuth = async (repo) => {
-      const repository = byUrl.get(repo.repo);
+      const repository = linked.find((entry) => sameRepository(entry.repository.sshUrl, worldRepoSource(repo)))?.repository;
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       return this.githubApp.brokerCredentials(repository);
     };

@@ -2,6 +2,7 @@ import { FieldSpec } from '../domain/types.js';
 import { CONFIRM_PROMPT_DEFAULT } from '../domain/confirm-prompt.js';
 import { ResolveRuleDecl } from '../resolve/cases.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { DEVELOPER_WORKSPACE_CAPABILITIES } from '../platform/capabilities.js';
 
 /**
  * Workflow manifests (SPEC §4.3). Data-only declarations the host reads to wire
@@ -205,7 +206,9 @@ Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
 const MERGE_ROLE: WorkflowRole = {
   name: 'merge',
   label: 'Merge agent',
-  capabilities: ['merge-into:*', 'signal-completion', 'task:escalate'],
+  // Merge remains a developer working in the task branch. The protected merge
+  // itself is still this role's additional, workflow-specific power.
+  capabilities: [...DEVELOPER_WORKSPACE_CAPABILITIES, 'merge-into:*', 'signal-completion', 'task:escalate'],
   promptTemplate: `{{toolsPreamble}}
 
 You are merging task "{{title}}". Its work is on branch {{branch}} in the worktree at {{worldPath}}.

@@ -49,14 +49,29 @@ describe('gateway request scope for bare-id routes', () => {
     const other = store.createOrganization({ name: 'Other', ownerUserId: 'b' });
     mine = store.createProject('Mine', {}, acme.id).id;
     theirs = store.createProject('Theirs', {}, other.id).id;
-    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'test', tokens, contentDir: home, worlds: new WorldRegistry() });
+    // Permission approval now parks by starting a replacement at the exact
+    // stage, so this software-dev fixture needs the repository its manifest
+    // requires even though the Temporal client below is a stub.
+    store.updateProjectConfig(mine, { repos: [home] });
+    const client = {
+      workflow: {
+        getHandle: () => ({
+          terminate: async () => {},
+          signal: async () => {},
+          query: async () => [],
+        }),
+        signalWithStart: async () => {},
+        start: async () => ({}),
+      },
+    } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, contentDir: home, worlds: new WorldRegistry() });
     const gateway = new Gateway({
       api, store, tokens,
       bus: new KarmaxBus(),
       contributions: new ContributionRegistry(),
       overlays: new Overlays(),
       authorization: new AuthorizationService(store),
-      client: {} as any,
+      client,
       taskQueue: 'test',
       staticDir: home,
       agentInfo: { provider: 'mock', reason: 'scope test' },

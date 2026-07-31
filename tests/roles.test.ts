@@ -4,6 +4,7 @@ import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/
 import { assemblePrompt } from '../src/agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
+import { allows } from '../src/platform/capabilities.js';
 
 const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
 const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
@@ -57,13 +58,22 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     // hand-edited copy on the persisted profile is structurally unreachable.
     expect(roleCeiling('merge')).toEqual(roleDef('merge')!.capabilities);
     expect(roleCeiling('merge')).toContain('merge-into:*');
+    // Merge runs in the same task branch as Do. Routine developer operations
+    // must not become permission prompts merely because the workflow advanced.
+    for (const capability of [
+      'project:read', 'repository:read', 'task:read', 'task:event:read',
+      'task:conversation:read', 'task:git:publish', 'task:git:import',
+    ]) expect(allows(roleCeiling('merge'), capability)).toBe(true);
     expect(roleCeiling('do')).toContain('create-sub-task');
     expect(roleCeiling('confirm')).toContain('confirm-decision');
     expect(roleCeiling('do')).toContain('task:escalate');
     expect(roleCeiling('merge')).toContain('task:escalate');
     expect(roleCeiling('confirm')).toContain('task:escalate');
-    // A Merge agent never gets the Do role's ceiling, whatever the task grant says.
-    expect(roleCeiling('merge')).not.toContain('create-sub-task');
+    // Ordinary Developer task operations are shared; workflow decisions are not.
+    expect(allows(roleCeiling('merge'), 'create-sub-task')).toBe(true);
+    expect(allows(roleCeiling('merge'), 'settings:write')).toBe(false);
+    expect(roleCeiling('merge')).not.toContain('confirm-decision');
+    expect(roleCeiling('merge')).not.toContain('resolve-decision');
   });
 
   it('keeps the retired Resolve ceiling resolvable so pinned executions replay', () => {

@@ -436,7 +436,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     inputSchema: { sourceTaskId: z.string() },
   }, async (a) => wrap(() => ops.importTaskBranch(a.sourceTaskId)));
   server.registerTool('refresh_upstream', {
-    description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world.',
+    description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world. Returns refreshed refs plus per-repository skipped/errors diagnostics for any partial failure.',
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
   // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's

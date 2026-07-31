@@ -1,5 +1,5 @@
 import { Store } from '../store/db.js';
-import { Capability, CAPABILITIES, allows, attenuate } from './capabilities.js';
+import { Capability, CAPABILITIES, DEVELOPER_WORKSPACE_CAPABILITIES, allows, attenuate } from './capabilities.js';
 import type { AuthorizationSelection } from '../domain/types.js';
 
 export type AuthorizationProfileId = 'viewer' | 'developer' | 'maintainer' | 'administrator' | 'god' | string;
@@ -43,9 +43,7 @@ const viewer = [
   'organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:read',
 ] satisfies Capability[];
 const developer = [
-  ...viewer, 'task:*', 'credential:read', 'vault:store', 'skill:write',
-  'use-card:*',
-  'inbox:*',
+  ...DEVELOPER_WORKSPACE_CAPABILITIES,
   // Workflow-internal decisions and merges are still narrowed by the role
   // profile and the workflow's exact branch target at execution time.
   'resolve-decision', 'confirm-decision', 'merge-into:*',

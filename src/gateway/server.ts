@@ -19,6 +19,7 @@ import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGl
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
 import { defaultBranch } from '../world/git.js';
+import { sameRepository } from '../world/repository-identity.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -2320,8 +2321,8 @@ export class Gateway {
           try {
             const repos = Array.isArray(b.repos) ? b.repos.map(String) : [];
             if (this.deps.hosted) {
-              const known = new Set(store.listRepositories(project.organizationId!).map((repository) => repository.sshUrl));
-              const unknown = repos.filter((repo: string) => !known.has(repo));
+              const known = store.listRepositories(project.organizationId!).map((repository) => repository.sshUrl);
+              const unknown = repos.filter((repo: string) => !known.some((candidate) => sameRepository(candidate, repo)));
               if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
             }
             const saved = store.setProjectRepositorySources(project.id, repos);

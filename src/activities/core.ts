@@ -54,6 +54,7 @@ import { Provider, Message, TaskInput, TaskView, AgentRole, type TaskPullRequest
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
+import { sameRepository } from '../world/repository-identity.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
   AGENT_QUEUE_WORKFLOW,
@@ -485,8 +486,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (project?.organizationId && (linked.length || wiki) && deps.githubApp) {
       return async (worldRepo) => {
         const source = worldRepoSource(worldRepo);
-        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository
-          ?? (wiki?.sshUrl === source ? wiki : undefined);
+        const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
+          ?? (wiki && sameRepository(wiki.sshUrl, source) ? wiki : undefined);
         if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
         return deps.githubApp!.brokerCredentials(repository);
       };
@@ -651,9 +652,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // the durable task record is the compatibility source for repository
       // enrollment, credentials, and world ownership.
       const linkedRepositories = projectId ? store.listProjectRepositories(projectId) : [];
-      const repositoryBranches = Object.fromEntries(linkedRepositories.map((candidate) => {
+      const repositoryBranches = Object.fromEntries(worldSources.flatMap((source) => {
+        const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, source));
+        if (!candidate) return [];
         const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
-        return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
+        return [[source, { base, target: candidate.targetBranch ?? base }]];
       }));
       if (wikiRoot && requestedSources.includes(wikiRoot))
         repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
@@ -663,8 +666,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
         for (const [index, source] of worldSources.entries()) {
-          const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
-          const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
+          const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, source));
+          const repository = linked?.repository
+            ?? (wikiRepository && sameRepository(wikiRepository.sshUrl, source) ? wikiRepository : undefined);
           if (!repository) {
             // A configured host checkout is already the authority for this
             // repository. cloudGitSource resolved its origin only as the cloud
@@ -734,7 +738,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
           const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
-          const wiki = world.handle.repos.find((repo) => worldRepoSource(repo) === wikiSource || repo.repo === wikiSource);
+          const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
+            || sameRepository(repo.repo, wikiSource));
           if (wiki) wiki.role = 'project-wiki';
         }
         // A platform-owned companion must not unexpectedly move agents out of

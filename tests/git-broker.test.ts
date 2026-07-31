@@ -65,7 +65,7 @@ describe('cloud Git broker', () => {
     const branch = await git(remote, ['show-ref', '--verify', 'refs/heads/karmax/cloud-task']);
     expect(branch.code).toBe(0);
     const refreshed = await brokerRefreshUpstream(collaborator, env, 'main');
-    expect(refreshed[0]).toMatchObject({ branch: 'main', ref: 'refs/remotes/origin/main', sha: result.sha });
+    expect(refreshed.refs[0]).toMatchObject({ branch: 'main', ref: 'refs/remotes/origin/main', sha: result.sha });
   });
 
   it('publishes a live local worktree branch without SSH or a self-fetch', async () => {
@@ -168,7 +168,7 @@ describe('cloud Git broker', () => {
     // refresh_upstream serves the LOCAL target state, so the merge agent can
     // resolve conflicts against the same history the merge will land on.
     const refreshed = await brokerRefreshUpstream(world, env, 'main');
-    expect(refreshed[0]!.sha).toBe((await git(source, ['rev-parse', 'main'])).stdout.trim());
+    expect(refreshed.refs[0]!.sha).toBe((await git(source, ['rev-parse', 'main'])).stdout.trim());
 
     const result = await brokerFinalizeMerge(world, 'main', { name: 'Karmax Test', email: 'karmax@example.com' }, env);
     expect(result.merged).toBe(true);
@@ -186,5 +186,51 @@ describe('cloud Git broker', () => {
     const imported = await brokerImportTaskBranch(collaborator, world.handle, 'cloud-local-task', env);
     expect((await git(collaborator.handle.root, ['show', `${imported[0]!.ref}:feature.txt`])).stdout)
       .toContain('landed in the local checkout');
+  });
+
+  it('reports a partial upstream refresh without discarding repositories already refreshed', async () => {
+    const calls: string[] = [];
+    const world = {
+      handle: {
+        kind: 'e2b', id: 'partial-refresh', root: '/workspace', branch: 'karmax/partial-refresh', base: 'main',
+        repos: [
+          { name: 'app', repo: 'git@example:app.git', root: '/workspace/app', branch: 'karmax/partial-refresh', base: 'main' },
+          { name: 'wiki', repo: '/not-an-ssh-remote', root: '/workspace/wiki', branch: 'karmax/partial-refresh', base: 'main' },
+        ],
+      },
+      async exec(command: string, args: string[], options: { cwd: string }) {
+        calls.push(`${options.cwd}:${command} ${args.join(' ')}`);
+        if (args[0] === 'rev-parse' && args.includes('refs/remotes/origin/main'))
+          return { code: 0, stdout: 'abc123\n', stderr: '' };
+        if (args[0] === 'rev-parse') return { code: 1, stdout: '', stderr: '' };
+        if (args[0] === 'fetch') return { code: 0, stdout: '', stderr: '' };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+      async writeFileBuffer() {},
+    } as any;
+    const auth = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'url.file:///tmp/does-not-matter/.insteadOf',
+      GIT_CONFIG_VALUE_0: 'git@example:',
+    };
+
+    // The fake cannot produce the app bundle, so use a host-local authority for
+    // the successful repo and leave the wiki deliberately invalid.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-partial-refresh-'));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), 'base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    world.handle.repos[0].localPath = source;
+
+    const refreshed = await brokerRefreshUpstream(world, auth, 'main');
+    expect(refreshed.refs).toEqual([expect.objectContaining({ repo: 'app', branch: 'main' })]);
+    expect(refreshed.skipped).toEqual(['wiki']);
+    expect(refreshed.errors?.wiki).toMatch(/SSH remote/);
+    expect(calls.some((call) => call.startsWith('/workspace/app:git fetch'))).toBe(true);
   });
 });
