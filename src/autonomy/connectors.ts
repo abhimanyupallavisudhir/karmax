@@ -1,10 +1,14 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { hostLocal } from '../config/deployment.js';
+import { paths } from '../config/paths.js';
+import { git, gitOrThrow, isolatedGitEnvironment } from '../world/git.js';
 import { CredentialBroker } from './broker.js';
+import { GitProfiles } from './git-profiles.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
 import { hostOf, passEntryMetadata } from './pass-path.js';
 
@@ -18,20 +22,24 @@ const pexec = promisify(execFile);
  * always hits the karmax vault, so a connector being down never blocks agents
  * and a cloud world needs no path to the user's desktop.
  *
- * Every real connector shells out to the store's own CLI (`bw`, `op`, `pass`),
- * so nothing here re-implements their crypto and the user's unlock secret stays
- * in the CLI's hands. Availability is probed like the git preflight — a missing
- * or locked CLI reports `connected: false` with a hint rather than throwing.
+ * Self-hosted connectors shell out to the store's own CLI (`bw`, `op`, `pass`).
+ * A managed cell never has a tenant-owned CLI profile: its 1Password connector
+ * uses the official service-account SDK; Bitwarden is withheld because a
+ * `BW_SESSION` unlocks one particular local CLI profile rather than identifying
+ * a remotely usable account. Git-backed pass is the hosted alternative to a
+ * local `~/.password-store`. Availability failures are data, not route errors.
  */
 
 export interface ConnectorInfo {
   name: string;
   label: string;
-  /** Present + usable right now (CLI installed and unlocked)? */
+  /** Present, authenticated, and usable by this deployment right now? */
   available: boolean;
   detail: string;
-  /** Does this connector support writing agent-created items back out? */
+  /** Does this connector support opt-in external write-back? */
   canPush: boolean;
+  /** Selects the connection form without exposing connector secrets. */
+  setup?: 'secret' | 'git-pass';
 }
 
 /** One external entry, normalized to karmax's vocabulary (no secrets yet). */
@@ -170,7 +178,7 @@ function timestampOf(value: unknown): { changedAt?: number } {
   return Number.isFinite(ms) ? { changedAt: ms } : {};
 }
 
-// ── 1Password (`op` CLI + service-account token; no desktop ceremony) ─────────
+// ── 1Password (`op` CLI for self-hosted installs) ─────────────────────────────
 
 export class OnePasswordConnector implements CredentialConnector {
   readonly name = '1password';
@@ -232,11 +240,200 @@ export class OnePasswordConnector implements CredentialConnector {
   }
 }
 
+/**
+ * Narrow structural view of the official SDK. Keeping this interface here
+ * makes the connector cheap to unit-test and keeps vendor types from leaking
+ * into the rest of the credential-broker contract.
+ */
+export interface OnePasswordSdkClient {
+  vaults: {
+    list(params?: { decryptDetails?: boolean }): Promise<Array<{ id: string; title: string }>>;
+  };
+  items: {
+    list(vaultId: string): Promise<any[]>;
+    get(vaultId: string, itemId: string): Promise<any>;
+    put(item: any): Promise<any>;
+  };
+}
+
+export type OnePasswordClientFactory = (token: string) => Promise<OnePasswordSdkClient>;
+
+const createOnePasswordClient: OnePasswordClientFactory = async (token) => {
+  const sdk = await import('@1password/sdk');
+  return sdk.createClient({
+    auth: token,
+    integrationName: 'Krmax',
+    integrationVersion: '1.0.0',
+  });
+};
+
+/**
+ * Managed-hosting implementation. A service-account token is a complete,
+ * least-privilege remote credential, so each connector instance can create an
+ * isolated SDK client without reading or writing a profile in the host home.
+ */
+export class OnePasswordSdkConnector implements CredentialConnector {
+  readonly name = '1password';
+  private clientPromise?: Promise<OnePasswordSdkClient>;
+  private catalogPromise?: Promise<Array<{ vault: { id: string; title: string }; item: any }>>;
+
+  constructor(
+    private token: () => string | undefined,
+    private createClient: OnePasswordClientFactory = createOnePasswordClient,
+  ) {}
+
+  private client(token = this.token()): Promise<OnePasswordSdkClient> {
+    if (!token) throw new Error('no 1Password service-account token is connected');
+    return this.clientPromise ??= this.createClient(token);
+  }
+
+  private async catalog(): Promise<Array<{ vault: { id: string; title: string }; item: any }>> {
+    return this.catalogPromise ??= (async () => {
+      const client = await this.client();
+      const vaults = await client.vaults.list({ decryptDetails: true });
+      const groups = await Promise.all(vaults.map(async (vault) =>
+        (await client.items.list(vault.id)).map((item) => ({ vault, item }))));
+      return groups.flat();
+    })();
+  }
+
+  private async location(externalId: string): Promise<[vaultId: string, itemId: string]> {
+    // Item IDs are what the previous `op` connector persisted. Keep that
+    // stable across the hosted migration; the SDK's required vault ID is
+    // transport metadata, not part of provenance identity.
+    const matches = (await this.catalog()).filter(({ item }) => item.id === externalId);
+    if (matches.length !== 1) {
+      const why = matches.length ? 'is ambiguous across vaults' : 'was not found';
+      throw new Error(`1Password item "${externalId}" ${why}`);
+    }
+    return [matches[0]!.vault.id, externalId];
+  }
+
+  async describe(): Promise<ConnectorInfo> {
+    const token = this.token();
+    if (!token) return {
+      name: this.name,
+      label: '1Password',
+      available: false,
+      canPush: true,
+      detail: 'paste a 1Password service-account token to connect',
+    };
+    try {
+      await (await this.client(token)).vaults.list({ decryptDetails: true });
+      return {
+        name: this.name,
+        label: '1Password',
+        available: true,
+        canPush: true,
+        detail: 'service account connected through the 1Password SDK',
+      };
+    } catch {
+      return {
+        name: this.name,
+        label: '1Password',
+        available: false,
+        canPush: true,
+        detail: 'the 1Password service-account token is invalid or unavailable',
+      };
+    }
+  }
+
+  async list(): Promise<ExternalItem[]> {
+    return (await this.catalog()).map(({ vault, item }) => normalizeOnePasswordSdk(item, vault));
+  }
+
+  async pull(externalIds: string[]): Promise<PullResult> {
+    const client = await this.client();
+    const items: ExternalSecretItem[] = [];
+    const failures: PullResult['failures'] = [];
+    for (const externalId of externalIds) {
+      try {
+        const [vaultId, itemId] = await this.location(externalId);
+        const item = await client.items.get(vaultId, itemId);
+        items.push(onePasswordSdkSecret(item, externalId));
+      } catch (e) {
+        failures.push({ externalId, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { items, failures };
+  }
+
+  async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    const client = await this.client();
+    const [vaultId, itemId] = await this.location(externalId);
+    const item = await client.items.get(vaultId, itemId);
+    if (field === 'note') {
+      item.notes = value;
+      await client.items.put(item);
+      return;
+    }
+    const target = (item.fields ?? []).find((candidate: any) => onePasswordField(candidate, field));
+    if (!target) throw new Error(`1Password item does not contain a writable "${field}" field`);
+    item.fields = item.fields.map((candidate: any) =>
+      candidate === target ? { ...candidate, value } : candidate);
+    await client.items.put(item);
+  }
+}
+
+function normalizeOnePasswordSdk(item: any, vault: { id: string; title: string }): ExternalItem {
+  const type = categoryType(item.category);
+  return {
+    externalId: item.id,
+    type,
+    label: item.title ?? 'item',
+    domains: (item.websites ?? []).map((website: any) => hostOf(website?.url)).filter(Boolean),
+    folder: vault.title,
+    fields: itemFieldsFor(type),
+    ...timestampOf(item.updatedAt),
+  };
+}
+
+function onePasswordSdkSecret(item: any, externalId: string): ExternalSecretItem {
+  const type = categoryType(item.category);
+  const fields = item.fields ?? [];
+  const value = (id: string) => fields.find((field: any) => field.id === id)?.value;
+  const secrets: Partial<Record<VaultFieldName, string>> = {};
+  if (type === 'login' && value('password')) secrets.password = value('password');
+  const otp = fields.find((field: any) => field.fieldType === 'Totp' || field.type === 'OTP');
+  if (otp?.value) secrets.totp = otp.value;
+  if (type === 'api-key') secrets.secret = value('credential') ?? value('password');
+  if (type === 'ssh-key') {
+    const key = fields.find((field: any) => field.fieldType === 'SshKey')?.value
+      ?? value('privateKey') ?? value('private key');
+    if (key) secrets.privateKey = key;
+  }
+  if (type === 'note' && item.notes) secrets.note = item.notes;
+  return {
+    externalId,
+    type,
+    label: item.title ?? 'item',
+    username: value('username'),
+    domains: (item.websites ?? []).map((website: any) => hostOf(website?.url)).filter(Boolean),
+    fields: Object.keys(secrets) as VaultFieldName[],
+    secrets,
+  };
+}
+
+function onePasswordField(field: any, target: VaultFieldName): boolean {
+  if (target === 'password') return field.id === 'password';
+  if (target === 'secret') return field.id === 'credential' || field.id === 'password';
+  if (target === 'totp') return field.fieldType === 'Totp' || field.type === 'OTP';
+  if (target === 'privateKey') return field.fieldType === 'SshKey'
+    || field.id === 'privateKey' || field.id === 'private key';
+  return false;
+}
+
 function categoryType(category: string): VaultItemType {
   switch (category) {
-    case 'API_CREDENTIAL': return 'api-key';
-    case 'SSH_KEY': return 'ssh-key';
-    case 'SECURE_NOTE': return 'note';
+    case 'API_CREDENTIAL':
+    case 'ApiCredentials':
+      return 'api-key';
+    case 'SSH_KEY':
+    case 'SshKey':
+      return 'ssh-key';
+    case 'SECURE_NOTE':
+    case 'SecureNote':
+      return 'note';
     default: return 'login';
   }
 }
@@ -395,6 +592,426 @@ export function parsePassFiles(raw: string, storeDir: string): string[] {
     return [relative.slice(0, -'.gpg'.length).split(path.sep).join('/')];
   });
   return entries.sort();
+}
+
+// ── Git-backed unix `pass` (hosted-safe, tenant-isolated) ───────────────────
+
+interface GitPassConnection {
+  repositoryUrl: string;
+  /** Relative path inside the repository. Empty means auto-detect. */
+  storePath?: string;
+  /** Optional organization Git profile; otherwise the organization default. */
+  gitProfile?: string;
+  /** ASCII-armored secret key. It stays in the credential broker at rest. */
+  gpgPrivateKey: string;
+  /** Optional passphrase for the secret key. */
+  gpgPassphrase?: string;
+}
+
+interface GitPassOptions {
+  /** Tests may use a local bare remote; production accepts remote URLs only. */
+  allowLocalRepository?: boolean;
+}
+
+const gitPassQueues = new Map<string, Promise<void>>();
+
+async function serializeGitPass<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const prior = gitPassQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const queued = prior.catch(() => undefined).then(() => gate);
+  gitPassQueues.set(key, queued);
+  await prior.catch(() => undefined);
+  try {
+    return await work();
+  } finally {
+    release();
+    if (gitPassQueues.get(key) === queued) gitPassQueues.delete(key);
+  }
+}
+
+/**
+ * An ongoing `pass` connector for hosted deployments. The password-store repo
+ * is cloned into an organization-scoped cache, decrypted with an ephemeral
+ * GNUPGHOME, and every write is committed and pushed before the call succeeds.
+ * Git transport credentials come from an organization Git profile; the GPG
+ * private key and its passphrase remain one opaque connector secret.
+ */
+export class GitPassConnector implements CredentialConnector {
+  readonly name = 'pass-git';
+
+  constructor(
+    private secret: () => string | undefined,
+    private organizationId = 'org_personal',
+    private gitEnvironment: (profile?: string) => Record<string, string> = () => ({}),
+    private root = path.join(paths().state, 'connectors', 'pass-git'),
+    private options: GitPassOptions = {},
+  ) {}
+
+  async describe(): Promise<ConnectorInfo> {
+    const raw = this.secret();
+    if (!raw) return {
+      name: this.name,
+      label: 'unix pass (Git)',
+      available: false,
+      canPush: true,
+      setup: 'git-pass',
+      detail: 'connect a Git password-store repository and its GPG private key',
+    };
+    try {
+      const connection = this.connection(raw);
+      return {
+        name: this.name,
+        label: 'unix pass (Git)',
+        available: true,
+        canPush: true,
+        setup: 'git-pass',
+        detail: `connected to ${redactedRepository(connection.repositoryUrl)}`,
+      };
+    } catch (e) {
+      return {
+        name: this.name,
+        label: 'unix pass (Git)',
+        available: false,
+        canPush: true,
+        setup: 'git-pass',
+        detail: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
+  async list(): Promise<ExternalItem[]> {
+    return this.inRepository(async (_connection, _checkout, store) =>
+      this.entries(store).map((entry) => this.metadata(store, entry)));
+  }
+
+  async pull(externalIds: string[]): Promise<PullResult> {
+    return this.inRepository(async (connection, _checkout, store) => {
+      const available = new Set(this.entries(store));
+      return this.withGpg(connection, async (gpgHome) => {
+        const items: ExternalSecretItem[] = [];
+        const failures: PullResult['failures'] = [];
+        for (const externalId of externalIds) {
+          if (!available.has(externalId)) continue;
+          try {
+            const body = await this.decrypt(gpgHome, connection, this.entryFile(store, externalId));
+            const lines = body.replace(/\r/g, '').split('\n');
+            const password = lines[0] ?? '';
+            const totp = lines.slice(1).find((line) => line.trim().startsWith('otpauth://'))?.trim();
+            const secrets: Partial<Record<VaultFieldName, string>> = { password };
+            if (totp) secrets.totp = totp;
+            items.push({ ...this.metadata(store, externalId), fields: Object.keys(secrets) as VaultFieldName[], secrets });
+          } catch (e) {
+            failures.push({ externalId, error: gitPassGpgError(e) });
+          }
+        }
+        return { items, failures };
+      });
+    });
+  }
+
+  async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    await this.inRepository(async (connection, checkout, store) => {
+      if (!this.entries(store).includes(externalId)) throw new Error(`pass entry "${externalId}" was not found`);
+      await this.withGpg(connection, async (gpgHome) => {
+        const file = this.entryFile(store, externalId);
+        const body = await this.decrypt(gpgHome, connection, file);
+        const lines = body.replace(/\r/g, '').replace(/\n$/, '').split('\n');
+        if (field === 'password') {
+          lines[0] = value;
+        } else if (field === 'totp') {
+          const index = lines.findIndex((line, i) => i > 0 && line.trim().startsWith('otpauth://'));
+          if (index >= 0) lines[index] = value;
+          else lines.push(value);
+        } else {
+          throw new Error(`Git-backed pass write-back does not support the "${field}" field`);
+        }
+        await this.encrypt(gpgHome, file, lines.join('\n') + '\n', this.recipients(store, path.dirname(file)));
+      });
+      await this.commitAndPush(connection, checkout, fileRelativeTo(checkout, this.entryFile(store, externalId)),
+        `Update pass entry ${externalId}`);
+    });
+  }
+
+  async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
+    return this.inRepository(async (connection, checkout, store) => {
+      if (item.type !== 'login' || item.secrets.password === undefined) {
+        throw new Error('Git-backed pass write-back supports login items with a password');
+      }
+      let stem = safePassName(item.label);
+      let externalId = `karmax/${stem}`;
+      for (let suffix = 2; fs.existsSync(this.entryFile(store, externalId)); suffix += 1) {
+        externalId = `karmax/${stem}-${suffix}`;
+      }
+      const file = this.entryFile(store, externalId);
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const body = [item.secrets.password, ...(item.username ? [`username: ${item.username}`] : []),
+        ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n') + '\n';
+      await this.withGpg(connection, async (gpgHome) => {
+        await this.encrypt(gpgHome, file, body, this.recipients(store, path.dirname(file)));
+      });
+      await this.commitAndPush(connection, checkout, fileRelativeTo(checkout, file), `Add pass entry ${externalId}`);
+      return { externalId };
+    });
+  }
+
+  private connection(raw = this.secret()): GitPassConnection {
+    if (!raw) throw new Error('no Git-backed pass connection is configured');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('Git-backed pass connection is invalid');
+    }
+    const value = parsed as Partial<GitPassConnection>;
+    const repositoryUrl = String(value.repositoryUrl ?? '').trim();
+    if (!repositoryUrl) throw new Error('repository URL is required');
+    if (!this.options.allowLocalRepository && !isRemoteGitUrl(repositoryUrl)) {
+      throw new Error('repository must use an HTTPS or SSH repository URL');
+    }
+    if (repositoryUrl.startsWith('-') || /[\r\n\0]/.test(repositoryUrl)) throw new Error('repository URL is invalid');
+    if (/^https:\/\//i.test(repositoryUrl)) {
+      const url = new URL(repositoryUrl);
+      if (url.username || url.password) throw new Error('repository URL must not embed credentials; select a Git profile instead');
+    }
+    const gpgPrivateKey = String(value.gpgPrivateKey ?? '').trim();
+    if (!gpgPrivateKey) throw new Error('an armored GPG private key is required');
+    if (gpgPrivateKey.length > 2 * 1024 * 1024) throw new Error('GPG private key is too large');
+    const storePath = String(value.storePath ?? '').trim().replace(/\\/g, '/');
+    if (storePath && (path.posix.isAbsolute(storePath) || storePath.split('/').includes('..'))) {
+      throw new Error('password-store path must stay inside the repository');
+    }
+    const gitProfile = String(value.gitProfile ?? '').trim() || undefined;
+    if (gitProfile && !/^[a-zA-Z0-9._-]+$/.test(gitProfile)) throw new Error('Git profile name is invalid');
+    return {
+      repositoryUrl,
+      ...(storePath ? { storePath } : {}),
+      ...(gitProfile ? { gitProfile } : {}),
+      gpgPrivateKey,
+      ...(value.gpgPassphrase ? { gpgPassphrase: String(value.gpgPassphrase) } : {}),
+    };
+  }
+
+  private async inRepository<T>(work: (connection: GitPassConnection, checkout: string, store: string) => Promise<T>): Promise<T> {
+    const connection = this.connection();
+    const checkout = this.checkoutFor(connection.repositoryUrl);
+    return serializeGitPass(checkout, async () => {
+      await this.refresh(connection, checkout);
+      const store = this.findStore(checkout, connection.storePath);
+      return work(connection, checkout, store);
+    });
+  }
+
+  private checkoutFor(repositoryUrl: string): string {
+    const digest = createHash('sha256').update(`${this.organizationId}\0${repositoryUrl}`).digest('hex').slice(0, 32);
+    return path.join(this.root, this.organizationId.replace(/[^a-zA-Z0-9._-]/g, '_'), digest, 'repo');
+  }
+
+  private gitEnv(connection: GitPassConnection): Record<string, string> {
+    return { ...isolatedGitEnvironment(), ...this.gitEnvironment(connection.gitProfile) };
+  }
+
+  private async refresh(connection: GitPassConnection, checkout: string): Promise<void> {
+    const env = this.gitEnv(connection);
+    const parent = path.dirname(checkout);
+    fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (fs.existsSync(path.join(checkout, '.git'))) {
+      const status = await git(checkout, ['status', '--porcelain'], { env });
+      const ahead = await git(checkout, ['rev-list', '--count', '@{upstream}..HEAD'], { env });
+      if (status.code !== 0 || status.stdout.trim() || ahead.code !== 0 || Number(ahead.stdout.trim()) > 0) {
+        fs.rmSync(checkout, { recursive: true, force: true });
+      }
+    } else if (fs.existsSync(checkout)) {
+      fs.rmSync(checkout, { recursive: true, force: true });
+    }
+    if (!fs.existsSync(path.join(checkout, '.git'))) {
+      await gitOrThrow(parent, ['clone', '--depth=1', '--', connection.repositoryUrl, path.basename(checkout)], { env });
+      return;
+    }
+    const pulled = await git(checkout, ['pull', '--ff-only', '--quiet'], { env });
+    if (pulled.code !== 0) throw new Error(`could not update password-store repository: ${pulled.stderr || pulled.stdout}`);
+  }
+
+  private findStore(checkout: string, configured?: string): string {
+    if (configured) {
+      const candidate = path.resolve(checkout, configured);
+      const stat = fs.lstatSync(candidate, { throwIfNoEntry: false });
+      if (!inside(checkout, candidate) || !stat?.isDirectory() || stat.isSymbolicLink()
+        || !inside(checkout, fs.realpathSync(candidate))) {
+        throw new Error(`password-store path "${configured}" is not a directory in the repository`);
+      }
+      return candidate;
+    }
+    const conventional = path.join(checkout, '.password-store');
+    const conventionalStat = fs.lstatSync(conventional, { throwIfNoEntry: false });
+    if (conventionalStat?.isDirectory() && !conventionalStat.isSymbolicLink()) return conventional;
+    if (regularFile(path.join(checkout, '.gpg-id'))) return checkout;
+    const queue = [checkout];
+    let visited = 0;
+    while (queue.length) {
+      const dir = queue.shift()!;
+      if (++visited > 10_000) throw new Error('password-store repository contains too many directories to scan safely');
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === '.git' || entry.isSymbolicLink()) continue;
+        const child = path.join(dir, entry.name);
+        if (entry.isFile() && entry.name === '.gpg-id') return dir;
+        if (entry.isDirectory()) queue.push(child);
+      }
+    }
+    throw new Error('no password store was found (set the path containing .gpg-id)');
+  }
+
+  private entries(store: string): string[] {
+    const files: string[] = [];
+    const queue = [store];
+    while (queue.length) {
+      const dir = queue.shift()!;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === '.git' || entry.isSymbolicLink()) continue;
+        const child = path.join(dir, entry.name);
+        if (entry.isDirectory()) queue.push(child);
+        else if (entry.isFile() && entry.name.endsWith('.gpg')) files.push(child);
+        if (files.length > 100_000) throw new Error('password store contains too many entries');
+      }
+    }
+    return files.map((file) => path.relative(store, file).slice(0, -4).split(path.sep).join('/')).sort();
+  }
+
+  private metadata(store: string, externalId: string): ExternalItem {
+    const { domain, username } = passEntryMetadata(externalId);
+    const slash = externalId.lastIndexOf('/');
+    const stat = fs.statSync(this.entryFile(store, externalId));
+    return {
+      externalId,
+      type: 'login',
+      label: externalId,
+      folder: slash >= 0 ? externalId.slice(0, slash) : '',
+      domains: domain ? [domain] : [],
+      ...(username ? { username } : {}),
+      fields: ['password'],
+      changedAt: stat.mtimeMs,
+    };
+  }
+
+  private entryFile(store: string, externalId: string): string {
+    const normalized = externalId.replace(/\\/g, '/');
+    if (!normalized || path.posix.isAbsolute(normalized) || normalized.split('/').includes('..')) {
+      throw new Error('invalid pass entry id');
+    }
+    const file = path.resolve(store, `${normalized}.gpg`);
+    if (!inside(store, file)) throw new Error('invalid pass entry id');
+    return file;
+  }
+
+  private recipients(store: string, start: string): string[] {
+    let dir = start;
+    for (;;) {
+      const idFile = path.join(dir, '.gpg-id');
+      if (regularFile(idFile)) {
+        const recipients = fs.readFileSync(idFile, 'utf8').split(/\r?\n/)
+          .map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+        if (!recipients.length) throw new Error(`${path.relative(store, idFile) || '.gpg-id'} has no recipients`);
+        return recipients;
+      }
+      if (dir === store) break;
+      const parent = path.dirname(dir);
+      if (!inside(store, parent) && parent !== store) break;
+      dir = parent;
+    }
+    throw new Error(`no .gpg-id applies to ${path.relative(store, start) || '.'}`);
+  }
+
+  private async withGpg<T>(connection: GitPassConnection, work: (home: string) => Promise<T>): Promise<T> {
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    const home = fs.mkdtempSync(path.join(this.root, '.gpg-'));
+    fs.chmodSync(home, 0o700);
+    try {
+      await realExec('gpg', ['--homedir', home, '--batch', '--yes', '--import'], { input: `${connection.gpgPrivateKey}\n` });
+      return await work(home);
+    } catch (e) {
+      throw new Error(gitPassGpgError(e));
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  private decrypt(home: string, connection: GitPassConnection, file: string): Promise<string> {
+    return realExec('gpg', ['--homedir', home, '--batch', '--yes', '--pinentry-mode', 'loopback',
+      '--passphrase-fd', '0', '--decrypt', file], { input: `${connection.gpgPassphrase ?? ''}\n` });
+  }
+
+  private async encrypt(home: string, file: string, plaintext: string, recipients: string[]): Promise<void> {
+    const temp = `${file}.karmax-${process.pid}-${Date.now()}`;
+    try {
+      const args = ['--homedir', home, '--batch', '--yes', '--trust-model', 'always', '--output', temp];
+      for (const recipient of recipients) args.push('--recipient', recipient);
+      args.push('--encrypt');
+      await realExec('gpg', args, { input: plaintext });
+      fs.chmodSync(temp, 0o600);
+      fs.renameSync(temp, file);
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
+  }
+
+  private async commitAndPush(connection: GitPassConnection, checkout: string, relative: string, message: string): Promise<void> {
+    const env = this.gitEnv(connection);
+    await gitOrThrow(checkout, ['add', '--', relative], { env });
+    await gitOrThrow(checkout, ['-c', 'user.name=karmax', '-c', 'user.email=karmax@localhost', 'commit', '-m', message], { env });
+    const pushed = await git(checkout, ['push', 'origin', 'HEAD'], { env });
+    if (pushed.code !== 0) {
+      throw new Error(`password-store changed remotely or could not be pushed; retry to refresh it: ${pushed.stderr || pushed.stdout}`);
+    }
+  }
+}
+
+function isRemoteGitUrl(value: string): boolean {
+  return /^https:\/\/[^\s]+$/i.test(value)
+    || /^ssh:\/\/[^\s]+$/i.test(value)
+    || /^(?:[^@\s]+@)?[^:\s/]+:[^\s]+$/.test(value);
+}
+
+function redactedRepository(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return value.replace(/^[^@\s]+@/, '');
+  }
+}
+
+function inside(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function fileRelativeTo(root: string, file: string): string {
+  const relative = path.relative(root, file);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('file is outside repository');
+  return relative;
+}
+
+function regularFile(file: string): boolean {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  return !!stat?.isFile() && !stat.isSymbolicLink();
+}
+
+function safePassName(label: string): string {
+  const value = label.trim().replace(/[^A-Za-z0-9._@-]+/g, '-').replace(/^-+|-+$/g, '');
+  return value || 'credential';
+}
+
+function gitPassGpgError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/spawn gpg ENOENT|gpg.*not found/i.test(message)) {
+    return 'Git-backed pass requires GnuPG (`gpg`) on the Karmax server';
+  }
+  if (/gpg|decrypt|secret key|passphrase|public key|decryption failed|bad key/i.test(message)) {
+    return 'Git-backed pass could not use the supplied GPG key or passphrase';
+  }
+  return message;
 }
 
 // ── the registry + sync service (state in the store kv) ───────────────────────
@@ -570,6 +1187,9 @@ export class Connectors {
     if (!this.config(name).writeBack) return undefined;
     const item = this.items.get(itemId);
     if (!item) throw new Error(`no vault item ${itemId}`);
+    if (item.provenance.source.startsWith('import:')) {
+      throw new Error('this item came from a one-way file import; write-back to the imported file is unavailable');
+    }
     if (item.provenance.source.startsWith('connector:')) throw new Error('this item was mirrored in from a store; write-back only pushes agent-created items back out (it never overwrites a synced entry)');
     const secrets: Partial<Record<VaultFieldName, string>> = {};
     for (const field of item.fields) {
@@ -630,13 +1250,17 @@ export class Connectors {
   async propagate(itemId: string, fields: VaultFieldName[]): Promise<{ connector: string; fields: VaultFieldName[] } | undefined> {
     const item = this.items.get(itemId);
     if (!item) return undefined;
+    // File imports are snapshots, not bindings. Their vendor item IDs exist
+    // solely to make a later file import idempotent and must never be routed to
+    // any connector, including through legacy or accidentally-added bindings.
+    if (item.provenance.source.startsWith('import:')) return undefined;
 
     let bindings: Array<[connector: string, externalId: string]> = [];
     if (item.provenance.source.startsWith('connector:') && item.provenance.externalId) {
       bindings = [[item.provenance.source.slice('connector:'.length), item.provenance.externalId]];
     } else if (item.provenance.externalIds) {
       bindings = Object.entries(item.provenance.externalIds);
-    } else if (item.provenance.externalId) {
+    } else if (item.provenance.externalId && !item.provenance.source.startsWith('import:')) {
       const candidates = this.names().filter((name) =>
         Boolean(this.get(name)?.updateSecret) && Boolean(this.config(name).writeBack));
       if (candidates.length > 1) {
@@ -667,18 +1291,35 @@ export class Connectors {
   }
 }
 
-/** The standard registry (Bitwarden + 1Password + pass), one construction shared
+/** The standard registry, one construction shared
  *  by every gateway call site so the wiring cannot drift.
  *
- *  Bitwarden and 1Password authenticate with a token the tenant supplies, so they
- *  travel anywhere. `pass` has no such credential — it reads the *host's*
- *  `~/.password-store` through the host's gpg-agent — so it is offered only while
- *  the browser and the host are the same machine. */
+ *  A managed cell uses 1Password's stateless service-account SDK. Bitwarden's
+ *  session key and local `pass` both depend on tenant-owned host state, so they
+ *  remain host-local. Git-backed pass is isolated and works in every mode. */
 export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined,
-  organizationId: string, opts: { hostLocal?: boolean } = {}): Connectors {
+  organizationId: string, opts: { hostLocal?: boolean; hosted?: boolean } = {}): Connectors {
   const connectors = new Connectors(store, items, broker, organizationId);
-  connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
-  connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
-  if (opts.hostLocal ?? hostLocal()) connectors.register(new PassConnector());
+  if (opts.hosted) {
+    connectors.register(new OnePasswordSdkConnector(() => connectors.secretFor('1password')));
+  } else {
+    connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
+    if (opts.hostLocal ?? hostLocal()) {
+      connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
+      connectors.register(new PassConnector());
+    }
+  }
+  const profiles = new GitProfiles(store, broker, paths().state, organizationId);
+  connectors.register(new GitPassConnector(
+    () => connectors.secretFor('pass-git'),
+    organizationId,
+    (requested) => {
+      const profileName = requested || profiles.defaultProfile();
+      if (!profileName) return {};
+      const profile = profiles.get(profileName);
+      if (!profile) throw new Error(`unknown Git profile "${profileName}"`);
+      return profiles.env(profile, {});
+    },
+  ));
   return connectors;
 }

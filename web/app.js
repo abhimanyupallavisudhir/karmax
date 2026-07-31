@@ -10070,8 +10070,16 @@ function passwordsCard() {
       <span class="vault-manage-count">Loading…</span>
     </button>
 
-    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
-      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on the machine running krmax, then Import.')}</div>
+    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Import or sync from a password manager
+      ${policyTip('krmax mirrors selected credentials into its own encrypted vault (a snapshot, not a live link), so agents keep working if the source store is offline and you choose exactly what they can touch. Hosted users can import a Bitwarden JSON export; available live connectors appear below.')}</div>
+    <div class="queue-item bitwarden-file-import" style="margin-bottom:8px">
+      <div style="flex:1"><b>Bitwarden JSON export</b>
+        <span class="chip">one-way import</span>
+        <div class="task-sub" style="color:var(--ink-3)">One-time import of logins, TOTP seeds, secure notes, and SSH keys. The plaintext export is processed once and not retained as a file; delete your local export afterward.</div>
+        <label class="task-sub" title="Bitwarden JSON is a snapshot, not a connected vault" style="display:inline-flex;align-items:center;gap:5px;color:var(--ink-3);margin-top:4px"><input type="checkbox" disabled /> Write changes back — unavailable for file imports</label></div>
+      <input class="bitwarden-file" type="file" accept=".json,application/json" hidden />
+      <button class="btn sm primary" type="button" data-bitwarden-file>Import JSON…</button>
+    </div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
     <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
@@ -10117,6 +10125,7 @@ async function wireVaultCards(organizationId) {
   box.querySelector('.vi-type').addEventListener('change', secretRows);
   let vaultItems = [];
   const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+    : src?.startsWith('import:') ? `<span class="chip" title="File imports are snapshots and cannot write back">${esc(src.slice(7))} · one-way import</span>`
     : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
   const renderItems = async () => {
     const button = box.querySelector('#vault-manage-open');
@@ -10184,7 +10193,12 @@ async function wireVaultCards(organizationId) {
       list.querySelectorAll('[data-vi-rotate]').forEach((button) => button.addEventListener('click', async () => {
         const item = vaultItems.find((candidate) => candidate.id === button.dataset.viRotate);
         const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
-        const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+        const sourceNote = item.provenance?.source?.startsWith('import:')
+          ? 'This is a one-way import; its source file will not be updated.'
+          : item.provenance?.source?.startsWith('connector:')
+            ? 'The connected source store is updated too if write-back is on.'
+            : 'Metadata and notes are untouched.';
+        const value = prompt(`New ${field} for "${item.label}" (${sourceNote}):`);
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
@@ -10210,7 +10224,102 @@ async function wireVaultCards(organizationId) {
     search.focus();
   };
   box.querySelector('#vault-manage-open').addEventListener('click', openVaultManager);
+  // Hosted-safe Bitwarden path: the browser reads a plaintext JSON export and
+  // sends it once to the organization vault. The gateway never writes the
+  // uploaded export to a temporary file.
+  const bitwardenFile = box.querySelector('.bitwarden-file');
+  const bitwardenButton = box.querySelector('[data-bitwarden-file]');
+  bitwardenButton.addEventListener('click', () => bitwardenFile.click());
+  bitwardenFile.addEventListener('change', async () => {
+    const file = bitwardenFile.files?.[0];
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      toast('Bitwarden export is larger than 50 MB', true);
+      bitwardenFile.value = '';
+      return;
+    }
+    bitwardenButton.disabled = true;
+    bitwardenButton.textContent = 'Importing…';
+    try {
+      let exported;
+      try {
+        exported = JSON.parse(await file.text());
+      } catch {
+        throw new Error('Select a valid Bitwarden JSON export');
+      }
+      const result = await api(`/api/vault/import/bitwarden${oq}`, {
+        method: 'POST',
+        body: JSON.stringify({ export: exported }),
+      });
+      const summary = [
+        `Imported ${result.count} item${result.count === 1 ? '' : 's'}`,
+        result.created ? `${result.created} new` : '',
+        result.updated ? `${result.updated} updated` : '',
+        result.skipped?.length ? `${result.skipped.length} skipped` : '',
+      ].filter(Boolean).join(' · ');
+      toast(`${summary}. Delete the plaintext export from your device.`);
+      await renderItems();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      bitwardenFile.value = '';
+      bitwardenButton.disabled = false;
+      bitwardenButton.textContent = 'Import JSON…';
+    }
+  });
   // ── connectors row: connect a store, then open the full import panel ──
+  const openGitPassConnect = async (conn) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    let profileData = { profiles: [], defaultProfile: null };
+    try { profileData = await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`); } catch {}
+    overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
+      <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
+        <div class="section-h" id="git-pass-title">Connect unix pass through Git</div>
+        <p class="task-sub" style="color:var(--ink-2);margin-top:2px">krmax clones the repository into isolated organization storage, decrypts entries only while syncing, and commits and pushes write-back changes.</p>
+      </div><button class="icon-btn" data-git-pass-close aria-label="Close">×</button></div>
+      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
+      <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detects .password-store)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
+      <div class="form-row"><label>Git profile <span class="task-sub">(used for private clone and push)</span></label><select class="git-pass-profile">
+        <option value="">Organization default${profileData.defaultProfile ? ` — ${esc(profileData.defaultProfile)}` : ''}</option>
+        ${profileData.profiles.map((profile) => `<option value="${esc(profile.name)}">${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}
+      </select></div>
+      <div class="form-row"><label>ASCII-armored GPG private key</label><textarea class="git-pass-key" rows="7" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea></div>
+      <div class="form-row"><label>GPG key passphrase <span class="task-sub">(leave blank if none)</span></label><input class="git-pass-passphrase" type="password" autocomplete="new-password" /></div>
+      <p class="task-sub" style="color:var(--ink-3)">The private key and passphrase are stored together as a write-only connector credential. They are imported into a temporary GPG home for each operation and removed afterward.</p>
+      <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn sm" data-git-pass-cancel>Cancel</button><button class="btn sm primary" data-git-pass-save>${conn?.available ? 'Replace connection' : 'Connect'}</button></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+    overlay.querySelector('[data-git-pass-close]').addEventListener('click', close);
+    overlay.querySelector('[data-git-pass-cancel]').addEventListener('click', close);
+    overlay.querySelector('[data-git-pass-save]').addEventListener('click', async (event) => {
+      const repositoryUrl = overlay.querySelector('.git-pass-repo').value.trim();
+      const gpgPrivateKey = overlay.querySelector('.git-pass-key').value.trim();
+      if (!repositoryUrl || !gpgPrivateKey) { toast('Repository URL and GPG private key are required', true); return; }
+      event.currentTarget.disabled = true;
+      try {
+        const connection = {
+          repositoryUrl,
+          storePath: overlay.querySelector('.git-pass-path').value.trim() || undefined,
+          gitProfile: overlay.querySelector('.git-pass-profile').value || undefined,
+          gpgPrivateKey,
+          gpgPassphrase: overlay.querySelector('.git-pass-passphrase').value || undefined,
+        };
+        await api(`/api/vault/connectors/pass-git/connect${oq}`, {
+          method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
+        });
+        close();
+        toast('Git-backed pass connected');
+        await renderConnectors();
+      } catch (error) {
+        event.currentTarget.disabled = false;
+        toast(error.message, true);
+      }
+    });
+    overlay.querySelector('.git-pass-repo').focus();
+  };
   const renderConnectors = async () => {
     const list = box.querySelector('.connectors-list');
     if (!list) return;
@@ -10219,7 +10328,9 @@ async function wireVaultCards(organizationId) {
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
-      ${c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      ${c.setup === 'git-pass'
+        ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>`
+        : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
@@ -10227,6 +10338,7 @@ async function wireVaultCards(organizationId) {
       row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
         try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) }); toast('Connected'); renderConnectors(); } catch (e) { toast(e.message, true); }
       });
+      row.querySelector('[data-git-pass-connect]')?.addEventListener('click', () => openGitPassConnect(conns.find((c) => c.name === name)));
       row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
     });
   };
