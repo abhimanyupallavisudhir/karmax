@@ -11,14 +11,90 @@ describe('durable authorization policy', () => {
     expect(CAPABILITY_GROUPS.every((group) => group.description && group.capabilities.every((cap) => cap.label && cap.description))).toBe(true);
   });
 
-  it('seeds four configurable job profiles and resolves project defaults', () => {
+  it('seeds the five canonical authorization levels and resolves project defaults', () => {
     const store = new Store(':memory:');
     const authz = new AuthorizationService(store);
-    expect(authz.profiles().map((p) => p.id)).toEqual(['administrator', 'developer', 'maintainer', 'operator']);
+    expect(authz.profiles().map((p) => p.id)).toEqual(['administrator', 'developer', 'god', 'maintainer', 'viewer']);
+    expect(authz.profile('viewer')!.capabilities).toContain('task:read');
+    expect(authz.profile('viewer')!.capabilities).not.toContain('task:create');
+    expect(authz.profile('god')!.capabilities).toEqual(['*']);
     expect(authz.defaultProfile('p1')).toBe('developer');
     authz.setDefault('user:admin', 'maintainer', 'p1');
     expect(authz.defaultProfile('p1')).toBe('maintainer');
     expect(authz.defaultProfile('p2')).toBe('developer');
+    expect(() => authz.setDefault('user:admin', 'operator')).toThrow(/unknown authorization level/i);
+    store.kvSet('authz:default:global', 'operator');
+    const migrated = new AuthorizationService(store);
+    expect(migrated.defaultProfile()).toBe('developer');
+  });
+
+  it('grants Viewer, Developer, and Project maintainer to project lists or an organization', () => {
+    const store = new Store(':memory:');
+    const authz = new AuthorizationService(store);
+    const organization = store.createOrganization({ name: 'Acme' });
+    const one = store.createProject('One', {}, organization.id);
+    const two = store.createProject('Two', {}, organization.id);
+    const otherOrg = store.createOrganization({ name: 'Other' });
+    const foreign = store.createProject('Foreign', {}, otherOrg.id);
+
+    authz.grant('root', { principalId: 'user:maintainer', scopeKey: `organization:${organization.id}`, profileId: 'maintainer' });
+    const projects = authz.taskGrant('user:maintainer', one.id, {
+      level: 'developer', scope: 'projects', projectIds: [one.id, two.id],
+    });
+    expect(projects).toMatchObject({ level: 'developer', scope: 'projects', projectIds: [one.id, two.id], attenuated: false });
+    expect(projects.capabilities).toContain('task:*');
+
+    const wholeOrg = authz.taskGrant('user:maintainer', one.id, {
+      level: 'maintainer', scope: 'organization',
+    });
+    expect(wholeOrg).toMatchObject({ level: 'maintainer', scope: 'organization', organizationId: organization.id, attenuated: false });
+    expect(() => authz.taskGrant('user:maintainer', one.id, {
+      level: 'developer', scope: 'projects', projectIds: [foreign.id],
+    })).toThrow(/same organization/i);
+  });
+
+  it('forces Administrator to organization scope and God to global scope', () => {
+    const store = new Store(':memory:');
+    const authz = new AuthorizationService(store);
+    const organization = store.createOrganization({ name: 'Acme' });
+    const project = store.createProject('One', {}, organization.id);
+    authz.grant('root', { principalId: 'user:god', scopeKey: 'global', profileId: 'god' });
+
+    expect(authz.taskGrant('user:god', project.id, { level: 'administrator', scope: 'organization' }))
+      .toMatchObject({ level: 'administrator', scope: 'organization', organizationId: organization.id, attenuated: false });
+    expect(authz.taskGrant('user:god', project.id, { level: 'god', scope: 'global' }))
+      .toMatchObject({ level: 'god', scope: 'global', attenuated: false, capabilities: ['*'] });
+    expect(() => authz.taskGrant('user:god', project.id, {
+      level: 'administrator', scope: 'projects', projectIds: [project.id],
+    })).toThrow(/organization scope/i);
+    expect(() => authz.taskGrant('user:god', project.id, { level: 'god', scope: 'organization' }))
+      .toThrow(/global scope/i);
+  });
+
+  it('replaces a person\'s organization authorization with one canonical scoped selection', () => {
+    const store = new Store(':memory:');
+    const authz = new AuthorizationService(store);
+    const organization = store.createOrganization({ name: 'Acme' });
+    const one = store.createProject('One', {}, organization.id);
+    const two = store.createProject('Two', {}, organization.id);
+    authz.grant('root', { principalId: 'user:god', scopeKey: 'global', profileId: 'god' });
+
+    authz.replacePrincipalAuthorization('user:god', 'user:dev', organization.id, {
+      level: 'developer', scope: 'projects', projectIds: [one.id, two.id],
+    });
+    expect(authz.grants('user:dev').map((grant) => grant.scopeKey).sort()).toEqual([
+      `project:${one.id}`, `project:${two.id}`,
+    ].sort());
+    expect(authz.selectionForPrincipal('user:dev', organization.id)).toEqual({
+      level: 'developer', scope: 'projects', projectIds: [one.id, two.id],
+    });
+
+    authz.replacePrincipalAuthorization('user:god', 'user:dev', organization.id, {
+      level: 'administrator', scope: 'organization',
+    });
+    expect(authz.grants('user:dev')).toEqual([
+      expect.objectContaining({ scopeKey: `organization:${organization.id}`, profileId: 'administrator' }),
+    ]);
   });
 
   it('migrates untouched legacy built-ins without overwriting customized profiles', () => {
@@ -44,15 +120,46 @@ describe('durable authorization policy', () => {
     expect(store.getAuthorizationProfile('global', 'maintainer').capabilities).toEqual(['project:read', 'task:read']);
   });
 
+  it('migrates legacy grants into the five canonical levels', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Acme' });
+    const project = store.createProject('App', {}, organization.id);
+    store.setAuthorizationProfile('global', {
+      id: 'operator', name: 'Automation operator', builtin: true, description: 'legacy', capabilities: ['task:*'],
+    });
+    store.setPrincipalGrant('user:global-admin', 'global', {
+      principalId: 'user:global-admin', scopeKey: 'global', profileId: 'administrator', grantedBy: 'root', grantedAt: 1,
+    });
+    store.setPrincipalGrant('user:org-operator', `organization:${organization.id}`, {
+      principalId: 'user:org-operator', scopeKey: `organization:${organization.id}`, profileId: 'operator', grantedBy: 'root', grantedAt: 1,
+    });
+    store.setPrincipalGrant('user:project-operator', `project:${project.id}`, {
+      principalId: 'user:project-operator', scopeKey: `project:${project.id}`, profileId: 'operator', grantedBy: 'root', grantedAt: 1,
+    });
+
+    const authz = new AuthorizationService(store);
+
+    expect(authz.profiles().map((profile) => profile.id)).not.toContain('operator');
+    expect(authz.grants('user:global-admin')[0]).toMatchObject({ profileId: 'god', scopeKey: 'global' });
+    expect(authz.selectionForPrincipal('user:org-operator', organization.id)).toEqual({
+      level: 'administrator', scope: 'organization',
+    });
+    expect(authz.selectionForPrincipal('user:project-operator', organization.id)).toEqual({
+      level: 'maintainer', scope: 'projects', projectIds: [project.id],
+    });
+  });
+
   it('caps a requested task profile at the creator and records attenuation', () => {
     const store = new Store(':memory:');
     const authz = new AuthorizationService(store);
-    authz.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope('p1'), profileId: 'developer' });
-    const requested = authz.taskGrant('user:dev', 'p1', 'administrator');
+    const organization = store.createOrganization({ name: 'Acme' });
+    const project = store.createProject('P1', {}, organization.id);
+    authz.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
+    const requested = authz.taskGrant('user:dev', project.id, 'administrator');
     expect(requested.attenuated).toBe(true);
     expect(allows(requested.capabilities, 'task:create')).toBe(true);
     expect(allows(requested.capabilities, 'user:write')).toBe(false);
-    const delegated = authz.taskGrant('user:admin', 'p1', 'administrator', ['task:read']);
+    const delegated = authz.taskGrant('user:admin', project.id, 'administrator', ['task:read']);
     expect(delegated.capabilities).toEqual(['task:read']);
   });
 
@@ -71,17 +178,17 @@ describe('durable authorization policy', () => {
     ]);
   });
 
-  it('lets an organization operator manage tenant payments without host authority', () => {
+  it('lets an organization Administrator manage tenant payments without host authority', () => {
     const store = new Store(':memory:');
     const authz = new AuthorizationService(store);
     const organization = store.createOrganization({ name: 'Acme' });
     const project = store.createProject('App', {}, organization.id);
     authz.grant('root', {
-      principalId: 'user:operator',
+      principalId: 'user:administrator',
       scopeKey: `organization:${organization.id}`,
-      profileId: 'operator',
+      profileId: 'administrator',
     });
-    const capabilities = authz.capabilities('user:operator', project.id, organization.id);
+    const capabilities = authz.capabilities('user:administrator', project.id, organization.id);
     expect(capabilities).toContain('payment:*');
     expect(capabilities).not.toContain('process:*');
   });
@@ -99,7 +206,8 @@ describe('durable authorization policy', () => {
 
     store.removeProjectMembership(project.id, { kind: 'team', teamId: team.id });
     store.setProjectMembership(project.id, { kind: 'organization', organizationId: organization.id }, 'administrator');
-    expect(allows(authz.capabilities('user:alice', project.id), 'project:delete')).toBe(true);
+    expect(allows(authz.capabilities('user:alice', project.id), 'project:settings:write')).toBe(true);
+    expect(allows(authz.capabilities('user:alice', project.id), 'project:delete')).toBe(false);
   });
 
   it('accepts the workflow-role capabilities exposed by the checklist', () => {

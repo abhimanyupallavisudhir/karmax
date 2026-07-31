@@ -23,7 +23,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
+import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -167,6 +167,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // the handler against the caller's own capability set.
   if (p === '/api/vault/store' || p === '/api/vault/passkey/save') return 'vault:store';
   if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
+  if (p === '/api/vault/import/bitwarden') return 'credential:write';
   if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
   // Connectors: describe is read; connect/sync/config/write-back are admin.
   if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
@@ -278,6 +279,24 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
       return { kind: 'organization', organizationId };
   }
   return principalFromBody(value);
+}
+
+function authorizationSelectionFromBody(value: unknown): AuthorizationSelection | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.level !== 'string' || typeof candidate.scope !== 'string') return undefined;
+  return {
+    level: candidate.level,
+    scope: candidate.scope as AuthorizationSelection['scope'],
+    ...(Array.isArray(candidate.projectIds) ? { projectIds: candidate.projectIds.map(String) } : {}),
+  };
+}
+
+function legacyAuthorizationSelection(profileId: unknown): AuthorizationSelection {
+  const level = String(profileId ?? 'developer');
+  if (level === 'god') return { level: 'god', scope: 'global' };
+  if (level === 'administrator' || level === 'operator') return { level: 'administrator', scope: 'organization' };
+  return { level: ['viewer', 'developer', 'maintainer'].includes(level) ? level : 'developer', scope: 'organization' };
 }
 
 function isWorldHandle(value: unknown): value is Record<string, unknown> & { kind: string; id: string } {
@@ -1204,10 +1223,8 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
-          this.deps.authorization?.grant(`user:${session.userId}`, {
-            principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
-            profileId: membership.profileId ?? 'developer',
-          });
+          this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${session.userId}`,
+            membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
           return this.json(res, 200, membership);
         } catch (e) {
           // Expired / already-used / wrong-email are user-facing, not 500s.
@@ -1298,21 +1315,23 @@ export class Gateway {
           const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
           return this.json(res, 200, store.listOrganizationMemberships(organizationId).map((membership) => {
             const user = users.get(membership.userId);
-            const grant = this.deps.authorization?.grants(`user:${membership.userId}`).find((candidate) => candidate.scopeKey === `organization:${organizationId}`);
-            return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'administrator' : 'developer'),
+            const authorization = this.deps.authorization?.selectionForPrincipal(`user:${membership.userId}`, organizationId)
+              ?? (membership.role === 'owner' ? { level: 'administrator', scope: 'organization' } : undefined);
+            return { ...membership, authorization, profileId: authorization?.level ?? 'viewer',
               protectedOwner: membership.role === 'owner', ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
           }));
         }
         if (method === 'POST') {
           const b = await this.body(req);
+          const authorization = authorizationSelectionFromBody(b.authorization) ?? legacyAuthorizationSelection(b.profileId);
+          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+            organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const existing = store.organizationMembership(organizationId, String(b.userId));
           const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
-          const profileId = String(b.profileId ?? 'developer');
-          this.deps.authorization?.grant(`user:${session.userId}`, {
-            principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
-            profileId,
-          });
-          return this.json(res, 200, membership);
+          this.deps.authorization?.replacePrincipalAuthorization(authRecord?.principal ?? `user:${session.userId}`,
+            `user:${membership.userId}`, organizationId, authorization,
+            authRecord?.kind === 'human' ? undefined : authRecord?.caps);
+          return this.json(res, 200, { ...membership, authorization });
         }
       }
       const organizationMember = p.match(/^\/api\/organizations\/([^/]+)\/members\/([^/]+)$/);
@@ -1327,8 +1346,11 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listOrganizationInvitations(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
+          const authorization = authorizationSelectionFromBody(b.authorization) ?? legacyAuthorizationSelection(b.profileId);
+          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+            organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const result = store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` });
+            role: 'member', authorization, invitedBy: `user:${session.userId}` });
           // Auto-deliver the invite when outbound email is configured; the copyable
           // link is still returned as a fallback (and for email-less installs).
           let emailed = false;
@@ -1580,8 +1602,19 @@ export class Gateway {
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
-      if (usage && method === 'GET') return this.json(res, 200, store.usageSummary(usage[1]!,
-        Number(url.searchParams.get('from') ?? 0), Number(url.searchParams.get('to') ?? Date.now())));
+      if (usage && method === 'GET') {
+        const now = Date.now();
+        const date = new Date(now);
+        const monthStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+        const from = Number(url.searchParams.get('from') ?? monthStart);
+        const to = Number(url.searchParams.get('to') ?? now);
+        const sync = store.listWorldProviderConnections(usage[1]!).map((connection) => {
+          try { return { provider: connection.provider,
+            ...JSON.parse(store.kvGet(`usage-sync:${usage[1]}:${connection.provider}`) ?? '{"status":"pending"}') }; }
+          catch { return { provider: connection.provider, status: 'pending' }; }
+        });
+        return this.json(res, 200, { ...store.usageSummary(usage[1]!, from, to), from, to, sync });
+      }
 
       if (p === '/api/inbox' && method === 'GET') {
         if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
@@ -1727,6 +1760,8 @@ export class Gateway {
       if (p === '/api/projects' && method === 'GET') {
         const projects = store.listProjects();
         if (authRecord?.projectId) return this.json(res, 200, projects.filter((x) => x.id === authRecord!.projectId));
+        if (authRecord?.projectIds?.length) return this.json(res, 200,
+          projects.filter((x) => authRecord!.projectIds!.includes(x.id)));
         // An organization-scoped token discovers its own tenant's projects only.
         if (authRecord?.organizationId) return this.json(res, 200,
           projects.filter((x) => (x.organizationId ?? 'org_personal') === authRecord!.organizationId));
@@ -2234,8 +2269,11 @@ export class Gateway {
           if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
           const principal = projectPrincipalFromBody(b.principal, project.organizationId);
           const profileId = String(b.profileId ?? 'developer');
-          if (this.deps.authorization && !this.deps.authorization.profile(profileId, projectId))
-            return this.json(res, 400, { error: `unknown authorization profile ${profileId}` });
+          if (!['viewer', 'developer', 'maintainer'].includes(profileId))
+            return this.json(res, 400, { error: 'project access must be Viewer, Developer, or Project maintainer' });
+          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+            project.organizationId, { level: profileId, scope: 'projects', projectIds: [projectId] },
+            authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
           const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner'
             : principal.kind === 'user' ? 'member' : profileId);
@@ -2583,7 +2621,8 @@ export class Gateway {
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
         try {
-          return this.json(res, 200, await api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+          return this.json(res, 200, await api.setTaskAuthorization(token, taskAuthMatch[1]!,
+            authorizationSelectionFromBody(b.authorization) ?? String(b.profileId ?? ''),
             Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
             b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
               ? b.credentialPolicies as any : undefined));
@@ -3456,6 +3495,40 @@ export class Gateway {
           ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', note: 'note' })[type];
         const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
 
+        if (p === '/api/vault/import/bitwarden' && method === 'POST') {
+          try {
+            // The browser sends a one-time plaintext JSON export. Keep it in
+            // request memory only: the importer writes each supported secret
+            // straight through VaultItems into the encrypted broker.
+            const b = await this.body(req, 51 * 1024 * 1024);
+            const source = b && typeof b === 'object' && Object.prototype.hasOwnProperty.call(b, 'export') ? b.export : b;
+            const requestedPolicy = b?.policy && typeof b.policy === 'object' ? b.policy : undefined;
+            const policy = requestedPolicy ? {
+              use: requestedPolicy.use === 'ask' ? 'ask' as const : 'auto' as const,
+              reveal: requestedPolicy.reveal === 'auto' || requestedPolicy.reveal === 'never'
+                ? requestedPolicy.reveal as 'auto' | 'never'
+                : 'ask' as const,
+            } : undefined;
+            const { importBitwardenExport } = await import('../autonomy/bitwarden-import.js');
+            const result = importBitwardenExport(vault, source, policy);
+            store.appendAudit({
+              principalId: principal,
+              action: 'vault.imported',
+              scopeKey: organizationId,
+              detail: {
+                source: 'bitwarden',
+                count: result.count,
+                created: result.created,
+                updated: result.updated,
+                skipped: result.skipped.length,
+              },
+            });
+            return this.json(res, 200, result);
+          } catch (e) {
+            const status = e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 400;
+            return this.json(res, status, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
         if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
@@ -3478,7 +3551,8 @@ export class Gateway {
           if (b.id && b.secrets && Object.keys(b.secrets).length) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+                { hostLocal: this.hostLocal, hosted: this.deps.hosted })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3550,7 +3624,8 @@ export class Gateway {
           if (prior && b.secrets) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+                { hostLocal: this.hostLocal, hosted: this.deps.hosted })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3563,7 +3638,8 @@ export class Gateway {
           let writeBack: Array<{ connector: string; externalId?: string; error?: string }> = [];
           if (!prior) {
             const { defaultConnectors } = await import('../autonomy/connectors.js');
-            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal }).writeBackCreated(saved.id);
+            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+              { hostLocal: this.hostLocal, hosted: this.deps.hosted }).writeBackCreated(saved.id);
             for (const result of writeBack) {
               store.appendAudit({ principalId: callerTaskId ? `task:${callerTaskId}` : principal,
                 action: result.error ? 'vault.write_back.failed' : 'vault.write_back',
@@ -3689,7 +3765,8 @@ export class Gateway {
         if (p.startsWith('/api/vault/connectors')) {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
           const { defaultConnectors } = await import('../autonomy/connectors.js');
-          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal });
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId,
+            { hostLocal: this.hostLocal, hosted: this.deps.hosted });
           if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
           const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
           if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });

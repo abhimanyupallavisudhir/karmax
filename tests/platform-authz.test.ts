@@ -6,6 +6,7 @@ import { KarmaxApi, CapabilityError, NotFoundError } from '../src/platform/api.j
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
 
 /**
  * Service-layer authorization scope, exercised directly against KarmaxApi (no
@@ -208,6 +209,40 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     expect(store.getTask(task.id)!.params.priority).toBe(3);
     const byId = new Map(store.listTags(mine).map((t) => [t.id, t]));
     expect(store.tagsFor(task.id).map((id) => byId.get(id)!.name).sort()).toEqual(['bug', 'search']);
+  });
+
+  it('stores explicit multi-project and organization authorization on tasks and refuses over-granting', async () => {
+    const organization = store.getProject(mine)!.organizationId!;
+    const sibling = store.createProject('Sibling', {}, organization).id;
+    const authorization = new AuthorizationService(store);
+    authorization.grant('root', { principalId: 'user:a', scopeKey: 'global', profileId: 'god' });
+    const globalToken = tokens.mintPrincipal('user:a', ['*']).token;
+    const scopedApi = new KarmaxApi({
+      store, tokens, authorization, contentDir, worlds: new WorldRegistry(), client: {} as any, taskQueue: 'karmax',
+    });
+
+    const projects = await scopedApi.createTask(globalToken, {
+      projectId: mine, title: 'Across two projects', prompt: 'x', draft: true,
+      authorization: { level: 'developer', scope: 'projects', projectIds: [mine, sibling] },
+    });
+    expect(projects.params._authorization).toMatchObject({
+      level: 'developer', scope: 'projects', projectIds: [mine, sibling], attenuated: false,
+    });
+
+    const admin = await scopedApi.createTask(globalToken, {
+      projectId: mine, title: 'Organization administrator', prompt: 'x', draft: true,
+      authorization: { level: 'administrator', scope: 'organization' },
+    });
+    expect(admin.params._authorization).toMatchObject({
+      level: 'administrator', scope: 'organization', organizationId: organization, attenuated: false,
+    });
+
+    authorization.revoke('root', 'user:a', 'global');
+    authorization.grant('root', { principalId: 'user:a', scopeKey: projectScope(mine), profileId: 'developer' });
+    await expect(scopedApi.createTask(token, {
+      projectId: mine, title: 'Over-grant', prompt: 'x', draft: true,
+      authorization: { level: 'developer', scope: 'organization' },
+    })).rejects.toThrow(/cannot grant/i);
   });
 
   /** An omitted scope is NO scope (see the first test): a missing task must be

@@ -340,6 +340,21 @@ export interface ProviderSandboxRef {
   destroy(): Promise<void>;
 }
 
+/** One completed billable execution reported by a provider's control plane.
+ * A persistent sandbox may have many executions as it pauses and resumes; `id`
+ * identifies that execution (not the sandbox) and is the idempotency key. */
+export interface ProviderUsageEvent {
+  id: string;
+  sandboxId: string;
+  taskId?: string;
+  startedAt: number;
+  endedAt: number;
+  activeMs: number;
+  cpu: number;
+  memoryMb: number;
+  gpu?: number;
+}
+
 /**
  * Order checkouts so a branch stacked on a sibling merges AFTER it. Order is the
  * whole point of stacking: land the dependent first and it drags its base's
@@ -398,6 +413,9 @@ export interface WorldProvider {
    * provider cannot enumerate and nothing is reaped.
    */
   listSandboxes?(organizationId?: string): Promise<ProviderSandboxRef[]>;
+  /** Completed provider-authoritative billable executions. Lease wall time is
+   * not usage: providers can auto-pause while a local capacity lease is stale. */
+  listUsageEvents?(organizationId: string): Promise<ProviderUsageEvent[]>;
 }
 
 /** Provider-independent confinement for every file/process cwd crossing the

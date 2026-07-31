@@ -33,6 +33,7 @@ function load(name) {
 }
 
 global.esc = (value) => String(value ?? '');
+global.authorizationSummary = (value) => value.level;
 global.S = {
   tasks: [], searchResult: null, deleted: new Set(), cancelling: new Set(),
   inbox: [], view: null, selected: null,
@@ -85,7 +86,7 @@ if (load('pendingInvitationRow') && load('appendPendingInvitation')) {
     querySelector: () => null,
     insertAdjacentHTML(_where, html) { this.html += html; },
   };
-  appendPendingInvitation({ id: 'invite-1', email: 'friend@example.com', profileId: 'developer' });
+  appendPendingInvitation({ id: 'invite-1', email: 'friend@example.com', authorization: { level: 'developer', scope: 'organization' } }, []);
   ok(!pendingBox.hidden && pendingBox.html.includes('friend@example.com'), 'a new invitation appears in Pending invitations immediately');
 }
 
@@ -111,12 +112,11 @@ if (load('syncPaymentProviderControls')) {
 
 function finish() {
   ok(src.includes('removeDeletedTaskLocally(id);'), 'workflow switching removes its superseded auto-draft locally');
-  ok(src.includes('appendPendingInvitation(result.invitation);'), 'inviting a member updates Pending invitations');
+  ok(src.includes('appendPendingInvitation(result.invitation, authorizationProjects);'), 'inviting a member updates Pending invitations');
   ok(src.includes("e.target.value = String(rec.params?.priority || 0)"), 'a rejected priority change restores the saved value');
   ok(src.includes('sel.value = sel.dataset.saved'), 'a rejected workflow pin restores the saved value');
   ok(src.includes('e.target.checked = S.meta.safeMode'), 'a rejected safe-mode change restores the saved value');
-  ok(src.includes('e.target.value = data.defaultProfile'), 'a rejected authorization-default change restores the saved value');
-  ok(src.includes('event.target.value = event.target.dataset.saved'), 'a rejected member-role change restores the saved value');
+  ok(src.includes("const editor = row.querySelector('.authz-editor')") && src.includes('toast(e.message, true); await hydrateOrganizationView();'), 'a rejected member authorization change reloads the durable value');
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

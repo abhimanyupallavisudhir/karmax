@@ -39,22 +39,68 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.setProjectExecutionPolicy(project.id, { worldProvider: null, monthlyBudgetMicros: null }).config).toEqual({});
   });
 
-  it('queues by durable capacity, activates on release, and attributes provider cost', async () => {
+  it('queues by durable capacity, activates on release, and attributes lease-priced provider cost', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Capacity', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny', resources: { cpu: 2, memoryMb: 2048 } }, organization.id);
-    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
+    const project = store.createProject('Cloud', { worldProvider: 'daytona', runnerPoolId: 'tiny', resources: { cpu: 2, memoryMb: 2048 } }, organization.id);
+    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'daytona', mode: 'managed',
       capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
     const runners = new RunnerPoolService(store);
-    const first = await runners.acquire({ project, taskId: 'one', worldId: 'one', provider: 'e2b', pollMs: 5 });
-    const secondPromise = runners.acquire({ project, taskId: 'two', worldId: 'two', provider: 'e2b', priority: 10, pollMs: 5 });
+    const first = await runners.acquire({ project, taskId: 'one', worldId: 'one', provider: 'daytona', pollMs: 5 });
+    const secondPromise = runners.acquire({ project, taskId: 'two', worldId: 'two', provider: 'daytona', priority: 10, pollMs: 5 });
     await new Promise((resolve) => setTimeout(resolve, 15));
     expect(store.listWorldLeases('tiny').map((lease) => lease.state)).toEqual(['active', 'queued']);
-    runners.release(first.leaseId, 'e2b');
+    runners.release(first.leaseId, 'daytona');
     const second = await secondPromise;
     expect(store.worldLease(second.leaseId).state).toBe('active');
-    runners.release(second.leaseId, 'e2b');
+    runners.release(second.leaseId, 'daytona');
     expect(store.usageSummary(organization.id).events).toBe(2);
+  });
+
+  it('never mistakes an E2B runner lease for continuously billed sandbox time', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Metering', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const runners = new RunnerPoolService(store);
+    const lease = await runners.acquire({ project, taskId: 'stale', worldId: 'stale', provider: 'e2b' });
+
+    // A real E2B sandbox auto-pauses while a stale karmax lease can remain active
+    // for days. Releasing capacity must not turn that wall-clock interval into a
+    // provider charge; lifecycle reconciliation records the actual executions.
+    store.db.prepare('UPDATE world_leases SET acquiredAt=? WHERE id=?')
+      .run(Date.now() - 10 * 24 * 60 * 60_000, lease.leaseId);
+    runners.release(lease.leaseId, 'e2b');
+
+    expect(store.usageSummary(organization.id)).toMatchObject({ costMicros: 0, events: 0 });
+  });
+
+  it('reconciles provider executions idempotently with actual E2B resources and runtime', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Reconciled', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Run', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    store.upsertWorldProviderConnection({ organizationId: organization.id, provider: 'e2b',
+      credentialHandle: 'test:e2b', enabled: true });
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true,
+      async listUsageEvents() {
+        return [{ id: 'execution-1', sandboxId: 'sandbox-1', taskId: task.id,
+          startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
+          activeMs: 300_000, cpu: 2, memoryMb: 512 }];
+      } } as any);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+
+    await lifecycle.sweep(Date.UTC(2026, 6, 31, 10, 6));
+    await lifecycle.sweep(Date.UTC(2026, 6, 31, 10, 7));
+
+    // 5 minutes × (2 × $0.000014/vCPU/s + 0.5 × $0.0000045/GiB/s)
+    expect(store.usageSummary(organization.id)).toEqual({
+      costMicros: 9_075, events: 1, byKind: { 'world.active': 9_075 },
+    });
+    expect(JSON.parse(store.kvGet(`usage-sync:${organization.id}:e2b`)!)).toMatchObject({
+      status: 'ready', coverageFrom: Date.UTC(2026, 6, 24, 10, 6), retentionDays: 7,
+    });
   });
 
   it('fails impossible or provider-mismatched reservations instead of queueing forever', async () => {

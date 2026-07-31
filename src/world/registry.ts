@@ -52,6 +52,11 @@ export class WorldRegistry {
     return [...this.providers.values()].filter((provider) => typeof provider.listSandboxes === 'function');
   }
 
+  /** Providers whose control plane exposes completed billable executions. */
+  metered(): WorldProvider[] {
+    return [...this.providers.values()].filter((provider) => typeof provider.listUsageEvents === 'function');
+  }
+
   async create(kind: WorldKind, spec: WorldSpec): Promise<World> {
     return this.get(kind).create(spec);
   }

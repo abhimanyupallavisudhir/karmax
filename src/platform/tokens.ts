@@ -16,6 +16,8 @@ export interface ScopedToken {
   role?: string;
   principal: string; // the granting user/principal id
   projectId?: string;
+  /** A task may be delegated the same level across an explicit project list. */
+  projectIds?: string[];
   organizationId?: string;
   caps: Capability[]; // effective (attenuated) capabilities
   issuedAt: number;
@@ -36,6 +38,7 @@ export interface MintArgs {
   role?: string;
   principal: string;
   projectId?: string;
+  projectIds?: string[];
   organizationId?: string;
   /** The profile-declared ceiling (the most it may attempt). */
   ceiling: Capability[];
@@ -74,6 +77,7 @@ export class TokenAuthority {
       role: args.role,
       principal: args.principal,
       projectId: args.projectId,
+      projectIds: args.projectIds?.length ? [...new Set(args.projectIds)] : undefined,
       organizationId: args.organizationId,
       caps: attenuate(args.ceiling, args.grantorCaps),
       issuedAt: Date.now(),
@@ -137,6 +141,8 @@ export class TokenAuthority {
       return { ok: false, record, reason: 'token world generation mismatch' };
     if (record.projectId && scope?.projectId && record.projectId !== scope.projectId)
       return { ok: false, record, reason: `token is scoped to project ${record.projectId}` };
+    if (record.projectIds?.length && scope?.projectId && !record.projectIds.includes(scope.projectId))
+      return { ok: false, record, reason: `token is scoped to selected projects ${record.projectIds.join(', ')}` };
     if (record.organizationId && scope?.organizationId && record.organizationId !== scope.organizationId)
       return { ok: false, record, reason: `token is scoped to organization ${record.organizationId}` };
     // `taskId` records which workflow minted the token; it is provenance, not an

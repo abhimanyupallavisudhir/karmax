@@ -63,6 +63,10 @@ export class RunnerPoolService {
     this.store.releaseWorldLease(leaseId);
     const startedAt = Number(lease.acquiredAt ?? lease.createdAt);
     const seconds = Math.max(0, (endedAt - startedAt) / 1000);
+    // E2B runner leases reserve concurrency; they are not billing intervals.
+    // Its sandboxes auto-pause independently and report exact executions through
+    // lifecycle events, reconciled by WorldLifecycleManager below.
+    if (billedProvider === 'e2b') return;
     this.store.recordUsage({ id: `usage:${leaseId}`, organizationId: lease.organizationId, projectId: lease.projectId,
       taskId: lease.taskId, worldId: lease.worldId, provider: billedProvider, kind: 'world.active', quantity: seconds,
       unit: 'second', costMicros: Math.round(seconds * costMicrosPerSecond(billedProvider, lease.cpu, lease.memoryMb, lease.gpu)),
@@ -88,6 +92,7 @@ export class WorldLifecycleManager {
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
   async sweep(now = Date.now()): Promise<number> {
+    await this.reconcileProviderUsage(now);
     for (const artifact of this.store.expiredPromotedArtifacts(now)) {
       this.store.deletePromotedArtifact(artifact.id);
       await this.objects?.delete(artifact.objectKey).catch(() => undefined);
@@ -148,6 +153,52 @@ export class WorldLifecycleManager {
     return hibernated;
   }
 
+  private async reconcileProviderUsage(now: number): Promise<void> {
+    for (const provider of this.worlds.metered()) {
+      for (const organization of this.store.listOrganizations()) {
+        // Each tenant key sees its own E2B project feed. Environment credentials
+        // are imported into org_personal on boot, so an absent connection means
+        // this organization must not be polled through another tenant's fallback.
+        const connection = this.store.getWorldProviderConnection(organization.id, provider.kind);
+        if (!connection?.enabled) continue;
+        const syncKey = `usage-sync:${organization.id}:${provider.kind}`;
+        let previous: Record<string, unknown> = {};
+        try { previous = JSON.parse(this.store.kvGet(syncKey) ?? '{}'); } catch {}
+        try {
+          const events = await provider.listUsageEvents!(organization.id);
+          for (const event of events) {
+            const task = event.taskId ? this.store.getTask(event.taskId) : undefined;
+            const project = task ? this.store.getProject(task.projectId) : undefined;
+            const attributed = project?.organizationId === organization.id;
+            const seconds = event.activeMs / 1000;
+            this.store.recordUsage({ id: `usage:${provider.kind}:${event.id}`,
+              organizationId: organization.id,
+              ...(attributed ? { projectId: project.id, taskId: task!.id, worldId: task!.id } : {}),
+              provider: provider.kind, kind: 'world.active', quantity: seconds, unit: 'second',
+              costMicros: Math.round(seconds * costMicrosPerSecond(provider.kind,
+                event.cpu, event.memoryMb, event.gpu ?? 0)),
+              startedAt: event.startedAt, endedAt: event.endedAt,
+              metadata: { source: 'provider-lifecycle', executionId: event.id,
+                sandboxId: event.sandboxId, cpu: event.cpu, memoryMb: event.memoryMb, gpu: event.gpu ?? 0 },
+            });
+          }
+          const retentionMs = 7 * 24 * 60 * 60_000;
+          const lastSuccessfulAt = Number(previous.lastSuccessfulAt ?? previous.at);
+          const coverageFrom = Number(previous.coverageFrom);
+          this.store.kvSet(syncKey, JSON.stringify({ status: 'ready', at: now, lastSuccessfulAt: now,
+            coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : now - retentionMs,
+            retentionDays: 7,
+            ...(previous.gap === true || (Number.isFinite(lastSuccessfulAt) && now - lastSuccessfulAt > retentionMs)
+              ? { gap: true } : {}) }));
+        } catch (error) {
+          this.store.kvSet(syncKey,
+            JSON.stringify({ ...previous, status: 'error', at: now,
+              error: (error instanceof Error ? error.message : String(error)).slice(0, 500) }));
+        }
+      }
+    }
+  }
+
   /**
    * Destroy remote sandboxes this deployment owns whose task no longer exists.
    *
@@ -198,7 +249,7 @@ function reconcileAfterMs(): number {
   return Number.isFinite(value) && value >= 0 ? value : 10 * 60_000;
 }
 
-function costMicrosPerSecond(provider: string, cpu: number, memoryMb: number, gpu: number): number {
+export function costMicrosPerSecond(provider: string, cpu: number, memoryMb: number, gpu: number): number {
   if (['worktree', 'container', 'memory'].includes(provider)) return 0;
   const prefix = `KARMAX_${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
   const meteredDefault = provider === 'e2b' || provider === 'daytona';

@@ -10,7 +10,9 @@ import {
   defaultConnectors,
   BitwardenConnector,
   OnePasswordConnector,
+  OnePasswordSdkConnector,
   PassConnector,
+  GitPassConnector,
   parsePassFiles,
   type Exec,
 } from '../src/autonomy/connectors.js';
@@ -77,6 +79,73 @@ describe('1Password connector', () => {
     const [pulled] = (await c.pull(['op1'])).items;
     expect(pulled!.username).toBe('octo');
     expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: '123456' });
+  });
+});
+
+describe('hosted 1Password connector', () => {
+  const full = {
+    id: 'op1',
+    vaultId: 'vault1',
+    title: 'GH',
+    category: 'Login',
+    websites: [{ url: 'https://github.com/login' }],
+    fields: [
+      { id: 'username', value: 'octo', fieldType: 'Text' },
+      { id: 'password', value: 'sw0rd', fieldType: 'Concealed' },
+      { id: 'otp', value: 'otpauth://totp/GH?secret=SEED', fieldType: 'Totp' },
+    ],
+  };
+  const puts: any[] = [];
+  const client = {
+    vaults: { list: async () => [{ id: 'vault1', title: 'Engineering' }] },
+    items: {
+      list: async (vaultId: string) => {
+        expect(vaultId).toBe('vault1');
+        return [{ ...full, fields: undefined }];
+      },
+      get: async (vaultId: string, itemId: string) => {
+        expect([vaultId, itemId]).toEqual(['vault1', 'op1']);
+        return structuredClone(full);
+      },
+      put: async (item: any) => { puts.push(item); return item; },
+    },
+  };
+
+  it('uses the service-account SDK without host CLI state', async () => {
+    const tokens: string[] = [];
+    const c = new OnePasswordSdkConnector(() => 'ops_token', async (token) => {
+      tokens.push(token);
+      return client;
+    });
+
+    expect((await c.describe()).available).toBe(true);
+    expect(tokens).toEqual(['ops_token']);
+    expect(await c.list()).toEqual([
+      expect.objectContaining({
+        externalId: 'op1',
+        folder: 'Engineering',
+        domains: ['github.com'],
+      }),
+    ]);
+    const [pulled] = (await c.pull(['op1'])).items;
+    expect(pulled).toMatchObject({
+      username: 'octo',
+      secrets: {
+        password: 'sw0rd',
+        totp: 'otpauth://totp/GH?secret=SEED',
+      },
+    });
+  });
+
+  it('updates one SDK field and preserves the rest of the item', async () => {
+    puts.length = 0;
+    const c = new OnePasswordSdkConnector(() => 'ops_token', async () => client);
+    await c.updateSecret('op1', 'password', 'rotated');
+
+    expect(puts).toHaveLength(1);
+    expect(puts[0].fields.find((f: any) => f.id === 'password').value).toBe('rotated');
+    expect(puts[0].fields.find((f: any) => f.id === 'username').value).toBe('octo');
+    expect(puts[0].websites).toEqual(full.websites);
   });
 });
 
@@ -189,15 +258,20 @@ describe('pass connector', () => {
 describe('the default registry follows where karmax is served', () => {
   it('offers the host password store only to the machine that runs karmax', async () => {
     const { items, broker, store } = makeVault();
-    const names = async (opts?: { hostLocal?: boolean }) =>
+    const names = async (opts?: { hostLocal?: boolean; hosted?: boolean }) =>
       (await defaultConnectors(store, items, broker, 'org_personal', opts).describe()).map((c) => c.name);
 
     expect(await names({ hostLocal: true })).toContain('pass');
     // Served to anyone but the operator, `pass` would read the *host's* store —
     // secrets nobody on the other end of the browser owns.
     expect(await names({ hostLocal: false })).not.toContain('pass');
-    // The token-authenticated stores stay: their credential comes from the tenant.
-    expect(await names({ hostLocal: false })).toEqual(expect.arrayContaining(['bitwarden', '1password']));
+    // A public self-host may use 1Password's stateless service-account token,
+    // but must not expose the operator's local Bitwarden CLI profile.
+    expect(await names({ hostLocal: false })).toEqual(['1password', 'pass-git']);
+    // A managed cell has no tenant-owned CLI profile. 1Password uses its
+    // service-account SDK there; Bitwarden's session key only unlocks local
+    // CLI state, so advertising it would be both broken and cross-tenant-prone.
+    expect(await names({ hostLocal: false, hosted: true })).toEqual(['1password', 'pass-git']);
   });
 });
 
@@ -576,5 +650,30 @@ describe('Connectors sync into the vault (§9)', () => {
     await expect(connectors.propagate(created.id, ['password'])).rejects.toThrow(
       /legacy write-back binding is ambiguous across enabled connectors: alpha, beta/,
     );
+  });
+
+  it('never treats a one-way file import id as a connector write-back binding', async () => {
+    const { items, store, broker } = makeVault();
+    const updated: any[] = [];
+    const connector = {
+      name: 'alpha',
+      label: 'alpha',
+      describe: async () => ({ name: 'alpha', label: 'alpha', available: true, canPush: true, detail: 'test' }),
+      list: async () => [],
+      pull: async () => ({ items: [], failures: [] }),
+      updateSecret: async (...args: any[]) => void updated.push(args),
+      push: async () => ({ externalId: 'alpha/new' }),
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector as any);
+    connectors.setConfig('alpha', { writeBack: true });
+    const imported = items.save({
+      type: 'login', label: 'from a file', secrets: { password: 'rotated' },
+      provenance: { source: 'import:bitwarden', externalId: 'bitwarden-item-id' },
+    });
+
+    expect(await connectors.propagate(imported.id, ['password'])).toBeUndefined();
+    await expect(connectors.writeBack('alpha', imported.id)).rejects.toThrow(/one-way file import/i);
+    expect(updated).toEqual([]);
   });
 });
