@@ -68,4 +68,26 @@ describe('connector import (web)', () => {
     expect(handler).toMatch(/Importing \$\{p\.done\}\/\$\{p\.total\}…/);
     expect(handler).toMatch(/finally \{ go\.disabled = false; go\.textContent = 'Import'; \}/);
   });
+
+  it('offers a bounded browser import for a Bitwarden JSON export', () => {
+    expect(app).toContain('data-bitwarden-file');
+    expect(app).toContain('accept=".json,application/json"');
+    expect(app).toContain('/api/vault/import/bitwarden');
+    expect(app).toContain('file.text()');
+    expect(app).toContain('50 * 1024 * 1024');
+    expect(app).toContain('Write changes back');
+    expect(app).toContain('unavailable for file imports');
+    expect(app).toContain('one-way import');
+  });
+
+  it('offers hosted Git-backed pass setup with Git-profile and GPG inputs', () => {
+    expect(app).toContain("c.setup === 'git-pass'");
+    expect(app).toContain('Connect unix pass through Git');
+    expect(app).toContain('Repository URL');
+    expect(app).toContain('Password-store path in repository');
+    expect(app).toContain('ASCII-armored GPG private key');
+    expect(app).toContain('GPG key passphrase');
+    expect(app).toContain('/git-profiles');
+    expect(app).toContain('/api/vault/connectors/pass-git/connect');
+  });
 });

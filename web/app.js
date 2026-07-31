@@ -2091,6 +2091,38 @@ function tagPathStr(id) {
 function tagSectionId(id) { return `tag-section-${id}`; }
 const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 
+function filterDeletedFromSearchResult(result) {
+  if (!result || !S.deleted.size) return result;
+  const keep = (tasks) => (tasks || []).filter((task) => !S.deleted.has(task.id));
+  const pruneGroup = (group) => {
+    const tasks = keep(group.tasks);
+    const childResults = (group.children || []).map(pruneGroup).filter(Boolean);
+    // Hierarchical tag-group counts cover the whole subtree and deduplicate tasks
+    // assigned to more than one tag. Flat groups have no children, so the same
+    // calculation naturally produces their bucket size.
+    const ids = new Set(tasks.map((task) => task.id));
+    for (const child of childResults) for (const id of child.ids) ids.add(id);
+    if (!ids.size) return null;
+    return {
+      ids,
+      group: {
+        ...group,
+        tasks,
+        ...(group.children ? { children: childResults.map((child) => child.group) } : {}),
+        count: ids.size,
+      },
+    };
+  };
+  const pruneGroups = (groups) => (groups || []).map(pruneGroup).filter(Boolean).map((entry) => entry.group);
+  const tasks = keep(result.tasks);
+  return {
+    ...result,
+    tasks,
+    ...(result.groups ? { groups: pruneGroups(result.groups) } : {}),
+    total: tasks.length,
+  };
+}
+
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
@@ -2111,7 +2143,9 @@ async function runSearch() {
       ...(g.children ? { children: overlayGroups(g.children) } : {}),
     }));
     if (r.groups) r.groups = overlayGroups(r.groups);
-    S.searchResult = r;
+    // A search issued before a draft DELETE may resolve afterwards. Apply the same
+    // session tombstones as loadTasks so that late response cannot restore its row.
+    S.searchResult = filterDeletedFromSearchResult(r);
     S.searchFailed = false;
     return true;
   } catch {
@@ -3822,6 +3856,7 @@ async function deleteDraft(id) {
   }
   S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
   S.tasks = S.tasks.filter((t) => t.id !== id);
+  S.searchResult = filterDeletedFromSearchResult(S.searchResult);
   renderMain();
   return true;
 }
@@ -8686,7 +8721,7 @@ async function hydrateProjectData(proj) {
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
       const files = [...$('#data-files').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a host path or a browser folder, not both', true);
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a path or a browser folder, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
@@ -9289,14 +9324,11 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
     </div>
-    <div class="card" id="resilience-card">
-      <div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
-    </div>
-    <div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
+    <div class="card" id="resilience-card" hidden></div>
+    ${hostLocal() ? `<div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
     <div class="card phone-access-card" id="phone-access-card">
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
-    </div>`;
+    </div>` : ''}`;
 }
 
 function phoneInstallHelp() {
@@ -9315,7 +9347,6 @@ function renderPhoneAccess(status) {
   const box = $('#phone-access-status');
   if (!box) return;
   const ready = status.state === 'ready';
-  const hosted = status.method === 'hosted';
   const label = status.setupInProgress ? 'Setting up…' : ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
     : status.state === 'needs-login' ? 'Sign-in needed'
       : status.state === 'conflict' ? 'Another service is connected' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
@@ -9325,12 +9356,10 @@ function renderPhoneAccess(status) {
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
     ? `<div class="phone-access-address"><span>Access your krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
-  const phoneSteps = hosted
-    ? '<li>Open this same HTTPS address on your phone.</li>'
-    : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
+    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>Tailscale not set up</b></div>`;
+  const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private krmax address shown here in your phone’s browser.</li>`;
-  const recovery = ready && !hosted
+  const recovery = ready
     ? `<details class="phone-troubleshooting">
         <summary>Address won’t open?</summary>
         <ol>
@@ -9355,15 +9384,14 @@ function renderPhoneAccess(status) {
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
         Sign in to the same Tailscale account on both.</p>`;
   const fallbackCommands = status.fallbackCommands || [];
-  const fallback = !hosted && fallbackCommands.length
+  const fallback = fallbackCommands.length
     ? `<details class="phone-terminal-fallback">
         <summary>Doesn’t work? Use the terminal instead</summary>
         <pre><code>${esc(fallbackCommands.join('\n'))}</code></pre>
         <button class="btn sm" id="remote-copy-fallback">Copy commands</button>
        </details>`
     : '';
-  const setupPanel = !hosted
-    ? `<details class="phone-setup" ${ready ? '' : 'open'}>
+  const setupPanel = `<details class="phone-setup" ${ready ? '' : 'open'}>
         <summary>${setupSummary}</summary>
         <div class="phone-setup-body">
           ${setupIntro}
@@ -9379,13 +9407,12 @@ function renderPhoneAccess(status) {
           ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. krmax never sees your OS or Tailscale password.</p>' : ''}
           ${fallback}
         </div>
-       </details>`
-    : `<p>${esc(status.detail)}</p>`;
+       </details>`;
   box.innerHTML = `${address}
     ${setupPanel}
     ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
       <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">${hosted ? 'krmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.'}</p>`;
+    <p class="phone-security">This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.</p>`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
@@ -9540,10 +9567,17 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
   }
   if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
+    // Worlds inherit the host's git config through git's own cascade
+    // (ensureIdentity only fills blanks), which is true of a worktree world on
+    // the operator's machine and false on a managed cell: there the world is a
+    // remote sandbox with no ~/.gitconfig to inherit, and no single "host" whose
+    // identity a tenant would want anyway.
     box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
-      organizationId === 'org_personal'
-        ? 'personal projects use the host’s own Git setup.'
-        : 'projects remain isolated from the host’s Git identity and credentials.'
+      S.meta?.hosted
+        ? 'add one to give this organization’s commits an identity.'
+        : organizationId === 'org_personal'
+          ? 'personal projects use the host’s own Git setup.'
+          : 'projects remain isolated from the host’s Git identity and credentials.'
     }</span>`;
     return;
   }
@@ -9607,7 +9641,7 @@ function paymentsCard(scope) {
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
-      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
+      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px" hidden></div>
       <div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
       <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
@@ -9742,7 +9776,11 @@ async function wirePaymentProviders(box, organizationId) {
     try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
   }
   const platformBox = box.querySelector('.pay-stripe-platform');
-  if (platformBox && platform) {
+  // The shared Connect application is installation-wide, so the box ships hidden
+  // and only `canManage` reveals it — a tenant is never shown the operator's form,
+  // not even for the frame between render and the answer coming back.
+  if (platformBox && platform?.canManage) {
+    platformBox.hidden = false;
     const status = platform.configured
       ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
       : '<span class="chip">setup required</span>';
@@ -9754,13 +9792,13 @@ async function wirePaymentProviders(box, organizationId) {
       <p class="task-sub">One Stripe Connect application identifies this krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
       <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
       <div class="settings-grid">
-        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
-        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
-        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" /></label>
+        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" /></label>
+        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
         <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
         <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
       </div>
-      ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
+      <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
       ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in krmax’s encrypted vault and makes them take precedence.</p>' : ''}
     </details>`;
     platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
@@ -10155,8 +10193,16 @@ function passwordsCard() {
       <span class="vault-manage-count">Loading…</span>
     </button>
 
-    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
-      ${policyTip('krmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Import or sync from a password manager
+      ${policyTip('krmax mirrors selected credentials into its own encrypted vault (a snapshot, not a live link), so agents keep working if the source store is offline and you choose exactly what they can touch. Hosted users can import a Bitwarden JSON export; available live connectors appear below.')}</div>
+    <div class="queue-item bitwarden-file-import" style="margin-bottom:8px">
+      <div style="flex:1"><b>Bitwarden JSON export</b>
+        <span class="chip">one-way import</span>
+        <div class="task-sub" style="color:var(--ink-3)">One-time import of logins, TOTP seeds, secure notes, and SSH keys. The plaintext export is processed once and not retained as a file; delete your local export afterward.</div>
+        <label class="task-sub" title="Bitwarden JSON is a snapshot, not a connected vault" style="display:inline-flex;align-items:center;gap:5px;color:var(--ink-3);margin-top:4px"><input type="checkbox" disabled /> Write changes back — unavailable for file imports</label></div>
+      <input class="bitwarden-file" type="file" accept=".json,application/json" hidden />
+      <button class="btn sm primary" type="button" data-bitwarden-file>Import JSON…</button>
+    </div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
     <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
@@ -10202,6 +10248,7 @@ async function wireVaultCards(organizationId) {
   box.querySelector('.vi-type').addEventListener('change', secretRows);
   let vaultItems = [];
   const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+    : src?.startsWith('import:') ? `<span class="chip" title="File imports are snapshots and cannot write back">${esc(src.slice(7))} · one-way import</span>`
     : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
   const renderItems = async () => {
     const button = box.querySelector('#vault-manage-open');
@@ -10269,7 +10316,12 @@ async function wireVaultCards(organizationId) {
       list.querySelectorAll('[data-vi-rotate]').forEach((button) => button.addEventListener('click', async () => {
         const item = vaultItems.find((candidate) => candidate.id === button.dataset.viRotate);
         const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
-        const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+        const sourceNote = item.provenance?.source?.startsWith('import:')
+          ? 'This is a one-way import; its source file will not be updated.'
+          : item.provenance?.source?.startsWith('connector:')
+            ? 'The connected source store is updated too if write-back is on.'
+            : 'Metadata and notes are untouched.';
+        const value = prompt(`New ${field} for "${item.label}" (${sourceNote}):`);
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
@@ -10295,7 +10347,102 @@ async function wireVaultCards(organizationId) {
     search.focus();
   };
   box.querySelector('#vault-manage-open').addEventListener('click', openVaultManager);
+  // Hosted-safe Bitwarden path: the browser reads a plaintext JSON export and
+  // sends it once to the organization vault. The gateway never writes the
+  // uploaded export to a temporary file.
+  const bitwardenFile = box.querySelector('.bitwarden-file');
+  const bitwardenButton = box.querySelector('[data-bitwarden-file]');
+  bitwardenButton.addEventListener('click', () => bitwardenFile.click());
+  bitwardenFile.addEventListener('change', async () => {
+    const file = bitwardenFile.files?.[0];
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      toast('Bitwarden export is larger than 50 MB', true);
+      bitwardenFile.value = '';
+      return;
+    }
+    bitwardenButton.disabled = true;
+    bitwardenButton.textContent = 'Importing…';
+    try {
+      let exported;
+      try {
+        exported = JSON.parse(await file.text());
+      } catch {
+        throw new Error('Select a valid Bitwarden JSON export');
+      }
+      const result = await api(`/api/vault/import/bitwarden${oq}`, {
+        method: 'POST',
+        body: JSON.stringify({ export: exported }),
+      });
+      const summary = [
+        `Imported ${result.count} item${result.count === 1 ? '' : 's'}`,
+        result.created ? `${result.created} new` : '',
+        result.updated ? `${result.updated} updated` : '',
+        result.skipped?.length ? `${result.skipped.length} skipped` : '',
+      ].filter(Boolean).join(' · ');
+      toast(`${summary}. Delete the plaintext export from your device.`);
+      await renderItems();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      bitwardenFile.value = '';
+      bitwardenButton.disabled = false;
+      bitwardenButton.textContent = 'Import JSON…';
+    }
+  });
   // ── connectors row: connect a store, then open the full import panel ──
+  const openGitPassConnect = async (conn) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    let profileData = { profiles: [], defaultProfile: null };
+    try { profileData = await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`); } catch {}
+    overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
+      <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
+        <div class="section-h" id="git-pass-title">Connect unix pass through Git</div>
+        <p class="task-sub" style="color:var(--ink-2);margin-top:2px">krmax clones the repository into isolated organization storage, decrypts entries only while syncing, and commits and pushes write-back changes.</p>
+      </div><button class="icon-btn" data-git-pass-close aria-label="Close">×</button></div>
+      <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
+      <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detects .password-store)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
+      <div class="form-row"><label>Git profile <span class="task-sub">(used for private clone and push)</span></label><select class="git-pass-profile">
+        <option value="">Organization default${profileData.defaultProfile ? ` — ${esc(profileData.defaultProfile)}` : ''}</option>
+        ${profileData.profiles.map((profile) => `<option value="${esc(profile.name)}">${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}
+      </select></div>
+      <div class="form-row"><label>ASCII-armored GPG private key</label><textarea class="git-pass-key" rows="7" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea></div>
+      <div class="form-row"><label>GPG key passphrase <span class="task-sub">(leave blank if none)</span></label><input class="git-pass-passphrase" type="password" autocomplete="new-password" /></div>
+      <p class="task-sub" style="color:var(--ink-3)">The private key and passphrase are stored together as a write-only connector credential. They are imported into a temporary GPG home for each operation and removed afterward.</p>
+      <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn sm" data-git-pass-cancel>Cancel</button><button class="btn sm primary" data-git-pass-save>${conn?.available ? 'Replace connection' : 'Connect'}</button></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+    overlay.querySelector('[data-git-pass-close]').addEventListener('click', close);
+    overlay.querySelector('[data-git-pass-cancel]').addEventListener('click', close);
+    overlay.querySelector('[data-git-pass-save]').addEventListener('click', async (event) => {
+      const repositoryUrl = overlay.querySelector('.git-pass-repo').value.trim();
+      const gpgPrivateKey = overlay.querySelector('.git-pass-key').value.trim();
+      if (!repositoryUrl || !gpgPrivateKey) { toast('Repository URL and GPG private key are required', true); return; }
+      event.currentTarget.disabled = true;
+      try {
+        const connection = {
+          repositoryUrl,
+          storePath: overlay.querySelector('.git-pass-path').value.trim() || undefined,
+          gitProfile: overlay.querySelector('.git-pass-profile').value || undefined,
+          gpgPrivateKey,
+          gpgPassphrase: overlay.querySelector('.git-pass-passphrase').value || undefined,
+        };
+        await api(`/api/vault/connectors/pass-git/connect${oq}`, {
+          method: 'POST', body: JSON.stringify({ secret: JSON.stringify(connection) }),
+        });
+        close();
+        toast('Git-backed pass connected');
+        await renderConnectors();
+      } catch (error) {
+        event.currentTarget.disabled = false;
+        toast(error.message, true);
+      }
+    });
+    overlay.querySelector('.git-pass-repo').focus();
+  };
   const renderConnectors = async () => {
     const list = box.querySelector('.connectors-list');
     if (!list) return;
@@ -10304,7 +10451,9 @@ async function wireVaultCards(organizationId) {
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
         <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
-      ${c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      ${c.setup === 'git-pass'
+        ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>`
+        : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
       <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
       || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
     list.querySelectorAll('[data-conn]').forEach((row) => {
@@ -10312,6 +10461,7 @@ async function wireVaultCards(organizationId) {
       row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
         try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) }); toast('Connected'); renderConnectors(); } catch (e) { toast(e.message, true); }
       });
+      row.querySelector('[data-git-pass-connect]')?.addEventListener('click', () => openGitPassConnect(conns.find((c) => c.name === name)));
       row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
     });
   };
@@ -10466,9 +10616,46 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// ── installation-wide OUTBOUND email (operator-only; server enforces settings:write)
+// ── installation-wide settings (safe mode, outbound email, Stripe platform) ──
+// These belong to whoever runs the installation, and the console has no
+// capability model of its own, so each card asks its endpoint: a refusal (or
+// canManage:false) means the reader is a tenant here.
+//
+// The card ships EMPTY and `hidden`, and is filled only once the server has
+// allowed it. Rendering first and removing on refusal would flash an operator
+// control at a tenant for however long the request takes.
+async function hydrateInstallationCard(selector, url, fill) {
+  const card = document.querySelector(selector);
+  if (!card) return;
+  try {
+    const data = await api(url);
+    if (!data.canManage) return;
+    card.hidden = false;
+    fill(card, data);
+  } catch { /* refused: leave the card absent */ }
+}
+
+function hydrateResilienceCard() {
+  return hydrateInstallationCard('#resilience-card', '/api/safe-mode', (card, data) => {
+    S.meta.safeMode = data.safeMode;
+    card.innerHTML = `<div class="section-h">Resilience</div>
+      <div class="switch"><input type="checkbox" id="safe-mode" ${data.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>`;
+    card.querySelector('#safe-mode').addEventListener('change', async (e) => {
+      try {
+        const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) });
+        S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`);
+      } catch (err) { toast(err.message, true); }
+    });
+  });
+}
+
 function outboundEmailCard() {
-  return `<div class="card" id="outbound-email-card">
+  return '<div class="card" id="outbound-email-card" hidden></div>';
+}
+
+async function wireOutboundEmailCard() {
+  return hydrateInstallationCard('#outbound-email-card', '/api/email', (card, data) => {
+    card.innerHTML = `
     <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
     <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let krmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
     <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
@@ -10489,56 +10676,50 @@ function outboundEmailCard() {
     <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
     <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
     <div id="oe-result" class="task-sub" style="margin-top:6px"></div>
-  </div>`;
-}
-async function wireOutboundEmailCard() {
-  const card = $('#outbound-email-card');
-  if (!card) return;
-  let data;
-  try { data = await api('/api/email'); }
-  catch { card.style.display = 'none'; return; } // no settings:write → hide entirely
-  const providerSel = $('#oe-provider');
-  const helpEl = $('#oe-help');
-  const applyProvider = () => {
-    const name = providerSel.value;
-    const info = (data.providers || []).find((p) => p.name === name);
-    $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
-    $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
-    $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-    const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
-    helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
-  };
-  if (data.provider) providerSel.value = data.provider;
-  if (data.from) $('#oe-from').value = data.from;
-  $('#oe-status').innerHTML = data.configured
-    ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
-    : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
-  applyProvider();
-  providerSel.addEventListener('change', applyProvider);
-  $('#oe-connect').addEventListener('click', async () => {
-    const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
-    if (providerSel.value === 'smtp') {
-      body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
-      body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
-    }
-    const btn = $('#oe-connect'); btn.disabled = true;
-    try {
-      const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
-      $('#oe-secret').value = '';
-      $('#oe-result').style.color = 'var(--ink-2)';
-      $('#oe-result').textContent = result.detail || 'Connected';
-      toast('Outbound email connected');
-      await wireOutboundEmailCard();
-    } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
-    finally { btn.disabled = false; }
-  });
-  $('#oe-test').addEventListener('click', async () => {
-    const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
-    if (!to) return;
-    const btn = $('#oe-test'); btn.disabled = true;
-    try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
-    catch (e) { toast(e.message, true); }
-    finally { btn.disabled = false; }
+  `;
+    const providerSel = $('#oe-provider');
+    const helpEl = $('#oe-help');
+    const applyProvider = () => {
+      const name = providerSel.value;
+      const info = (data.providers || []).find((p) => p.name === name);
+      $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
+      $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
+      $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
+      const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+      helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
+    };
+    if (data.provider) providerSel.value = data.provider;
+    if (data.from) $('#oe-from').value = data.from;
+    $('#oe-status').innerHTML = data.configured
+      ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
+      : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
+    applyProvider();
+    providerSel.addEventListener('change', applyProvider);
+    $('#oe-connect').addEventListener('click', async () => {
+      const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
+      if (providerSel.value === 'smtp') {
+        body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
+        body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
+      }
+      const btn = $('#oe-connect'); btn.disabled = true;
+      try {
+        const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
+        $('#oe-secret').value = '';
+        $('#oe-result').style.color = 'var(--ink-2)';
+        $('#oe-result').textContent = result.detail || 'Connected';
+        toast('Outbound email connected');
+        await wireOutboundEmailCard();
+      } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
+      finally { btn.disabled = false; }
+    });
+    $('#oe-test').addEventListener('click', async () => {
+      const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+      if (!to) return;
+      const btn = $('#oe-test'); btn.disabled = true;
+      try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
+      catch (e) { toast(e.message, true); }
+      finally { btn.disabled = false; }
+    });
   });
 }
 
@@ -10689,7 +10870,8 @@ function profilesCard(scope) {
 }
 
 function wireGlobalSettings(organizationId) {
-  hydratePhoneAccess();
+  if (hostLocal()) hydratePhoneAccess();
+  hydrateResilienceCard();
   wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
@@ -10812,9 +10994,6 @@ function wireGlobalSettings(organizationId) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#safe-mode')?.addEventListener('change', async (e) => {
-    try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
-  });
 }
 
 // ── inbox + collaboration ───────────────────────────────────────────────────
@@ -11204,7 +11383,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Phone Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -11272,7 +11451,7 @@ async function hydrateOrganizationView() {
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so krmax refreshes repository access when you ask instead of using webhooks.'}</p>
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
+    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. Git uses short-lived App tokens, so connecting many repositories does not add a deploy key to each one.${hostLocal() ? ' On localhost, setup works without a webhook and repository access is refreshed on demand.' : ''}</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
@@ -11307,13 +11486,21 @@ async function hydrateOrganizationView() {
       <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-browser-v1" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="codex" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
         : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
     <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select><input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds"><button class="btn sm" id="runner-create">Add pool</button></div>`;
-  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">This query period · ${usage.events} metered events</div></div>` : 'Usage unavailable.';
+  const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
+  const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
+    : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
+      : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
+  const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
+  const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
+    : coverageFrom > Number(usage?.from || 0)
+      ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
+  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Provider-reconciled compute · ${usagePeriod} · ${usage.events} completed executions${usageSyncLabel}</div></div>` : 'Usage unavailable.';
   if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
     <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>

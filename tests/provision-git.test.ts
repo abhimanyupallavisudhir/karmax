@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { provisionGitRepos, type ProvisionTarget } from '../src/world/provision-git.js';
+import { provisionGitCredentials, provisionGitRepos, type ProvisionTarget } from '../src/world/provision-git.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 
 const pexec = promisify(execFile);
@@ -62,6 +62,31 @@ describe('shared cloud world git provisioning', () => {
     await expect(provisionGitRepos(target, { taskId: 't1', base: 'main', repo: 'https://github.com/acme/app.git' }, OPTIONS))
       .rejects.toThrow('ssh only');
     expect(commands).toHaveLength(0);
+  });
+
+  it('clones an SSH-shaped GitHub remote with an ephemeral HTTPS App token', async () => {
+    const commands: string[] = [];
+    const writes = new Map<string, string>();
+    const target: ProvisionTarget = {
+      async run(command) {
+        commands.push(command);
+        return { stdout: command.includes('rev-parse') ? `${'a'.repeat(40)}\n` : '', stderr: '', code: 0 };
+      },
+      async writeFile(file, content) { writes.set(file, String(content)); },
+    };
+    const spec = {
+      taskId: 'token-clone', base: 'main', repo: 'git@github.com:acme/app.git',
+      gitCredentials: { httpsTokens: { 'git@github.com:acme/app.git': 'short-lived-token' } },
+    };
+    await provisionGitCredentials(target, spec, OPTIONS.home);
+    await provisionGitRepos(target, spec, OPTIONS);
+
+    const clone = commands.find((command) => command.includes('git clone'))!;
+    expect(clone).toContain('url.https://github.com/.insteadOf');
+    expect(clone).toContain('GIT_ASKPASS=');
+    expect(clone).not.toContain('short-lived-token');
+    expect([...writes.values()]).toContain('short-lived-token');
+    expect([...writes.values()].join('\n')).toContain('x-access-token');
   });
 
   it('reports copied compatibility files as ephemeral world paths', async () => {

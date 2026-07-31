@@ -13,7 +13,8 @@ const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 // this Node context. Its free identifiers (S, api, renderMain, toast) resolve to
 // the globals we define below.
 function extractFn(name) {
-  const start = src.indexOf(`async function ${name}(`);
+  const asyncStart = src.indexOf(`async function ${name}(`);
+  const start = asyncStart >= 0 ? asyncStart : src.indexOf(`function ${name}(`);
   if (start < 0) throw new Error(`${name} not found`);
   let depth = 0, i = src.indexOf('{', start);
   for (let j = i; j < src.length; j++) {
@@ -28,7 +29,7 @@ let serverList = [];           // authoritative task rows (as the store would ho
 let pendingGets = [];          // resolvers for in-flight list GETs (to control ordering)
 let toasts = [];
 
-global.S = { projectId: 'proj', tasks: [], deleted: new Set(), forkPool: null };
+global.S = { projectId: 'proj', tasks: [], deleted: new Set(), searchResult: null, forkPool: null };
 global.renderMain = () => {};
 global.toast = (msg, err) => { toasts.push({ msg, err: !!err }); };
 global.api = (p, opts = {}) => {
@@ -47,6 +48,7 @@ global.api = (p, opts = {}) => {
 const releaseGet = () => pendingGets.shift()();
 
 eval(extractFn('loadTasks'));
+eval(extractFn('filterDeletedFromSearchResult'));
 eval(extractFn('deleteDraft'));
 
 let pass = 0, fail = 0;
@@ -58,6 +60,14 @@ const has = (id) => S.tasks.some((t) => t.id === id);
   const t2 = { id: 'task_t2', title: 'running', params: {} };
   serverList = [d1, t2];
   S.tasks = [d1, t2];
+  S.searchResult = {
+    tasks: [d1, t2],
+    groups: [{
+      key: 'drafts', label: 'Drafts', count: 2, tasks: [d1],
+      children: [{ key: 'nested', label: 'Nested', count: 2, tasks: [d1, t2] }],
+    }],
+    total: 2,
+  };
 
   // 1. A background refresh fires first (ws debounce / auto-save) and snapshots the
   //    list *including* the draft — but its response hasn't arrived yet.
@@ -68,6 +78,12 @@ const has = (id) => S.tasks.some((t) => t.id === id);
   ok(!has('task_d1'), 'draft removed from the list after delete');
   ok(has('task_t2'), 'the unrelated running task is untouched');
   ok(S.deleted.has('task_d1'), 'deleted draft id is tombstoned');
+  ok(!S.searchResult.tasks.some((t) => t.id === 'task_d1'), 'draft removed from the visible search result');
+  ok(!S.searchResult.groups[0].tasks.some((t) => t.id === 'task_d1'), 'draft removed from a grouped search result');
+  ok(!S.searchResult.groups[0].children[0].tasks.some((t) => t.id === 'task_d1'), 'draft removed from a nested search group');
+  ok(S.searchResult.total === 1, 'visible search result total updated after delete');
+  ok(S.searchResult.groups[0].count === 1 && S.searchResult.groups[0].children[0].count === 1,
+    'search group counts updated after delete');
 
   // 3. The stale GET now resolves with the pre-delete list. THE BUG: without the
   //    tombstone this overwrites S.tasks and the draft re-appears.

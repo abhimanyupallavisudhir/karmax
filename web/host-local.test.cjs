@@ -12,6 +12,17 @@ let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
 // `const` inside eval is block-scoped, so hoist the declaration onto global.
 const load = (name) => eval(lines.find((l) => l.startsWith(`const ${name} = `)).replace(`const ${name} =`, `global.${name} =`));
+// Same idea for a multi-line function declaration: brace-match it, then hoist.
+const loadFn = (name) => {
+  const start = src.indexOf(`async function ${name}(`);
+  let depth = 0;
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0)
+      return eval(`global.${name} = ${src.slice(start, i + 1)}`);
+  }
+  throw new Error(`unterminated ${name}`);
+};
 
 // ── the helper itself ────────────────────────────────────────────────────────
 ok(lines.some((l) => l.startsWith('const hostLocal = ')), 'app.js defines a hostLocal() helper');
@@ -66,5 +77,81 @@ for (const l of lines.filter((l) => l.includes('cd ${v.worldPath}')))
 for (const l of lines.filter((l) => /localPath:/.test(l)))
   ok(l.includes('localWorldPath(v)'), 'a rendered world localPath goes through localWorldPath');
 
-console.log(`${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+// ── Phone Access is setup for reaching a loopback karmax from elsewhere ──────
+// Off-machine there is nothing to set up: you are already reading this page at
+// the URL the section would help you obtain, and /api/remote-access 503s (it
+// drives tailscale/pkexec on the host), so rendering the card only produces a
+// permanent "Needs attention" error.
+for (const marker of ['id="settings-access"', '#settings-access'])
+  for (const l of lines.filter((l) => l.includes(marker)))
+    ok(l.includes('hostLocal()'), `the Phone Access ${marker} is gated on hostLocal()`);
+// The card itself sits on its own line inside that gated template, so check it
+// structurally: it must fall between the gate's `${hostLocal() ?` and its `: ''}`.
+const gateStart = src.indexOf('${hostLocal() ? `<div class="settings-section-title" id="settings-access"');
+const gateEnd = src.indexOf(": ''}", gateStart);
+ok(gateStart > 0 && gateEnd > gateStart, 'the Phone Access section is wrapped in a hostLocal() gate');
+ok(src.indexOf('id="phone-access-card"') > gateStart && src.indexOf('id="phone-access-card"') < gateEnd,
+  'the Phone Access card renders only inside that gate');
+ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess()')),
+  'the Phone Access status is not fetched when the endpoint is withdrawn');
+
+// ── wording that only holds on the machine running karmax ───────────────────
+// "On localhost, setup works without a webhook" is a claim about THIS install's
+// reachability. It is stated before the GitHub App exists, so the server's
+// derived syncMode is still 'on-demand' either way and cannot carry it.
+for (const l of lines.filter((l) => l.includes('On localhost, setup works')))
+  ok(l.includes('hostLocal()'), 'the GitHub App localhost note is gated on hostLocal()');
+
+// Neither of these should still say "host path"/"this host" as if the reader
+// were sitting at it.
+for (const [marker, what] of [['Choose a host path', 'the data-import conflict toast'],
+  ['Connect the store CLI on this host', 'the password-manager tooltip']])
+  ok(!src.includes(marker), `${what} no longer addresses the reader as the host`);
+
+// ── content that assumes one machine everyone shares (the SaaS axis) ────────
+// Distinct from hostLocal: a self-host on a public URL still has exactly one
+// operator, and its worlds really do inherit that machine's git config.
+for (const l of lines.filter((l) => l.includes('use the host’s own Git setup')))
+  ok(/S\.meta\?\.hosted/.test(src.slice(src.indexOf(l) - 400, src.indexOf(l) + 200)),
+    'the "inherits the host git setup" empty state is not claimed on a managed cell');
+
+// ── installation-wide settings are absent unless the server says you own them ─
+// The console has no capability model, so each of these asks its endpoint and
+// stays absent on a refusal or canManage:false. Deployment mode is NOT the lever:
+// outbound email has no env path, so hiding it on `hosted` would leave a SaaS
+// operator no way to configure email at all.
+// All three fail closed the same way: the markup ships empty and `hidden`, and
+// only the server's `canManage` reveals it. Rendering first and removing later
+// would flash an operator control at a tenant on a slow connection.
+for (const [id, endpoint] of [['resilience-card', '/api/safe-mode'], ['outbound-email-card', '/api/email']]) {
+  ok(new RegExp(`id="${id}" hidden></div>`).test(src), `#${id} ships empty and hidden`);
+  ok(new RegExp(`hydrateInstallationCard\\('#${id}', '${endpoint.replace(/\//g, '\\/')}'`).test(src),
+    `#${id} is hydrated through the shared installation-card helper`);
+}
+ok(/class="pay-stripe-platform"[^>]*\shidden>/.test(src), 'the shared Stripe Connect box ships hidden too');
+ok(/platformBox\.hidden = false/.test(src), 'the Stripe box is revealed only once the server allows managing it');
+
+// Nothing may render an installation control and take it away afterwards.
+for (const dead of ['card.remove()', 'platformBox.remove()', "platform.canManage ? '' : 'disabled'"])
+  ok(!src.includes(dead), `no reveal-then-retract or disabled-input fallback remains (${dead})`);
+
+// The helper itself, exercised rather than grepped: a card must stay hidden and
+// unfilled for anyone the server does not vouch for.
+loadFn('hydrateInstallationCard');
+const runHydrate = async (answer) => {
+  const card = { hidden: true, filled: false };
+  global.document = { querySelector: () => card };
+  global.api = async () => { if (answer instanceof Error) throw answer; return answer; };
+  await hydrateInstallationCard('#x', '/api/x', (c) => { c.filled = true; });
+  return card;
+};
+(async () => {
+  const operator = await runHydrate({ canManage: true });
+  ok(operator.hidden === false && operator.filled, 'an operator gets the card revealed and filled');
+  for (const [label, answer] of [['canManage:false', { canManage: false }], ['a refused read', new Error('403')]]) {
+    const tenant = await runHydrate(answer);
+    ok(tenant.hidden === true && !tenant.filled, `${label} leaves the card hidden and unfilled`);
+  }
+  console.log(`${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+})();

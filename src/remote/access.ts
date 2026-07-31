@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 
 const pexec = promisify(execFile);
 
-export type RemoteMethod = 'tailscale' | 'hosted' | 'none';
+export type RemoteMethod = 'tailscale' | 'none';
 export type RemoteState = 'ready' | 'available' | 'needs-login' | 'unavailable' | 'conflict' | 'error';
 export type RemoteSetupStage = 'install' | 'authorize' | 'login' | 'connect' | 'serve' | 'ready';
 
@@ -128,8 +128,6 @@ export class RemoteAccessController {
 
   constructor(private readonly options: {
     port: () => number;
-    hosted?: boolean;
-    publicUrl?: string;
     run?: Run;
     elevate?: Run;
     platform?: NodeJS.Platform;
@@ -177,19 +175,6 @@ export class RemoteAccessController {
   }
 
   async status(): Promise<RemoteAccessStatus> {
-    if (this.options.hosted) {
-      return {
-        method: 'hosted',
-        state: 'ready',
-        setupStage: 'ready',
-        ...(this.options.publicUrl ? { url: this.options.publicUrl } : {}),
-        detail: 'This hosted installation already uses authenticated HTTPS.',
-        canSetup: false,
-        canEnable: false,
-        canDisable: false,
-      };
-    }
-
     let node: Record<string, any>;
     try {
       const result = await this.run(['status', '--json']);
@@ -359,7 +344,7 @@ export class RemoteAccessController {
 
   private async advanceSetup(): Promise<RemoteAccessStatus> {
     let current = await this.status();
-    if (current.method === 'hosted' || current.state === 'ready' || current.state === 'unavailable' || current.state === 'conflict') {
+    if (current.state === 'ready' || current.state === 'unavailable' || current.state === 'conflict') {
       return current;
     }
 

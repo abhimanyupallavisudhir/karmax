@@ -483,11 +483,7 @@ async function main() {
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));
   let gatewayPort = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : 4505;
-  const remoteAccess = new RemoteAccessController({
-    port: () => gatewayPort,
-    hosted: deployment.hosted,
-    publicUrl,
-  });
+  const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
   const gateway = new Gateway({
     api,
     store,
@@ -546,7 +542,7 @@ async function main() {
   console.log(`\n  ✓ krmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
   try {
-    if (!deployment.hosted) {
+    if (deployment.hostLocal) {
       const remote = await remoteAccessPlan(port, { hasPassword: true });
       console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
     }

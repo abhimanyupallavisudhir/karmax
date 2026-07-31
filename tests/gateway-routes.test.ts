@@ -57,6 +57,10 @@ describe('gateway route capability binding', () => {
     // The ordinary organization read is unchanged.
     expect(cap('GET', '/api/organizations/o1')).toBe('organization:read');
   });
+
+  it('gates a password-manager export import as a credential write', () => {
+    expect(cap('POST', '/api/vault/import/bitwarden')).toBe('credential:write');
+  });
 });
 
 describe('gateway route capability catalog', () => {
