@@ -16,6 +16,15 @@ function extractFunction(name: string): string {
 }
 
 describe('Project settings browser source', () => {
+  it('uses the same name-first heading hierarchy for project and organization settings', () => {
+    const project = source.slice(source.indexOf('function settingsView('), source.indexOf('function cloudEnvironmentCard('));
+    const organization = source.slice(source.indexOf('function organizationView('), source.indexOf('function pendingInvitationRow('));
+
+    expect(project).toContain('<h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p>');
+    expect(organization).toContain('<h1 class="page-title">${esc(org?.name || \'Organization\')}</h1>');
+    expect(organization).toContain('<p class="settings-intro">Organization settings</p>');
+  });
+
   it('formats discovered and revision byte sizes without a missing global', () => {
     const formatBytes = Function(`${extractFunction('formatBytes')}; return formatBytes;`)() as (value: unknown) => string;
     expect(formatBytes(0)).toBe('0 B');

@@ -2601,6 +2601,7 @@ function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
   if (draggingProject) return; // never repaint out from under a drag in flight
+  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
   // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
@@ -2613,7 +2614,7 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
-        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0" draggable="true" title="Drag to reorder">
+        (p) => `<a class="proj ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0" draggable="true" title="Drag to reorder">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
         </a>`,
       )
@@ -11530,8 +11531,8 @@ function cycleSettingsPane(delta) {
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
-  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">Settings</h1>
-    <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
+  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(org?.name || 'Organization')}</h1>
+    <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
     <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
