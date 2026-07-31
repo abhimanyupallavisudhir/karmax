@@ -5,12 +5,9 @@ import type { World, WorldGitIdentity, WorldRepo } from './types.js';
 import { sharesHostRefDatabase, worldRepos, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
+import { materializeGitCredential, type GitCredential } from './git-credential.js';
 
-export interface GitBrokerCredential {
-  /** Private key is materialized to a 0600 file only for one broker operation. */
-  sshKey?: string;
-  env?: Record<string, string>;
-}
+export interface GitBrokerCredential extends GitCredential {}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
 export interface GitBrokerPublishResult {
   pushed: string[];
@@ -272,12 +269,7 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
   }
   if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error('Git broker requires an SSH remote');
   const credential = await resolveCredential(auth, repo);
-  const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
-  if (credential.sshKey) {
-    const keyPath = path.join(temp, 'repository.key');
-    fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
-    env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-  }
+  const { env } = materializeGitCredential(temp, credential);
   const clone = path.join(temp, 'repo');
   const cloned = await git(temp, ['clone', '-q', '--branch', branch, '--single-branch', repo.repo, clone],
     { env, timeoutMs: 10 * 60_000 });
@@ -440,12 +432,7 @@ async function withTransferredRepo<T>(
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   try {
     const credential = await resolveCredential(auth, repo);
-    const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
-    if (credential.sshKey) {
-      const keyPath = path.join(temp, 'repository.key');
-      fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
-      env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-    }
+    const { env } = materializeGitCredential(temp, credential);
     const bundlePath = path.join(temp, 'world.bundle');
     await fs.promises.writeFile(bundlePath, transferred, { mode: 0o600 });
     const clone = path.join(temp, 'repo');

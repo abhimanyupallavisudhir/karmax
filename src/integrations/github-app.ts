@@ -1,17 +1,11 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import net from 'node:net';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import os from 'node:os';
-import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
 import { pullRequestWebhookEvent, type GithubPrWebhookEvent } from './github-pr.js';
 
-const pexec = promisify(execFile);
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
 export const GITHUB_APP_CLIENT_SECRET_HANDLE = 'github-app:client-secret';
@@ -61,7 +55,6 @@ export interface GitHubAppOptions {
   clientId?: string;
   apiBase?: string;
   fetch?: typeof fetch;
-  keyPair?: () => Promise<{ privateKey: string; publicKey: string }>;
   /** Injectable delay for rate-limit/5xx backoff (tests pass a no-op). */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -85,18 +78,11 @@ const MAX_RETRY_WAIT_MS = 60_000;
  *    sends; it SETS membership of a fixed repository in a fixed installation
  *    (204, no body, no id minted), so a repeat is a no-op. Genuinely idempotent,
  *    not merely idempotent-by-RFC.
- *  - DELETE `/repos/:o/:r/keys/:id` — the only DELETE karmax sends; it names an
- *    already-existing resource, so a repeat either deletes it or 404s, and every
- *    caller (`deleteDeployKey`) already tolerates that 404. GitHub does not
- *    recycle key ids, so a retry cannot hit a different key.
- * POST is deliberately absent: `POST /repos/:o/:r/keys` MINTS a resource, and
- * retrying it after a processed-then-5xx create enrolls a SECOND write-capable
- * deploy key whose id karmax never records — orphaned at GitHub with write
- * access forever, because `removeOrphanDeployKeys` only sweeps repositories with
- * no local record at all. Do not "improve reliability" by widening this set: a
- * failed write must surface so the caller can decide, and the callers here are
- * either idempotent themselves (`ensureRepository`, `ensureDeployKeys`) or
- * redelivered by GitHub. PATCH is absent for the same reason.
+ *  - DELETE `/repos/:o/:r/keys/:id` — legacy deploy-key cleanup names an
+ *    already-existing resource, so a repeat either deletes it or 404s.
+ * POST is deliberately absent: token minting and repository creation are not
+ * safe to replay after a processed-then-5xx response. PATCH is absent for the
+ * same reason.
  */
 const RETRYABLE_5XX_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
 /**
@@ -142,15 +128,14 @@ function retryDelayMs(response: Response, attempt = 0, method = 'GET'): number |
   return undefined;
 }
 
-/** Organization-owned GitHub App integration. App and deploy-key secrets live
- * only in the credential broker; durable records carry installation/key IDs. */
+/** Organization-owned GitHub App integration. Durable App secrets live only in
+ * the credential broker. Git transport uses short-lived installation tokens. */
 export class GitHubAppService {
   private fetcher: typeof fetch;
   private apiBase: string;
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
-  private keyPair: () => Promise<{ privateKey: string; publicKey: string }>;
 
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
     this.options = {
@@ -161,7 +146,6 @@ export class GitHubAppService {
     };
     this.fetcher = options.fetch ?? fetch;
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
-    this.keyPair = options.keyPair ?? generateEd25519KeyPair;
   }
 
   configured(): boolean {
@@ -226,7 +210,7 @@ export class GitHubAppService {
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
       callback_urls: [`${origin}/api/github/oauth/callback`],
-      default_permissions: { administration: 'write', contents: 'write', metadata: 'read', pull_requests: 'write' },
+      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
     // cannot reach them. Local Karmax instances reconcile installations on
@@ -325,7 +309,7 @@ export class GitHubAppService {
         providerId: String(item.id), owner: item.owner.login, name: item.name, sshUrl: item.ssh_url,
         defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id });
       active.add(repository.id);
-      await this.ensureDeployKeys(repository, token);
+      await this.removeLegacyDeployKeys(repository, token);
       repositories.push(repository);
     }
     for (const repository of this.store.listRepositories(connection.organizationId)) {
@@ -442,23 +426,45 @@ export class GitHubAppService {
     return mint;
   }
 
-  /** Read-only material is for provisioning; write material is broker-only. */
-  repositorySshKey(repositoryId: string, mode: 'clone' | 'write'): string {
-    const keys = this.store.repositoryDeployKeys(repositoryId);
-    if (!keys) throw new Error(`repository ${repositoryId} has no deploy keys`);
-    const handle = mode === 'clone' ? keys.cloneHandle : keys.writeHandle;
-    return this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
-  }
-
-  async brokerCredentials(repository: Repository): Promise<{ sshKey: string; env: Record<string, string> }> {
+  async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {
     if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
     const connection = this.store.getGitConnection(repository.gitConnectionId);
     if (!connection) throw new Error('repository GitHub App connection is missing');
-    return { sshKey: this.repositorySshKey(repository.id, 'write'), env: { GH_TOKEN: await this.installationToken(connection) } };
+    const token = await this.installationToken(connection);
+    return { httpsToken: token, env: { GH_TOKEN: token } };
+  }
+
+  /**
+   * Mint a read-only token scoped to one repository for trusted world
+   * provisioning. It is deliberately not cached: the caller materializes it
+   * only long enough to clone, then removes it before the agent starts.
+   */
+  async repositoryCloneToken(repository: Repository): Promise<string> {
+    return this.repositoryToken(repository);
+  }
+
+  /** Mint the least-powerful clone credential for one repository. The sandbox
+   * never receives the installation-wide token used by trusted host services. */
+  private async repositoryToken(repository: Repository): Promise<string> {
+    if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
+    const connection = this.store.getGitConnection(repository.gitConnectionId);
+    if (!connection) throw new Error('repository GitHub App connection is missing');
+    if (connection.suspendedAt) throw new Error('GitHub App installation is suspended');
+    if (!/^\d+$/.test(repository.providerId ?? ''))
+      throw new Error(`repository ${repository.id} has no GitHub repository id`);
+    const created = await this.appRequest<{ token: string }>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}/access_tokens`,
+      { method: 'POST', body: JSON.stringify({
+        repository_ids: [Number(repository.providerId)],
+        permissions: { contents: 'read' },
+      }) },
+    );
+    if (!created.token) throw new Error('GitHub returned no installation token');
+    return created.token;
   }
 
   /** Create a GitHub repository, add it to a selected-repository App
-   * installation, enroll isolated deploy keys, and return the durable record. */
+   * installation, and return the durable record. */
   async createRepository(connectionId: string, userId: string, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
   }): Promise<Repository> {
@@ -477,7 +483,7 @@ export class GitHubAppService {
 
   /** Idempotently provision a platform-owned repository. A previous attempt can
    * succeed at GitHub and then be interrupted before the durable record or
-   * deploy keys are saved; retrying must adopt that exact private repository
+   * repository record is saved; retrying must adopt that exact private repository
    * instead of repeatedly failing with GitHub's "name already exists" 422. */
   async ensureRepository(connectionId: string, userId: string, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
@@ -540,13 +546,13 @@ export class GitHubAppService {
       providerId: String(created.id), owner: created.owner.login, name: created.name, sshUrl: created.ssh_url,
       defaultBranch: defaultBranch?.trim() || created.default_branch || 'main', private: created.private,
       gitConnectionId: connection.id });
-    await this.ensureDeployKeys(repository, installationToken);
+    await this.removeLegacyDeployKeys(repository, installationToken);
     return repository;
   }
 
-  /** Remove every repository-scoped key Karmax installed for a tenant. Failure
-   * is surfaced so organization deletion can be retried instead of orphaning a
-   * write-capable deploy key in GitHub.
+  /** Remove deploy keys left by versions that predate installation-token Git
+   * transport. Failure is surfaced so organization deletion can be retried
+   * instead of orphaning a write-capable key in GitHub.
    *
    * A SUSPENDED (or deleted) installation is the exception: `installationToken`
    * refuses to mint for one, so minting unconditionally whenever repositories
@@ -558,7 +564,8 @@ export class GitHubAppService {
   async disconnectOrganization(organizationId: string): Promise<void> {
     for (const connection of this.store.listGitConnections(organizationId)) {
       const repositories = this.store.listRepositories(organizationId).filter((repo) => repo.gitConnectionId === connection.id);
-      const token = repositories.length && !connection.suspendedAt ? await this.installationToken(connection) : undefined;
+      const hasLegacyKeys = repositories.some((repository) => this.store.repositoryDeployKeys(repository.id));
+      const token = hasLegacyKeys && !connection.suspendedAt ? await this.installationToken(connection) : undefined;
       for (const repository of repositories) {
         const keys = this.store.repositoryDeployKeys(repository.id);
         if (!keys) continue;
@@ -568,72 +575,23 @@ export class GitHubAppService {
         }
         this.broker.deleteHandle(keys.cloneHandle);
         this.broker.deleteHandle(keys.writeHandle);
+        this.store.clearRepositoryDeployKeys(repository.id);
       }
       this.tokenCache.delete(connection.id);
     }
   }
 
-  /**
-   * Enroll this repository's isolated clone/write deploy keys, exactly once.
-   *
-   * Both keys are created at GitHub before anything durable is written, so a
-   * crash in the middle leaves keys GitHub knows about and karmax does not — and
-   * the next reconcile, seeing no local record, mints two more. The `catch` below
-   * covers an *error* (it deletes what it created), but not a process death.
-   *
-   * The durable mitigation is here: before creating anything, sweep GitHub's
-   * existing keys for karmax's own deterministic titles and delete the orphans.
-   * `karmax clone <repositoryId>` / `karmax broker <repositoryId>` are unique per
-   * repository and only ever written by this method, so a key bearing one with no
-   * local record can only be such an orphan. Best-effort — a listing failure must
-   * not block enrollment.
-   */
-  private async ensureDeployKeys(repository: Repository, installationToken: string): Promise<void> {
-    if (this.store.repositoryDeployKeys(repository.id)) return;
-    await this.removeOrphanDeployKeys(repository, installationToken);
-    const clone = await this.keyPair();
-    const write = await this.keyPair();
-    let cloneKeyId: string | undefined;
-    let writeKeyId: string | undefined;
-    const cloneHandle = repositoryKeyHandle(repository.id, 'clone');
-    const writeHandle = repositoryKeyHandle(repository.id, 'write');
-    try {
-      const cloneCreated = await this.request<{ id: number | string }>(
-        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/keys`, installationToken,
-        { method: 'POST', body: JSON.stringify({ title: `karmax clone ${repository.id}`, key: clone.publicKey, read_only: true }) },
-      );
-      cloneKeyId = String(cloneCreated.id);
-      const writeCreated = await this.request<{ id: number | string }>(
-        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/keys`, installationToken,
-        { method: 'POST', body: JSON.stringify({ title: `karmax broker ${repository.id}`, key: write.publicKey, read_only: false }) },
-      );
-      writeKeyId = String(writeCreated.id);
-      this.broker.registerHandle(cloneHandle, clone.privateKey);
-      this.broker.registerHandle(writeHandle, write.privateKey);
-      this.store.setRepositoryDeployKeys({ repositoryId: repository.id, cloneKeyId,
-        writeKeyId, cloneHandle, writeHandle });
-    } catch (error) {
-      if (cloneKeyId) await this.deleteDeployKey(repository, cloneKeyId, installationToken).catch(() => undefined);
-      if (writeKeyId) await this.deleteDeployKey(repository, writeKeyId, installationToken).catch(() => undefined);
-      this.broker.deleteHandle(cloneHandle);
-      this.broker.deleteHandle(writeHandle);
-      throw error;
-    }
-  }
-
-  /** Delete deploy keys GitHub still has under karmax's own titles for a
-   *  repository karmax has no local record for (see `ensureDeployKeys`). */
-  private async removeOrphanDeployKeys(repository: Repository, installationToken: string): Promise<void> {
-    const titles = new Set([`karmax clone ${repository.id}`, `karmax broker ${repository.id}`]);
-    try {
-      const existing = await this.request<Array<{ id: number | string; title?: string }>>(
-        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/keys?per_page=100`,
-        installationToken);
-      if (!Array.isArray(existing)) return;
-      for (const key of existing) {
-        if (key?.title && titles.has(key.title)) await this.deleteDeployKey(repository, String(key.id), installationToken);
-      }
-    } catch { /* listing is a best-effort cleanup; never block enrollment */ }
+  /** One-way migration away from the two per-repository deploy keys. New
+   * connections never create these records; a refresh removes old remote keys,
+   * deletes their private material, and clears the compatibility row. */
+  private async removeLegacyDeployKeys(repository: Repository, installationToken: string): Promise<void> {
+    const keys = this.store.repositoryDeployKeys(repository.id);
+    if (!keys) return;
+    await this.deleteDeployKey(repository, keys.cloneKeyId, installationToken);
+    await this.deleteDeployKey(repository, keys.writeKeyId, installationToken);
+    this.broker.deleteHandle(keys.cloneHandle);
+    this.broker.deleteHandle(keys.writeHandle);
+    this.store.clearRepositoryDeployKeys(repository.id);
   }
 
   private async removeRepository(repository: Repository, installationToken: string): Promise<void> {
@@ -645,6 +603,7 @@ export class GitHubAppService {
       ].map((promise) => promise.catch(() => undefined)));
       this.broker.deleteHandle(keys.cloneHandle);
       this.broker.deleteHandle(keys.writeHandle);
+      this.store.clearRepositoryDeployKeys(repository.id);
     }
     this.store.deleteRepository(repository.id);
   }
@@ -790,17 +749,6 @@ export class GitHubAppService {
     });
     if (!response.ok) throw new Error(`GitHub OAuth failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
     return response.json();
-  }
-}
-
-async function generateEd25519KeyPair(): Promise<{ privateKey: string; publicKey: string }> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-key-'));
-  const file = path.join(dir, 'id_ed25519');
-  try {
-    await pexec('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'karmax', '-f', file], { timeout: 15_000 });
-    return { privateKey: fs.readFileSync(file, 'utf8'), publicKey: fs.readFileSync(`${file}.pub`, 'utf8').trim() };
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 

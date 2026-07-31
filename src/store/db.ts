@@ -1586,6 +1586,10 @@ export class Store {
     return this.db.prepare('SELECT * FROM repository_deploy_keys WHERE repositoryId=?').get(repositoryId) as any;
   }
 
+  clearRepositoryDeployKeys(repositoryId: string): void {
+    this.db.prepare('DELETE FROM repository_deploy_keys WHERE repositoryId=?').run(repositoryId);
+  }
+
   /** Claim a webhook delivery id. `false` ⇒ already consumed (a duplicate). The
    *  claim is provisional: a handler that fails must `releaseGithubDelivery` so
    *  GitHub's redelivery is not discarded as a duplicate. Rows age out via

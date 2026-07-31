@@ -803,7 +803,7 @@ describe('existing project wiki remote backfill', () => {
           gitConnectionId: connection.id,
         });
       },
-      repositorySshKey: () => 'unused-for-file-transport',
+      brokerCredentials: async () => ({ httpsToken: 'unused-for-file-transport' }),
     };
     const worlds = new WorldRegistry();
     const gateway = new Gateway({
