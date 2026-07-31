@@ -167,6 +167,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // the handler against the caller's own capability set.
   if (p === '/api/vault/store' || p === '/api/vault/passkey/save') return 'vault:store';
   if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
+  if (p === '/api/vault/import/bitwarden') return 'credential:write';
   if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
   // Connectors: describe is read; connect/sync/config/write-back are admin.
   if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
@@ -176,7 +177,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/agent-mail/ingest') return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
-  if (p === '/api/safe-mode') return 'safe-mode:write';
+  if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
   // like the mailbox provider. The connected secret never leaves the vault.
   if (p === '/api/email' || p.startsWith('/api/email/')) return read ? 'settings:read' : 'settings:write';
@@ -3467,6 +3468,40 @@ export class Gateway {
           ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', note: 'note' })[type];
         const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
 
+        if (p === '/api/vault/import/bitwarden' && method === 'POST') {
+          try {
+            // The browser sends a one-time plaintext JSON export. Keep it in
+            // request memory only: the importer writes each supported secret
+            // straight through VaultItems into the encrypted broker.
+            const b = await this.body(req, 51 * 1024 * 1024);
+            const source = b && typeof b === 'object' && Object.prototype.hasOwnProperty.call(b, 'export') ? b.export : b;
+            const requestedPolicy = b?.policy && typeof b.policy === 'object' ? b.policy : undefined;
+            const policy = requestedPolicy ? {
+              use: requestedPolicy.use === 'ask' ? 'ask' as const : 'auto' as const,
+              reveal: requestedPolicy.reveal === 'auto' || requestedPolicy.reveal === 'never'
+                ? requestedPolicy.reveal as 'auto' | 'never'
+                : 'ask' as const,
+            } : undefined;
+            const { importBitwardenExport } = await import('../autonomy/bitwarden-import.js');
+            const result = importBitwardenExport(vault, source, policy);
+            store.appendAudit({
+              principalId: principal,
+              action: 'vault.imported',
+              scopeKey: organizationId,
+              detail: {
+                source: 'bitwarden',
+                count: result.count,
+                created: result.created,
+                updated: result.updated,
+                skipped: result.skipped.length,
+              },
+            });
+            return this.json(res, 200, result);
+          } catch (e) {
+            const status = e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 400;
+            return this.json(res, status, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
         if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
@@ -3489,7 +3524,8 @@ export class Gateway {
           if (b.id && b.secrets && Object.keys(b.secrets).length) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+                { hostLocal: this.hostLocal, hosted: this.deps.hosted })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3561,7 +3597,8 @@ export class Gateway {
           if (prior && b.secrets) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
-              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal })
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+                { hostLocal: this.hostLocal, hosted: this.deps.hosted })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -3574,7 +3611,8 @@ export class Gateway {
           let writeBack: Array<{ connector: string; externalId?: string; error?: string }> = [];
           if (!prior) {
             const { defaultConnectors } = await import('../autonomy/connectors.js');
-            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal }).writeBackCreated(saved.id);
+            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId,
+              { hostLocal: this.hostLocal, hosted: this.deps.hosted }).writeBackCreated(saved.id);
             for (const result of writeBack) {
               store.appendAudit({ principalId: callerTaskId ? `task:${callerTaskId}` : principal,
                 action: result.error ? 'vault.write_back.failed' : 'vault.write_back',
@@ -3700,7 +3738,8 @@ export class Gateway {
         if (p.startsWith('/api/vault/connectors')) {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
           const { defaultConnectors } = await import('../autonomy/connectors.js');
-          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId, { hostLocal: this.hostLocal });
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId,
+            { hostLocal: this.hostLocal, hosted: this.deps.hosted });
           if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
           const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
           if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });
@@ -3838,6 +3877,7 @@ export class Gateway {
         return this.json(res, 200, {
           provider: config.provider, from: config.from,
           configured: this.deps.email?.configured() ?? false,
+          canManage: this.deps.tokens.check(token, 'settings:write').ok,
           providers: describeOutboundProviders(config),
         });
       }
@@ -4436,6 +4476,13 @@ export class Gateway {
       }
 
       // safe mode toggle
+      // Installation-wide: safe mode reboots the whole cell. The console renders
+      // every card for everyone, so the server has to say who may manage this —
+      // the same server-derived `canManage` the Stripe Connect card takes.
+      if (p === '/api/safe-mode' && method === 'GET') {
+        return this.json(res, 200, { safeMode: this.safeMode,
+          canManage: this.deps.tokens.check(token, 'safe-mode:write').ok });
+      }
       if (p === '/api/safe-mode' && method === 'POST') {
         const b = await this.body(req);
         this.safeMode = !!b.enabled;

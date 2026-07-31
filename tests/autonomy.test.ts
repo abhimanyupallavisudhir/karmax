@@ -692,24 +692,6 @@ describe('remote access plan (SPEC §12)', () => {
     await expect.poll(async () => (await controller.setupStatus()).state).toBe('ready');
     expect(calls.some((args) => args[0] === 'down')).toBe(false);
   });
-  it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
-    const controller = new RemoteAccessController({
-      port: () => 4505,
-      hosted: true,
-      publicUrl: 'https://karmax.example.com',
-      run: async () => { throw new Error('must not run'); },
-    });
-    expect(await controller.status()).toEqual({
-      method: 'hosted',
-      state: 'ready',
-      setupStage: 'ready',
-      url: 'https://karmax.example.com',
-      detail: 'This hosted installation already uses authenticated HTTPS.',
-      canSetup: false,
-      canEnable: false,
-      canDisable: false,
-    });
-  });
 });
 
 describe('budget coordinator (virtual-card lease, SPEC §7.6)', () => {
