@@ -149,12 +149,14 @@ export interface WorldSpec {
    * Providers may install them into the isolated world, but must never persist
    * their values in WorldHandle or logs. */
   gitCredentials?: {
-    /** Disable host gh/SSH/helper fallback when no explicit key matches. */
+    /** Disable host gh/SSH/helper fallback when no explicit credential matches. */
     isolated?: boolean;
     /** Compatibility key for one repository/local profiles. */
     sshKey?: string;
-    /** SSH URL -> distinct read-only clone key for hosted repository records. */
+    /** SSH URL -> distinct read-only clone key for non-GitHub repositories. */
     repositories?: Record<string, string>;
+    /** SSH-shaped GitHub URL -> short-lived, repository-scoped App token. */
+    httpsTokens?: Record<string, string>;
   };
   /** Per-repository branch policy supplied by first-class hosted repository
    * attachments. Keys are the exact SSH URLs in `repos`. */

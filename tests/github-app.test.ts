@@ -9,14 +9,13 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 
 describe('GitHub App integration', () => {
-  it('bootstraps itself through an App manifest, authorizes a user, and creates plus enrolls a repository', async () => {
+  it('bootstraps itself through an App manifest and creates a repository without deploy keys', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-turnkey-'));
     const store = new Store(':memory:');
     const broker = new CredentialBroker(new Vault(dir));
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
-    let keyId = 500;
     const calls: Array<{ host: string; path: string; method: string; body?: string }> = [];
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
@@ -31,11 +30,9 @@ describe('GitHub App integration', () => {
       if (url.pathname === '/orgs/acme/repos' && init.method === 'POST') return Response.json({ id: 77, name: 'new-app', private: true,
         ssh_url: 'git@github.com:acme/new-app.git', default_branch: 'main', owner: { login: 'acme' } });
       if (url.pathname === '/user/installations/42/repositories/77' && init.method === 'PUT') return new Response(null, { status: 204 });
-      if (url.pathname === '/repos/acme/new-app/keys' && init.method === 'POST') return Response.json({ id: ++keyId });
       return new Response('not found', { status: 404 });
     };
-    const service = new GitHubAppService(store, broker, { fetch: fakeFetch as typeof fetch,
-      keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId}` }) });
+    const service = new GitHubAppService(store, broker, { fetch: fakeFetch as typeof fetch });
 
     const manifest = service.manifest('https://karmax.example', 'state');
     expect(manifest.action).toBe('https://github.com/settings/apps/new');
@@ -45,6 +42,7 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
     expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review']);
+    expect(manifest.manifest).not.toHaveProperty('default_permissions.administration');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
     expect(service.status('owner')).toMatchObject({ configured: true, appSlug: 'karmax-acme', oauthConfigured: true,
@@ -58,7 +56,8 @@ describe('GitHub App integration', () => {
     expect(service.status('owner').userAuthorized).toBe(true);
     const repository = await service.createRepository(connected.connection.id, 'owner', { name: 'new-app', private: true });
     expect(repository).toMatchObject({ owner: 'acme', name: 'new-app', sshUrl: 'git@github.com:acme/new-app.git' });
-    expect(store.repositoryDeployKeys(repository.id)).toBeTruthy();
+    expect(store.repositoryDeployKeys(repository.id)).toBeUndefined();
+    expect(calls.some((call) => call.path.endsWith('/keys'))).toBe(false);
     expect(calls.some((call) => call.path === '/user/installations/42/repositories/77' && call.method === 'PUT')).toBe(true);
     expect(calls.find((call) => call.path === '/login/oauth/access_token')?.body).toContain('redirect_uri=');
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
@@ -88,7 +87,6 @@ describe('GitHub App integration', () => {
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    let keyId = 700;
     const calls: Array<{ path: string; method: string }> = [];
     const payload = { id: 77, name: 'project-wiki', private: true,
       ssh_url: 'git@github.com:acme/project-wiki.git', default_branch: 'main', owner: { login: 'acme' } };
@@ -111,19 +109,14 @@ describe('GitHub App integration', () => {
         return new Response('installation has access to all repositories', { status: 422 });
       if (url.pathname === '/app/installations/42/access_tokens')
         return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
-      if (url.pathname === '/repos/acme/project-wiki/keys' && init.method === 'POST')
-        return Response.json({ id: ++keyId });
-      if (url.pathname === '/repos/acme/all-repos-wiki/keys' && init.method === 'POST')
-        return Response.json({ id: ++keyId });
       return new Response('not found', { status: 404 });
     };
-    const service = new GitHubAppService(store, broker, { appId: '123', fetch: fakeFetch as typeof fetch,
-      keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId}` }) });
+    const service = new GitHubAppService(store, broker, { appId: '123', fetch: fakeFetch as typeof fetch });
 
     const repository = await service.ensureRepository(connection.id, 'owner',
       { name: 'project-wiki', private: true, autoInit: false });
     expect(repository).toMatchObject({ providerId: '77', name: 'project-wiki', private: true });
-    expect(store.repositoryDeployKeys(repository.id)).toBeTruthy();
+    expect(store.repositoryDeployKeys(repository.id)).toBeUndefined();
     expect(calls.some((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toBe(false);
     expect(calls).toContainEqual({ path: '/user/installations/42/repositories/77', method: 'PUT' });
     await expect(service.ensureRepository(connection.id, 'owner',
@@ -151,7 +144,6 @@ describe('GitHub App integration', () => {
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
-    let keyId = 800;
     let refreshes = 0;
     const payload = { id: 77, name: 'project-wiki', private: true,
       ssh_url: 'git@github.com:acme/project-wiki.git', default_branch: 'main', owner: { login: 'acme' } };
@@ -170,11 +162,10 @@ describe('GitHub App integration', () => {
         return new Response(null, { status: 204 });
       if (url.pathname === '/app/installations/42/access_tokens')
         return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
-      if (url.pathname === '/repos/acme/project-wiki/keys' && init.method === 'POST') return Response.json({ id: ++keyId });
       return new Response('not found', { status: 404 });
     };
     const service = new GitHubAppService(store, broker, { appId: '123', clientId: 'Iv1.client',
-      fetch: fakeFetch as typeof fetch, keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId}` }) });
+      fetch: fakeFetch as typeof fetch });
 
     // Provisioning must recover instead of surfacing GitHub's "Bad credentials" 401.
     const repository = await service.ensureRepository(connection.id, 'owner',
@@ -218,7 +209,7 @@ describe('GitHub App integration', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('imports installation repositories, creates separate clone/write deploy keys, verifies webhooks, and cleans up removal', async () => {
+  it('imports repositories, uses scoped installation tokens for Git, and verifies webhooks', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-app-'));
     const store = new Store(':memory:');
     const broker = new CredentialBroker(new Vault(dir));
@@ -229,7 +220,6 @@ describe('GitHub App integration', () => {
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     let repositories = [{ id: 7, name: 'app', private: true, ssh_url: 'git@github.com:acme/app.git',
       default_branch: 'main', owner: { login: 'acme' } }];
-    let keyId = 100;
     const calls: Array<{ path: string; method: string; body?: any; auth?: string }> = [];
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
@@ -239,12 +229,10 @@ describe('GitHub App integration', () => {
       if (url.pathname === '/app/installations/42') return Response.json({ id: 42, account: { login: 'acme', type: 'Organization' } });
       if (url.pathname === '/app/installations/42/access_tokens') return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
       if (url.pathname === '/installation/repositories') return Response.json({ repositories });
-      if (url.pathname === '/repos/acme/app/keys' && init.method === 'POST') return Response.json({ id: ++keyId });
-      if (url.pathname.startsWith('/repos/acme/app/keys/') && init.method === 'DELETE') return new Response(null, { status: 204 });
       return new Response('not found', { status: 404 });
     };
-    const service = new GitHubAppService(store, broker, { appId: '123', appSlug: 'karmax-test', fetch: fakeFetch as typeof fetch,
-      keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId} karmax` }) });
+    const service = new GitHubAppService(store, broker, { appId: '123', appSlug: 'karmax-test',
+      fetch: fakeFetch as typeof fetch });
 
     const install = new URL(service.installationUrl('one-time-state'));
     expect(install.pathname).toBe('/apps/karmax-test/installations/new');
@@ -253,12 +241,17 @@ describe('GitHub App integration', () => {
     const connected = await service.connectInstallation(organization.id, '42');
     expect(connected.repositories).toHaveLength(1);
     const repository = connected.repositories[0]!;
-    const keys = store.repositoryDeployKeys(repository.id)!;
-    expect(keys.cloneKeyId).not.toBe(keys.writeKeyId);
-    expect(calls.filter((call) => call.path === '/repos/acme/app/keys').map((call) => call.body.read_only)).toEqual([true, false]);
+    expect(store.repositoryDeployKeys(repository.id)).toBeUndefined();
+    expect(calls.some((call) => call.path.includes('/keys'))).toBe(false);
     expect(calls.find((call) => call.path === '/app/installations/42')?.auth?.split('.')).toHaveLength(3);
-    expect(service.repositorySshKey(repository.id, 'clone')).toContain('PRIVATE');
-    expect((await service.brokerCredentials(repository)).env.GH_TOKEN).toBe('installation-token');
+    expect(await service.brokerCredentials(repository)).toMatchObject({
+      httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' },
+    });
+    expect(await service.repositoryCloneToken(repository)).toBe('installation-token');
+    const scopedMints = calls.filter((call) => call.path === '/app/installations/42/access_tokens')
+      .map((call) => call.body).filter((body) => body?.repository_ids);
+    expect(scopedMints).toContainEqual({ repository_ids: [7], permissions: { contents: 'read' } });
+    expect(scopedMints).not.toContainEqual({ repository_ids: [7], permissions: { contents: 'write' } });
 
     const payload = Buffer.from(JSON.stringify({ installation: { id: 42 }, action: 'added' }));
     const signature = `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(payload).digest('hex')}`;
@@ -269,9 +262,7 @@ describe('GitHub App integration', () => {
     repositories = [];
     await service.reconcile(connected.connection);
     expect(store.getRepository(repository.id)).toBeUndefined();
-    expect(broker.hasHandle(keys.cloneHandle)).toBe(false);
-    expect(broker.hasHandle(keys.writeHandle)).toBe(false);
-    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(2);
+    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -320,39 +311,44 @@ describe('GitHub App integration', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('removes both remote keys and local handles when deploy-key enrollment fails after creation', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-rollback-'));
+  it('removes deploy keys left by an older karmax version during reconciliation', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-key-migration-'));
     const store = new Store(':memory:');
     const broker = new CredentialBroker(new Vault(dir));
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
     broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-    const organization = store.createOrganization({ name: 'Rollback', ownerUserId: 'owner' });
+    const organization = store.createOrganization({ name: 'Migration', ownerUserId: 'owner' });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '9', accountLogin: 'acme', accountType: 'Organization' });
+    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github',
+      providerId: '8', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    const cloneHandle = `github:repository:${repository.id}:clone`;
+    const writeHandle = `github:repository:${repository.id}:write`;
+    broker.registerHandle(cloneHandle, 'OLD-CLONE-KEY');
+    broker.registerHandle(writeHandle, 'OLD-WRITE-KEY');
+    store.setRepositoryDeployKeys({ repositoryId: repository.id, cloneKeyId: '201',
+      writeKeyId: '202', cloneHandle, writeHandle });
     const deleted: string[] = [];
-    let keyId = 200;
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
       if (url.pathname === '/app/installations/9') return Response.json({ id: 9, account: { login: 'acme' } });
       if (url.pathname === '/app/installations/9/access_tokens')
         return Response.json({ token: 'token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
-      if (url.pathname === '/installation/repositories') return Response.json({ repositories: [{ id: 8, name: 'broken', private: true,
-        ssh_url: 'git@github.com:acme/broken.git', default_branch: 'main', owner: { login: 'acme' } }] });
-      if (url.pathname === '/repos/acme/broken/keys' && init.method === 'POST') return Response.json({ id: ++keyId });
-      if (url.pathname.startsWith('/repos/acme/broken/keys/') && init.method === 'DELETE') {
+      if (url.pathname === '/installation/repositories') return Response.json({ repositories: [{ id: 8, name: 'app', private: true,
+        ssh_url: 'git@github.com:acme/app.git', default_branch: 'main', owner: { login: 'acme' } }] });
+      if (url.pathname.startsWith('/repos/acme/app/keys/') && init.method === 'DELETE') {
         deleted.push(url.pathname); return new Response(null, { status: 204 });
       }
       return new Response('not found', { status: 404 });
     };
-    const originalSave = store.setRepositoryDeployKeys.bind(store);
-    store.setRepositoryDeployKeys = () => { throw new Error('simulated database failure'); };
-    const service = new GitHubAppService(store, broker, { appId: '123', fetch: fakeFetch as typeof fetch,
-      keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId}` }) });
-    await expect(service.connectInstallation(organization.id, '9')).rejects.toThrow('simulated database failure');
-    const repository = store.listRepositories(organization.id)[0]!;
-    expect(deleted).toHaveLength(2);
-    expect(broker.hasHandle(`github:repository:${repository.id}:clone`)).toBe(false);
-    expect(broker.hasHandle(`github:repository:${repository.id}:write`)).toBe(false);
-    store.setRepositoryDeployKeys = originalSave;
+    const service = new GitHubAppService(store, broker, { appId: '123', fetch: fakeFetch as typeof fetch });
+    await expect(service.connectInstallation(organization.id, '9')).resolves.toBeTruthy();
+    expect(deleted).toEqual(['/repos/acme/app/keys/201', '/repos/acme/app/keys/202']);
+    expect(store.repositoryDeployKeys(repository.id)).toBeUndefined();
+    expect(broker.hasHandle(cloneHandle)).toBe(false);
+    expect(broker.hasHandle(writeHandle)).toBe(false);
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -371,8 +367,7 @@ describe('GitHub App failure and suspension handling', () => {
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const service = new GitHubAppService(store, broker, { appId: '123', appSlug: 'karmax-test',
       fetch: ((input: any, init: RequestInit = {}) => fetcher(new URL(String(input)), init)) as typeof fetch,
-      sleep: async () => {}, // do not actually wait out the 5xx backoff
-      keyPair: async () => ({ privateKey: 'PRIVATE', publicKey: 'ssh-ed25519 PUBLIC karmax' }) });
+      sleep: async () => {} }); // do not actually wait out the 5xx backoff
     const deliver = (event: string, id: string, body: unknown) => {
       const raw = Buffer.from(JSON.stringify(body));
       return service.handleWebhook(event, id, raw,
@@ -486,38 +481,26 @@ describe('GitHub App failure and suspension handling', () => {
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('never retries a non-idempotent write, so a 5xx cannot duplicate a deploy key', async () => {
-    const creates: string[] = [];
+  it('never retries a non-idempotent token mint, while legacy key deletion is retryable', async () => {
+    let mints = 0;
     let deleteAttempts = 0;
     const h = harness(async (url, init) => {
-      if (url.pathname === '/app/installations/42/access_tokens')
-        return Response.json({ token: 't', expires_at: new Date(Date.now() + 3600_000).toISOString() });
-      if (url.pathname === '/installation/repositories')
-        return Response.json({ repositories: [{ id: 8, name: 'app', private: true,
-          ssh_url: 'git@github.com:acme/app.git', default_branch: 'main', owner: { login: 'acme' } }] });
-      if (url.pathname === '/repos/acme/app/keys' && init.method === 'POST') {
-        // The dangerous shape: GitHub PROCESSES the create and only then fails
-        // (or the connection drops). A retry enrolls a SECOND write-capable key
-        // whose id karmax never records — orphaned at GitHub forever, since
-        // `removeOrphanDeployKeys` only sweeps when there is no local record.
-        creates.push(String(init.body));
+      if (url.pathname === '/app/installations/42/access_tokens') {
+        mints++;
         return new Response('service unavailable', { status: 503 });
       }
-      if (url.pathname === '/repos/acme/app/keys') return Response.json([]); // the orphan sweep's GET
-      if (url.pathname.startsWith('/repos/acme/app/keys/') && init.method === 'DELETE')
-        return new Response(null, { status: 204 });
       return new Response('not found', { status: 404 });
     });
     const connection = h.store.upsertGitConnection({ organizationId: h.organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const repository = h.store.upsertRepository({ organizationId: h.organization.id, provider: 'github',
+      providerId: '8', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
 
-    await expect(h.service.reconcile(connection)).rejects.toThrow(/503/);
-    expect(creates).toHaveLength(1);
-    const repository = h.store.listRepositories(h.organization.id)[0]!;
-    expect(h.store.repositoryDeployKeys(repository.id)).toBeFalsy();
+    await expect(h.service.repositoryCloneToken(repository)).rejects.toThrow(/503/);
+    expect(mints).toBe(1);
 
-    // DELETE of a specific key id IS retried: the resource is named, so a repeat
-    // either deletes it or 404s (which every caller already tolerates).
+    // DELETE of a specific legacy key id is safe to retry.
     const request = (h.service as any).request.bind(h.service);
     const del = async (u: URL, init: RequestInit) => {
       if (u.pathname === '/repos/acme/app/keys/7' && init.method === 'DELETE')
