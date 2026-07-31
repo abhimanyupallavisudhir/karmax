@@ -1,7 +1,7 @@
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
-import { TokenAuthority } from './tokens.js';
+import { TokenAuthority, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, allows } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, mergeQueueDomains } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -613,6 +613,8 @@ export class KarmaxApi {
       quick?: boolean;
       /** Job-shaped permission profile for every agent spawned by this workflow. */
       authorizationProfile?: string;
+      /** Canonical level plus its project-list / organization / global scope. */
+      authorization?: AuthorizationSelection;
       /** Per-task vault item grants (PLAN-passwords.md §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
@@ -641,9 +643,13 @@ export class KarmaxApi {
     const start = this.resolveStart(workflow, this.workflowPinFor(args.projectId, workflow), project.organizationId);
     if (!start) throw new Error(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
+    const requestedAuthorization = args.authorization ?? args.authorizationProfile;
+    const grantorCaps = this.authorizationGrantorCaps(token, caller, requestedAuthorization, project.organizationId ?? 'org_personal');
     const authorization = this.deps.authorization
-      ? this.deps.authorization.taskGrant(caller.principal, args.projectId, args.authorizationProfile, caller.caps)
+      ? this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps)
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
+    if (args.authorization && authorization.attenuated)
+      throw new CapabilityError('you cannot grant an authorization level you do not hold for the selected scope');
     this.applyCredentialGrants(authorization, args.credentialGrants, caller.caps);
     const credentialPolicies = this.credentialPolicyOverrides(
       project.organizationId ?? 'org_personal', args.credentialPolicies, caller.caps, authorization,
@@ -1243,7 +1249,7 @@ export class KarmaxApi {
   async setTaskAuthorization(
     token: string,
     taskId: string,
-    profileId: string,
+    requested: string | AuthorizationSelection,
     credentialGrants?: string[],
     credentialPolicies?: VaultTaskPolicyOverrides,
   ): Promise<TaskRecord> {
@@ -1254,9 +1260,13 @@ export class KarmaxApi {
     // workflow update below (frozen only once it's cancelled/terminal).
     const editInPlace = !!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable;
     const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
+    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
+    const grantorCaps = this.authorizationGrantorCaps(token, caller, requested, organizationId);
     const authorization = this.deps.authorization
-      ? this.deps.authorization.taskGrant(caller.principal, task.projectId, profileId, caller.caps)
-      : { profileId, capabilities: caller.caps, attenuated: false };
+      ? this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps)
+      : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
+    if (typeof requested !== 'string' && authorization.attenuated)
+      throw new CapabilityError('you cannot grant an authorization level you do not hold for the selected scope');
     this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
     const priorPolicies = (task.params?._authorization as { credentialPolicies?: VaultTaskPolicyOverrides } | undefined)
       ?.credentialPolicies;
@@ -1277,7 +1287,7 @@ export class KarmaxApi {
           args: [{
             grant: authorization.capabilities,
             grantPrincipal: caller.principal,
-            authorizationProfile: authorization.profileId ?? profileId,
+            authorizationProfile: authorization.profileId ?? (typeof requested === 'string' ? requested : requested.level),
           }],
         });
       } catch (e) {
@@ -1291,6 +1301,31 @@ export class KarmaxApi {
     const updated = this.deps.store.getTask(taskId)!;
     this.persistTaskCredentialPolicies(updated);
     return updated;
+  }
+
+  private authorizationGrantorCaps(
+    token: string,
+    caller: ScopedToken,
+    requested: string | AuthorizationSelection | undefined,
+    organizationId: string,
+  ): Capability[] | undefined {
+    // An authenticated human's durable grants are evaluated independently for
+    // every selected project. A task/system bearer must use only its immediate
+    // token: looking up the named human would turn it into a confused deputy.
+    if (caller.kind === 'human' && caller.principal.startsWith('user:')) return undefined;
+    if (!requested || typeof requested === 'string') return caller.caps;
+    if (requested.scope === 'projects') {
+      for (const projectId of requested.projectIds ?? []) {
+        const checked = this.deps.tokens.check(token, 'task:create', { projectId, organizationId });
+        if (!checked.ok) throw new CapabilityError(`you cannot delegate access to project ${projectId}: ${checked.reason}`);
+      }
+    } else if (requested.scope === 'organization') {
+      if (caller.organizationId !== organizationId || caller.projectId || caller.projectIds?.length)
+        throw new CapabilityError('this token cannot delegate organization-wide access');
+    } else if (caller.projectId || caller.projectIds?.length || caller.organizationId) {
+      throw new CapabilityError('this token cannot delegate global access');
+    }
+    return caller.caps;
   }
 
   /**

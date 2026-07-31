@@ -111,12 +111,17 @@ describe('organization and collaboration domain', () => {
   it('stores only an invitation hash and enforces email, expiry, and single use', () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Invite test', ownerUserId: 'owner' });
+    const project = store.createProject('App', {}, organization.id);
     const { token } = store.createOrganizationInvitation({ organizationId: organization.id,
-      email: 'new@example.com', profileId: 'maintainer', invitedBy: 'owner' });
+      email: 'new@example.com', authorization: { level: 'maintainer', scope: 'projects', projectIds: [project.id] },
+      invitedBy: 'owner' });
     const row = store.db.prepare('SELECT tokenHash FROM organization_invitations').get() as any;
     expect(row.tokenHash).not.toContain(token);
     expect(() => store.acceptOrganizationInvitation(token, 'wrong', 'wrong@example.com')).toThrow(/different email/);
-    expect(store.acceptOrganizationInvitation(token, 'new', 'NEW@example.com')).toMatchObject({ role: 'member', profileId: 'maintainer' });
+    expect(store.acceptOrganizationInvitation(token, 'new', 'NEW@example.com')).toMatchObject({
+      role: 'member', profileId: 'maintainer',
+      authorization: { level: 'maintainer', scope: 'projects', projectIds: [project.id] },
+    });
     expect(() => store.acceptOrganizationInvitation(token, 'new', 'new@example.com')).toThrow(/already used/);
   });
 

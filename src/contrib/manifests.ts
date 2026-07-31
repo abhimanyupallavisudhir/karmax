@@ -174,15 +174,20 @@ export interface WorkflowRole {
 const DO_ROLE: WorkflowRole = {
   name: 'do',
   label: 'Do agent',
+  // Task authorization is the deliberate delegation boundary. A Do agent may
+  // use everything the granting human selected (including organization/global
+  // operation); attenuation still removes everything that human did not hold.
+  // Workflow decisions and protected-target merges stay reserved for their
+  // concrete Resolve/Confirm/Merge roles even when the task is God-authorized.
   capabilities: [
+    // Keep the historical spellings in the declaration for replay/tests; the
+    // capability layer normalizes them to the task:* / skill:* families below.
     'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
-    'task:escalate',
-    'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
-    'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
-    // Vault access (PLAN-passwords.md): the ceiling admits the task grant's
-    // use-credential item caps; which items the task actually got remains the
-    // grant's decision, and item policy can still demand per-use approval.
-    'credential:read', 'vault:store', 'use-credential:*',
+    'task:*', 'project:*', 'organization:*', 'team:*', 'repository:*', 'inbox:*',
+    'queue:*', 'workflow:*', 'profile:*', 'skill:write',
+    'diagnostic:read', 'process:*', 'credential:*', 'vault:store', 'use-credential:*',
+    'payment:*', 'use-card:*', 'settings:*', 'safe-mode:write',
+    'authorization:*', 'user:*',
   ],
   promptTemplate: `{{toolsPreamble}}
 

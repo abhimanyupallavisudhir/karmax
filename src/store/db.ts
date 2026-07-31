@@ -25,6 +25,7 @@ import {
   OrganizationExecutionPolicy,
   OrganizationMembership,
   OrganizationInvitation,
+  AuthorizationSelection,
   Team,
   TeamMembership,
   ProjectMembership,
@@ -271,7 +272,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS organization_invitations (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, email TEXT NOT NULL,
         role TEXT NOT NULL, tokenHash TEXT NOT NULL UNIQUE, invitedBy TEXT NOT NULL,
-        createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, acceptedAt INTEGER
+        createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, acceptedAt INTEGER,
+        authorizationJson TEXT
       );
       CREATE TABLE IF NOT EXISTS teams (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT,
@@ -597,6 +599,7 @@ export class Store {
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_provider_external ON cards(provider, externalId) WHERE externalId IS NOT NULL');
     const invitationCols = this.db.prepare('PRAGMA table_info(organization_invitations)').all() as any[];
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
+    if (!invitationCols.some((c) => c.name === 'authorizationJson')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT');
     const wikiVersionCols = this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all() as any[];
@@ -1285,36 +1288,41 @@ export class Store {
     }
   }
 
-  createOrganizationInvitation(input: { organizationId: string; email: string; role?: OrganizationMembership['role']; profileId?: string; invitedBy: string; ttlMs?: number }): { invitation: OrganizationInvitation; token: string } {
+  createOrganizationInvitation(input: { organizationId: string; email: string; role?: OrganizationMembership['role']; profileId?: string;
+    authorization?: AuthorizationSelection; invitedBy: string; ttlMs?: number }): { invitation: OrganizationInvitation; token: string } {
     if (!this.getOrganization(input.organizationId)) throw new Error(`no organization ${input.organizationId}`);
     const token = `ki_${crypto.randomBytes(24).toString('base64url')}`;
     const invitation: OrganizationInvitation = {
       id: newId('invite'), organizationId: input.organizationId, email: input.email.trim().toLowerCase(),
-      role: input.role ?? 'member', profileId: input.profileId ?? 'developer', invitedBy: input.invitedBy, createdAt: Date.now(),
+      role: input.role ?? 'member', profileId: input.authorization?.level ?? input.profileId ?? 'developer',
+      authorization: input.authorization, invitedBy: input.invitedBy, createdAt: Date.now(),
       expiresAt: Date.now() + (input.ttlMs ?? 7 * 24 * 60 * 60 * 1000),
     };
     this.db.prepare(`INSERT INTO organization_invitations
-      (id, organizationId, email, role, profileId, tokenHash, invitedBy, createdAt, expiresAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      (id, organizationId, email, role, profileId, tokenHash, invitedBy, createdAt, expiresAt, authorizationJson)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         invitation.id, invitation.organizationId, invitation.email, invitation.role,
         invitation.profileId ?? 'developer', sha256(token), invitation.invitedBy, invitation.createdAt, invitation.expiresAt,
+        invitation.authorization ? JSON.stringify(invitation.authorization) : null,
       );
     return { invitation, token };
   }
 
-  acceptOrganizationInvitation(token: string, userId: string, email: string): OrganizationMembership & { profileId?: string } {
+  acceptOrganizationInvitation(token: string, userId: string, email: string): OrganizationMembership & { profileId?: string; authorization?: AuthorizationSelection } {
     const r = this.db.prepare('SELECT * FROM organization_invitations WHERE tokenHash=?').get(sha256(token)) as any;
     if (!r || r.acceptedAt) throw new Error('invitation is invalid or already used');
     if (r.expiresAt <= Date.now()) throw new Error('invitation has expired');
     if (String(r.email).toLowerCase() !== email.trim().toLowerCase()) throw new Error('invitation belongs to a different email address');
     const membership = this.setOrganizationMembership(r.organizationId, userId, r.role);
     this.db.prepare('UPDATE organization_invitations SET acceptedAt=? WHERE id=?').run(Date.now(), r.id);
-    return { ...membership, profileId: r.profileId ?? 'developer' };
+    return { ...membership, profileId: r.profileId ?? 'developer',
+      authorization: r.authorizationJson ? JSON.parse(r.authorizationJson) : undefined };
   }
 
   listOrganizationInvitations(organizationId: string): OrganizationInvitation[] {
     return (this.db.prepare('SELECT * FROM organization_invitations WHERE organizationId=? ORDER BY createdAt DESC').all(organizationId) as any[])
-      .map((r) => ({ id: r.id, organizationId: r.organizationId, email: r.email, role: r.role, profileId: r.profileId ?? 'developer', invitedBy: r.invitedBy,
+      .map((r) => ({ id: r.id, organizationId: r.organizationId, email: r.email, role: r.role, profileId: r.profileId ?? 'developer',
+        authorization: r.authorizationJson ? JSON.parse(r.authorizationJson) : undefined, invitedBy: r.invitedBy,
         createdAt: r.createdAt, expiresAt: r.expiresAt, acceptedAt: r.acceptedAt ?? undefined }));
   }
 

@@ -6,8 +6,17 @@ import { capMatches, allows, attenuate, effectiveAllows } from '../src/platform/
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
+import { roleCeiling } from '../src/contrib/manifests.js';
 
 describe('capability model + attenuation (SPEC §8.2)', () => {
+  it('lets the Do role use delegated organization authority without bypassing workflow gates', () => {
+    const ceiling = roleCeiling('do');
+    expect(allows(ceiling, 'organization:member:write')).toBe(true);
+    expect(allows(ceiling, 'settings:write')).toBe(true);
+    expect(allows(ceiling, 'merge-into:main')).toBe(false);
+    expect(allows(ceiling, 'confirm-decision')).toBe(false);
+  });
+
   it('matches exact, prefix-wildcard, and global', () => {
     expect(capMatches('create-task', 'create-task')).toBe(true);
     expect(capMatches('merge-into:*', 'merge-into:/r:main')).toBe(true);
@@ -68,6 +77,19 @@ describe('TokenAuthority (workflow-minted scoped tokens)', () => {
     // create-task was over the profile ceiling → not in effective set
     expect(ta.check(token, 'create-task').ok).toBe(false);
     expect(ta.check('kt_bogus', 'signal-completion').ok).toBe(false);
+  });
+
+  it('scopes one task token to a selected list of projects', () => {
+    const ta = new TokenAuthority();
+    const { token } = ta.mint({
+      taskId: 't1', profileId: 'do', principal: 'user:abc',
+      projectIds: ['p1', 'p2'], organizationId: 'org1',
+      ceiling: ['task:read'], grantorCaps: ['task:read'],
+    });
+    expect(ta.check(token, 'task:read', { projectId: 'p1', organizationId: 'org1' }).ok).toBe(true);
+    expect(ta.check(token, 'task:read', { projectId: 'p2', organizationId: 'org1' }).ok).toBe(true);
+    expect(ta.check(token, 'task:read', { projectId: 'p3', organizationId: 'org1' }).ok).toBe(false);
+    expect(ta.check(token, 'task:read', { projectId: 'p1', organizationId: 'org2' }).ok).toBe(false);
   });
 });
 

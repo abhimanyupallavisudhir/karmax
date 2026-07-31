@@ -23,7 +23,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
+import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -278,6 +278,24 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
       return { kind: 'organization', organizationId };
   }
   return principalFromBody(value);
+}
+
+function authorizationSelectionFromBody(value: unknown): AuthorizationSelection | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.level !== 'string' || typeof candidate.scope !== 'string') return undefined;
+  return {
+    level: candidate.level,
+    scope: candidate.scope as AuthorizationSelection['scope'],
+    ...(Array.isArray(candidate.projectIds) ? { projectIds: candidate.projectIds.map(String) } : {}),
+  };
+}
+
+function legacyAuthorizationSelection(profileId: unknown): AuthorizationSelection {
+  const level = String(profileId ?? 'developer');
+  if (level === 'god') return { level: 'god', scope: 'global' };
+  if (level === 'administrator' || level === 'operator') return { level: 'administrator', scope: 'organization' };
+  return { level: ['viewer', 'developer', 'maintainer'].includes(level) ? level : 'developer', scope: 'organization' };
 }
 
 function isWorldHandle(value: unknown): value is Record<string, unknown> & { kind: string; id: string } {
@@ -1204,10 +1222,8 @@ export class Gateway {
         const b = await this.body(req);
         try {
           const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
-          this.deps.authorization?.grant(`user:${session.userId}`, {
-            principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
-            profileId: membership.profileId ?? 'developer',
-          });
+          this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${session.userId}`,
+            membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
           return this.json(res, 200, membership);
         } catch (e) {
           // Expired / already-used / wrong-email are user-facing, not 500s.
@@ -1298,21 +1314,23 @@ export class Gateway {
           const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
           return this.json(res, 200, store.listOrganizationMemberships(organizationId).map((membership) => {
             const user = users.get(membership.userId);
-            const grant = this.deps.authorization?.grants(`user:${membership.userId}`).find((candidate) => candidate.scopeKey === `organization:${organizationId}`);
-            return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'administrator' : 'developer'),
+            const authorization = this.deps.authorization?.selectionForPrincipal(`user:${membership.userId}`, organizationId)
+              ?? (membership.role === 'owner' ? { level: 'administrator', scope: 'organization' } : undefined);
+            return { ...membership, authorization, profileId: authorization?.level ?? 'viewer',
               protectedOwner: membership.role === 'owner', ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
           }));
         }
         if (method === 'POST') {
           const b = await this.body(req);
+          const authorization = authorizationSelectionFromBody(b.authorization) ?? legacyAuthorizationSelection(b.profileId);
+          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+            organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const existing = store.organizationMembership(organizationId, String(b.userId));
           const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
-          const profileId = String(b.profileId ?? 'developer');
-          this.deps.authorization?.grant(`user:${session.userId}`, {
-            principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
-            profileId,
-          });
-          return this.json(res, 200, membership);
+          this.deps.authorization?.replacePrincipalAuthorization(authRecord?.principal ?? `user:${session.userId}`,
+            `user:${membership.userId}`, organizationId, authorization,
+            authRecord?.kind === 'human' ? undefined : authRecord?.caps);
+          return this.json(res, 200, { ...membership, authorization });
         }
       }
       const organizationMember = p.match(/^\/api\/organizations\/([^/]+)\/members\/([^/]+)$/);
@@ -1327,8 +1345,11 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listOrganizationInvitations(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
+          const authorization = authorizationSelectionFromBody(b.authorization) ?? legacyAuthorizationSelection(b.profileId);
+          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+            organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const result = store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` });
+            role: 'member', authorization, invitedBy: `user:${session.userId}` });
           // Auto-deliver the invite when outbound email is configured; the copyable
           // link is still returned as a fallback (and for email-less installs).
           let emailed = false;
@@ -1727,6 +1748,8 @@ export class Gateway {
       if (p === '/api/projects' && method === 'GET') {
         const projects = store.listProjects();
         if (authRecord?.projectId) return this.json(res, 200, projects.filter((x) => x.id === authRecord!.projectId));
+        if (authRecord?.projectIds?.length) return this.json(res, 200,
+          projects.filter((x) => authRecord!.projectIds!.includes(x.id)));
         // An organization-scoped token discovers its own tenant's projects only.
         if (authRecord?.organizationId) return this.json(res, 200,
           projects.filter((x) => (x.organizationId ?? 'org_personal') === authRecord!.organizationId));
@@ -2234,8 +2257,11 @@ export class Gateway {
           if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
           const principal = projectPrincipalFromBody(b.principal, project.organizationId);
           const profileId = String(b.profileId ?? 'developer');
-          if (this.deps.authorization && !this.deps.authorization.profile(profileId, projectId))
-            return this.json(res, 400, { error: `unknown authorization profile ${profileId}` });
+          if (!['viewer', 'developer', 'maintainer'].includes(profileId))
+            return this.json(res, 400, { error: 'project access must be Viewer, Developer, or Project maintainer' });
+          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+            project.organizationId, { level: profileId, scope: 'projects', projectIds: [projectId] },
+            authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
           const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner'
             : principal.kind === 'user' ? 'member' : profileId);
@@ -2583,7 +2609,8 @@ export class Gateway {
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
         try {
-          return this.json(res, 200, await api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+          return this.json(res, 200, await api.setTaskAuthorization(token, taskAuthMatch[1]!,
+            authorizationSelectionFromBody(b.authorization) ?? String(b.profileId ?? ''),
             Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
             b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
               ? b.credentialPolicies as any : undefined));
