@@ -84,13 +84,13 @@ describe('cloud repository source resolution', () => {
       async open() { throw new Error('unused'); },
       async destroy() {},
     } as any);
-    const keyRequests: string[] = [];
+    const tokenRequests: string[] = [];
     const core = makeCoreActivities({
       store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock'), contentDir: content,
       githubApp: {
-        repositorySshKey(repositoryId: string) {
-          keyRequests.push(repositoryId);
-          return 'wiki clone key';
+        async repositoryCloneToken(repository: { id: string }) {
+          tokenRequests.push(repository.id);
+          return 'wiki clone token';
         },
       } as any,
     });
@@ -101,8 +101,8 @@ describe('cloud repository source resolution', () => {
       });
       expect(received.repos).toEqual(['git@github.com:acme/app.git', wikiUrl]);
       expect(received.copySources).toEqual([app, wikiRoot]);
-      expect(received.gitCredentials.repositories).toEqual({ [wikiUrl]: 'wiki clone key' });
-      expect(keyRequests).toEqual([wiki.id]);
+      expect(received.gitCredentials.httpsTokens).toEqual({ [wikiUrl]: 'wiki clone token' });
+      expect(tokenRequests).toEqual([wiki.id]);
       expect(handle.repos?.find((repo) => repo.name === 'app')?.localPath).toBe(app);
     } finally {
       store.close();

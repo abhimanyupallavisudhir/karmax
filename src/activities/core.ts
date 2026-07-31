@@ -661,7 +661,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       };
       if (linkedRepositories.length || wikiRepository) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
-        const credentials: Record<string, string> = {};
+        const httpsTokens: Record<string, string> = {};
         for (const [index, source] of worldSources.entries()) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
           const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
@@ -677,12 +677,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             continue;
           }
-          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(repository.id, 'clone');
+          if (deps.githubApp) httpsTokens[source] = await deps.githubApp.repositoryCloneToken(repository);
         }
-        // Repository-scoped read-only keys take precedence for enrolled
-        // sources. Local managed clones use the same ephemeral provisioning
-        // credential without persisting it.
-        if (Object.keys(credentials).length) gitCredentials = { ...gitCredentials, repositories: credentials };
+        // Repository-scoped read-only installation tokens exist only during
+        // trusted provisioning and are removed before the agent starts.
+        if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
       }
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       const environmentSelection = projectId

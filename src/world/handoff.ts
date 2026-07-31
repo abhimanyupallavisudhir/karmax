@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
 import type { TaskView } from '../domain/types.js';
 import type { WorldHandle } from './types.js';
@@ -18,6 +17,7 @@ import {
 import type { WorldAccessService } from './access.js';
 import { git } from './git.js';
 import { paths } from '../config/paths.js';
+import { materializeGitCredential } from './git-credential.js';
 
 export interface LocalCheckoutPlan {
   taskId: string;
@@ -92,7 +92,8 @@ export class WorldHandoffService {
       if (!repo.localPath && !record) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       const source = repo.localPath ?? repo.repo;
       const credential = record ? await this.githubApp.brokerCredentials(record) : {};
-      const env = await gitEnvironment(root, credential);
+      const materialized = gitEnvironment(root, credential);
+      const env = materialized.env;
       const destination = path.join(root, safeName(repo.name));
       try {
         if (fs.existsSync(path.join(destination, '.git'))) {
@@ -110,7 +111,7 @@ export class WorldHandoffService {
         const head = (await git(destination, ['rev-parse', 'HEAD'])).stdout.trim();
         repositories.push({ name: repo.name, path: destination, branch: repo.branch, head });
       } finally {
-        if (env.keyPath) fs.rmSync(env.keyPath, { force: true });
+        fs.rmSync(materialized.directory, { recursive: true, force: true });
       }
     }
     return { taskId, root, cwd: repositories.length === 1 ? repositories[0]!.path : root,
@@ -248,15 +249,11 @@ function sh(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'`;
 
 function safeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]/g, '-'); }
 
-async function gitEnvironment(root: string, credential: GitBrokerCredential): Promise<Record<string, string> & { keyPath?: string }> {
-  const env: Record<string, string> & { keyPath?: string } = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
-  if (credential.sshKey) {
-    const keyPath = path.join(root, `.karmax-clone-${crypto.randomBytes(12).toString('hex')}.key`);
-    fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
-    env.keyPath = keyPath;
-    env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-  }
-  return env;
+function gitEnvironment(root: string, credential: GitBrokerCredential): {
+  env: Record<string, string>; directory: string;
+} {
+  const directory = fs.mkdtempSync(path.join(root, '.karmax-clone-auth-'));
+  return { env: materializeGitCredential(directory, credential).env, directory };
 }
 
 async function gitOk(cwd: string, args: string[], env: Record<string, string>): Promise<void> {

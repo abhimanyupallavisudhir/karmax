@@ -35,24 +35,61 @@ export async function runOrThrow(target: ProvisionTarget, command: string, timeo
   return result;
 }
 
-/** Write read-only clone keys into the sandbox for trusted provisioning. The
- * caller must delete them (rm -f $HOME/.ssh/karmax-auth-*) before the agent
- * runs; pushes and merges go through the host-side Git broker. */
+/** Write clone credentials into the sandbox for trusted provisioning. GitHub
+ * tokens use HTTPS askpass; legacy/non-GitHub sources may use SSH keys. The
+ * caller deletes every karmax-auth-* file before the agent runs. */
 export async function provisionGitCredentials(target: ProvisionTarget, spec: WorldSpec, home: string): Promise<void> {
   const values = [spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
     .filter((value): value is string => Boolean(value));
-  if (!values.length) return;
+  const tokens = Object.values(spec.gitCredentials?.httpsTokens ?? {})
+    .filter((value): value is string => Boolean(value));
+  if (!values.length && !tokens.length) return;
   const ssh = path.posix.join(home, '.ssh');
-  await runOrThrow(target, `mkdir -p ${quote(ssh)} && chmod 700 ${quote(ssh)} && ssh-keyscan github.com >> ${quote(path.posix.join(ssh, 'known_hosts'))} 2>/dev/null || true`);
+  await runOrThrow(target, `mkdir -p ${quote(ssh)} && chmod 700 ${quote(ssh)}`);
+  if (values.length)
+    await runOrThrow(target, `ssh-keyscan github.com >> ${quote(path.posix.join(ssh, 'known_hosts'))} 2>/dev/null || true`);
   for (const [index, key] of [...new Set(values)].entries()) {
     const file = credentialFile(home, index);
     await target.writeFile(file, key.endsWith('\n') ? key : `${key}\n`);
     await runOrThrow(target, `chmod 600 ${quote(file)}`);
   }
+  for (const [index, token] of [...new Set(tokens)].entries()) {
+    const tokenFile = credentialTokenFile(home, index);
+    const askpassFile = credentialAskpassFile(home, index);
+    await target.writeFile(tokenFile, token);
+    await target.writeFile(askpassFile, `#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\\n' x-access-token ;;
+  *) cat ${quote(tokenFile)} ;;
+esac
+`);
+    await runOrThrow(target, `chmod 600 ${quote(tokenFile)} && chmod 700 ${quote(askpassFile)}`);
+  }
 }
 
 export function credentialFile(home: string, index: number): string {
   return path.posix.join(home, `.ssh/karmax-auth-${index}`);
+}
+
+function credentialTokenFile(home: string, index: number): string {
+  return path.posix.join(home, `.ssh/karmax-auth-token-${index}`);
+}
+
+function credentialAskpassFile(home: string, index: number): string {
+  return path.posix.join(home, `.ssh/karmax-auth-askpass-${index}`);
+}
+
+function githubHttpsAuthPrefix(home: string, index: number): string {
+  return [
+    'GIT_TERMINAL_PROMPT=0',
+    `GIT_ASKPASS=${quote(credentialAskpassFile(home, index))}`,
+    'GIT_CONFIG_COUNT=2',
+    `GIT_CONFIG_KEY_0=${quote('url.https://github.com/.insteadOf')}`,
+    `GIT_CONFIG_VALUE_0=${quote('git@github.com:')}`,
+    `GIT_CONFIG_KEY_1=${quote('url.https://github.com/.insteadOf')}`,
+    `GIT_CONFIG_VALUE_1=${quote('ssh://git@ssh.github.com:443/')}`,
+    '',
+  ].join(' ');
 }
 
 export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec, options: ProvisionRepoOptions):
@@ -80,6 +117,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   }
   const uniqueKeys = [...new Set([spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
     .filter((value): value is string => Boolean(value)))];
+  const uniqueTokens = [...new Set(Object.values(spec.gitCredentials?.httpsTokens ?? {})
+    .filter((value): value is string => Boolean(value)))];
   const repos: WorldRepo[] = [];
   for (let index = 0; index < sources.length; index++) {
     const source = sources[index]!;
@@ -88,11 +127,13 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const targetBranch = branchPolicy?.target ?? spec.target;
     const repoRoot = multi ? path.posix.join(root, names[index]!) : root;
     const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
+    const token = spec.gitCredentials?.httpsTokens?.[source];
     const keyIndex = key ? uniqueKeys.indexOf(key) : -1;
-    const ssh = keyIndex >= 0
+    const tokenIndex = token ? uniqueTokens.indexOf(token) : -1;
+    const auth = keyIndex >= 0
       ? `GIT_SSH_COMMAND=${quote(`ssh -i ${credentialFile(options.home, keyIndex)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`)} `
-      : '';
-    await cloneWithRetry(target, `${ssh}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
+      : tokenIndex >= 0 ? githubHttpsAuthPrefix(options.home, tokenIndex) : '';
+    await cloneWithRetry(target, `${auth}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
     const localPath = spec.copySources?.[index];
     if (localPath) await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
     const requested = spec.branch ?? base;
