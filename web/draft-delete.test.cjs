@@ -29,7 +29,7 @@ let serverList = [];           // authoritative task rows (as the store would ho
 let pendingGets = [];          // resolvers for in-flight list GETs (to control ordering)
 let toasts = [];
 
-global.S = { projectId: 'proj', tasks: [], deleted: new Set(), searchResult: null, forkPool: null };
+global.S = { projectId: 'proj', tasks: [], deleted: new Set(), cancelling: new Set(), searchResult: null, forkPool: null };
 global.renderMain = () => {};
 global.toast = (msg, err) => { toasts.push({ msg, err: !!err }); };
 global.api = (p, opts = {}) => {
@@ -47,8 +47,11 @@ global.api = (p, opts = {}) => {
 };
 const releaseGet = () => pendingGets.shift()();
 
+eval(extractFn('pendingCancellationView'));
+eval(extractFn('pendingCancellationTask'));
 eval(extractFn('loadTasks'));
 eval(extractFn('filterDeletedFromSearchResult'));
+eval(extractFn('removeDeletedTaskLocally'));
 eval(extractFn('deleteDraft'));
 
 let pass = 0, fail = 0;

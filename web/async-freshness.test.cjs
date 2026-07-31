@@ -43,6 +43,7 @@ global.S = {
   tab: 'tasks',
   tasks: [{ id: 'a-current', projectId: 'A' }],
   deleted: new Set(),
+  cancelling: new Set(),
   search: '',
   searchResult: null,
 };
@@ -57,6 +58,8 @@ global.taskRecord = (id) => S.tasks.find((task) => task.id === id);
 global.taskRefreshPromise = null;
 global.taskRefreshQueued = false;
 
+eval(extractFn('pendingCancellationView'));
+eval(extractFn('pendingCancellationTask'));
 eval(extractFn('loadTasks'));
 eval(extractFn('filterDeletedFromSearchResult'));
 eval(extractFn('runSearch'));
