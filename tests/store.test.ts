@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { Store, isReviewEvent, deleteRows } from '../src/store/db.js';
+import { Store, isReviewRequestEvent, deleteRows } from '../src/store/db.js';
 
 describe('Store', () => {
   let store: Store;
@@ -714,16 +714,20 @@ describe('Store', () => {
     expect(count('SELECT COUNT(*) n FROM delivery_outbox')).toBe(0);
   });
 
-  it('routes only genuine review events to the review audience', () => {
+  it('routes only a genuine review REQUEST to the review audience', () => {
     // `ev.type.includes('review')` is a substring match on an open vocabulary:
     // every `preview.*` type contains it, and so would any package-declared type.
-    expect(isReviewEvent('review.built')).toBe(true);
-    expect(isReviewEvent('github.pr.review')).toBe(true);
-    expect(isReviewEvent('software-dev.review-requested')).toBe(true);
-    expect(isReviewEvent('preview.active')).toBe(false);
-    expect(isReviewEvent('preview.ready')).toBe(false);
-    expect(isReviewEvent('world.preview-created')).toBe(false);
-    expect(isReviewEvent('agent.previewed')).toBe(false);
+    // Matching a whole `review` segment fixed that but still swept in
+    // `review.built`, which a task emits on every agent turn — dozens of
+    // identical "review requested" rows for one task actually sitting in review.
+    expect(isReviewRequestEvent('software-dev.review-requested')).toBe(true);
+    expect(isReviewRequestEvent('review.requested')).toBe(true);
+    expect(isReviewRequestEvent('review.built')).toBe(false);
+    expect(isReviewRequestEvent('github.pr.review')).toBe(false);
+    expect(isReviewRequestEvent('preview.requested')).toBe(false);
+    expect(isReviewRequestEvent('preview.active')).toBe(false);
+    expect(isReviewRequestEvent('world.preview-created')).toBe(false);
+    expect(isReviewRequestEvent('agent.previewed')).toBe(false);
   });
 
   it('chunks IN(...) deletes past SQLite\'s variable limit', () => {
