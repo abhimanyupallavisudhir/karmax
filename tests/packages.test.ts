@@ -133,7 +133,8 @@ describe('PackageStore (name@version resolution)', () => {
   it('pins by version and returns the latest when unspecified', () => {
     const history = PackageStore.withBundled().versions('software-dev');
     const store = PackageStore.withBundled();
-    const newest = '1.11.0';
+    const [major = 1, minor = 0] = bundled('software-dev')!.version.split('.').map(Number);
+    const newest = `${major}.${minor + 1}.0`;
     store.register({ ...bundled('software-dev'), version: newest, description: 'newer' });
     store.register({ ...bundled('software-dev'), version: '1.2.0', description: 'mid' });
     expect(store.versions('software-dev')).toEqual([...history, newest]);
