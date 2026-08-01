@@ -21,11 +21,14 @@ const context = vm.createContext({
   esc: (value: unknown) => String(value),
   pipeline: () => '',
   liveRoleFor: () => 'do',
-  S: { tasks: [] },
+  // `cancelling` holds the tasks whose cancel click has not yet been reflected by
+  // the server; the list patcher reads it through pendingCancellationView().
+  S: { tasks: [], cancelling: new Set<string>() },
 });
 vm.runInContext(
   [
     extractFunction('patchTaskListFromEvent'),
+    extractFunction('pendingCancellationView'),
     extractFunction('waitingProviderLabel'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),

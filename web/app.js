@@ -958,6 +958,12 @@ function normalizedAuthorization(value, fallbackProjectId) {
   return { level, scope: 'projects', projectIds };
 }
 
+// The hint is the empty state of the one scope field — once a scope is chosen the
+// chips say where the grant applies, so the placeholder gets out of their way.
+function authorizationScopePlaceholder(chips) {
+  return chips.length ? '' : 'Project name or @organization';
+}
+
 function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
   const selected = normalizedAuthorization(value, fallbackProjectId);
   const level = authorizationLevels().find((candidate) => candidate.id === selected.level);
@@ -969,7 +975,7 @@ function authorizationEditorHtml(id, value, projects, fallbackProjectId) {
     <div class="authz-scope-combo" ${level.scope === 'selectable' ? '' : 'hidden'}>
       <div class="authz-scope-field">
         <span class="authz-scope-chips">${chips.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : names.get(scope) || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('')}</span>
-        <input class="authz-scope-input" aria-label="Authorization scope" autocomplete="off" spellcheck="false" placeholder="@organization or project name">
+        <input class="authz-scope-input" aria-label="Authorization scope" autocomplete="off" spellcheck="false" placeholder="${esc(authorizationScopePlaceholder(chips))}">
         <button type="button" class="authz-scope-caret" aria-label="Show authorization scopes" tabindex="-1">⌄</button>
       </div>
       <div class="authz-scope-menu" role="listbox" hidden></div>
@@ -998,6 +1004,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const menu = root.querySelector('.authz-scope-menu');
   const caret = root.querySelector('.authz-scope-caret');
   const chips = root.querySelector('.authz-scope-chips');
+  const field = root.querySelector('.authz-scope-field');
   let value = normalizedAuthorization(JSON.parse(root.dataset.authorization || '{}'));
   let active = -1;
   const projectById = new Map((projects || []).map((project) => [project.id, project]));
@@ -1006,6 +1013,7 @@ function wireAuthorizationEditor(root, projects, onChange) {
   const drawChips = () => {
     const selected = value.scope === 'organization' ? ['@organization'] : (value.projectIds || []);
     chips.innerHTML = selected.map((scope) => `<span class="authz-scope-chip" data-scope="${esc(scope)}"><span>${esc(scope === '@organization' ? scope : projectById.get(scope)?.name || scope)}</span><button type="button" aria-label="Remove ${esc(scope)}">×</button></span>`).join('');
+    input.placeholder = authorizationScopePlaceholder(selected);
     chips.querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
       const scope = button.closest('[data-scope]').dataset.scope;
       value = scope === '@organization' ? { level: value.level, scope: 'projects', projectIds: [] }
@@ -1058,6 +1066,11 @@ function wireAuthorizationEditor(root, projects, onChange) {
     } else if (event.key === 'Escape') hide();
   });
   caret.addEventListener('mousedown', (event) => { event.preventDefault(); input.focus(); menu.hidden ? show() : hide(); });
+  // The whole box is the text field — clicking its padding lands the cursor.
+  field.addEventListener('mousedown', (event) => {
+    if (event.target !== field && event.target !== chips) return;
+    event.preventDefault(); input.focus();
+  });
   root._authorizationValue = value;
   drawChips();
 }

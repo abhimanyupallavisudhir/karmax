@@ -1033,45 +1033,67 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .authz-cap-item input, .authz-all input, .authz-cap-group summary input { margin-top: 2px; flex: none; }
 .authz-scoped { margin: 8px 0 12px; }
 
-/* One authorization control everywhere: level on the left, scope chips and a
-   filtering project combobox on the right. The joined outline makes the two
-   policy dimensions read as one compact grant rather than an admin form. */
-.authz-editor {
-  display: flex; align-items: stretch; min-width: min(100%, 390px); max-width: 100%;
-  border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface);
-  box-shadow: 0 1px 0 rgba(0,0,0,.025); transition: border-color .14s, box-shadow .14s;
+/* One authorization control everywhere: the level on its own line, then a single
+   field where the scopes live — chosen scopes sit as chips beside the cursor, so
+   there is one box to look at and one place to type. Stacking keeps it legible in
+   the narrow task-form sidebar. Everything is qualified by `.authz-editor` on
+   purpose: the generic `.form-row input/select` rules are more specific than a
+   bare class and would otherwise repaint the field as a boxed input-in-a-box. */
+.authz-editor { display: grid; gap: 6px; min-width: 0; max-width: 100%; }
+.authz-editor .authz-level-select {
+  width: 100%; padding: 8px 11px; border: 1px solid var(--line-strong); border-radius: 9px;
+  background: var(--surface); color: var(--ink); font-weight: 650; outline: 0;
+  transition: border-color .14s, box-shadow .14s;
 }
-.authz-editor:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
-.authz-level-select {
-  width: auto; min-width: 128px; max-width: 54%; flex: 0 1 170px; border: 0; border-radius: 8px 0 0 8px;
-  background: var(--surface-2); color: var(--ink); font-weight: 650; outline: 0;
-}
-.authz-scope-combo { position: relative; flex: 1; min-width: 0; border-left: 1px solid var(--line); }
+.authz-editor .authz-level-select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.authz-scope-combo { position: relative; min-width: 0; }
 .authz-scope-combo[hidden] { display: none; }
-.authz-scope-field { display: flex; align-items: center; min-height: 34px; padding: 3px 30px 3px 5px; }
+.authz-scope-field {
+  position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  min-height: 36px; padding: 4px 30px 4px 5px; cursor: text;
+  border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface);
+  transition: border-color .14s, box-shadow .14s;
+}
+.authz-scope-field:hover { border-color: var(--ink-3); }
+.authz-scope-field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
 .authz-scope-chips { display: contents; }
 .authz-scope-chip {
-  display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 150px;
-  margin-right: 4px; padding: 2px 4px 2px 8px; border-radius: 999px;
-  background: var(--accent-weak); color: var(--accent-ink); font-size: 11px; font-weight: 650;
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%;
+  padding: 3px 5px 3px 9px; border-radius: 999px;
+  background: var(--accent-weak); color: var(--accent); font-size: 11.5px; font-weight: 650;
 }
 .authz-scope-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.authz-scope-chip button { border: 0; padding: 0 2px; background: transparent; color: inherit; cursor: pointer; opacity: .62; }
-.authz-scope-chip button:hover { opacity: 1; }
-.authz-scope-input { flex: 1 1 78px; min-width: 50px; width: 0; border: 0; padding: 4px; background: transparent; outline: 0; }
-.authz-scope-caret { position: absolute; right: 6px; top: 5px; border: 0; padding: 2px 5px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.authz-scope-chip button {
+  display: grid; place-items: center; width: 15px; height: 15px; flex: none;
+  border: 0; padding: 0; border-radius: 50%; background: transparent;
+  color: inherit; font-size: 12px; line-height: 1; cursor: pointer; opacity: .55;
+}
+.authz-scope-chip button:hover { opacity: 1; background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.authz-editor .authz-scope-input {
+  flex: 1 1 60px; min-width: 44px; width: 0; border: 0; border-radius: 0;
+  padding: 3px 4px; background: transparent; color: inherit; outline: 0;
+}
+.authz-editor .authz-scope-input::placeholder { color: var(--ink-3); }
+.authz-scope-caret {
+  position: absolute; right: 4px; top: 4px; display: grid; place-items: center;
+  width: 24px; height: 26px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--ink-3); font-size: 12px; cursor: pointer;
+}
+.authz-scope-caret:hover { color: var(--ink-2); }
 .authz-scope-menu {
   position: absolute; z-index: 90; left: -1px; right: -1px; top: calc(100% + 5px);
   max-height: 230px; overflow: auto; padding: 5px; border: 1px solid var(--line-strong);
   border-radius: 9px; background: var(--surface); box-shadow: var(--shadow);
 }
-.authz-scope-option { display: flex; width: 100%; justify-content: space-between; gap: 12px; border: 0; border-radius: 6px; padding: 7px 8px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
-.authz-scope-option:hover, .authz-scope-option.active { background: var(--accent-weak); color: var(--accent-ink); }
+.authz-scope-option { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; border: 0; border-radius: 6px; padding: 7px 8px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
+/* --accent-ink is the ink for a SOLID accent fill; on the weak tint it reads as
+   white-on-lavender. The tint takes the accent itself. */
+.authz-scope-option:hover, .authz-scope-option.active { background: var(--accent-weak); color: var(--accent); }
 .authz-scope-option small, .authz-scope-empty { color: var(--ink-3); font-size: 10px; }
 .authz-scope-empty { display: block; padding: 8px; }
-.authz-invite-row { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(300px, 1.5fr) auto; gap: 8px; align-items: start; margin-top: 10px; }
+.authz-invite-row { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(260px, 1.5fr) auto; gap: 8px; align-items: start; margin-top: 10px; }
 .authz-member-row .person-name { margin-right: auto; }
-.authz-member-row .authz-editor { margin-left: auto; }
+.authz-member-row .authz-editor { margin-left: auto; flex: 0 1 280px; }
 @media (max-width: 760px) {
   .authz-invite-row { grid-template-columns: 1fr; }
   .authz-member-row { align-items: stretch; flex-wrap: wrap; }
