@@ -375,11 +375,15 @@ export async function brokerFinalizeMerge(
  * repos whose merges land in a host-local checkout, because that is where the
  * pull request has to read it from.
  */
-export async function brokerPushBranches(world: World, auth: GitBrokerAuth): Promise<GitBrokerPublishResult> {
+export async function brokerPushBranches(
+  world: World,
+  auth: GitBrokerAuth,
+  repos: WorldRepo[] = worldRepos(world.handle),
+): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
-  for (const repo of worldRepos(world.handle)) {
+  for (const repo of repos) {
     try {
       await pushBranchToOrigin(world, repo, auth);
       pushed.push(repo.name);
