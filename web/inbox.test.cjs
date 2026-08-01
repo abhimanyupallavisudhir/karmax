@@ -41,7 +41,7 @@ global.globalRoute = (tab) => `/personal/${tab}`;
 // A `const` inside a direct eval stays in the eval's own scope; hoist it out.
 eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
-for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxView']) eval(extractFn(name));
+for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxView']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -54,28 +54,32 @@ S.inbox = [
   item('1', 'approval-requested', true),
   item('2', 'review-requested', true),
   item('3', 'review-requested', false),
-  item('4', 'update', false),
+  item('4', 'update', true),
 ];
 
 // Show read is OFF by default: an answered notification stops taking up space.
 ok(inboxShowRead() === false, 'read items are hidden by default');
-ok(inboxItems().map((x) => x.id).join(',') === '1,2', 'only unread items render by default');
+ok(inboxItems().map((x) => x.id).join(',') === '1,2', 'All renders unread asks, not routine updates');
 global.FLAGS = { 'karmax-inbox-show-read': true };
-ok(inboxItems().map((x) => x.id).join(',') === '1,2,3,4', 'the toggle brings read items back');
+ok(inboxItems().map((x) => x.id).join(',') === '1,2,3', 'the toggle brings read asks back without adding updates to All');
 global.FLAGS = {};
 
-// Sub-tabs classify by kind, and only kinds actually present get a tab.
+// Every known kind has a stable tab, including kinds with no current items.
 const tabs = inboxTabs();
 ok(tabs[0].key === 'all', 'All is the first sub-tab');
-ok(tabs.map((t) => t.key).join(',') === 'all,approval-requested,review-requested,update',
-  `only kinds present get a tab (got ${tabs.map((t) => t.key).join(',')})`);
+ok(tabs.map((t) => t.key).join(',') === 'all,approval-requested,review-requested,escalated,assigned,mentioned,update',
+  `every kind gets a tab (got ${tabs.map((t) => t.key).join(',')})`);
 ok(tabs.find((t) => t.key === 'review-requested').unread === 1, 'a sub-tab counts its UNREAD items');
-ok(tabs.find((t) => t.key === 'all').unread === 2, 'All counts every unread item');
+ok(tabs.find((t) => t.key === 'escalated').unread === 0, 'an empty sub-tab has a zero count');
+ok(tabs.find((t) => t.key === 'update').unread === 1, 'Updates counts its unread items');
+ok(tabs.find((t) => t.key === 'all').unread === 2, 'All counts unread asks, not updates');
 
 S.inboxFilter = 'approval-requested';
 ok(inboxItems().map((x) => x.id).join(',') === '1', 'the selected sub-tab filters the list');
 S.inboxFilter = 'escalated'; // a filter whose items have all been answered
 ok(inboxItems().length === 0, 'an empty sub-tab simply renders empty');
+S.inboxFilter = 'update';
+ok(inboxItems().map((x) => x.id).join(',') === '4', 'routine updates remain available in their own sub-tab');
 S.inboxFilter = 'all';
 
 // An update's news is the outcome, not the word "update".
@@ -107,14 +111,17 @@ S.inbox = [
   item('1', 'approval-requested', true),
   item('2', 'review-requested', true),
   item('3', 'review-requested', false),
-  item('4', 'update', false),
+  item('4', 'update', true),
 ];
 const html = inboxView();
 ok(html.includes('href="/personal/inbox/approval-requested"'), 'sub-tabs are real links (URL owns the view)');
+ok(html.includes('href="/personal/inbox/escalated"'), 'empty sub-tabs are still rendered as links');
 ok(html.includes('id="inbox-show-read"'), 'the panel offers the Show read toggle');
 ok(!/id="inbox-show-read"[^>]*checked/.test(html), 'Show read is unchecked by default');
 ok(html.includes('Task 1'), 'rows render the task title');
 ok(!html.includes('Task 3'), 'a read row is not rendered while Show read is off');
+ok(!html.includes('Task 4'), 'All does not render an unread routine update');
+ok(html.includes('<span>2 unread</span>'), 'the All toolbar count excludes routine updates');
 // Behaviour lives in one place — the profile — not next to the list it affects.
 ok(html.includes(`href="/personal/profile#notifications"`), 'the panel points at the notification settings');
 ok(!html.includes('id="save-delivery"'), 'delivery preferences are no longer configured from the list');
