@@ -21,11 +21,16 @@ const context = vm.createContext({
   esc: (value: unknown) => String(value),
   pipeline: () => '',
   liveRoleFor: () => 'do',
-  S: { tasks: [] },
+  // `cancelling` holds the tasks whose cancel click has not yet been confirmed by
+  // the server; pendingCancellationView consults it on every patch.
+  S: { tasks: [], cancelling: new Set() },
 });
 vm.runInContext(
   [
     extractFunction('patchTaskListFromEvent'),
+    // patchTaskListFromEvent calls this; without it the compact-update test threw
+    // a ReferenceError from inside the vm rather than exercising the labels.
+    extractFunction('pendingCancellationView'),
     extractFunction('waitingProviderLabel'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),

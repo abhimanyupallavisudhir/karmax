@@ -96,6 +96,31 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     }]);
   });
 
+  /** Urgency is how loudly the agent is allowed to ask. It has to survive the MCP
+   *  boundary, and a level nobody defined has to be refused at it. */
+  it('carries the agent\'s chosen urgency across the boundary, and only a real level', async () => {
+    const seen: any[] = [];
+    const stub = { escalateToHuman: async (args: unknown) => { seen.push(args); return { status: 'waiting' }; } } as any;
+    const server = createPlatformMcpServer(stub);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverT);
+    const c = new Client({ name: 'urgency-test', version: '1.0.0' });
+    await c.connect(clientT);
+
+    await c.callTool({ name: 'escalate_to_human',
+      arguments: { audience: ['@owners'], message: 'The card was declined.', urgency: 'critical' } });
+    expect(seen[0]).toMatchObject({ urgency: 'critical' });
+
+    // Silence stays silent here: the default belongs to the API, not the tool call.
+    await c.callTool({ name: 'escalate_to_human', arguments: { audience: ['@owners'], message: 'Which font?' } });
+    expect(seen[1]).not.toHaveProperty('urgency');
+
+    const invalid: any = await c.callTool({ name: 'escalate_to_human',
+      arguments: { audience: ['@owners'], message: 'Now!', urgency: 'EXTREMELY' } });
+    expect(invalid.isError).toBeTruthy();
+    expect(seen).toHaveLength(2);
+  });
+
   it('forwards an exact permission request with its chosen audience and reason', async () => {
     const seen: unknown[] = [];
     const stub = {

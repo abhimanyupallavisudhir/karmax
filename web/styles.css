@@ -248,6 +248,11 @@ a { color: var(--accent); text-decoration: none; }
 /* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
 .task-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); font-weight: 500; }
 .task-sub { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+/* The flex row above is for a strip of metadata (a div of chips). A <p> is prose:
+   as a flex container every inline <a>/<span> in the sentence became its own item,
+   gapped and wrapped away from the words around it. Prose flows as prose. */
+p.task-sub { display: block; line-height: 1.55; }
+p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .principal-chip { display:inline-flex; align-items:center; border-radius:999px; padding:2px 7px; background:var(--accent-weak); color:var(--accent); font-weight:600; }
@@ -312,7 +317,25 @@ a { color: var(--accent); text-decoration: none; }
 .inbox-row { display:grid; grid-template-columns:auto 1fr auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid var(--line); border-radius:var(--r); background:var(--surface); margin-bottom:7px; cursor:pointer; }
 .inbox-row.unread { border-left:3px solid var(--accent); background:var(--surface-2); }
 .inbox-kind { color:var(--accent); }
-.delivery-card { margin-top:22px; }
+/* Urgency is loud only above normal: the list is already ordered by it, so a chip
+   on every row would label the ordinary case instead of the exception. */
+.urgency-chip {
+  display:inline-block; padding:1px 7px; border-radius:999px;
+  font-family:var(--font-mono); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em;
+  background:var(--working-weak); color:var(--working); vertical-align:middle;
+}
+.urgency-chip.critical { background:var(--danger-weak); color:var(--danger); }
+.urgency-chip.normal, .urgency-chip.low { background:var(--surface-2); color:var(--ink-3); }
+/* Trailing the task title in a list; leading its own row in the settings table,
+   where a grid item would otherwise stretch to the full column instead of
+   hugging the word. */
+.inbox-row .urgency-chip { margin-left:8px; }
+.notify-row .urgency-chip { justify-self:start; }
+/* Per-urgency behaviour: one row per level, one column per behaviour. */
+.notify-grid { display:grid; gap:2px; margin:6px 0 12px; }
+.notify-row { display:grid; grid-template-columns:110px repeat(2,minmax(0,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
+.notify-row:last-child { border-bottom:0; }
+.notify-head { color:var(--ink-3); font-size:11px; text-transform:uppercase; letter-spacing:.05em; border-bottom:1px solid var(--line); }
 .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 14px; }
 .organization-settings { max-width:1080px; margin:0 auto; }
 .main-inner:has(> .organization-settings) { max-width:1160px; }

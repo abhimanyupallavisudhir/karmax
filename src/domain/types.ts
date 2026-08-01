@@ -130,6 +130,43 @@ export interface GitConnection {
   suspendedAt?: number;
 }
 
+/**
+ * How loudly an ask asks. Urgency is the one knob an agent turns when it needs a
+ * person: it orders the inbox (highest first, always) and selects the behaviour
+ * that person configured for the level — a system notification, a sound, and in
+ * time a connector that reaches them away from the browser.
+ */
+export type Urgency = 'low' | 'normal' | 'high' | 'critical';
+
+/** Ascending, so the array index IS the rank the inbox row stores and sorts on. */
+export const URGENCY_LEVELS: Urgency[] = ['low', 'normal', 'high', 'critical'];
+
+export function urgencyRank(urgency: Urgency): number {
+  const rank = URGENCY_LEVELS.indexOf(urgency);
+  return rank < 0 ? URGENCY_LEVELS.indexOf('normal') : rank;
+}
+
+/** Anything unrecognized collapses to the caller's fallback instead of throwing:
+ * urgency is advisory metadata and must never be the reason an ask fails. */
+export function normalizeUrgency(value: unknown, fallback: Urgency = 'normal'): Urgency {
+  return URGENCY_LEVELS.includes(value as Urgency) ? value as Urgency : fallback;
+}
+
+/**
+ * What a kind of ask is worth when nobody said. An approval request blocks an
+ * agent on a person and is the one thing that cannot proceed without them, so it
+ * starts high; an outcome report is not an ask at all, so it starts low. Agents
+ * override this per request — the default is what an unopinionated caller gets.
+ */
+export const DEFAULT_URGENCY: Record<InboxItem['kind'], Urgency> = {
+  'approval-requested': 'high',
+  'review-requested': 'normal',
+  escalated: 'normal',
+  assigned: 'normal',
+  mentioned: 'normal',
+  update: 'low',
+};
+
 export interface InboxItem {
   id: string;
   organizationId: string;
@@ -137,6 +174,7 @@ export interface InboxItem {
   eventSeq: number;
   taskId: string;
   kind: 'assigned' | 'mentioned' | 'review-requested' | 'approval-requested' | 'escalated' | 'update';
+  urgency: Urgency;
   unread: boolean;
   actionable: boolean;
   createdAt: number;

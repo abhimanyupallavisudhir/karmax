@@ -24,7 +24,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
+import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -2760,6 +2760,7 @@ export class Gateway {
           return this.json(res, 200, await api.escalateToHuman(token, {
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             message: String(b.message ?? ''),
+            ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
           }));
         } catch (error) {
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
@@ -2772,6 +2773,7 @@ export class Gateway {
             capabilities: Array.isArray(b.capabilities) ? b.capabilities.map(String) : [],
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             reason: String(b.reason ?? ''),
+            ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
           }));
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -3727,6 +3729,7 @@ export class Gateway {
                 ...(decision.itemId ? { itemId: decision.itemId } : {}),
                 ...(b.domain ? { domain: String(b.domain) } : {}),
                 ...(b.why ? { why: String(b.why) } : {}),
+                ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
               },
             });
           }

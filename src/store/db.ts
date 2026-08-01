@@ -51,6 +51,10 @@ import {
   ResourceAttachment,
   ResourceRevision,
   ResourceLease,
+  DEFAULT_URGENCY,
+  URGENCY_LEVELS,
+  normalizeUrgency,
+  urgencyRank,
 } from '../domain/types.js';
 import { resourceDriver } from '../domain/resource-drivers.js';
 import { newId } from '../util/id.js';
@@ -444,6 +448,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS inbox (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
         eventSeq INTEGER NOT NULL, taskId TEXT NOT NULL, kind TEXT NOT NULL,
+        urgency INTEGER NOT NULL DEFAULT ${urgencyRank('normal')},
         unread INTEGER NOT NULL, actionable INTEGER NOT NULL, createdAt INTEGER NOT NULL,
         readAt INTEGER, UNIQUE (userId, eventSeq, kind)
       );
@@ -621,6 +626,12 @@ export class Store {
         DELETE FROM inbox WHERE id IN (${duplicates});
         CREATE UNIQUE INDEX idx_inbox_live ON inbox(userId, taskId, kind);`);
     }
+    // Urgency arrived after the inbox did. Existing asks are all "normal": the
+    // column default backfills them, and nothing needs to guess a level for an
+    // ask whose requester never had one to state.
+    const inboxCols = this.db.prepare('PRAGMA table_info(inbox)').all() as { name: string }[];
+    if (!inboxCols.some((c) => c.name === 'urgency'))
+      this.db.exec(`ALTER TABLE inbox ADD COLUMN urgency INTEGER NOT NULL DEFAULT ${urgencyRank('normal')}`);
     const invitationCols = this.db.prepare('PRAGMA table_info(organization_invitations)').all() as any[];
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT');
@@ -2386,8 +2397,11 @@ export class Store {
       .map((r) => JSON.parse(r.principal));
   }
 
+  /** Urgency first, recency second: the most urgent ask is always at the top,
+   * and the limit therefore truncates the least urgent tail rather than a
+   * high-urgency ask that happens to be older. */
   listInbox(userId: string, organizationId: string, opts: { unreadOnly?: boolean; limit?: number } = {}): InboxItem[] {
-    const sql = `SELECT * FROM inbox WHERE userId=? AND organizationId=?${opts.unreadOnly ? ' AND unread=1' : ''} ORDER BY createdAt DESC LIMIT ?`;
+    const sql = `SELECT * FROM inbox WHERE userId=? AND organizationId=?${opts.unreadOnly ? ' AND unread=1' : ''} ORDER BY urgency DESC, createdAt DESC LIMIT ?`;
     return (this.db.prepare(sql).all(userId, organizationId, Math.max(1, Math.min(opts.limit ?? 200, 1000))) as any[]).map(rowToInbox);
   }
 
@@ -2619,6 +2633,11 @@ export class Store {
       for (const subscriber of this.subscribersFor(task.id)) users.push(...this.expandPrincipal(subscriber, task.projectId));
     }
     if (!kind) return;
+    // The requester states urgency ONCE, on the event that raises the ask; the
+    // lifecycle ticks that restate it carry none. So an explicit level always
+    // wins, and silence leaves whatever the ask was already raised at — never
+    // demoting an agent's "critical" back to the kind's default on the next tick.
+    const requested = ev.payload.urgency === undefined ? undefined : normalizeUrgency(ev.payload.urgency);
     for (const userId of new Set(users)) {
       const preferences = this.getDeliveryPreferences(userId, project.organizationId);
       if (!actionable && !preferences.routine) continue;
@@ -2627,17 +2646,17 @@ export class Store {
       if (existing) {
         // The same ask, restated. Point it at the newest event but leave its age
         // and read state alone: a repeat is not a new notification.
-        this.db.prepare('UPDATE inbox SET eventSeq=?, actionable=? WHERE id=?')
-          .run(eventSeq, actionable ? 1 : 0, existing.id);
+        this.db.prepare(`UPDATE inbox SET eventSeq=?, actionable=?${requested ? ', urgency=?' : ''} WHERE id=?`)
+          .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id);
         continue;
       }
       if (actionable) this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]);
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
-        taskId: task.id, kind, unread: true, actionable, createdAt: ev.ts };
+        taskId: task.id, kind, urgency: requested ?? DEFAULT_URGENCY[kind], unread: true, actionable, createdAt: ev.ts };
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO inbox
-        (id, organizationId, userId, eventSeq, taskId, kind, unread, actionable, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
-          item.taskId, item.kind, item.actionable ? 1 : 0, item.createdAt);
+        (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(item.id, item.organizationId, item.userId, item.eventSeq,
+          item.taskId, item.kind, urgencyRank(item.urgency), item.actionable ? 1 : 0, item.createdAt);
       if (Number(inserted.changes)) {
         const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack'].filter(Boolean) as string[];
         for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
@@ -2678,7 +2697,7 @@ export class Store {
       // A crashed dispatcher releases its claim after one minute.
       this.db.prepare("UPDATE delivery_outbox SET state='pending', claimedAt=NULL WHERE state='sending' AND claimedAt<?")
         .run(now - 60_000);
-      const row = this.db.prepare(`SELECT d.*, i.organizationId, i.userId, i.eventSeq, i.taskId, i.kind,
+      const row = this.db.prepare(`SELECT d.*, i.organizationId, i.userId, i.eventSeq, i.taskId, i.kind, i.urgency,
         i.unread, i.actionable, i.createdAt inboxCreatedAt, i.readAt FROM delivery_outbox d
         JOIN inbox i ON i.id=d.inboxId WHERE d.state='pending' AND d.nextAt<=? ORDER BY d.createdAt LIMIT 1`).get(now) as any;
       if (!row) { this.db.exec('COMMIT'); return undefined; }
@@ -2686,7 +2705,7 @@ export class Store {
       this.db.exec('COMMIT');
       return { id: row.id, channel: row.channel, attempts: Number(row.attempts), inbox: rowToInbox({
         id: row.inboxId, organizationId: row.organizationId, userId: row.userId, eventSeq: row.eventSeq,
-        taskId: row.taskId, kind: row.kind, unread: row.unread, actionable: row.actionable,
+        taskId: row.taskId, kind: row.kind, urgency: row.urgency, unread: row.unread, actionable: row.actionable,
         createdAt: row.inboxCreatedAt, readAt: row.readAt,
       }) };
     } catch (error) {
@@ -4476,7 +4495,8 @@ function rowToRepository(r: any): Repository {
 
 function rowToInbox(r: any): InboxItem {
   return { id: r.id, organizationId: r.organizationId, userId: r.userId, eventSeq: r.eventSeq,
-    taskId: r.taskId, kind: r.kind, unread: Boolean(r.unread), actionable: Boolean(r.actionable),
+    taskId: r.taskId, kind: r.kind, urgency: URGENCY_LEVELS[Number(r.urgency ?? urgencyRank('normal'))] ?? 'normal',
+    unread: Boolean(r.unread), actionable: Boolean(r.actionable),
     createdAt: r.createdAt, readAt: r.readAt ?? undefined };
 }
 

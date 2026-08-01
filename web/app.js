@@ -2053,6 +2053,13 @@ async function loadCollaboration() {
   S.users = users || [];
   S.inbox = inbox || [];
   S.deliveryPreferences = prefs;
+  // Announce what ARRIVED since the last list. The first load only seeds the
+  // seen set (and switching organization reseeds it), so opening the app never
+  // replays the backlog. See announceInbox for what each urgency does.
+  const seen = S.announcedOrganizationId === organizationId ? S.announcedInbox : null;
+  S.announcedInbox = new Set(S.inbox.map((item) => item.id));
+  S.announcedOrganizationId = organizationId;
+  announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
 }
 
@@ -11125,13 +11132,23 @@ const INBOX_TABS = [
   { key: 'mentioned', label: 'Mentions' },
   { key: 'update', label: 'Updates' },
 ];
+// How loudly an ask asks (domain/types.ts). Ascending, so the index is the sort
+// rank; an unrecognized level reads as 'normal' rather than sinking to the floor.
+const URGENCY_LEVELS = ['low', 'normal', 'high', 'critical'];
+function urgencyRank(urgency) {
+  const rank = URGENCY_LEVELS.indexOf(urgency);
+  return rank < 0 ? URGENCY_LEVELS.indexOf('normal') : rank;
+}
 // Read items are hidden by default — an answered notification should stop taking
 // up space. A per-browser display choice, like the theme (see renderFlag).
 function inboxShowRead() { return renderFlag('karmax-inbox-show-read', false); }
+// Urgency first, recency second — the same order the server returns, restated
+// here so the list is right even when a row is patched in place client-side.
 function inboxItems() {
   const showRead = inboxShowRead();
   return S.inbox.filter((item) => (showRead || item.unread)
-    && (S.inboxFilter === 'all' || item.kind === S.inboxFilter));
+    && (S.inboxFilter === 'all' || item.kind === S.inboxFilter))
+    .sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency) || b.createdAt - a.createdAt);
 }
 function inboxTabs() {
   const unread = (match) => S.inbox.filter((item) => item.unread && match(item)).length;
@@ -11144,8 +11161,13 @@ function inboxTabs() {
 function inboxRowLabel(item) {
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
 }
+// Only an above-normal level is worth a chip: the list is already ordered by
+// urgency, so marking every row would label the ordinary case.
+function urgencyChip(urgency) {
+  return urgencyRank(urgency) > urgencyRank('normal')
+    ? `<span class="urgency-chip ${urgency}">${esc(urgency)}</span>` : '';
+}
 function inboxView() {
-  const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
     <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
@@ -11153,21 +11175,12 @@ function inboxView() {
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
-      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.kind)}</b>
+      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.kind)}</b>${urgencyChip(item.urgency)}
       <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
-    <div class="card delivery-card"><div class="section-h">Delivery</div>
-      ${['browser', 'email', 'slack'].map((key) => {
-    // A channel with no adapter cannot deliver anything. Offering the switch anyway
-    // — and toasting "saved" — meant a user could turn on Email and simply stop
-    // being notified, with the failure logged only on the server.
-    const ready = (S.meta?.deliveryChannels ?? ['browser']).includes(key);
-    const label = key[0].toUpperCase() + key.slice(1);
-    return `<label class="switch${ready ? '' : ' disabled'}"${ready ? '' : ` title="Not set up on this server yet"`}>`
-      + `<input type="checkbox" data-delivery="${key}" ${prefs[key] && ready ? 'checked' : ''} ${ready ? '' : 'disabled'}/>`
-      + `<span>${label}${ready ? '' : ' <span class="task-sub">— not set up</span>'}</span></label>`;
-  }).join('')}
-      <button class="btn sm primary" id="save-delivery">Save preferences</button></div>`;
+    <p class="task-sub">Sorted by urgency, then by age. What each level does when it arrives — a system
+      notification, a sound, which channels it is delivered on — is set in
+      <a data-spa href="${globalRoute('profile')}#notifications">your profile</a>.</p>`;
 }
 
 function wireInboxView() {
@@ -11192,13 +11205,90 @@ function wireInboxView() {
       await loadCollaboration(); renderMain(); renderRail();
     } catch (error) { toast(error.message, true); }
   });
-  $('#save-delivery')?.addEventListener('click', async () => {
-    const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
-    try {
-      S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
-      toast('Delivery preferences saved');
-    } catch (error) { toast(error.message, true); }
-  });
+}
+
+// ── notification behaviour, per urgency ─────────────────────────────────────
+// The list is where asks live; this is what an ask DOES when it arrives. Both
+// behaviours only make sense where the person actually is, so — like the theme —
+// they are per-browser: a system notification needs this browser's permission,
+// and a sound can only be heard here.
+const NOTIFY_BEHAVIOURS = [
+  { key: 'notify', label: 'System notification' },
+  { key: 'sound', label: 'Sound' },
+];
+// Sensible defaults: silence is the floor, and each level up interrupts a little
+// more. Nothing below high interrupts at all — an inbox that pings for routine
+// news is one people turn off entirely.
+const NOTIFY_DEFAULTS = {
+  critical: { notify: true, sound: true },
+  high: { notify: true, sound: false },
+  normal: { notify: false, sound: false },
+  low: { notify: false, sound: false },
+};
+function notifyPrefs() {
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem('karmax-notify') || '{}') || {}; } catch {}
+  return Object.fromEntries(URGENCY_LEVELS.map((level) =>
+    [level, { ...NOTIFY_DEFAULTS[level], ...(stored[level] || {}) }]));
+}
+function setNotifyPref(level, behaviour, on) {
+  const next = notifyPrefs();
+  next[level] = { ...next[level], [behaviour]: Boolean(on) };
+  try { localStorage.setItem('karmax-notify', JSON.stringify(next)); } catch {}
+  return next;
+}
+// Only asks that ARRIVED, and only once the browser has seen a first list:
+// opening the app must never replay the backlog as a burst of notifications.
+function inboxArrivals(previous, items) {
+  return previous ? items.filter((item) => item.unread && !previous.has(item.id)) : [];
+}
+function announceInbox(items) {
+  const prefs = notifyPrefs();
+  let sounded = false;
+  for (const item of items) {
+    const behaviour = prefs[item.urgency] || prefs.normal;
+    if (behaviour.notify) showSystemNotification(item);
+    // One sound per batch. `items` is urgency-ordered, so the first level that
+    // asks for a sound is the loudest one that arrived — five asks landing
+    // together are a single event to the person hearing it.
+    if (behaviour.sound && !sounded) { playNotificationSound(item.urgency); sounded = true; }
+  }
+}
+function showSystemNotification(item) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
+  try {
+    const number = item.task?.num != null ? `#${item.task.num} · ` : '';
+    const notification = new Notification(item.task?.title || 'karmax', {
+      body: `${number}${inboxRowLabel(item)}`,
+      tag: item.id,                                    // a restated ask replaces its own popup
+      requireInteraction: item.urgency === 'critical', // critical waits to be dismissed
+    });
+    notification.onclick = () => { window.focus(); notification.close(); openInboxItem(item); };
+    return true;
+  } catch { return false; }
+}
+// Synthesized rather than shipped: no asset to fetch, no volume surprise, and a
+// critical ask simply gets a second blip instead of a different sound to learn.
+function playNotificationSound(urgency = 'normal') {
+  const Ctx = typeof window === 'undefined' ? null : (window.AudioContext || window.webkitAudioContext);
+  if (!Ctx) return false;
+  try {
+    const ctx = S.audio || (S.audio = new Ctx());
+    ctx.resume?.();
+    for (const offset of urgency === 'critical' ? [0, 0.18] : [0]) {
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      oscillator.frequency.value = urgency === 'critical' ? 880 : 660;
+      oscillator.connect(gain).connect(ctx.destination);
+      const at = ctx.currentTime + offset;
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.12, at + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
+      oscillator.start(at);
+      oscillator.stop(at + 0.16);
+    }
+    return true;
+  } catch { return false; }
 }
 
 async function openInboxItem(item) {
@@ -11330,6 +11420,7 @@ function profileView() {
       <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
       <div class="profile-orgs">${orgList}</div>
     </div>
+    ${notificationsCard()}
     <div class="card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
@@ -11346,7 +11437,94 @@ function profileView() {
   </div>`;
 }
 
+// One place for everything an ask does to you: the per-urgency behaviour of this
+// browser, and the channels the server delivers on. The inbox page lists asks;
+// it does not configure them.
+function notificationsCard() {
+  const prefs = notifyPrefs();
+  const delivery = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
+  const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
+  const permissionNote = {
+    granted: '<p class="task-sub">This browser may show system notifications.</p>',
+    denied: '<p class="task-sub">This browser is blocking notifications — allow them in its site settings, or the levels above can only play a sound.</p>',
+    unsupported: '<p class="task-sub">This browser cannot show system notifications; sounds still work.</p>',
+    default: '<button class="btn sm" id="notify-permission" type="button">Allow system notifications</button>',
+  }[permission] ?? '';
+  // Loudest first, the same order the inbox itself is in.
+  const levels = [...URGENCY_LEVELS].reverse();
+  return `<div class="card" id="notifications">
+    <div class="section-h">Notifications</div>
+    <p class="task-sub">Agents set an urgency when they need you — approvals arrive high by default. Higher
+      urgency always sorts to the top of your inbox; here you choose what else each level does.</p>
+    <div class="notify-grid">
+      <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
+    `<span>${behaviour.label}</span>`).join('')}<span></span></div>
+      ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
+        <span class="urgency-chip ${level}">${level}</span>
+        ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
+          aria-label="${behaviour.label} for ${level} urgency" ${prefs[level][behaviour.key] ? 'checked' : ''}/></span>`).join('')}
+        <span><button class="btn sm" type="button" data-notify-test="${level}">Test</button></span>
+      </div>`).join('')}
+    </div>
+    ${permissionNote}
+    <div class="settings-divider"></div>
+    <div class="section-h">Delivery</div>
+    <p class="task-sub">Where an ask is delivered, for every organization you work in.</p>
+    ${['browser', 'email', 'slack'].map((key) => {
+    // A channel with no adapter cannot deliver anything. Offering the switch anyway
+    // — and toasting "saved" — meant a user could turn on Email and simply stop
+    // being notified, with the failure logged only on the server.
+    const ready = (S.meta?.deliveryChannels ?? ['browser']).includes(key);
+    const label = key[0].toUpperCase() + key.slice(1);
+    return `<label class="switch${ready ? '' : ' disabled'}"${ready ? '' : ` title="Not set up on this server yet"`}>`
+      + `<input type="checkbox" data-delivery="${key}" ${delivery[key] && ready ? 'checked' : ''} ${ready ? '' : 'disabled'}/>`
+      + `<span>${label}${ready ? '' : ' <span class="task-sub">— not set up</span>'}</span></label>`;
+  }).join('')}
+    <label class="switch"><input type="checkbox" data-delivery="routine" ${delivery.routine ? 'checked' : ''}/>
+      <span>Outcome updates for tasks I follow <span class="task-sub">— low urgency, nothing is asked of you</span></span></label>
+    <button class="btn sm primary" id="save-delivery">Save preferences</button>
+  </div>`;
+}
+
+function wireNotificationsCard() {
+  // The inbox links here by anchor. A SPA render is not a document load, so the
+  // browser never honours the fragment on its own — arriving at the profile and
+  // being left at the top would make that link a lie.
+  if (location.hash === '#notifications')
+    requestAnimationFrame(() => $('#notifications')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  $('#main').querySelectorAll('[data-notify]').forEach((box) => box.addEventListener('change', () => {
+    const [level, behaviour] = box.dataset.notify.split(':');
+    setNotifyPref(level, behaviour, box.checked);
+    // Turning a level on is the natural moment to ask for the permission it needs.
+    if (box.checked && behaviour === 'notify' && typeof Notification !== 'undefined' && Notification.permission === 'default')
+      Notification.requestPermission?.().then(() => renderMain()).catch(() => {});
+  }));
+  $('#main').querySelectorAll('[data-notify-test]').forEach((button) => button.addEventListener('click', () => {
+    const level = button.dataset.notifyTest;
+    const behaviour = notifyPrefs()[level];
+    if (behaviour.sound) playNotificationSound(level);
+    const shown = behaviour.notify && showSystemNotification({ id: `test-${level}`, urgency: level,
+      kind: 'escalated', task: { title: `Test ${level} notification` } });
+    toast(behaviour.notify && !shown
+      ? 'Allow notifications in this browser to see the popup.'
+      : behaviour.notify || behaviour.sound ? `Sent a ${level} notification.` : `${level} notifications are silent.`,
+    behaviour.notify && !shown);
+  }));
+  $('#notify-permission')?.addEventListener('click', async () => {
+    try { await Notification.requestPermission(); } catch {}
+    renderMain();
+  });
+  $('#save-delivery')?.addEventListener('click', async () => {
+    const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
+    try {
+      S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
+      toast('Delivery preferences saved');
+    } catch (error) { toast(error.message, true); }
+  });
+}
+
 function wireProfileView() {
+  wireNotificationsCard();
   const setProfileEditor = (kind) => {
     document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
       panel.hidden = panel.id !== `profile-${kind}-panel`;
