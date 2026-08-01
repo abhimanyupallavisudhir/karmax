@@ -303,7 +303,12 @@ a { color: var(--accent); text-decoration: none; }
 .responsibility-editor { width:100%; display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; padding-top:10px; border-top:1px solid var(--line); margin-top:10px; }
 .responsibility-editor > label:not(.switch) { display:flex; flex-direction:column; gap:4px; color:var(--ink-3); font-size:11px; }
 .responsibility-editor .switch, .responsibility-editor .pal-sub { align-self:end; margin:0; }
-.inbox-toolbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; color:var(--ink-2); }
+.inbox-toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; color:var(--ink-2); }
+.inbox-controls { display:flex; align-items:center; gap:14px; }
+.inbox-controls .switch { gap:7px; font-size:13px; }
+.inbox-controls .switch input { width:30px; height:18px; }
+/* The kind sub-tabs sit under the page title, so they are not the sticky bar. */
+.inbox-tabs { position:static; }
 .inbox-row { display:grid; grid-template-columns:auto 1fr auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid var(--line); border-radius:var(--r); background:var(--surface); margin-bottom:7px; cursor:pointer; }
 .inbox-row.unread { border-left:3px solid var(--accent); background:var(--surface-2); }
 .inbox-kind { color:var(--accent); }

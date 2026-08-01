@@ -91,7 +91,9 @@ eq(globalRoute('organization', organizationById('org_globex')), '/globex/setting
 // ── parseRoute round-trips the new scheme ─────────────────────────────────────
 eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'dashboard' }, 'parse /<org>/dashboard');
 eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organization' }, 'parse /<org>/settings');
-eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox' }, 'parse /<org>/inbox');
+eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox', sub: null }, 'parse /<org>/inbox');
+eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', org: 'acme', tab: 'inbox', sub: 'review-requested' },
+  'parse /<org>/inbox/<kind> as the inbox pinned to one kind of notification');
 eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: null }, 'parse bare /<org> as org home');
 eq(parseRoute('/acme/website-redesign'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: '' },
@@ -127,7 +129,7 @@ eq(projectBySlug('mobile-app', 'org_globex')?.id, 'P2', 'same slug resolves per-
 eq(parseRoute('/dashboard'), { name: 'global', tab: 'dashboard', legacy: true }, 'legacy /dashboard');
 eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /organization');
 eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
-eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', legacy: true }, 'legacy /inbox');
+eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', sub: null, legacy: true }, 'legacy /inbox');
 eq(parseRoute('/projects/website-redesign/tasks/42'),
   { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '', legacy: true },
   'legacy /projects/:name/tasks/:num');
