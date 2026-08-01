@@ -399,7 +399,7 @@ async function main() {
     worldAccess, githubApp, bus });
 
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
-  // dependency completes, a schedule fires, or a matching event occurs. Runs
+  // dependency prerequisites are met and a schedule/event activates it. Runs
   // in-process off the same bus as the self-heal loop; the store is the durable
   // source of truth, so it re-arms every armed task on boot.
   const { TriggerScheduler } = await import('./platform/trigger-scheduler.js');
