@@ -74,6 +74,18 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
   });
 
+  it('offers urgency on every tool that asks a human for something', () => {
+    for (const name of ['escalate_to_human', 'request_permission', 'request_credential']) {
+      const schema = TOOL_SCHEMAS.find((tool) => tool.name === name)!;
+      expect(schema.parameters.properties.urgency).toMatchObject({
+        type: 'string',
+        enum: ['low', 'normal', 'high', 'critical'],
+      });
+      // Optional: an agent with no opinion gets the kind's default, not an error.
+      expect(schema.parameters.required).not.toContain('urgency');
+    }
+  });
+
   it('advertises exact permission elevation as a routed approval request', () => {
     const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'request_permission')!;
     expect(schema).toBeDefined();
@@ -122,6 +134,31 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(obj.safeParse({ body: { name: 'x' } }).success).toBe(true);
     expect(obj.safeParse({ body: [1, 2] }).success).toBe(true);
     expect(obj.safeParse({ body: 'raw' }).success).toBe(true);
+  });
+
+  /** A schema the handler drops on the floor is worse than no schema: the agent
+   *  is told it can raise the alarm, and nothing louder happens. */
+  it('forwards the agent\'s urgency to the gateway, and omits it when unstated', async () => {
+    const sent: any[] = [];
+    const handlers = platformToolHandlers({} as any, {
+      platformRequest: async (method: string, requestPath: string, body?: unknown) => {
+        sent.push({ requestPath, body }); return {};
+      },
+      createReviewInfo: () => {},
+      emit() {}, emitActivity() {},
+    } as any);
+
+    await handlers.escalate_to_human!({ audience: ['@owners'], message: 'stuck', urgency: 'critical' });
+    await handlers.request_permission!({ capabilities: ['task:create'], audience: ['@owners'], reason: 'why', urgency: 'low' });
+    await handlers.request_credential!({ domain: 'github.com', why: 'need it', urgency: 'high' });
+    expect(sent.map((r) => r.body.urgency)).toEqual(['critical', 'low', 'high']);
+
+    // Silence stays silent on the wire: the default belongs to the API, which
+    // knows what KIND of ask this is, not to a tool call guessing on its behalf.
+    sent.length = 0;
+    await handlers.escalate_to_human!({ audience: ['@owners'], message: 'stuck' });
+    await handlers.request_credential!({ domain: 'github.com', why: 'need it' });
+    expect(sent.every((r) => !('urgency' in r.body))).toBe(true);
   });
 
   it('rejects overlong review text without recording it and tells the agent why', async () => {

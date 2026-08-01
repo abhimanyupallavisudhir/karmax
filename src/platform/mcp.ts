@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
 import { PLATFORM_API_CATALOG } from './catalog.js';
+import { URGENCY_LEVELS, type Urgency } from '../domain/types.js';
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
@@ -44,8 +45,8 @@ export interface PlatformOps {
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
-  escalateToHuman(a: { audience: string[]; message: string }): Promise<unknown>;
-  requestPermission(a: { capabilities: string[]; audience: string[]; reason: string }): Promise<unknown>;
+  escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
@@ -391,10 +392,13 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Pause your current task at its exact stage and request input from selected people or teams. ' +
         'Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Calling this stops the current turn; the task resumes when a selected human responds.',
+        'Calling this stops the current turn; the task resumes when a selected human responds. ' +
+        'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
+        'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
         audience: z.array(z.string()).min(1).max(32),
         message: z.string().trim().min(1).max(4_000),
+        urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
     },
     async (a) => wrap(() => ops.escalateToHuman(a)),
@@ -407,11 +411,13 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'and is routed to selected people or teams. Audience selectors: user:<id>, @team:<slug>, @creator, @owners, ' +
         '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Only a selected human who already holds every requested capability can approve; approval resumes the task ' +
-        'with a newly scoped token. Do not request wildcards.',
+        'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
+        'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {
         capabilities: z.array(z.string().trim().min(1)).min(1).max(32),
         audience: z.array(z.string().trim().min(1)).min(1).max(32),
         reason: z.string().trim().min(1).max(4_000),
+        urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
     },
     async (a) => wrap(() => ops.requestPermission(a)),
@@ -448,7 +454,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) this task was not granted, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string() },
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string(), urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/requests', a)),
   );

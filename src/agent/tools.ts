@@ -6,6 +6,7 @@ import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
   compactSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
+import { URGENCY_LEVELS } from '../domain/types.js';
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
 export interface ToolSchema {
@@ -25,6 +26,16 @@ const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) 
 export const MAX_REVIEW_TEXT_LENGTH = 280;
 
 const reviewTextLength = (value: string) => [...value].length;
+
+/** How loudly an ask asks. One shared parameter across every human-facing tool,
+ * so an agent learns the vocabulary once. See `Urgency` in domain/types.ts. */
+const URGENCY_PARAMETER = {
+  type: 'string',
+  enum: URGENCY_LEVELS,
+  description: 'How loudly to ask: low | normal | high | critical. It orders the human\'s inbox and decides '
+    + 'whether their device alerts them. Approval requests default to high; reserve critical for something that '
+    + 'goes wrong if it waits.',
+} as const;
 
 /**
  * The tools every real agent gets: do real work in the world (bash/read/write)
@@ -235,6 +246,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         mode: { type: 'string', enum: ['use', 'reveal'], description: 'use = fill/inject without seeing the secret (default); reveal = you need the plaintext.' },
         kind: { type: 'string', enum: ['access', 'reset'], description: 'reset = the stored secret appears invalid; always parks for the human.' },
         why: { type: 'string', description: 'Why you need it / what failed (shown to the human).' },
+        urgency: URGENCY_PARAMETER,
       },
       required: ['why'],
     },
@@ -574,6 +586,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           maxLength: 4_000,
           description: 'The concrete question or decision the human needs to answer.',
         },
+        urgency: URGENCY_PARAMETER,
       },
       required: ['audience', 'message'],
     },
@@ -608,6 +621,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           maxLength: 4_000,
           description: 'Why the task needs these capabilities (shown to the human).',
         },
+        urgency: URGENCY_PARAMETER,
       },
       required: ['capabilities', 'audience', 'reason'],
     },
@@ -857,6 +871,7 @@ export function platformToolHandlers(
     async request_credential(args) {
       const r: any = await platformRequest('POST', '/api/vault/requests', {
         itemId: args?.item_id, domain: args?.domain, mode: args?.mode, kind: args?.kind, why: args?.why ? String(args.why) : undefined,
+        ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
       });
       // Mirror request_spend: a parked request surfaces at the Review gate.
       if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {
@@ -1066,6 +1081,7 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest('POST', '/api/agent/escalate', {
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         message: String(args?.message ?? ''),
+        ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
       }));
     },
     async request_permission(args) {
@@ -1073,6 +1089,7 @@ export function platformToolHandlers(
         capabilities: Array.isArray(args?.capabilities) ? args.capabilities.map(String) : [],
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         reason: String(args?.reason ?? ''),
+        ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
       }));
     },
     async publish_task_branch() {

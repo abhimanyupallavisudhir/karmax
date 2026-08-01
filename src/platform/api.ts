@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -2045,7 +2045,7 @@ export class KarmaxApi {
    */
   async escalateToHuman(
     token: string,
-    args: { taskId?: string; audience: string[]; message: string },
+    args: { taskId?: string; audience: string[]; message: string; urgency?: Urgency },
   ): Promise<TaskView> {
     const caller = this.require(token, 'escalate_to_human');
     const taskId = args.taskId ?? (caller.taskId !== '*' ? caller.taskId : undefined);
@@ -2081,7 +2081,8 @@ export class KarmaxApi {
       taskId,
       type: 'task.escalated',
       ts: Date.now(),
-      payload: { audience, detail, requestedBy, originStage: view.stage },
+      payload: { audience, detail, requestedBy, originStage: view.stage,
+        urgency: normalizeUrgency(args.urgency, DEFAULT_URGENCY.escalated) },
     };
     const seq = this.deps.store.appendEvent(event);
     this.deps.bus?.emit({ ...event, seq });
@@ -2095,7 +2096,7 @@ export class KarmaxApi {
    */
   async requestPermission(
     token: string,
-    args: { capabilities: string[]; audience: string[]; reason: string },
+    args: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency },
   ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; audience?: string[] }> {
     const caller = this.require(token, 'request_permission');
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
@@ -2148,6 +2149,9 @@ export class KarmaxApi {
           recipients: request.recipients,
           reason: request.reason,
           requestedBy: request.requestedBy,
+          // An approval blocks the agent on a person, so it is high by default —
+          // the agent may raise it further for something genuinely time-critical.
+          urgency: normalizeUrgency(args.urgency, DEFAULT_URGENCY['approval-requested']),
         },
       };
       const seq = this.deps.store.appendEvent(event);

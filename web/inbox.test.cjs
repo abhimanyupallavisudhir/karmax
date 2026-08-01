@@ -36,15 +36,18 @@ global.renderFlag = (key, dflt) => (global.FLAGS && key in global.FLAGS ? global
 global.inboxRoute = (filter) => `/personal/inbox${filter && filter !== 'all' ? `/${filter}` : ''}`;
 global.S = { inbox: [], inboxFilter: 'all', meta: { deliveryChannels: ['browser'] }, deliveryPreferences: null };
 
+global.globalRoute = (tab) => `/personal/${tab}`;
+
 // A `const` inside a direct eval stays in the eval's own scope; hoist it out.
 eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
-for (const name of ['inboxShowRead', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'inboxView']) eval(extractFn(name));
+eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
+for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxView']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
 
-const item = (id, kind, unread, extra = {}) => ({ id, kind, unread, actionable: kind !== 'update',
+const item = (id, kind, unread, extra = {}) => ({ id, kind, unread, actionable: kind !== 'update', urgency: 'normal',
   taskId: `task_${id}`, createdAt: 1_700_000_000_000, task: { id: `task_${id}`, num: Number(id), title: `Task ${id}`, projectId: 'project_1' }, ...extra });
 
 S.inbox = [
@@ -81,12 +84,40 @@ ok(inboxRowLabel(item('9', 'update', true, { task: { status: 'cancelled' } })) =
 ok(inboxRowLabel(item('9', 'update', true)) === 'update', 'and falls back when the status is unknown');
 ok(inboxRowLabel(item('9', 'review-requested', true)) === 'review requested', 'an ask names itself');
 
+// Urgency orders the list: the most urgent ask is at the top whatever its age,
+// and only an above-normal level is chipped (the ordinary case needs no label).
+S.inbox = [
+  item('11', 'escalated', true, { urgency: 'high', createdAt: 1 }),
+  item('12', 'review-requested', true, { urgency: 'normal', createdAt: 9 }),
+  item('13', 'escalated', true, { urgency: 'critical', createdAt: 5 }),
+  item('14', 'escalated', true, { urgency: 'high', createdAt: 0 }),
+];
+ok(inboxItems().map((x) => x.id).join(',') === '13,11,14,12',
+  `urgency outranks recency (got ${inboxItems().map((x) => x.id).join(',')})`);
+ok(urgencyRank('critical') > urgencyRank('high') && urgencyRank('high') > urgencyRank('normal')
+  && urgencyRank('normal') > urgencyRank('low'), 'the levels rank in order');
+ok(urgencyRank('nonsense') === urgencyRank('normal'), 'an unknown level reads as normal, not as the floor');
+const urgentHtml = inboxView();
+ok(/urgency-chip critical/.test(urgentHtml) && /urgency-chip high/.test(urgentHtml), 'high and critical rows are chipped');
+ok(!/urgency-chip normal/.test(urgentHtml), 'a normal ask carries no chip');
+ok(urgentHtml.indexOf('urgency-chip critical') < urgentHtml.indexOf('urgency-chip high'),
+  'the critical row is rendered first');
+
+S.inbox = [
+  item('1', 'approval-requested', true),
+  item('2', 'review-requested', true),
+  item('3', 'review-requested', false),
+  item('4', 'update', false),
+];
 const html = inboxView();
 ok(html.includes('href="/personal/inbox/approval-requested"'), 'sub-tabs are real links (URL owns the view)');
 ok(html.includes('id="inbox-show-read"'), 'the panel offers the Show read toggle');
 ok(!/id="inbox-show-read"[^>]*checked/.test(html), 'Show read is unchecked by default');
 ok(html.includes('Task 1'), 'rows render the task title');
 ok(!html.includes('Task 3'), 'a read row is not rendered while Show read is off');
+// Behaviour lives in one place — the profile — not next to the list it affects.
+ok(html.includes(`href="/personal/profile#notifications"`), 'the panel points at the notification settings');
+ok(!html.includes('id="save-delivery"'), 'delivery preferences are no longer configured from the list');
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
