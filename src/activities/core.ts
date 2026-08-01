@@ -460,13 +460,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return targets;
   }
 
-  /** Publish every repo's task branch to origin so a PR can reference it. */
-  async function pushTaskBranches(world: World, handle: WorldHandle, env: Record<string, string>) {
-    if (isRemote(handle.kind)) return brokerPushBranches(world, brokerAuthFor(handle, handle.id));
+  /** Publish each changed repo's task branch to origin so its PR can reference it. */
+  async function pushTaskBranches(
+    world: World,
+    handle: WorldHandle,
+    env: Record<string, string>,
+    repos: ReturnType<typeof worldRepos>,
+  ) {
+    if (isRemote(handle.kind)) return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos);
     const pushed: string[] = [];
     const skipped: string[] = [];
     const errors: Record<string, string> = {};
-    for (const repo of worldRepos(world.handle)) {
+    for (const repo of repos) {
       const push = await world.exec('git', ['push', '-u', 'origin', repo.branch],
         { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
       if (push.code === 0) pushed.push(repo.name);
@@ -1946,13 +1951,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async openPr(handle: WorldHandle, target: string, details: OpenPrDetails = {}): Promise<TaskPullRequest[]> {
       const world = await openWorld(handle);
       const repos = worldRepos(world.handle);
-      const pushed = await pushTaskBranches(world, handle, gitEnvFor(handle, handle.id));
       const targets = await githubPrTargets(world, handle);
       if (!targets.length) {
         throw new Error('remote policy "pr" is on, but no repository in this world has a GitHub origin remote'
           + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin');
       }
-      const opened: TaskPullRequest[] = [];
+      const changed: Array<(typeof targets)[number] & { base: string }> = [];
+      let firstUnchanged: { repo: (typeof targets)[number]['repo']; base: string } | undefined;
       for (const { repo, slug, api } of targets) {
         // A checkout whose base is a SIBLING's branch is a stacked pull request:
         // open it against that branch so GitHub renders the stack and its diff
@@ -1964,10 +1969,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // here with nothing committed is a state the design produces. GitHub
         // answers it with an opaque 422 — diagnose it ourselves instead.
         const ahead = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
-        if (ahead.code === 0 && ahead.stdout.trim() === '0') {
-          throw new Error(`branch "${repo.branch}" of repo "${repo.name}" has no commits ahead of "${base}",`
-            + ' so there is nothing to open a pull request for — the agent must commit its work before the PR stage');
+        if (ahead.code !== 0) {
+          throw new Error(`could not compare branch "${repo.branch}" of repo "${repo.name}" with "${base}":`
+            + ` ${ahead.stderr || ahead.stdout || 'git rev-list failed'}`);
         }
+        if (ahead.stdout.trim() === '0') {
+          firstUnchanged ??= { repo, base };
+          record(handle.id, 'pr.skipped', { repo: repo.name, reason: `no commits ahead of ${base}` });
+          continue;
+        }
+        changed.push({ repo, slug, api, base });
+      }
+      // An unchanged companion checkout (especially the platform-owned project
+      // wiki) has no proposal and gets no PR. But if EVERY GitHub target is
+      // unchanged, preserve the actionable failure: the task itself produced no
+      // committed branch history for GitHub to compare.
+      if (!changed.length && firstUnchanged) {
+        throw new Error(`branch "${firstUnchanged.repo.branch}" of repo "${firstUnchanged.repo.name}" has no commits ahead of "${firstUnchanged.base}",`
+          + ' so there is nothing to open a pull request for — the agent must commit its work before the PR stage');
+      }
+      const pushed = await pushTaskBranches(world, handle, gitEnvFor(handle, handle.id), changed.map(({ repo }) => repo));
+      const opened: TaskPullRequest[] = [];
+      for (const { repo, slug, api, base } of changed) {
         if (!pushed.pushed.includes(repo.name)) {
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
             + `${pushed.errors?.[repo.name] ? `: ${pushed.errors[repo.name]}` : ''}`);
@@ -1976,10 +1999,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           head: repo.branch, base,
           // With several branches in flight the task title alone names none of
           // them; say which pull request this one is.
-          title: repos.length > 1
+          title: changed.length > 1
             ? `${details.title?.trim() || 'karmax'} (${repo.name})`
             : details.title?.trim() || `karmax: ${repo.branch}`,
-          body: prBody(handle, details, store.getTask(handle.id)?.num, repos.length > 1 ? repo.name : undefined),
+          body: prBody(handle, details, store.getTask(handle.id)?.num, changed.length > 1 ? repo.name : undefined),
         });
         const ref: TaskPullRequest = { repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged };
         record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base });
