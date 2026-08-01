@@ -361,7 +361,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.10.0',
+    version: '1.11.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -465,7 +465,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.10.0',
+    version: '1.11.0',
     description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],

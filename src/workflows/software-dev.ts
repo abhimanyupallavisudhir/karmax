@@ -283,13 +283,19 @@ export async function softwareDevV1_10(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.10.0');
 }
 
+/** Prepare a branch with the Merge agent before the PR activity needs committed
+ * history. The protected-target merge remains after PR creation. */
+export async function softwareDevV1_11(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.11.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -337,6 +343,12 @@ async function softwareDevImpl(
   // New activity calls in an existing stage would break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
   const githubPrLifecycle = minor >= 8;
+  // A PR can only name committed history. Earlier versions allowed Do to leave
+  // a dirty tree for Merge, but opened the PR before the Merge agent ran; GitHub
+  // therefore rejected exactly that valid workflow state with "no commits".
+  // Split Merge into branch preparation before the PR and the protected-target
+  // landing afterwards. This adds agent/activity commands and must stay pinned.
+  const prepareBranchBeforePr = minor >= 11;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -1429,6 +1441,53 @@ async function softwareDevImpl(
     return turn;
   }
 
+  /** The judgment-bearing half of Merge: decide what belongs in the change,
+   * commit it, integrate the target into the task branch, resolve conflicts and
+   * test. The deterministic protected-target landing is deliberately separate. */
+  async function mergeTurn(text: string) {
+    const mergeIn: Message = {
+      id: `m-in-${mergeMsgs.length}`,
+      role: 'user',
+      text,
+      ts: mergeMsgs.length,
+    };
+    mergeMsgs.push(mergeIn);
+    const mt = await leasedTurn('merge', (
+      accountConfigHome,
+      accountApiKeyHandle,
+      agentTurnId,
+      accountCredentialKind,
+      accountCredentialProvider,
+      admission,
+    ) =>
+      agentTurns.runAgentTurn({
+        taskId,
+        role: 'merge',
+        worldHandle: world as any,
+        // Feed the Merge agent its full transcript so a retry has the rejection
+        // context and role-addressed human follow-ups are not lost.
+        messages: mergeMsgs,
+        session: sessionMatchesHome(accountConfigHome) ? session : undefined,
+        task: liveInput,
+        bindings: { reviewInfo: reviewInfo?.summary ?? '' },
+        accountConfigHome,
+        accountApiKeyHandle,
+        accountCredentialKind,
+        accountCredentialProvider,
+        ...(agentTurnId ? { agentTurnId } : {}),
+        ...admission,
+      }),
+    ).catch((e) => {
+      if (isCancellation(e)) throw e;
+      log.warn('merge agent turn failed; proceeding to authoritative check', { e: String(e) });
+      return undefined;
+    });
+    if (mt?.output?.trim()) {
+      mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length });
+    }
+    return mt;
+  }
+
   /** Run one Confirm-agent turn at the Review gate (SPEC §5.2): it reviews the work and
    *  returns a structured verdict (confirm / revise / reject) — the same three moves a
    *  human makes. Leased + resolve-wrapped like every other role. Returns the verdict,
@@ -2054,6 +2113,7 @@ async function softwareDevImpl(
   }
 
   // ── PR (optional) ──
+  let branchPreparedForPr = false;
   if (recoveryStage !== 'merge') {
   stage = 'pr';
   status = 'active';
@@ -2063,6 +2123,19 @@ async function softwareDevImpl(
     // Opening a PR binds it to `target`; close the edit window before we do (SPEC §2).
     targetLocked = true;
     await publish();
+    if (prepareBranchBeforePr) {
+      // GitHub cannot open a PR for an uncommitted worktree: the branch still
+      // equals its base. Run the judgment-bearing Merge work first, while the
+      // protected target is untouched. This is preparation, not the point of no
+      // return; cancellation remains valid until finalizeMergeActivity lands it.
+      consumed.add('agent:merge');
+      await mergeTurn(
+        `Prepare this branch for merge into ${target} before opening the pull request. `
+        + `The worktree may contain uncommitted changes: commit what should land; gitignore (or delete) what should not. `
+        + `Merge ${target} into the current branch, resolve any conflicts, ensure the build and tests pass, and leave the worktree clean.`,
+      );
+      branchPreparedForPr = true;
+    }
     const opened = await withResolve('pr', () => core.openPr(world as any, target, {
       title: input.title,
       summary: reviewInfo?.summary ?? lastOutputs(msgs),
@@ -2141,52 +2214,19 @@ async function softwareDevImpl(
       mergeQueuePos = { position: 0, total: mergeQueuePos?.total ?? 1 };
       await publish();
 
-      // The merge agent is about to run — freeze `agent:merge` (SPEC §5.5).
-      consumed.add('agent:merge');
-      const mergeIn: Message = {
-        id: `m-in-${mergeMsgs.length}`,
-        role: 'user',
-        text: mergeDirty
-          ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
-          : mergeConflict
-            ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
-            : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`,
-        ts: mergeMsgs.length,
-      };
-      mergeMsgs.push(mergeIn);
       try {
-        // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-        const mt = await leasedTurn('merge', (
-          accountConfigHome,
-          accountApiKeyHandle,
-          agentTurnId,
-          accountCredentialKind,
-          accountCredentialProvider,
-          admission,
-        ) =>
-          agentTurns.runAgentTurn({
-            taskId,
-            role: 'merge',
-            worldHandle: world as any,
-            // Feed the merge agent its full transcript so any human follow-up queued
-            // for it (SPEC §5.6) is included alongside the merge prompt.
-            messages: mergeMsgs,
-            session: sessionMatchesHome(accountConfigHome) ? session : undefined,
-            task: liveInput,
-            bindings: { reviewInfo: reviewInfo?.summary ?? '' },
-            accountConfigHome,
-            accountApiKeyHandle,
-            accountCredentialKind,
-            accountCredentialProvider,
-            ...(agentTurnId ? { agentTurnId } : {}),
-            ...admission,
-          }),
-        ).catch((e) => {
-          if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge
-          log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) });
-          return undefined;
-        });
-        if (mt?.output?.trim()) mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length });
+        // Under PR policy v1.11 already prepared the branch before opening the
+        // PR. Do not spend a duplicate agent turn; go straight to the protected
+        // landing. If the target raced or the branch is still dirty, finalize's
+        // rejection loops back here and the Merge agent gets the exact details.
+        if (!branchPreparedForPr || mergeAttempts > 0 || mergeDirty || mergeConflict) {
+          consumed.add('agent:merge');
+          await mergeTurn(mergeDirty
+            ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
+            : mergeConflict
+              ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
+              : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`);
+        }
         // …then the authoritative, deterministic merge that guarantees work lands.
         result = await long.finalizeMergeActivity(world as any, target);
       } catch (err) {

@@ -121,6 +121,46 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(final.pr.url).toBe(`https://github.com/${SLUG}/pull/1`);
   }, 120_000);
 
+  it('has the Merge agent commit and prepare an uncommitted Do result before opening the PR', async () => {
+    const repo = await repoWithOrigin('uncommitted');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.11.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        taskId,
+        projectId: 'p1',
+        title: 'Commit before PR',
+        // Task 399's exact shape: Do creates the requested file and finishes
+        // without committing it. The branch-preparation half of Merge must run
+        // before openPr, because GitHub cannot open a PR for a dirty-but-empty
+        // branch. The protected-target merge still happens afterwards.
+        prompt: '@write kablooga.md :: # Kablooga\n@review Added kablooga.md',
+        base: 'main',
+        target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+
+    expect(prs).toHaveLength(1);
+    expect(prs[0].head.ref).toBe(`karmax/${taskId}`);
+    const origin = path.join(originDir, 'uncommitted.git');
+    // The proposed remote branch already contains the Merge agent's commit;
+    // preparation did not happen only after the PR had captured an empty head.
+    expect((await git(origin, ['show', `karmax/${taskId}:kablooga.md`])).stdout)
+      .toContain('# Kablooga');
+    expect((await git(origin, ['show', 'main:kablooga.md'])).stdout)
+      .toContain('# Kablooga');
+    const final = await view(handle);
+    const merge = final.transcripts.find((transcript: any) => transcript.role === 'merge');
+    expect(merge.messages.map((message: any) => message.text).join('\n')).toMatch(/before opening the pull request/i);
+    expect(merge.messages.filter((message: any) => message.role === 'user')).toHaveLength(1); // no duplicate initial Merge turn
+  }, 120_000);
+
   /** Workflow versions are pinned per execution (SPEC §5.1): a task started
    *  before the PR lifecycle existed keeps running the behavior it recorded, so
    *  the reconcile/close steps must be gated by version, not by policy alone. */
