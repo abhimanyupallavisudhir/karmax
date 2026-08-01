@@ -8,6 +8,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent } from '../src/integrations/github-pr.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
+import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 
 /** The GitHub pull-request integration (SPEC §5.2, PLAN-git-config.md §5):
  *  the REST client, the PR stage activity, merge/cancel reconciliation, and the
@@ -49,7 +50,7 @@ function fakeGithub() {
       return json(200, prs.filter((pr) => pr.head.ref === branch && pr.repo === list[1]));
     }
     if (list && method === 'POST') {
-      if (prs.some((pr) => pr.head.ref === body.head && pr.state === 'open'))
+      if (prs.some((pr) => pr.repo === list[1] && pr.head.ref === body.head && pr.state === 'open'))
         return json(422, { message: 'A pull request already exists' });
       const pr = { repo: list[1], number: next, html_url: `https://github.com/${list[1]}/pull/${next}`,
         state: 'open', merged_at: null, title: body.title, body: body.body,
@@ -103,6 +104,40 @@ async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fet
   worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
   const core = makeCoreActivities({ store, worlds, adapters: new Map(),
     profiles: new ProfileResolver(store, 'mock'), broker, githubPr: github.options });
+  return Object.assign(core, { store });
+}
+
+async function remoteCoreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } },
+  githubApp: Record<string, unknown>, contentDir: string) {
+  const { Store } = await import('../src/store/db.js');
+  const { WorldRegistry } = await import('../src/world/registry.js');
+  const { ProfileResolver } = await import('../src/agent/profiles.js');
+  const { makeCoreActivities } = await import('../src/activities/core.js');
+  const store = new Store(':memory:');
+  const worlds = new WorldRegistry();
+  const backing = new WorktreeProvider(path.join(tmp, 'remote-worlds'));
+  const active = new Map<string, any>();
+  worlds.register({
+    kind: 'fake-remote', capabilities: { remote: true },
+    async create(spec: any) {
+      const sources = spec.copySources as string[];
+      const world = await backing.create({ ...spec, repo: undefined, repos: sources, copySources: undefined });
+      world.handle.kind = 'fake-remote';
+      const remotes: string[] = spec.repos ?? [spec.repo];
+      for (const [index, repo] of world.handle.repos!.entries()) {
+        repo.repo = remotes[index]!;
+        repo.localPath = sources[index]!;
+      }
+      world.handle.repo = remotes[0]!;
+      active.set(spec.taskId, world);
+      return world;
+    },
+    async open(handle: any) { return active.get(handle.id)!; },
+    async destroy(handle: any) { await active.get(handle.id)?.destroy(); active.delete(handle.id); },
+  } as any);
+  const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+    profiles: new ProfileResolver(store, 'mock'), broker, githubPr: github.options,
+    githubApp: githubApp as any, contentDir });
   return Object.assign(core, { store });
 }
 
@@ -191,6 +226,59 @@ describe('PR stage (remote policy "pr")', () => {
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Add a feature v2');
     await core.destroyWorld(handle);
+  });
+
+  it('pushes a cloud PR for a configured local checkout when only its companion wiki is App-enrolled', async () => {
+    const gh = fakeGithub();
+    const app = await repoWithGithubOrigin('local-app');
+    await gitOrThrow(app, ['config', '--unset-all', `url.${path.join(tmp, 'local-app-origin.git')}.insteadOf`]);
+    const content = path.join(tmp, 'content');
+    const wikiRemote = 'git@github.com:acme/project-wiki.git';
+    const wikiOrigin = path.join(tmp, 'wiki-origin.git');
+    const credentialRequests: string[] = [];
+    const core = await remoteCoreFor(gh, {
+      async repositoryCloneToken() { return 'clone-token'; },
+      async brokerCredentials(repository: { name: string }) {
+        credentialRequests.push(repository.name);
+        return { env: {} };
+      },
+    }, content);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Local source', { repos: [app], worldProvider: 'fake-remote' });
+    const wikiRoot = ensureProjectWikiRepository(content, project.id);
+    await gitOrThrow(tmp, ['init', '-q', '--bare', '-b', 'main', wikiOrigin]);
+    await gitOrThrow(wikiRoot, ['remote', 'add', 'origin', wikiRemote]);
+    await gitOrThrow(wikiRoot, ['config', `url.${wikiOrigin}.insteadOf`, wikiRemote]);
+    await gitOrThrow(wikiRoot, ['push', '-q', 'origin', 'main']);
+    await gitOrThrow(wikiRoot, ['config', '--unset-all', `url.${wikiOrigin}.insteadOf`]);
+    const wiki = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      owner: 'acme', name: 'project-wiki', sshUrl: wikiRemote, defaultBranch: 'main', private: true });
+    core.store.setProjectWikiRepository(project.id, wiki.id);
+    const task = core.store.createTask({ projectId: project.id, title: 'Cloud PR', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } });
+    const handle = await core.createWorld({ taskId: task.id, repo: app, base: 'main', target: 'main', kind: 'fake-remote' });
+    for (const [index, repo] of handle.repos!.entries()) {
+      await fs.promises.writeFile(path.join(repo.root, `change-${index}.txt`), 'x');
+      await git(repo.root, ['add', '-A']);
+      await git(repo.root, ['commit', '-q', '-m', 'work']);
+    }
+
+    const prior = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('GIT_CONFIG_')));
+    Object.assign(process.env, {
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: `url.${path.join(tmp, 'local-app-origin.git')}.insteadOf`, GIT_CONFIG_VALUE_0: REMOTE,
+      GIT_CONFIG_KEY_1: `url.${wikiOrigin}.insteadOf`, GIT_CONFIG_VALUE_1: wikiRemote,
+    });
+    try {
+      await expect(core.openPr(handle, 'main', { title: 'Cloud PR' })).resolves.toHaveLength(2);
+      expect((await git(path.join(tmp, 'local-app-origin.git'), ['rev-parse', '--verify', handle.branch])).code).toBe(0);
+      expect((await git(wikiOrigin, ['rev-parse', '--verify', handle.branch])).code).toBe(0);
+      expect(credentialRequests).toEqual(['project-wiki']);
+    } finally {
+      for (const key of Object.keys(process.env).filter((key) => key.startsWith('GIT_CONFIG_'))) delete process.env[key];
+      Object.assign(process.env, prior);
+      await core.destroyWorld(handle);
+    }
   });
 
   it('fails loudly when the policy asks for a PR and no repo has a GitHub origin', async () => {

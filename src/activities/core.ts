@@ -488,6 +488,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const source = worldRepoSource(worldRepo);
         const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
           ?? (wiki && sameRepository(wiki.sshUrl, source) ? wiki : undefined);
+        // A cloud checkout provisioned from a project-configured host checkout
+        // is enrolled by that exact local authority, not by the GitHub App
+        // catalog. PR policy still needs to publish its task branch to the
+        // checkout's origin, so use the world's selected Git profile (or the
+        // personal organization's host fallback) for that one operation. The
+        // sealed world handle preserves localPath from cloudGitSource; arbitrary
+        // network repositories still fail the catalog guard below.
+        if (!repository && worldRepo.localPath) return { env: gitEnvFor(handle, taskId) };
         if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
         return deps.githubApp!.brokerCredentials(repository);
       };
