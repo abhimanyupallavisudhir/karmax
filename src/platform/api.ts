@@ -1392,7 +1392,8 @@ export class KarmaxApi {
 
     if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId)).id };
 
-    const fired = { ...(task.params as Record<string, unknown>), triggerState: 'fired' };
+    const fired: Record<string, unknown> = { ...(task.params as Record<string, unknown>), triggerState: 'fired' };
+    delete fired.triggerPending;
     this.deps.store.updateTaskParams(taskId, fired as any);
     try {
       const { startType, input } = await this.buildStart({ ...task, params: fired as any });
@@ -1435,12 +1436,12 @@ export class KarmaxApi {
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     this.armer?.disarm(taskId);
-    // Drop the cron catch-up mark along with the armed state. Keeping
+    // Drop dispatcher bookkeeping along with the armed state. Keeping
     // `triggerLastFiredAt` while disarming meant a task paused for days and then
     // re-queued looked, to `catchUpCron`, like a task that had missed an
     // occurrence — so it fired once immediately on being re-queued. Pausing is
     // not missing: a task that was deliberately not armed has nothing to catch up.
-    const { triggerState: _s, triggerLastFiredAt: _f, ...rest } = task.params as Record<string, unknown>;
+    const { triggerState: _s, triggerLastFiredAt: _f, triggerPending: _p, ...rest } = task.params as Record<string, unknown>;
     this.deps.store.updateTaskParams(taskId, { ...rest, draft: true } as any);
     return this.deps.store.getTask(taskId)!;
   }

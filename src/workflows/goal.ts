@@ -10,6 +10,7 @@ import {
   softwareDevV1_8,
   softwareDevV1_9,
   softwareDevV1_10,
+  softwareDevV1_11,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -71,6 +72,11 @@ export async function goalV1_9(input: TaskInput): Promise<{ stage: Stage; sha?: 
  *  softwareDevV1_10 for why these are 1.10.0 and not 1.9.0). */
 export async function goalV1_10(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_10({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Prepare PR branches before opening their pull requests. */
+export async function goalV1_11(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_11({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

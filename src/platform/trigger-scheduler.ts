@@ -16,7 +16,10 @@ import {
 /**
  * The trigger dispatcher (SPEC §3.3). Triggers gate *when* a task's workflow
  * starts; the task is stored-not-started and *armed*, and this service starts it
- * when a trigger is satisfied. It is the reactive transport layer that sits
+ * when its trigger expression is satisfied. Dependencies are prerequisites:
+ * every dependency trigger must be met AND a schedule/event activator must have
+ * occurred (or dependency completion itself activates a dependency-only task).
+ * It is the reactive transport layer that sits
  * *underneath* control flow — it never becomes the control flow — exactly the
  * role the spec reserves for the dispatcher.
  *
@@ -63,6 +66,14 @@ interface ArmedEntry {
   triggers: TaskTrigger[];
   /** Dependency task ids observed satisfied so far. */
   satisfiedDeps: Set<string>;
+  /**
+   * A non-dependency trigger has occurred and is waiting for its dependency
+   * prerequisites. Persisted on the task so a restart cannot lose a due time or
+   * matching event while the prerequisites are still running.
+   */
+  activationPending: boolean;
+  /** A pending activation has been claimed by an asynchronous workflow/run start. */
+  activationInFlight: boolean;
   timers: unknown[];
   /** Guards a one-shot entry from double-firing across overlapping events. */
   fired: boolean;
@@ -156,7 +167,15 @@ export class TriggerScheduler {
     const errs = this.validationErrors(task);
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
     this.disarm(task.id); // idempotent re-arm
-    const entry: ArmedEntry = { task, triggers, satisfiedDeps: new Set(), timers: [], fired: false };
+    const entry: ArmedEntry = {
+      task,
+      triggers,
+      satisfiedDeps: new Set(),
+      activationPending: task.params?.triggerPending === true,
+      activationInFlight: false,
+      timers: [],
+      fired: false,
+    };
     this.armed.set(task.id, entry);
 
     // Seed dependency satisfaction from already-recorded statuses (a dep may have
@@ -177,7 +196,8 @@ export class TriggerScheduler {
       if (trig.kind === 'schedule') this.armSchedule(entry, trig);
     }
 
-    // A dependency/event trigger may already be satisfied at arm time.
+    // Dependencies may already be satisfied at arm time, and a durable pending
+    // activation may have been recorded before a restart.
     this.evaluate(entry);
   }
 
@@ -194,14 +214,18 @@ export class TriggerScheduler {
     // Copy: firing mutates the map (one-shot disarm).
     for (const entry of [...this.armed.values()]) {
       if (entry.fired) continue;
-      // `event` triggers: a direct type/scope/payload match fires immediately.
+      // `event` triggers are activators. They become runnable only once every
+      // dependency prerequisite is also satisfied.
       // `firedNow` is load-bearing for a REPEATABLE series: `entry.fired` is only
       // ever set for one-shots, so without it a single event that matched two of
       // the entry's triggers spawned two runs of the same series.
       let firedNow = false;
       for (const trig of entry.triggers) {
         if (entry.fired || firedNow) break;
-        if (trig.kind === 'event' && eventMatchesEventTrigger(trig, ev)) firedNow = this.fireFor(entry, trig);
+        if (trig.kind === 'event' && eventMatchesEventTrigger(trig, ev)) {
+          this.markActivationPending(entry);
+          firedNow = this.evaluate(entry, trig);
+        }
       }
       if (entry.fired || firedNow || !this.armed.has(entry.task.id)) continue;
       // `dependency` triggers: fold the event into satisfaction, then re-evaluate.
@@ -259,15 +283,46 @@ export class TriggerScheduler {
 
   // ─── Firing ────────────────────────────────────────────────────────────────
 
-  /** Evaluate all of an entry's non-time triggers; fire if any is satisfied. */
-  private evaluate(entry: ArmedEntry): void {
-    if (entry.fired) return;
-    for (const trig of entry.triggers) {
-      if (trig.kind === 'dependency' && dependencyMet(trig, entry.satisfiedDeps)) {
-        this.fireFor(entry, trig);
-        return;
-      }
+  /**
+   * Fire only when every dependency prerequisite is met AND an activator has
+   * occurred. A dependency-only task needs no separate activator: completion of
+   * its dependencies is itself the activation.
+   */
+  private evaluate(entry: ArmedEntry, cause?: TaskTrigger): boolean {
+    if (entry.fired) return false;
+    const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
+    if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return false;
+
+    const activators = entry.triggers.filter((t) => t.kind !== 'dependency');
+    if (activators.length && !entry.activationPending) return false;
+
+    const firingTrigger = cause && cause.kind !== 'dependency'
+      ? cause
+      : activators[0] ?? cause ?? dependencies[0];
+    return firingTrigger ? this.fireFor(entry, firingTrigger) : false;
+  }
+
+  /** Durably remember (or consume) an activation that is gated on dependencies. */
+  private setActivationPending(entry: ArmedEntry, pending: boolean): void {
+    const current = this.deps.store.getTask(entry.task.id) ?? entry.task;
+    const persisted = current.params?.triggerPending === true;
+    if (entry.activationPending === pending && persisted === pending) return;
+    entry.activationPending = pending;
+    const params = { ...(current.params as Record<string, unknown>) };
+    if (pending) params.triggerPending = true;
+    else delete params.triggerPending;
+    entry.task = { ...current, params: params as TaskRecord['params'] };
+    try {
+      this.deps.store.updateTaskParams(entry.task.id, entry.task.params);
+    } catch (e) {
+      // The in-memory level still gives correct behavior for this process. A
+      // vanished task will fail at fire time and be reported through that path.
+      this.log(`could not record pending trigger for ${entry.task.id}: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  private markActivationPending(entry: ArmedEntry): void {
+    this.setActivationPending(entry, true);
   }
 
   /**
@@ -278,6 +333,15 @@ export class TriggerScheduler {
    */
   private fireFor(entry: ArmedEntry, trig: TaskTrigger): boolean {
     if (entry.fired) return false;
+    const consumesActivation = entry.triggers.some((t) => t.kind !== 'dependency');
+    if (consumesActivation && entry.activationInFlight) return false;
+    if (consumesActivation) {
+      // Claim it in memory, but keep the durable `triggerPending` marker until
+      // the workflow/run has actually started. If the process dies between here
+      // and the API call, boot safely retries the claimed occurrence.
+      entry.activationPending = false;
+      entry.activationInFlight = true;
+    }
     const repeatable = !!entry.task.params?.repeatable;
     const taskId = entry.task.id;
     if (!repeatable) {
@@ -286,8 +350,22 @@ export class TriggerScheduler {
     }
     void this.deps
       .fire(taskId, repeatable ? 'clone' : 'self')
-      .then(() => this.log(`trigger fired for ${taskId} (${trig.kind}, ${repeatable ? 'run' : 'self'})`))
+      .then(() => {
+        if (consumesActivation) {
+          entry.activationInFlight = false;
+          // A second occurrence may have arrived while this run was starting.
+          // Preserve it and start one more coalesced run; otherwise the claimed
+          // durable marker can now be cleared.
+          if (repeatable && entry.activationPending) this.evaluate(entry);
+          else this.setActivationPending(entry, false);
+        }
+        this.log(`trigger fired for ${taskId} (${trig.kind}, ${repeatable ? 'run' : 'self'})`);
+      })
       .catch((e) => {
+        if (consumesActivation) {
+          entry.activationInFlight = false;
+          entry.activationPending = true; // durable marker was deliberately retained
+        }
         this.log(`trigger fire failed for ${taskId}: ${e instanceof Error ? e.message : String(e)}`);
         if (!repeatable) {
           // api re-arms the task row on failure; re-arm the in-memory entry too.
@@ -311,7 +389,10 @@ export class TriggerScheduler {
 
   private armSchedule(entry: ArmedEntry, trig: ScheduleTrigger): void {
     if (trig.at !== undefined) {
-      this.armAt(entry, trig.at, () => this.fireFor(entry, trig));
+      this.armAt(entry, trig.at, () => {
+        this.markActivationPending(entry);
+        this.evaluate(entry, trig);
+      });
       return;
     }
     if (trig.cron) {
@@ -354,7 +435,8 @@ export class TriggerScheduler {
     if (last === undefined) return mark;
     this.log(`cron catch-up for ${entry.task.id}: occurrence at ${new Date(last).toISOString()} was missed`);
     this.recordCronFire(entry, last);
-    this.fireFor(entry, trig);
+    this.markActivationPending(entry);
+    this.evaluate(entry, trig);
     return last;
   }
 
@@ -392,7 +474,8 @@ export class TriggerScheduler {
       // Cron is recurring: fire a clone, then re-arm for the next occurrence,
       // measured from the SCHEDULED instant (never from the wall clock).
       this.recordCronFire(entry, next);
-      this.fireFor(entry, trig);
+      this.markActivationPending(entry);
+      this.evaluate(entry, trig);
       if (this.armed.get(entry.task.id) === entry) this.armCron(entry, trig, next);
     });
   }
