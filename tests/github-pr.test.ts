@@ -78,7 +78,7 @@ function fakeGithub() {
 
 /** A repo whose origin *reads* as GitHub but pushes to a local bare repo, so
  *  the whole activity (slug detection + real push + API) runs unmodified. */
-async function repoWithGithubOrigin(name: string): Promise<string> {
+async function repoWithGithubOrigin(name: string, slug = SLUG): Promise<string> {
   const repo = path.join(tmp, name);
   fs.mkdirSync(repo, { recursive: true });
   await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
@@ -88,8 +88,9 @@ async function repoWithGithubOrigin(name: string): Promise<string> {
   await git(repo, ['commit', '-q', '-m', 'init']);
   const origin = path.join(tmp, `${name}-origin.git`);
   await gitOrThrow(tmp, ['init', '-q', '--bare', '-b', 'main', origin]);
-  await git(repo, ['remote', 'add', 'origin', REMOTE]);
-  await git(repo, ['config', `url.${origin}.insteadOf`, REMOTE]);
+  const remote = `git@github.com:${slug}.git`;
+  await git(repo, ['remote', 'add', 'origin', remote]);
+  await git(repo, ['config', `url.${origin}.insteadOf`, remote]);
   await git(repo, ['push', '-q', 'origin', 'main']);
   return repo;
 }
@@ -225,6 +226,38 @@ describe('PR stage (remote policy "pr")', () => {
     expect(again[0]!.number).toBe(1);
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Add a feature v2');
+    await core.destroyWorld(handle);
+  });
+
+  it('opens PRs only for changed checkouts and skips an unchanged companion wiki', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const app = await repoWithGithubOrigin('changed-app');
+    const wiki = await repoWithGithubOrigin('unchanged-wiki', 'acme/project-wiki');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_changed_only',
+      repos: [app, wiki],
+      base: 'main',
+      target: 'main',
+      kind: 'worktree',
+    });
+    const appCheckout = handle.repos![0]!;
+    const wikiCheckout = handle.repos![1]!;
+    await fs.promises.writeFile(path.join(appCheckout.root, 'feature.txt'), 'changed');
+    await git(appCheckout.root, ['add', '-A']);
+    await git(appCheckout.root, ['commit', '-q', '-m', 'change app only']);
+
+    const opened = await core.openPr(handle, 'main', { title: 'App-only change' });
+
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ repo: appCheckout.name, slug: SLUG });
+    expect(gh.prs).toHaveLength(1);
+    expect(gh.prs[0].repo).toBe(SLUG);
+    expect(gh.prs[0].title).toBe('App-only change');
+    expect((await git(path.join(tmp, 'changed-app-origin.git'), ['rev-parse', '--verify', appCheckout.branch])).code).toBe(0);
+    // The unchanged companion branch is not published merely because it shares
+    // the task world; it has no proposal and therefore no PR.
+    expect((await git(path.join(tmp, 'unchanged-wiki-origin.git'), ['rev-parse', '--verify', wikiCheckout.branch])).code).not.toBe(0);
     await core.destroyWorld(handle);
   });
 
