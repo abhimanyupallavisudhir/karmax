@@ -2219,13 +2219,28 @@ async function softwareDevImpl(
         // PR. Do not spend a duplicate agent turn; go straight to the protected
         // landing. If the target raced or the branch is still dirty, finalize's
         // rejection loops back here and the Merge agent gets the exact details.
-        if (!branchPreparedForPr || mergeAttempts > 0 || mergeDirty || mergeConflict) {
+        const runsMergeAgent = !branchPreparedForPr || mergeAttempts > 0 || !!mergeDirty || !!mergeConflict;
+        if (runsMergeAgent) {
           consumed.add('agent:merge');
           await mergeTurn(mergeDirty
             ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
             : mergeConflict
               ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
               : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`);
+        }
+        if (branchPreparedForPr && runsMergeAgent && remotePolicyOf(input.project) === 'pr') {
+          // A conflict/dirty rejection after PR creation sends the branch back to
+          // the Merge agent. Its fix changes the proposed head, so refresh the
+          // remote branch and existing PR BEFORE landing it. This runs while all
+          // merge domains are leased: the target cannot race between the refreshed
+          // proposal and finalizeMergeActivity. openPr is idempotent by branch and
+          // updates the existing PR rather than creating another one.
+          const refreshed = await core.openPr(world as any, target, {
+            title: input.title,
+            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+          });
+          prs = refreshed;
+          pr = prs[0];
         }
         // …then the authoritative, deterministic merge that guarantees work lands.
         result = await long.finalizeMergeActivity(world as any, target);
