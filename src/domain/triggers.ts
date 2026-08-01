@@ -3,7 +3,10 @@
  * starts* — it is orthogonal to what the workflow does, so it lives on the
  * generic task lifecycle (`TaskParams`, alongside `draft`), NOT in any single
  * workflow's manifest. A task with triggers is stored-not-started (like a draft)
- * and armed; a dispatcher starts it when a trigger is satisfied (SPEC §3.3).
+ * and armed; a dispatcher starts it when its trigger expression is satisfied
+ * (SPEC §3.3). Dependency triggers are prerequisites: they combine with a
+ * schedule/event using AND, so reaching a scheduled time never bypasses
+ * unfinished work. Multiple schedule/event activators remain alternatives.
  *
  * This module is PURE (no Node/Temporal imports) so it is safe to import from
  * the deterministic workflow sandbox, the platform API, and the dispatcher, and
@@ -240,7 +243,7 @@ export function forcesRepeatable(triggers: TaskTrigger[]): boolean {
 
 /** Params for a run spawned from a series: the original minus trigger + series metadata. */
 export function cloneParamsWithoutTriggers<T extends Record<string, unknown>>(params: T): T {
-  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, draft: _d, repeatable: _r, runOf: _ro, ...rest } = params as Record<string, unknown>;
+  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, repeatable: _r, runOf: _ro, ...rest } = params as Record<string, unknown>;
   return rest as T;
 }
 

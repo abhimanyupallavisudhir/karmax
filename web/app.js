@@ -3958,8 +3958,8 @@ function triggersSection(values, selfId) {
   ).join('');
   return `
     <details class="advanced" style="margin-top:10px" ${existing.length ? 'open' : ''}>
-      <summary>Triggers — start this task on a dependency or a schedule</summary>
-      <p class="task-sub" style="color:var(--ink-3);margin-top:0">Leave empty to start immediately.</p>
+      <summary>Triggers — start this task after dependencies, on a schedule</summary>
+      <p class="task-sub" style="color:var(--ink-3);margin-top:0">When both are set, the task waits for its dependencies and the scheduled time. Leave empty to start immediately.</p>
       <div class="form-row">
         <div class="label-row"><label>Task dependencies</label></div>
         <div class="chip-input" id="dep-box">

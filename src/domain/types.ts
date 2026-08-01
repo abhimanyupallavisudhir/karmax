@@ -736,7 +736,8 @@ export interface TaskParams {
    * Triggers (generic, workflow-agnostic): gate *when* this task's workflow
    * starts — on other tasks completing, on a schedule, or on any karmax event.
    * A task with triggers is stored-not-started and armed; the dispatcher starts
-   * it when a trigger is satisfied (see src/domain/triggers.ts). Kept here (not
+   * it when its dependency prerequisites and an activation trigger are satisfied
+   * (see src/domain/triggers.ts). Kept here (not
    * in a workflow manifest) because a trigger is orthogonal to what the workflow
    * does — the same tier as `draft`.
    */
@@ -745,14 +746,20 @@ export interface TaskParams {
   triggerState?: TriggerState;
   /**
    * Dispatcher bookkeeping for cron catch-up: the scheduled instant (epoch-ms) of
-   * the most recent cron occurrence this task has fired for, or the moment it was
+   * the most recent cron occurrence this task has observed, or the moment it was
    * first armed. `nextCronFire` is strictly-after-now, so without a durable mark
    * a window missed while karmax was down would be unrepresentable and silently
-   * skipped — `0 9 * * *` would simply lose the day. On boot the dispatcher fires
-   * once if an occurrence elapsed between this mark and now (see
+   * skipped — `0 9 * * *` would simply lose the day. On boot the dispatcher records
+   * one pending activation if an occurrence elapsed between this mark and now (see
    * src/platform/trigger-scheduler.ts). Never sent to any agent.
    */
   triggerLastFiredAt?: number;
+  /**
+   * Dispatcher bookkeeping: a schedule/event activation occurred but is still
+   * waiting for its dependency prerequisites. Durable so a restart cannot lose
+   * that occurrence. Never sent to an agent.
+   */
+  triggerPending?: boolean;
   /**
    * Repeatable "series" (Model A — template + runs). A repeatable task never runs
    * its own workflow; it spawns independent **run** records (each a normal task

@@ -233,7 +233,7 @@ describe('trigger helpers', () => {
     expect(isRecurring({ kind: 'schedule', at: 123 })).toBe(false); // one-shot by default
     expect(isRecurring({ kind: 'dependency', tasks: ['a'] })).toBe(false);
     expect(isRecurring({ kind: 'event', type: 'a', recurring: true })).toBe(true);
-    const cloned = cloneParamsWithoutTriggers({ prompt: 'p', triggers: [{ kind: 'schedule', cron: '* * * * *' }], triggerState: 'armed', draft: true });
+    const cloned = cloneParamsWithoutTriggers({ prompt: 'p', triggers: [{ kind: 'schedule', cron: '* * * * *' }], triggerState: 'armed', triggerPending: true, draft: true });
     expect(cloned).toEqual({ prompt: 'p' });
   });
 });
@@ -386,6 +386,29 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(fired).toEqual([[t.id, 'self']]);
   });
 
+  it('holds an event activation across a restart until dependencies finish', async () => {
+    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
+    const t = armedTask([
+      { kind: 'dependency', tasks: [dep.id] },
+      { kind: 'event', type: 'release.approved' },
+    ]);
+    const first = makeScheduler();
+    first.start();
+
+    bus.emit({ type: 'release.approved', taskId: 'release', ts: 0, payload: {} } as KarmaxEvent);
+    expect(fired).toHaveLength(0);
+    expect(store.getTask(t.id)!.params.triggerPending).toBe(true);
+
+    first.stop();
+    const restarted = makeScheduler();
+    restarted.start();
+    emitDone(dep.id);
+    expect(fired).toEqual([[t.id, 'self']]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(store.getTask(t.id)!.params.triggerPending).toBeUndefined();
+    restarted.stop();
+  });
+
   it('fires a one-shot `at` schedule when the clock reaches it', () => {
     const t = armedTask([{ kind: 'schedule', at: 5000 }]);
     const s = makeScheduler();
@@ -397,15 +420,52 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(s.size).toBe(0);
   });
 
-  it('fires a cron schedule as a recurring clone and stays armed', () => {
+  it('waits for dependencies when a one-shot schedule becomes due first', () => {
+    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
+    const t = armedTask([
+      { kind: 'dependency', tasks: [dep.id] },
+      { kind: 'schedule', at: 5000 },
+    ]);
+    const s = makeScheduler();
+    s.start();
+
+    clock.advance(5000);
+    expect(fired).toHaveLength(0); // due, but its prerequisite is still running
+    expect(s.size).toBe(1);
+
+    emitDone(dep.id);
+    expect(fired).toEqual([[t.id, 'self']]);
+    expect(s.size).toBe(0);
+  });
+
+  it('waits for the one-shot schedule when dependencies finish first', () => {
+    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
+    const t = armedTask([
+      { kind: 'dependency', tasks: [dep.id] },
+      { kind: 'schedule', at: 5000 },
+    ]);
+    const s = makeScheduler();
+    s.start();
+
+    emitDone(dep.id);
+    expect(fired).toHaveLength(0); // prerequisite met, but the earliest start is still ahead
+
+    clock.advance(5000);
+    expect(fired).toEqual([[t.id, 'self']]);
+    expect(s.size).toBe(0);
+  });
+
+  it('fires a cron schedule as a recurring clone and stays armed', async () => {
     // every minute; clock starts at 0 → next fire at 60_000.
     const t = armedTask([{ kind: 'schedule', cron: '* * * * *' }]);
     const s = makeScheduler();
     s.start();
     clock.advance(60_000);
     expect(fired).toEqual([[t.id, 'clone']]);
+    await new Promise((r) => setTimeout(r, 0));
     expect(s.size).toBe(1); // still armed for the next occurrence
     clock.advance(60_000);
+    await new Promise((r) => setTimeout(r, 0));
     expect(fired).toEqual([
       [t.id, 'clone'],
       [t.id, 'clone'],
@@ -635,6 +695,63 @@ describe('TriggerScheduler (dispatcher)', () => {
     clock.advance(3600_000);
     expect(fired).toHaveLength(1);
     s.stop();
+  });
+
+  it('durably holds a due cron occurrence until its dependencies finish', async () => {
+    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
+    const series = armedTask([
+      { kind: 'dependency', tasks: [dep.id] },
+      { kind: 'schedule', cron: '* * * * *' },
+    ]);
+    const first = makeScheduler();
+    first.start();
+
+    clock.advance(120_000); // two blocked occurrences coalesce into one pending run
+    expect(fired).toHaveLength(0);
+    expect(store.getTask(series.id)!.params.triggerPending).toBe(true);
+
+    first.stop();
+    const restarted = makeScheduler();
+    restarted.start();
+    expect(fired).toHaveLength(0);
+
+    emitDone(dep.id);
+    expect(fired).toEqual([[series.id, 'clone']]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(store.getTask(series.id)!.params.triggerPending).toBeUndefined();
+
+    clock.advance(60_000);
+    expect(fired).toEqual([[series.id, 'clone'], [series.id, 'clone']]);
+    restarted.stop();
+  });
+
+  it('keeps a claimed cron occurrence pending when its run fails to start', async () => {
+    const series = armedTask([{ kind: 'schedule', cron: '* * * * *' }]);
+    let failedAttempts = 0;
+    const first = new TriggerScheduler({
+      store,
+      bus,
+      fire: async () => {
+        failedAttempts += 1;
+        throw new Error('engine unavailable');
+      },
+      now: clock.now,
+      setTimer: clock.set,
+      clearTimer: clock.clear,
+    });
+    first.start();
+    clock.advance(60_000);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(failedAttempts).toBe(1);
+    expect(store.getTask(series.id)!.params.triggerPending).toBe(true);
+
+    first.stop();
+    const restarted = makeScheduler();
+    restarted.start();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fired).toEqual([[series.id, 'clone']]);
+    expect(store.getTask(series.id)!.params.triggerPending).toBeUndefined();
+    restarted.stop();
   });
 
   it('seeds the catch-up mark on first arm rather than firing retroactively', () => {
