@@ -1621,10 +1621,8 @@ export class Gateway {
         if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
         const items = store.listInbox(session.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
-        return this.json(res, 200, items.map((item) => {
-          const task = store.getTask(item.taskId);
-          return { ...item, task: task ? { id: task.id, num: task.num, title: task.title, projectId: task.projectId } : undefined };
-        }));
+        const headers = store.taskHeaders(items.map((item) => item.taskId));
+        return this.json(res, 200, items.map((item) => ({ ...item, task: headers.get(item.taskId) })));
       }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {

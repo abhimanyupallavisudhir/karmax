@@ -49,5 +49,41 @@ ok(source.match(/authorizationEditorHtml\(/g).length >= 3, 'organization people,
 ok(source.includes("level.scope === 'selectable'"), 'scope input only appears for Viewer, Developer, and Project maintainer');
 ok(css.includes('.authz-editor'), 'shared editor has dedicated visual styling');
 
+// The control reads as a label, a level, and then ONE scope field: chips and the
+// text cursor live in the same box, so there is no second boxed input carrying a
+// hint next to the already-chosen scopes.
+const authorizationEditorHtmlFn = Function(`
+  const esc = (value) => String(value);
+  ${extractFunction('authorizationLevels')}
+  ${extractFunction('normalizedAuthorization')}
+  ${extractFunction('authorizationScopePlaceholder')}
+  ${editor}
+  return authorizationEditorHtml;
+`)();
+const authorizationScopePlaceholder = Function(
+  `${extractFunction('authorizationScopePlaceholder')}; return authorizationScopePlaceholder;`,
+)();
+const projects = [{ id: 'p1', name: 'Alpha' }, { id: 'p2', name: 'Beta' }];
+const filled = authorizationEditorHtmlFn('e1', { level: 'developer', scope: 'projects', projectIds: ['p1'] }, projects, 'p1');
+const blank = authorizationEditorHtmlFn('e2', { level: 'developer', scope: 'projects', projectIds: [] }, projects);
+
+ok(/authz-scope-field[\s\S]*authz-scope-chip[\s\S]*authz-scope-input[\s\S]*<\/div>/.test(filled),
+  'chips and the typing cursor share a single scope field');
+ok((filled.match(/<input/g) || []).length === 1, 'the scope field is the only text input in the editor');
+ok(/placeholder=""/.test(filled), 'a field that already holds a scope shows no leftover hint');
+ok(/placeholder="[^"]*[Pp]roject[^"]*"/.test(blank), 'an empty field invites typing a project name');
+ok(authorizationScopePlaceholder(['@organization']) === '' && authorizationScopePlaceholder([]).includes('@organization'),
+  'the placeholder is the empty state of the one field, not a permanent hint');
+ok(source.includes('input.placeholder = authorizationScopePlaceholder('),
+  'the live editor keeps the placeholder in step with the chips');
+
+// Stacked, and styled from inside .authz-editor: the generic `.form-row input`
+// rules are more specific than a bare `.authz-scope-input`, so without the
+// parent qualifier the task form repaints the field as its own boxed input.
+ok(/\.authz-editor\s*\{[^}]*display:\s*grid/.test(css), 'the level sits on its own line above the scope field');
+ok(css.includes('.authz-editor .authz-level-select'), 'the level select is styled from inside the editor');
+ok(css.includes('.authz-editor .authz-scope-input'), 'the scope input is styled from inside the editor');
+ok(/\.authz-scope-field\s*\{[^}]*flex-wrap:\s*wrap/.test(css), 'scope chips wrap inside the field instead of squeezing it');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

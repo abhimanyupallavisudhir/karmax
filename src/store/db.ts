@@ -93,22 +93,20 @@ const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
 const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
 
 /**
- * Does an event type mean "a human is being asked to look at this"? Such events
- * are routed to the review audience as an ACTIONABLE inbox item (`routeInbox`).
+ * Does an event type mean "a human is being asked to review this"? Such events
+ * are routed to the review audience as an ACTIONABLE inbox item.
  *
- * Event types are dotted `namespace.action` paths (`software-dev.review-requested`,
- * `github.pr.review`, `review.built`), so the test is on a whole SEGMENT: a
- * segment that is `review` or begins `review-`/`review_`.
- *
- * The old test was `ev.type.includes('review')` — a substring match on an open
- * vocabulary. Every `preview.*` type contains "review", as would any type a
- * workflow package chose to declare, so unrelated lifecycle noise arrived in
- * reviewers' inboxes flagged as work they had to act on. Segment matching keeps
- * every real review event and drops `preview.active`, `world.preview-created`
- * and friends.
+ * The bar is a request, not the word "review". Event types are dotted
+ * `namespace.action` paths, and the two earlier rules both spammed the inbox: a
+ * substring match on `review` swept in every `preview.*` type, and matching any
+ * `review` SEGMENT swept in `review.built` — which a task emits on every single
+ * agent turn, so one task in review produced dozens of identical "review
+ * requested" rows. Only a trailing `review-requested` (any separator) survives:
+ * `software-dev.review-requested` and `review.requested` match, `review.built`,
+ * `github.pr.review` and `preview.requested` do not.
  */
-export const isReviewEvent = (type: string): boolean =>
-  type.split('.').some((segment) => segment === 'review' || /^review[-_]/.test(segment));
+export const isReviewRequestEvent = (type: string): boolean =>
+  /(^|-)review-requested$/.test(type.replace(/[._]/g, '-'));
 
 /**
  * The metadata index. Temporal holds the authoritative live workflow state;
@@ -134,6 +132,10 @@ export class Store {
 
   /** One-time data migrations (idempotent; run every boot). */
   private migrateData() {
+    // Notifications whose ask was already answered — the backlog older builds
+    // never removed, and a net for any closing event this install missed.
+    this.pruneStaleInbox();
+
     // Early organization-policy builds expanded their infrastructure defaults
     // into every project. Those records accidentally became permanent project
     // overrides when execution policy later switched to sparse inheritance. In
@@ -569,6 +571,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_memberships(userId, organizationId);
       CREATE INDEX IF NOT EXISTS idx_project_members_principal ON project_memberships(principalKey, projectId);
       CREATE INDEX IF NOT EXISTS idx_inbox_user ON inbox(userId, unread, createdAt DESC);
+      CREATE INDEX IF NOT EXISTS idx_inbox_task ON inbox(taskId, kind);
       CREATE INDEX IF NOT EXISTS idx_repositories_org ON repositories(organizationId, owner, name);
       CREATE INDEX IF NOT EXISTS idx_github_install_states_expiry ON github_install_states(expiresAt, usedAt);
       CREATE INDEX IF NOT EXISTS idx_scoped_tokens_expiry ON scoped_tokens(expiresAt);
@@ -606,6 +609,18 @@ export class Store {
     if (!cardCols.some((c) => c.name === 'cardholderId')) this.db.exec('ALTER TABLE cards ADD COLUMN cardholderId TEXT');
     if (!cardCols.some((c) => c.name === 'last4')) this.db.exec('ALTER TABLE cards ADD COLUMN last4 TEXT');
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_provider_external ON cards(provider, externalId) WHERE externalId IS NOT NULL');
+    // One inbox row per (user, task, kind): a notification is a LIVE ask, not a
+    // copy of the event log. Older builds keyed rows by EVENT, so a task sitting
+    // in review minted a fresh row on every lifecycle tick — the real install
+    // reached 2,492 unread rows across 216 tasks. Collapse each group onto its
+    // OLDEST row (the ask's true age) before the invariant becomes an index.
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_inbox_live'").get()) {
+      const duplicates = `SELECT id FROM inbox WHERE id NOT IN
+        (SELECT id FROM (SELECT id, MIN(createdAt) FROM inbox GROUP BY userId, taskId, kind))`;
+      this.db.exec(`DELETE FROM delivery_outbox WHERE inboxId IN (${duplicates});
+        DELETE FROM inbox WHERE id IN (${duplicates});
+        CREATE UNIQUE INDEX idx_inbox_live ON inbox(userId, taskId, kind);`);
+    }
     const invitationCols = this.db.prepare('PRAGMA table_info(organization_invitations)').all() as any[];
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT');
@@ -2376,6 +2391,25 @@ export class Store {
     return (this.db.prepare(sql).all(userId, organizationId, Math.max(1, Math.min(opts.limit ?? 200, 1000))) as any[]).map(rowToInbox);
   }
 
+  /**
+   * The task header an inbox row is about. `getTask` per row would JSON.parse
+   * each task's FULL `lastView` — transcript included — on every inbox poll, the
+   * exact allocation pattern `listTaskSummaries` documents as pushing a few
+   * hundred tasks past 1 GiB RSS. Project the six fields the panel renders.
+   */
+  taskHeaders(taskIds: string[]): Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }> {
+    const out = new Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }>();
+    chunked([...new Set(taskIds)], (chunk) => {
+      const rows = this.db.prepare(`SELECT id, num, title, projectId,
+        json_extract(lastView, '$.status') status, json_extract(lastView, '$.stage') stage
+        FROM tasks WHERE id IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as any[];
+      for (const row of rows) out.set(String(row.id), { id: String(row.id),
+        ...(row.num == null ? {} : { num: Number(row.num) }), title: String(row.title), projectId: String(row.projectId),
+        ...(row.status ? { status: String(row.status) } : {}), ...(row.stage ? { stage: String(row.stage) } : {}) });
+    });
+    return out;
+  }
+
   markInbox(userId: string, id: string, unread: boolean): InboxItem | undefined {
     this.db.prepare('UPDATE inbox SET unread=?, readAt=? WHERE id=? AND userId=?')
       .run(unread ? 1 : 0, unread ? null : Date.now(), id, userId);
@@ -2483,21 +2517,68 @@ export class Store {
     return [...users];
   }
 
+  /**
+   * Every inbox delete goes through here. `claimDelivery` inner-joins `inbox`,
+   * so a row dropped without its pending deliveries strands them in the outbox
+   * forever (the same defect `deleteTask` documents).
+   */
+  private deleteInbox(where: string, params: unknown[]): number {
+    const ids = (this.db.prepare(`SELECT id FROM inbox WHERE ${where}`).all(...(params as any[])) as any[])
+      .map((row) => String(row.id));
+    if (!ids.length) return 0;
+    deleteRows(this.db, 'delivery_outbox', 'inboxId', ids);
+    deleteRows(this.db, 'inbox', 'id', ids);
+    return ids.length;
+  }
+
+  /** Approval asks on a task that no `*.approval-resolved` event has answered. */
+  private hasPendingApprovals(taskId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM events e
+      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested')
+        AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
+          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved')
+          AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
+      LIMIT 1`).get(taskId));
+  }
+
+  /**
+   * An inbox row is a LIVE ask (or the task's latest outcome), never a copy of
+   * the event log. Three invariants keep the panel readable, and every one of
+   * them is a bug this replaced:
+   *
+   *  - one row per (user, task, kind) — a repeat of the same ask updates the row
+   *    in place and keeps its original age, instead of stacking a new one;
+   *  - at most one ACTIONABLE row per (user, task) — a new ask supersedes the
+   *    previous one, because it is what the task needs from you *now*;
+   *  - a row is DELETED the moment its ask is discharged (the task stopped
+   *    waiting on a human, every approval was resolved, the task finished).
+   *
+   * Machine waits — an account lease, a host agent slot, the merge queue — are
+   * not asks. Reporting `status === 'waiting'` as a review request is what
+   * turned one task in review into 66 unread "review requested" rows.
+   */
   private materializeInbox(eventSeq: number, ev: KarmaxEvent): void {
     const task = this.getTaskShallow(ev.taskId);
     const project = task && this.getProject(task.projectId);
     if (!task || !project?.organizationId) return;
+    const status = ev.type === 'view.updated' ? String(ev.payload.status ?? '') : '';
+    const finished = ['done', 'failed', 'cancelled'].includes(status);
+
+    // ── Discharge: drop what the task no longer needs from anybody ───────────
     if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved') {
-      const requestId = String(ev.payload.requestId ?? '');
-      if (requestId) {
-        this.db.prepare(`UPDATE inbox SET unread=0, actionable=0, readAt=?
-          WHERE taskId=? AND kind='approval-requested' AND eventSeq IN (
-            SELECT seq FROM events WHERE taskId=? AND type IN ('credential.approval-requested', 'permission.approval-requested')
-              AND json_extract(payload, '$.requestId')=?
-          )`).run(ev.ts, task.id, task.id, requestId);
-      }
+      if (!this.hasPendingApprovals(task.id)) this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]);
       return;
     }
+    if (finished) this.deleteInbox('taskId=? AND actionable=1', [task.id]);
+    else if (ev.type === 'view.updated') {
+      // The task is live again, so its last outcome has stopped being news — and
+      // any ask it had parked on is answered unless it is STILL on a human.
+      const stale = ev.payload.waitingFor === 'human'
+        ? ["'update'"] : ["'update'", "'review-requested'", "'escalated'"];
+      this.deleteInbox(`taskId=? AND kind IN (${stale.join(', ')})`, [task.id]);
+    }
+
+    // ── Classify: what is this event asking of whom ─────────────────────────
     let kind: InboxItem['kind'] | undefined;
     let actionable = false;
     let users: string[] = [];
@@ -2518,13 +2599,22 @@ export class Store {
     } else if (ev.type === 'permission.approval-requested') {
       kind = 'approval-requested'; actionable = true;
       users = Array.isArray(ev.payload.recipients) ? ev.payload.recipients.map(String) : [];
-    } else if (isReviewEvent(ev.type) || (ev.type === 'view.updated' && (ev.payload.status === 'waiting' || ev.payload.stage === 'review'))) {
+    } else if (isReviewRequestEvent(ev.type)) {
       kind = 'review-requested'; actionable = true; users = this.reviewAudience(task);
-    } else if (ev.type.includes('escalat') || ev.payload.waitingFor === 'human') {
+    } else if (ev.type.includes('escalat')) {
       kind = 'escalated'; actionable = true;
       users = this.reviewAudience(task);
       if (!users.length && task.assignee) users = this.expandPrincipal(task.assignee, task.projectId);
-    } else if (ev.type === 'view.updated' && ['done', 'failed', 'cancelled'].includes(String(ev.payload.status))) {
+    } else if (ev.type === 'view.updated' && ev.payload.waitingFor === 'human') {
+      // The one lifecycle state that is an ask: the task is parked ON a human.
+      // While an approval is outstanding that approval IS the ask, and it was
+      // already routed to exactly the people who can answer it.
+      if (this.hasPendingApprovals(task.id)) return;
+      kind = ev.payload.stage === 'review' ? 'review-requested' : 'escalated';
+      actionable = true;
+      users = this.reviewAudience(task);
+      if (!users.length && task.assignee) users = this.expandPrincipal(task.assignee, task.projectId);
+    } else if (finished) {
       kind = 'update';
       for (const subscriber of this.subscribersFor(task.id)) users.push(...this.expandPrincipal(subscriber, task.projectId));
     }
@@ -2532,6 +2622,16 @@ export class Store {
     for (const userId of new Set(users)) {
       const preferences = this.getDeliveryPreferences(userId, project.organizationId);
       if (!actionable && !preferences.routine) continue;
+      const existing = this.db.prepare('SELECT id FROM inbox WHERE userId=? AND taskId=? AND kind=?')
+        .get(userId, task.id, kind) as any;
+      if (existing) {
+        // The same ask, restated. Point it at the newest event but leave its age
+        // and read state alone: a repeat is not a new notification.
+        this.db.prepare('UPDATE inbox SET eventSeq=?, actionable=? WHERE id=?')
+          .run(eventSeq, actionable ? 1 : 0, existing.id);
+        continue;
+      }
+      if (actionable) this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]);
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
         taskId: task.id, kind, unread: true, actionable, createdAt: ev.ts };
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO inbox
@@ -2545,6 +2645,31 @@ export class Store {
           .run(newId('delivery'), item.id, channel, item.createdAt, item.createdAt);
       }
     }
+  }
+
+  /**
+   * The same discharge rules, applied to the whole table from the tasks' current
+   * state rather than from one event. Runs on every boot: it clears the backlog
+   * older builds accumulated, and nets any ask whose closing event was missed.
+   */
+  pruneStaleInbox(): number {
+    let dropped = 0;
+    dropped += this.deleteInbox('taskId NOT IN (SELECT id FROM tasks)', []);
+    dropped += this.deleteInbox(`actionable=1 AND taskId IN (SELECT id FROM tasks
+      WHERE json_extract(lastView, '$.status') IN ('done', 'failed', 'cancelled'))`, []);
+    dropped += this.deleteInbox(`kind='update' AND taskId IN (SELECT id FROM tasks
+      WHERE COALESCE(json_extract(lastView, '$.status'), 'setup') NOT IN ('done', 'failed', 'cancelled'))`, []);
+    dropped += this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
+      WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human')`, []);
+    if (this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get()) {
+      dropped += this.deleteInbox(`kind='approval-requested' AND taskId NOT IN (
+        SELECT e.taskId FROM events e
+        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested')
+          AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
+            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved')
+            AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []);
+    }
+    return dropped;
   }
 
   claimDelivery(now = Date.now()): { id: string; inbox: InboxItem; channel: 'browser' | 'email' | 'slack'; attempts: number } | undefined {
