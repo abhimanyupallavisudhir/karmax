@@ -36,7 +36,7 @@ global.localStorage = {
   setItem: (k, v) => store.set(k, String(v)),
 };
 global.esc = (value) => String(value ?? '');
-global.S = { deliveryPreferences: null, meta: { deliveryChannels: ['browser'] } };
+global.S = {};
 global.NOTIFY_BEHAVIOURS = undefined;
 
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
@@ -136,9 +136,10 @@ for (const level of URGENCY_LEVELS) {
 }
 ok(card.indexOf('critical') < card.indexOf('>low<'), 'levels are listed loudest first');
 ok(card.includes('id="notifications"'), 'the card is linkable from the inbox');
-ok(card.includes('id="save-delivery"') && card.includes('data-delivery="browser"'),
-  'delivery channels moved here, next to the behaviour they carry');
-ok(card.includes('data-delivery="routine"'), 'routine outcome updates are a real switch, not an implicit default');
+ok(!card.includes('>Delivery<') && !card.includes('data-delivery='),
+  'unimplemented delivery preferences are not shown as notification behaviour');
+ok(!card.includes('Outcome updates for tasks I follow'),
+  'outcome updates are not presented as a delivery destination');
 
 // ── layout regressions ──────────────────────────────────────────────────────
 // Two rules the markup above silently depends on. Both were real: `.task-sub` is

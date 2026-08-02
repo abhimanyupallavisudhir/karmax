@@ -47,7 +47,6 @@ const S = {
   users: [],
   inbox: [],
   inboxFilter: 'all', // which kind of notification the inbox is pinned to (URL-owned)
-  deliveryPreferences: null,
   projectId: null,
   tasks: [],
   attemptGroup: null, // logical-task group for the open task page
@@ -2053,19 +2052,17 @@ async function loadCollaboration() {
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
   const q = `?organizationId=${encodeURIComponent(organizationId)}`;
-  const [members, teams, users, inbox, prefs] = await Promise.all([
+  const [members, teams, users, inbox] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/inbox${q}`).catch(() => []),
-    api(`/api/inbox/preferences${q}`).catch(() => null),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
   S.inbox = inbox || [];
-  S.deliveryPreferences = prefs;
   // Announce what ARRIVED since the last list. The first load only seeds the
   // seen set (and switching organization reseeds it), so opening the app never
   // replays the backlog. See announceInbox for what each urgency does.
@@ -2497,16 +2494,18 @@ function verificationBanner() {
 // domain was unverified at the provider. The server log names the cause.
 const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';
 
+async function resendConfirmationEmail(button) {
+  button.disabled = true;
+  try {
+    const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
+    toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
+  } catch { toast(EMAIL_SEND_FAILED, true); }
+  button.disabled = false;
+}
+
 function wireVerificationBanner() {
-  $('#verify-resend')?.addEventListener('click', async () => {
-    const btn = $('#verify-resend'); btn.disabled = true;
-    try {
-      const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
-      toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
-    } catch { toast(EMAIL_SEND_FAILED, true); }
-    btn.disabled = false;
-  });
+  $('#verify-resend')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
 }
 
@@ -11366,7 +11365,9 @@ function profileView() {
           <span class="profile-row-label">Email</span>
           <div class="profile-row-control">
             <span class="profile-row-value">${esc(email)}</span>
-            <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+            ${u.emailVerified
+              ? '<span class="chip success">verified</span>'
+              : '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>'}
             <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
               aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
           </div>
@@ -11453,12 +11454,10 @@ function profileView() {
   </div>`;
 }
 
-// One place for everything an ask does to you: the per-urgency behaviour of this
-// browser, and the channels the server delivers on. The inbox page lists asks;
-// it does not configure them.
+// One place for the per-urgency behaviour of this browser. The inbox page lists
+// asks; it does not configure them.
 function notificationsCard() {
   const prefs = notifyPrefs();
-  const delivery = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     granted: '<p class="task-sub">This browser may show system notifications.</p>',
@@ -11483,22 +11482,6 @@ function notificationsCard() {
       </div>`).join('')}
     </div>
     ${permissionNote}
-    <div class="settings-divider"></div>
-    <div class="section-h">Delivery</div>
-    <p class="task-sub">Where an ask is delivered, for every organization you work in.</p>
-    ${['browser', 'email', 'slack'].map((key) => {
-    // A channel with no adapter cannot deliver anything. Offering the switch anyway
-    // — and toasting "saved" — meant a user could turn on Email and simply stop
-    // being notified, with the failure logged only on the server.
-    const ready = (S.meta?.deliveryChannels ?? ['browser']).includes(key);
-    const label = key[0].toUpperCase() + key.slice(1);
-    return `<label class="switch${ready ? '' : ' disabled'}"${ready ? '' : ` title="Not set up on this server yet"`}>`
-      + `<input type="checkbox" data-delivery="${key}" ${delivery[key] && ready ? 'checked' : ''} ${ready ? '' : 'disabled'}/>`
-      + `<span>${label}${ready ? '' : ' <span class="task-sub">— not set up</span>'}</span></label>`;
-  }).join('')}
-    <label class="switch"><input type="checkbox" data-delivery="routine" ${delivery.routine ? 'checked' : ''}/>
-      <span>Outcome updates for tasks I follow <span class="task-sub">— low urgency, nothing is asked of you</span></span></label>
-    <button class="btn sm primary" id="save-delivery">Save preferences</button>
   </div>`;
 }
 
@@ -11530,13 +11513,6 @@ function wireNotificationsCard() {
     try { await Notification.requestPermission(); } catch {}
     renderMain();
   });
-  $('#save-delivery')?.addEventListener('click', async () => {
-    const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
-    try {
-      S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
-      toast('Delivery preferences saved');
-    } catch (error) { toast(error.message, true); }
-  });
 }
 
 function wireProfileView() {
@@ -11555,6 +11531,7 @@ function wireProfileView() {
     setProfileEditor(opening ? button.dataset.profileEdit : null);
   }));
   document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
+  $('#profile-resend-confirmation')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
 
   $('#profile-email-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
