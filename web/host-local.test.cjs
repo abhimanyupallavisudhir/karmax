@@ -83,7 +83,7 @@ for (const l of lines.filter((l) => /localPath:/.test(l)))
 // drives tailscale/pkexec on the host), so rendering the card only produces a
 // permanent "Needs attention" error.
 for (const marker of ['id="settings-access"', '#settings-access'])
-  for (const l of lines.filter((l) => l.includes(marker)))
+  for (const l of lines.filter((l) => l.includes(marker) && /<(?:a|div)\b/.test(l)))
     ok(l.includes('hostLocal()'), `the Phone Access ${marker} is gated on hostLocal()`);
 // The card itself sits on its own line inside that gated template, so check it
 // structurally: it must fall between the gate's `${hostLocal() ?` and its `: ''}`.
@@ -94,6 +94,16 @@ ok(src.indexOf('id="phone-access-card"') > gateStart && src.indexOf('id="phone-a
   'the Phone Access card renders only inside that gate');
 ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess()')),
   'the Phone Access status is not fetched when the endpoint is withdrawn');
+
+// Phone Access is also an installation-wide host control: an organization
+// administrator may manage their tenant but must not see a control that drives
+// this machine's Tailscale/pkexec. Like the other installation cards below, it
+// ships hidden and is revealed only after its settings:read endpoint succeeds.
+ok(/id="phone-access-nav"[^>]*\shidden/.test(src), 'the Phone Access nav link ships hidden');
+ok(/id="settings-access"[^>]*\shidden/.test(src), 'the Phone Access section title ships hidden');
+ok(/id="phone-access-card"[^>]*\shidden/.test(src), 'the Phone Access card ships hidden');
+ok(/error\?\.status === 403\) return/.test(src), 'a refused Phone Access read leaves the control absent');
+ok(/function revealPhoneAccess\(\)/.test(src), 'Phone Access has an explicit post-authorization reveal');
 
 // ── wording that only holds on the machine running karmax ───────────────────
 // "On localhost, setup works without a webhook" is a claim about THIS install's
