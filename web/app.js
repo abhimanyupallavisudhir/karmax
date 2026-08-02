@@ -11134,8 +11134,7 @@ function markInboxItemReadLocally(item) {
   updateBell();
 }
 // The inbox is one list of live asks, split by what is being asked. Every kind
-// the server can route has a sub-tab; a kind with nothing in it has no tab, so
-// the header shows the shape of the actual backlog rather than a fixed menu.
+// the server can route has a stable sub-tab, even when that tab is empty.
 const INBOX_TABS = [
   { key: 'approval-requested', label: 'Approvals' },
   { key: 'review-requested', label: 'Review' },
@@ -11154,19 +11153,24 @@ function urgencyRank(urgency) {
 // Read items are hidden by default — an answered notification should stop taking
 // up space. A per-browser display choice, like the theme (see renderFlag).
 function inboxShowRead() { return renderFlag('karmax-inbox-show-read', false); }
+// Routine updates have their own stream; All is the combined attention queue.
+function inboxItemMatchesFilter(item, filter = S.inboxFilter) {
+  return filter === 'all' ? item.kind !== 'update' : item.kind === filter;
+}
+function inboxUnreadCount(filter = S.inboxFilter) {
+  return S.inbox.filter((item) => item.unread && inboxItemMatchesFilter(item, filter)).length;
+}
 // Urgency first, recency second — the same order the server returns, restated
 // here so the list is right even when a row is patched in place client-side.
 function inboxItems() {
   const showRead = inboxShowRead();
   return S.inbox.filter((item) => (showRead || item.unread)
-    && (S.inboxFilter === 'all' || item.kind === S.inboxFilter))
+    && inboxItemMatchesFilter(item))
     .sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency) || b.createdAt - a.createdAt);
 }
 function inboxTabs() {
-  const unread = (match) => S.inbox.filter((item) => item.unread && match(item)).length;
-  return [{ key: 'all', label: 'All', unread: unread(() => true) }].concat(
-    INBOX_TABS.filter((tab) => S.inbox.some((item) => item.kind === tab.key))
-      .map((tab) => ({ ...tab, unread: unread((item) => item.kind === tab.key) })));
+  return [{ key: 'all', label: 'All', unread: inboxUnreadCount('all') }].concat(
+    INBOX_TABS.map((tab) => ({ ...tab, unread: inboxUnreadCount(tab.key) })));
 }
 // What a row is about. An ask names itself ("review requested"); an update's
 // news is the outcome it is reporting, so it names the task's status instead.
@@ -11183,7 +11187,7 @@ function inboxView() {
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
     <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
-    <div class="inbox-toolbar"><span>${S.inbox.filter((x) => x.unread).length} unread</span>
+    <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
