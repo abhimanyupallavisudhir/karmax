@@ -329,12 +329,11 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
-  /** karmax's own model tolerates an uncommitted worktree until the merge stage
-   *  (PLAN-git-config.md §6 loops it back to the merge agent), so reaching the PR
-   *  stage with nothing committed is a state the design actually produces — and
-   *  GitHub answers it with an opaque 422 ("No commits between …"). Diagnose it
-   *  here instead, naming the repo and what to do. */
-  it('says the branch has no commits rather than passing an empty branch to GitHub', async () => {
+  /** Historical workflow pins can reach PR before their Merge agent has prepared
+   *  a dirty branch. An empty proposal is not a PR-stage failure: skipping it lets
+   *  that already-recorded workflow continue to Merge, whose dirty-worktree guard
+   *  sends the work to the Merge agent instead of losing it. */
+  it('skips an empty proposal so a historical workflow can continue to Merge', async () => {
     const gh = fakeGithub();
     const core = await coreFor(gh);
     const repo = await repoWithGithubOrigin('empty');
@@ -342,11 +341,13 @@ describe('PR stage (remote policy "pr")', () => {
     // The agent wrote a file but never committed it — exactly the dirty-worktree case.
     await fs.promises.writeFile(path.join(handle.root, 'uncommitted.txt'), 'x');
 
-    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/no commits/i);
-    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/empty/); // names the repo
+    await expect(core.openPr(handle, 'main', {})).resolves.toEqual([]);
     expect(gh.prs).toHaveLength(0);
-    // No pointless POST to GitHub either — the branch is checked first.
+    // Neither a pointless GitHub request nor an empty remote branch is created.
     expect(gh.calls.filter((c) => c.startsWith('POST'))).toHaveLength(0);
+    expect((await git(path.join(tmp, 'empty-origin.git'), ['rev-parse', '--verify', handle.branch])).code).not.toBe(0);
+    // openPr is read-only in this case; Merge still sees the work it must classify.
+    expect(fs.readFileSync(path.join(handle.root, 'uncommitted.txt'), 'utf8')).toBe('x');
     await core.destroyWorld(handle);
   });
 

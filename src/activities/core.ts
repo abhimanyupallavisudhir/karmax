@@ -1957,7 +1957,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin');
       }
       const changed: Array<(typeof targets)[number] & { base: string }> = [];
-      let firstUnchanged: { repo: (typeof targets)[number]['repo']; base: string } | undefined;
       for (const { repo, slug, api } of targets) {
         // A checkout whose base is a SIBLING's branch is a stacked pull request:
         // open it against that branch so GitHub renders the stack and its diff
@@ -1974,20 +1973,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             + ` ${ahead.stderr || ahead.stdout || 'git rev-list failed'}`);
         }
         if (ahead.stdout.trim() === '0') {
-          firstUnchanged ??= { repo, base };
           record(handle.id, 'pr.skipped', { repo: repo.name, reason: `no commits ahead of ${base}` });
           continue;
         }
         changed.push({ repo, slug, api, base });
       }
-      // An unchanged companion checkout (especially the platform-owned project
-      // wiki) has no proposal and gets no PR. But if EVERY GitHub target is
-      // unchanged, preserve the actionable failure: the task itself produced no
-      // committed branch history for GitHub to compare.
-      if (!changed.length && firstUnchanged) {
-        throw new Error(`branch "${firstUnchanged.repo.branch}" of repo "${firstUnchanged.repo.name}" has no commits ahead of "${firstUnchanged.base}",`
-          + ' so there is nothing to open a pull request for — the agent must commit its work before the PR stage');
-      }
+      // No committed proposal is a successful PR no-op, even when EVERY checkout
+      // is unchanged. Historical workflow pins (notably softwareDev@1.10.0) can
+      // legitimately reach this activity with a dirty-but-uncommitted branch and
+      // have their already-recorded Merge stage prepare it afterwards. Failing
+      // here strands those executions before the Merge agent can do its job.
+      // Current workflows prepare before PR, while finalizeMergeActivity still
+      // rejects dirty worktrees, so returning [] neither loses work nor weakens
+      // the protected-target merge invariant.
       const pushed = await pushTaskBranches(world, handle, gitEnvFor(handle, handle.id), changed.map(({ repo }) => repo));
       const opened: TaskPullRequest[] = [];
       for (const { repo, slug, api, base } of changed) {
