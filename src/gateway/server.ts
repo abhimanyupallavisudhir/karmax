@@ -121,6 +121,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  // A signed-in person always owns their own Git identity. It is not an
+  // organization credential grant and must remain editable after they join a
+  // project only as a Developer (or before they join any project at all).
+  if (/^\/api\/user\/git-profiles(?:\/|$)/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
@@ -796,9 +800,14 @@ export class Gateway {
     if (p === '/api/session' && method === 'GET') {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
-        if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user,
+        if (current) {
+          const onboardingKey = `git:onboarding:${current.user.id}`;
+          const gitOnboarding = this.deps.store.kvGet(onboardingKey) === 'pending';
+          if (gitOnboarding) this.deps.store.kvSet(onboardingKey, 'seen');
+          return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user, gitOnboarding,
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
           google: this.deps.identity.googleEnabled });
+        }
         return this.json(res, 200, {
           authRequired: true,
           authenticated: false,
@@ -1024,6 +1033,7 @@ export class Gateway {
         );
         this.deps.authorization?.bootstrapAdministrator(user.id);
         this.deps.store.claimPersonalOrganization(user.id, user.name);
+        this.deps.store.kvSet(`git:onboarding:${user.id}`, 'pending');
         for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
           this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user.id }, 'owner');
         }
@@ -1054,7 +1064,10 @@ export class Gateway {
         // lands in a usable app immediately — no "no access yet" waiting room.
         const created = (await response.clone().json().catch(() => ({}))) as any;
         const userId = created?.user?.id ? String(created.user.id) : undefined;
-        if (userId) this.provisionPersonalWorkspace(userId, String(created?.user?.name ?? b.name ?? ''));
+        if (userId) {
+          this.provisionPersonalWorkspace(userId, String(created?.user?.name ?? b.name ?? ''));
+          this.deps.store.kvSet(`git:onboarding:${userId}`, 'pending');
+        }
         return this.sendWebResponse(res, response);
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     }
@@ -4131,20 +4144,29 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      // Git profiles (PLAN-git-config.md §3): named git identity + credentials for
+      // Git profiles: a person's development identity lives at /api/user/…;
+      // organization profiles remain a distinct service/automation credential.
       // the repos karmax works on. The registry is public; secrets are write-only
       // into the vault (never echoed) and resolved JIT by the broker at use time.
-      if (resourcePath === '/api/git-profiles' && method === 'GET') {
-        const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
-        return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null });
+      const userGitResource = p.match(/^\/api\/user\/git-profiles(\/.*)?$/);
+      if (userGitResource || resourcePath.startsWith('/api/git-profiles')) {
+      const gitResourcePath = userGitResource ? `/api/git-profiles${userGitResource[1] ?? ''}` : resourcePath;
+      const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
+      const gitScope = userGitResource
+        ? (session.userId ? userGitScope(session.userId) : undefined)
+        : resourceOrganizationId;
+      if (userGitResource && !gitScope) return this.json(res, 400, { error: 'a human account is required' });
+      if (gitResourcePath === '/api/git-profiles' && method === 'GET') {
+        const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
+        const canManage = userGitResource ? true
+          : this.deps.tokens.check(token, 'credential:write', { organizationId: resourceOrganizationId }).ok;
+        return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null, canManage });
       }
-      if (resourcePath === '/api/git-profiles' && method === 'POST') {
+      if (gitResourcePath === '/api/git-profiles' && method === 'POST') {
         const b = await this.body(req);
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!b.name || !b.userName || !b.userEmail) return this.json(res, 400, { error: 'name, userName, userEmail required' });
-        const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
+        const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
         try {
           const rec = gp.save({
             name: String(b.name),
@@ -4154,37 +4176,46 @@ export class Gateway {
             signingKey: b.signingKey ? String(b.signingKey) : undefined,
             githubToken: b.githubToken ? String(b.githubToken) : undefined,
           });
-          if (b.default) gp.setDefault(rec.name);
+          if (b.default || (userGitResource && !gp.defaultProfile())) gp.setDefault(rec.name);
           return this.json(res, 200, { profile: rec }); // never echoes the secrets
         } catch (e) {
           return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
         }
       }
-      const gitProfileMatch = resourcePath.match(/^\/api\/git-profiles\/([^/]+)$/);
+      const gitProfileMatch = gitResourcePath.match(/^\/api\/git-profiles\/([^/]+)$/);
       if (gitProfileMatch && method === 'DELETE') {
-        const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId)
+        new GitProfiles(store, this.deps.broker, undefined, gitScope!)
           .delete(decodeURIComponent(gitProfileMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
       // The doctor check (PLAN-git-config.md §7): which tier a project's remote
       // ops resolve to (profile / host fallback) and whether it can reach the
       // repos' remotes non-interactively. Read-only.
-      if (resourcePath === '/api/git-profiles/preflight' && method === 'GET') {
+      if (!userGitResource && gitResourcePath === '/api/git-profiles/preflight' && method === 'GET') {
         const projectId = url.searchParams.get('projectId') ?? undefined;
         const project = projectId ? store.getProject(projectId) : undefined;
-        const { GitProfiles } = await import('../autonomy/git-profiles.js');
         const organizationId = project?.organizationId ?? resourceOrganizationId;
         if (project && organizationId !== resourceOrganizationId)
           return this.json(res, 400, { error: 'project does not belong to this organization' });
         return this.json(res, 200, await new GitProfiles(store, this.deps.broker, undefined, organizationId).preflight(project?.config));
       }
-      if (resourcePath === '/api/git-profiles/default' && method === 'POST') {
+      if (gitResourcePath === '/api/git-profiles/default' && method === 'POST') {
         const b = await this.body(req);
-        const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId)
+        new GitProfiles(store, this.deps.broker, undefined, gitScope!)
           .setDefault(b.name ? String(b.name) : undefined);
         return this.json(res, 200, { ok: true });
+      }
+      if (!userGitResource && gitResourcePath === '/api/git-profiles/reuse-user' && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const organizationProfiles = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
+        try {
+          const profile = organizationProfiles.reuseUserProfile(
+            new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId)));
+          return this.json(res, 200, { profile, defaultProfile: profile.name });
+        } catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       }
 
       // Manual availability override for an agent login (SPEC §6.2): force a login

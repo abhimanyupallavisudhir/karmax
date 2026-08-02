@@ -73,6 +73,9 @@ const signupResponse = await json('/api/signup', {
 });
 const signupCookie = signupResponse.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
 if (!signupResponse.ok || !signupCookie) throw new Error(`self signup failed: ${await signupResponse.text()}`);
+const signupFirstSession = await (await json('/api/session', { headers: { cookie: signupCookie } })).json() as any;
+const signupSecondSession = await (await json('/api/session', { headers: { cookie: signupCookie } })).json() as any;
+const signupGitOnboardingOnce = signupFirstSession.gitOnboarding === true && signupSecondSession.gitOnboarding === false;
 // Self-signup now lands the user in their own personal-workspace organization —
 // no "no access yet" waiting room. Projects is reachable (empty until they make
 // one) and the user owns exactly one personal org.
@@ -129,6 +132,7 @@ process.stdout.write(JSON.stringify({
   signupEntersApp,
   signupHasPersonalWorkspace,
   signupDashboardOk,
+  signupGitOnboardingOnce,
   signupAccountVisible: rootUsers.some((u) => u.email === 'waiting@example.com'),
   loggedOut: !loggedOut.authenticated,
 }));

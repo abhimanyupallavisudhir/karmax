@@ -461,10 +461,10 @@ export interface ProjectConfig {
    *  branch added later has somewhere to live inside the world boundary; the
    *  task's lifecycle stays singular (one Review, one Merge). */
   multiPr?: boolean;
-  /** Named git identity/credentials (an organization-owned GitProfile)
-   *  this project's worlds commit and push as. Absent ⇒ the organization default
-   *  profile. Only the migrated personal organization may fall back to the
-   *  host's own git setup; other organizations fail closed. */
+  /** @deprecated Human-created development ignores this field and always uses
+   *  the creator's user-owned default Git profile. Retained for replay and for
+   *  system/automation work with no human creator, where it selects an
+   *  organization service profile. */
   gitProfile?: string;
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;
@@ -662,8 +662,8 @@ export interface TaskPullRequest {
  * config-home account. The record itself carries NO secrets: the three key
  * fields are true/false flags for whether a vault secret exists under the
  * profile's handles (`git:<name>:ssh` / `git:<name>:signing` / `git:<name>:token`).
- * Selection is per project (`ProjectConfig.gitProfile`) with a global default;
- * an unconfigured project falls through to the host's own git setup.
+ * Human development profiles are user-owned and selected by the task creator's
+ * default. Organization-scoped records exist separately for service automation.
  */
 export interface GitProfile {
   name: string;
@@ -677,6 +677,10 @@ export interface GitProfile {
   sshKey?: boolean;
   /** A GitHub token is stored (injected as GH_TOKEN for gh + https pushes). */
   githubToken?: boolean;
+  /** An organization may deliberately reuse a member's user-owned profile.
+   * This is a live reference, not a secret copy: rotation and revocation remain
+   * under that user's control. User-owned profile records never set `source`. */
+  source?: { kind: 'user'; userId: string; profile: string };
 }
 
 export interface TaskList {

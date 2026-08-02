@@ -19,16 +19,29 @@ const pexec = promisify(execFile);
  * handles and are resolved JIT by the broker, per subprocess — never written to
  * any git config file, never journaled (§2 principle 4).
  *
- * Selection: project's `gitProfile` → its organization default → undefined.
- * Host fallback is a legacy privilege of org_personal only; other organizations
- * receive a neutral identity and an explicitly scrubbed Git environment.
+ * Human development resolves in the creator's user scope. Organization scopes
+ * remain available for service/automation work with no human creator. Host
+ * fallback is a compatibility privilege of legacy org_personal work only.
  */
 
 const LEGACY_KV_PROFILES = 'git:profiles';
 const LEGACY_KV_DEFAULT = 'git:default-profile';
 
+/** User Git configuration is deliberately outside every tenant namespace. */
+export function userGitScope(userId: string): string {
+  const id = userId.trim();
+  if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error('invalid user id for Git profile scope');
+  return `user:${id}`;
+}
+
+function userIdOfScope(scope: string): string | undefined {
+  return scope.startsWith('user:') ? scope.slice('user:'.length) : undefined;
+}
+
 /** The vault handle for one of a profile's secrets. */
 export function gitHandle(profile: string, kind: 'ssh' | 'signing' | 'token', organizationId = 'org_personal'): string {
+  const userId = userIdOfScope(organizationId);
+  if (userId) return `git:user:${userId}:${profile}:${kind}`;
   // Existing handles are assigned to the migrated personal organization. New
   // organizations receive a disjoint vault namespace even when profile names match.
   return organizationId === 'org_personal'
@@ -62,7 +75,16 @@ export class GitProfiles {
       ?? (this.organizationId === 'org_personal' ? this.store.kvGet(LEGACY_KV_PROFILES) : undefined);
     if (!raw) return [];
     try {
-      return JSON.parse(raw) as GitProfile[];
+      const profiles = JSON.parse(raw) as GitProfile[];
+      // Linked organization records follow the user's public identity/flags as
+      // well as their vault handles. A name/email edit or token rotation should
+      // not leave a stale organization snapshot behind.
+      return profiles.map((profile) => {
+        if (!profile.source) return profile;
+        const current = new GitProfiles(this.store, this.broker, this.home,
+          userGitScope(profile.source.userId)).get(profile.source.profile);
+        return current ? { ...current, name: profile.name, source: profile.source } : profile;
+      });
     } catch {
       return [];
     }
@@ -78,8 +100,32 @@ export class GitProfiles {
   }
 
   setDefault(name: string | undefined) {
-    if (name && !this.get(name)) throw new Error(`unknown git profile "${name}" in organization ${this.organizationId}`);
+    if (name && !this.get(name)) throw new Error(`unknown git profile "${name}" in ${this.scopeLabel()}`);
     this.store.kvSet(this.defaultKey(), name ?? '');
+  }
+
+  /** Link an empty organization's service Git configuration to the signed-in
+   * member's default user profile. Secrets remain in the user's vault namespace
+   * so there is one rotation/revocation authority rather than a stale copy. */
+  reuseUserProfile(userProfiles: GitProfiles): GitProfile {
+    if (userIdOfScope(this.organizationId)) throw new Error('a user profile cannot reuse another user profile');
+    if (this.list().length || this.defaultProfile()) throw new Error('organization Git is already configured');
+    const userId = userIdOfScope(userProfiles.organizationId);
+    if (!userId) throw new Error('source must be a user Git profile');
+    const source = userProfiles.resolve(undefined);
+    if (!source) throw new Error('configure a default Git profile on your user page first');
+    const linked: GitProfile = {
+      name: source.name,
+      userName: source.userName,
+      userEmail: source.userEmail,
+      ...(source.sshKey ? { sshKey: true } : {}),
+      ...(source.signingKey ? { signingKey: true } : {}),
+      ...(source.githubToken ? { githubToken: true } : {}),
+      source: { kind: 'user', userId, profile: source.name },
+    };
+    this.store.kvSet(this.profilesKey(), JSON.stringify([linked]));
+    this.setDefault(linked.name);
+    return linked;
   }
 
   /**
@@ -102,7 +148,7 @@ export class GitProfiles {
       if (value?.trim()) {
         this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim());
         (rec as any)[flag] = true;
-      } else if (prior?.[flag]) {
+      } else if (prior?.[flag] && !prior.source) {
         (rec as any)[flag] = true; // keep the existing secret
       }
     }
@@ -114,15 +160,18 @@ export class GitProfiles {
   }
 
   delete(name: string) {
+    const profile = this.get(name);
     this.store.kvSet(this.profilesKey(), JSON.stringify(this.list().filter((p) => p.name !== name)));
     if (this.defaultProfile() === name) this.setDefault(undefined);
-    for (const kind of ['ssh', 'signing', 'token'] as const) {
-      this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId));
+    if (!profile?.source) {
+      for (const kind of ['ssh', 'signing', 'token'] as const) {
+        this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId));
+      }
     }
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });
   }
 
-  /** The profile a project's worlds use: project → organization default → none. */
+  /** Resolve a named override (legacy organization automation) or this scope's default. */
   resolve(project: ProjectConfig | undefined): GitProfile | undefined {
     const name = project?.gitProfile?.trim() || this.defaultProfile();
     return name ? this.get(name) : undefined;
@@ -269,12 +318,13 @@ export class GitProfiles {
   }
 
   private resolveSecret(profile: string, kind: 'ssh' | 'signing' | 'token', ctx: { taskId?: string }): string {
-    const cap = this.organizationId === 'org_personal'
-      ? `use-credential:git:${profile}:*`
-      : `use-credential:git:${this.organizationId}:${profile}:*`;
-    return this.requireBroker().resolve(gitHandle(profile, kind, this.organizationId), {
+    const record = this.get(profile);
+    const scope = record?.source ? userGitScope(record.source.userId) : this.organizationId;
+    const sourceProfile = record?.source?.profile ?? profile;
+    const handle = gitHandle(sourceProfile, kind, scope);
+    return this.requireBroker().resolve(handle, {
       taskId: ctx.taskId,
-      caps: [cap],
+      caps: [`use-credential:${handle}`],
     });
   }
 
@@ -285,11 +335,20 @@ export class GitProfiles {
   }
 
   private profilesKey(): string {
+    const userId = userIdOfScope(this.organizationId);
+    if (userId) return `git:profiles:user:${userId}`;
     return `git:profiles:${this.organizationId}`;
   }
 
   private defaultKey(): string {
+    const userId = userIdOfScope(this.organizationId);
+    if (userId) return `git:default-profile:user:${userId}`;
     return `git:default-profile:${this.organizationId}`;
+  }
+
+  private scopeLabel(): string {
+    const userId = userIdOfScope(this.organizationId);
+    return userId ? `user ${userId}` : `organization ${this.organizationId}`;
   }
 
   private requireBroker(): CredentialBroker {

@@ -2457,6 +2457,21 @@ export class Store {
     return r ? rowToTask(r) : undefined;
   }
 
+  /** Human whose Git identity should own development performed for this task.
+   * Agent-created children inherit through their parent chain; automations with
+   * no human ancestor intentionally return undefined. */
+  taskCreatorUserId(taskId: string): string | undefined {
+    let task = this.getTaskShallow(taskId);
+    const visited = new Set<string>();
+    while (task && !visited.has(task.id)) {
+      visited.add(task.id);
+      if (task.createdBy?.kind === 'user') return task.createdBy.userId;
+      if (task.createdBy?.kind !== 'task-agent') return undefined;
+      task = this.getTaskShallow(task.createdBy.taskId);
+    }
+    return undefined;
+  }
+
   private expandPrincipal(principal: ProjectPrincipalRef, projectId: string): string[] {
     if (principal.kind === 'user') return [principal.userId];
     if (principal.kind === 'team') return (this.listTeamMemberships(principal.teamId)).map((m) => m.userId);

@@ -61,6 +61,12 @@ describe('gateway route capability binding', () => {
   it('gates a password-manager export import as a credential write', () => {
     expect(cap('POST', '/api/vault/import/bitwarden')).toBe('credential:write');
   });
+
+  it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
+    expect(cap('GET', '/api/user/git-profiles')).toBe('none');
+    expect(cap('POST', '/api/user/git-profiles')).toBe('none');
+    expect(cap('DELETE', '/api/user/git-profiles/main')).toBe('none');
+  });
 });
 
 describe('gateway route capability catalog', () => {

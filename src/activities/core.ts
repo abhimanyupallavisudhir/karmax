@@ -28,7 +28,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
-import { GitProfiles } from '../autonomy/git-profiles.js';
+import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
@@ -363,12 +363,43 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
 
-  const gitProfilesFor = (projectId?: string) => new GitProfiles(
+  const organizationGitProfilesFor = (projectId?: string) => new GitProfiles(
     store,
     deps.broker,
     paths().state,
     (projectId ? store.getProject(projectId)?.organizationId : undefined) ?? 'org_personal',
   );
+
+  const gitProfilesForScope = (scope: string) => new GitProfiles(store, deps.broker, paths().state, scope);
+
+  /** Development follows the human creator, never the tenant. Organization Git
+   * remains the fallback for system/automation tasks that have no human owner and
+   * for historical task-less activity calls used by older workflow histories. */
+  const developmentGitBinding = (taskId: string, projectId?: string, requestedProfile?: string) => {
+    const userId = store.taskCreatorUserId(taskId);
+    if (userId) {
+      const scope = userGitScope(userId);
+      const profiles = gitProfilesForScope(scope);
+      return { scope, profiles, profile: profiles.resolve(undefined), userId };
+    }
+    const profiles = organizationGitProfilesFor(projectId);
+    const organizationId = (projectId ? store.getProject(projectId)?.organizationId : undefined) ?? 'org_personal';
+    return { scope: organizationId, profiles, profile: profiles.resolve({ gitProfile: requestedProfile }) };
+  };
+
+  const gitBindingFromHandle = (handle: WorldHandle, taskId?: string) => {
+    const profileName = handle.meta?.gitProfile;
+    const scope = handle.meta?.gitProfileScope;
+    if (typeof profileName === 'string' && profileName && typeof scope === 'string' && scope) {
+      const profiles = gitProfilesForScope(scope);
+      return { scope, profiles, profile: profiles.get(profileName) };
+    }
+    const projectId = typeof handle.meta?.projectId === 'string'
+      ? handle.meta.projectId
+      : taskId ? store.getTask(taskId)?.projectId : undefined;
+    return developmentGitBinding(taskId ?? handle.id, projectId,
+      typeof profileName === 'string' ? profileName : undefined);
+  };
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
     const ev = { type, taskId, ts: Date.now(), payload };
@@ -377,23 +408,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
-   *  the world's git profile (stamped on the handle at creation) → GIT_SSH_COMMAND /
-   *  GH_TOKEN, per subprocess. The personal organization retains host fallback;
-   *  every other organization gets an explicitly credential-free environment. */
+   *  the world's user-owned git profile (stamped on the handle at creation) →
+   *  GIT_SSH_COMMAND / GH_TOKEN, per subprocess. Only legacy worlds without a
+   *  human owner retain host fallback. */
   function gitEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
-    const projectId = typeof handle.meta?.projectId === 'string'
-      ? handle.meta.projectId
-      : taskId ? store.getTask(taskId)?.projectId : undefined;
-    const organizationId = projectId
-      ? store.getProject(projectId)?.organizationId ?? 'org_personal'
-      : 'org_personal';
-    const fallback = organizationId === 'org_personal' ? {} : isolatedGitEnvironment();
-    const name = handle.meta?.gitProfile;
-    if (typeof name !== 'string' || !name) return fallback;
+    const binding = gitBindingFromHandle(handle, taskId);
+    const fallback = binding.scope === 'org_personal' ? {} : isolatedGitEnvironment();
+    if (!binding.profile) return fallback;
     try {
-      const gitProfiles = gitProfilesFor(projectId);
-      const profile = gitProfiles.get(name);
-      return profile ? { ...fallback, ...gitProfiles.env(profile, { taskId }) } : fallback;
+      return { ...fallback, ...binding.profiles.env(binding.profile, { taskId }) };
     } catch {
       return fallback;
     }
@@ -401,15 +424,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   /**
    * The GitHub API token PR operations on `slug` run as, in the order karmax
-   * trusts credentials (PLAN-git-config.md §4B): the project's App installation
-   * (the hosted path — scoped to exactly the enrolled repository), then the
-   * world's git profile, then — only for the migrated personal organization,
-   * which is the one allowed host fallback — the host's own token or `gh` login.
+   * trusts credentials: the human creator's GitHub identity first (so PRs and
+   * pushes are attributed to the contributor), then the project's App installation
+   * for repository service work, then legacy host fallback.
    */
   async function githubTokenFor(handle: WorldHandle, slug: string): Promise<string | undefined> {
     const projectId = typeof handle.meta?.projectId === 'string'
       ? handle.meta.projectId
       : store.getTask(handle.id)?.projectId;
+    const env = gitEnvFor(handle, handle.id);
+    if (env.GH_TOKEN) return env.GH_TOKEN;
+    // A human task must never silently open its PR as the organization App.
+    // Repository provisioning may use the App's scoped read token, but authorship
+    // is the contributor's user configuration or an actionable setup failure.
+    if (gitBindingFromHandle(handle, handle.id).scope.startsWith('user:')) return undefined;
     if (projectId && deps.githubApp) {
       const enrolled = store.listProjectRepositories(projectId).map((entry) => entry.repository);
       const wiki = store.projectWiki(projectId)?.repository;
@@ -418,8 +446,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const connection = repository?.gitConnectionId ? store.getGitConnection(repository.gitConnectionId) : undefined;
       if (connection) return await deps.githubApp.installationToken(connection);
     }
-    const env = gitEnvFor(handle, handle.id);
-    if (env.GH_TOKEN) return env.GH_TOKEN;
     // `isolatedGitEnvironment()` blanks GH_TOKEN: an organization without a
     // credentialed profile fails closed rather than borrowing the host's login.
     if ('GH_TOKEN' in env) return undefined;
@@ -433,8 +459,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function prApiFor(handle: WorldHandle, slug: string): Promise<GithubPrApi> {
     const token = await githubTokenFor(handle, slug);
     if (!token) {
-      throw new Error(`no GitHub credential can act on ${slug} — connect the repository to the GitHub App,`
-        + ' give this project a git profile with a GitHub token, or authorize `gh` on the host');
+      throw new Error(`no personal GitHub credential can act on ${slug} — add a GitHub token to your Development Git identity on your user page`);
     }
     return new GithubPrApi(token, deps.githubPr ?? {});
   }
@@ -612,26 +637,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       record(args.taskId, 'world.provisioning', { provider: args.kind });
       const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const project = projectId ? store.getProject(projectId) : undefined;
-      const gitProfiles = gitProfilesFor(projectId);
       const organizationId = project?.organizationId ?? 'org_personal';
-      // Resolve the git profile (project → organization default → none) and materialize
-      // its identity for worktree-scoped config (PLAN-git-config.md §4A). Identity
-      // failure downgrades to a warning — the world is still usable locally.
-      const profile = gitProfiles.resolve({ gitProfile: args.gitProfile });
+      // Resolve the human creator's profile. A tenant-wide identity is only valid
+      // for a system-created task with no human ancestor.
+      const gitBinding = developmentGitBinding(args.taskId, projectId, args.gitProfile);
+      const { profile, profiles: gitProfiles } = gitBinding;
       let gitIdentity;
       let gitCredentials;
       try {
         gitIdentity = profile
           ? gitProfiles.identity(profile, { taskId: args.taskId })
-          : organizationId === 'org_personal'
-            ? undefined
-            : { name: 'karmax', email: `karmax+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
+          : gitBinding.userId
+            ? { name: 'karmax', email: `karmax+${gitBinding.userId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` }
+            : organizationId === 'org_personal'
+              ? undefined
+              : { name: 'karmax', email: `karmax+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
       }
       try {
         gitCredentials = {
-          ...(organizationId === 'org_personal' ? {} : { isolated: true }),
+          ...(gitBinding.scope === 'org_personal' ? {} : { isolated: true }),
           ...(profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : {}),
         };
         if (!Object.keys(gitCredentials).length) gitCredentials = undefined;
@@ -748,7 +774,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           world.handle = runtime.handle;
           for (const warning of runtime.warnings) record(args.taskId, 'world.warning', { warning });
         }
-        if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
+        if (profile) world.handle.meta = { ...world.handle.meta,
+          gitProfile: profile.name, gitProfileScope: gitBinding.scope };
         if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
           const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
           const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
@@ -1741,12 +1768,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const profileName = handle.meta?.gitProfile;
       if (typeof profileName === 'string' && profileName) {
         try {
-          const projectId = typeof handle.meta?.projectId === 'string'
-            ? handle.meta.projectId
-            : store.getTask(handle.id)?.projectId;
-          const gitProfiles = gitProfilesFor(projectId);
-          const profile = gitProfiles.get(profileName);
-          identity = profile ? gitProfiles.identity(profile, { taskId: handle.id }) : undefined;
+          const binding = gitBindingFromHandle(handle, handle.id);
+          identity = binding.profile ? binding.profiles.identity(binding.profile, { taskId: handle.id }) : undefined;
         } catch {
           identity = undefined; // fall back to ensureIdentity inside finalizeMerge
         }

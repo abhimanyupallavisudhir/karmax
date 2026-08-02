@@ -86,14 +86,6 @@ const multiPrField = (): FieldSpec => ({
   scopes: ALL,
   bind: 'project',
 });
-const gitProfileField = (): FieldSpec => ({
-  name: 'gitProfile',
-  type: 'string',
-  label: 'Git profile',
-  help: 'Named git identity/credentials (Organization settings → Git accounts) this project commits, signs and pushes as. Empty ⇒ the organization default, else the host’s own git setup.',
-  scopes: ['project', 'global'],
-  bind: 'project',
-});
 // "Agent environment" (SPEC §11) — the world backend a task's agent runs in: a
 // local git worktree/container or a remote sandbox (E2B/Daytona). Canonical
 // storage remains the execution policy (ProjectConfig.worldProvider / the
@@ -411,7 +403,6 @@ export const MANIFESTS: WorkflowManifest[] = [
       multiPrField(),
       copyGlobsField(),
       remoteField(),
-      gitProfileField(),
       agentField('merge', 'Merge agent', 'always'),
       ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
       confirmerField(),
@@ -482,7 +473,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
     roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), gitProfileField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), confirmerField()],
   },
   {
     name: 'merge-only',

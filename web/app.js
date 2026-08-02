@@ -1989,6 +1989,11 @@ async function boot() {
     throw e;
   }
   if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
+  // Account creation marks exactly one session response for Git onboarding. Do
+  // this after organizations load so the profile URL has its canonical org slug,
+  // and only replace the neutral home route (never an invitation/deep link).
+  if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
+    history.replaceState({ kx: 1 }, '', globalRoute('profile'));
   await loadCollaboration().catch(() => {});
   const projectScope = S.projectId
     ? `?projectId=${encodeURIComponent(S.projectId)}`
@@ -8663,7 +8668,7 @@ function settingsView(proj) {
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
-    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
+    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${globalRoute('profile')}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
     <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files krmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
@@ -8706,23 +8711,6 @@ function paneError(box, error, retry) {
   box.querySelector('button').addEventListener('click', retry);
 }
 
-async function hydrateProjectGitProfile(proj) {
-  const box = $('#project-git-profile'); if (!box) return;
-  try {
-    const [profiles, defaults] = await Promise.all([
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-profiles`),
-      api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`).catch(() => ({})),
-    ]);
-    box.innerHTML = `<div class="inline-form"><label>Git profile <select id="project-git-profile-select"><option value="">Organization default${profiles.defaultProfile ? ` — ${esc(profiles.defaultProfile)}` : ''}</option>${profiles.profiles.map((profile) => `<option value="${esc(profile.name)}" ${defaults.gitProfile === profile.name ? 'selected' : ''}>${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}</select></label><button class="btn sm" id="project-git-profile-save">Save</button></div>`;
-    $('#project-git-profile-save').addEventListener('click', async () => {
-      const current = await api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`).catch(() => ({}));
-      const selected = $('#project-git-profile-select').value;
-      if (selected) current.gitProfile = selected; else delete current.gitProfile;
-      await api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`, { method: 'PUT', body: JSON.stringify({ values: current }) });
-      toast('Git profile saved');
-    });
-  } catch (error) { paneError(box, error, () => hydrateProjectGitProfile(proj)); }
-}
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
@@ -9182,7 +9170,6 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
-  hydrateProjectGitProfile(proj);
   hydrateProjectSecrets(proj);
   hydrateProjectData(proj);
   hydrateProjectServices(proj);
@@ -9209,20 +9196,6 @@ function wireSettingsView(proj) {
     }),
   );
   wirePaymentsCard('project', proj.id, proj.organizationId);
-  $('#git-preflight-run')?.addEventListener('click', async () => {
-    const out = $('#git-preflight-result');
-    const btn = $('#git-preflight-run');
-    btn.disabled = true;
-    out.innerHTML = 'Checking identity, credentials and remote reachability…';
-    try {
-      const r = await api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
-      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : r.tier === 'host' ? 'host fallback (personal organization)' : 'not configured — isolated from host Git accounts'}</b></div>` +
-        r.checks.map((c) => `<div>${c.ok ? '🟢' : '🔴'} <b>${esc(c.label)}</b> — ${esc(c.detail || (c.ok ? 'ok' : 'failed'))}</div>`).join('');
-    } catch (e) {
-      out.textContent = e.message;
-      out.style.color = 'var(--bad, crimson)';
-    } finally { btn.disabled = false; }
-  });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -9399,8 +9372,8 @@ function globalSettingsView(embedded = false) {
       </div>
     </div>
     <div class="card" id="git-accounts-card">
-      <div class="section-h">Git accounts <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named commit identities and SSH credentials for repository work. Secrets go straight to the encrypted vault and are injected only into the git subprocess that needs them.</p>
+      <div class="section-h">Organization Git service <span class="chip">organization resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Used by organization-owned automation and repository services when no human owns the work. Development commits and pull requests use each task creator’s personal Git identity instead.</p>
       <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Add / update a profile</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -9696,23 +9669,29 @@ async function hydrateGitProfiles(organizationId = S.organizationId) {
   }
   if (!renderIsCurrent()) return;
   if (!data.profiles.length) {
-    // Worlds inherit the host's git config through git's own cascade
-    // (ensureIdentity only fills blanks), which is true of a worktree world on
-    // the operator's machine and false on a managed cell: there the world is a
-    // remote sandbox with no ~/.gitconfig to inherit, and no single "host" whose
-    // identity a tenant would want anyway.
-    box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
-      S.meta?.hosted
-        ? 'add one to give this organization’s commits an identity.'
-        : organizationId === 'org_personal'
-          ? 'personal projects use the host’s own Git setup.'
-          : 'projects remain isolated from the host’s Git identity and credentials.'
-    }</span>`;
+    let personal = { profiles: [], defaultProfile: null };
+    try { personal = await api('/api/user/git-profiles'); } catch {}
+    if (!renderIsCurrent()) return;
+    const mine = personal.profiles.find((profile) => profile.name === personal.defaultProfile);
+    box.innerHTML = `<div class="git-empty-state"><span>No organization Git service is configured. Human-owned development already uses each creator’s personal identity.</span>${data.canManage && mine
+      ? `<button class="btn sm primary" id="gitp-reuse-user">Use my Git credentials</button><small>This links ${esc(mine.userName)} &lt;${esc(mine.userEmail)}&gt;; secrets are not copied.</small>`
+      : data.canManage
+        ? `<a class="btn sm" data-spa href="${globalRoute('profile')}">Set up my Git identity first</a>`
+        : ''}</div>`;
+    $('#gitp-reuse-user')?.addEventListener('click', async (event) => {
+      event.currentTarget.disabled = true;
+      try {
+        await api(`${base}/reuse-user`, { method: 'POST', body: '{}' });
+        toast('Organization Git now uses your linked credentials');
+        hydrateGitProfiles(organizationId);
+      } catch (error) { toast(error.message, true); event.currentTarget.disabled = false; }
+    });
     return;
   }
   box.innerHTML = data.profiles.map((p) => `<div class="queue-item" data-gitp="${esc(p.name)}">
       <div style="flex:1"><b>${esc(p.name)}</b>
         ${data.defaultProfile === p.name ? '<span class="chip">default</span>' : `<button class="btn sm" data-gitp-default="${esc(p.name)}">make default</button>`}
+        ${p.source?.kind === 'user' ? '<span class="chip">linked user profile</span>' : ''}
         <span class="task-sub" style="color:var(--ink-3)">${esc(p.userName)} &lt;${esc(p.userEmail)}&gt;</span>
         <div class="task-sub" style="color:var(--ink-3)">${[p.sshKey ? 'ssh key' : null, p.signingKey ? 'signing key' : null, p.githubToken ? 'github token' : null].filter(Boolean).join(' · ') || 'identity only'}</div>
       </div>
@@ -11349,6 +11328,72 @@ function userDisplayName() {
   return 'Account';
 }
 
+function personalGitProfilesCard(apiPath) {
+  const u = S.user && typeof S.user === 'object' ? S.user : {};
+  return `<div class="card personal-git-card" id="personal-git-card" data-api="${esc(apiPath)}">
+    <div class="section-h">Development Git identity <span class="chip">yours</span></div>
+    <p class="task-sub">Every task you create commits and opens pull requests as you, even inside an organization. Keys and tokens are encrypted and injected only into Git or GitHub operations.</p>
+    <div class="git-byline-preview" id="user-git-preview" aria-live="polite">
+      <span class="git-byline-mark" aria-hidden="true">●</span>
+      <span><small>Future commits by</small><b>Not configured</b><code>Add an identity below</code></span>
+    </div>
+    <div id="user-git-profiles" class="personal-git-list">Loading…</div>
+    <details class="settings-disclosure compact personal-git-editor" id="user-git-editor" open>
+      <summary><b>Add or update an identity</b><span>Git byline plus optional GitHub access</span></summary>
+      <div class="personal-git-fields">
+        <label class="form-row"><span>Profile name</span><input id="user-git-name" value="main" placeholder="main"></label>
+        <label class="form-row"><span>Commit name</span><input id="user-git-username" value="${esc(u.name || '')}" placeholder="Your name"></label>
+        <label class="form-row"><span>Commit email</span><input id="user-git-email" type="email" value="${esc(u.email || '')}" placeholder="you@example.com"></label>
+        <label class="form-row wide"><span>GitHub personal access token <small>(optional)</small></span><input id="user-git-token" type="password" autocomplete="new-password" placeholder="For pushes and pull requests"></label>
+        <label class="form-row wide"><span>SSH private key <small>(optional)</small></span><textarea id="user-git-ssh" rows="2" placeholder="For SSH fetch and push"></textarea></label>
+        <label class="form-row wide"><span>SSH signing key <small>(optional)</small></span><textarea id="user-git-signing" rows="2" placeholder="For signed commits"></textarea></label>
+      </div>
+      <div class="profile-edit-actions"><button class="btn primary" id="user-git-save" type="button">Save Git identity</button><span class="task-sub" id="user-git-result"></span></div>
+    </details>
+  </div>`;
+}
+
+async function hydrateUserGitProfiles() {
+  const box = $('#user-git-profiles');
+  const preview = $('#user-git-preview');
+  if (!box || !preview) return;
+  const renderIsCurrent = beginAsyncElementRender(box);
+  let data;
+  try { data = await api('/api/user/git-profiles'); }
+  catch (error) { if (renderIsCurrent()) box.textContent = error.message; return; }
+  if (!renderIsCurrent()) return;
+  const selected = data.profiles.find((profile) => profile.name === data.defaultProfile);
+  preview.innerHTML = selected
+    ? `<span class="git-byline-mark ready" aria-hidden="true">●</span><span><small>Future commits by</small><b>${esc(selected.userName)}</b><code>&lt;${esc(selected.userEmail)}&gt;</code></span>`
+    : '<span class="git-byline-mark" aria-hidden="true">●</span><span><small>Future commits by</small><b>Not configured</b><code>Add an identity below</code></span>';
+  box.innerHTML = data.profiles.length ? data.profiles.map((profile) => `<div class="queue-item">
+    <div class="personal-git-profile"><b>${esc(profile.name)}</b>${data.defaultProfile === profile.name ? '<span class="chip">active</span>' : `<button class="btn sm" data-user-git-default="${esc(profile.name)}">Use for my tasks</button>`}
+      <span class="task-sub">${esc(profile.userName)} &lt;${esc(profile.userEmail)}&gt;</span>
+      <small>${[profile.githubToken ? 'GitHub token' : null, profile.sshKey ? 'SSH auth' : null, profile.signingKey ? 'signed commits' : null].filter(Boolean).join(' · ') || 'commit identity only'}</small></div>
+    <button class="btn sm danger" data-user-git-delete="${esc(profile.name)}">Delete</button></div>`).join('')
+    : '<p class="git-onboarding-note">Add your identity before creating development tasks. Until then, commits use a neutral krmax byline and cannot use your GitHub account.</p>';
+  box.querySelectorAll('[data-user-git-default]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      await api('/api/user/git-profiles/default', { method: 'POST', body: JSON.stringify({ name: button.dataset.userGitDefault }) });
+      hydrateUserGitProfiles();
+    } catch (error) { toast(error.message, true); }
+  }));
+  box.querySelectorAll('[data-user-git-delete]').forEach((button) => button.addEventListener('click', async () => {
+    if (!confirm(`Delete your Git identity “${button.dataset.userGitDelete}” and its stored secrets?`)) return;
+    try {
+      await api(`/api/user/git-profiles/${encodeURIComponent(button.dataset.userGitDelete)}`, { method: 'DELETE' });
+      hydrateUserGitProfiles();
+    } catch (error) { toast(error.message, true); }
+  }));
+  // Updating the active profile should start from its public identity; secrets
+  // stay blank because they are write-only and a blank preserves the stored value.
+  if (selected) {
+    $('#user-git-name').value = selected.name;
+    $('#user-git-username').value = selected.userName;
+    $('#user-git-email').value = selected.userEmail;
+  }
+}
+
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileView() {
@@ -11452,6 +11497,7 @@ function profileView() {
         </div>` : ''}
       </div>
     </div>
+    ${personalGitProfilesCard('/api/user/git-profiles')}
     <div class="card">
       <div class="section-h">Organizations</div>
       <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
@@ -11537,6 +11583,7 @@ function wireNotificationsCard() {
 
 function wireProfileView() {
   wireNotificationsCard();
+  hydrateUserGitProfiles();
   const setProfileEditor = (kind) => {
     document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
       panel.hidden = panel.id !== `profile-${kind}-panel`;
@@ -11633,6 +11680,27 @@ function wireProfileView() {
     }
   });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#user-git-save')?.addEventListener('click', async () => {
+    const button = $('#user-git-save');
+    const name = $('#user-git-name').value.trim();
+    const userName = $('#user-git-username').value.trim();
+    const userEmail = $('#user-git-email').value.trim();
+    if (!name || !userName || !userEmail) return toast('Profile name, commit name, and commit email are required.', true);
+    button.disabled = true;
+    try {
+      await api('/api/user/git-profiles', { method: 'POST', body: JSON.stringify({
+        name, userName, userEmail, default: true,
+        githubToken: $('#user-git-token').value.trim() || undefined,
+        sshKey: $('#user-git-ssh').value.trim() || undefined,
+        signingKey: $('#user-git-signing').value.trim() || undefined,
+      }) });
+      for (const selector of ['#user-git-token', '#user-git-ssh', '#user-git-signing']) $(selector).value = '';
+      $('#user-git-result').textContent = 'Saved. Future tasks use this identity.';
+      $('#user-git-editor').open = false;
+      await hydrateUserGitProfiles();
+    } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
+  });
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
     if (S.taskTab === 'checkin') renderTaskPage();
@@ -11737,7 +11805,7 @@ function organizationView() {
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
     ${outboundEmailCard()}
 
-    <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>The GitHub connection and commit identities your projects share</small></div></div>
+    <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>Repository access and organization-owned automation</small></div></div>
     <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
 
     <div class="settings-section-title" id="settings-compute"><div>Compute<small>Where tasks run, how large each world is, and the monthly ceiling</small></div></div>

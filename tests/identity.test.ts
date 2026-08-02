@@ -24,6 +24,7 @@ describe('Better Auth identity boundary', () => {
       signupEntersApp: true,
       signupHasPersonalWorkspace: true,
       signupDashboardOk: true,
+      signupGitOnboardingOnce: true,
       signupAccountVisible: true,
       loggedOut: true,
     });
