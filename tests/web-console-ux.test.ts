@@ -77,6 +77,14 @@ describe('profile account controls', () => {
     expect(app).toContain('id="profile-confirm-password"');
     expect(app).toContain("fetch('/api/auth/change-password'");
   });
+
+  it('does not expose delivery settings before external channels are implemented', () => {
+    const notifications = app.slice(app.indexOf('function notificationsCard()'), app.indexOf('function wireNotificationsCard()'));
+    expect(notifications).not.toContain('>Delivery<');
+    expect(notifications).not.toContain('data-delivery=');
+    expect(notifications).not.toContain('Outcome updates for tasks I follow');
+    expect(app).not.toContain("$('#save-delivery')");
+  });
 });
 
 describe('animations', () => {
@@ -104,7 +112,6 @@ describe('forms report their failures', () => {
     "$('#environment-save')?.addEventListener",
     "$('#main').querySelectorAll('[data-inbox-toggle]')",
     "$('#inbox-read-all')?.addEventListener",
-    "$('#save-delivery')?.addEventListener",
   ];
   for (const anchor of anchors) {
     it(`${anchor} surfaces the error`, () => {
