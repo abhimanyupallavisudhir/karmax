@@ -16,6 +16,8 @@ describe('personal Git development settings', () => {
     expect(profile).not.toContain('/api/organizations/${encodeURIComponent');
     expect(source).toContain('Development Git identity');
     expect(source).toContain('git-byline-preview');
+    expect(source).toContain('user-github-connection');
+    expect(source).toContain('manual keys and tokens are compatibility fallbacks');
   });
 
   it('offers an authorized organization owner a one-click link only while organization Git is empty', () => {

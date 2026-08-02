@@ -32,6 +32,7 @@ import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
+import { materializeGitCredential } from '../world/git-credential.js';
 import { GithubPrApi, githubSlug, type GithubPrApiOptions } from '../integrations/github-pr.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
@@ -50,7 +51,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole, type TaskPullRequest } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole, type Repository, type TaskPullRequest } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -422,12 +423,68 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
   }
 
-  /**
-   * The GitHub API token PR operations on `slug` run as, in the order karmax
-   * trusts credentials: the human creator's GitHub identity first (so PRs and
-   * pushes are attributed to the contributor), then the project's App installation
-   * for repository service work, then legacy host fallback.
-   */
+  /** The project-enrolled GitHub repository behind a PR slug. Enrollment is the
+   * authority boundary: a user's OAuth grant must not turn an arbitrary origin
+   * mentioned by a task into an authorized repository. */
+  function enrolledGithubRepository(projectId: string | undefined, slug: string): Repository | undefined {
+    if (!projectId) return undefined;
+    const linked = store.listProjectRepositories(projectId).map((entry) => entry.repository);
+    const wiki = store.projectWiki(projectId)?.repository;
+    return [...linked, ...(wiki ? [wiki] : [])]
+      .find((candidate) => `${candidate.owner}/${candidate.name}`.toLowerCase() === slug.toLowerCase());
+  }
+
+  /** Resolve a local or remote checkout back to its enrolled repository. Local
+   * worktrees retain a filesystem source, so their configured origin supplies
+   * the network identity used for the lookup. */
+  async function enrolledRepositoryForCheckout(handle: WorldHandle, repo: ReturnType<typeof worldRepos>[number]): Promise<Repository | undefined> {
+    const projectId = typeof handle.meta?.projectId === 'string'
+      ? handle.meta.projectId
+      : store.getTask(handle.id)?.projectId;
+    if (!projectId) return undefined;
+    const linked = store.listProjectRepositories(projectId).map((entry) => entry.repository);
+    const wiki = store.projectWiki(projectId)?.repository;
+    const candidates = [...linked, ...(wiki ? [wiki] : [])];
+    for (const source of [worldRepoSource(repo), repo.repo, repo.source].filter((value): value is string => Boolean(value))) {
+      const found = candidates.find((candidate) => sameRepository(candidate.sshUrl, source));
+      if (found) return found;
+    }
+    if (!isRemote(handle.kind)) {
+      const origin = await hostGit(repo.root, ['config', '--get', 'remote.origin.url']);
+      if (origin.code === 0) {
+        const found = candidates.find((candidate) => sameRepository(candidate.sshUrl, origin.stdout.trim()));
+        if (found) return found;
+      }
+    }
+    return undefined;
+  }
+
+  /** Run one trusted host-side Git operation with the enrolled repository's
+   * short-lived installation credential. The caller's profile/host env remains
+   * the compatibility path for sources outside the App catalog. */
+  async function hostGitWithRepositoryCredential(
+    repository: Repository | undefined,
+    cwd: string,
+    args: string[],
+    fallbackEnv: Record<string, string>,
+  ) {
+    if (!repository?.gitConnectionId || !deps.githubApp) return hostGit(cwd, args, { env: fallbackEnv });
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-auth-'));
+    try {
+      const credential = await deps.githubApp.brokerCredentials(repository);
+      const materialized = materializeGitCredential(directory, {
+        ...credential,
+        env: { ...isolatedGitEnvironment(), ...(credential.env ?? {}) },
+      });
+      return await hostGit(cwd, args, { env: materialized.env });
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
+  /** Static-token compatibility for PR operations. Human work first resolves
+   * its refreshable App user authorization in prApiFor(); this fallback retains
+   * manually managed profiles, organization automation, and legacy host login. */
   async function githubTokenFor(handle: WorldHandle, slug: string): Promise<string | undefined> {
     const projectId = typeof handle.meta?.projectId === 'string'
       ? handle.meta.projectId
@@ -435,14 +492,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const env = gitEnvFor(handle, handle.id);
     if (env.GH_TOKEN) return env.GH_TOKEN;
     // A human task must never silently open its PR as the organization App.
-    // Repository provisioning may use the App's scoped read token, but authorship
-    // is the contributor's user configuration or an actionable setup failure.
+    // Transport may use the installation, but authorship is the person's App
+    // authorization (handled above), a manual profile fallback, or a setup error.
     if (gitBindingFromHandle(handle, handle.id).scope.startsWith('user:')) return undefined;
     if (projectId && deps.githubApp) {
-      const enrolled = store.listProjectRepositories(projectId).map((entry) => entry.repository);
-      const wiki = store.projectWiki(projectId)?.repository;
-      const repository = [...enrolled, ...(wiki ? [wiki] : [])]
-        .find((candidate) => `${candidate.owner}/${candidate.name}`.toLowerCase() === slug.toLowerCase());
+      const repository = enrolledGithubRepository(projectId, slug);
       const connection = repository?.gitConnectionId ? store.getGitConnection(repository.gitConnectionId) : undefined;
       if (connection) return await deps.githubApp.installationToken(connection);
     }
@@ -457,9 +511,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function prApiFor(handle: WorldHandle, slug: string): Promise<GithubPrApi> {
+    const projectId = typeof handle.meta?.projectId === 'string'
+      ? handle.meta.projectId
+      : store.getTask(handle.id)?.projectId;
+    const userId = store.taskCreatorUserId(handle.id);
+    const repository = enrolledGithubRepository(projectId, slug);
+    // Connected development uses the SAME deployment App in two distinct
+    // capacities: its installation owns repository transport, while this
+    // per-user OAuth grant makes the PR attributable to the task creator.
+    if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).userAuthorized) {
+      return new GithubPrApi(
+        (options) => deps.githubApp!.userAccessToken(userId, options),
+        deps.githubPr ?? {},
+      );
+    }
     const token = await githubTokenFor(handle, slug);
     if (!token) {
-      throw new Error(`no personal GitHub credential can act on ${slug} — add a GitHub token to your Development Git identity on your user page`);
+      if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).oauthConfigured) {
+        throw new Error(`your GitHub identity is not connected for ${slug} — connect GitHub on your user page, then retry`);
+      }
+      throw new Error(`no personal GitHub credential can act on ${slug} — connect GitHub on your user page, or add a fallback token to your Development Git identity`);
     }
     return new GithubPrApi(token, deps.githubPr ?? {});
   }
@@ -497,8 +568,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const skipped: string[] = [];
     const errors: Record<string, string> = {};
     for (const repo of repos) {
-      const push = await world.exec('git', ['push', '-u', 'origin', repo.branch],
-        { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
+      const repository = await enrolledRepositoryForCheckout(handle, repo);
+      // GitHub App installation tokens are short-lived HTTPS credentials. Use
+      // them from the trusted host even for a local/container worktree, so a
+      // connected repository never needs the person's SSH private key or PAT.
+      const push = repository?.gitConnectionId && deps.githubApp
+        ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', '-u', 'origin', repo.branch], env)
+        : await world.exec('git', ['push', '-u', 'origin', repo.branch],
+          { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
       if (push.code === 0) pushed.push(repo.name);
       else {
         skipped.push(repo.name);
@@ -2115,7 +2192,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // retarget so we push the branch the merge actually landed on, matching
           // the origin-authoritative branch below.
           const repoTarget = r.targetPinned === false ? target : (r.target ?? target);
-          const push = await hostGit(r.localPath, ['push', 'origin', repoTarget], { env });
+          const repository = await enrolledRepositoryForCheckout(handle, r);
+          const push = await hostGitWithRepositoryCredential(repository, r.localPath,
+            ['push', 'origin', repoTarget], env);
           if (push.code === 0) {
             pushed.push(r.name);
             record(handle.id, 'push.done', { repo: r.name, target: repoTarget });
@@ -2128,13 +2207,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       for (const r of worldRepos(handle)) {
         const repoTarget = r.targetPinned === false ? target : (r.target ?? target);
-        const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
+        const repository = await enrolledRepositoryForCheckout(handle, r);
+        const appConnected = Boolean(repository?.gitConnectionId && deps.githubApp);
+        const hasOrigin = appConnected
+          ? await hostGit(r.repo, ['remote', 'get-url', 'origin'], { env })
+          : await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
         if (hasOrigin.code !== 0) {
           skipped.push(r.name);
           record(handle.id, 'push.skipped', { repo: r.name, reason: 'no origin remote' });
           continue;
         }
-        const push = await world.exec('git', ['push', 'origin', repoTarget], { cwd: r.repo, env });
+        const push = appConnected
+          ? await hostGitWithRepositoryCredential(repository, r.repo, ['push', 'origin', repoTarget], env)
+          : await world.exec('git', ['push', 'origin', repoTarget], { cwd: r.repo, env });
         if (push.code === 0) {
           pushed.push(r.name);
           record(handle.id, 'push.done', { repo: r.name, target });

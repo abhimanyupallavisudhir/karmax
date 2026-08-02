@@ -143,7 +143,7 @@ function organizationById(id) { return (S.organizations || []).find((o) => o.id 
 // grant is idempotent, so there is no cost to keeping the affordance visible.
 function githubAuthorizeButton(githubApp, id) {
   if (!githubApp?.oauthConfigured) return '';
-  const label = githubApp.userAuthorized ? 'Re-authorize GitHub' : 'Authorize repository creation';
+  const label = githubApp.userAuthorized ? 'Reconnect my GitHub identity' : 'Connect my GitHub identity';
   return `<button class="btn sm" id="${id}">${label}</button>`;
 }
 function organizationBySlug(slug) {
@@ -11332,20 +11332,21 @@ function personalGitProfilesCard(apiPath) {
   const u = S.user && typeof S.user === 'object' ? S.user : {};
   return `<div class="card personal-git-card" id="personal-git-card" data-api="${esc(apiPath)}">
     <div class="section-h">Development Git identity <span class="chip">yours</span></div>
-    <p class="task-sub">Every task you create commits and opens pull requests as you, even inside an organization. Keys and tokens are encrypted and injected only into Git or GitHub operations.</p>
+    <p class="task-sub">Every task you create commits and opens pull requests as you, even inside an organization. Connect GitHub once for pull requests and repository access; manual keys and tokens are compatibility fallbacks.</p>
+    <div id="user-github-connection" class="git-onboarding-note">Loading GitHub connection…</div>
     <div class="git-byline-preview" id="user-git-preview" aria-live="polite">
       <span class="git-byline-mark" aria-hidden="true">●</span>
       <span><small>Future commits by</small><b>Not configured</b><code>Add an identity below</code></span>
     </div>
     <div id="user-git-profiles" class="personal-git-list">Loading…</div>
     <details class="settings-disclosure compact personal-git-editor" id="user-git-editor" open>
-      <summary><b>Add or update an identity</b><span>Git byline plus optional GitHub access</span></summary>
+      <summary><b>Add or update an identity</b><span>Git byline plus optional fallback credentials</span></summary>
       <div class="personal-git-fields">
         <label class="form-row"><span>Profile name</span><input id="user-git-name" value="main" placeholder="main"></label>
         <label class="form-row"><span>Commit name</span><input id="user-git-username" value="${esc(u.name || '')}" placeholder="Your name"></label>
         <label class="form-row"><span>Commit email</span><input id="user-git-email" type="email" value="${esc(u.email || '')}" placeholder="you@example.com"></label>
-        <label class="form-row wide"><span>GitHub personal access token <small>(optional)</small></span><input id="user-git-token" type="password" autocomplete="new-password" placeholder="For pushes and pull requests"></label>
-        <label class="form-row wide"><span>SSH private key <small>(optional)</small></span><textarea id="user-git-ssh" rows="2" placeholder="For SSH fetch and push"></textarea></label>
+        <label class="form-row wide"><span>GitHub personal access token <small>(fallback)</small></span><input id="user-git-token" type="password" autocomplete="new-password" placeholder="Only for repositories not connected through the GitHub App"></label>
+        <label class="form-row wide"><span>SSH private key <small>(fallback)</small></span><textarea id="user-git-ssh" rows="2" placeholder="Only for non-App Git remotes"></textarea></label>
         <label class="form-row wide"><span>SSH signing key <small>(optional)</small></span><textarea id="user-git-signing" rows="2" placeholder="For signed commits"></textarea></label>
       </div>
       <div class="profile-edit-actions"><button class="btn primary" id="user-git-save" type="button">Save Git identity</button><span class="task-sub" id="user-git-result"></span></div>
@@ -11356,12 +11357,29 @@ function personalGitProfilesCard(apiPath) {
 async function hydrateUserGitProfiles() {
   const box = $('#user-git-profiles');
   const preview = $('#user-git-preview');
+  const githubBox = $('#user-github-connection');
   if (!box || !preview) return;
   const renderIsCurrent = beginAsyncElementRender(box);
   let data;
   try { data = await api('/api/user/git-profiles'); }
   catch (error) { if (renderIsCurrent()) box.textContent = error.message; return; }
   if (!renderIsCurrent()) return;
+  if (githubBox) {
+    const github = data.githubApp;
+    githubBox.innerHTML = github?.userAuthorized
+      ? `<span class="chip">GitHub connected</span> Pull requests use your refreshable GitHub authorization; connected repositories use short-lived App credentials. ${githubAuthorizeButton(github, 'user-authorize-github')}`
+      : github?.oauthConfigured
+        ? `Connect your GitHub identity to open pull requests as you without pasting a token. ${githubAuthorizeButton(github, 'user-authorize-github')}`
+        : 'This deployment has no GitHub App user authorization configured. Manual fallback credentials remain available below.';
+    $('#user-authorize-github')?.addEventListener('click', async () => {
+      const organizationId = S.organizationId || currentOrg()?.id;
+      if (!organizationId) return toast('Choose an organization before connecting GitHub.', true);
+      try {
+        const result = await api(`/api/organizations/${organizationId}/github/authorize`, { method: 'POST', body: '{}' });
+        location.assign(result.url);
+      } catch (error) { toast(error.message, true); }
+    });
+  }
   const selected = data.profiles.find((profile) => profile.name === data.defaultProfile);
   preview.innerHTML = selected
     ? `<span class="git-byline-mark ready" aria-hidden="true">●</span><span><small>Future commits by</small><b>${esc(selected.userName)}</b><code>&lt;${esc(selected.userEmail)}&gt;</code></span>`

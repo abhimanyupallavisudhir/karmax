@@ -3,10 +3,13 @@
  * (SPEC §5.2, PLAN-git-config.md §5 `remote: 'pr'`).
  *
  * Everything here speaks the REST API with a bearer token, deliberately *not*
- * the `gh` CLI: the token is already resolvable (App installation → git profile
- * → host), and the API is the same call from a worktree world, a cloud world,
+ * the `gh` CLI: the token is already resolvable (user App authorization for
+ * human work; installation/profile/host fallback for automation/compatibility),
+ * and the API is the same call from a worktree world, a cloud world,
  * or the host — so PR behavior no longer depends on a binary being installed in
- * whatever environment happens to run the activity.
+ * whatever environment happens to run the activity. Human work supplies a
+ * refreshable GitHub App user token; installation/static tokens remain valid
+ * for automation and compatibility callers.
  */
 
 export interface GithubPullRequest {
@@ -23,6 +26,11 @@ export interface GithubPrApiOptions {
   apiBase?: string;
   fetch?: typeof fetch;
 }
+
+/** A refreshable GitHub App user authorization. A forced resolution follows a
+ * 401, which is safe to retry because GitHub rejected the request before
+ * executing it. Static PAT/App-token callers retain the string form. */
+export type GithubTokenProvider = (options?: { forceRefresh?: boolean }) => Promise<string>;
 
 /** `owner/name` for a GitHub remote (ssh, https, or `git@`), else undefined. */
 export function githubSlug(remote: string): string | undefined {
@@ -52,7 +60,7 @@ export class GithubPrApi {
   private fetcher: typeof fetch;
   private apiBase: string;
 
-  constructor(private token: string, options: GithubPrApiOptions = {}) {
+  constructor(private token: string | GithubTokenProvider, options: GithubPrApiOptions = {}) {
     this.fetcher = options.fetch ?? fetch;
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
   }
@@ -111,11 +119,18 @@ export class GithubPrApi {
   }
 
   private async request<T = any>(pathname: string, init: RequestInit = {}): Promise<T> {
-    const response = await this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
-      accept: 'application/vnd.github+json', authorization: `Bearer ${this.token}`,
-      'x-github-api-version': '2022-11-28', 'content-type': 'application/json',
-      'user-agent': 'karmax', ...(init.headers ?? {}),
-    } });
+    const send = async (forceRefresh = false) => {
+      const token = typeof this.token === 'function'
+        ? await this.token(forceRefresh ? { forceRefresh: true } : undefined)
+        : this.token;
+      return this.fetcher(`${this.apiBase}${pathname}`, { ...init, headers: {
+        accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
+        'x-github-api-version': '2022-11-28', 'content-type': 'application/json',
+        'user-agent': 'karmax', ...(init.headers ?? {}),
+      } });
+    };
+    let response = await send();
+    if (response.status === 401 && typeof this.token === 'function') response = await send(true);
     if (!response.ok) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
     if (response.status === 204) return undefined as T;
     return await response.json() as T;

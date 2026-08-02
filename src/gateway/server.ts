@@ -4160,7 +4160,12 @@ export class Gateway {
         const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
         const canManage = userGitResource ? true
           : this.deps.tokens.check(token, 'credential:write', { organizationId: resourceOrganizationId }).ok;
-        return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null, canManage });
+        return this.json(res, 200, {
+          profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null, canManage,
+          ...(userGitResource && session.userId && this.deps.githubApp
+            ? { githubApp: this.deps.githubApp.status(session.userId) }
+            : {}),
+        });
       }
       if (gitResourcePath === '/api/git-profiles' && method === 'POST') {
         const b = await this.body(req);

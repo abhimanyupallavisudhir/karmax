@@ -27,13 +27,13 @@ describe('GitHub re-authorization affordance', () => {
   it('offers re-authorization even while a stored credential still looks authorized', () => {
     const markup = githubAuthorizeButton({ oauthConfigured: true, userAuthorized: true }, 'authorize-github');
     expect(markup).toContain('id="authorize-github"');
-    expect(markup).toMatch(/re-authorize/i);
+    expect(markup).toMatch(/reconnect/i);
   });
 
   it('asks for first-time authorization when no credential is stored', () => {
     const markup = githubAuthorizeButton({ oauthConfigured: true, userAuthorized: false }, 'authorize-github');
     expect(markup).toContain('id="authorize-github"');
-    expect(markup).toContain('Authorize repository creation');
+    expect(markup).toContain('Connect my GitHub identity');
   });
 
   it('stays hidden when the App has no OAuth credentials to authorize against', () => {
@@ -46,6 +46,7 @@ describe('GitHub re-authorization affordance', () => {
     // share one helper, so the escape hatch cannot regress in only one of them.
     expect(source).toContain("githubAuthorizeButton(githubApp, 'authorize-github')");
     expect(source).toContain("githubAuthorizeButton(githubApp, 'project-authorize-github')");
+    expect(source).toContain("githubAuthorizeButton(github, 'user-authorize-github')");
     expect(source).not.toContain('githubApp.oauthConfigured && !githubApp.userAuthorized');
   });
 });

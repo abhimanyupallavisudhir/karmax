@@ -697,22 +697,22 @@ export class GitHubAppService {
     }));
   }
 
-  /** Resolve the operator's user token, refreshing when the recorded expiry is
-   * near. `forceRefresh` ignores that clock: it is the recovery path for a token
-   * GitHub invalidated *before* its recorded expiry (revocation, client-secret
-   * rotation, or a single-use refresh chain consumed by a concurrent instance).
-   * A dead credential is cleared so `status().userAuthorized` flips to false and
-   * the operator is told to reconnect, rather than 401ing against it forever. */
-  private async userToken(userId: string, opts: { forceRefresh?: boolean } = {}): Promise<string> {
+  /** Resolve the signed-in person's refreshable GitHub authorization for
+   * user-attributed work (repository creation, pull requests, comments). This
+   * is intentionally distinct from installationToken(): GitHub records actions
+   * made with this token as the person, not as the organization App.
+   * `forceRefresh` recovers from early invalidation; a dead refresh grant is
+   * cleared so status flips to disconnected instead of 401ing forever. */
+  async userAccessToken(userId: string, opts: { forceRefresh?: boolean } = {}): Promise<string> {
     const handle = githubUserTokenHandle(userId);
-    if (!this.broker.hasHandle(handle)) throw new Error('Authorize your GitHub account before creating repositories');
+    if (!this.broker.hasHandle(handle)) throw new Error('Connect your GitHub identity before acting on your behalf');
     const stored = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as {
       accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
     };
     if (!opts.forceRefresh && (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000)) return stored.accessToken;
     if (!stored.refreshToken || (stored.refreshExpiresAt && stored.refreshExpiresAt <= Date.now())) {
       this.broker.deleteHandle(handle);
-      throw new Error('GitHub authorization expired; reconnect GitHub from Organization settings');
+      throw new Error('GitHub authorization expired; reconnect your GitHub identity on your user page');
     }
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
     const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
@@ -724,7 +724,7 @@ export class GitHubAppService {
       // (HTTP 200) rather than a token. Clearing here forces a clean reconnect.
       this.broker.deleteHandle(handle);
       const reason = value.error_description || value.error;
-      throw new Error(`GitHub authorization expired; reconnect GitHub from Organization settings${reason ? ` (${reason})` : ''}`);
+      throw new Error(`GitHub authorization expired; reconnect your GitHub identity on your user page${reason ? ` (${reason})` : ''}`);
     }
     this.saveUserToken(userId, value);
     return String(value.access_token);
@@ -735,10 +735,10 @@ export class GitHubAppService {
    * still trusts (but GitHub has revoked) recovers instead of failing the caller. */
   private async userRequest<T = unknown>(userId: string, pathname: string, init: RequestInit = {}): Promise<T> {
     try {
-      return await this.request<T>(pathname, await this.userToken(userId), init);
+      return await this.request<T>(pathname, await this.userAccessToken(userId), init);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.includes('GitHub API 401')) throw error;
-      return await this.request<T>(pathname, await this.userToken(userId, { forceRefresh: true }), init);
+      return await this.request<T>(pathname, await this.userAccessToken(userId, { forceRefresh: true }), init);
     }
   }
 

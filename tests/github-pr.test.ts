@@ -35,12 +35,14 @@ function fakeGithub() {
   const prs: any[] = [];
   const comments: { number: number; body: string }[] = [];
   const calls: string[] = [];
+  const tokens: string[] = [];
   let next = 1;
   const fetcher = (async (url: string, init: RequestInit = {}) => {
     const u = new URL(String(url));
     const method = init.method ?? 'GET';
     const body = init.body ? JSON.parse(String(init.body)) : {};
     calls.push(`${method} ${u.pathname}${u.search}`);
+    tokens.push(new Headers(init.headers).get('authorization') ?? '');
     const json = (status: number, value: unknown) =>
       new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
     const list = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
@@ -73,7 +75,7 @@ function fakeGithub() {
     }
     return json(404, { message: `unrouted ${method} ${u.pathname}` });
   }) as unknown as typeof fetch;
-  return { fetcher, prs, comments, calls, options: { apiBase: 'https://api.github.test', fetch: fetcher } };
+  return { fetcher, prs, comments, calls, tokens, options: { apiBase: 'https://api.github.test', fetch: fetcher } };
 }
 
 /** A repo whose origin *reads* as GitHub but pushes to a local bare repo, so
@@ -95,7 +97,7 @@ async function repoWithGithubOrigin(name: string, slug = SLUG): Promise<string> 
   return repo;
 }
 
-async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } }) {
+async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } }, githubApp?: Record<string, unknown>) {
   const { Store } = await import('../src/store/db.js');
   const { WorldRegistry } = await import('../src/world/registry.js');
   const { ProfileResolver } = await import('../src/agent/profiles.js');
@@ -104,7 +106,9 @@ async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fet
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
   const core = makeCoreActivities({ store, worlds, adapters: new Map(),
-    profiles: new ProfileResolver(store, 'mock'), broker, githubPr: github.options });
+    profiles: new ProfileResolver(store, 'mock'), broker, githubPr: github.options,
+    contentDir: path.join(tmp, 'content'),
+    ...(githubApp ? { githubApp: githubApp as any } : {}) });
   return Object.assign(core, { store });
 }
 
@@ -164,6 +168,22 @@ describe('GitHub PR client', () => {
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Two');
     expect(gh.prs[0].body).toBe('second');
+  });
+
+  it('refreshes a GitHub App user token once when GitHub rejects it', async () => {
+    const forced: boolean[] = [];
+    const fetcher = (async (_url: string, init: RequestInit = {}) => {
+      const token = new Headers(init.headers).get('authorization');
+      if (token === 'Bearer dead') return new Response('bad credentials', { status: 401 });
+      return Response.json({ number: 7, html_url: 'https://github.test/acme/widgets/pull/7', state: 'open' });
+    }) as typeof fetch;
+    const api = new GithubPrApi(async (options) => {
+      forced.push(Boolean(options?.forceRefresh));
+      return options?.forceRefresh ? 'fresh' : 'dead';
+    }, { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.get(SLUG, 7)).resolves.toMatchObject({ number: 7, state: 'open' });
+    expect(forced).toEqual([false, true]);
   });
 
   it('reopens a PR that was closed without merging, but never reopens a merged one', async () => {
@@ -226,6 +246,57 @@ describe('PR stage (remote policy "pr")', () => {
     expect(again[0]!.number).toBe(1);
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Add a feature v2');
+    await core.destroyWorld(handle);
+  });
+
+  it('uses one connected GitHub account for user-attributed PRs and App-authenticated pushes', async () => {
+    const gh = fakeGithub();
+    const repo = await repoWithGithubOrigin('connected');
+    const userTokenCalls: Array<boolean | undefined> = [];
+    const transport: string[] = [];
+    const core = await coreFor(gh, {
+      status(userId: string) {
+        expect(userId).toBe('jane');
+        return { configured: true, oauthConfigured: true, userAuthorized: true };
+      },
+      async userAccessToken(userId: string, options?: { forceRefresh?: boolean }) {
+        expect(userId).toBe('jane');
+        userTokenCalls.push(options?.forceRefresh);
+        return 'connected-user-token';
+      },
+      async brokerCredentials(repository: { name: string }) {
+        transport.push(repository.name);
+        return { httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' } };
+      },
+      async repositoryCloneToken() { return 'clone-token'; },
+    });
+    core.store.claimPersonalOrganization('jane');
+    const project = core.store.createProject('Connected', { repos: [repo] });
+    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
+      gitConnectionId: connection.id });
+    core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = core.store.createTask({ projectId: project.id, title: 'Connected PR', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } });
+
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
+      base: 'main', target: 'main', kind: 'worktree' });
+    await fs.promises.writeFile(path.join(handle.workdir ?? handle.root, 'connected.txt'), 'x');
+    await git(handle.workdir ?? handle.root, ['add', '-A']);
+    await git(handle.workdir ?? handle.root, ['commit', '-q', '-m', 'connected work']);
+
+    await expect(core.openPr(handle, 'main', { title: 'Connected PR' })).resolves.toHaveLength(1);
+    expect(gh.tokens).toContain('Bearer connected-user-token');
+    expect(userTokenCalls).toContain(undefined);
+    expect(transport).toContain('widgets');
+    expect((await git(path.join(tmp, 'connected-origin.git'), ['rev-parse', '--verify', handle.branch])).code).toBe(0);
+    await expect(core.finalizeMergeActivity(handle, 'main')).resolves.toMatchObject({ merged: true });
+    const targetPush = await core.pushTarget(handle, 'main');
+    expect(targetPush.pushed).toContain('connected');
+    expect(transport.filter((name) => name === 'widgets')).toHaveLength(2);
+    expect((await git(path.join(tmp, 'connected-origin.git'), ['show', 'main:connected.txt'])).stdout).toBe('x');
     await core.destroyWorld(handle);
   });
 
