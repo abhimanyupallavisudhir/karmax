@@ -1039,6 +1039,34 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 /* login */
 .login-wrap { display: grid; place-items: center; height: 100vh; height: 100dvh; }
 .login-card { width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 28px; box-shadow: var(--shadow); }
+.google-signin-btn {
+  width: 100%; height: 40px; margin-top: 8px; padding: 0 12px;
+  display: grid; grid-template-columns: 20px 1fr 20px; align-items: center; column-gap: 10px;
+  border: 1px solid #747775; border-radius: 8px;
+  background: #fff; color: #1f1f1f; cursor: pointer;
+  font-family: "Google Sans", Roboto, Arial, sans-serif;
+  font-size: 14px; font-weight: 500; line-height: 20px; letter-spacing: .01px;
+}
+.google-signin-mark { display: block; width: 18px; height: 18px; }
+.google-signin-btn:hover { background: #f8faff; box-shadow: 0 1px 2px rgba(60, 64, 67, .18); }
+.google-signin-btn:active { background: #f0f4f9; box-shadow: none; }
+.google-signin-btn:focus-visible { outline: 2px solid #0b57d0; outline-offset: 2px; }
+html[data-theme="dark"] .google-signin-btn,
+:root.dark .google-signin-btn {
+  background: #131314; color: #e3e3e3; border-color: #8e918f;
+}
+html[data-theme="dark"] .google-signin-btn:hover,
+:root.dark .google-signin-btn:hover { background: #1f1f20; }
+html[data-theme="dark"] .google-signin-btn:active,
+:root.dark .google-signin-btn:active { background: #2a2a2b; }
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) .google-signin-btn {
+    background: #131314; color: #e3e3e3; border-color: #8e918f;
+  }
+  html:not([data-theme="light"]) .google-signin-btn:hover { background: #1f1f20; }
+  html:not([data-theme="light"]) .google-signin-btn:active { background: #2a2a2b; }
+}
 
 /* Authorization profiles: the finite capability surface is a discoverable
    checklist. Dynamic resource scopes remain tucked under one expert control. */
