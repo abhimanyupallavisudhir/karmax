@@ -188,6 +188,39 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(merge.messages.filter((message: any) => message.role === 'user')).toHaveLength(1); // no duplicate initial Merge turn
   }, 120_000);
 
+  /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its
+   *  recorded workflow must remain replay-compatible, but a newly fixed activity
+   *  can let its empty PR stage be a no-op; the historical Merge stage then does
+   *  exactly what it always did: commit the dirty result and land it safely. */
+  it('lets a pinned 1.10 workflow with uncommitted work continue past its empty PR stage', async () => {
+    const repo = await repoWithOrigin('pinned-1-10');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.10.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        taskId,
+        projectId: 'p1',
+        title: 'Historical dirty branch',
+        prompt: '@write historical.md :: preserved by Merge\n@review Added historical.md',
+        base: 'main',
+        target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+
+    expect(prs).toHaveLength(0); // this historical pin cannot add a post-Merge PR command
+    const origin = path.join(originDir, 'pinned-1-10.git');
+    expect((await git(origin, ['show', 'main:historical.md'])).stdout).toContain('preserved by Merge');
+    const final = await view(handle);
+    const merge = final.transcripts.find((transcript: any) => transcript.role === 'merge');
+    expect(merge.messages.map((message: any) => message.text).join('\n')).toMatch(/commit any work that should land/i);
+  }, 120_000);
+
   it('pushes a post-PR conflict resolution back to the pull-request branch before landing it', async () => {
     const repo = await repoWithOrigin('post-pr-conflict');
     fs.writeFileSync(path.join(repo, 'conflict.txt'), 'base\n');
