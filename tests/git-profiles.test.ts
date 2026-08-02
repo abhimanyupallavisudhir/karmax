@@ -114,6 +114,21 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(sam.env(sam.get('main')!, {}).GH_TOKEN).toBe('sam-token');
   });
 
+  it('infers the default commit identity from GitHub and keeps signing optional', () => {
+    const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    expect(user.saveGithubIdentity({ id: 12345, login: 'jane-dev', name: 'Jane Developer' })).toMatchObject({
+      name: 'github', userName: 'Jane Developer', userEmail: '12345+jane-dev@users.noreply.github.com',
+      github: { id: '12345', login: 'jane-dev' },
+    });
+    expect(user.defaultProfile()).toBe('github');
+    expect(user.saveGithubSigningKey('PRIVATE SIGNING KEY')).toMatchObject({ signingKey: true });
+    expect(broker.hasHandle(gitHandle('github', 'signing', userGitScope('user_jane')))).toBe(true);
+    // Reconnecting refreshes public identity without dropping the signing key.
+    expect(user.saveGithubIdentity({ id: '12345', login: 'jane-renamed' })).toMatchObject({
+      userName: 'jane-renamed', userEmail: '12345+jane-renamed@users.noreply.github.com', signingKey: true,
+    });
+  });
+
   it('lets an empty organization link its default to an authorized user profile without copying secrets', () => {
     const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
     user.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' });

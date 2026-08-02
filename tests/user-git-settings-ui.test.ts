@@ -10,21 +10,24 @@ describe('personal Git development settings', () => {
     expect(source).toContain("globalRoute('profile')");
   });
 
-  it('puts development Git identity on the user profile, with a commit byline preview', () => {
+  it('puts one GitHub control and the optional signing key inside the main profile card', () => {
     const profile = source.slice(source.indexOf('function profileView()'), source.indexOf('function notificationsCard()'));
-    expect(profile).toContain('/api/user/git-profiles');
-    expect(profile).not.toContain('/api/organizations/${encodeURIComponent');
-    expect(source).toContain('Development Git identity');
-    expect(source).toContain('git-byline-preview');
-    expect(source).toContain('user-github-connection');
-    expect(source).toContain('manual keys and tokens are compatibility fallbacks');
+    expect(profile).toContain('${profileGithubFields()}');
+    expect(source).toContain('Connect GitHub');
+    expect(source).toContain('GitHub signing key <span>(optional)</span>');
+    expect(source).toContain('/api/user/git-profiles/signing-key');
+    expect(source).not.toContain('user-git-token');
+    expect(source).not.toContain('user-git-ssh');
+    expect(source).not.toContain('Commit email');
     expect(source).toContain("JSON.stringify({ returnTo: 'profile' })");
   });
 
-  it('offers an authorized organization owner a one-click link only while organization Git is empty', () => {
-    const hydrate = source.slice(source.indexOf('async function hydrateGitProfiles('), source.indexOf('async function hydrateWorkflows('));
-    expect(hydrate).toContain('canManage');
-    expect(hydrate).toContain('Use my Git credentials');
-    expect(hydrate).toContain('/reuse-user');
+  it('reduces organization Git settings to one connect/manage control', () => {
+    expect(source).toContain('id="connect-github"');
+    expect(source).toContain("gitConnections.length ? 'Manage GitHub' : 'Connect GitHub'");
+    expect(source).not.toContain('git-accounts-card');
+    expect(source).not.toContain('setup-github-app');
+    expect(source).not.toContain('save-github-app');
+    expect(source).not.toContain('id="refresh-github"');
   });
 });

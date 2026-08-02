@@ -9371,26 +9371,6 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — krmax never sees it elsewhere.)</div>
       </div>
     </div>
-    <div class="card" id="git-accounts-card">
-      <div class="section-h">Organization Git service <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Used by organization-owned automation and repository services when no human owns the work. Development commits and pull requests use each task creator’s personal Git identity instead.</p>
-      <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
-      <div class="form-row"><label>Add / update a profile</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <input id="gitp-name" placeholder="profile name (e.g. personal)" style="width:160px" />
-          <input id="gitp-username" placeholder="git user.name" style="flex:1;min-width:130px" />
-          <input id="gitp-email" placeholder="git user.email" style="flex:1;min-width:160px" />
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
-          <input id="gitp-token" type="password" placeholder="GitHub token (optional)" style="flex:1;min-width:160px" />
-          <textarea id="gitp-ssh" placeholder="SSH private key for push/fetch (optional)" rows="1" style="flex:1;min-width:160px"></textarea>
-          <textarea id="gitp-signing" placeholder="SSH signing key (optional)" rows="1" style="flex:1;min-width:160px"></textarea>
-          <button class="btn primary" id="gitp-save">Save</button>
-        </div>
-        <div id="gitp-result" style="font-size:12px;margin-top:6px"></div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
-      </div>
-    </div>
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">organization resource</span></div>
@@ -9655,57 +9635,6 @@ function revealPhoneAccess() {
   // its idempotent wiring so a permitted deep link to #settings-access opens
   // after the previously hidden destination becomes available.
   wireSettingsNavigation();
-}
-
-async function hydrateGitProfiles(organizationId = S.organizationId) {
-  const box = $('#git-profiles-list');
-  if (!box) return;
-  const renderIsCurrent = beginAsyncElementRender(box);
-  let data = { profiles: [], defaultProfile: null };
-  const base = `/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`;
-  try { data = await api(base); } catch {
-    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>';
-    return;
-  }
-  if (!renderIsCurrent()) return;
-  if (!data.profiles.length) {
-    let personal = { profiles: [], defaultProfile: null };
-    try { personal = await api('/api/user/git-profiles'); } catch {}
-    if (!renderIsCurrent()) return;
-    const mine = personal.profiles.find((profile) => profile.name === personal.defaultProfile);
-    box.innerHTML = `<div class="git-empty-state"><span>No organization Git service is configured. Human-owned development already uses each creator’s personal identity.</span>${data.canManage && mine
-      ? `<button class="btn sm primary" id="gitp-reuse-user">Use my Git credentials</button><small>This links ${esc(mine.userName)} &lt;${esc(mine.userEmail)}&gt;; secrets are not copied.</small>`
-      : data.canManage
-        ? `<a class="btn sm" data-spa href="${globalRoute('profile')}">Set up my Git identity first</a>`
-        : ''}</div>`;
-    $('#gitp-reuse-user')?.addEventListener('click', async (event) => {
-      event.currentTarget.disabled = true;
-      try {
-        await api(`${base}/reuse-user`, { method: 'POST', body: '{}' });
-        toast('Organization Git now uses your linked credentials');
-        hydrateGitProfiles(organizationId);
-      } catch (error) { toast(error.message, true); event.currentTarget.disabled = false; }
-    });
-    return;
-  }
-  box.innerHTML = data.profiles.map((p) => `<div class="queue-item" data-gitp="${esc(p.name)}">
-      <div style="flex:1"><b>${esc(p.name)}</b>
-        ${data.defaultProfile === p.name ? '<span class="chip">default</span>' : `<button class="btn sm" data-gitp-default="${esc(p.name)}">make default</button>`}
-        ${p.source?.kind === 'user' ? '<span class="chip">linked user profile</span>' : ''}
-        <span class="task-sub" style="color:var(--ink-3)">${esc(p.userName)} &lt;${esc(p.userEmail)}&gt;</span>
-        <div class="task-sub" style="color:var(--ink-3)">${[p.sshKey ? 'ssh key' : null, p.signingKey ? 'signing key' : null, p.githubToken ? 'github token' : null].filter(Boolean).join(' · ') || 'identity only'}</div>
-      </div>
-      <button class="btn sm danger" data-gitp-del="${esc(p.name)}">Delete</button>
-    </div>`).join('');
-  box.querySelectorAll('[data-gitp-del]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm(`Delete git profile "${b.dataset.gitpDel}" (and its stored secrets)?`)) return;
-    try { await api(`${base}/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
-    hydrateGitProfiles(organizationId);
-  }));
-  box.querySelectorAll('[data-gitp-default]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`${base}/default`, { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
-    hydrateGitProfiles(organizationId);
-  }));
 }
 
 async function hydrateWorkflows(organizationId = S.organizationId) {
@@ -11001,34 +10930,10 @@ function wireGlobalSettings(organizationId) {
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateWorkflows(organizationId);
-  hydrateGitProfiles(organizationId);
   wireVaultCards(organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
   wireOutboundEmailCard();
-  $('#gitp-save')?.addEventListener('click', async () => {
-    const name = $('#gitp-name').value.trim();
-    const userName = $('#gitp-username').value.trim();
-    const userEmail = $('#gitp-email').value.trim();
-    const out = $('#gitp-result');
-    if (!name || !userName || !userEmail) return toast('profile name, user.name and user.email required', true);
-    const btn = $('#gitp-save'); btn.disabled = true;
-    try {
-      await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`, { method: 'POST', body: JSON.stringify({
-        name, userName, userEmail,
-        githubToken: $('#gitp-token').value.trim() || undefined,
-        sshKey: $('#gitp-ssh').value.trim() || undefined,
-        signingKey: $('#gitp-signing').value.trim() || undefined,
-      }) });
-      out.innerHTML = `🟢 Saved <b>${esc(name)}</b>. Secrets went to the vault and are never shown again.`;
-      out.style.color = 'var(--ok, green)';
-      for (const id of ['#gitp-token', '#gitp-ssh', '#gitp-signing']) $(id).value = '';
-      hydrateGitProfiles(organizationId);
-    } catch (e) {
-      out.textContent = e.message;
-      out.style.color = 'var(--bad, crimson)';
-    } finally { btn.disabled = false; }
-  });
   $('#wf-install')?.addEventListener('click', async () => {
     const url = $('#wf-url').value.trim();
     const ref = $('#wf-ref').value.trim();
@@ -11328,90 +11233,63 @@ function userDisplayName() {
   return 'Account';
 }
 
-function personalGitProfilesCard(apiPath) {
-  const u = S.user && typeof S.user === 'object' ? S.user : {};
-  return `<div class="card personal-git-card" id="personal-git-card" data-api="${esc(apiPath)}">
-    <div class="section-h">Development Git identity <span class="chip">yours</span></div>
-    <p class="task-sub">Every task you create commits and opens pull requests as you, even inside an organization. Connect GitHub once for pull requests and repository access; manual keys and tokens are compatibility fallbacks.</p>
-    <div id="user-github-connection" class="git-onboarding-note">Loading GitHub connection…</div>
-    <div class="git-byline-preview" id="user-git-preview" aria-live="polite">
-      <span class="git-byline-mark" aria-hidden="true">●</span>
-      <span><small>Future commits by</small><b>Not configured</b><code>Add an identity below</code></span>
-    </div>
-    <div id="user-git-profiles" class="personal-git-list">Loading…</div>
-    <details class="settings-disclosure compact personal-git-editor" id="user-git-editor" open>
-      <summary><b>Add or update an identity</b><span>Git byline plus optional fallback credentials</span></summary>
-      <div class="personal-git-fields">
-        <label class="form-row"><span>Profile name</span><input id="user-git-name" value="main" placeholder="main"></label>
-        <label class="form-row"><span>Commit name</span><input id="user-git-username" value="${esc(u.name || '')}" placeholder="Your name"></label>
-        <label class="form-row"><span>Commit email</span><input id="user-git-email" type="email" value="${esc(u.email || '')}" placeholder="you@example.com"></label>
-        <label class="form-row wide"><span>GitHub personal access token <small>(fallback)</small></span><input id="user-git-token" type="password" autocomplete="new-password" placeholder="Only for repositories not connected through the GitHub App"></label>
-        <label class="form-row wide"><span>SSH private key <small>(fallback)</small></span><textarea id="user-git-ssh" rows="2" placeholder="Only for non-App Git remotes"></textarea></label>
-        <label class="form-row wide"><span>SSH signing key <small>(optional)</small></span><textarea id="user-git-signing" rows="2" placeholder="For signed commits"></textarea></label>
-      </div>
-      <div class="profile-edit-actions"><button class="btn primary" id="user-git-save" type="button">Save Git identity</button><span class="task-sub" id="user-git-result"></span></div>
+function profileGithubFields() {
+  return `<div class="profile-github" id="profile-github">
+    <div class="profile-github-row" id="user-github-connection"><button class="btn primary" id="user-authorize-github" type="button">Connect GitHub</button></div>
+    <details class="profile-github-signing">
+      <summary>GitHub signing key <span>(optional)</span></summary>
+      <textarea id="user-git-signing" rows="3" spellcheck="false"></textarea>
+      <div class="profile-edit-actions"><button class="btn sm" id="user-git-signing-save" type="button">Save</button><span class="task-sub" id="user-git-signing-result"></span></div>
     </details>
   </div>`;
 }
 
-async function hydrateUserGitProfiles() {
-  const box = $('#user-git-profiles');
-  const preview = $('#user-git-preview');
-  const githubBox = $('#user-github-connection');
-  if (!box || !preview) return;
+async function hydrateProfileGithub() {
+  const box = $('#profile-github');
+  const connection = $('#user-github-connection');
+  if (!box || !connection) return;
   const renderIsCurrent = beginAsyncElementRender(box);
   let data;
   try { data = await api('/api/user/git-profiles'); }
-  catch (error) { if (renderIsCurrent()) box.textContent = error.message; return; }
+  catch (error) { if (renderIsCurrent()) connection.textContent = error.message; return; }
   if (!renderIsCurrent()) return;
-  if (githubBox) {
-    const github = data.githubApp;
-    githubBox.innerHTML = github?.userAuthorized
-      ? `<span class="chip">GitHub connected</span> Pull requests use your refreshable GitHub authorization; connected repositories use short-lived App credentials. ${githubAuthorizeButton(github, 'user-authorize-github')}`
-      : github?.oauthConfigured
-        ? `Connect your GitHub identity to open pull requests as you without pasting a token. ${githubAuthorizeButton(github, 'user-authorize-github')}`
-        : 'This deployment has no GitHub App user authorization configured. Manual fallback credentials remain available below.';
-    $('#user-authorize-github')?.addEventListener('click', async () => {
-      const organizationId = S.organizationId || currentOrg()?.id;
-      if (!organizationId) return toast('Choose an organization before connecting GitHub.', true);
-      try {
-        const result = await api(`/api/organizations/${organizationId}/github/authorize`, {
-          method: 'POST', body: JSON.stringify({ returnTo: 'profile' }),
+  const github = data.githubApp;
+  const profile = data.profiles.find((candidate) => candidate.github && candidate.name === data.defaultProfile);
+  const githubConnectable = !github?.configured || github.oauthConfigured;
+  connection.innerHTML = `<button class="btn ${profile ? '' : 'primary'}" id="user-authorize-github" type="button" ${githubConnectable ? '' : 'disabled'}>${profile ? 'Reconnect GitHub' : 'Connect GitHub'}</button>${profile ? `<span class="task-sub">Connected as @${esc(profile.github.login)}</span>` : ''}`;
+  $('#user-authorize-github')?.addEventListener('click', async () => {
+    const organizationId = S.organizationId || currentOrg()?.id;
+    if (!organizationId) return toast('Choose an organization before connecting GitHub.', true);
+    try {
+      if (!github?.configured) {
+        const result = await api(`/api/organizations/${organizationId}/github/app-manifest`, {
+          method: 'POST', body: JSON.stringify({ publicUrl: location.origin, returnTo: 'profile' }),
         });
-        location.assign(result.url);
-      } catch (error) { toast(error.message, true); }
-    });
-  }
-  const selected = data.profiles.find((profile) => profile.name === data.defaultProfile);
-  preview.innerHTML = selected
-    ? `<span class="git-byline-mark ready" aria-hidden="true">●</span><span><small>Future commits by</small><b>${esc(selected.userName)}</b><code>&lt;${esc(selected.userEmail)}&gt;</code></span>`
-    : '<span class="git-byline-mark" aria-hidden="true">●</span><span><small>Future commits by</small><b>Not configured</b><code>Add an identity below</code></span>';
-  box.innerHTML = data.profiles.length ? data.profiles.map((profile) => `<div class="queue-item">
-    <div class="personal-git-profile"><b>${esc(profile.name)}</b>${data.defaultProfile === profile.name ? '<span class="chip">active</span>' : `<button class="btn sm" data-user-git-default="${esc(profile.name)}">Use for my tasks</button>`}
-      <span class="task-sub">${esc(profile.userName)} &lt;${esc(profile.userEmail)}&gt;</span>
-      <small>${[profile.githubToken ? 'GitHub token' : null, profile.sshKey ? 'SSH auth' : null, profile.signingKey ? 'signed commits' : null].filter(Boolean).join(' · ') || 'commit identity only'}</small></div>
-    <button class="btn sm danger" data-user-git-delete="${esc(profile.name)}">Delete</button></div>`).join('')
-    : '<p class="git-onboarding-note">Add your identity before creating development tasks. Until then, commits use a neutral krmax byline and cannot use your GitHub account.</p>';
-  box.querySelectorAll('[data-user-git-default]').forEach((button) => button.addEventListener('click', async () => {
-    try {
-      await api('/api/user/git-profiles/default', { method: 'POST', body: JSON.stringify({ name: button.dataset.userGitDefault }) });
-      hydrateUserGitProfiles();
+        const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
+        const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
+        form.appendChild(manifest); document.body.appendChild(form); form.submit();
+        return;
+      }
+      const result = await api(`/api/organizations/${organizationId}/github/authorize`, {
+        method: 'POST', body: JSON.stringify({ returnTo: 'profile' }),
+      });
+      location.assign(result.url);
     } catch (error) { toast(error.message, true); }
-  }));
-  box.querySelectorAll('[data-user-git-delete]').forEach((button) => button.addEventListener('click', async () => {
-    if (!confirm(`Delete your Git identity “${button.dataset.userGitDelete}” and its stored secrets?`)) return;
+  });
+  const signingSave = $('#user-git-signing-save');
+  if (signingSave) signingSave.disabled = !profile;
+  $('#user-git-signing-result').textContent = profile?.signingKey ? 'Saved' : '';
+  signingSave?.addEventListener('click', async () => {
+    const signingKey = $('#user-git-signing').value.trim();
+    if (!signingKey) return;
+    signingSave.disabled = true;
     try {
-      await api(`/api/user/git-profiles/${encodeURIComponent(button.dataset.userGitDelete)}`, { method: 'DELETE' });
-      hydrateUserGitProfiles();
+      await api('/api/user/git-profiles/signing-key', { method: 'POST', body: JSON.stringify({ signingKey }) });
+      $('#user-git-signing').value = '';
+      $('#user-git-signing-result').textContent = 'Saved';
     } catch (error) { toast(error.message, true); }
-  }));
-  // Updating the active profile should start from its public identity; secrets
-  // stay blank because they are write-only and a blank preserves the stored value.
-  if (selected) {
-    $('#user-git-name').value = selected.name;
-    $('#user-git-username').value = selected.userName;
-    $('#user-git-email').value = selected.userEmail;
-  }
+    finally { signingSave.disabled = false; }
+  });
 }
 
 // A clean profile page: identity, the browser display preference (theme), and the
@@ -11516,8 +11394,9 @@ function profileView() {
           </form>
         </div>` : ''}
       </div>
+      <div class="settings-divider"></div>
+      ${profileGithubFields()}
     </div>
-    ${personalGitProfilesCard('/api/user/git-profiles')}
     <div class="card">
       <div class="section-h">Organizations</div>
       <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
@@ -11603,7 +11482,7 @@ function wireNotificationsCard() {
 
 function wireProfileView() {
   wireNotificationsCard();
-  hydrateUserGitProfiles();
+  hydrateProfileGithub();
   const setProfileEditor = (kind) => {
     document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
       panel.hidden = panel.id !== `profile-${kind}-panel`;
@@ -11700,27 +11579,6 @@ function wireProfileView() {
     }
   });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
-  $('#user-git-save')?.addEventListener('click', async () => {
-    const button = $('#user-git-save');
-    const name = $('#user-git-name').value.trim();
-    const userName = $('#user-git-username').value.trim();
-    const userEmail = $('#user-git-email').value.trim();
-    if (!name || !userName || !userEmail) return toast('Profile name, commit name, and commit email are required.', true);
-    button.disabled = true;
-    try {
-      await api('/api/user/git-profiles', { method: 'POST', body: JSON.stringify({
-        name, userName, userEmail, default: true,
-        githubToken: $('#user-git-token').value.trim() || undefined,
-        sshKey: $('#user-git-ssh').value.trim() || undefined,
-        signingKey: $('#user-git-signing').value.trim() || undefined,
-      }) });
-      for (const selector of ['#user-git-token', '#user-git-ssh', '#user-git-signing']) $(selector).value = '';
-      $('#user-git-result').textContent = 'Saved. Future tasks use this identity.';
-      $('#user-git-editor').open = false;
-      await hydrateUserGitProfiles();
-    } catch (error) { toast(error.message, true); }
-    finally { button.disabled = false; }
-  });
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
     if (S.taskTab === 'checkin') renderTaskPage();
@@ -11826,7 +11684,7 @@ function organizationView() {
     ${outboundEmailCard()}
 
     <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>Repository access and organization-owned automation</small></div></div>
-    <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
+    <div class="card"><div id="org-github">Loading…</div></div>
 
     <div class="settings-section-title" id="settings-compute"><div>Compute<small>Where tasks run, how large each world is, and the monthly ceiling</small></div></div>
     <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
@@ -11860,8 +11718,6 @@ async function hydrateOrganizationView() {
   const renderIsCurrent = () => S.organizationViewEpoch === epoch
     && S.organizationId === organizationId
     && !!$('#org-members');
-  const gitAccounts = $('#git-accounts-card');
-  if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   // Instance-wide cards render inside globalSettingsView but belong under
   // Advanced, not among the task defaults. Moving the node keeps its listeners.
   for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
@@ -11894,14 +11750,8 @@ async function hydrateOrganizationView() {
   $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
-  $('#org-github').innerHTML = githubApp.configured ? `
-    <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
-    ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
-    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so krmax refreshes repository access when you ask instead of using webhooks.'}</p>
-    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
-    <p class="task-sub">This creates a private GitHub App for this krmax installation, then lets you choose exactly which repositories it may access. Git uses short-lived App tokens, so connecting many repositories does not add a deploy key to each one.${hostLocal() ? ' On localhost, setup works without a webhook and repository access is refreshed on demand.' : ''}</p>
-    <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
-    <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
+  const githubAccounts = gitConnections.map((connection) => `@${connection.accountLogin}`).join(', ');
+  $('#org-github').innerHTML = `<div class="profile-github-row"><button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${gitConnections.length ? 'Manage GitHub' : 'Connect GitHub'}</button>${githubAccounts ? `<span class="task-sub">Connected to ${esc(githubAccounts)}</span>` : ''}</div>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   S.worldProviderConnections = providerConnections;
   // The default Agent environment moved to Task defaults (below) and can be
@@ -11966,25 +11816,19 @@ async function hydrateOrganizationView() {
     } catch (e) { toast(e.message, true); }
   });
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  $('#setup-github-app')?.addEventListener('click', async () => {
+  $('#connect-github')?.addEventListener('click', async () => {
     try {
+      if (githubApp.configured) {
+        const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' });
+        location.assign(result.url);
+        return;
+      }
       const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) });
       const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
       const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
       form.appendChild(manifest); document.body.appendChild(form); form.submit();
-    } catch (e) { toast(e.message, true); }
+    } catch (error) { toast(error.message, true); }
   });
-  $('#save-github-app')?.addEventListener('click', async () => {
-    try {
-      await api(`/api/organizations/${S.organizationId}/github/app`, { method: 'PUT', body: JSON.stringify({
-        appId: $('#github-app-id').value, appSlug: $('#github-app-slug').value, privateKey: $('#github-private-key').value,
-        webhookSecret: $('#github-webhook-secret').value, clientId: $('#github-client-id').value, clientSecret: $('#github-client-secret').value,
-      }) }); toast('GitHub App saved'); await hydrateOrganizationView();
-    } catch (e) { toast(e.message, true); }
-  });
-  $('#connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
-  $('#authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
-  $('#refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); } catch (e) { toast(e.message, true); } });
   $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
     const provider = row.dataset.provider;
     row.querySelector('.provider-save')?.addEventListener('click', async () => {

@@ -677,6 +677,10 @@ export interface GitProfile {
   sshKey?: boolean;
   /** A GitHub token is stored (injected as GH_TOKEN for gh + https pushes). */
   githubToken?: boolean;
+  /** GitHub account that owns this inferred human identity. The numeric id is
+   * stable across login renames and is also part of GitHub's attributed noreply
+   * commit address. */
+  github?: { id: string; login: string };
   /** An organization may deliberately reuse a member's user-owned profile.
    * This is a live reference, not a secret copy: rotation and revocation remain
    * under that user's control. User-owned profile records never set `source`. */

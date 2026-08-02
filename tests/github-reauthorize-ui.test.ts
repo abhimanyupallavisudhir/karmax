@@ -42,12 +42,11 @@ describe('GitHub re-authorization affordance', () => {
     expect(githubAuthorizeButton(undefined, 'authorize-github')).toBe('');
   });
 
-  it('renders the affordance from both the organization and project settings panes', () => {
-    // Both panes previously duplicated the same `!userAuthorized` gate; they now
-    // share one helper, so the escape hatch cannot regress in only one of them.
-    expect(source).toContain("githubAuthorizeButton(githubApp, 'authorize-github')");
+  it('keeps the project escape hatch while profile and organization use their single controls', () => {
     expect(source).toContain("githubAuthorizeButton(githubApp, 'project-authorize-github')");
-    expect(source).toContain("githubAuthorizeButton(github, 'user-authorize-github')");
+    expect(source).not.toContain("githubAuthorizeButton(githubApp, 'authorize-github')");
+    expect(source).not.toContain("githubAuthorizeButton(github, 'user-authorize-github')");
+    expect(source).toContain("profile ? 'Reconnect GitHub' : 'Connect GitHub'");
     expect(source).not.toContain('githubApp.oauthConfigured && !githubApp.userAuthorized');
   });
 

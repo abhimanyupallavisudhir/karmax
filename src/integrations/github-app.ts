@@ -49,6 +49,12 @@ interface GitHubInstallationPayload {
   suspended_at?: string | null;
 }
 
+export interface GitHubUserIdentity {
+  id: string;
+  login: string;
+  name?: string;
+}
+
 export interface GitHubAppOptions {
   appId?: string;
   appSlug?: string;
@@ -250,7 +256,7 @@ export class GitHubAppService {
     return url.toString();
   }
 
-  async authorizeUser(userId: string, code: string, publicUrl?: string): Promise<void> {
+  async authorizeUser(userId: string, code: string, publicUrl?: string): Promise<GitHubUserIdentity> {
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
     const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] });
@@ -258,6 +264,18 @@ export class GitHubAppService {
       ...(publicUrl ? { redirect_uri: `${new URL(publicUrl).origin}/api/github/oauth/callback` } : {}) });
     if (!value.access_token) throw new Error(value.error_description || value.error || 'GitHub returned no user access token');
     this.saveUserToken(userId, value);
+    return this.userIdentity(userId);
+  }
+
+  /** Public account data needed for the commit byline. A stable GitHub noreply
+   * address is derived later, so this does not request private-email access. */
+  async userIdentity(userId: string): Promise<GitHubUserIdentity> {
+    const value = await this.userRequest<{ id?: string | number; login?: string; name?: string | null }>(userId, '/user');
+    const id = String(value.id ?? '').trim();
+    const login = String(value.login ?? '').trim();
+    if (!/^\d+$/.test(id) || !/^[A-Za-z0-9-]+$/.test(login))
+      throw new Error('GitHub returned an invalid account identity');
+    return { id, login, ...(value.name?.trim() ? { name: value.name.trim() } : {}) };
   }
 
   installationUrl(state: string): string {

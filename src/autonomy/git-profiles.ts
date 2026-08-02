@@ -26,6 +26,7 @@ const pexec = promisify(execFile);
 
 const LEGACY_KV_PROFILES = 'git:profiles';
 const LEGACY_KV_DEFAULT = 'git:default-profile';
+export const GITHUB_GIT_PROFILE = 'github';
 
 /** User Git configuration is deliberately outside every tenant namespace. */
 export function userGitScope(userId: string): string {
@@ -118,6 +119,7 @@ export class GitProfiles {
       name: source.name,
       userName: source.userName,
       userEmail: source.userEmail,
+      ...(source.github ? { github: source.github } : {}),
       ...(source.sshKey ? { sshKey: true } : {}),
       ...(source.signingKey ? { signingKey: true } : {}),
       ...(source.githubToken ? { githubToken: true } : {}),
@@ -133,7 +135,8 @@ export class GitProfiles {
    * is stored in the vault under the profile's handle; absent/empty leaves the
    * stored secret untouched. The registry record carries only has-secret flags.
    */
-  save(args: { name: string; userName: string; userEmail: string; sshKey?: string; signingKey?: string; githubToken?: string }): GitProfile {
+  save(args: { name: string; userName: string; userEmail: string; sshKey?: string; signingKey?: string;
+    githubToken?: string; github?: { id: string; login: string } }): GitProfile {
     const name = args.name.trim();
     if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error('profile name must be alphanumeric with . _ - only');
     if (!args.userName?.trim() || !args.userEmail?.trim()) throw new Error('userName and userEmail are required');
@@ -143,7 +146,11 @@ export class GitProfiles {
       ['token', args.githubToken, 'githubToken'],
     ];
     const prior = this.get(name);
-    const rec: GitProfile = { name, userName: args.userName.trim(), userEmail: args.userEmail.trim() };
+    const github = args.github ?? prior?.github;
+    const rec: GitProfile = {
+      name, userName: args.userName.trim(), userEmail: args.userEmail.trim(),
+      ...(github ? { github } : {}),
+    };
     for (const [kind, value, flag] of secrets) {
       if (value?.trim()) {
         this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim());
@@ -157,6 +164,31 @@ export class GitProfiles {
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });
     return rec;
+  }
+
+  /** GitHub OAuth is the normal human onboarding path: the public account
+   * identity supplies both commit fields, while authentication remains in the
+   * App's refreshable user grant rather than this profile. */
+  saveGithubIdentity(identity: { id: string | number; login: string; name?: string | null }): GitProfile {
+    const id = String(identity.id).trim();
+    const login = identity.login.trim();
+    if (!/^\d+$/.test(id) || !/^[A-Za-z0-9-]+$/.test(login))
+      throw new Error('GitHub returned an invalid account identity');
+    const profile = this.save({
+      name: GITHUB_GIT_PROFILE,
+      userName: identity.name?.trim() || login,
+      userEmail: `${id}+${login}@users.noreply.github.com`,
+      github: { id, login },
+    });
+    this.setDefault(profile.name);
+    return profile;
+  }
+
+  saveGithubSigningKey(signingKey: string): GitProfile {
+    const profile = this.get(GITHUB_GIT_PROFILE);
+    if (!profile?.github) throw new Error('Connect GitHub before adding a signing key');
+    return this.save({ name: profile.name, userName: profile.userName, userEmail: profile.userEmail,
+      github: profile.github, signingKey });
   }
 
   delete(name: string) {

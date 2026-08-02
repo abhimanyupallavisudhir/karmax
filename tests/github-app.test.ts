@@ -24,6 +24,7 @@ describe('GitHub App integration', () => {
         webhook_secret: 'hook-secret', client_id: 'Iv1.client', client_secret: 'client-secret' });
       if (url.pathname === '/login/oauth/access_token') return Response.json({ access_token: 'user-token', expires_in: 28_800,
         refresh_token: 'refresh-token', refresh_token_expires_in: 15_552_000 });
+      if (url.pathname === '/user') return Response.json({ id: 42, login: 'octocat', name: 'The Octocat' });
       if (url.pathname === '/app/installations/42') return Response.json({ id: 42, account: { login: 'acme', type: 'Organization' } });
       if (url.pathname === '/app/installations/42/access_tokens') return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
       if (url.pathname === '/installation/repositories') return Response.json({ repositories: [] });
@@ -52,7 +53,9 @@ describe('GitHub App integration', () => {
     const connected = await service.connectInstallation(organization.id, '42');
     const authorize = new URL(service.userAuthorizationUrl('oauth-state', 'https://karmax.example'));
     expect(authorize.searchParams.get('client_id')).toBe('Iv1.client');
-    await service.authorizeUser('owner', 'oauth-code', 'https://karmax.example');
+    await expect(service.authorizeUser('owner', 'oauth-code', 'https://karmax.example')).resolves.toEqual({
+      id: '42', login: 'octocat', name: 'The Octocat',
+    });
     expect(service.status('owner').userAuthorized).toBe(true);
     const repository = await service.createRepository(connected.connection.id, 'owner', { name: 'new-app', private: true });
     expect(repository).toMatchObject({ owner: 'acme', name: 'new-app', sshUrl: 'git@github.com:acme/new-app.git' });
