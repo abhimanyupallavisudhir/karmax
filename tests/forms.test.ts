@@ -87,6 +87,35 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     });
   });
 
+  it('changes an unqueued draft workflow in place', async () => {
+    const draft = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Editable workflow',
+      workflow: 'goal',
+      draft: true,
+      notes: 'keep this note',
+      params: { prompt: 'prepare the repository', wikiContext: ['@proj:SPEC.md'] },
+    });
+
+    const response = await fetch(`${base}/api/tasks/${draft.id}/workflow`, {
+      method: 'PATCH',
+      headers: auth(),
+      body: JSON.stringify({ workflow: 'software-dev' }),
+    });
+    expect(response.status).toBe(200);
+    const changed = await J(response);
+    expect(changed).toMatchObject({
+      workflow: 'software-dev',
+      task: {
+        id: draft.id,
+        workflow: 'software-dev',
+        executionWorkflow: 'software-dev',
+        params: { draft: true, prompt: 'prepare the repository', wikiContext: ['@proj:SPEC.md'] },
+        notes: 'keep this note',
+      },
+    });
+    expect(changed.task.lastView).toBeFalsy();
+  });
+
   it('saves a draft (not queued), then queues it to completion', async () => {
     const draft = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Draft task',

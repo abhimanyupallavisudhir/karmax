@@ -4210,6 +4210,7 @@ async function openTaskForm(workflow, draft, seedText) {
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = !!draft?.params?.repeatable; // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
+  const workflowEditable = !draft || !!draft.params?.draft;
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -4247,7 +4248,7 @@ async function openTaskForm(workflow, draft, seedText) {
           <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
-          <select id="tf-wf" title="Workflow" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
+          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
         </div>
       </div>
       <div class="tf-scroll">
@@ -4305,32 +4306,30 @@ async function openTaskForm(workflow, draft, seedText) {
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   let closeForm = () => (root.innerHTML = '');
   $('#tf-wf')?.addEventListener('change', async () => {
-    // Re-render for the new workflow, preserving text typed into the current
-    // consuming field so it moves to the new workflow's consuming field.
-    const cf = consumingField(fields);
-    const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
-    // Drop any draft auto-created for the previous workflow — its params won't
-    // map onto the new workflow's schema, and reopening starts fresh anyway.
-    // Let any in-flight save settle first so a create still mid-flight can't
-    // materialise its draft AFTER this delete and orphan it.
+    const select = $('#tf-wf');
+    const nextWorkflow = select.value;
+    const st = formState();
     clearTimeout(saveTimer);
-    await saveChain;
-    if (localCred && draftId) {
-      const id = draftId;
-      try {
-        await api(`/api/tasks/${id}`, { method: 'DELETE' });
-        removeDeletedTaskLocally(id);
-        draftId = null;
-      } catch (error) {
-        if (!/no such task|HTTP 404/i.test(error.message || '')) {
-          toast(error.message, true);
-          return;
-        }
-        removeDeletedTaskLocally(id);
-        draftId = null;
+    select.disabled = true;
+    try {
+      await persistDraft(st);
+      if (draftId) {
+        const changed = await api(`/api/tasks/${draftId}/workflow`, {
+          method: 'PATCH', body: JSON.stringify({ workflow: nextWorkflow }),
+        });
+        const at = S.tasks.findIndex((task) => task.id === draftId);
+        if (at >= 0 && changed.task) S.tasks[at] = changed.task;
+        return openTaskForm(nextWorkflow, changed.task);
       }
+      const carried = consumingField(fields)
+        ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
+        : '';
+      openTaskForm(nextWorkflow, undefined, (carried || '').trim());
+    } catch (error) {
+      select.value = wf;
+      select.disabled = !workflowEditable;
+      toast(error.message, true);
     }
-    openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));

@@ -2958,12 +2958,22 @@ export class KarmaxApi {
     token: string,
     taskId: string,
     workflow: string,
-  ): Promise<{ workflow: 'software-dev' | 'goal' }> {
+  ): Promise<{ workflow: 'software-dev' | 'goal'; task?: TaskRecord }> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
+    }
+    // A draft has no Temporal execution yet, so its workflow is ordinary editable
+    // task metadata. Re-pin it to the target definition in place: identity, notes,
+    // tags, authorization and sparse parameters all survive the form change.
+    if (task.params?.draft) {
+      const project = this.deps.store.getProject(task.projectId);
+      const start = this.resolveStart(workflow, this.workflowPinFor(task.projectId, workflow), project?.organizationId);
+      if (!start) throw new Error(`workflow "${workflow}" is not available to this organization`);
+      this.deps.store.setDraftWorkflow(taskId, workflow, start.manifest.version);
+      return { workflow, task: this.deps.store.getTask(taskId)! };
     }
     const heldView = task.lastView;
     const heldOrigin =
