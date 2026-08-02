@@ -27,7 +27,8 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
+import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels,
+  modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
@@ -4660,7 +4661,16 @@ export class Gateway {
         : provider === 'codex' ? codexModels
         : provider === 'opencode' ? opencodeModels
         : (home?: string) => acpModels(provider, home);
-      const results = await Promise.all(homes(provider).map((home) => fn(home).catch(() => [])));
+      const results = await Promise.all(homes(provider).map((home) => fn(home).catch((error) => {
+        // Discovery is best-effort, but a silent auth failure made connected
+        // accounts appear to vanish with no causal trace. Log only a classified,
+        // credential-safe reason; provider exceptions can contain sensitive data.
+        console.warn(
+          `[karmax] ${provider} model discovery failed for ${home ? 'a connected login' : 'an API credential'} `
+          + `(${modelDiscoveryFailureReason(error)}); using the fallback catalog`,
+        );
+        return [];
+      })));
       return mergeModels(results);
     };
     const [claude, codex, opencode] = await Promise.all([

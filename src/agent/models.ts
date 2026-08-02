@@ -1,8 +1,11 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { client, methods, ndJsonStream, PROTOCOL_VERSION, type SessionConfigOption } from '@agentclientprotocol/sdk';
 import { CodexAppServerClient } from './codex-app-server-client.js';
-import { capturedToken, claudeAccessToken, scrubbedEnv, tokenToInject } from '../autonomy/config-homes.js';
+import { capturedToken, claudeAccessToken, scrubbedEnv } from '../autonomy/config-homes.js';
 import { withTimeout } from '../util/timeout.js';
 import type { Provider } from '../domain/types.js';
 import type { AcpProvider } from './provider-registry.js';
@@ -17,6 +20,31 @@ export interface AvailableModel {
 }
 
 export type ModelCatalog = Record<Provider, AvailableModel[]>;
+
+/** A credential-safe reason for provider-discovery logs. Provider exceptions can
+ * contain response bodies, paths, or auth headers, none of which belong in logs. */
+export function modelDiscoveryFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (/timed out/i.test(message)) return 'timed out';
+  const status = message.match(/\b(?:API |returned |status[=: ]+)([45]\d\d)\b/i)?.[1];
+  if (status) return `provider returned ${status}`;
+  if (/no available models/i.test(message)) return 'provider returned no models';
+  if (/no model list/i.test(message)) return 'provider returned an invalid catalog';
+  return error instanceof Error && error.name ? error.name : 'unknown error';
+}
+
+interface ClaudeModelDiscoveryDeps {
+  query?: (input: any) => {
+    supportedModels(): Promise<Array<{
+      value: string;
+      displayName?: string;
+      description?: string;
+      supportedEffortLevels?: string[];
+    }>>;
+    close(): void;
+  };
+  apiModels?: typeof claudeApiModels;
+}
 
 /** Ask Anthropic's account-aware models endpoint for exact model ids. Claude
  * Code's SDK picker is deliberately a short alias list (`opus[1m]`, `sonnet`,
@@ -59,44 +87,63 @@ export async function claudeApiModels(
 /** Ask both Claude Code and Anthropic for the models available to this login. No
  * model turn is made: the SDK streaming input stays idle while initialization
  * metadata is read, then the exact REST catalog fills in models omitted by the
- * CLI's alias-oriented picker. */
-export async function claudeModels(configHome?: string, timeoutMs = 10_000): Promise<AvailableModel[]> {
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+ * CLI's alias-oriented picker.
+ *
+ * Claude Code may refresh or clear its credential file during initialization.
+ * Model discovery is read-only, so run it in a throwaway config home carrying
+ * only the current access token. Copying the refresh token would still be unsafe:
+ * a successful refresh can rotate it and strand the canonical home with the old
+ * value even if the copy is later discarded. */
+export async function claudeModels(
+  configHome?: string,
+  timeoutMs = 10_000,
+  deps: ClaudeModelDiscoveryDeps = {},
+): Promise<AvailableModel[]> {
+  const query = deps.query ?? (await import('@anthropic-ai/claude-agent-sdk')).query;
   async function* idleInput(): AsyncGenerator<never, void, unknown> {
     await new Promise<void>(() => undefined);
   }
-  const injectedToken = configHome ? tokenToInject(configHome) : undefined;
-  const env = configHome
-    ? scrubbedEnv({
-        provider: 'claude',
-        configHome,
-        extra: injectedToken ? { CLAUDE_CODE_OAUTH_TOKEN: injectedToken } : undefined,
-      })
-    : { ...(process.env as Record<string, string>) };
-  const session = query({ prompt: idleInput(), options: { cwd: process.cwd(), env } });
   let sdkModels: AvailableModel[] = [];
   let sdkError: unknown;
-  try {
-    const models = await withTimeout(session.supportedModels(), timeoutMs);
-    sdkModels = models.map((m) => ({
-      id: m.value,
-      displayName: m.displayName,
-      description: m.description,
-      ...(m.supportedEffortLevels?.length ? { effort: [...m.supportedEffortLevels] } : {}),
-      ...(m.value === 'default' ? { isDefault: true } : {}),
-    }));
-  } catch (error) {
-    sdkError = error;
-  } finally {
-    session.close();
+  const oauthToken = configHome
+    ? claudeAccessToken(configHome) ?? capturedToken(configHome)
+    : undefined;
+  const apiKey = configHome ? undefined : process.env.ANTHROPIC_API_KEY;
+  if (oauthToken || apiKey) {
+    const probeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-claude-models-'));
+    fs.chmodSync(probeHome, 0o700);
+    const env = scrubbedEnv({
+      provider: 'claude',
+      configHome: probeHome,
+      extra: {
+        ...(oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: oauthToken } : {}),
+        ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}),
+      },
+    });
+    let session: ReturnType<NonNullable<ClaudeModelDiscoveryDeps['query']>> | undefined;
+    try {
+      session = query({ prompt: idleInput(), options: { cwd: process.cwd(), env } });
+      const models = await withTimeout(session.supportedModels(), timeoutMs);
+      sdkModels = models.map((m) => ({
+        id: m.value,
+        displayName: m.displayName,
+        description: m.description,
+        ...(m.supportedEffortLevels?.length ? { effort: [...m.supportedEffortLevels] } : {}),
+        ...(m.value === 'default' ? { isDefault: true } : {}),
+      }));
+    } catch (error) {
+      sdkError = error;
+    } finally {
+      try { session?.close(); } finally {
+        fs.rmSync(probeHome, { recursive: true, force: true });
+      }
+    }
   }
 
   let apiModels: AvailableModel[] = [];
   let apiError: unknown;
   try {
-    // Run after SDK initialization so Claude Code has had a chance to refresh an
-    // expired access token in the isolated config home.
-    apiModels = await claudeApiModels(configHome, timeoutMs);
+    apiModels = await (deps.apiModels ?? claudeApiModels)(configHome, timeoutMs);
   } catch (error) {
     apiError = error;
   }
