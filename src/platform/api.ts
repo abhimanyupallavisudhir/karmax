@@ -686,6 +686,12 @@ export class KarmaxApi {
     const createdBy = callerRef?.kind === 'user'
       && !this.deps.store.organizationMembership(project.organizationId ?? 'org_personal', callerRef.userId)
       ? undefined : callerRef;
+    // Pin the connected account when the task is created. Switching the user's
+    // active account later must not silently change an existing task's commit or
+    // pull-request actor.
+    const githubAccountId = createdBy?.kind === 'user'
+      ? this.deps.githubApp?.activeUserAccountId(createdBy.userId)
+      : undefined;
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
@@ -708,6 +714,7 @@ export class KarmaxApi {
         profiles: args.profiles,
         draft: !!args.draft,
         _authorization: { ...authorization, principal: caller.principal, credentialPolicies },
+        ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
         ...(repeatable ? { repeatable: true } : {}),
       },
       confirmer: (() => {

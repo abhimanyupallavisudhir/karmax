@@ -27,6 +27,7 @@ const pexec = promisify(execFile);
 const LEGACY_KV_PROFILES = 'git:profiles';
 const LEGACY_KV_DEFAULT = 'git:default-profile';
 export const GITHUB_GIT_PROFILE = 'github';
+export const GITHUB_AUTOMATION_PROFILE = 'github-automation';
 
 /** User Git configuration is deliberately outside every tenant namespace. */
 export function userGitScope(userId: string): string {
@@ -136,7 +137,8 @@ export class GitProfiles {
    * stored secret untouched. The registry record carries only has-secret flags.
    */
   save(args: { name: string; userName: string; userEmail: string; sshKey?: string; signingKey?: string;
-    githubToken?: string; github?: { id: string; login: string } }): GitProfile {
+    githubToken?: string; github?: { id: string; login: string; name?: string };
+    customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean }): GitProfile {
     const name = args.name.trim();
     if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error('profile name must be alphanumeric with . _ - only');
     if (!args.userName?.trim() || !args.userEmail?.trim()) throw new Error('userName and userEmail are required');
@@ -150,9 +152,12 @@ export class GitProfiles {
     const rec: GitProfile = {
       name, userName: args.userName.trim(), userEmail: args.userEmail.trim(),
       ...(github ? { github } : {}),
+      ...(args.customIdentity ? { customIdentity: args.customIdentity } : {}),
     };
     for (const [kind, value, flag] of secrets) {
-      if (value?.trim()) {
+      if (kind === 'signing' && args.clearSigningKey) {
+        this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId));
+      } else if (value?.trim()) {
         this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim());
         (rec as any)[flag] = true;
       } else if (prior?.[flag] && !prior.source) {
@@ -174,21 +179,81 @@ export class GitProfiles {
     const login = identity.login.trim();
     if (!/^\d+$/.test(id) || !/^[A-Za-z0-9-]+$/.test(login))
       throw new Error('GitHub returned an invalid account identity');
+    const prior = this.list().find((profile) => profile.github?.id === id);
+    const customIdentity = prior?.customIdentity;
     const profile = this.save({
-      name: GITHUB_GIT_PROFILE,
-      userName: identity.name?.trim() || login,
-      userEmail: `${id}+${login}@users.noreply.github.com`,
-      github: { id, login },
+      name: prior?.name ?? (this.get(GITHUB_GIT_PROFILE) ? `github-${id}` : GITHUB_GIT_PROFILE),
+      userName: customIdentity?.userName || identity.name?.trim() || login,
+      userEmail: customIdentity?.userEmail || `${id}+${login}@users.noreply.github.com`,
+      github: { id, login, ...(identity.name?.trim() ? { name: identity.name.trim() } : {}) },
+      ...(customIdentity ? { customIdentity } : {}),
     });
+    if (!this.defaultProfile()) this.setDefault(profile.name);
+    return profile;
+  }
+
+  githubProfile(accountId: string): GitProfile | undefined {
+    return this.list().find((profile) => profile.github?.id === accountId);
+  }
+
+  setActiveGithub(accountId: string): GitProfile {
+    const profile = this.githubProfile(accountId);
+    if (!profile) throw new Error('GitHub account identity is not configured');
     this.setDefault(profile.name);
     return profile;
   }
 
+  saveGithubCustomIdentity(accountId: string, args: { userName?: string; userEmail?: string;
+    signingKey?: string; removeSigningKey?: boolean }): GitProfile {
+    const profile = this.githubProfile(accountId);
+    if (!profile?.github) throw new Error('Connect GitHub before customizing its identity');
+    const customIdentity = {
+      ...(args.userName?.trim() ? { userName: args.userName.trim() } : {}),
+      ...(args.userEmail?.trim() ? { userEmail: args.userEmail.trim() } : {}),
+    };
+    return this.save({
+      name: profile.name,
+      userName: customIdentity.userName || profile.github.name || profile.github.login,
+      userEmail: customIdentity.userEmail || `${profile.github.id}+${profile.github.login}@users.noreply.github.com`,
+      github: profile.github,
+      ...(Object.keys(customIdentity).length ? { customIdentity } : {}),
+      signingKey: args.signingKey,
+      clearSigningKey: args.removeSigningKey,
+    });
+  }
+
+  /** Compatibility for callers from the single-account UI/API. */
   saveGithubSigningKey(signingKey: string): GitProfile {
-    const profile = this.get(GITHUB_GIT_PROFILE);
+    const profile = this.resolve(undefined);
     if (!profile?.github) throw new Error('Connect GitHub before adding a signing key');
-    return this.save({ name: profile.name, userName: profile.userName, userEmail: profile.userEmail,
-      github: profile.github, signingKey });
+    return this.saveGithubCustomIdentity(profile.github.id, { signingKey });
+  }
+
+  deleteGithubIdentity(accountId: string): void {
+    const profile = this.githubProfile(accountId);
+    if (profile) this.delete(profile.name);
+  }
+
+  automationIdentity(): GitProfile | undefined {
+    return this.get(GITHUB_AUTOMATION_PROFILE);
+  }
+
+  saveAutomationIdentity(args: { userName?: string; userEmail?: string; signingKey?: string;
+    removeSigningKey?: boolean }): GitProfile | undefined {
+    const customIdentity = {
+      ...(args.userName?.trim() ? { userName: args.userName.trim() } : {}),
+      ...(args.userEmail?.trim() ? { userEmail: args.userEmail.trim() } : {}),
+    };
+    const profile = this.save({
+      name: GITHUB_AUTOMATION_PROFILE,
+      userName: customIdentity.userName || 'krmax',
+      userEmail: customIdentity.userEmail || `krmax+${this.organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost`,
+      ...(Object.keys(customIdentity).length ? { customIdentity } : {}),
+      signingKey: args.signingKey,
+      clearSigningKey: args.removeSigningKey,
+    });
+    this.setDefault(profile.name);
+    return profile;
   }
 
   delete(name: string) {

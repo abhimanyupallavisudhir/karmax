@@ -124,7 +124,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
-  if (/^\/api\/user\/git-profiles(?:\/|$)/.test(p)) return 'none';
+  if (/^\/api\/user\/(?:git-profiles|github-accounts)(?:\/|$)/.test(p)) return 'none';
   if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
@@ -135,7 +135,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
-  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
@@ -964,7 +964,8 @@ export class Gateway {
       try {
         await this.deps.githubApp.convertManifest(code);
         const installState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
-          pending.returnTo === 'profile' ? { returnTo: 'profile' } : {});
+          pending.returnTo === 'profile' ? { returnTo: 'profile', selectAccount: pending.selectAccount,
+            githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin } : {});
         res.writeHead(303, { location: this.deps.githubApp.installationUrl(installState) });
         return void res.end();
       } catch (error) {
@@ -979,8 +980,17 @@ export class Gateway {
       const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
       if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
       try {
-        const githubIdentity = await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
+        const githubIdentity = await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req), {
+          expectedAccountId: pending.githubAccountId,
+          makeActive: pending.selectAccount || !pending.githubAccountId,
+        });
         await this.saveGithubIdentity(identity.user.id, githubIdentity);
+        const activeAccountId = this.deps.githubApp.activeUserAccountId(identity.user.id);
+        if (activeAccountId) {
+          const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
+          new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(identity.user.id))
+            .setActiveGithub(activeAccountId);
+        }
         for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
           await this.ensureProjectWiki(project, identity.user.id);
         const destination = pending.returnTo === 'profile'
@@ -1002,17 +1012,23 @@ export class Gateway {
       try {
         await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
         const status = this.deps.githubApp.status(identity.user.id);
-        if (status.oauthConfigured && !status.userAuthorized) {
+        if (pending.returnTo === 'profile' && status.oauthConfigured) {
           const oauthState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
-            pending.returnTo === 'profile' ? { returnTo: 'profile' } : {});
+            { returnTo: 'profile', selectAccount: pending.selectAccount,
+              githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin });
           const publicUrl = this.githubPublicUrl(req);
-          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
+          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl, {
+            login: pending.githubLogin, selectAccount: pending.selectAccount,
+          }) });
           return void res.end();
         }
-        if (status.userAuthorized)
-          await this.saveGithubIdentity(identity.user.id, await this.deps.githubApp.userIdentity(identity.user.id));
-        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
-          await this.ensureProjectWiki(project, identity.user.id);
+        // Repository provisioning needs a human user authorization. Installing
+        // the organization App is still a complete repository-transport setup on
+        // its own; defer wiki creation until a connected person is available.
+        if (status.userAuthorized) {
+          for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+            await this.ensureProjectWiki(project, identity.user.id);
+        }
         const destination = pending.returnTo === 'profile'
           ? userProfilePath(this.deps.store, pending.organizationId)
           : organizationSettingsPath(this.deps.store, pending.organizationId);
@@ -1451,17 +1467,44 @@ export class Gateway {
         store.removeTeamMembership(teamMember[2]!, teamMember[3]!);
         return this.json(res, 200, { ok: true });
       }
-      const gitConnections = p.match(/^\/api\/organizations\/([^/]+)\/git-connections$/);
+      const gitConnections = p.match(/^\/api\/organizations\/([^/]+)\/git-connections(?:\/([^/]+))?$/);
       if (gitConnections) {
         const organizationId = gitConnections[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listGitConnections(organizationId));
-        if (method === 'POST') {
+        const connectionId = gitConnections[2] ? decodeURIComponent(gitConnections[2]) : undefined;
+        if (method === 'GET' && !connectionId) return this.json(res, 200, store.listGitConnections(organizationId));
+        if (method === 'POST' && !connectionId) {
           const b = await this.body(req);
           if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
           const connected = await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? ''));
           for (const project of store.listProjects().filter((candidate) => candidate.organizationId === organizationId))
             await this.ensureProjectWiki(project, session.userId);
           return this.json(res, 200, connected);
+        }
+        if (method === 'DELETE' && connectionId) {
+          const connections = store.listGitConnections(organizationId);
+          if (!connections.some((connection) => connection.id === connectionId))
+            return this.json(res, 404, { error: 'GitHub connection not found' });
+          if (connections.length <= 1) return this.json(res, 409, { error: 'Connect a new GitHub account first' });
+          if (this.deps.githubApp) this.deps.githubApp.disconnectInstallation(connectionId);
+          else store.deleteGitConnection(connectionId);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const githubIdentity = p.match(/^\/api\/organizations\/([^/]+)\/github\/identity$/);
+      if (githubIdentity) {
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gp = new GitProfiles(store, this.deps.broker, undefined, githubIdentity[1]!);
+        if (method === 'GET') return this.json(res, 200, { profile: gp.automationIdentity() ?? null });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, { profile: gp.saveAutomationIdentity({
+              userName: b.userName ? String(b.userName) : undefined,
+              userEmail: b.userEmail ? String(b.userEmail) : undefined,
+              signingKey: b.signingKey ? String(b.signingKey) : undefined,
+              removeSigningKey: b.removeSigningKey === true,
+            }) ?? null });
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
       const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
@@ -1488,7 +1531,7 @@ export class Gateway {
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = store.createGithubInstallState(githubManifest[1]!, session.userId,
-          b.returnTo === 'profile' ? { returnTo: 'profile' } : {});
+          b.returnTo === 'profile' ? { returnTo: 'profile', selectAccount: true } : {});
         try {
           const publicUrl = this.githubPublicUrl(req, b.publicUrl);
           return this.json(res, 200, this.deps.githubApp.manifest(publicUrl, state));
@@ -1500,9 +1543,20 @@ export class Gateway {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const b = await this.body(req);
+        const reconnectAccountId = b.accountId ? String(b.accountId) : undefined;
+        let reconnectLogin: string | undefined;
+        if (reconnectAccountId) {
+          const account = (await this.deps.githubApp.listUserAccounts(session.userId))
+            .find((candidate) => candidate.id === reconnectAccountId);
+          if (!account) return this.json(res, 404, { error: 'GitHub account is not connected' });
+          reconnectLogin = account.login;
+        }
         const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId,
-          b.returnTo === 'profile' ? { returnTo: 'profile' } : {});
-        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req)) }); }
+          b.returnTo === 'profile' ? { returnTo: 'profile', githubAccountId: reconnectAccountId,
+            githubLogin: reconnectLogin, selectAccount: b.mode === 'add' } : {});
+        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req), {
+          login: reconnectLogin, selectAccount: b.mode === 'add',
+        }) }); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
@@ -4163,6 +4217,51 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
+      const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity))?)?$/);
+      if (githubAccountsResource) {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp || !this.deps.broker)
+          return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
+        const gp = new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId));
+        const accountId = githubAccountsResource[1] ? decodeURIComponent(githubAccountsResource[1]) : undefined;
+        const action = githubAccountsResource[2];
+        try {
+          if (method === 'GET' && !accountId) {
+            const accounts = await this.deps.githubApp.listUserAccounts(session.userId);
+            for (const account of accounts) gp.saveGithubIdentity(account);
+            const active = accounts.find((account) => account.active);
+            if (active) gp.setActiveGithub(active.id);
+            return this.json(res, 200, {
+              accounts: accounts.map((account) => ({ ...account, profile: gp.githubProfile(account.id) ?? null })),
+              githubApp: this.deps.githubApp.status(session.userId),
+            });
+          }
+          if (method === 'POST' && accountId && action === 'active') {
+            await this.deps.githubApp.setActiveUserAccount(session.userId, accountId);
+            return this.json(res, 200, { profile: gp.setActiveGithub(accountId) });
+          }
+          if (method === 'PUT' && accountId && action === 'identity') {
+            const b = await this.body(req);
+            return this.json(res, 200, { profile: gp.saveGithubCustomIdentity(accountId, {
+              userName: b.userName ? String(b.userName) : undefined,
+              userEmail: b.userEmail ? String(b.userEmail) : undefined,
+              signingKey: b.signingKey ? String(b.signingKey) : undefined,
+              removeSigningKey: b.removeSigningKey === true,
+            }) });
+          }
+          if (method === 'DELETE' && accountId && !action) {
+            const active = await this.deps.githubApp.removeUserAccount(session.userId, accountId);
+            gp.deleteGithubIdentity(accountId);
+            gp.setActiveGithub(active);
+            return this.json(res, 200, { ok: true, activeAccountId: active });
+          }
+        } catch (error) {
+          return this.json(res, error instanceof Error && error.message === 'Connect a new GitHub account first' ? 409 : 400,
+            { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       // Git profiles: a person's development identity lives at /api/user/…;
       // organization profiles remain a distinct service/automation credential.
       // the repos karmax works on. The registry is public; secrets are write-only
@@ -4211,8 +4310,10 @@ export class Gateway {
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!String(b.signingKey ?? '').trim()) return this.json(res, 400, { error: 'signing key required' });
         try {
-          const profile = new GitProfiles(store, this.deps.broker, undefined, gitScope!)
-            .saveGithubSigningKey(String(b.signingKey));
+          const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
+          const profile = gp.resolve(undefined)?.github
+            ? gp.saveGithubCustomIdentity(gp.resolve(undefined)!.github!.id, { signingKey: String(b.signingKey) })
+            : (() => { throw new Error('Connect GitHub before adding a signing key'); })();
           return this.json(res, 200, { profile });
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });

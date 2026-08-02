@@ -211,6 +211,17 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     expect(store.tagsFor(task.id).map((id) => byId.get(id)!.name).sort()).toEqual(['bug', 'search']);
   });
 
+  it('pins the active personal GitHub account when a human creates a task', async () => {
+    let active = '42';
+    const accountApi = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir,
+      worlds: new WorldRegistry(), githubApp: { activeUserAccountId: () => active } as any });
+    const first = await accountApi.createTask(token, { projectId: mine, prompt: 'first', draft: true });
+    active = '99';
+    const second = await accountApi.createTask(token, { projectId: mine, prompt: 'second', draft: true });
+    expect(store.getTask(first.id)?.params._githubAccountId).toBe('42');
+    expect(store.getTask(second.id)?.params._githubAccountId).toBe('99');
+  });
+
   it('stores explicit multi-project and organization authorization on tasks and refuses over-granting', async () => {
     const organization = store.getProject(mine)!.organizationId!;
     const sibling = store.createProject('Sibling', {}, organization).id;

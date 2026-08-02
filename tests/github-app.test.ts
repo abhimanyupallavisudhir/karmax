@@ -9,6 +9,38 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 
 describe('GitHub App integration', () => {
+  it('keeps multiple personal accounts, selects an active one, and guards the last connection', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-accounts-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') {
+        const code = new URLSearchParams(String(init.body)).get('code');
+        return Response.json({ access_token: code === 'second' ? 'token-2' : 'token-1' });
+      }
+      const auth = String((init.headers as Record<string, string> | undefined)?.authorization ?? '');
+      if (url.pathname === '/user' && auth === 'Bearer token-1') return Response.json({ id: 1, login: 'first' });
+      if (url.pathname === '/user' && auth === 'Bearer token-2') return Response.json({ id: 2, login: 'second' });
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+    const picker = new URL(service.userAuthorizationUrl('state', 'https://karmax.example', { selectAccount: true }));
+    expect(picker.searchParams.get('prompt')).toBe('select_account');
+    await service.authorizeUser('owner', 'first', undefined, { makeActive: true });
+    await service.authorizeUser('owner', 'second', undefined, { makeActive: true });
+    expect(await service.listUserAccounts('owner')).toEqual([
+      expect.objectContaining({ id: '1', login: 'first', active: false }),
+      expect.objectContaining({ id: '2', login: 'second', active: true }),
+    ]);
+    await service.setActiveUserAccount('owner', '1');
+    expect(service.activeUserAccountId('owner')).toBe('1');
+    expect(await service.removeUserAccount('owner', '2')).toBe('1');
+    await expect(service.removeUserAccount('owner', '1')).rejects.toThrow('Connect a new GitHub account first');
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('bootstraps itself through an App manifest and creates a repository without deploy keys', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-turnkey-'));
     const store = new Store(':memory:');

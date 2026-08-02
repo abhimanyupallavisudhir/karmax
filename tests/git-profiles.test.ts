@@ -129,6 +129,23 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     });
   });
 
+  it('keeps per-account custom identities separate and supports an organization automation identity', () => {
+    const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    user.saveGithubIdentity({ id: '1', login: 'first', name: 'First Person' });
+    user.saveGithubIdentity({ id: '2', login: 'second' });
+    user.saveGithubCustomIdentity('2', { userName: 'Release Author', userEmail: 'release@example.test', signingKey: 'SIGN' });
+    expect(user.githubProfile('1')).toMatchObject({ name: 'github', userName: 'First Person' });
+    expect(user.githubProfile('2')).toMatchObject({ name: 'github-2', userName: 'Release Author',
+      userEmail: 'release@example.test', customIdentity: { userName: 'Release Author', userEmail: 'release@example.test' }, signingKey: true });
+    expect(user.setActiveGithub('2').name).toBe('github-2');
+
+    const organization = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
+    expect(organization.saveAutomationIdentity({ userName: 'Acme Bot' })).toMatchObject({
+      userName: 'Acme Bot', userEmail: 'krmax+org-acme@localhost', customIdentity: { userName: 'Acme Bot' },
+    });
+    expect(organization.saveAutomationIdentity({})).toMatchObject({ userName: 'krmax' });
+  });
+
   it('lets an empty organization link its default to an authorized user profile without copying secrets', () => {
     const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
     user.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' });
@@ -424,7 +441,7 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const committed = await git(cwd, ['commit', '-q', '-m', 'tenant']);
       expect(committed.code, committed.stderr).toBe(0);
       expect((await git(cwd, ['log', '-1', '--format=%an <%ae>'])).stdout.trim())
-        .toBe(`karmax <karmax+${organization.id.replace(/[^a-z0-9.-]/gi, '-')}@localhost>`);
+        .toBe(`krmax <krmax+${organization.id.replace(/[^a-z0-9.-]/gi, '-')}@localhost>`);
       await core.destroyWorld(handle);
     } finally {
       delete process.env.KARMAX_HOME;

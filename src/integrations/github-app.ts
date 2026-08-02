@@ -13,7 +13,11 @@ const GITHUB_APP_ID_KEY = 'github-app:id';
 const GITHUB_APP_SLUG_KEY = 'github-app:slug';
 const GITHUB_APP_CLIENT_ID_KEY = 'github-app:client-id';
 export const GITHUB_APP_PUBLIC_URL_KEY = 'github-app:public-url';
-const githubUserTokenHandle = (userId: string) => `github-app:user:${userId}:authorization`;
+const legacyGithubUserTokenHandle = (userId: string) => `github-app:user:${userId}:authorization`;
+const githubUserTokenHandle = (userId: string, accountId: string) =>
+  `github-app:user:${userId}:account:${accountId}:authorization`;
+const githubUserAccountsKey = (userId: string) => `github-app:user:${userId}:accounts`;
+const githubUserActiveAccountKey = (userId: string) => `github-app:user:${userId}:active-account`;
 
 function publicWebhookOrigin(url: URL): boolean {
   if (url.protocol !== 'https:') return false;
@@ -53,6 +57,10 @@ export interface GitHubUserIdentity {
   id: string;
   login: string;
   name?: string;
+}
+
+export interface GitHubUserAccount extends GitHubUserIdentity {
+  active: boolean;
 }
 
 export interface GitHubAppOptions {
@@ -172,7 +180,9 @@ export class GitHubAppService {
       oauthConfigured: Boolean(this.options.clientId && this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)),
       webhookConfigured: this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE),
       syncMode,
-      userAuthorized: Boolean(userId && this.broker.hasHandle(githubUserTokenHandle(userId))),
+      userAuthorized: Boolean(userId && (this.userAccounts(userId).some((account) =>
+        this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
+        || this.broker.hasHandle(legacyGithubUserTokenHandle(userId)))),
     };
   }
 
@@ -246,36 +256,102 @@ export class GitHubAppService {
       webhookSecret: value.webhook_secret, clientId: value.client_id, clientSecret: value.client_secret });
   }
 
-  userAuthorizationUrl(state: string, publicUrl: string): string {
+  userAuthorizationUrl(state: string, publicUrl: string, options: { login?: string; selectAccount?: boolean } = {}): string {
     if (!this.options.clientId || !this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
       throw new Error('GitHub user authorization is unavailable; configure the App client id and secret');
     const url = new URL('https://github.com/login/oauth/authorize');
     url.searchParams.set('client_id', this.options.clientId);
     url.searchParams.set('redirect_uri', `${new URL(publicUrl).origin}/api/github/oauth/callback`);
     url.searchParams.set('state', state);
+    if (options.login?.trim()) url.searchParams.set('login', options.login.trim());
+    if (options.selectAccount) url.searchParams.set('prompt', 'select_account');
     return url.toString();
   }
 
-  async authorizeUser(userId: string, code: string, publicUrl?: string): Promise<GitHubUserIdentity> {
+  async authorizeUser(userId: string, code: string, publicUrl?: string,
+    options: { expectedAccountId?: string; makeActive?: boolean } = {}): Promise<GitHubUserIdentity> {
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
     const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] });
     const value = await this.oauthToken({ client_id: this.options.clientId, client_secret: clientSecret, code,
       ...(publicUrl ? { redirect_uri: `${new URL(publicUrl).origin}/api/github/oauth/callback` } : {}) });
     if (!value.access_token) throw new Error(value.error_description || value.error || 'GitHub returned no user access token');
-    this.saveUserToken(userId, value);
-    return this.userIdentity(userId);
+    const identity = await this.identityForToken(String(value.access_token));
+    if (options.expectedAccountId && identity.id !== options.expectedAccountId)
+      throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
+    this.saveUserToken(userId, identity.id, value);
+    const accounts = this.userAccounts(userId);
+    const prior = accounts.find((account) => account.id === identity.id);
+    const next = [...accounts.filter((account) => account.id !== identity.id), { ...prior, ...identity }];
+    this.saveUserAccounts(userId, next);
+    if (options.makeActive || !this.activeUserAccountId(userId))
+      this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
+    return identity;
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply
    * address is derived later, so this does not request private-email access. */
-  async userIdentity(userId: string): Promise<GitHubUserIdentity> {
-    const value = await this.userRequest<{ id?: string | number; login?: string; name?: string | null }>(userId, '/user');
+  async userIdentity(userId: string, accountId?: string): Promise<GitHubUserIdentity> {
+    const value = await this.userRequest<{ id?: string | number; login?: string; name?: string | null }>(
+      userId, '/user', {}, accountId);
+    return this.parseUserIdentity(value);
+  }
+
+  private async identityForToken(token: string): Promise<GitHubUserIdentity> {
+    return this.parseUserIdentity(await this.request<{ id?: string | number; login?: string; name?: string | null }>('/user', token));
+  }
+
+  private parseUserIdentity(value: { id?: string | number; login?: string; name?: string | null }): GitHubUserIdentity {
     const id = String(value.id ?? '').trim();
     const login = String(value.login ?? '').trim();
     if (!/^\d+$/.test(id) || !/^[A-Za-z0-9-]+$/.test(login))
       throw new Error('GitHub returned an invalid account identity');
     return { id, login, ...(value.name?.trim() ? { name: value.name.trim() } : {}) };
+  }
+
+  private userAccounts(userId: string): GitHubUserIdentity[] {
+    try {
+      const value = JSON.parse(this.store.kvGet(githubUserAccountsKey(userId)) ?? '[]');
+      return Array.isArray(value) ? value.filter((account): account is GitHubUserIdentity =>
+        /^\d+$/.test(String(account?.id ?? '')) && /^[A-Za-z0-9-]+$/.test(String(account?.login ?? ''))) : [];
+    } catch { return []; }
+  }
+
+  private saveUserAccounts(userId: string, accounts: GitHubUserIdentity[]): void {
+    this.store.kvSet(githubUserAccountsKey(userId), JSON.stringify(accounts));
+  }
+
+  activeUserAccountId(userId: string): string | undefined {
+    const configured = this.userAccounts(userId).filter((account) =>
+      this.broker.hasHandle(githubUserTokenHandle(userId, account.id)));
+    const active = this.store.kvGet(githubUserActiveAccountKey(userId));
+    return configured.some((account) => account.id === active) ? active : configured[0]?.id;
+  }
+
+  async listUserAccounts(userId: string): Promise<GitHubUserAccount[]> {
+    await this.migrateLegacyUserAuthorization(userId);
+    const active = this.activeUserAccountId(userId);
+    return this.userAccounts(userId)
+      .filter((account) => this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
+      .map((account) => ({ ...account, active: account.id === active }));
+  }
+
+  async setActiveUserAccount(userId: string, accountId: string): Promise<void> {
+    const accounts = await this.listUserAccounts(userId);
+    if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
+    this.store.kvSet(githubUserActiveAccountKey(userId), accountId);
+  }
+
+  async removeUserAccount(userId: string, accountId: string): Promise<string> {
+    const accounts = await this.listUserAccounts(userId);
+    if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
+    if (accounts.length <= 1) throw new Error('Connect a new GitHub account first');
+    this.broker.deleteHandle(githubUserTokenHandle(userId, accountId));
+    const remaining = accounts.filter((account) => account.id !== accountId);
+    this.saveUserAccounts(userId, remaining);
+    const active = this.activeUserAccountId(userId) ?? remaining[0]!.id;
+    this.store.kvSet(githubUserActiveAccountKey(userId), active);
+    return active;
   }
 
   installationUrl(state: string): string {
@@ -301,6 +377,12 @@ export class GitHubAppService {
       installationId: String(installation.id), accountLogin: installation.account.login,
       accountType: installation.account.type, suspendedAt: installation.suspended_at ? Date.parse(installation.suspended_at) : undefined });
     return { connection, repositories: await this.reconcile(connection) };
+  }
+
+  disconnectInstallation(connectionId: string): void {
+    this.tokenCache.delete(connectionId);
+    this.tokenMints.delete(connectionId);
+    this.store.deleteGitConnection(connectionId);
   }
 
   async reconcile(connection: GitConnection): Promise<Repository[]> {
@@ -705,9 +787,13 @@ export class GitHubAppService {
     }
   }
 
-  private saveUserToken(userId: string, value: any): void {
+  private saveUserToken(userId: string, accountId: string, value: any): void {
+    this.saveTokenHandle(githubUserTokenHandle(userId, accountId), value);
+  }
+
+  private saveTokenHandle(handle: string, value: any): void {
     const now = Date.now();
-    this.broker.registerHandle(githubUserTokenHandle(userId), JSON.stringify({
+    this.broker.registerHandle(handle, JSON.stringify({
       accessToken: String(value.access_token),
       expiresAt: value.expires_in ? now + Number(value.expires_in) * 1000 : undefined,
       refreshToken: value.refresh_token ? String(value.refresh_token) : undefined,
@@ -721,8 +807,9 @@ export class GitHubAppService {
    * made with this token as the person, not as the organization App.
    * `forceRefresh` recovers from early invalidation; a dead refresh grant is
    * cleared so status flips to disconnected instead of 401ing forever. */
-  async userAccessToken(userId: string, opts: { forceRefresh?: boolean } = {}): Promise<string> {
-    const handle = githubUserTokenHandle(userId);
+  async userAccessToken(userId: string, opts: { forceRefresh?: boolean; accountId?: string } = {}): Promise<string> {
+    const accountId = opts.accountId ?? this.activeUserAccountId(userId);
+    const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
     if (!this.broker.hasHandle(handle)) throw new Error('Connect your GitHub identity before acting on your behalf');
     const stored = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as {
       accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
@@ -744,20 +831,35 @@ export class GitHubAppService {
       const reason = value.error_description || value.error;
       throw new Error(`GitHub authorization expired; reconnect your GitHub identity on your user page${reason ? ` (${reason})` : ''}`);
     }
-    this.saveUserToken(userId, value);
+    this.saveTokenHandle(handle, value);
     return String(value.access_token);
   }
 
   /** A user-token GitHub request that self-heals a server-side invalidation: on a
    * 401 it forces a token refresh once and retries, so a token karmax's own clock
    * still trusts (but GitHub has revoked) recovers instead of failing the caller. */
-  private async userRequest<T = unknown>(userId: string, pathname: string, init: RequestInit = {}): Promise<T> {
+  private async userRequest<T = unknown>(userId: string, pathname: string, init: RequestInit = {}, accountId?: string): Promise<T> {
     try {
-      return await this.request<T>(pathname, await this.userAccessToken(userId), init);
+      return await this.request<T>(pathname, await this.userAccessToken(userId, { accountId }), init);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.includes('GitHub API 401')) throw error;
-      return await this.request<T>(pathname, await this.userAccessToken(userId, { forceRefresh: true }), init);
+      return await this.request<T>(pathname, await this.userAccessToken(userId, { forceRefresh: true, accountId }), init);
     }
+  }
+
+  /** Move the pre-multi-account authorization into the account-addressed vault
+   * namespace after discovering its stable GitHub id. This is lazy so boot never
+   * depends on GitHub being reachable. */
+  private async migrateLegacyUserAuthorization(userId: string): Promise<void> {
+    const legacy = legacyGithubUserTokenHandle(userId);
+    if (!this.broker.hasHandle(legacy)) return;
+    const identity = await this.userIdentity(userId);
+    const stored = this.broker.resolve(legacy, { caps: [`use-credential:${legacy}`] });
+    this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored);
+    const accounts = this.userAccounts(userId);
+    this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), identity]);
+    if (!this.store.kvGet(githubUserActiveAccountKey(userId))) this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
+    this.broker.deleteHandle(legacy);
   }
 
   private async oauthToken(input: Record<string, string>): Promise<any> {

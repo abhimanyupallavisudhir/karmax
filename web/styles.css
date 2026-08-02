@@ -919,18 +919,23 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .profile-org:hover { border-color: var(--accent); background: var(--accent-weak); }
 .profile-org-mark { color: var(--ink-3); }
 .profile-org-name { font-weight: 600; flex: 1; }
-.profile-github-row { display: flex; align-items: center; gap: 10px; }
-.profile-github-signing { margin-top: 13px; }
-.profile-github-signing summary { color: var(--ink-2); font-size: 13px; cursor: pointer; }
-.profile-github-signing summary span { color: var(--ink-3); }
-.profile-github-signing textarea { width: 100%; margin-top: 10px; resize: vertical; }
+.github-mark { width: 16px; height: 16px; flex: none; }
+.github-account-list { display: grid; gap: 8px; margin-bottom: 10px; }
+.github-account-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.github-account-label, .github-account-actions, .github-org-actions { display: flex; align-items: center; gap: 8px; }
+.github-account-actions { justify-content: flex-end; flex-wrap: wrap; }
+.github-account-row .icon-btn svg { width: 15px; height: 15px; }
+.github-org-actions { flex-wrap: wrap; }
+.git-identity-dialog { width: min(480px, calc(100vw - 28px)); }
+.git-identity-dialog textarea { width: 100%; resize: vertical; }
 @media (max-width: 560px) {
   .profile-row-action { align-items: flex-start; }
   .profile-row-control { flex-wrap: wrap; }
   .profile-row-value { max-width: 100%; }
   .profile-password-fields { grid-template-columns: 1fr; }
   .profile-password-fields .form-row:first-child { grid-column: auto; }
-  .profile-github-row { align-items: flex-start; flex-direction: column; }
+  .github-account-row { align-items: flex-start; flex-direction: column; }
+  .github-account-actions { justify-content: flex-start; }
 }
 
 /* confirm layers (SPEC §5.2): one bordered row per Review gate, played in order */

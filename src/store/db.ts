@@ -358,7 +358,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS github_install_states (
         tokenHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, usedAt INTEGER,
-        returnTo TEXT
+        returnTo TEXT, githubAccountId TEXT, githubLogin TEXT, selectAccount INTEGER
       );
       CREATE TABLE IF NOT EXISTS world_instances (
         worldId TEXT NOT NULL, generation INTEGER NOT NULL, handle TEXT NOT NULL,
@@ -641,6 +641,12 @@ export class Store {
     const githubStateCols = this.db.prepare('PRAGMA table_info(github_install_states)').all() as { name: string }[];
     if (!githubStateCols.some((c) => c.name === 'returnTo'))
       this.db.exec('ALTER TABLE github_install_states ADD COLUMN returnTo TEXT');
+    if (!githubStateCols.some((c) => c.name === 'githubAccountId'))
+      this.db.exec('ALTER TABLE github_install_states ADD COLUMN githubAccountId TEXT');
+    if (!githubStateCols.some((c) => c.name === 'githubLogin'))
+      this.db.exec('ALTER TABLE github_install_states ADD COLUMN githubLogin TEXT');
+    if (!githubStateCols.some((c) => c.name === 'selectAccount'))
+      this.db.exec('ALTER TABLE github_install_states ADD COLUMN selectAccount INTEGER');
     const wikiVersionCols = this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all() as any[];
     if (!wikiVersionCols.some((c) => c.name === 'previousPath'))
       this.db.exec('ALTER TABLE organization_wiki_versions ADD COLUMN previousPath TEXT');
@@ -1581,6 +1587,18 @@ export class Store {
     return (this.db.prepare('SELECT * FROM git_connections WHERE organizationId=? ORDER BY createdAt').all(organizationId) as any[]).map(rowToGitConnection);
   }
 
+  deleteGitConnection(id: string): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE repositories SET gitConnectionId=NULL WHERE gitConnectionId=?').run(id);
+      this.db.prepare('DELETE FROM git_connections WHERE id=?').run(id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   upsertRepository(input: Omit<Repository, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }): Repository {
     if (!/^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(input.sshUrl)) throw new Error('repository must use a GitHub SSH URL');
     const existing = this.db.prepare('SELECT id, createdAt FROM repositories WHERE organizationId=? AND provider=? AND owner=? AND name=?')
@@ -1651,25 +1669,32 @@ export class Store {
    * Only its SHA-256 digest is durable, so a database read cannot mint a valid
    * callback. The state is consumed atomically before any GitHub API call. */
   createGithubInstallState(organizationId: string, userId: string,
-    options: number | { ttlMs?: number; returnTo?: 'profile' } = {}): string {
+    options: number | { ttlMs?: number; returnTo?: 'profile'; githubAccountId?: string;
+      githubLogin?: string; selectAccount?: boolean } = {}): string {
     if (!this.organizationMembership(organizationId, userId)) throw new Error('user is not an organization member');
     const state = `kg_${crypto.randomBytes(32).toString('base64url')}`;
     const now = Date.now();
     const ttlMs = typeof options === 'number' ? options : options.ttlMs ?? 10 * 60_000;
     const returnTo = typeof options === 'object' && options.returnTo === 'profile' ? 'profile' : undefined;
+    const githubAccountId = typeof options === 'object' ? options.githubAccountId?.trim() : undefined;
+    const githubLogin = typeof options === 'object' ? options.githubLogin?.trim() : undefined;
+    const selectAccount = typeof options === 'object' && options.selectAccount;
     this.db.prepare('DELETE FROM github_install_states WHERE expiresAt<=? OR usedAt IS NOT NULL').run(now);
     this.db.prepare(`INSERT INTO github_install_states
-      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo) VALUES (?, ?, ?, ?, ?, NULL, ?)`)
-      .run(sha256(state), organizationId, userId, now, now + Math.max(60_000, ttlMs), returnTo ?? null);
+      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo, githubAccountId, githubLogin, selectAccount)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`)
+      .run(sha256(state), organizationId, userId, now, now + Math.max(60_000, ttlMs), returnTo ?? null,
+        githubAccountId ?? null, githubLogin ?? null, selectAccount ? 1 : 0);
     return state;
   }
 
-  consumeGithubInstallState(state: string, userId: string): { organizationId: string; returnTo?: 'profile' } | undefined {
+  consumeGithubInstallState(state: string, userId: string): { organizationId: string; returnTo?: 'profile';
+    githubAccountId?: string; githubLogin?: string; selectAccount?: boolean } | undefined {
     const hash = sha256(state);
     const now = Date.now();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const row = this.db.prepare(`SELECT organizationId, userId, returnTo FROM github_install_states
+      const row = this.db.prepare(`SELECT organizationId, userId, returnTo, githubAccountId, githubLogin, selectAccount FROM github_install_states
         WHERE tokenHash=? AND usedAt IS NULL AND expiresAt>?`).get(hash, now) as any;
       if (!row || row.userId !== userId) {
         this.db.exec('ROLLBACK');
@@ -1680,6 +1705,9 @@ export class Store {
       return {
         organizationId: String(row.organizationId),
         ...(row.returnTo === 'profile' ? { returnTo: 'profile' as const } : {}),
+        ...(row.githubAccountId ? { githubAccountId: String(row.githubAccountId) } : {}),
+        ...(row.githubLogin ? { githubLogin: String(row.githubLogin) } : {}),
+        ...(row.selectAccount ? { selectAccount: true } : {}),
       };
     } catch (error) {
       this.db.exec('ROLLBACK');

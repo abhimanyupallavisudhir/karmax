@@ -66,6 +66,8 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/user/git-profiles')).toBe('none');
     expect(cap('POST', '/api/user/git-profiles')).toBe('none');
     expect(cap('DELETE', '/api/user/git-profiles/main')).toBe('none');
+    expect(cap('GET', '/api/user/github-accounts')).toBe('none');
+    expect(cap('PUT', '/api/user/github-accounts/42/identity')).toBe('none');
   });
 });
 

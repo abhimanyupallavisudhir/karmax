@@ -372,6 +372,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   );
 
   const gitProfilesForScope = (scope: string) => new GitProfiles(store, deps.broker, paths().state, scope);
+  const activeGithubAccountId = (userId: string) => typeof deps.githubApp?.activeUserAccountId === 'function'
+    ? deps.githubApp.activeUserAccountId(userId) : undefined;
+
+  const taskGithubAccountId = (taskId: string): string | undefined => {
+    const seen = new Set<string>();
+    let task = store.getTask(taskId);
+    while (task && !seen.has(task.id)) {
+      seen.add(task.id);
+      const accountId = task.params?._githubAccountId;
+      if (typeof accountId === 'string' && /^\d+$/.test(accountId)) return accountId;
+      task = task.parentTaskId ? store.getTask(task.parentTaskId) : undefined;
+    }
+    return undefined;
+  };
 
   /** Development follows the human creator, never the tenant. Organization Git
    * remains the fallback for system/automation tasks that have no human owner and
@@ -381,11 +395,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (userId) {
       const scope = userGitScope(userId);
       const profiles = gitProfilesForScope(scope);
-      return { scope, profiles, profile: profiles.resolve(undefined), userId };
+      const accountId = taskGithubAccountId(taskId) ?? activeGithubAccountId(userId);
+      return { scope, profiles, profile: accountId ? profiles.githubProfile(accountId) : profiles.resolve(undefined), userId, accountId };
     }
     const profiles = organizationGitProfilesFor(projectId);
     const organizationId = (projectId ? store.getProject(projectId)?.organizationId : undefined) ?? 'org_personal';
-    return { scope: organizationId, profiles, profile: profiles.resolve({ gitProfile: requestedProfile }) };
+    const configured = profiles.resolve({ gitProfile: requestedProfile });
+    return { scope: organizationId, profiles,
+      profile: configured ?? profiles.automationIdentity() ?? profiles.saveAutomationIdentity({}) };
   };
 
   const gitBindingFromHandle = (handle: WorldHandle, taskId?: string) => {
@@ -515,13 +532,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ? handle.meta.projectId
       : store.getTask(handle.id)?.projectId;
     const userId = store.taskCreatorUserId(handle.id);
+    const accountId = taskGithubAccountId(handle.id) ?? (userId ? activeGithubAccountId(userId) : undefined);
     const repository = enrolledGithubRepository(projectId, slug);
     // Connected development uses the SAME deployment App in two distinct
     // capacities: its installation owns repository transport, while this
     // per-user OAuth grant makes the PR attributable to the task creator.
     if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).userAuthorized) {
       return new GithubPrApi(
-        (options) => deps.githubApp!.userAccessToken(userId, options),
+        (options) => deps.githubApp!.userAccessToken(userId, { ...options, ...(accountId ? { accountId } : {}) }),
         deps.githubPr ?? {},
       );
     }

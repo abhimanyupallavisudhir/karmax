@@ -140,6 +140,11 @@ describe('organization and collaboration domain', () => {
       organizationId: organization.id,
       returnTo: 'profile',
     });
+    const accountState = store.createGithubInstallState(organization.id, 'owner', { returnTo: 'profile',
+      githubAccountId: '42', githubLogin: 'octocat', selectAccount: true });
+    expect(store.consumeGithubInstallState(accountState, 'owner')).toEqual({
+      organizationId: organization.id, returnTo: 'profile', githubAccountId: '42', githubLogin: 'octocat', selectAccount: true,
+    });
     expect(() => store.createGithubInstallState(organization.id, 'attacker')).toThrow(/not an organization member/);
   });
 

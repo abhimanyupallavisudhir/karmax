@@ -11233,62 +11233,86 @@ function userDisplayName() {
   return 'Account';
 }
 
+const githubMark = () => `<svg class="github-mark" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0a8 8 0 0 0-2.53 15.59c.4.08.55-.17.55-.38l-.01-1.49c-2.23.49-2.7-1.08-2.7-1.08-.37-.93-.9-1.18-.9-1.18-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.34.67.07-.52.28-.87.51-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.65 7.65 0 0 1 8 3.73c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.66 3.95.29.25.54.74.54 1.5l-.01 2.31c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"/></svg>`;
+const trashIcon = () => `<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.5 1h3l.5 1H14v1.5H2V2h4l.5-1ZM3 5h10l-.6 9H3.6L3 5Zm2 1.5.4 6h1.4l-.2-6H5Zm4.4 0-.2 6h1.4l.4-6H9.4Z"/></svg>`;
+
 function profileGithubFields() {
-  return `<div class="profile-github" id="profile-github">
-    <div class="profile-github-row" id="user-github-connection"><button class="btn primary" id="user-authorize-github" type="button">Connect GitHub</button></div>
-    <details class="profile-github-signing">
-      <summary>GitHub signing key <span>(optional)</span></summary>
-      <textarea id="user-git-signing" rows="3" spellcheck="false"></textarea>
-      <div class="profile-edit-actions"><button class="btn sm" id="user-git-signing-save" type="button">Save</button><span class="task-sub" id="user-git-signing-result"></span></div>
-    </details>
+  return `<div class="profile-github" id="profile-github"><div class="task-sub">Loading…</div></div>`;
+}
+
+function submitGithubManifest(result) {
+  const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
+  const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
+  form.appendChild(manifest); document.body.appendChild(form); form.submit();
+}
+
+async function startUserGithubConnection(githubApp, mode, accountId) {
+  const organizationId = S.organizationId || currentOrg()?.id;
+  if (!organizationId) throw new Error('Choose an organization before connecting GitHub.');
+  if (!githubApp?.configured) {
+    return submitGithubManifest(await api(`/api/organizations/${organizationId}/github/app-manifest`, {
+      method: 'POST', body: JSON.stringify({ publicUrl: location.origin, returnTo: 'profile' }),
+    }));
+  }
+  const result = await api(`/api/organizations/${organizationId}/github/authorize`, {
+    method: 'POST', body: JSON.stringify({ returnTo: 'profile', mode, accountId }),
+  });
+  location.assign(result.url);
+}
+
+function openGitIdentityDialog({ title, profile, endpoint, onSaved }) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  const custom = profile?.customIdentity || {};
+  overlay.innerHTML = `<div class="modal-card git-identity-dialog" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head"><b>${esc(title)}</b><button class="icon-btn git-identity-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row">git config user.name <span class="task-sub">optional</span><input class="git-identity-name" value="${esc(custom.userName || '')}" /></label>
+    <label class="form-row">git config user.email <span class="task-sub">optional</span><input class="git-identity-email" type="email" value="${esc(custom.userEmail || '')}" /></label>
+    <label class="form-row">Signing key <span class="task-sub">optional</span><textarea class="git-identity-signing" rows="4" spellcheck="false" placeholder="${profile?.signingKey ? 'Saved — paste a new key to replace it' : ''}"></textarea></label>
+    ${profile?.signingKey ? '<label class="switch"><input class="git-identity-remove-signing" type="checkbox" />Remove saved signing key</label>' : ''}
+    <div class="modal-actions"><button class="btn git-identity-cancel" type="button">Cancel</button><button class="btn primary git-identity-save" type="button">Save</button></div>
   </div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.git-identity-close').addEventListener('click', close);
+  overlay.querySelector('.git-identity-cancel').addEventListener('click', close);
+  overlay.querySelector('.git-identity-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try {
+      await api(endpoint, { method: 'PUT', body: JSON.stringify({
+        userName: overlay.querySelector('.git-identity-name').value.trim() || undefined,
+        userEmail: overlay.querySelector('.git-identity-email').value.trim() || undefined,
+        signingKey: overlay.querySelector('.git-identity-signing').value.trim() || undefined,
+        removeSigningKey: overlay.querySelector('.git-identity-remove-signing')?.checked || false,
+      }) });
+      close(); toast('Git identity saved'); await onSaved?.();
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('.git-identity-name').focus();
 }
 
 async function hydrateProfileGithub() {
-  const box = $('#profile-github');
-  const connection = $('#user-github-connection');
-  if (!box || !connection) return;
+  const box = $('#profile-github'); if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
   let data;
-  try { data = await api('/api/user/git-profiles'); }
-  catch (error) { if (renderIsCurrent()) connection.textContent = error.message; return; }
+  try { data = await api('/api/user/github-accounts'); }
+  catch (error) { if (renderIsCurrent()) paneError(box, error, hydrateProfileGithub); return; }
   if (!renderIsCurrent()) return;
-  const github = data.githubApp;
-  const profile = data.profiles.find((candidate) => candidate.github && candidate.name === data.defaultProfile);
-  const githubConnectable = !github?.configured || github.oauthConfigured;
-  connection.innerHTML = `<button class="btn ${profile ? '' : 'primary'}" id="user-authorize-github" type="button" ${githubConnectable ? '' : 'disabled'}>${profile ? 'Reconnect GitHub' : 'Connect GitHub'}</button>${profile ? `<span class="task-sub">Connected as @${esc(profile.github.login)}</span>` : ''}`;
-  $('#user-authorize-github')?.addEventListener('click', async () => {
-    const organizationId = S.organizationId || currentOrg()?.id;
-    if (!organizationId) return toast('Choose an organization before connecting GitHub.', true);
-    try {
-      if (!github?.configured) {
-        const result = await api(`/api/organizations/${organizationId}/github/app-manifest`, {
-          method: 'POST', body: JSON.stringify({ publicUrl: location.origin, returnTo: 'profile' }),
-        });
-        const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
-        const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
-        form.appendChild(manifest); document.body.appendChild(form); form.submit();
-        return;
-      }
-      const result = await api(`/api/organizations/${organizationId}/github/authorize`, {
-        method: 'POST', body: JSON.stringify({ returnTo: 'profile' }),
-      });
-      location.assign(result.url);
-    } catch (error) { toast(error.message, true); }
-  });
-  const signingSave = $('#user-git-signing-save');
-  if (signingSave) signingSave.disabled = !profile;
-  $('#user-git-signing-result').textContent = profile?.signingKey ? 'Saved' : '';
-  signingSave?.addEventListener('click', async () => {
-    const signingKey = $('#user-git-signing').value.trim();
-    if (!signingKey) return;
-    signingSave.disabled = true;
-    try {
-      await api('/api/user/git-profiles/signing-key', { method: 'POST', body: JSON.stringify({ signingKey }) });
-      $('#user-git-signing').value = '';
-      $('#user-git-signing-result').textContent = 'Saved';
-    } catch (error) { toast(error.message, true); }
-    finally { signingSave.disabled = false; }
+  const accounts = data.accounts || [];
+  box.innerHTML = `<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
+    <span class="github-account-label">${githubMark()}<b>${esc(account.login)}</b>${account.active ? '<span class="chip">Active</span>' : ''}</span>
+    <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
+  </div>`).join('')}</div>
+  <button class="btn ${accounts.length ? '' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
+  box.querySelector('.github-add')?.addEventListener('click', () => startUserGithubConnection(data.githubApp, 'add').catch((error) => toast(error.message, true)));
+  box.querySelectorAll('.github-account-row').forEach((row) => {
+    const account = accounts.find((candidate) => candidate.id === row.dataset.account);
+    row.querySelector('.github-reconnect')?.addEventListener('click', () => startUserGithubConnection(data.githubApp, 'reconnect', account.id).catch((error) => toast(error.message, true)));
+    row.querySelector('.github-use')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}/active`, { method: 'POST', body: '{}' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
+    row.querySelector('.github-custom')?.addEventListener('click', () => openGitIdentityDialog({ title: 'Custom identity', profile: account.profile,
+      endpoint: `/api/user/github-accounts/${account.id}/identity`, onSaved: hydrateProfileGithub }));
+    row.querySelector('.github-remove')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });
 }
 
@@ -11734,9 +11758,10 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
-  const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
+  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
     api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
     api(`/api/organizations/${organizationId}/runner-pools`).catch(() => []),
     api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
     api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
@@ -11750,8 +11775,14 @@ async function hydrateOrganizationView() {
   $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
   $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
-  const githubAccounts = gitConnections.map((connection) => `@${connection.accountLogin}`).join(', ');
-  $('#org-github').innerHTML = `<div class="profile-github-row"><button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${gitConnections.length ? 'Manage GitHub' : 'Connect GitHub'}</button>${githubAccounts ? `<span class="task-sub">Connected to ${esc(githubAccounts)}</span>` : ''}</div>`;
+  const githubManageUrl = (connection) => connection.accountType === 'Organization'
+    ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
+    : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
+  $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => `<div class="github-account-row" data-connection="${esc(connection.id)}">
+    <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b></span>
+    <span class="github-account-actions"><a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
+  </div>`).join('')}</div>
+  <div class="github-org-actions"><button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}</div>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   S.worldProviderConnections = providerConnections;
   // The default Agent environment moved to Task defaults (below) and can be
@@ -11824,10 +11855,18 @@ async function hydrateOrganizationView() {
         return;
       }
       const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) });
-      const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
-      const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
-      form.appendChild(manifest); document.body.appendChild(form); form.submit();
+      submitGithubManifest(result);
     } catch (error) { toast(error.message, true); }
+  });
+  $('#org-github-custom')?.addEventListener('click', () => openGitIdentityDialog({
+    title: 'Custom automation identity', profile: githubIdentity.profile,
+    endpoint: `/api/organizations/${S.organizationId}/github/identity`, onSaved: hydrateOrganizationView,
+  }));
+  $('#org-github').querySelectorAll('.github-account-row').forEach((row) => {
+    row.querySelector('.github-remove')?.addEventListener('click', async () => {
+      try { await api(`/api/organizations/${S.organizationId}/git-connections/${encodeURIComponent(row.dataset.connection)}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
+      catch (error) { toast(error.message, true); }
+    });
   });
   $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
     const provider = row.dataset.provider;

@@ -42,16 +42,17 @@ describe('GitHub re-authorization affordance', () => {
     expect(githubAuthorizeButton(undefined, 'authorize-github')).toBe('');
   });
 
-  it('keeps the project escape hatch while profile and organization use their single controls', () => {
+  it('keeps the project escape hatch while profile and organization use account cards', () => {
     expect(source).toContain("githubAuthorizeButton(githubApp, 'project-authorize-github')");
     expect(source).not.toContain("githubAuthorizeButton(githubApp, 'authorize-github')");
     expect(source).not.toContain("githubAuthorizeButton(github, 'user-authorize-github')");
-    expect(source).toContain("profile ? 'Reconnect GitHub' : 'Connect GitHub'");
+    expect(source).toContain('github-account-row');
+    expect(source).toContain('Add new GitHub account');
     expect(source).not.toContain('githubApp.oauthConfigured && !githubApp.userAuthorized');
   });
 
   it('returns profile-originated authorization to the user page', () => {
-    expect(source).toContain("JSON.stringify({ returnTo: 'profile' })");
+    expect(source).toContain("returnTo: 'profile', mode, accountId");
     expect(gatewaySource).toContain("pending.returnTo === 'profile'");
     expect(gatewaySource).toContain('userProfilePath(this.deps.store, pending.organizationId)');
   });
