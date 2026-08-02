@@ -919,12 +919,36 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .profile-org:hover { border-color: var(--accent); background: var(--accent-weak); }
 .profile-org-mark { color: var(--ink-3); }
 .profile-org-name { font-weight: 600; flex: 1; }
+.personal-git-card { overflow: hidden; }
+.git-byline-preview {
+  display: flex; align-items: center; gap: 13px; margin: 16px 0;
+  padding: 13px 15px; border: 1px solid var(--line); border-radius: 10px;
+  background: linear-gradient(110deg, var(--surface-2), var(--surface));
+}
+.git-byline-preview > span:last-child { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 1px 9px; min-width: 0; }
+.git-byline-preview small { grid-column: 1 / -1; color: var(--ink-3); font: 10px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+.git-byline-preview b { font-size: 14px; }
+.git-byline-preview code { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; }
+.git-byline-mark { color: var(--ink-3); font-size: 12px; filter: drop-shadow(0 0 0 transparent); }
+.git-byline-mark.ready { color: var(--merged); filter: drop-shadow(0 0 5px color-mix(in srgb, var(--merged) 55%, transparent)); }
+.personal-git-list { margin-bottom: 12px; }
+.personal-git-profile { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.personal-git-profile .task-sub, .personal-git-profile small { flex-basis: 100%; color: var(--ink-3); }
+.personal-git-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; padding-top: 14px; }
+.personal-git-fields .wide { grid-column: 1 / -1; }
+.git-onboarding-note, .git-empty-state { color: var(--ink-2); font-size: 12px; line-height: 1.5; }
+.git-empty-state { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.git-empty-state > span { flex-basis: 100%; }
+.git-empty-state small { color: var(--ink-3); }
 @media (max-width: 560px) {
   .profile-row-action { align-items: flex-start; }
   .profile-row-control { flex-wrap: wrap; }
   .profile-row-value { max-width: 100%; }
   .profile-password-fields { grid-template-columns: 1fr; }
   .profile-password-fields .form-row:first-child { grid-column: auto; }
+  .personal-git-fields { grid-template-columns: 1fr; }
+  .personal-git-fields .wide { grid-column: auto; }
+  .git-byline-preview > span:last-child { grid-template-columns: 1fr; }
 }
 
 /* confirm layers (SPEC §5.2): one bordered row per Review gate, played in order */

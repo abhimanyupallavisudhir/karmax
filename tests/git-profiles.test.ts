@@ -8,7 +8,7 @@ import { finalizeMerge } from '../src/world/merge.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { GitProfiles, gitHandle } from '../src/autonomy/git-profiles.js';
+import { GitProfiles, gitHandle, userGitScope } from '../src/autonomy/git-profiles.js';
 import { remotePolicyOf } from '../src/domain/types.js';
 
 /** Git & GitHub configuration (PLAN-git-config.md): the GitProfile registry,
@@ -97,6 +97,38 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(beta.get('work')?.userEmail).toBe('bot@beta.test');
     expect(broker.hasHandle(gitHandle('work', 'token', 'org_beta'))).toBe(true);
     expect((await acme.preflight({})).tier).toBe('unconfigured');
+  });
+
+  it('stores each user’s development identity outside every organization registry', () => {
+    const jane = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    const sam = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_sam'));
+    jane.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' });
+    jane.setDefault('main');
+    sam.save({ name: 'main', userName: 'Sam Dev', userEmail: 'sam@example.test', githubToken: 'sam-token' });
+    sam.setDefault('main');
+
+    expect(jane.resolve({})?.userEmail).toBe('jane@example.test');
+    expect(sam.resolve({})?.userEmail).toBe('sam@example.test');
+    expect(profiles.list()).toEqual([]);
+    expect(jane.env(jane.get('main')!, {}).GH_TOKEN).toBe('jane-token');
+    expect(sam.env(sam.get('main')!, {}).GH_TOKEN).toBe('sam-token');
+  });
+
+  it('lets an empty organization link its default to an authorized user profile without copying secrets', () => {
+    const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    user.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test', githubToken: 'jane-token' });
+    user.setDefault('main');
+    const organization = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
+
+    const linked = organization.reuseUserProfile(user);
+    expect(linked.source).toEqual({ kind: 'user', userId: 'user_jane', profile: 'main' });
+    expect(organization.defaultProfile()).toBe('main');
+    expect(organization.env(linked, {}).GH_TOKEN).toBe('jane-token');
+    user.save({ name: 'main', userName: 'Jane Updated', userEmail: 'new@example.test', githubToken: 'rotated-token' });
+    expect(organization.get('main')).toMatchObject({ userName: 'Jane Updated', userEmail: 'new@example.test' });
+    expect(organization.env(organization.get('main')!, {}).GH_TOKEN).toBe('rotated-token');
+    expect(broker.hasHandle(gitHandle('main', 'token', 'org_acme'))).toBe(false);
+    expect(() => organization.reuseUserProfile(user)).toThrow(/already configured/i);
   });
 
   it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', () => {
@@ -262,6 +294,50 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const merged = await core.finalizeMergeActivity(handle, 'main');
       expect(merged.merged).toBe(true);
       expect((await git(repo, ['log', '-1', '--format=%an <%ae>', 'main'])).stdout.trim()).toBe('Jane <jane@example.com>');
+      await core.destroyWorld(handle);
+    } finally {
+      delete process.env.KARMAX_HOME;
+    }
+  });
+
+  it('attributes development to the human task creator instead of the organization account', async () => {
+    process.env.KARMAX_HOME = path.join(tmp, 'creator-home');
+    try {
+      const repo = await makeRepo('creator-repo');
+      const { Store } = await import('../src/store/db.js');
+      const { WorldRegistry } = await import('../src/world/registry.js');
+      const { ProfileResolver } = await import('../src/agent/profiles.js');
+      const { makeCoreActivities } = await import('../src/activities/core.js');
+      const store2 = new Store(':memory:');
+      const organization = store2.createOrganization({ name: 'Acme', ownerUserId: 'jane' });
+      const project = store2.createProject('Product', { repos: [repo] }, organization.id);
+      const orgProfiles = new GitProfiles(store2, broker, undefined, organization.id);
+      orgProfiles.save({ name: 'shared', userName: 'Acme Bot', userEmail: 'bot@acme.test' });
+      orgProfiles.setDefault('shared');
+      const userProfiles = new GitProfiles(store2, broker, undefined, userGitScope('jane'));
+      userProfiles.save({ name: 'main', userName: 'Jane Dev', userEmail: 'jane@example.test' });
+      userProfiles.setDefault('main');
+      const task = store2.createTask({
+        projectId: project.id,
+        title: 'Change product',
+        workflow: 'software-dev',
+        workflowVersion: '1.0.0',
+        params: { prompt: 'change it' },
+        createdBy: { kind: 'user', userId: 'jane' },
+      });
+      const worlds = new WorldRegistry();
+      worlds.register(new WorktreeProvider(path.join(tmp, 'creator-worlds')));
+      const core = makeCoreActivities({ store: store2, worlds, adapters: new Map(), profiles: new ProfileResolver(store2, 'mock'), broker });
+
+      const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo, base: 'main', target: 'main', kind: 'worktree' });
+      expect(handle.meta).toMatchObject({ gitProfile: 'main', gitProfileScope: userGitScope('jane') });
+      const world = await worlds.open(handle);
+      const cwd = handle.workdir ?? handle.root;
+      await world.writeFile(path.relative(handle.root, path.join(cwd, 'creator.txt')), 'owned by Jane');
+      await git(cwd, ['add', '-A']);
+      expect((await git(cwd, ['commit', '-q', '-m', 'work'])).code).toBe(0);
+      expect((await git(handle.workdir ?? handle.root, ['log', '-1', '--format=%an <%ae>'])).stdout.trim())
+        .toBe('Jane Dev <jane@example.test>');
       await core.destroyWorld(handle);
     } finally {
       delete process.env.KARMAX_HOME;

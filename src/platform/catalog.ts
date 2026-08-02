@@ -110,6 +110,8 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/skills', 'POST /api/safe-mode',
   ],
   credentials: [
+    'GET|POST /api/user/git-profiles', 'DELETE /api/user/git-profiles/:id',
+    'POST /api/user/git-profiles/default',
     'GET|POST /api/organizations/:organizationId/accounts', 'POST /api/organizations/:organizationId/accounts/connect',
     'PATCH|DELETE /api/organizations/:organizationId/accounts/logins/:provider/:account',
     'POST /api/organizations/:organizationId/accounts/availability|concurrency|usage/recheck',
@@ -120,6 +122,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/organizations/:organizationId/git-profiles/:id',
     'GET /api/organizations/:organizationId/git-profiles/preflight?projectId=',
     'POST /api/organizations/:organizationId/git-profiles/default',
+    'POST /api/organizations/:organizationId/git-profiles/reuse-user',
   ],
   vault: [
     'GET|POST /api/vault/items (typed credential items; secret fields are write-only)', 'DELETE /api/vault/items/:id',
