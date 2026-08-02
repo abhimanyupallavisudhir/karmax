@@ -57,6 +57,14 @@ describe('websocket reconnect', () => {
 });
 
 describe('profile account controls', () => {
+  it('lets an unverified user resend their confirmation email from the email row', () => {
+    expect(app).toContain('id="profile-resend-confirmation"');
+    expect(app).toContain('Resend confirmation email');
+    expect(app).not.toContain('confirmation pending');
+    const handler = handlerAfter("$('#profile-resend-confirmation')?.addEventListener");
+    expect(handler).toContain('resendConfirmationEmail');
+  });
+
   it('edits the existing email row instead of rendering a second email card', () => {
     expect(app).toContain('data-profile-edit="email"');
     expect(app).toContain('id="profile-email-panel"');
