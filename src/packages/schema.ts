@@ -58,7 +58,12 @@ export const manifestSchema = z.object({
   promptPreamble: z.string().max(200_000).optional(),
   stages: z.array(stage).max(200).optional(),
   params: z.array(field).max(500),
-  onActivate: z.object({ spawnTask: z.object({ workflow: z.string().max(200), title: z.string().max(1_000), prompt: z.string().max(200_000) }).optional() }).passthrough().optional(),
+  onActivate: z.object({ spawnTask: z.object({
+    workflow: z.string().max(200),
+    title: z.string().max(1_000),
+    prompt: z.string().max(200_000),
+    hostedPrompt: z.string().max(200_000).optional(),
+  }).optional() }).passthrough().optional(),
   kind: z.enum(['task', 'coordinator']).optional(),
   selectable: z.boolean().optional(),
 }).passthrough();
