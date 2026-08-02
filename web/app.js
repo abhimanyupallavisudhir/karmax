@@ -12608,11 +12608,20 @@ function openHelp() {
 // "Continue with Google" — Better Auth's own social endpoint (the gateway proxies
 // /api/auth/* verbatim, so there is no karmax route here). Sign-in and sign-up are
 // the same call: Google either matches an existing account or creates one.
-// Deliberately not Google's stock branded button — it would be the only foreign
-// visual element on the card. A plain `.btn` keeps the sign-in card coherent, and
-// the wordmark in the label is what actually tells the user where they're going.
+// The provider-specific treatment follows Google's button guidance so this trust
+// boundary is recognizable before someone clicks it. Keep the G paths inline: the
+// sign-in card must work without a third-party asset request.
 const googleBtn = (id) => S.google
-  ? `<button class="btn" id="${id}" style="width:100%;margin-top:8px">Continue with Google</button>`
+  ? `<button class="google-signin-btn" id="${id}" type="button">
+      <svg class="google-signin-mark" viewBox="0 0 18 18" aria-hidden="true">
+        <path fill="#4285F4" d="M17.64 9.205c0-.638-.057-1.252-.164-1.841H9v3.481h4.844a4.14 4.14 0 0 1-1.797 2.716v2.258h2.909c1.702-1.567 2.684-3.875 2.684-6.614Z" />
+        <path fill="#34A853" d="M9 18c2.43 0 4.468-.806 5.956-2.181l-2.909-2.258c-.806.54-1.835.859-3.047.859-2.344 0-4.328-1.585-5.037-3.714H.956v2.333A9 9 0 0 0 9 18Z" />
+        <path fill="#FBBC05" d="M3.963 10.706A5.42 5.42 0 0 1 3.682 9c0-.592.102-1.167.281-1.706V4.961H.956A9 9 0 0 0 0 9c0 1.452.347 2.827.956 4.039l3.007-2.333Z" />
+        <path fill="#EA4335" d="M9 3.58c1.321 0 2.507.454 3.441 1.346l2.582-2.582C13.464.892 11.43 0 9 0A9 9 0 0 0 .956 4.961l3.007 2.333C4.672 5.165 6.656 3.58 9 3.58Z" />
+      </svg>
+      <span>Continue with Google</span>
+      <span aria-hidden="true"></span>
+    </button>`
   : '';
 
 // What a failed round trip to Google means, in the user's terms. Better Auth
