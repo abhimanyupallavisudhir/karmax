@@ -2497,16 +2497,18 @@ function verificationBanner() {
 // domain was unverified at the provider. The server log names the cause.
 const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';
 
+async function resendConfirmationEmail(button) {
+  button.disabled = true;
+  try {
+    const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
+    toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
+  } catch { toast(EMAIL_SEND_FAILED, true); }
+  button.disabled = false;
+}
+
 function wireVerificationBanner() {
-  $('#verify-resend')?.addEventListener('click', async () => {
-    const btn = $('#verify-resend'); btn.disabled = true;
-    try {
-      const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
-      toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
-    } catch { toast(EMAIL_SEND_FAILED, true); }
-    btn.disabled = false;
-  });
+  $('#verify-resend')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
 }
 
@@ -11366,7 +11368,9 @@ function profileView() {
           <span class="profile-row-label">Email</span>
           <div class="profile-row-control">
             <span class="profile-row-value">${esc(email)}</span>
-            <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+            ${u.emailVerified
+              ? '<span class="chip success">verified</span>'
+              : '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>'}
             <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
               aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
           </div>
@@ -11555,6 +11559,7 @@ function wireProfileView() {
     setProfileEditor(opening ? button.dataset.profileEdit : null);
   }));
   document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
+  $('#profile-resend-confirmation')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
 
   $('#profile-email-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
