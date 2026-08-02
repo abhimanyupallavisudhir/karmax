@@ -57,6 +57,14 @@ describe('websocket reconnect', () => {
 });
 
 describe('profile account controls', () => {
+  it('lets an unverified user resend their confirmation email from the email row', () => {
+    expect(app).toContain('id="profile-resend-confirmation"');
+    expect(app).toContain('Resend confirmation email');
+    expect(app).not.toContain('confirmation pending');
+    const handler = handlerAfter("$('#profile-resend-confirmation')?.addEventListener");
+    expect(handler).toContain('resendConfirmationEmail');
+  });
+
   it('edits the existing email row instead of rendering a second email card', () => {
     expect(app).toContain('data-profile-edit="email"');
     expect(app).toContain('id="profile-email-panel"');
@@ -76,6 +84,14 @@ describe('profile account controls', () => {
     expect(app).toContain('id="profile-new-password"');
     expect(app).toContain('id="profile-confirm-password"');
     expect(app).toContain("fetch('/api/auth/change-password'");
+  });
+
+  it('does not expose delivery settings before external channels are implemented', () => {
+    const notifications = app.slice(app.indexOf('function notificationsCard()'), app.indexOf('function wireNotificationsCard()'));
+    expect(notifications).not.toContain('>Delivery<');
+    expect(notifications).not.toContain('data-delivery=');
+    expect(notifications).not.toContain('Outcome updates for tasks I follow');
+    expect(app).not.toContain("$('#save-delivery')");
   });
 });
 
@@ -104,7 +120,6 @@ describe('forms report their failures', () => {
     "$('#environment-save')?.addEventListener",
     "$('#main').querySelectorAll('[data-inbox-toggle]')",
     "$('#inbox-read-all')?.addEventListener",
-    "$('#save-delivery')?.addEventListener",
   ];
   for (const anchor of anchors) {
     it(`${anchor} surfaces the error`, () => {
@@ -116,6 +131,18 @@ describe('forms report their failures', () => {
     expect(app).not.toContain('box.textContent = error.message');
     expect(app).toContain('function paneError(box, error, retry)');
     expect(app).toContain('Couldn’t load this section.');
+  });
+});
+
+describe('draft workflow selection', () => {
+  it('keeps the selector editable and changes the existing draft in place', () => {
+    expect(app).toContain('const workflowEditable = !draft || !!draft.params?.draft;');
+    expect(app).toContain("${workflowEditable ? '' : 'disabled'}");
+    const handler = handlerAfter("$('#tf-wf')?.addEventListener('change'");
+    expect(handler).toContain('persistDraft(st)');
+    expect(handler).toContain("method: 'PATCH'");
+    expect(handler).toContain('/workflow`');
+    expect(handler).not.toContain("method: 'DELETE'");
   });
 });
 
@@ -165,6 +192,13 @@ describe('focus is always visible', () => {
 describe('mobile viewport', () => {
   it('sizes the login card with dvh so it does not jump under the address bar', () => {
     expect(css).toMatch(/\.login-wrap \{[^}]*height: 100dvh/);
+  });
+});
+
+describe('verification banner', () => {
+  it('stays at its intrinsic height while the app body fills the remaining viewport', () => {
+    expect(css).toMatch(/#app \{[^}]*display: flex;[^}]*flex-direction: column/);
+    expect(css).toMatch(/\.body \{[^}]*flex: 1;[^}]*min-height: 0/);
   });
 });
 

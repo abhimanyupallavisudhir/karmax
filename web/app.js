@@ -47,7 +47,6 @@ const S = {
   users: [],
   inbox: [],
   inboxFilter: 'all', // which kind of notification the inbox is pinned to (URL-owned)
-  deliveryPreferences: null,
   projectId: null,
   tasks: [],
   attemptGroup: null, // logical-task group for the open task page
@@ -2058,19 +2057,17 @@ async function loadCollaboration() {
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
   const q = `?organizationId=${encodeURIComponent(organizationId)}`;
-  const [members, teams, users, inbox, prefs] = await Promise.all([
+  const [members, teams, users, inbox] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
     api(`/api/inbox${q}`).catch(() => []),
-    api(`/api/inbox/preferences${q}`).catch(() => null),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
   S.inbox = inbox || [];
-  S.deliveryPreferences = prefs;
   // Announce what ARRIVED since the last list. The first load only seeds the
   // seen set (and switching organization reseeds it), so opening the app never
   // replays the backlog. See announceInbox for what each urgency does.
@@ -2502,16 +2499,18 @@ function verificationBanner() {
 // domain was unverified at the provider. The server log names the cause.
 const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';
 
+async function resendConfirmationEmail(button) {
+  button.disabled = true;
+  try {
+    const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
+    toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
+  } catch { toast(EMAIL_SEND_FAILED, true); }
+  button.disabled = false;
+}
+
 function wireVerificationBanner() {
-  $('#verify-resend')?.addEventListener('click', async () => {
-    const btn = $('#verify-resend'); btn.disabled = true;
-    try {
-      const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
-      toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
-    } catch { toast(EMAIL_SEND_FAILED, true); }
-    btn.disabled = false;
-  });
+  $('#verify-resend')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
 }
 
@@ -4215,6 +4214,7 @@ async function openTaskForm(workflow, draft, seedText) {
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = !!draft?.params?.repeatable; // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
+  const workflowEditable = !draft || !!draft.params?.draft;
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -4252,7 +4252,7 @@ async function openTaskForm(workflow, draft, seedText) {
           <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
           ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
           <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
-          <select id="tf-wf" title="Workflow" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
+          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
         </div>
       </div>
       <div class="tf-scroll">
@@ -4310,32 +4310,30 @@ async function openTaskForm(workflow, draft, seedText) {
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   let closeForm = () => (root.innerHTML = '');
   $('#tf-wf')?.addEventListener('change', async () => {
-    // Re-render for the new workflow, preserving text typed into the current
-    // consuming field so it moves to the new workflow's consuming field.
-    const cf = consumingField(fields);
-    const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
-    // Drop any draft auto-created for the previous workflow — its params won't
-    // map onto the new workflow's schema, and reopening starts fresh anyway.
-    // Let any in-flight save settle first so a create still mid-flight can't
-    // materialise its draft AFTER this delete and orphan it.
+    const select = $('#tf-wf');
+    const nextWorkflow = select.value;
+    const st = formState();
     clearTimeout(saveTimer);
-    await saveChain;
-    if (localCred && draftId) {
-      const id = draftId;
-      try {
-        await api(`/api/tasks/${id}`, { method: 'DELETE' });
-        removeDeletedTaskLocally(id);
-        draftId = null;
-      } catch (error) {
-        if (!/no such task|HTTP 404/i.test(error.message || '')) {
-          toast(error.message, true);
-          return;
-        }
-        removeDeletedTaskLocally(id);
-        draftId = null;
+    select.disabled = true;
+    try {
+      await persistDraft(st);
+      if (draftId) {
+        const changed = await api(`/api/tasks/${draftId}/workflow`, {
+          method: 'PATCH', body: JSON.stringify({ workflow: nextWorkflow }),
+        });
+        const at = S.tasks.findIndex((task) => task.id === draftId);
+        if (at >= 0 && changed.task) S.tasks[at] = changed.task;
+        return openTaskForm(nextWorkflow, changed.task);
       }
+      const carried = consumingField(fields)
+        ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
+        : '';
+      openTaskForm(nextWorkflow, undefined, (carried || '').trim());
+    } catch (error) {
+      select.value = wf;
+      select.disabled = !workflowEditable;
+      toast(error.message, true);
     }
-    openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
@@ -9409,8 +9407,8 @@ function globalSettingsView(embedded = false) {
       </div>
     </div>
     <div class="card" id="resilience-card" hidden></div>
-    ${hostLocal() ? `<div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
-    <div class="card phone-access-card" id="phone-access-card">
+    ${hostLocal() ? `<div class="settings-section-title" id="settings-access" hidden><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
+    <div class="card phone-access-card" id="phone-access-card" hidden>
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>` : ''}`;
 }
@@ -9619,9 +9617,18 @@ async function hydratePhoneAccess() {
   const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const status = await api('/api/remote-access');
-    if (renderIsCurrent()) renderPhoneAccess(status);
+    if (renderIsCurrent()) {
+      renderPhoneAccess(status);
+      revealPhoneAccess();
+    }
   } catch (error) {
     if (!renderIsCurrent()) return;
+    // Phone Access changes the installation host, not the current tenant. An
+    // organization administrator is expected to be refused here; keep this
+    // installation-only control absent instead of rendering the raw capability
+    // error as if Tailscale itself needed attention.
+    if (error?.status === 403) return;
+    revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
         <span>Access your krmax at</span>
@@ -9637,6 +9644,17 @@ async function hydratePhoneAccess() {
       </div>`;
     $('#remote-retry')?.addEventListener('click', hydratePhoneAccess);
   }
+}
+
+function revealPhoneAccess() {
+  for (const selector of ['#phone-access-nav', '#settings-access', '#phone-access-card']) {
+    const element = $(selector);
+    if (element) element.hidden = false;
+  }
+  // The navigation is wired while the authorization probe is in flight. Re-run
+  // its idempotent wiring so a permitted deep link to #settings-access opens
+  // after the previously hidden destination becomes available.
+  wireSettingsNavigation();
 }
 
 async function hydrateGitProfiles(organizationId = S.organizationId) {
@@ -11114,8 +11132,7 @@ function markInboxItemReadLocally(item) {
   updateBell();
 }
 // The inbox is one list of live asks, split by what is being asked. Every kind
-// the server can route has a sub-tab; a kind with nothing in it has no tab, so
-// the header shows the shape of the actual backlog rather than a fixed menu.
+// the server can route has a stable sub-tab, even when that tab is empty.
 const INBOX_TABS = [
   { key: 'approval-requested', label: 'Approvals' },
   { key: 'review-requested', label: 'Review' },
@@ -11134,19 +11151,24 @@ function urgencyRank(urgency) {
 // Read items are hidden by default — an answered notification should stop taking
 // up space. A per-browser display choice, like the theme (see renderFlag).
 function inboxShowRead() { return renderFlag('karmax-inbox-show-read', false); }
+// Routine updates have their own stream; All is the combined attention queue.
+function inboxItemMatchesFilter(item, filter = S.inboxFilter) {
+  return filter === 'all' ? item.kind !== 'update' : item.kind === filter;
+}
+function inboxUnreadCount(filter = S.inboxFilter) {
+  return S.inbox.filter((item) => item.unread && inboxItemMatchesFilter(item, filter)).length;
+}
 // Urgency first, recency second — the same order the server returns, restated
 // here so the list is right even when a row is patched in place client-side.
 function inboxItems() {
   const showRead = inboxShowRead();
   return S.inbox.filter((item) => (showRead || item.unread)
-    && (S.inboxFilter === 'all' || item.kind === S.inboxFilter))
+    && inboxItemMatchesFilter(item))
     .sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency) || b.createdAt - a.createdAt);
 }
 function inboxTabs() {
-  const unread = (match) => S.inbox.filter((item) => item.unread && match(item)).length;
-  return [{ key: 'all', label: 'All', unread: unread(() => true) }].concat(
-    INBOX_TABS.filter((tab) => S.inbox.some((item) => item.kind === tab.key))
-      .map((tab) => ({ ...tab, unread: unread((item) => item.kind === tab.key) })));
+  return [{ key: 'all', label: 'All', unread: inboxUnreadCount('all') }].concat(
+    INBOX_TABS.map((tab) => ({ ...tab, unread: inboxUnreadCount(tab.key) })));
 }
 // What a row is about. An ask names itself ("review requested"); an update's
 // news is the outcome it is reporting, so it names the task's status instead.
@@ -11163,7 +11185,7 @@ function inboxView() {
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
     <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
-    <div class="inbox-toolbar"><span>${S.inbox.filter((x) => x.unread).length} unread</span>
+    <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
@@ -11408,7 +11430,9 @@ function profileView() {
           <span class="profile-row-label">Email</span>
           <div class="profile-row-control">
             <span class="profile-row-value">${esc(email)}</span>
-            <span class="chip ${u.emailVerified ? 'success' : 'working'}">${u.emailVerified ? 'verified' : 'confirmation pending'}</span>
+            ${u.emailVerified
+              ? '<span class="chip success">verified</span>'
+              : '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>'}
             <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
               aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
           </div>
@@ -11496,12 +11520,10 @@ function profileView() {
   </div>`;
 }
 
-// One place for everything an ask does to you: the per-urgency behaviour of this
-// browser, and the channels the server delivers on. The inbox page lists asks;
-// it does not configure them.
+// One place for the per-urgency behaviour of this browser. The inbox page lists
+// asks; it does not configure them.
 function notificationsCard() {
   const prefs = notifyPrefs();
-  const delivery = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
     granted: '<p class="task-sub">This browser may show system notifications.</p>',
@@ -11526,22 +11548,6 @@ function notificationsCard() {
       </div>`).join('')}
     </div>
     ${permissionNote}
-    <div class="settings-divider"></div>
-    <div class="section-h">Delivery</div>
-    <p class="task-sub">Where an ask is delivered, for every organization you work in.</p>
-    ${['browser', 'email', 'slack'].map((key) => {
-    // A channel with no adapter cannot deliver anything. Offering the switch anyway
-    // — and toasting "saved" — meant a user could turn on Email and simply stop
-    // being notified, with the failure logged only on the server.
-    const ready = (S.meta?.deliveryChannels ?? ['browser']).includes(key);
-    const label = key[0].toUpperCase() + key.slice(1);
-    return `<label class="switch${ready ? '' : ' disabled'}"${ready ? '' : ` title="Not set up on this server yet"`}>`
-      + `<input type="checkbox" data-delivery="${key}" ${delivery[key] && ready ? 'checked' : ''} ${ready ? '' : 'disabled'}/>`
-      + `<span>${label}${ready ? '' : ' <span class="task-sub">— not set up</span>'}</span></label>`;
-  }).join('')}
-    <label class="switch"><input type="checkbox" data-delivery="routine" ${delivery.routine ? 'checked' : ''}/>
-      <span>Outcome updates for tasks I follow <span class="task-sub">— low urgency, nothing is asked of you</span></span></label>
-    <button class="btn sm primary" id="save-delivery">Save preferences</button>
   </div>`;
 }
 
@@ -11573,13 +11579,6 @@ function wireNotificationsCard() {
     try { await Notification.requestPermission(); } catch {}
     renderMain();
   });
-  $('#save-delivery')?.addEventListener('click', async () => {
-    const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
-    try {
-      S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
-      toast('Delivery preferences saved');
-    } catch (error) { toast(error.message, true); }
-  });
 }
 
 function wireProfileView() {
@@ -11599,6 +11598,7 @@ function wireProfileView() {
     setProfileEditor(opening ? button.dataset.profileEdit : null);
   }));
   document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
+  $('#profile-resend-confirmation')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
 
   $('#profile-email-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -11753,7 +11753,9 @@ function wireSettingsNavigation() {
   }
   const panes = [...content.querySelectorAll('.settings-pane')];
   const activate = (id) => {
-    const target = panes.some((pane) => pane.dataset.pane === id) ? id : links[0].getAttribute('href').slice(1);
+    const visibleLinks = links.filter((link) => !link.hidden);
+    const target = visibleLinks.some((link) => link.getAttribute('href') === `#${id}`)
+      ? id : visibleLinks[0]?.getAttribute('href').slice(1);
     panes.forEach((pane) => pane.classList.toggle('active', pane.dataset.pane === target));
     links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${target}`));
   };
@@ -11780,7 +11782,7 @@ function wireSettingsNavigation() {
 function cycleSettingsPane(delta) {
   const layout = document.querySelector('.settings-layout');
   if (!layout) return;
-  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]')];
+  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]:not([hidden])')];
   if (!links.length) return;
   const i = links.findIndex((l) => l.classList.contains('active'));
   const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
@@ -11794,7 +11796,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access" id="phone-access-nav" hidden>Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -12673,11 +12675,20 @@ function openHelp() {
 // "Continue with Google" — Better Auth's own social endpoint (the gateway proxies
 // /api/auth/* verbatim, so there is no karmax route here). Sign-in and sign-up are
 // the same call: Google either matches an existing account or creates one.
-// Deliberately not Google's stock branded button — it would be the only foreign
-// visual element on the card. A plain `.btn` keeps the sign-in card coherent, and
-// the wordmark in the label is what actually tells the user where they're going.
+// The provider-specific treatment follows Google's button guidance so this trust
+// boundary is recognizable before someone clicks it. Keep the G paths inline: the
+// sign-in card must work without a third-party asset request.
 const googleBtn = (id) => S.google
-  ? `<button class="btn" id="${id}" style="width:100%;margin-top:8px">Continue with Google</button>`
+  ? `<button class="google-signin-btn" id="${id}" type="button">
+      <svg class="google-signin-mark" viewBox="0 0 18 18" aria-hidden="true">
+        <path fill="#4285F4" d="M17.64 9.205c0-.638-.057-1.252-.164-1.841H9v3.481h4.844a4.14 4.14 0 0 1-1.797 2.716v2.258h2.909c1.702-1.567 2.684-3.875 2.684-6.614Z" />
+        <path fill="#34A853" d="M9 18c2.43 0 4.468-.806 5.956-2.181l-2.909-2.258c-.806.54-1.835.859-3.047.859-2.344 0-4.328-1.585-5.037-3.714H.956v2.333A9 9 0 0 0 9 18Z" />
+        <path fill="#FBBC05" d="M3.963 10.706A5.42 5.42 0 0 1 3.682 9c0-.592.102-1.167.281-1.706V4.961H.956A9 9 0 0 0 0 9c0 1.452.347 2.827.956 4.039l3.007-2.333Z" />
+        <path fill="#EA4335" d="M9 3.58c1.321 0 2.507.454 3.441 1.346l2.582-2.582C13.464.892 11.43 0 9 0A9 9 0 0 0 .956 4.961l3.007 2.333C4.672 5.165 6.656 3.58 9 3.58Z" />
+      </svg>
+      <span>Continue with Google</span>
+      <span aria-hidden="true"></span>
+    </button>`
   : '';
 
 // What a failed round trip to Google means, in the user's terms. Better Auth

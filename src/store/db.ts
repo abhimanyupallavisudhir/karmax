@@ -2193,6 +2193,14 @@ export class Store {
     this.db.prepare('UPDATE tasks SET workflow = ? WHERE id = ?').run(workflow, taskId);
   }
 
+  /** Rebind an unqueued draft to another workflow definition. The API owns the
+   * lifecycle guard; keeping all three columns in one statement prevents a draft
+   * from ever carrying a mixed workflow/version plan. */
+  setDraftWorkflow(taskId: string, workflow: string, workflowVersion: string) {
+    this.db.prepare('UPDATE tasks SET workflow = ?, executionWorkflow = ?, workflowVersion = ? WHERE id = ?')
+      .run(workflow, workflow, workflowVersion, taskId);
+  }
+
   /** Record the workflow definition of a newly-started/recovered Temporal run. */
   setTaskExecutionWorkflow(taskId: string, workflow: string) {
     this.db.prepare('UPDATE tasks SET executionWorkflow = ? WHERE id = ?').run(workflow, taskId);

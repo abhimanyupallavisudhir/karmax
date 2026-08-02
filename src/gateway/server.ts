@@ -14,7 +14,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
-import { manifest } from '../contrib/manifests.js';
+import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
@@ -27,7 +27,8 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
+import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels,
+  modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
@@ -4564,7 +4565,9 @@ export class Gateway {
    * Seed a brand-new project with its preparation task (SPEC §4.6). A new project's
    * tasks default to the `software-dev` workflow, so we seed that workflow's
    * `onActivate` prep task — "make this project karmax-ready" — as the first task on
-   * the list. It's created as a **draft**: a project is usually created (name only)
+   * the list. The manifest supplies hosted-specific copy because isolated cloud
+   * worlds do not need the local-worktree resource-collision scan. It's created as
+   * a **draft**: a project is usually created (name only)
    * before its repository is configured, and a repo-oriented task can't run without
    * one — so the prep task waits on the list for the user to queue once the repo is
    * set, rather than failing creation or running against an empty sandbox.
@@ -4577,7 +4580,7 @@ export class Gateway {
       await this.deps.api.createTask(token, {
         projectId,
         title: prep.title,
-        prompt: prep.prompt,
+        prompt: activationTaskPrompt(prep, this.deps.hosted === true),
         workflow: prep.workflow,
         draft: true,
       });
@@ -4691,7 +4694,16 @@ export class Gateway {
         : provider === 'codex' ? codexModels
         : provider === 'opencode' ? opencodeModels
         : (home?: string) => acpModels(provider, home);
-      const results = await Promise.all(homes(provider).map((home) => fn(home).catch(() => [])));
+      const results = await Promise.all(homes(provider).map((home) => fn(home).catch((error) => {
+        // Discovery is best-effort, but a silent auth failure made connected
+        // accounts appear to vanish with no causal trace. Log only a classified,
+        // credential-safe reason; provider exceptions can contain sensitive data.
+        console.warn(
+          `[karmax] ${provider} model discovery failed for ${home ? 'a connected login' : 'an API credential'} `
+          + `(${modelDiscoveryFailureReason(error)}); using the fallback catalog`,
+        );
+        return [];
+      })));
       return mergeModels(results);
     };
     const [claude, codex, opencode] = await Promise.all([

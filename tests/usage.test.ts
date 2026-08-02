@@ -205,6 +205,34 @@ describe('probeClaudeUsage', () => {
     }
   });
 
+  it('does not give a read-only usage probe authority to rotate the refresh token', async () => {
+    const home = mkHome(false);
+    const credential = JSON.stringify({ claudeAiOauth: {
+      accessToken: 'current-access',
+      refreshToken: 'canonical-refresh',
+      expiresAt: NOW + 60_000,
+      scopes: ['user:profile'],
+    } });
+    fs.writeFileSync(path.join(home, '.credentials.json'), credential, { mode: 0o600 });
+    try {
+      const r = await probeClaudeUsage({ configHome: home, now: NOW, run: async (probeHome) => {
+        expect(probeHome).not.toBe(home);
+        const probeCredential = JSON.parse(fs.readFileSync(path.join(probeHome, '.credentials.json'), 'utf8'));
+        expect(probeCredential.claudeAiOauth.accessToken).toBe('current-access');
+        expect(probeCredential.claudeAiOauth.refreshToken).toBeUndefined();
+        // A provider-side logout or failed refresh remains confined to the probe.
+        fs.writeFileSync(path.join(probeHome, '.credentials.json'), JSON.stringify({
+          claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0 },
+        }));
+        return FULL_PANEL;
+      } });
+      expect(r.ok).toBe(true);
+      expect(fs.readFileSync(path.join(home, '.credentials.json'), 'utf8')).toBe(credential);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('reports setup-token (no .credentials.json) without running the CLI', async () => {
     const home = mkHome(false);
     let ran = false;
