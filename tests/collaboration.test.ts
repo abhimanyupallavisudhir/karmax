@@ -135,6 +135,11 @@ describe('organization and collaboration domain', () => {
     expect(store.consumeGithubInstallState(state, 'attacker')).toBeUndefined();
     expect(store.consumeGithubInstallState(state, 'owner')).toEqual({ organizationId: organization.id });
     expect(store.consumeGithubInstallState(state, 'owner')).toBeUndefined();
+    const profileState = store.createGithubInstallState(organization.id, 'owner', { returnTo: 'profile' });
+    expect(store.consumeGithubInstallState(profileState, 'owner')).toEqual({
+      organizationId: organization.id,
+      returnTo: 'profile',
+    });
     expect(() => store.createGithubInstallState(organization.id, 'attacker')).toThrow(/not an organization member/);
   });
 

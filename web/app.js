@@ -11375,7 +11375,9 @@ async function hydrateUserGitProfiles() {
       const organizationId = S.organizationId || currentOrg()?.id;
       if (!organizationId) return toast('Choose an organization before connecting GitHub.', true);
       try {
-        const result = await api(`/api/organizations/${organizationId}/github/authorize`, { method: 'POST', body: '{}' });
+        const result = await api(`/api/organizations/${organizationId}/github/authorize`, {
+          method: 'POST', body: JSON.stringify({ returnTo: 'profile' }),
+        });
         location.assign(result.url);
       } catch (error) { toast(error.message, true); }
     });

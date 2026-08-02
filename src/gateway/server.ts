@@ -338,6 +338,11 @@ function organizationSettingsPath(store: Store, organizationId: string): string 
   return slug ? `/${slug}/settings` : '/settings';
 }
 
+function userProfilePath(store: Store, organizationId: string): string {
+  const slug = store.getOrganization(organizationId)?.slug;
+  return slug ? `/${slug}/profile` : '/profile';
+}
+
 /**
  * Build the public wire projection of gateway data. Provider handles are
  * capabilities: even though they contain no API key, exposing sandbox ids,
@@ -976,7 +981,10 @@ export class Gateway {
         await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
         for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
           await this.ensureProjectWiki(project, identity.user.id);
-        res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        const destination = pending.returnTo === 'profile'
+          ? userProfilePath(this.deps.store, pending.organizationId)
+          : organizationSettingsPath(this.deps.store, pending.organizationId);
+        res.writeHead(303, { location: `${destination}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
         return this.githubCallbackPage(res, 502, `GitHub authorization failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1482,7 +1490,9 @@ export class Gateway {
       if (githubAuthorize && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
-        const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId);
+        const b = await this.body(req);
+        const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId,
+          b.returnTo === 'profile' ? { returnTo: 'profile' } : {});
         try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req)) }); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const source = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
+const gatewaySource = fs.readFileSync(path.resolve('src/gateway/server.ts'), 'utf8');
 
 function extractFunction(name: string): string {
   const start = source.indexOf(`function ${name}(`);
@@ -48,5 +49,11 @@ describe('GitHub re-authorization affordance', () => {
     expect(source).toContain("githubAuthorizeButton(githubApp, 'project-authorize-github')");
     expect(source).toContain("githubAuthorizeButton(github, 'user-authorize-github')");
     expect(source).not.toContain('githubApp.oauthConfigured && !githubApp.userAuthorized');
+  });
+
+  it('returns profile-originated authorization to the user page', () => {
+    expect(source).toContain("JSON.stringify({ returnTo: 'profile' })");
+    expect(gatewaySource).toContain("pending.returnTo === 'profile'");
+    expect(gatewaySource).toContain('userProfilePath(this.deps.store, pending.organizationId)');
   });
 });

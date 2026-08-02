@@ -18,6 +18,7 @@ describe('personal Git development settings', () => {
     expect(source).toContain('git-byline-preview');
     expect(source).toContain('user-github-connection');
     expect(source).toContain('manual keys and tokens are compatibility fallbacks');
+    expect(source).toContain("JSON.stringify({ returnTo: 'profile' })");
   });
 
   it('offers an authorized organization owner a one-click link only while organization Git is empty', () => {

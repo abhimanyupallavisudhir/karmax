@@ -357,7 +357,8 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS github_install_states (
         tokenHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT NOT NULL,
-        createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, usedAt INTEGER
+        createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, usedAt INTEGER,
+        returnTo TEXT
       );
       CREATE TABLE IF NOT EXISTS world_instances (
         worldId TEXT NOT NULL, generation INTEGER NOT NULL, handle TEXT NOT NULL,
@@ -637,6 +638,9 @@ export class Store {
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT');
+    const githubStateCols = this.db.prepare('PRAGMA table_info(github_install_states)').all() as { name: string }[];
+    if (!githubStateCols.some((c) => c.name === 'returnTo'))
+      this.db.exec('ALTER TABLE github_install_states ADD COLUMN returnTo TEXT');
     const wikiVersionCols = this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all() as any[];
     if (!wikiVersionCols.some((c) => c.name === 'previousPath'))
       this.db.exec('ALTER TABLE organization_wiki_versions ADD COLUMN previousPath TEXT');
@@ -1646,23 +1650,26 @@ export class Store {
   /** One-time, user-bound state for GitHub's browser installation callback.
    * Only its SHA-256 digest is durable, so a database read cannot mint a valid
    * callback. The state is consumed atomically before any GitHub API call. */
-  createGithubInstallState(organizationId: string, userId: string, ttlMs = 10 * 60_000): string {
+  createGithubInstallState(organizationId: string, userId: string,
+    options: number | { ttlMs?: number; returnTo?: 'profile' } = {}): string {
     if (!this.organizationMembership(organizationId, userId)) throw new Error('user is not an organization member');
     const state = `kg_${crypto.randomBytes(32).toString('base64url')}`;
     const now = Date.now();
+    const ttlMs = typeof options === 'number' ? options : options.ttlMs ?? 10 * 60_000;
+    const returnTo = typeof options === 'object' && options.returnTo === 'profile' ? 'profile' : undefined;
     this.db.prepare('DELETE FROM github_install_states WHERE expiresAt<=? OR usedAt IS NOT NULL').run(now);
     this.db.prepare(`INSERT INTO github_install_states
-      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt) VALUES (?, ?, ?, ?, ?, NULL)`)
-      .run(sha256(state), organizationId, userId, now, now + Math.max(60_000, ttlMs));
+      (tokenHash, organizationId, userId, createdAt, expiresAt, usedAt, returnTo) VALUES (?, ?, ?, ?, ?, NULL, ?)`)
+      .run(sha256(state), organizationId, userId, now, now + Math.max(60_000, ttlMs), returnTo ?? null);
     return state;
   }
 
-  consumeGithubInstallState(state: string, userId: string): { organizationId: string } | undefined {
+  consumeGithubInstallState(state: string, userId: string): { organizationId: string; returnTo?: 'profile' } | undefined {
     const hash = sha256(state);
     const now = Date.now();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const row = this.db.prepare(`SELECT organizationId, userId FROM github_install_states
+      const row = this.db.prepare(`SELECT organizationId, userId, returnTo FROM github_install_states
         WHERE tokenHash=? AND usedAt IS NULL AND expiresAt>?`).get(hash, now) as any;
       if (!row || row.userId !== userId) {
         this.db.exec('ROLLBACK');
@@ -1670,7 +1677,10 @@ export class Store {
       }
       this.db.prepare('UPDATE github_install_states SET usedAt=? WHERE tokenHash=? AND usedAt IS NULL').run(now, hash);
       this.db.exec('COMMIT');
-      return { organizationId: String(row.organizationId) };
+      return {
+        organizationId: String(row.organizationId),
+        ...(row.returnTo === 'profile' ? { returnTo: 'profile' as const } : {}),
+      };
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
