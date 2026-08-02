@@ -92,7 +92,7 @@ a { color: var(--accent); text-decoration: none; }
 .mono { font-family: var(--font-mono); font-feature-settings: "ss01"; }
 
 /* ── layout shell ───────────────────────────────────────────── */
-#app { display: grid; grid-template-rows: auto 1fr; height: 100vh; overflow: hidden; }
+#app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
 .topbar {
   display: flex; align-items: center; gap: 16px;
@@ -169,7 +169,7 @@ a { color: var(--accent); text-decoration: none; }
 }
 .topbar-user:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface); }
 
-.body { display: grid; grid-template-columns: 232px 1fr; overflow: hidden; }
+.body { flex: 1; min-height: 0; display: grid; grid-template-columns: 232px 1fr; overflow: hidden; }
 
 /* ── projects rail ──────────────────────────────────────────── */
 .rail {

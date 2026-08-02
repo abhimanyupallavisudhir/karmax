@@ -180,6 +180,13 @@ describe('mobile viewport', () => {
   });
 });
 
+describe('verification banner', () => {
+  it('stays at its intrinsic height while the app body fills the remaining viewport', () => {
+    expect(css).toMatch(/#app \{[^}]*display: flex;[^}]*flex-direction: column/);
+    expect(css).toMatch(/\.body \{[^}]*flex: 1;[^}]*min-height: 0/);
+  });
+});
+
 describe('copy', () => {
   /**
    * INTENDED, and the reason this is not a blanket "never capitalize" rule:
