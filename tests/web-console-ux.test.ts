@@ -126,6 +126,18 @@ describe('forms report their failures', () => {
   });
 });
 
+describe('draft workflow selection', () => {
+  it('keeps the selector editable and changes the existing draft in place', () => {
+    expect(app).toContain('const workflowEditable = !draft || !!draft.params?.draft;');
+    expect(app).toContain("${workflowEditable ? '' : 'disabled'}");
+    const handler = handlerAfter("$('#tf-wf')?.addEventListener('change'");
+    expect(handler).toContain('persistDraft(st)');
+    expect(handler).toContain("method: 'PATCH'");
+    expect(handler).toContain('/workflow`');
+    expect(handler).not.toContain("method: 'DELETE'");
+  });
+});
+
 describe('destructive actions confirm first', () => {
   it('confirms before removing a project member', () => {
     expect(handlerAfter("row.querySelector('.project-member-remove')")).toContain('confirm(');
@@ -172,6 +184,13 @@ describe('focus is always visible', () => {
 describe('mobile viewport', () => {
   it('sizes the login card with dvh so it does not jump under the address bar', () => {
     expect(css).toMatch(/\.login-wrap \{[^}]*height: 100dvh/);
+  });
+});
+
+describe('verification banner', () => {
+  it('stays at its intrinsic height while the app body fills the remaining viewport', () => {
+    expect(css).toMatch(/#app \{[^}]*display: flex;[^}]*flex-direction: column/);
+    expect(css).toMatch(/\.body \{[^}]*flex: 1;[^}]*min-height: 0/);
   });
 });
 

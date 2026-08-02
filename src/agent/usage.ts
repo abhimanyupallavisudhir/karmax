@@ -22,9 +22,11 @@ import { CodexAppServerClient } from './codex-app-server-client.js';
  *  - Current Codex app-server exposes the same information without a model turn
  *    through the stable `account/rateLimits/read` method. It returns absolute reset
  *    instants and can include additional per-model limit buckets.
- * The Claude probe runs in a throwaway config dir holding only a COPY of the
- * login's `.credentials.json`, so it never races or mutates a leased home. Codex's
- * app-server account read uses its native CODEX_HOME, as Codex agent turns do.
+ * The Claude probe runs in a throwaway config dir holding a refresh-token-free
+ * projection of the login's `.credentials.json`. A plain copy is not isolated:
+ * OAuth refresh can rotate the token server-side, then deleting the throwaway
+ * copy strands the canonical home with the revoked predecessor. Codex's app-server
+ * account read uses its native CODEX_HOME, as Codex agent turns do.
  */
 
 export interface UsageWindow {
@@ -273,12 +275,21 @@ export async function probeClaudeUsage(
   if (!hasClaudeNativeCredential(path.dirname(cred))) {
     return { ok: false, at: now, reason: opts.configHome ? 'setup-token' : 'logged-out' };
   }
-  // Isolate: run against a throwaway dir holding only a copy of the credential, so
-  // we never race or mutate a home an agent may be leasing.
+  // Isolate: the probe gets the current access token and account metadata, but no
+  // refresh authority. A successful refresh commonly rotates the refresh token;
+  // doing that in a directory we delete would silently invalidate the real home.
   const tmp = path.join(os.tmpdir(), `karmax-usage-${crypto.randomBytes(6).toString('hex')}`);
   try {
     fs.mkdirSync(tmp, { recursive: true });
-    fs.copyFileSync(cred, path.join(tmp, '.credentials.json'));
+    const source = JSON.parse(fs.readFileSync(cred, 'utf8'));
+    const oauth = source?.claudeAiOauth;
+    if (oauth && typeof oauth === 'object') {
+      delete oauth.refreshToken;
+      delete oauth.refreshTokenExpiresAt;
+      delete oauth.refresh_token;
+      delete oauth.refresh_token_expires_at;
+    }
+    fs.writeFileSync(path.join(tmp, '.credentials.json'), JSON.stringify(source), { mode: 0o600 });
     const text = opts.run ? await opts.run(tmp) : await runUsageCli(tmp, opts.timeoutMs ?? 30_000);
     return parseUsagePanel(text, now);
   } catch (e) {

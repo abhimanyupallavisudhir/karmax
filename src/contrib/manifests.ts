@@ -150,7 +150,12 @@ export interface CommandDecl {
 
 export interface OnActivateDecl {
   /** Spawn a preparation task when the workflow is added to a project (SPEC §4.6). */
-  spawnTask?: { workflow: string; title: string; prompt: string };
+  spawnTask?: { workflow: string; title: string; prompt: string; hostedPrompt?: string };
+}
+
+/** Deployment-aware activation copy remains manifest data, not gateway policy. */
+export function activationTaskPrompt(task: NonNullable<OnActivateDecl['spawnTask']>, hosted: boolean): string {
+  return hosted ? task.hostedPrompt ?? task.prompt : task.prompt;
 }
 
 /**
@@ -413,10 +418,12 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     onActivate: {
       spawnTask: {
-        workflow: 'goal',
+        workflow: 'software-dev',
         title: 'Make this project krmax-ready',
         prompt:
-          'Ensure git is initialized in each repo. For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them. Report what you changed.',
+          "## Initial set-up tasks for krmax-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.\n2) For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them.\nReport what you changed.",
+        hostedPrompt:
+          "## Initial set-up tasks for krmax-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.\nReport what you changed.",
       },
     },
   },
