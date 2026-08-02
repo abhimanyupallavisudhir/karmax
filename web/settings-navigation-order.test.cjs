@@ -13,8 +13,12 @@ const view = src.slice(viewStart, viewEnd);
 const nav = view.match(/<nav class="settings-nav" aria-label="Settings sections">([\s\S]*?)<\/nav>/)?.[1];
 if (!nav) throw new Error('organization settings navigation not found');
 
-const sections = [...nav.matchAll(/<a href="#([^"]+)">([^<]+)<\/a>/g)]
-  .map(([, id, label]) => ({ id, label: label.replace(/&amp;/g, '&') }));
+const sections = [...nav.matchAll(/<a\b([^>]*)>([^<]+)<\/a>/g)]
+  .map(([, attributes, label]) => ({
+    id: attributes.match(/href="#([^"]+)"/)?.[1],
+    label: label.replace(/&amp;/g, '&'),
+  }))
+  .filter(({ id }) => id);
 const peopleIndex = sections.findIndex(({ id }) => id === 'settings-people');
 const phoneIndex = sections.findIndex(({ id }) => id === 'settings-access');
 

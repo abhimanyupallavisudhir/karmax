@@ -9434,8 +9434,8 @@ function globalSettingsView(embedded = false) {
       </div>
     </div>
     <div class="card" id="resilience-card" hidden></div>
-    ${hostLocal() ? `<div class="settings-section-title" id="settings-access"><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
-    <div class="card phone-access-card" id="phone-access-card">
+    ${hostLocal() ? `<div class="settings-section-title" id="settings-access" hidden><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
+    <div class="card phone-access-card" id="phone-access-card" hidden>
       <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>` : ''}`;
 }
@@ -9644,9 +9644,18 @@ async function hydratePhoneAccess() {
   const renderIsCurrent = beginAsyncElementRender(box);
   try {
     const status = await api('/api/remote-access');
-    if (renderIsCurrent()) renderPhoneAccess(status);
+    if (renderIsCurrent()) {
+      renderPhoneAccess(status);
+      revealPhoneAccess();
+    }
   } catch (error) {
     if (!renderIsCurrent()) return;
+    // Phone Access changes the installation host, not the current tenant. An
+    // organization administrator is expected to be refused here; keep this
+    // installation-only control absent instead of rendering the raw capability
+    // error as if Tailscale itself needed attention.
+    if (error?.status === 403) return;
+    revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
         <span>Access your krmax at</span>
@@ -9662,6 +9671,17 @@ async function hydratePhoneAccess() {
       </div>`;
     $('#remote-retry')?.addEventListener('click', hydratePhoneAccess);
   }
+}
+
+function revealPhoneAccess() {
+  for (const selector of ['#phone-access-nav', '#settings-access', '#phone-access-card']) {
+    const element = $(selector);
+    if (element) element.hidden = false;
+  }
+  // The navigation is wired while the authorization probe is in flight. Re-run
+  // its idempotent wiring so a permitted deep link to #settings-access opens
+  // after the previously hidden destination becomes available.
+  wireSettingsNavigation();
 }
 
 async function hydrateGitProfiles(organizationId = S.organizationId) {
@@ -11665,7 +11685,9 @@ function wireSettingsNavigation() {
   }
   const panes = [...content.querySelectorAll('.settings-pane')];
   const activate = (id) => {
-    const target = panes.some((pane) => pane.dataset.pane === id) ? id : links[0].getAttribute('href').slice(1);
+    const visibleLinks = links.filter((link) => !link.hidden);
+    const target = visibleLinks.some((link) => link.getAttribute('href') === `#${id}`)
+      ? id : visibleLinks[0]?.getAttribute('href').slice(1);
     panes.forEach((pane) => pane.classList.toggle('active', pane.dataset.pane === target));
     links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${target}`));
   };
@@ -11692,7 +11714,7 @@ function wireSettingsNavigation() {
 function cycleSettingsPane(delta) {
   const layout = document.querySelector('.settings-layout');
   if (!layout) return;
-  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]')];
+  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]:not([hidden])')];
   if (!links.length) return;
   const i = links.findIndex((l) => l.classList.contains('active'));
   const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
@@ -11706,7 +11728,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access">Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access" id="phone-access-nav" hidden>Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
