@@ -200,7 +200,8 @@ async function main() {
   // the browser through GitHub's App Manifest flow; environment values are only
   // an upgrade/enterprise bootstrap path.
   const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
-    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID });
+    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
+    publicApp: deployment.hosted });
   const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
     ? new S3ObjectStore({
         endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),

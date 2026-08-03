@@ -139,6 +139,19 @@ describe('GitHub App integration', () => {
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('creates a public app manifest for a hosted deployment', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-hosted-manifest-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    const personal = new GitHubAppService(store, broker);
+    const hosted = new GitHubAppService(store, broker, { publicApp: true });
+
+    expect(personal.manifest('https://self-host.example', 'state').manifest.public).toBe(false);
+    expect(hosted.manifest('https://krmax.io', 'state').manifest.public).toBe(true);
+
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('adopts an existing private repository after interrupted provisioning', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-adopt-'));
     const store = new Store(':memory:');
