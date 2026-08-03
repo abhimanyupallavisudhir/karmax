@@ -101,10 +101,12 @@ function taskRecord(id) {
 // Every page is a host-owned route; the browser URL is the single source of truth
 // for {organization, project, tab, open task}. Workflows/coordinators never own a
 // URL — a page like the merge queue is a first-party route that projects
-// coordinator/task state. Every page lives under its organization's slug; projects
-// are addressed by a slug of their name; tasks are numbered per project.
+// coordinator/task state. Organization-owned pages live under the organization's
+// slug; the user-owned profile does not. Projects are addressed by a slug of their
+// name; tasks are numbered per project.
 // Scheme:
 //   /                                    → home (redirects into the current org)
+//   /profile                             → the current user's profile
 //   /<org>                               → org home (redirects to a project or dashboard)
 //   /<org>/dashboard                     → organization dashboard
 //   /<org>/settings                      → organization settings
@@ -161,7 +163,7 @@ function currentOrg() {
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', profile: 'profile' };
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
 // Parse an in-app URL — a path, optionally with its `?…` query string — into the
 // page it names. The tasks list's whole search state (free text, filters, group,
@@ -173,6 +175,7 @@ function parseRoute(url) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
+  if (seg[0] === 'profile') return { name: 'profile' };
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
@@ -186,6 +189,9 @@ function parseRoute(url) {
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
   if (!seg[1]) return { name: 'global', org, tab: null };            // /<org> → org home
+  // Profile used to be organization-prefixed. It never belonged to that tenant,
+  // so recognize old bookmarks without carrying their org into application state.
+  if (seg[1] === 'profile') return { name: 'profile', legacy: true };
   // The inbox is the one org view with a sub-view (which kind of notification).
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
@@ -227,6 +233,9 @@ function globalRoute(tab, org = currentOrg()) {
   const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab;
   return `${orgBase(org)}/${seg}`;
 }
+
+// The profile belongs to the signed-in user, not to the selected organization.
+function profileRoute() { return '/profile'; }
 
 // The inbox pinned to one kind of notification: /<org>/inbox/<kind> ('all' is
 // the bare route). Which sub-tab you are on is part of the page, so it lives in
@@ -277,6 +286,14 @@ async function applyRoute() {
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
     return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
+  }
+  if (r.name === 'profile') {
+    if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
+    closeTaskDom();
+    S.tab = 'profile';
+    renderRail();
+    renderMain();
+    return;
   }
   if (r.name === 'global') {
     // Select the organization named in the URL (if any) before painting.
@@ -1989,11 +2006,10 @@ async function boot() {
     throw e;
   }
   if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
-  // Account creation marks exactly one session response for Git onboarding. Do
-  // this after organizations load so the profile URL has its canonical org slug,
-  // and only replace the neutral home route (never an invitation/deep link).
+  // Account creation marks exactly one session response for Git onboarding. Only
+  // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
-    history.replaceState({ kx: 1 }, '', globalRoute('profile'));
+    history.replaceState({ kx: 1 }, '', profileRoute());
   await loadCollaboration().catch(() => {});
   const projectScope = S.projectId
     ? `?projectId=${encodeURIComponent(S.projectId)}`
@@ -2487,7 +2503,7 @@ function verificationBanner() {
   return `<div class="verify-banner" id="verify-banner">
     <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
     <button class="btn sm" id="verify-resend">Resend link</button>
-    <a class="btn sm" data-spa href="${globalRoute('profile')}">Change email</a>
+    <a class="btn sm" data-spa href="${profileRoute()}">Change email</a>
     <button class="verify-dismiss" id="verify-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
   </div>`;
 }
@@ -2556,7 +2572,7 @@ function renderShell() {
       </button>
       <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
       <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
-      <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
@@ -8668,7 +8684,7 @@ function settingsView(proj) {
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
-    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${globalRoute('profile')}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
+    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
     <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files krmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
@@ -11099,7 +11115,7 @@ function inboxView() {
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
     <p class="task-sub">Sorted by urgency, then by age. What each level does when it arrives — a system
       notification, a sound, which channels it is delivered on — is set in
-      <a data-spa href="${globalRoute('profile')}#notifications">your profile</a>.</p>`;
+      <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
 }
 
 function wireInboxView() {
@@ -12082,7 +12098,7 @@ const HOST_COMMANDS = [
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
-  { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(globalRoute('profile')) },
+  { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(globalRoute('inbox')) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];

@@ -1,7 +1,7 @@
-// Verifies the organization-scoped URL scheme in app.js: every page lives under
-// its organization's slug, project/task permalinks nest beneath it, and the
-// pre-organization URLs (/dashboard, /organization, /projects/:name/…) still parse
-// so they can be canonicalised to the new form.
+// Verifies the URL scheme in app.js: organization-owned pages live under their
+// organization's slug, the user-owned profile is global, project/task permalinks
+// nest beneath their organization, and pre-organization URLs still parse so they
+// can be canonicalised to the current form.
 // Run: node web/routing.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -66,6 +66,7 @@ eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
 eval(extractFn('encodeQuery'));
 eval(extractFn('globalRoute'));
+eval(extractFn('profileRoute'));
 eval(extractFn('taskRecord'));
 eval(extractFn('taskUrl'));
 global.location = { pathname: '/' };
@@ -86,7 +87,11 @@ eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under
 eq(globalRoute('dashboard'), '/acme/dashboard', 'dashboard route is org-prefixed');
 eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
 eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
+eq(profileRoute(), '/profile', 'profile route is user-scoped, not org-prefixed');
 eq(globalRoute('organization', organizationById('org_globex')), '/globex/settings', 'globalRoute honours an explicit org');
+S.organizationId = 'org_globex';
+eq(profileRoute(), '/profile', 'profile route is stable when a different organization is selected');
+S.organizationId = 'org_acme';
 
 // ── parseRoute round-trips the new scheme ─────────────────────────────────────
 eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'dashboard' }, 'parse /<org>/dashboard');
@@ -94,6 +99,9 @@ eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organizati
 eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox', sub: null }, 'parse /<org>/inbox');
 eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', org: 'acme', tab: 'inbox', sub: 'review-requested' },
   'parse /<org>/inbox/<kind> as the inbox pinned to one kind of notification');
+eq(parseRoute('/profile'), { name: 'profile' }, 'parse the global user profile');
+eq(parseRoute('/globex/profile'), { name: 'profile', legacy: true },
+  'an old org-prefixed profile URL canonicalises without selecting that organization');
 eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: null }, 'parse bare /<org> as org home');
 eq(parseRoute('/acme/website-redesign'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: '' },
