@@ -296,13 +296,19 @@ export async function softwareDevV1_12(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.12.0');
 }
 
+/** Proposal preparation remains Do work. The Merge role is not started until
+ * Review has approved the proposal. */
+export async function softwareDevV1_13(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.13.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -361,6 +367,12 @@ async function softwareDevImpl(
   // merge itself uses a consenting human's user token and GitHub rules.
   const githubAuthoritativeMerge = minor >= 12 && remotePolicyOf(input.project) === 'pr';
   const proposalBeforeReview = minor >= 12;
+  // Preparing the exact branch/PR that a reviewer will inspect is part of Do,
+  // not Merge. A Merge-role turn is an authorization boundary: it may only be
+  // started after the Review route has approved the proposal. v1.12 mistakenly
+  // used Merge here because the same cleanup skills were useful, which made a
+  // pre-confirmation agent appear (and run) as the Merge agent.
+  const proposalPreparationIsDo = minor >= 13;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -1454,10 +1466,24 @@ async function softwareDevImpl(
     return turn;
   }
 
+  /** Continue the Do conversation until the branch is a stable proposal. This
+   * may commit, clean, integrate the target, and test, but it is deliberately
+   * still Do work: the Merge role is reserved for work after Review approval. */
+  async function prepareProposalTurn(text: string) {
+    msgs.push({ id: `u${msgs.length}`, role: 'user', text, ts: msgs.length });
+    return doTurn();
+  }
+
   /** The judgment-bearing half of Merge: decide what belongs in the change,
    * commit it, integrate the target into the task branch, resolve conflicts and
    * test. The deterministic protected-target landing is deliberately separate. */
   async function mergeTurn(text: string) {
+    if (proposalPreparationIsDo && stage !== 'merge') {
+      throw ApplicationFailure.nonRetryable(
+        `the Merge agent cannot run during ${stage}; Review must approve before Merge begins`,
+        'MergeBeforeReview',
+      );
+    }
     const mergeIn: Message = {
       id: `m-in-${mergeMsgs.length}`,
       role: 'user',
@@ -1988,24 +2014,37 @@ async function softwareDevImpl(
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
       if (proposalBeforeReview) {
-        // Publish the proposal stage before Review. Under GitHub policy this is
-        // the actual PR—not a worktree snapshot that will be committed/rebased
-        // later. This is still before the point of no return: the Merge agent
-        // only prepares the task branch and openPr updates its idempotent PR.
-        stage = 'pr';
-        status = 'active';
-        await publish();
-        if (cancelled) return await abort();
+        // Under GitHub policy Review must see the actual PR, not a worktree
+        // snapshot that will be committed/rebased later. v1.13 finishes making
+        // that stable proposal in the Do conversation before advertising PR;
+        // the Merge role remains strictly downstream of Review approval.
+        // Keep the command order of replay-pinned v1.12 executions intact.
+        if (!proposalPreparationIsDo) {
+          stage = 'pr';
+          status = 'active';
+          await publish();
+          if (cancelled) return await abort();
+        }
         if (githubAuthoritativeMerge) {
           targetLocked = true;
-          consumed.add('agent:merge');
-          await mergeTurn(
+          const preparationPrompt =
             `Prepare this branch as the exact proposal reviewers will inspect for merge into ${target}. `
             + `The worktree may contain uncommitted changes: commit what should land; gitignore (or delete) what should not. `
             + `Merge ${target} into the current branch, `
-            + `resolve every conflict, run the relevant build and tests, and leave the worktree clean. Do not merge the target branch itself.`,
-          );
+            + `resolve every conflict, run the relevant build and tests, and leave the worktree clean. Do not merge the target branch itself.`;
+          if (proposalPreparationIsDo) {
+            await prepareProposalTurn(preparationPrompt);
+          } else {
+            consumed.add('agent:merge');
+            await mergeTurn(preparationPrompt);
+          }
           branchPreparedForPr = true;
+          if (proposalPreparationIsDo && cancelled) return await abort();
+          if (proposalPreparationIsDo) {
+            stage = 'pr';
+            status = 'active';
+            await publish();
+          }
           const opened = await withResolve('pr', () => core.openPr(world as any, target, {
             title: input.title,
             summary: reviewInfo?.summary ?? lastOutputs(msgs),
@@ -2017,6 +2056,11 @@ async function softwareDevImpl(
           // and the PR head describe the same proposal.
           const preparedReview = await core.buildReview(world as any, base).catch(() => undefined);
           if (preparedReview) reviewInfo = { ...reviewInfo, ...preparedReview };
+        } else if (proposalPreparationIsDo) {
+          stage = 'pr';
+          status = 'active';
+          await publish();
+          if (cancelled) return await abort();
         }
       }
       // Read where every branch stands BEFORE entering Review. Approval is bound to

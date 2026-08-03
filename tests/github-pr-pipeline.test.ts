@@ -214,10 +214,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
     h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
     const task = h.store.createTask({ projectId: project.id, title: 'GitHub merge', workflow: 'software-dev',
-      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
       createdBy: { kind: 'user', userId: 'a' } });
     const taskId = task.id;
-    const handle = await h.client.workflow.start('softwareDev@1.12.0', {
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [{
@@ -230,6 +230,11 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       const current = await view(handle);
       return `${current.stage}/${current.prs?.length ?? 0}`;
     }, { timeout: 30_000 }).toBe('review/1');
+    const awaitingReview = await view(handle);
+    expect(awaitingReview.transcripts.find((transcript: any) => transcript.role === 'merge')).toBeUndefined();
+    const doTranscript = awaitingReview.transcripts.find((transcript: any) => transcript.role === 'do');
+    expect(doTranscript.messages.map((message: any) => message.text).join('\n'))
+      .toMatch(/exact proposal reviewers will inspect/i);
     expect(prs[0].state).toBe('open');
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
