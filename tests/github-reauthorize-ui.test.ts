@@ -57,3 +57,18 @@ describe('GitHub re-authorization affordance', () => {
     expect(gatewaySource).toContain('userProfilePath(this.deps.store, pending.organizationId)');
   });
 });
+
+describe('GitHub merge authorization UX', () => {
+  it('warns at task composition without blocking queueing', () => {
+    expect(source).toContain('/github-merge-eligibility');
+    expect(source).toContain('GitHub merge reviewer recommended');
+    expect(source).toContain('You can still queue the task');
+    expect(source).toContain('Add a <b>Human confirms</b> step');
+  });
+
+  it('makes the consent carried by a human confirmation explicit', () => {
+    expect(source).toContain('Confirm & authorize merge');
+    expect(source).toContain('Authorize GitHub merge');
+    expect(gatewaySource).toContain("github-merge-eligibility");
+  });
+});

@@ -38,6 +38,7 @@ import {
   ParentResponse,
   SubTaskResponse,
   TaskPullRequest,
+  GitHubMergeAuthorization,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
@@ -289,13 +290,19 @@ export async function softwareDevV1_11(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.11.0');
 }
 
+/** Human Review sees the GitHub proposal, and GitHub applies repository policy
+ * under the consenting human's own authorization. */
+export async function softwareDevV1_12(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.12.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -349,6 +356,11 @@ async function softwareDevImpl(
   // Split Merge into branch preparation before the PR and the protected-target
   // landing afterwards. This adds agent/activity commands and must stay pinned.
   const prepareBranchBeforePr = minor >= 11;
+  // GitHub is the authoritative merge surface for PR-policy repositories. The
+  // PR is opened before Review so the decision binds to its exact head SHA; the
+  // merge itself uses a consenting human's user token and GitHub rules.
+  const githubAuthoritativeMerge = minor >= 12 && remotePolicyOf(input.project) === 'pr';
+  const proposalBeforeReview = minor >= 12;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -419,6 +431,7 @@ async function softwareDevImpl(
   let terminalOrigin: Stage | undefined;
   let pr: TaskPullRequest | undefined;
   let prs: TaskPullRequest[] = [];
+  let branchPreparedForPr = false;
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
@@ -658,7 +671,7 @@ async function softwareDevImpl(
       case 'pr':
         return [cancel];
       case 'merge':
-        return [cancel];
+        return waitingFor?.kind === 'human' ? [confirm, cancel] : [cancel];
       case 'resolve':
         return [cancel];
       case 'escalated':
@@ -1974,6 +1987,38 @@ async function softwareDevImpl(
         const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
+      if (proposalBeforeReview) {
+        // Publish the proposal stage before Review. Under GitHub policy this is
+        // the actual PR—not a worktree snapshot that will be committed/rebased
+        // later. This is still before the point of no return: the Merge agent
+        // only prepares the task branch and openPr updates its idempotent PR.
+        stage = 'pr';
+        status = 'active';
+        await publish();
+        if (cancelled) return await abort();
+        if (githubAuthoritativeMerge) {
+          targetLocked = true;
+          consumed.add('agent:merge');
+          await mergeTurn(
+            `Prepare this branch as the exact proposal reviewers will inspect for merge into ${target}. `
+            + `The worktree may contain uncommitted changes: commit what should land; gitignore (or delete) what should not. `
+            + `Merge ${target} into the current branch, `
+            + `resolve every conflict, run the relevant build and tests, and leave the worktree clean. Do not merge the target branch itself.`,
+          );
+          branchPreparedForPr = true;
+          const opened = await withResolve('pr', () => core.openPr(world as any, target, {
+            title: input.title,
+            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+          }));
+          prs = opened ?? [];
+          pr = prs[0];
+          // Preparation may have committed conflict resolutions or cleanup after
+          // the Do packet was built. Refresh the human-facing diff now so Review
+          // and the PR head describe the same proposal.
+          const preparedReview = await core.buildReview(world as any, base).catch(() => undefined);
+          if (preparedReview) reviewInfo = { ...reviewInfo, ...preparedReview };
+        }
+      }
       // Read where every branch stands BEFORE entering Review. Approval is bound to
       // a head sha, so this is also what makes a stale approval lapse: a branch the
       // Do agent touched since it was approved now reports a different head and
@@ -2113,8 +2158,7 @@ async function softwareDevImpl(
   }
 
   // ── PR (optional) ──
-  let branchPreparedForPr = false;
-  if (recoveryStage !== 'merge') {
+  if (!proposalBeforeReview && recoveryStage !== 'merge') {
   stage = 'pr';
   status = 'active';
   await publish();
@@ -2177,6 +2221,7 @@ async function softwareDevImpl(
     const held: string[] = [];
     let acquireCancelled = false;
     let result;
+    let githubResult: GitHubMergeAuthorization | undefined;
     // Every acquired domain MUST be released — including when enqueueMerge / the
     // position publish / the merge agent throws while acquiring or holding a LATER
     // domain. Without this, domains 0..n-1 stayed leased until the coordinator's
@@ -2242,10 +2287,22 @@ async function softwareDevImpl(
           prs = refreshed;
           pr = prs[0];
         }
-        // …then the authoritative, deterministic merge that guarantees work lands.
-        result = await long.finalizeMergeActivity(world as any, target);
+        if (githubAuthoritativeMerge) {
+          // The proposal was already prepared and reviewed. Do not create a
+          // second local merge and push it with the installation credential;
+          // request the exact reviewed PR merge under a consenting human token.
+          githubResult = await core.mergeGithubPrs(world as any, prs);
+        } else {
+          // …then the authoritative, deterministic local merge that guarantees
+          // work lands for non-PR and replay-pinned historical workflows.
+          result = await long.finalizeMergeActivity(world as any, target);
+        }
       } catch (err) {
-        result = { merged: false, landedFiles: [], note: String(err) };
+        if (githubAuthoritativeMerge) {
+          githubResult = { status: 'waiting', prs, detail: String(err) };
+        } else {
+          result = { merged: false, landedFiles: [], note: String(err) };
+        }
       }
     } finally {
       // Swallow per-domain. From 1.9.0 `coordinator` retries a bounded 5 times
@@ -2257,6 +2314,51 @@ async function softwareDevImpl(
       for (const d of held) await coordinator.releaseMerge(d, taskId).catch(() => undefined);
       held.length = 0;
     }
+
+    if (githubAuthoritativeMerge) {
+      const decision = githubResult ?? { status: 'waiting' as const, prs, detail: 'GitHub merge did not return a result.' };
+      prs = decision.prs;
+      pr = prs[0];
+      if (prs.some((candidate) => candidate.merged)) pointOfNoReturnPassed = true;
+      if (decision.status === 'merged') {
+        sha = decision.sha;
+        pointOfNoReturnPassed = true;
+        break;
+      }
+      if (decision.status === 'needs-authorizer' || decision.status === 'stale-review') {
+        // A controlled terminal human layer. It does not rewrite the configured
+        // Review route (already consumed/frozen); its only meaning is consent to
+        // retry this unchanged GitHub proposal under the confirming person's
+        // token. Every retry re-checks repository permission live.
+        confirmed = false;
+        status = 'waiting';
+        const eligible = decision.eligibleUserIds ?? [];
+        const audience = eligible.length
+          ? [...eligible.map((userId) => `user:${userId}`), '@creator']
+          : ['@creator'];
+        waitingFor = {
+          kind: 'human', audience,
+          detail: decision.detail ?? (decision.status === 'stale-review'
+            ? 'The pull request changed after Review; review and confirm the new head.'
+            : 'A connected human with GitHub merge access must confirm this merge.'),
+        };
+        await publish();
+        await condition(() => confirmed || cancelled);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        confirmed = false;
+        continue;
+      }
+      status = 'waiting';
+      waitingFor = { kind: 'github', detail: decision.detail ?? 'Waiting for GitHub checks or merge queue.' };
+      await publish();
+      await condition(() => cancelled, '30s');
+      waitingFor = undefined;
+      if (cancelled) return await abort();
+      continue;
+    }
+
+    if (!result) result = { merged: false, landedFiles: [], note: 'local merge did not return a result' };
 
     if (result.merged) {
       sha = result.sha;

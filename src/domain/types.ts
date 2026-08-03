@@ -655,6 +655,21 @@ export interface TaskPullRequest {
   url: string;
   state: 'open' | 'closed';
   merged?: boolean;
+  /** GitHub's immutable commit identity for the proposal a human reviewed. */
+  headSha?: string;
+  /** GraphQL node id, used only to enter a repository merge queue. */
+  nodeId?: string;
+}
+
+export interface GitHubMergeAuthorization {
+  status: 'merged' | 'queued' | 'waiting' | 'needs-authorizer' | 'stale-review';
+  prs: TaskPullRequest[];
+  /** GitHub user whose token performed or queued the merge. */
+  actorUserId?: string;
+  sha?: string;
+  detail?: string;
+  /** Project members whose live GitHub role currently permits a merge request. */
+  eligibleUserIds?: string[];
 }
 
 /**
@@ -1250,7 +1265,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;

@@ -68,7 +68,10 @@ export async function bootHarness(
   adapterOverride?: import('../../src/agent/types.js').AgentAdapter,
   /** Activity-dep overrides a test needs the worker to run with (e.g. a stub
    *  GitHub endpoint for the pull-request integration). */
-  overrides: { githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions } = {},
+  overrides: {
+    githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions;
+    githubApp?: import('../../src/integrations/github-app.js').GitHubAppService;
+  } = {},
 ): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
   const conn = { address: server.address, namespace: server.namespace };

@@ -14,12 +14,59 @@
 
 export interface GithubPullRequest {
   number: number;
+  nodeId?: string;
   url: string;
   state: 'open' | 'closed';
   merged: boolean;
   title?: string;
   head?: string;
+  headSha?: string;
   base?: string;
+  mergeable?: boolean | null;
+  mergeableState?: string;
+  mergeCommitSha?: string;
+}
+
+export interface GithubMergeResult {
+  merged: boolean;
+  sha?: string;
+  message: string;
+  /** GitHub accepted the PR into its merge queue. */
+  queued?: boolean;
+}
+
+export type GithubMergeMethod = 'merge' | 'squash' | 'rebase';
+export type GithubPullRequestMergeable = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+export type GithubPullRequestMergeState =
+  'BEHIND' | 'BLOCKED' | 'CLEAN' | 'DIRTY' | 'DRAFT' | 'HAS_HOOKS' | 'UNKNOWN' | 'UNSTABLE';
+export type GithubPullRequestReviewDecision = 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED';
+export type GithubStatusCheckState = 'ERROR' | 'EXPECTED' | 'FAILURE' | 'PENDING' | 'SUCCESS';
+
+/** GitHub's live merge-policy observations. This intentionally does not reduce
+ * branch rules, reviews, checks, and queue state to a local `ready` boolean. */
+export interface GithubPullRequestReadiness {
+  nodeId: string;
+  url: string;
+  state: GithubPullRequest['state'];
+  draft: boolean;
+  merged: boolean;
+  headSha: string;
+  mergeable: GithubPullRequestMergeable;
+  mergeStateStatus: GithubPullRequestMergeState;
+  reviewDecision?: GithubPullRequestReviewDecision;
+  checks?: GithubStatusCheckState;
+  mergeQueueEntryId?: string;
+  autoMerge?: { enabledAt: string; mergeMethod: GithubMergeMethod };
+  viewerCanEnableAutoMerge: boolean;
+  viewerCanMergeAsAdmin: boolean;
+}
+
+export interface GithubAutoMergeResult {
+  enabled: boolean;
+  pullRequestId?: string;
+  enabledAt?: string;
+  mergeMethod?: GithubMergeMethod;
+  message: string;
 }
 
 export interface GithubPrApiOptions {
@@ -47,12 +94,17 @@ export function taskIdOfBranch(branch: string | undefined): string | undefined {
 function normalize(raw: any): GithubPullRequest {
   return {
     number: Number(raw.number),
+    ...(raw.node_id ? { nodeId: String(raw.node_id) } : {}),
     url: String(raw.html_url ?? raw.url ?? ''),
     state: raw.state === 'closed' ? 'closed' : 'open',
     merged: Boolean(raw.merged ?? raw.merged_at),
     ...(raw.title ? { title: String(raw.title) } : {}),
     ...(raw.head?.ref ? { head: String(raw.head.ref) } : {}),
+    ...(raw.head?.sha ? { headSha: String(raw.head.sha) } : {}),
     ...(raw.base?.ref ? { base: String(raw.base.ref) } : {}),
+    ...(Object.prototype.hasOwnProperty.call(raw, 'mergeable') ? { mergeable: raw.mergeable == null ? null : Boolean(raw.mergeable) } : {}),
+    ...(raw.mergeable_state ? { mergeableState: String(raw.mergeable_state) } : {}),
+    ...(raw.merge_commit_sha ? { mergeCommitSha: String(raw.merge_commit_sha) } : {}),
   };
 }
 
@@ -118,7 +170,117 @@ export class GithubPrApi {
     await this.request(`/repos/${slug}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
   }
 
-  private async request<T = any>(pathname: string, init: RequestInit = {}): Promise<T> {
+  /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
+   * review record. GitHub may reject self-approval or an already-settled review;
+   * callers treat that as non-fatal and let repository policy decide at merge. */
+  async approve(slug: string, number: number, headSha: string, body: string): Promise<void> {
+    await this.request(`/repos/${slug}/pulls/${number}/reviews`, {
+      method: 'POST', body: JSON.stringify({ commit_id: headSha, event: 'APPROVE', body }),
+    });
+  }
+
+  /** Ask GitHub to merge this exact reviewed head. GitHub remains the policy
+   * authority: branch protection, rulesets, required reviews and checks are all
+   * enforced by this endpoint. A moved head cannot be merged accidentally. */
+  async merge(slug: string, number: number, headSha: string,
+    mergeMethod: GithubMergeMethod = 'merge'): Promise<GithubMergeResult> {
+    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/merge`, {
+      method: 'PUT',
+      body: JSON.stringify({ sha: headSha, merge_method: mergeMethod }),
+    }, [405, 409, 422]);
+    return {
+      merged: Boolean(value?.merged),
+      ...(value?.sha ? { sha: String(value.sha) } : {}),
+      message: String(value?.message ?? (value?.merged ? 'Pull request merged' : 'GitHub did not merge the pull request')),
+    };
+  }
+
+  /** Repositories configured with GitHub merge queues reject the direct REST
+   * merge. Enqueue the same PR through GraphQL; a mutation error simply means
+   * this repository is not queue-enabled (or its current policy is unmet). */
+  async enqueue(nodeId: string, headSha?: string): Promise<GithubMergeResult> {
+    const value = await this.graphql<any>(
+      'mutation($input:EnqueuePullRequestInput!){ enqueuePullRequest(input:$input){ mergeQueueEntry{ id } } }',
+      { input: { pullRequestId: nodeId, ...(headSha ? { expectedHeadOid: headSha } : {}) } },
+    );
+    return {
+      merged: false,
+      queued: Boolean(value?.data?.enqueuePullRequest?.mergeQueueEntry?.id),
+      message: value?.errors?.[0]?.message
+        ? String(value.errors[0].message)
+        : value?.data?.enqueuePullRequest?.mergeQueueEntry?.id
+          ? 'Pull request queued for merge'
+          : 'GitHub did not queue the pull request',
+    };
+  }
+
+  /** Inspect the PR state GitHub uses when deciding whether and how it may
+   * merge, including reviews, checks, queue state, and viewer capabilities. */
+  async readiness(slug: string, number: number): Promise<GithubPullRequestReadiness> {
+    const [owner, name, ...extra] = slug.split('/');
+    if (!owner || !name || extra.length) throw new Error(`Invalid GitHub repository slug: ${slug}`);
+    const value = await this.graphql<any>(`query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          id url state isDraft merged headRefOid mergeable mergeStateStatus reviewDecision
+          statusCheckRollup { state }
+          mergeQueueEntry { id }
+          autoMergeRequest { enabledAt mergeMethod }
+          viewerCanEnableAutoMerge viewerCanMergeAsAdmin
+        }
+      }
+    }`, { owner, name, number });
+    if (value?.errors?.length) {
+      const message = value.errors.map((error: any) => String(error?.message ?? 'Unknown error')).join('; ');
+      throw new Error(`GitHub GraphQL: ${message.slice(0, 300)}`);
+    }
+    const raw = value?.data?.repository?.pullRequest;
+    if (!raw) throw new Error(`GitHub pull request ${slug}#${number} was not found`);
+    return {
+      nodeId: String(raw.id),
+      url: String(raw.url),
+      state: raw.state === 'OPEN' ? 'open' : 'closed',
+      draft: Boolean(raw.isDraft),
+      merged: Boolean(raw.merged),
+      headSha: String(raw.headRefOid),
+      mergeable: raw.mergeable as GithubPullRequestMergeable,
+      mergeStateStatus: raw.mergeStateStatus as GithubPullRequestMergeState,
+      ...(raw.reviewDecision ? { reviewDecision: raw.reviewDecision as GithubPullRequestReviewDecision } : {}),
+      ...(raw.statusCheckRollup?.state ? { checks: raw.statusCheckRollup.state as GithubStatusCheckState } : {}),
+      ...(raw.mergeQueueEntry?.id ? { mergeQueueEntryId: String(raw.mergeQueueEntry.id) } : {}),
+      ...(raw.autoMergeRequest ? { autoMerge: { enabledAt: String(raw.autoMergeRequest.enabledAt),
+        mergeMethod: String(raw.autoMergeRequest.mergeMethod).toLowerCase() as GithubMergeMethod } } : {}),
+      viewerCanEnableAutoMerge: Boolean(raw.viewerCanEnableAutoMerge),
+      viewerCanMergeAsAdmin: Boolean(raw.viewerCanMergeAsAdmin),
+    };
+  }
+
+  /** Enable GitHub auto-merge only while the PR still points at `headSha`. */
+  async enableAutoMerge(nodeId: string, headSha: string,
+    mergeMethod: GithubMergeMethod = 'merge'): Promise<GithubAutoMergeResult> {
+    const value = await this.graphql<any>(`mutation EnablePullRequestAutoMerge($input: EnablePullRequestAutoMergeInput!) {
+      enablePullRequestAutoMerge(input: $input) {
+        pullRequest { id autoMergeRequest { enabledAt mergeMethod } }
+      }
+    }`, { input: { pullRequestId: nodeId, expectedHeadOid: headSha, mergeMethod: mergeMethod.toUpperCase() } });
+    const raw = value?.data?.enablePullRequestAutoMerge?.pullRequest;
+    const request = raw?.autoMergeRequest;
+    return {
+      enabled: Boolean(request),
+      ...(raw?.id ? { pullRequestId: String(raw.id) } : {}),
+      ...(request?.enabledAt ? { enabledAt: String(request.enabledAt) } : {}),
+      ...(request?.mergeMethod ? { mergeMethod: String(request.mergeMethod).toLowerCase() as GithubMergeMethod } : {}),
+      message: value?.errors?.[0]?.message
+        ? String(value.errors[0].message)
+        : request ? 'Pull request auto-merge enabled' : 'GitHub did not enable pull request auto-merge',
+    };
+  }
+
+  private async graphql<T = any>(query: string, variables: Record<string, unknown>): Promise<T> {
+    return this.request<T>('/graphql', { method: 'POST', body: JSON.stringify({ query, variables }) });
+  }
+
+  private async request<T = any>(pathname: string, init: RequestInit = {}, accepted: number[] = []): Promise<T> {
     const send = async (forceRefresh = false) => {
       const token = typeof this.token === 'function'
         ? await this.token(forceRefresh ? { forceRefresh: true } : undefined)
@@ -131,9 +293,10 @@ export class GithubPrApi {
     };
     let response = await send();
     if (response.status === 401 && typeof this.token === 'function') response = await send(true);
-    if (!response.ok) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    if (!response.ok && !accepted.includes(response.status)) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
     if (response.status === 204) return undefined as T;
-    return await response.json() as T;
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 }
 

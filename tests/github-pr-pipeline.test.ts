@@ -32,13 +32,21 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   }
   if (u.pathname === `/repos/${SLUG}/pulls` && method === 'POST') {
     const pr = { number: prs.length + 1, html_url: `https://github.com/${SLUG}/pull/${prs.length + 1}`,
-      state: 'open', merged_at: null, title: body.title, body: body.body,
-      head: { ref: body.head }, base: { ref: body.base } };
+      node_id: `PR_${prs.length + 1}`, state: 'open', merged_at: null, title: body.title, body: body.body,
+      head: { ref: body.head, sha: 'reviewed-head' }, base: { ref: body.base } };
     prs.push(pr);
     const hook = afterPrOpened;
     afterPrOpened = undefined;
     await hook?.();
     return json(201, pr);
+  }
+  const merge = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)/merge$`));
+  if (merge && method === 'PUT') {
+    const pr = prs.find((candidate) => candidate.number === Number(merge[1]));
+    if (!pr) return json(404, {});
+    if (body.sha !== pr.head.sha) return json(409, { merged: false, message: 'Head branch was modified' });
+    pr.state = 'closed'; pr.merged_at = new Date().toISOString();
+    return json(200, { merged: true, sha: 'github-merge-sha', message: 'merged' });
   }
   const one = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)$`));
   if (one) {
@@ -82,13 +90,22 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         return mock.runTurn(input, ctx);
       },
     };
-    h = await bootHarness('mock', adapter, { githubPr: { apiBase: 'https://api.github.test', fetch: fetcher } });
+    h = await bootHarness('mock', adapter, {
+      githubPr: { apiBase: 'https://api.github.test', fetch: fetcher },
+      githubApp: {
+        status: () => ({ userAuthorized: true, oauthConfigured: true }),
+        activeUserAccountId: (userId: string) => `${userId}-github`,
+        repositoryPermission: async (_userId: string, slug: string) => ({ slug, permission: 'write', canMerge: true }),
+        userAccessToken: async (userId: string) => `${userId}-token`,
+        brokerCredentials: async () => ({ env: {} }),
+      } as any,
+    });
     originDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pr-origin-'));
   }, 120_000);
   afterAll(async () => {
     delete process.env.GH_TOKEN;
     await h?.stop();
-    fs.rmSync(originDir, { recursive: true, force: true });
+    if (originDir) fs.rmSync(originDir, { recursive: true, force: true });
   });
   beforeEach(() => { prs.length = 0; comments.length = 0; afterPrOpened = undefined; });
 
@@ -186,6 +203,43 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const merge = final.transcripts.find((transcript: any) => transcript.role === 'merge');
     expect(merge.messages.map((message: any) => message.text).join('\n')).toMatch(/before opening the pull request/i);
     expect(merge.messages.filter((message: any) => message.role === 'user')).toHaveLength(1); // no duplicate initial Merge turn
+  }, 120_000);
+
+  it('opens the proposal before Review and lets GitHub merge it as the eligible creator', async () => {
+    const repo = await repoWithOrigin('github-authoritative');
+    const project = h.store.createProject('GitHub authoritative', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'GitHub merge', workflow: 'software-dev',
+      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const taskId = task.id;
+    const handle = await h.client.workflow.start('softwareDev@1.12.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        taskId, projectId: project.id, title: 'GitHub merge', prompt: '@write proposal.md :: reviewed proposal\n@review Ready',
+        base: 'main', target: 'main', project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.prs?.length ?? 0}`;
+    }, { timeout: 30_000 }).toBe('review/1');
+    expect(prs[0].state).toBe('open');
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
+    expect(prs[0].state).toBe('closed');
+    const final = await view(handle);
+    expect(final.pr).toMatchObject({ merged: true, state: 'closed', headSha: 'reviewed-head' });
+    // GitHub, not a local installation-token push, is authoritative: the local
+    // bare origin's target is intentionally untouched by this stub merge.
+    const origin = path.join(originDir, 'github-authoritative.git');
+    expect((await git(origin, ['show', 'main:proposal.md'])).code).not.toBe(0);
   }, 120_000);
 
   /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its
