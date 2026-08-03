@@ -6039,6 +6039,68 @@ function subTasksSection(v) {
   </section>`;
 }
 
+// A task-agent fork is stored on the NEW task as `resumeFrom.taskId`. Agent
+// specs can appear in several workflow fields (Do/Merge overrides and nested
+// confirmation layers), so discover the declared relationship by shape rather
+// than hard-coding today's field names. Raw provider session continuations have
+// no taskId and intentionally do not participate in this hierarchy.
+function taskForkSourceIds(task) {
+  const sources = new Set();
+  const seen = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    const resumeFrom = value.resumeFrom;
+    if (resumeFrom && typeof resumeFrom === 'object' && typeof resumeFrom.taskId === 'string')
+      sources.add(resumeFrom.taskId);
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(task?.params);
+  return [...sources];
+}
+
+// Build from the complete project task pool (which includes archived tasks), so
+// a completed fork remains visible and forks of forks naturally form a tree.
+// The lineage guard makes malformed/cyclic stored parameters harmless.
+function agentForkTree(sourceTaskId, lineage = []) {
+  const ancestors = new Set(lineage);
+  ancestors.add(sourceTaskId);
+  return (S.tasks || [])
+    .filter((task) => !ancestors.has(task.id) && taskForkSourceIds(task).includes(sourceTaskId))
+    .map((task) => ({ task, children: agentForkTree(task.id, [...ancestors]) }));
+}
+
+function agentForksSection(v) {
+  const tree = agentForkTree(v.taskId);
+  if (!tree.length) return '';
+  const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
+  const renderNodes = (nodes) => `<ul class="fork-tree">${nodes.map(({ task, children }) => {
+    const state = subTaskState(task);
+    return `<li class="fork-tree-item">
+      <a class="fork-row" data-spa href="${esc(taskUrl(task.id))}" aria-label="Open ${esc(task.title)} — ${esc(state.label)}">
+        <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
+        <span class="fork-identity">
+          <span class="fork-title">${task.num != null ? `<span class="task-num">#${task.num}</span>` : ''}<strong>${esc(task.title)}</strong></span>
+          <span class="fork-state">${esc(state.label)}</span>
+        </span>
+        <span class="fork-arrow" aria-hidden="true">›</span>
+      </a>
+      ${children.length ? renderNodes(children) : ''}
+    </li>`;
+  }).join('')}</ul>`;
+  const count = countNodes(tree);
+  return `<section class="agent-forks" aria-labelledby="agent-forks-title">
+    <div class="agent-forks-head">
+      <div>
+        <div class="agent-forks-kicker">Branched conversations</div>
+        <h3 id="agent-forks-title">Agent forks</h3>
+      </div>
+      <div class="agent-forks-count">${count} task fork${count === 1 ? '' : 's'}</div>
+    </div>
+    ${renderNodes(tree)}
+  </section>`;
+}
+
 // ── the four task-page tabs ───────────────────────────────────────────────────
 // Overview: what the task IS and where it stands — pipeline, review, widgets,
 // sub-tasks, notes. Everything shown comes off the workflow's declared view.
@@ -6114,6 +6176,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
+  const agentForks = agentForksSection(v);
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
@@ -6121,6 +6184,7 @@ function overviewTab(v) {
     ${waiting}
     ${agentTurn}
     ${subtasks}
+    ${agentForks}
     ${checkoutsSection(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
