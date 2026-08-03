@@ -34,7 +34,7 @@ describe('cloud repository source resolution', () => {
     await expect(cloudGitSource(repo)).rejects.toThrow(/has no git remote/);
   });
 
-  it('uses an auto-detected local origin without requiring a project catalog attachment', async () => {
+  it('uses the connected App for an auto-detected local origin without requiring a project attachment', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cloud-local-origin-')); dirs.push(root);
     const app = path.join(root, 'app');
     const content = path.join(root, 'content');
@@ -50,6 +50,16 @@ describe('cloud repository source resolution', () => {
     const task = store.createTask({
       projectId: project.id, title: 'Cloud work', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'work' },
+    });
+
+    const connection = store.upsertGitConnection({
+      organizationId: project.organizationId!, provider: 'github', installationId: '42',
+      accountLogin: 'acme', accountType: 'Organization',
+    });
+    const appRepository = store.upsertRepository({
+      organizationId: project.organizationId!, provider: 'github', providerId: '7',
+      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id,
     });
 
     const wikiUrl = 'git@github.com:acme/project-wiki.git';
@@ -90,7 +100,7 @@ describe('cloud repository source resolution', () => {
       githubApp: {
         async repositoryCloneToken(repository: { id: string }) {
           tokenRequests.push(repository.id);
-          return 'wiki clone token';
+          return repository.id === appRepository.id ? 'app clone token' : 'wiki clone token';
         },
       } as any,
     });
@@ -101,8 +111,11 @@ describe('cloud repository source resolution', () => {
       });
       expect(received.repos).toEqual(['git@github.com:acme/app.git', wikiUrl]);
       expect(received.copySources).toEqual([app, wikiRoot]);
-      expect(received.gitCredentials.httpsTokens).toEqual({ [wikiUrl]: 'wiki clone token' });
-      expect(tokenRequests).toEqual([wiki.id]);
+      expect(received.gitCredentials.httpsTokens).toEqual({
+        'git@github.com:acme/app.git': 'app clone token',
+        [wikiUrl]: 'wiki clone token',
+      });
+      expect(tokenRequests).toEqual([appRepository.id, wiki.id]);
       expect(handle.repos?.find((repo) => repo.name === 'app')?.localPath).toBe(app);
     } finally {
       store.close();

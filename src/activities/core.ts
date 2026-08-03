@@ -471,6 +471,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (origin.code === 0) {
         const found = candidates.find((candidate) => sameRepository(candidate.sshUrl, origin.stdout.trim()));
         if (found) return found;
+        // A configured local checkout is itself a project authority. It may
+        // predate first-class project repository attachments, but if its origin
+        // exactly matches a repository exposed by this organization's GitHub
+        // App installation, use that installation instead of falling back to
+        // the host's SSH agent/PAT.
+        const catalog = store.listRepositories(store.getProject(projectId)?.organizationId ?? 'org_personal');
+        return catalog.find((candidate) => sameRepository(candidate.sshUrl, origin.stdout.trim()));
       }
     }
     return undefined;
@@ -608,18 +615,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const project = projectId ? store.getProject(projectId) : undefined;
     const linked = projectId ? store.listProjectRepositories(projectId) : [];
     const wiki = projectId ? store.projectWiki(projectId)?.repository : undefined;
-    if (project?.organizationId && (linked.length || wiki) && deps.githubApp) {
+    const catalog = project?.organizationId ? store.listRepositories(project.organizationId) : [];
+    if (project?.organizationId && (linked.length || wiki || catalog.length) && deps.githubApp) {
       return async (worldRepo) => {
         const source = worldRepoSource(worldRepo);
-        const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
+        let repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
           ?? (wiki && sameRepository(wiki.sshUrl, source) ? wiki : undefined);
+        if (!repository && worldRepo.localPath)
+          repository = catalog.find((candidate) => sameRepository(candidate.sshUrl, source));
         // A cloud checkout provisioned from a project-configured host checkout
-        // is enrolled by that exact local authority, not by the GitHub App
-        // catalog. PR policy still needs to publish its task branch to the
-        // checkout's origin, so use the world's selected Git profile (or the
-        // personal organization's host fallback) for that one operation. The
-        // sealed world handle preserves localPath from cloudGitSource; arbitrary
-        // network repositories still fail the catalog guard below.
+        // is authorized by that exact local authority. Prefer its matching App
+        // catalog credential; if the installation does not expose that origin,
+        // retain the selected Git profile compatibility path. The sealed world
+        // handle preserves localPath from cloudGitSource; arbitrary network
+        // repositories still fail the catalog guard below.
         if (!repository && worldRepo.localPath) return { env: gitEnvFor(handle, taskId) };
         if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
         return deps.githubApp!.brokerCredentials(repository);
@@ -786,6 +795,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // the durable task record is the compatibility source for repository
       // enrollment, credentials, and world ownership.
       const linkedRepositories = projectId ? store.listProjectRepositories(projectId) : [];
+      const organizationRepositories = project?.organizationId
+        ? store.listRepositories(project.organizationId)
+        : [];
+      const hasCatalogedLocalSource = worldSources.some((source, index) =>
+        Boolean(cloudSources[index]?.localPath)
+        && organizationRepositories.some((candidate) => sameRepository(candidate.sshUrl, source)));
       const repositoryBranches = Object.fromEntries(worldSources.flatMap((source) => {
         const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, source));
         if (!candidate) return [];
@@ -796,13 +811,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
         base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
       };
-      if (linkedRepositories.length || wikiRepository) {
+      if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
         for (const [index, source] of worldSources.entries()) {
           const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, source));
           const repository = linked?.repository
-            ?? (wikiRepository && sameRepository(wikiRepository.sshUrl, source) ? wikiRepository : undefined);
+            ?? (wikiRepository && sameRepository(wikiRepository.sshUrl, source) ? wikiRepository : undefined)
+            // Local filesystem sources are explicitly configured project
+            // authorities. In a cloud world their origin becomes the clone
+            // transport; match that origin against the connected GitHub App
+            // catalog even when the project predates repository attachments.
+            ?? (cloudSources[index]?.localPath
+              ? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, source))
+              : undefined);
           if (!repository) {
             // A configured host checkout is already the authority for this
             // repository. cloudGitSource resolved its origin only as the cloud
