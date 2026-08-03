@@ -49,7 +49,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(fieldNames).not.toContain('gitProfile');
     expect(sd.params.find((f: any) => f.name === 'agent:do').type).toBe('agent');
     // each workflow serves its own lifecycle stages (drives the pipeline UI)
-    expect(sd.stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'review', 'pr', 'merge', 'done']);
+    expect(sd.stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'pr', 'review', 'merge', 'done']);
     expect(schema.map((s: any) => s.name)).not.toContain('just-do');
     expect(schema.map((s: any) => s.name)).not.toContain('script-exec');
   });
