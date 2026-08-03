@@ -97,4 +97,85 @@ describe('project wiki remote provisioning', () => {
     expect(execFileSync('git', ['--git-dir', bare, 'rev-parse', 'refs/heads/main'],
       { encoding: 'utf8' }).trim()).toMatch(/^[0-9a-f]{40}$/);
   });
+
+  it('fast-forwards the canonical wiki after GitHub merges a wiki pull request', async () => {
+    const root = ensureProjectWikiRepository(paths().content, 'remote-ahead');
+    const bare = path.join(home, 'remote-ahead.git');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    await setProjectWikiRemote(root, bare, { env: {} });
+
+    // Model GitHub landing a reviewed task branch while the canonical checkout
+    // still has its pre-merge main and a stale origin/main tracking ref.
+    const github = path.join(home, 'github-merge');
+    execFileSync('git', ['clone', '-q', bare, github]);
+    execFileSync('git', ['-C', github, 'config', 'user.name', 'GitHub']);
+    execFileSync('git', ['-C', github, 'config', 'user.email', 'github@localhost']);
+    fs.writeFileSync(path.join(github, 'remote.md'), 'landed on GitHub\n');
+    execFileSync('git', ['-C', github, 'add', 'remote.md']);
+    execFileSync('git', ['-C', github, 'commit', '-q', '-m', 'Merge wiki pull request']);
+    execFileSync('git', ['-C', github, 'push', '-q', 'origin', 'main']);
+    const remoteHead = execFileSync('git', ['-C', github, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+    await expect(setProjectWikiRemote(root, bare, { env: {} })).resolves.toBeUndefined();
+    expect(execFileSync('git', ['-C', root, 'rev-parse', 'main'], { encoding: 'utf8' }).trim()).toBe(remoteHead);
+    expect(fs.readFileSync(path.join(root, 'remote.md'), 'utf8')).toBe('landed on GitHub\n');
+    expect(execFileSync('git', ['--git-dir', bare, 'rev-parse', 'main'], { encoding: 'utf8' }).trim()).toBe(remoteHead);
+  });
+
+  it('merges independent local and remote wiki edits without overwriting either', async () => {
+    const root = ensureProjectWikiRepository(paths().content, 'diverged');
+    const bare = path.join(home, 'diverged.git');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    await setProjectWikiRemote(root, bare, { env: {} });
+
+    const github = path.join(home, 'github-diverged');
+    execFileSync('git', ['clone', '-q', bare, github]);
+    execFileSync('git', ['-C', github, 'config', 'user.name', 'GitHub']);
+    execFileSync('git', ['-C', github, 'config', 'user.email', 'github@localhost']);
+    fs.writeFileSync(path.join(github, 'remote.md'), 'remote edit\n');
+    execFileSync('git', ['-C', github, 'add', 'remote.md']);
+    execFileSync('git', ['-C', github, 'commit', '-q', '-m', 'Remote edit']);
+    execFileSync('git', ['-C', github, 'push', '-q', 'origin', 'main']);
+
+    fs.writeFileSync(path.join(root, 'local.md'), 'local edit\n');
+    execFileSync('git', ['-C', root, 'add', 'local.md']);
+    execFileSync('git', ['-C', root, 'commit', '-q', '-m', 'Local edit']);
+
+    await expect(setProjectWikiRemote(root, bare, { env: {} })).resolves.toBeUndefined();
+    const localHead = execFileSync('git', ['-C', root, 'rev-parse', 'main'], { encoding: 'utf8' }).trim();
+    expect(execFileSync('git', ['--git-dir', bare, 'rev-parse', 'main'], { encoding: 'utf8' }).trim()).toBe(localHead);
+    expect(fs.readFileSync(path.join(root, 'local.md'), 'utf8')).toBe('local edit\n');
+    expect(fs.readFileSync(path.join(root, 'remote.md'), 'utf8')).toBe('remote edit\n');
+    expect(execFileSync('git', ['-C', root, 'rev-list', '--parents', '-n', '1', 'HEAD'],
+      { encoding: 'utf8' }).trim().split(' ')).toHaveLength(3);
+  });
+
+  it('aborts a conflicting reconciliation without changing either wiki history', async () => {
+    const root = ensureProjectWikiRepository(paths().content, 'conflict');
+    fs.writeFileSync(path.join(root, 'shared.md'), 'baseline\n');
+    execFileSync('git', ['-C', root, 'add', 'shared.md']);
+    execFileSync('git', ['-C', root, 'commit', '-q', '-m', 'Baseline']);
+    const bare = path.join(home, 'conflict.git');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    await setProjectWikiRemote(root, bare, { env: {} });
+
+    const github = path.join(home, 'github-conflict');
+    execFileSync('git', ['clone', '-q', bare, github]);
+    execFileSync('git', ['-C', github, 'config', 'user.name', 'GitHub']);
+    execFileSync('git', ['-C', github, 'config', 'user.email', 'github@localhost']);
+    fs.writeFileSync(path.join(github, 'shared.md'), 'remote edit\n');
+    execFileSync('git', ['-C', github, 'commit', '-qam', 'Remote edit']);
+    execFileSync('git', ['-C', github, 'push', '-q', 'origin', 'main']);
+    const remoteHead = execFileSync('git', ['-C', github, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+    fs.writeFileSync(path.join(root, 'shared.md'), 'local edit\n');
+    execFileSync('git', ['-C', root, 'commit', '-qam', 'Local edit']);
+    const localHead = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+    await expect(setProjectWikiRemote(root, bare, { env: {} })).rejects.toThrow();
+    expect(execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(localHead);
+    expect(execFileSync('git', ['--git-dir', bare, 'rev-parse', 'main'], { encoding: 'utf8' }).trim()).toBe(remoteHead);
+    expect(execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).trim()).toBe('');
+    expect(fs.readFileSync(path.join(root, 'shared.md'), 'utf8')).toBe('local edit\n');
+  });
 });

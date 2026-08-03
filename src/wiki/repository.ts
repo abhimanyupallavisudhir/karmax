@@ -151,6 +151,39 @@ export async function setProjectWikiRemote(root: string, remote: string, credent
   try {
     const { env } = materializeGitCredential(dir, credential);
     setRemote(root, remote);
+    // A PR-policy task is landed by GitHub, so origin/main can legitimately be
+    // ahead of the canonical local checkout the next time the gateway starts.
+    // Fetch and reconcile that history before publishing local wiki edits. A
+    // blind push here used to fail forever with "fetch first" after every wiki
+    // PR merge because the retry repeated the exact same push without fetching.
+    const remoteHead = await gitAsync(root,
+      ['ls-remote', '--heads', 'origin', `refs/heads/${PROJECT_WIKI_BRANCH}`], env);
+    if (remoteHead) {
+      const tracking = `refs/remotes/origin/${PROJECT_WIKI_BRANCH}`;
+      await gitAsync(root, ['fetch', '--no-tags', 'origin',
+        `+refs/heads/${PROJECT_WIKI_BRANCH}:${tracking}`], env);
+      let remoteIsAncestor = true;
+      try { git(root, ['merge-base', '--is-ancestor', tracking, PROJECT_WIKI_BRANCH]); }
+      catch { remoteIsAncestor = false; }
+      if (!remoteIsAncestor) {
+        try {
+          // This fast-forwards the ordinary GitHub-merge case. If local wiki
+          // edits raced the remote merge, retain both with a normal merge commit
+          // rather than overwriting either side. Unrelated history is possible
+          // when a repository was initialized manually before it was connected.
+          await gitAsync(root, [
+            '-c', 'user.name=karmax', '-c', 'user.email=karmax@localhost',
+            'merge', '--no-edit', '--allow-unrelated-histories',
+            '-m', `karmax: sync origin/${PROJECT_WIKI_BRANCH}`,
+            tracking,
+          ]);
+        } catch (error) {
+          // Never leave the shared canonical wiki in a conflicted merge state.
+          await gitAsync(root, ['merge', '--abort']).catch(() => undefined);
+          throw error;
+        }
+      }
+    }
     await gitAsync(root, ['push', '-u', 'origin', `${PROJECT_WIKI_BRANCH}:${PROJECT_WIKI_BRANCH}`], env);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
