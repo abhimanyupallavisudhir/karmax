@@ -52,6 +52,7 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.softwareDev, '1.10.0'),
   qualifiedType(WF.softwareDev, '1.11.0'),
   qualifiedType(WF.softwareDev, '1.12.0'),
+  qualifiedType(WF.softwareDev, '1.13.0'),
   qualifiedType(WF.justDo, '1.0.0'),
   qualifiedType(WF.justDo, '1.1.0'),
   qualifiedType(WF.justDo, '1.2.0'),
@@ -71,6 +72,7 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.goal, '1.10.0'),
   qualifiedType(WF.goal, '1.11.0'),
   qualifiedType(WF.goal, '1.12.0'),
+  qualifiedType(WF.goal, '1.13.0'),
   qualifiedType(WF.mergeOnly, '1.0.0'),
   qualifiedType(WF.mergeOnly, '1.1.0'),
   qualifiedType(WF.mergeOnly, '1.2.0'),
@@ -97,6 +99,7 @@ export const SIG = {
   collaborationRequested: 'collaborationRequested',
   collaborationSettled: 'collaborationSettled',
   confirm: 'confirm',
+  openPr: 'openPr',
   /** Approve ONE branch of a multi-PR task (SPEC §11.1). Records what has been
    *  reviewed so an untouched branch is not re-reviewed after a loop back to Do;
    *  `confirm` remains the only signal that passes the Review gate. */

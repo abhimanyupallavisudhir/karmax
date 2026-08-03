@@ -20,7 +20,7 @@ import { agentRoleDef, manifest } from '../contrib/manifests.js';
  *   · durable platform tools (task list, wiki, vault, `platform_request`) —
  *     served by the gateway-backed `karmax` stdio MCP, or in-process as function
  *     tools on the raw-API rails;
- *   · TURN-LOCAL controls (`create_review_info`, `signal_completion`,
+ *   · TURN-LOCAL controls (`create_review_info`, `open_pr`, `signal_completion`,
  *     `create_sub_task`, `raise_to_parent`, `confirm_decision`, …) — they mutate
  *     the running activity's result, so each rail hosts them itself; see the rail
  *     table in `control-bridge.ts`.
@@ -29,7 +29,7 @@ import { agentRoleDef, manifest } from '../contrib/manifests.js';
  * app-server / `codex exec` / ACP rails, which made the Resolve and Confirm
  * gates structurally unreachable on a Codex subscription or OpenCode while this
  * text still advertised them. `tests/agent-control-tools.test.ts` now asserts
- * every rail registers all ten, so this preamble stays honest by construction —
+ * every rail registers every control, so this preamble stays honest by construction —
  * if you add a rail, add it to that table-driven test rather than trimming text
  * here.
  */
@@ -45,8 +45,10 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
 - list_events(taskId?, since?) and describe_platform(): inspect karmax event/diagnostic context and discover the automation surface.
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by karmax for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
+- open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
+- escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.
-Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response.
+Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response. If you are the Do agent and the work is ready for review, call open_pr as your final action. If you need a human decision first, use escalate_to_human instead; waiting for input and opening a PR are separate decisions.
 If you need the result of a long command (e.g. a test or build run), wait for it in THIS turn — run it in the foreground, or wait for your backgrounded job to finish — then fold in the result before ending your turn. Do NOT end your turn expecting to be re-notified later except for a durable request_agent_action collaboration: ordinary background jobs do not pause the task. Only leave a job running in the background if you genuinely don't need its result (e.g. a dev server).`;
 
 // Minimal fallback if a role is undeclared and there's no `do` role registered.

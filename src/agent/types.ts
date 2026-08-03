@@ -10,6 +10,10 @@ import { World } from '../world/types.js';
 
 /** Platform capabilities the agent reaches via the platform MCP, surfaced as tool calls. */
 export interface PlatformToolContext {
+  /** Do-agent ONLY: declare that the completed, committed proposal is ready to
+   *  publish and enter Review. This is deliberately distinct from merely ending
+   *  a model turn or asking a human for input. */
+  openPr(): void;
   /** Optional structured completion summary; provider terminal success is authoritative. */
   signalCompletion(summary?: string): void;
   /** Optionally attach terse, click-to-verify actions/outputs for the Review stage. */
@@ -17,8 +21,8 @@ export interface PlatformToolContext {
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
   createSubTask(t: { title: string; prompt: string }): void;
-  /** Parent-agent ONLY: answer a child that raised to you (confirm/comment/retry/
-   *  cancel). `childTaskId` omitted ⇒ all children awaiting a response. */
+  /** Parent-agent ONLY: answer a child that raised to you (open_pr/comment/retry/
+   *  cancel; `confirm` is a replay-compatible alias). */
   respondToSubTask(r: SubTaskResponse): void;
   /** Child-agent ONLY: raise a typed request UP to your parent (needs_info /
    *  needs_permission / needs_confirmation / blocked) and pause for its reply. */
@@ -173,6 +177,8 @@ export interface TurnResult {
   /** Provider-native successful terminal status/reason. */
   providerTermination?: AdapterTurn['termination'];
   completed: boolean;
+  /** The Do agent explicitly requested the PR/Review cycle. */
+  openPrRequested?: boolean;
   output: string;
   reviewInfo?: ReviewInfo;
   subTasks?: { title: string; prompt: string }[];

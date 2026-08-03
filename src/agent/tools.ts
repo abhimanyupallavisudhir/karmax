@@ -39,8 +39,8 @@ const URGENCY_PARAMETER = {
 
 /**
  * The tools every real agent gets: do real work in the world (bash/read/write)
- * plus the platform tools (SPEC §5.2). signal_completion is an optional structured
- * summary; adapters establish completion from provider-native terminal events.
+ * plus the platform tools (SPEC §5.2). `open_pr` is the Do agent's explicit
+ * proposal transition; signal_completion remains an optional structured summary.
  */
 export const TOOL_SCHEMAS: ToolSchema[] = [
   {
@@ -113,12 +113,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "confirm" (approve its Review so it merges into your branch), "comment" (send it guidance/answer its question — it goes back to work), "retry" (tell a stuck/blocked child to try its failed step again), or "cancel" (abandon it). Omit child_task_id to answer all sub-tasks currently waiting on you.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve a PR already at Review), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children.',
     parameters: {
       type: 'object',
       properties: {
         child_task_id: { type: 'string', description: 'The raising child; omit to respond to all waiting children.' },
-        action: { type: 'string', enum: ['confirm', 'comment', 'retry', 'cancel'] },
+        action: { type: 'string', enum: ['open_pr', 'confirm', 'comment', 'retry', 'cancel'] },
         text: { type: 'string', description: 'For "comment": the message/answer/guidance to send down.' },
       },
       required: ['action'],
@@ -665,6 +665,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'open_pr',
+    description:
+      'Do agents ONLY. Open (or refresh) this task\'s pull request and send its exact committed proposal to Review. Call this only as your final action after the requested work is truly complete, all intended files are committed, unwanted files are ignored or removed, and relevant tests pass. Ending a turn or asking a human for input does not open a PR.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
     name: 'signal_completion',
     description: 'Optionally attach a structured completion summary. A successful provider turn already establishes completion; this tool is not required.',
     parameters: {
@@ -690,7 +696,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'confirm_decision',
     description:
-      'Confirm agents ONLY. You are the reviewer at the Review gate — decide whether the work is acceptable, do NOT keep building it. action: "confirm" (accept the work; it proceeds to PR/merge), "revise" (send it back to the Do agent with specific feedback in `text`), or "reject" (the work is unsalvageable; cancel the task, say why in `text`). Calling this ends your turn.',
+      'Confirm agents ONLY. Review the already-open proposal; do NOT keep building it. action: "confirm" (accept the PR; it proceeds to merge), "revise" (send it back to the Do agent with specific feedback in `text`), or "reject" (cancel the task and say why). Calling this ends your turn.',
     parameters: {
       type: 'object',
       properties: {
@@ -724,6 +730,7 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'wait_for_subtasks',
   'request_spend',
   'fill_payment_card',
+  'open_pr',
   'signal_completion',
   'resolve_decision',
   'confirm_decision',
@@ -790,11 +797,11 @@ export function platformToolHandlers(
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
-      if (!['confirm', 'comment', 'retry', 'cancel'].includes(action))
-        return 'invalid action — use confirm | comment | retry | cancel';
+      if (!['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(action))
+        return 'invalid action — use open_pr | confirm | comment | retry | cancel';
       ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
-        action: action as 'confirm' | 'comment' | 'retry' | 'cancel',
+        action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
         text: args?.text ? String(args.text) : undefined,
       });
       return `responded to sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: ${action}`;
@@ -1122,6 +1129,10 @@ export function platformToolHandlers(
     async signal_completion(args) {
       ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
       return 'completion recorded';
+    },
+    async open_pr() {
+      ctx.openPr();
+      return 'pull request requested; finish this turn now';
     },
     async resolve_decision(args) {
       const t = parseTransition(args);

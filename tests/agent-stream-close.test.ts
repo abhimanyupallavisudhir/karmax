@@ -73,6 +73,7 @@ function fakeHarness(script: (h: Harness) => AsyncGenerator<any>): { current?: H
 
 async function runTurn(reviewInfos: ReviewInfo[]) {
   const ctx: PlatformToolContext = {
+    openPr: () => {},
     signalCompletion: () => {},
     createReviewInfo: (info) => { reviewInfos.push(info); },
     createSubTask: () => {},

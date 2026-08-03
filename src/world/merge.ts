@@ -33,7 +33,7 @@ export interface MergeResult {
   sha?: string;
   conflict?: string;
   /** Uncommitted paths that blocked the merge (newline-joined). Commit-vs-gitignore
-   *  is a judgment call, so a dirty tree is rejected back to the merge agent
+   *  is a judgment call, so a dirty tree is rejected back to the task agent
    *  instead of being blind-swept (PLAN-git-config.md §6). */
   dirty?: string;
   landedFiles: string[];
@@ -45,7 +45,7 @@ export interface MergeResult {
  * world with several checkouts — one per repo, and/or several branches of one
  * repo when the task's change is partitioned into several pull requests — it
  * merges every checkout into its target, aggregating the landed files (prefixed
- * by checkout name) and stopping at the first conflict so the merge agent can
+ * by checkout name) and stopping at the first conflict so the task agent can
  * resolve it and re-run; checkouts that already landed re-merge as no-ops, so
  * the retry is safe (partial-merge recoverable, not atomic).
  *
@@ -96,7 +96,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
   // 0. A merge-agent turn may have died (or given up) mid-`git merge`, leaving an
   //    in-progress merge with unresolved conflict hunks. Committing that state
   //    would COMPLETE the merge and land the conflict markers as file content —
-  //    abort it and report the conflict so the merge agent gets another turn.
+  //    abort it and report the conflict so the task agent gets another turn.
   const unresolved = await git(root, ['diff', '--name-only', '--diff-filter=U']);
   if (unresolved.stdout.trim()) {
     await git(root, ['merge', '--abort']);
@@ -108,10 +108,10 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
     };
   }
 
-  // 1. A dirty tree is the merge agent's to resolve, never machinery's: commit-
+  // 1. A dirty tree is the task agent's to resolve, never machinery's: commit-
   //    vs-gitignore is a judgment call, and a blind `git add -A` here would land
   //    files generated AFTER the Review gate (test artifacts, logs) unseen.
-  //    Reject with the file list so the workflow loops back to the merge agent
+  //    Reject with the file list so the workflow loops back to the task agent
   //    (PLAN-git-config.md §6). One mechanical exception: a RESOLVED but
   //    uncommitted merge (MERGE_HEAD present; step 0 ruled out unresolved paths)
   //    is completed on purpose — that is a forgotten `git commit`, not a
@@ -180,7 +180,7 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
   }
 
   // 2. Bring the target into the branch so conflicts surface here (resolvable
-  //    by the merge agent in a prior turn). Abort + report on conflict.
+  //    by the task agent in a prior turn). Abort + report on conflict.
   const into = await git(root, [
     ...asIdentity,
     'merge',

@@ -90,7 +90,9 @@ describe('default branch + auto-review (real Temporal + git)', () => {
     expect(v.targetBranch).toBe('trunk'); // detected, not "main"
     // auto-review attached from git — changed files only; diffs are intentionally
     // no longer part of the review packet (reviewers use the terminal / transcripts).
-    expect(v.reviewInfo.changedFiles).toEqual(expect.arrayContaining(['feature.js (new)']));
+    // Open PR requires a clean committed proposal, so the file is tracked by the
+    // time Review describes the exact proposed head.
+    expect(v.reviewInfo.changedFiles).toEqual(expect.arrayContaining(['feature.js']));
     expect(v.reviewInfo.diff).toBeUndefined();
     // the agent's reply is in the conversation thread
     expect(v.messages.some((m: any) => m.role === 'agent')).toBe(true);

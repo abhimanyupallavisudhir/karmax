@@ -98,6 +98,8 @@ export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const confirmSignal = defineSignal('confirm');
+/** Explicit transition from Do/waiting-for-input into PR preparation. */
+export const openPrSignal = defineSignal('openPr');
 /** Approve ONE branch of a multi-PR task at the head it has right now (SPEC §11.1).
  *  Lets a human confirm the finished branches and send a follow-up about the rest;
  *  the approval lapses by itself if the Do agent moves that branch afterwards. */
@@ -177,8 +179,8 @@ export interface SoftwareDevInput extends TaskInput {
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
-/** A rejected merge (conflicts / leftover markers) loops back to the merge agent
- *  this many times before escalating to a human/parent (SPEC §5.2). */
+/** Historical workflow pins loop rejected merges through their Merge agent this
+ * many times. Current explicit-PR runs return to Do and replay PR + Review. */
 const MAX_MERGE_ATTEMPTS = 3;
 /** Sub-task fan-out bounds (SPEC §5.3): concurrent children, and children over the
  *  task's whole life. Non-blocking spawn makes runaway delegation cheap without these. */
@@ -214,9 +216,9 @@ class Cancelled extends Error {}
 class CredentialDenied extends Error {}
 
 /**
- * The software-development workflow (SPEC §5): Setup → Do ⇄ Review → PR → Merge
- * → End, with cross-cutting Resolve and awaited sub-tasks. Merge is the point of
- * no return.
+ * The software-development workflow (SPEC §5): Setup → Do/wait → explicit PR
+ * → Review → Merge → End. Ordinary input waits never publish a proposal;
+ * landing repair returns to the same Do agent. Merge is the point of no return.
  */
 export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.1.0');
@@ -296,13 +298,19 @@ export async function softwareDevV1_12(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.12.0');
 }
 
+/** Explicit Open PR lifecycle; ordinary Do turns wait for input, and the Do
+ * agent owns proposal preparation plus any landing repair. */
+export async function softwareDevV1_13(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.13.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -361,6 +369,7 @@ async function softwareDevImpl(
   // merge itself uses a consenting human's user token and GitHub rules.
   const githubAuthoritativeMerge = minor >= 12 && remotePolicyOf(input.project) === 'pr';
   const proposalBeforeReview = minor >= 12;
+  const explicitPrCycle = minor >= 13;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -409,13 +418,14 @@ async function softwareDevImpl(
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
   let confirmed = false;
+  let prRequested = recoveryStage === 'pr';
   // checkout name -> head sha it was approved at (multi-PR Review, PLAN-multi-pr.md §3).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
   let checkoutHeads: Record<string, string> = {};
   let cancelled = false;
   let retryRequested = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
-  let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'workflowChange'; role?: string } | undefined;
+  let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
   let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
@@ -429,9 +439,9 @@ async function softwareDevImpl(
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined;
   let terminalOrigin: Stage | undefined;
-  let pr: TaskPullRequest | undefined;
-  let prs: TaskPullRequest[] = [];
-  let branchPreparedForPr = false;
+  let prs: TaskPullRequest[] = recovery?.prs?.map((candidate) => ({ ...candidate })) ?? [];
+  let pr: TaskPullRequest | undefined = prs[0];
+  let branchPreparedForPr = explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
@@ -644,7 +654,8 @@ async function softwareDevImpl(
       ...(responsiveHumanHold && humanPauseActive && pausedRole ? { roles: [pausedRole] } : {}),
     };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: !pointOfNoReturnPassed, danger: true };
-    const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true };
+    const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: explicitPrCycle ? 'Confirm PR' : 'Confirm', enabled: true };
+    const openPr: DeclaredAction = { name: 'openPr', kind: 'signal', label: 'Open PR', enabled: true };
     const setTarget: DeclaredAction = {
       name: 'setTarget',
       kind: 'update',
@@ -654,6 +665,7 @@ async function softwareDevImpl(
     };
     if (responsiveHumanHold && humanPauseActive) {
       return [
+        ...(explicitPrCycle && stage === 'do' ? [openPr] : []),
         ...(stage === 'review' ? [confirm] : []),
         ...(pausedRole ? [followUp] : []),
         ...(stage === 'do' || stage === 'review' ? [setTarget] : []),
@@ -665,7 +677,7 @@ async function softwareDevImpl(
       case 'setup':
         return [cancel];
       case 'do':
-        return [followUp, setTarget, cancel];
+        return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp, setTarget, cancel];
       case 'review':
         return [confirm, followUp, setTarget, cancel];
       case 'pr':
@@ -684,7 +696,7 @@ async function softwareDevImpl(
   /** All per-role transcripts, omitting roles that haven't run a turn yet. */
   function buildTranscripts(): { role: string; label: string; messages: Message[] }[] {
     const t = [{ role: 'do', label: 'Do agent', messages: msgs }];
-    if (mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
+    if (!explicitPrCycle && mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
     if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
     if (confirmMsgs.length) t.push({ role: 'confirm', label: 'Confirm agent', messages: confirmMsgs });
     return t;
@@ -817,6 +829,12 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
   });
+  setHandler(openPrSignal, () => {
+    if (!explicitPrCycle || stage !== 'do') return;
+    prRequested = true;
+    if (responsiveHumanHold && humanPauseActive)
+      humanPauseWake = { kind: 'openPr' };
+  });
   // Approving one branch is the same decision as Confirm, taken for one pull
   // request instead of all of them — so a human can approve what is finished and
   // send a follow-up about the rest. It is recorded against that branch's CURRENT
@@ -845,7 +863,11 @@ async function softwareDevImpl(
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
   setHandler(parentResponseSignal, (resp) => {
-    if (resp.action === 'confirm') {
+    if (resp.action === 'open_pr') {
+      prRequested = true;
+      if (responsiveHumanHold && humanPauseActive)
+        humanPauseWake = { kind: 'openPr' };
+    } else if (resp.action === 'confirm') {
       confirmed = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'confirm' };
@@ -1444,13 +1466,20 @@ async function softwareDevImpl(
     } else {
       seen = delivered;
     }
-    if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    if (turn.reviewInfo) {
+      // A proposal-readiness/landing refusal resumes the SAME Do conversation.
+      // A later turn may provide only a completion summary; do not erase useful
+      // review affordances (caption/actions/links) from the proposal it repaired.
+      // Fields the later turn actually supplies remain last-write-wins.
+      reviewInfo = { ...reviewInfo, ...turn.reviewInfo };
+    }
     // A branch the agent added with `create_branch` already exists in the world;
     // adopt the handle that now names it so the PR and merge stages see it. The
     // handle rides back on the turn RESULT, so this is journaled state, not a
     // second source of truth — and older pinned versions never set it, so their
     // replay is unaffected.
     if (multiPrEnabled && turn.worldHandle) world = turn.worldHandle as WorldHandleLike;
+    if (explicitPrCycle && turn.openPrRequested) prRequested = true;
     return turn;
   }
 
@@ -1773,7 +1802,9 @@ async function softwareDevImpl(
     status = 'active';
   }
 
-  // ── Do ⇄ Review ──
+  let sha: string | undefined;
+  proposalCycle: for (;;) {
+  // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
   if (!restoredReviewApproved && recoveryStage !== 'pr' && recoveryStage !== 'merge') {
   for (;;) {
     // Each iteration starts fresh in Do — clears any park state left by a prior
@@ -1788,7 +1819,12 @@ async function softwareDevImpl(
     await publish();
     if (cancelled) return await abort();
 
-    const turn = await doTurn();
+    // A human/parent may request Open PR while the task is already parked. That
+    // transition uses the proposal the Do agent just produced; it must not spend
+    // another model turn before publishing it.
+    const turn: Awaited<ReturnType<typeof doTurn>> = explicitPrCycle && prRequested
+      ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
+      : await doTurn();
     // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
     // down to the children they target (SPEC §5.3).
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
@@ -1987,7 +2023,72 @@ async function softwareDevImpl(
         const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
-      if (proposalBeforeReview) {
+      if (explicitPrCycle) {
+        // Ending a Do turn is not a shipping decision. Unless the agent called
+        // open_pr, park in Do for ordinary input; a follow-up resumes the same
+        // agent, while Open PR advances this exact proposal without another turn.
+        if (!prRequested) {
+          status = 'waiting';
+          if (input.parentTaskId) {
+            waitingFor = { kind: 'parent', detail: 'Waiting for the managing agent to open the PR' };
+            await notifyParent(turn.raise?.type ?? 'needs_confirmation',
+              turn.raise?.detail ?? 'The Do turn ended. Open the PR only if the requested work is truly complete; otherwise send a comment.');
+          } else {
+            waitingFor = {
+              kind: 'human',
+              audience: ['@creator'],
+              detail: turn.raise?.detail ?? 'The agent finished its turn. Send a follow-up, or open the PR if the work is truly complete.',
+            };
+          }
+          await publish();
+          await condition(() => prRequested || cancelled || msgs.length > seen);
+          waitingFor = undefined;
+          if (cancelled) return await abort();
+          if (!prRequested) {
+            stage = 'do';
+            status = 'active';
+            continue;
+          }
+        }
+
+        // The Do agent owns commit-vs-ignore judgment. The workflow validates
+        // the result, and a refused proposal goes back to the same conversation
+        // instead of invoking a second "Merge" personality.
+        const readiness = await core.checkProposal(world as any);
+        if (!readiness.ready) {
+          const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
+          msgs.push({
+            id: `pr-refused-${msgs.length}`,
+            role: 'user',
+            text: `Open PR was refused: ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nResolve this in the task branch, verify it, then call open_pr again.`,
+            ts: msgs.length,
+          });
+          prRequested = false;
+          stage = 'do';
+          status = 'active';
+          continue;
+        }
+
+        stage = 'pr';
+        status = 'active';
+        await publish();
+        if (cancelled) return await abort();
+        targetLocked = true;
+        if (githubAuthoritativeMerge) {
+          const opened = await withResolve('pr', () => core.openPr(world as any, target, {
+            title: input.title,
+            summary: reviewInfo?.summary ?? lastOutputs(msgs),
+          }));
+          prs = opened ?? [];
+          pr = prs[0];
+        }
+        branchPreparedForPr = true;
+        prRequested = false;
+        // The proposal is commit-bound now; rebuild the review packet after the
+        // readiness check/open so Review describes the exact published head.
+        const preparedReview = await core.buildReview(world as any, base).catch(() => undefined);
+        if (preparedReview) reviewInfo = { ...reviewInfo, ...preparedReview };
+      } else if (proposalBeforeReview) {
         // Publish the proposal stage before Review. Under GitHub policy this is
         // the actual PR—not a worktree snapshot that will be committed/rebased
         // later. This is still before the point of no return: the Merge agent
@@ -2197,7 +2298,6 @@ async function softwareDevImpl(
   // keyed by target, so from here it's load-bearing and no longer editable (SPEC §5.5).
   // Set before any await so no queued edit can slip in and desync the domain.
   targetLocked = true;
-  let sha: string | undefined;
   // Conflict loop-back state: how many rejected merges this round, and the last
   // rejection's detail (fed into the merge agent's next prompt so it actually
   // knows what to fix — a human retry resets the attempt budget, not the context).
@@ -2264,7 +2364,8 @@ async function softwareDevImpl(
         // PR. Do not spend a duplicate agent turn; go straight to the protected
         // landing. If the target raced or the branch is still dirty, finalize's
         // rejection loops back here and the Merge agent gets the exact details.
-        const runsMergeAgent = !branchPreparedForPr || mergeAttempts > 0 || !!mergeDirty || !!mergeConflict;
+        const runsMergeAgent = !explicitPrCycle
+          && (!branchPreparedForPr || mergeAttempts > 0 || !!mergeDirty || !!mergeConflict);
         if (runsMergeAgent) {
           consumed.add('agent:merge');
           await mergeTurn(mergeDirty
@@ -2273,7 +2374,7 @@ async function softwareDevImpl(
               ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
               : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`);
         }
-        if (branchPreparedForPr && runsMergeAgent && remotePolicyOf(input.project) === 'pr') {
+        if (!explicitPrCycle && branchPreparedForPr && runsMergeAgent && remotePolicyOf(input.project) === 'pr') {
           // A conflict/dirty rejection after PR creation sends the branch back to
           // the Merge agent. Its fix changes the proposed head, so refresh the
           // remote branch and existing PR BEFORE landing it. This runs while all
@@ -2324,6 +2425,21 @@ async function softwareDevImpl(
         sha = decision.sha;
         pointOfNoReturnPassed = true;
         break;
+      }
+      if (explicitPrCycle && (decision.status === 'needs-revision' || decision.status === 'stale-review')) {
+        msgs.push({
+          id: `merge-revise-${msgs.length}`,
+          role: 'user',
+          text: `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`,
+          ts: msgs.length,
+        });
+        confirmed = false;
+        prRequested = false;
+        branchPreparedForPr = false;
+        checkoutApprovals = {};
+        stage = 'do';
+        status = 'active';
+        continue proposalCycle;
       }
       if (decision.status === 'needs-authorizer' || decision.status === 'stale-review') {
         // A controlled terminal human layer. It does not rewrite the configured
@@ -2378,6 +2494,22 @@ async function softwareDevImpl(
       }
       break;
     }
+    if (explicitPrCycle && (result.conflict || result.dirty)) {
+      const detail = result.conflict ?? result.dirty ?? result.note ?? 'merge rejected';
+      msgs.push({
+        id: `merge-revise-${msgs.length}`,
+        role: 'user',
+        text: `Landing the reviewed PR was refused: ${result.note ?? 'the target changed or the branch is not ready'}.\n${detail}\nRepair this in the task branch, verify it, then call open_pr again. The updated proposal must pass Review again.`,
+        ts: msgs.length,
+      });
+      confirmed = false;
+      prRequested = false;
+      branchPreparedForPr = false;
+      checkoutApprovals = {};
+      stage = 'do';
+      status = 'active';
+      continue proposalCycle;
+    }
     // Merge rejected. Conflicts (including leftover markers) and dirty worktrees
     // (commit-vs-gitignore is a judgment call — PLAN-git-config.md §6) are the
     // merge agent's job: loop straight back to it with the details, bounded,
@@ -2426,6 +2558,9 @@ async function softwareDevImpl(
     status = 'active';
     error = undefined;
     mergeAttempts = 0; // a human/parent retry grants a fresh loop-back budget
+  }
+
+  break proposalCycle;
   }
 
   stage = 'done';

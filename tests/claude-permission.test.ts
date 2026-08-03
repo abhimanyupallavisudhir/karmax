@@ -77,6 +77,7 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
       ];
 
       const ctx: PlatformToolContext = {
+        openPr: () => {},
         signalCompletion: () => {},
         createReviewInfo: () => {},
         createSubTask: () => {},
@@ -210,6 +211,7 @@ describe.skipIf(!FRESH_LIVE)('claude agent writes files in a FRESH config home (
       ];
 
       const ctx: PlatformToolContext = {
+        openPr: () => {},
         signalCompletion: () => {},
         createReviewInfo: () => {},
         createSubTask: () => {},

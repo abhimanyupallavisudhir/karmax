@@ -62,6 +62,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   if (!adapter) throw new Error(`no agent adapter for provider "${input.profile.provider}"`);
 
   let completed = false;
+  let openPrRequested = false;
   let reviewInfo: ReviewInfo | undefined;
   let resolution: Transition | undefined;
   let confirmDecision: ConfirmDecision | undefined;
@@ -74,6 +75,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let worldHandle: import('../world/types.js').WorldHandle | undefined;
 
   const ctx: PlatformToolContext = {
+    openPr() {
+      if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
+      openPrRequested = true;
+      completed = true;
+    },
     // Optional, structured task-finish annotation. Provider completion is established
     // independently by the adapter's verified terminal event; this tool may add a summary
     // but is no longer required to make an ordinary successful turn count as finished.
@@ -233,6 +239,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     providerCompleted: true,
     providerTermination: turn.termination,
     completed,
+    ...(openPrRequested ? { openPrRequested: true } : {}),
     output: turn.output,
     delivered: turn.delivered,
     reviewInfo,

@@ -27,7 +27,7 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     const names = defs.map((d: any) => d.name).sort();
     expect(names).toEqual(SDK_CONTROL_TOOL_SCHEMAS.map((t) => t.name).sort());
     // The specific tools whose absence caused the bug:
-    expect(names).toEqual(expect.arrayContaining(['respond_to_sub_task', 'raise_to_parent', 'wait_for_subtasks']));
+    expect(names).toEqual(expect.arrayContaining(['open_pr', 'respond_to_sub_task', 'raise_to_parent', 'wait_for_subtasks']));
     expect(names).not.toEqual(expect.arrayContaining(['find_task', 'platform_request', 'save_skill']));
     // Read/Write/Bash are provided natively by the SDK and must NOT be re-registered:
     for (const native of SDK_NATIVE_TOOLS) expect(names).not.toContain(native);
@@ -46,6 +46,7 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     const shape = jsonSchemaToZodShape(z, schema.parameters);
     const obj = z.object(shape);
     expect(obj.safeParse({ action: 'confirm' }).success).toBe(true); // required enum ok
+    expect(obj.safeParse({ action: 'open_pr' }).success).toBe(true);
     expect(obj.safeParse({ action: 'confirm', child_task_id: 't1', text: 'hi' }).success).toBe(true);
     expect(obj.safeParse({ action: 'not-an-action' }).success).toBe(false); // enum enforced
     expect(obj.safeParse({}).success).toBe(false); // action is required

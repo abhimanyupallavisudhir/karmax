@@ -1,6 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
-import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
+import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -13,7 +13,7 @@ import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
  *   @run <command...>               run a shell command in the world
  *   @subtask <title> :: <prompt>    spawn a child task
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
- *   @respond <action> [:: text]     parent answers a raising child (confirm/comment/retry/cancel)
+ *   @respond <action> [:: text]     parent answers a raising child (open_pr/confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
  *   @subagents <n>                  report in-harness sub-agents (Task tool) still running:
@@ -29,6 +29,7 @@ import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
  *                                   transient-infra retry path — no Resolve)
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @confirm <action> [:: text]     confirm agent verdict (confirm/revise/reject)
+ *   @openpr                         explicitly request the PR/Review cycle
  *   @incomplete                     do NOT signal completion this turn
  *   @profile                        echo this turn's model/effort (`profile: <model>/<effort>`)
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
@@ -147,8 +148,8 @@ export class MockAdapter implements AgentAdapter {
           // child_task_id, so it targets all children currently waiting.
           const [action, textRest = ''] = splitOn(rest, '::');
           const act = action.trim();
-          if (['confirm', 'comment', 'retry', 'cancel'].includes(act)) {
-            ctx.respondToSubTask({ action: act as 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
+          if (['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(act)) {
+            ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
             outputs.push(`respond: ${act}`);
           }
           break;
@@ -260,6 +261,10 @@ export class MockAdapter implements AgentAdapter {
           }
           break;
         }
+        case 'openpr':
+          ctx.openPr();
+          outputs.push('open PR');
+          break;
         case 'incomplete':
           complete = false;
           break;
@@ -296,15 +301,30 @@ export class MockAdapter implements AgentAdapter {
     const recent = input.messages.filter((m) => m.role === 'user');
     const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
     await processText(initialText);
-    // A competent merge agent answers the dirty-worktree rejection by committing
-    // (PLAN-git-config.md §6 — finalizeMerge no longer sweeps uncommitted work).
-    // The mock mirrors that, so the loop-back is the exercised path in every
-    // pipeline test whose Do agent @writes without committing.
+    // A competent agent answers a dirty-proposal/landing rejection by committing
+    // (machinery never sweeps uncommitted work). In current software-dev this is
+    // the same Do agent; historical pins may still run the old Merge role.
     if (/uncommitted changes/.test(initialText) && /commit/i.test(initialText)) {
       for (const r of worldRepos(input.world.handle)) {
         await input.world.exec('bash', ['-lc', 'git add -A && git commit -q -m "mock: commit pending work" || true'], { cwd: r.root });
       }
       outputs.push('committed pending work');
+    }
+    // Current software-dev returns target races to the same Do agent. Exercise a
+    // real repair (merge target into the proposal, resolve in favor of the task's
+    // intended version, commit) before reopening it; historical Merge-agent tests
+    // use different wording and retain their deliberately bounded failure path.
+    if (/Landing the reviewed PR was refused/.test(initialText) && /conflict/i.test(initialText)) {
+      for (const r of worldRepos(input.world.handle)) {
+        const target = worldRepoTarget(r, input.world.handle.target ?? input.world.handle.base);
+        const merged = await input.world.exec('git', ['merge', '--no-edit', target], { cwd: r.root });
+        if (merged.code !== 0) {
+          await input.world.exec('git', ['checkout', '--ours', '--', '.'], { cwd: r.root });
+          await input.world.exec('git', ['add', '-A'], { cwd: r.root });
+          await input.world.exec('git', ['commit', '-q', '-m', 'mock: resolve proposal race'], { cwd: r.root });
+        }
+      }
+      outputs.push('repaired target race');
     }
     // Catch any follow-up that landed near the end of the turn (or during a non-sleep
     // turn) — process it in-flight rather than deferring it to the next turn.
@@ -326,7 +346,14 @@ export class MockAdapter implements AgentAdapter {
     }
 
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
-    if (complete) ctx.signalCompletion(outputs.join('; '));
+    if (complete) {
+      ctx.signalCompletion(outputs.join('; '));
+      // A competent current Do agent follows the prompt and explicitly opens the
+      // PR when its work is complete. Auxiliary roles never own this transition.
+      // Some adapter-only unit fixtures intentionally provide a partial context;
+      // production runtimes always install the control bridge.
+      if (input.role === 'do') ctx.openPr?.();
+    }
     ctx.emitActivity({ id: `message-${deliveredIndex}`, kind: 'message', phase: 'completed', title: outputs.join('\n') });
     return {
       termination: { kind: 'success', status: 'mock.completed' },

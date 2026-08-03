@@ -66,8 +66,10 @@ describe('GitHub merge authorization UX', () => {
     expect(source).toContain('Add a <b>Human confirms</b> step');
   });
 
-  it('makes the consent carried by a human confirmation explicit', () => {
-    expect(source).toContain('Confirm & authorize merge');
+  it('separates PR review confirmation from later GitHub authorization', () => {
+    expect(source).toContain("v.stage === 'review' ? 'Review' : 'Work summary'");
+    expect(source).toContain('Confirm PR');
+    expect(source).not.toContain('Confirm & authorize merge');
     expect(source).toContain('Authorize GitHub merge');
     expect(gatewaySource).toContain("github-merge-eligibility");
   });

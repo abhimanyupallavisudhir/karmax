@@ -353,6 +353,48 @@ describe('GitHub-authoritative merge activity', () => {
       });
   });
 
+  it('returns a conflicting current proposal to Do instead of attempting a GitHub merge', async () => {
+    const methods: string[] = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const method = init.method ?? 'GET';
+      methods.push(method);
+      if (method === 'GET') return Response.json({
+        number: 17, node_id: 'PR_conflict', html_url: 'https://github.test/acme/widgets/pull/17', state: 'open',
+        merged: false, head: { ref: 'karmax/task_conflict', sha: 'reviewed-head' }, base: { ref: 'main' },
+      });
+      if (method === 'POST') return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_conflict', url: 'https://github.test/acme/widgets/pull/17', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'reviewed-head', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY',
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+      return Response.json({ message: 'merge must not be attempted' }, { status: 500 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'reviewer-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'reviewer-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Conflicting GitHub proposal');
+    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
+    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
+    const task = core.store.createTask({ projectId: project.id, title: 'Repair me', workflow: 'software-dev',
+      workflowVersion: '1.13.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+      payload: { userId: 'reviewer', satisfied: true, githubMergeAuthorized: true,
+        githubPrHeads: [{ slug: SLUG, number: 17, headSha: 'reviewed-head' }] } });
+
+    await expect(core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_conflict',
+      base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 17,
+      nodeId: 'PR_conflict', url: 'https://github.test/acme/widgets/pull/17', state: 'open',
+      headSha: 'reviewed-head' }])).resolves.toMatchObject({
+        status: 'needs-revision', actorUserId: 'reviewer',
+        detail: expect.stringMatching(/conflicts with its target/i),
+      });
+    expect(methods).not.toContain('PUT');
+  });
+
   it('binds merge-queue and auto-merge fallback to the reviewed head', async () => {
     const graphqlInputs: any[] = [];
     const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {

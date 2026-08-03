@@ -22,6 +22,7 @@ import type { PlatformToolContext } from '../src/agent/types.js';
 const NOTLIVE = process.env.KARMAX_SKIP_LIVE === '1';
 
 const ctx = (): PlatformToolContext => ({
+  openPr() {},
   signalCompletion() {},
   createReviewInfo() {},
   createSubTask() {},

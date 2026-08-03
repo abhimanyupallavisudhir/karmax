@@ -172,8 +172,8 @@ const DO_ROLE: WorkflowRole = {
   // Task authorization is the deliberate delegation boundary. A Do agent may
   // use everything the granting human selected (including organization/global
   // operation); attenuation still removes everything that human did not hold.
-  // Workflow decisions and protected-target merges stay reserved for their
-  // concrete Resolve/Confirm/Merge roles even when the task is God-authorized.
+  // Workflow decisions and protected-target landing stay in workflow code;
+  // Resolve/Confirm retain their narrow contracts even on a God-authorized task.
   capabilities: [
     // Keep the historical spellings in the declaration for replay/tests; the
     // capability layer normalizes them to the task:* / skill:* families below.
@@ -257,7 +257,7 @@ const CONFIRM_ROLE: WorkflowRole = {
   // global/project instructions (including resolved wiki context) as the Do agent.
   promptTemplate: `{{toolsPreamble}}
 
-You are the CONFIRM (review) agent for task "{{title}}". The Do agent believes the work is finished and it has reached the Review gate. Your job is to decide whether to accept it — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work.
+You are the CONFIRM (review) agent for task "{{title}}". The Do agent has opened the finished proposal and it has reached the Review gate. Your job is to decide whether to accept this pull request — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work and its exact proposed head.
 
 # Work under review
 Worktree: {{worldPath}} (branch {{branch}} off {{base}}).
@@ -273,7 +273,7 @@ Recent Do-agent transcript:
 
 ## How to review
 Inspect the diff and the worktree (read files, run the build/tests) to judge whether the work actually satisfies the task. Then finish by calling confirm_decision exactly once:
-- action:"confirm" — the work is acceptable; it proceeds to PR/merge.
+- action:"confirm" — the pull request is acceptable; it proceeds to merge.
 - action:"revise"  — it needs changes; put specific, actionable feedback in \`text\` and it goes back to the Do agent.
 - action:"reject"  — it is unsalvageable or the task should not proceed; say why in \`text\` (this cancels the task).
 
@@ -355,8 +355,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.12.0',
-    description: 'Branch/world → do → PR → review → GitHub-authorized merge → end, with auto-resolution, escalation, and sub-tasks.',
+    version: '1.13.0',
+    description: 'Branch/world → do/wait → explicit PR → review → authorized merge → end, with the Do agent owning proposal repairs.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -381,15 +381,16 @@ export const MANIFESTS: WorkflowManifest[] = [
       { slot: 'project-settings', tier: 2, component: 'software-dev-settings', title: 'Software dev' },
     ],
     commands: [
-      { id: 'task.confirm', title: 'Confirm task', keybinding: 'c' },
+      { id: 'task.openPr', title: 'Open PR', keybinding: 'o' },
+      { id: 'task.confirm', title: 'Confirm PR', keybinding: 'c' },
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
-    roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
+    roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
     params: [
       promptField(),
-      // `always`: the Do/Merge agents' model + effort can be retuned
+      // `always`: the Do agent's model + effort can be retuned
       // in-flight up to the point of no return (SPEC §5.5); software-dev's update
       // validator still gates the IDENTITY swap (provider/session) per role.
       agentField('do', 'Do agent', 'always'),
@@ -400,7 +401,6 @@ export const MANIFESTS: WorkflowManifest[] = [
       multiPrField(),
       copyGlobsField(),
       remoteField(),
-      agentField('merge', 'Merge agent', 'always'),
       ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
       confirmerField(),
     ],
@@ -460,15 +460,15 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.12.0',
-    description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
+    version: '1.13.0',
+    description: 'Software Dev in autonomous completion mode; the Do agent explicitly opens the finished proposal for review.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
-    // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
-    roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
+    // goal delegates to softwareDev, so it shares the Do/Review machinery.
+    roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
     params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), confirmerField()],
   },

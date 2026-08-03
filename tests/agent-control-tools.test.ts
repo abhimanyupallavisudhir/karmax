@@ -25,7 +25,7 @@ import {
 /**
  * Cross-rail coverage for the TURN-LOCAL control tools (SDK_CONTROL_TOOL_NAMES).
  *
- * These ten tools mutate the result of the activity that is running right now, so
+ * These eleven tools mutate the result of the activity that is running right now, so
  * they cannot be served by the durable gateway-backed `karmax` MCP — every rail has
  * to host them itself. Three rails silently did not: the Codex app-server outside a
  * remote world, `codex exec`, and every ACP harness (OpenCode/Kimi/Grok). On a Codex
@@ -109,6 +109,7 @@ describe('control bridge (codex exec / ACP transport)', () => {
   it('routes a control tool call through the child MCP into THIS turn’s result', async () => {
     const recorded: any = {};
     const bridge = await bridgeFor({
+      openPr: () => { recorded.openPr = true; },
       confirmDecision: (d: any) => { recorded.confirm = d; },
       createReviewInfo: (info: any) => { recorded.review = info; },
       emit() {}, emitActivity() {},
@@ -126,6 +127,10 @@ describe('control bridge (codex exec / ACP transport)', () => {
       const review: any = await client.callTool({ name: 'create_review_info', arguments: { caption: 'run the suite' } });
       expect(review.content[0].text).toBe('review info recorded');
       expect(recorded.review).toMatchObject({ caption: 'run the suite' });
+
+      const opened: any = await client.callTool({ name: 'open_pr', arguments: {} });
+      expect(opened.content[0].text).toMatch(/pull request requested/i);
+      expect(recorded.openPr).toBe(true);
 
       // The nested `actions` schema survives the hop verbatim (no zod round trip).
       const listed = await client.listTools();
@@ -168,7 +173,7 @@ describe('control bridge (codex exec / ACP transport)', () => {
  * Every karmax agent's harness (`codex exec`, ACP) is spawned host-side by the same
  * uid, so the 0700 temp dir and 0600 socket exclude other unix *users* and nobody
  * else. Agent A's ordinary `bash` tool can list `os.tmpdir()`, find agent B's live
- * `kx-ctl-*` socket and speak the NDJSON protocol at it. Three of the ten control
+ * `kx-ctl-*` socket and speak the NDJSON protocol at it. Three of the eleven control
  * tools reach past this turn — `request_spend` allocates budget, `fill_payment_card`
  * types a real PAN/CVC over CDP, `create_sub_task` creates a durable task — so an
  * unauthenticated socket is a cross-agent hijack of B's turn, not a cosmetic gap.

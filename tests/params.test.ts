@@ -31,18 +31,18 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     expect(r.remote).toBe('none'); // field default
   });
 
-  it('resolves unified/separate agent forms across inheritance layers', () => {
+  it('migrates the former unified Do/Merge wire value onto the sole Do agent', () => {
     const doAgent = { provider: 'codex', model: 'do-model', resumeFrom: { taskId: 'old' } };
     const mergeAgent = { provider: 'claude', model: 'merge-model', resumeFrom: { taskId: 'merge-old' } };
 
-    const separatedChild = resolveParams(sd, {
+    const migratedUnified = resolveParams(sd, {
       task: { separateAgents: true },
       project: { separateAgents: false, 'agent:unified': doAgent },
     });
-    expect(separatedChild['agent:do']).toEqual(doAgent);
-    expect(separatedChild['agent:merge']).toEqual({ provider: 'codex', model: 'do-model' });
+    expect(migratedUnified['agent:do']).toEqual(doAgent);
+    expect(migratedUnified['agent:merge']).toBeUndefined();
 
-    const unifiedChild = resolveParams(sd, {
+    const migratedSeparated = resolveParams(sd, {
       task: { separateAgents: false },
       project: {
         separateAgents: true,
@@ -50,9 +50,8 @@ describe('resolveParams (overlay: task → project → global → default)', () 
         'agent:merge': mergeAgent,
       },
     });
-    expect(unifiedChild['agent:do']).toEqual(doAgent);
-    expect(unifiedChild['agent:merge']).toEqual({ provider: 'codex', model: 'do-model' });
-    expect(unifiedChild.separateAgents).toBe(false);
+    expect(migratedSeparated['agent:do']).toEqual(doAgent);
+    expect(migratedSeparated['agent:merge']).toBeUndefined();
   });
 });
 

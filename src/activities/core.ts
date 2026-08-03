@@ -1908,6 +1908,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return { summary, changedFiles };
     },
 
+    /** Read-only readiness check for the explicit Open PR transition. The Do
+     * agent owns commit-vs-ignore judgment; machinery only refuses to publish a
+     * proposal that still has unresolved or uncommitted state. */
+    async checkProposal(handle: WorldHandle): Promise<{
+      ready: boolean;
+      dirty?: string;
+      conflict?: string;
+      note?: string;
+    }> {
+      const world = await openWorld(handle);
+      const dirty: string[] = [];
+      const conflicts: string[] = [];
+      for (const repo of worldRepos(world.handle)) {
+        const unresolved = await world.exec('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
+        if (unresolved.stdout.trim()) {
+          conflicts.push(...unresolved.stdout.trim().split('\n').filter(Boolean).map((file) => `${repo.name}/${file}`));
+        }
+        const status = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        if (status.code !== 0) {
+          return { ready: false, note: `could not inspect checkout "${repo.name}": ${status.stderr || status.stdout || 'git status failed'}` };
+        }
+        dirty.push(...status.stdout.split('\n').filter(Boolean).map((line) => `${repo.name}/${line.slice(3).trim()}`));
+      }
+      if (conflicts.length) {
+        return { ready: false, conflict: [...new Set(conflicts)].join('\n'), note: 'the proposal has unresolved merge conflicts' };
+      }
+      if (dirty.length) {
+        return { ready: false, dirty: [...new Set(dirty)].join('\n'), note: 'the proposal has uncommitted changes' };
+      }
+      return { ready: true };
+    },
+
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
       const world = await openWorld(handle);
       // Merge commits carry the world's profile identity too (PLAN-git-config.md
@@ -2286,6 +2318,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             detail: `Pull request ${ref.slug}#${ref.number} changed after Review. Review the new head before merging.`,
             eligibleUserIds: [actorUserId],
           };
+        }
+        // Current explicit-PR workflows route a genuinely conflicting GitHub
+        // proposal back to the Do agent. Checks/reviews/queues remain durable
+        // GitHub waits; only a code conflict requires changing the proposal and
+        // therefore replaying Open PR + Review.
+        const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
+        if (workflowMinor >= 13 && live.nodeId) {
+          const readiness = await api.readiness(ref.slug, ref.number).catch(() => undefined);
+          if (readiness?.mergeable === 'CONFLICTING' || readiness?.mergeStateStatus === 'DIRTY') {
+            return {
+              status: 'needs-revision',
+              prs: [...settled, next, ...prs.slice(settled.length + 1)],
+              actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
+            };
+          }
         }
         const alreadyMirrored = store.eventsSince(handle.id, 0).some((event) =>
           event.type === 'github.pr.review-approved'

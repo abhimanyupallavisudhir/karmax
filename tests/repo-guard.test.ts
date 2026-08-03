@@ -90,7 +90,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(store.getProject(p.id)?.config).toMatchObject({ repos: [repository.sshUrl], defaultBase: 'trunk', defaultTarget: 'trunk' });
   });
 
-  it('snapshots and reports the exact unified Codex selection for every enabled runtime role', async () => {
+  it('snapshots and reports the exact Codex selection for the Software Dev Do agent', async () => {
     const p = store.createProject('Codex', { repos: ['/some/repo'] });
     const selected = { provider: 'codex' as const, model: 'gpt-5.6-sol', effort: 'high' as const };
     const task = await api.createTask(token, {
@@ -100,7 +100,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
       params: { separateAgents: false, 'agent:unified': selected },
     });
 
-    const expected = { do: selected, merge: selected, ...(RESOLVE_AGENT_ENABLED ? { resolve: selected } : {}) };
+    const expected = { do: selected };
     const input = startedInput();
     expect(input.agents).toEqual(expected);
 

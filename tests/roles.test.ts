@@ -15,7 +15,7 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     const roles = Object.fromEntries(allRoles().map((r) => [r.name, r]));
     expect(Object.keys(roles).sort()).toEqual(['confirm', 'do', 'merge']);
     expect(roles.do!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal']));
-    expect(roles.merge!.workflows).toEqual(expect.arrayContaining(['software-dev', 'merge-only', 'goal']));
+    expect(roles.merge!.workflows).toEqual(['merge-only']);
     // every workflow with a Review gate declares the confirm role (agent confirm layers)
     expect(roles.confirm!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal', 'merge-only']));
     expect(roles.confirm!.capabilities).toContain('confirm-decision');

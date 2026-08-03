@@ -205,7 +205,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(merge.messages.filter((message: any) => message.role === 'user')).toHaveLength(1); // no duplicate initial Merge turn
   }, 120_000);
 
-  it('opens the proposal before Review and lets GitHub merge it as the eligible creator', async () => {
+  it('v1.13 opens the explicit proposal before Review and merges without a Merge agent', async () => {
     const repo = await repoWithOrigin('github-authoritative');
     const project = h.store.createProject('GitHub authoritative', { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -214,10 +214,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
     h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
     const task = h.store.createTask({ projectId: project.id, title: 'GitHub merge', workflow: 'software-dev',
-      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
       createdBy: { kind: 'user', userId: 'a' } });
     const taskId = task.id;
-    const handle = await h.client.workflow.start('softwareDev@1.12.0', {
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [{
@@ -236,6 +236,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(prs[0].state).toBe('closed');
     const final = await view(handle);
     expect(final.pr).toMatchObject({ merged: true, state: 'closed', headSha: 'reviewed-head' });
+    expect(final.transcripts.some((transcript: any) => transcript.role === 'merge')).toBe(false);
+    expect(final.messages.map((message: any) => message.text).join('\n')).toMatch(/Open PR was refused: the proposal has uncommitted changes/i);
     // GitHub, not a local installation-token push, is authoritative: the local
     // bare origin's target is intentionally untouched by this stub merge.
     const origin = path.join(originDir, 'github-authoritative.git');

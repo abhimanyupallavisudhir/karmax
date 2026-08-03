@@ -6117,7 +6117,7 @@ function agentForksSection(v) {
 // Approving marks a branch as reviewed AT ITS CURRENT HEAD. That is what makes the
 // loop-back cheap: send a follow-up about one branch, and when the task comes back
 // from Do the ones the agent did not touch are still approved, so only the changed
-// work needs another look. Confirm remains the single act that passes the gate.
+// work needs another look. Confirm PR remains the single act that passes Review.
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
   if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
@@ -6144,8 +6144,8 @@ function checkoutsSection(v) {
     <div class="card checkout-list">
       ${rows}
       ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
-        ? `${pending} of ${checkouts.length} still to review — approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm approves the rest and passes Review.`
-        : 'Every branch approved. Confirm to pass Review.'}</div>` : ''}
+        ? `${pending} of ${checkouts.length} still to review — approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.`
+        : 'Every branch approved. Confirm PR to pass Review.'}</div>` : ''}
     </div>`;
 }
 
@@ -6163,7 +6163,7 @@ function overviewTab(v) {
         ? `<div class="task-sub" style="color:var(--ink-3);margin:0 0 6px">↑ Agent raised for a decision</div>`
         : '';
   const review = v.reviewInfo
-    ? `<div class="section-h">Review</div>
+    ? `<div class="section-h">${v.stage === 'review' ? 'Review' : 'Work summary'}</div>
        <div class="review">
          ${completionBadge}
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
@@ -7290,19 +7290,17 @@ function wireParams(v) {
 
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions.
 // This is the footer bar that stays visible on every task-page tab, so
-// Confirm/Cancel are always one click (or one digit) away.
+// Open PR / Confirm PR / Cancel are always one click (or one digit) away.
 function taskActions(v) {
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
-    const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
+    const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
     const label = a.name === 'confirm' && v.stage === 'merge' && v.waitingFor?.kind === 'human'
       ? 'Authorize GitHub merge'
-      : a.name === 'confirm' && v.stage === 'review' && (v.prs || []).length
-        ? 'Confirm & authorize merge'
-        : a.label;
+      : a.label;
     const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
     // `data-label` carries the bare label because the keyboard digit renders
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
@@ -7329,8 +7327,8 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
-  const standard = { confirm: 'confirm', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
@@ -8132,7 +8130,7 @@ const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
-// edited in the Agents card beside the Do/Merge agents it gates — not here.
+// edited in the Agents card beside the task agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
 // The stored `__common__` row is shared by several forms (task defaults here; the
 // Review route and Git profile elsewhere) and a settings PUT replaces the whole
@@ -8148,7 +8146,7 @@ async function saveCommonSettings(scope, projectId, organizationId, ownNames, co
   await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
 }
 // Agent defaults live in the profile editor, so manifests correctly declare
-// these controls as task-scoped. Quick tasks still need the same Do/Merge picker:
+// these controls as task-scoped. Quick tasks still need the same task-agent picker:
 // read those task fields directly rather than hiding them behind settings scopes.
 const quickAgentFields = () => schemaFor('software-dev').filter((field) => field.type === 'agent');
 function settingsForms(scope, projectId) {
@@ -10960,9 +10958,9 @@ function profileRow(p, scope) {
   </div>`;
 }
 
-// Render + wire the agents editor for a scope (global or a project). One agent
-// runs both Do and Merge unless deliberately separated — the same unified shape
-// the task form and Quick defaults present — so the common case is one choice.
+// Render + wire the agents editor for a scope (global or a project). Software
+// Dev has only a Do agent; the remaining Merge profile belongs to merge-only and
+// is therefore shown honestly as its own role instead of being coupled to Do.
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
@@ -10973,26 +10971,8 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
   if (!renderIsCurrent()) return;
   profiles = profiles.filter((p) => p.role !== 'confirm');
-  const doP = profiles.find((p) => p.role === 'do');
-  const mergeP = profiles.find((p) => p.role === 'merge');
-  const rest = profiles.filter((p) => p !== doP && p !== mergeP);
-  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null });
-  const separate = !!(doP && mergeP && essence(doP) !== essence(mergeP));
-  const unified = doP && mergeP
-    ? { ...doP, id: '__unified__', name: 'Agent', role: 'do + merge', scope: doP.scope === 'project' || mergeP.scope === 'project' ? 'project' : doP.scope }
-    : null;
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
-    : unified
-      ? `<div class="profiles-group">
-          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, scope)}</div>
-          <label class="agent-separate-toggle"><input type="checkbox" class="profiles-separate" ${separate ? 'checked' : ''}> Separate Do and Merge agent configurations</label>
-          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, scope)).join('')}</div>
-        </div>${rest.map((p) => profileRow(p, scope)).join('')}`
-      : profiles.map((p) => profileRow(p, scope)).join('');
-  list.querySelector('.profiles-separate')?.addEventListener('change', (e) => {
-    list.querySelector('.profiles-unified').hidden = e.target.checked;
-    list.querySelector('.profiles-separated').hidden = !e.target.checked;
-  });
+    : profiles.map((p) => profileRow(p, scope)).join('');
   list.querySelectorAll('[data-profile]').forEach((card) => {
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
@@ -11010,8 +10990,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       effort: card.querySelector('.pf-effort').value || undefined,
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
     };
-    // The unified row IS the Do and Merge defaults: one Save writes both roles.
-    const targets = b.dataset.saveprofile === '__unified__' ? [doP, mergeP] : [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
+    const targets = [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
     try {
       for (const orig of targets) {
         await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
@@ -11025,7 +11004,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
     } catch (e) { toast(e.message, true); }
   }));
   list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
-    const ids = b.dataset.resetprofile === '__unified__' ? [doP.id, mergeP.id] : [b.dataset.resetprofile];
+    const ids = [b.dataset.resetprofile];
     try {
       for (const id of ids) await api(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
       toast('Reset to inherited');
@@ -11036,7 +11015,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
 
 // The Review route — who checks the work at Review: human layers, agent layers,
 // or none (auto-confirm). Stored with the shared task defaults (__common__/
-// confirm) but edited here, beside the Do/Merge agents it gates.
+// confirm) but edited here, beside the task agents it gates.
 async function hydrateReviewRoute(scope, projectId, organizationId) {
   const box = $(`#review-route-${scope}`);
   if (!box) return;

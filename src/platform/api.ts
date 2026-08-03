@@ -1833,6 +1833,7 @@ export class KarmaxApi {
       messages: view.messages,
       transcripts: view.transcripts,
       reviewInfo: view.reviewInfo,
+      prs: view.prs?.map((pr) => ({ ...pr })),
       seen: typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : view.messages.length,
       target: view.targetBranch,
       // Carry multi-PR Review approvals across a replacement execution so a human
@@ -1849,6 +1850,9 @@ export class KarmaxApi {
         ...transcript,
         messages: transcript.messages.map((message) => ({ ...message })),
       })),
+      // A saved checkpoint predates the current human hold. Prefer the live PR
+      // refs so a recovered Review/Merge can authorize the exact opened heads.
+      prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
       resumeStage,
       ...(pausedForHuman ? { pausedForHuman: true } : {}),
     };
@@ -2668,13 +2672,16 @@ export class KarmaxApi {
         : undefined;
     if (signal === SIG.confirm && heldOrigin && heldOrigin !== 'review')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a Review decision; resume it or send the relevant agent a follow-up`);
-    if ((signal === SIG.confirm || signal === SIG.approveCheckout)
+    if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
+      throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
+    if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
       if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
       if (!this.deps.store.humanMayAct(taskId, userId))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
-      // Approving one branch is not the confirmation itself — only `confirm`
+      // Approving one branch and opening the proposal are not Review confirmation
+      // decisions — only `confirm`
       // passes the gate, so only `confirm` is journalled as the decision.
       if (signal === SIG.confirm) {
         this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
@@ -2754,10 +2761,12 @@ export class KarmaxApi {
     }
 
     // Confirming a Review-origin hold approves that preserved Review exactly
-    // once. Resume at PR rather than briefly restoring a second Review gate.
+    // once. Current workflows already opened the PR before Review, so they resume
+    // at Merge; historical post-Review-PR versions retain their recorded route.
     if (signal === SIG.confirm && scopedTask && heldView && heldOrigin === 'review') {
       await this.stopTaskActivity(scopedTask, heldView, 'Human confirmed the Review held for input');
-      await this.startTransitionReplacement(scopedTask, heldView, 'pr');
+      const minor = Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0);
+      await this.startTransitionReplacement(scopedTask, heldView, minor >= 12 ? 'merge' : 'pr');
       return;
     }
 

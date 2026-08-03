@@ -58,17 +58,31 @@ export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMa
 const AGENT_GROUP_ROLES: readonly string[] = ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : [])];
 
 /**
- * Do/Merge have a compact, unified editor by default. The editor shape is
- * itself an inherited setting: a unified child inherits only its parent's Do
- * agent and applies that identity to both roles; a separated child inherits
- * each corresponding parent role. Fork/session state is deliberately copied only
- * to Do when a unified value fans out.
+ * Historical workflows with Do/Merge have a compact, unified editor. Current
+ * software-dev is Do-only; `resolveAgentGroup` below migrates its old unified
+ * wire value without recreating the removed Merge role.
  *
  * Older rows predate `separateAgents`; infer their old separate form when they
  * contain any role override so existing settings retain their meaning.
  */
 function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undefined)[], out: ValueMap): void {
   const names = new Set(manifest.params.filter((f) => f.type === 'agent' && f.role).map((f) => f.role));
+  // Current software-dev has one operational agent: Do also owns proposal
+  // preparation and merge-conflict repair. Preserve values saved by the former
+  // compact Do+Merge editor, whose wire shape used `agent:unified`.
+  if (names.has('do') && !names.has('merge')) {
+    let resolved = out['agent:do'];
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const layer = layers[i];
+      if (!layer) continue;
+      resolved = pick(layer['agent:do'], pick(layer['agent:unified'], resolved));
+    }
+    if (resolved !== undefined) {
+      out['agent:do'] = resolved;
+      out['agent:unified'] = resolved;
+    }
+    return;
+  }
   if (!AGENT_GROUP_ROLES.every((role) => names.has(role))) return;
 
   const resolved: Record<string, unknown> = {};

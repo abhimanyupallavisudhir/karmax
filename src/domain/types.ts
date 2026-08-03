@@ -662,7 +662,7 @@ export interface TaskPullRequest {
 }
 
 export interface GitHubMergeAuthorization {
-  status: 'merged' | 'queued' | 'waiting' | 'needs-authorizer' | 'stale-review';
+  status: 'merged' | 'queued' | 'waiting' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */
   actorUserId?: string;
@@ -1134,7 +1134,7 @@ export interface AgentSpec {
  * A `human` layer waits for a person to click Confirm. An `agent` layer runs a
  * Confirm-agent turn that reviews the work and returns a structured verdict
  * (confirm / revise / reject) — the same three transitions a human drives; its
- * `AgentSpec` fields configure that agent exactly like the Do/Merge agent
+ * `AgentSpec` fields configure that agent exactly like any operational agent
  * fields (including `resumeFrom`).
  *
  * The pre-layers single-gate shape ({ mode, …agent }) is still accepted anywhere a
@@ -1385,6 +1385,8 @@ export interface TaskRecoveryCheckpoint {
   messages: Message[];
   transcripts?: { role: string; label: string; messages: Message[] }[];
   reviewInfo?: ReviewInfo;
+  /** Pull requests already opened for the preserved proposal. */
+  prs?: TaskPullRequest[];
   session?: string;
   sessionHome?: string;
   seen?: number;
@@ -1426,7 +1428,7 @@ export interface ChildRaise {
 }
 
 /** How a parent's Do agent answers a child raise (the `respond_to_sub_task` tool). */
-export type SubTaskAction = 'confirm' | 'comment' | 'retry' | 'cancel';
+export type SubTaskAction = 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel';
 
 /** Signal a parent sends DOWN to a child in response to a raise. */
 export interface ParentResponse {

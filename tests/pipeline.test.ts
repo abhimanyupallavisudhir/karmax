@@ -111,6 +111,77 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it('v1.13 waits for input until Open PR is explicitly requested', async () => {
+    const repo = await h.makeRepo('explicit-open-pr');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Explicit proposal',
+        prompt: 'Prepare it.\n@write proposal.js :: export const ready = true;\n'
+          + '@run git add -A && git commit -q -m "prepare proposal"\n@incomplete',
+      })],
+    });
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}/${current.waitingFor?.kind}`;
+    }, { timeout: 30_000 }).toBe('do/waiting/human');
+    const waiting = await view(handle);
+    expect(waiting.actions.map((action: any) => [action.name, action.label])).toContainEqual(['openPr', 'Open PR']);
+    expect(waiting.actions.map((action: any) => action.name)).not.toContain('confirm');
+    expect(waiting.transcripts.some((transcript: any) => transcript.role === 'merge')).toBe(false);
+
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.actions.map((action: any) => [action.name, action.label])).toContainEqual(['confirm', 'Confirm PR']);
+    expect(review.transcripts.some((transcript: any) => transcript.role === 'merge')).toBe(false);
+
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');
+  }, 120_000);
+
+  it('v1.13 returns a raced landing to Do and reviews the repaired proposal again', async () => {
+    const repo = await h.makeRepo('explicit-pr-race');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Repair raced proposal',
+        prompt: '@write index.js :: console.log("proposal")',
+      })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    fs.writeFileSync(path.join(repo, 'index.js'), 'console.log("target moved")\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-q', '-m', 'move target']);
+    await handle.signal('confirm');
+
+    // The deterministic landing aborts its conflict, returns the exact context
+    // to Do, and the competent mock reopens the unchanged/repaired proposal. A
+    // real Do agent would resolve it in that same conversation first.
+    await expect.poll(async () => {
+      const current = await view(handle);
+      const returned = current.messages.some((message: any) => /Landing the reviewed PR was refused/.test(message.text));
+      return `${current.stage}/${returned}`;
+    }, { timeout: 30_000 }).toBe('review/true');
+    const replayed = await view(handle);
+    expect(replayed.transcripts.some((transcript: any) => transcript.role === 'merge')).toBe(false);
+    expect(replayed.actions.map((action: any) => action.label)).toContain('Confirm PR');
+
+    await handle.signal('cancel');
+    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
   it('restarts an interrupted turn in Do instead of accepting partial output as Review (Task 162)', async () => {
     const repo = await h.makeRepo('restart-do-stage');
     const taskId = newId('task');

@@ -377,6 +377,21 @@ describe('task stage transitions', () => {
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
+  it('lets the selected human open a PR from a Do-stage input wait', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'openPr', kind: 'signal', label: 'Open PR', enabled: true }],
+      state: { ...f.view.state, humanPauseOrigin: 'do' },
+      stage: 'do',
+    });
+
+    await f.api.signalTask(f.token, f.task.id, 'openPr');
+    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr' });
+  });
+
   it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {
     const f = fixture();
     f.store.saveView(f.task.id, {

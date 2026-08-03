@@ -269,15 +269,24 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     const task = await h.api.createTask(token, {
       projectId: project.id,
       workflow: 'software-dev',
-      prompt: '@write b.txt :: y\n@review ok',
+      prompt: '@write b.txt :: y\n@review ok\n@incomplete',
     });
     const handle = h.client.workflow.getHandle(task.id);
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}`;
+    }, { timeout: 15_000 }).toBe('do/waiting');
 
-    // target edit accepted through the api (validates assembleTaskInput → paramWindows)
+    // Target remains editable while Do is waiting and no proposal exists.
     const r = await h.api.updateParams(token, task.id, { target: 'staging' });
     expect(r.applied).toEqual(['target']);
     expect((await view(handle)).targetBranch).toBe('staging');
+
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    // Review is bound to an already-open target/head, so retargeting now is a
+    // new proposal and must not mutate this one in place.
+    await expect(h.api.updateParams(token, task.id, { target: 'other' })).rejects.toThrow(/edited now|frozen/i);
 
     // A workflow-accepted agent retune updates the platform's effective-agent
     // snapshot too, so the task page cannot keep showing the queue-time model.
