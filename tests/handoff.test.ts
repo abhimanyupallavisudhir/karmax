@@ -10,6 +10,27 @@ import type { World, WorldHandle } from '../src/world/types.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 
 describe('hosted/local Git handoff', () => {
+  it('opens files directly from a local non-Git task world', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-open-'));
+    const file = path.join(dir, 'result.txt');
+    fs.writeFileSync(file, 'done\n');
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const project = store.createProject('Scripts', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Run script', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+      actions: [], state: {}, messages: [], worldPath: dir, updatedAt: 1 } as any;
+    store.saveView(task.id, view);
+    store.registerWorld({ kind: 'worktree', id: task.id, root: dir, branch: 'main', base: 'main' }, project.id);
+
+    const opened = await new WorldHandoffService(store, new WorldRegistry(), {} as any).openFile(task.id, view, 'result.txt', 2);
+    expect(opened).toEqual({ path: file, command: `code --goto '${file}:2'`, materialized: false });
+
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('produces a secret-free SSH checkout plan for every attached repository', () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
@@ -151,9 +172,12 @@ describe('hosted/local Git handoff', () => {
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world, open: async () => world, destroy: async () => {} } as any);
     const github = { brokerCredentials: async () => ({ env: { GIT_SSH_COMMAND: ssh } }) } as any;
-    const result = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot).materialize(task.id, view);
-    expect(result.cwd).toBe(path.join(localRoot, task.id, 'app'));
-    expect(fs.readFileSync(path.join(result.cwd, 'cloud.txt'), 'utf8')).toBe('from E2B\n');
+    const result = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .openFile(task.id, view, `${cloud}/cloud.txt`, 7);
+    expect(result.path).toBe(path.join(localRoot, task.id, 'app', 'cloud.txt'));
+    expect(result.command).toBe(`code --goto '${path.join(localRoot, task.id, 'app', 'cloud.txt')}:7'`);
+    expect(result.materialized).toBe(true);
+    expect(fs.readFileSync(result.path, 'utf8')).toBe('from E2B\n');
     expect(store.eventsSince(task.id, 0).some((event) => event.type === 'push.branch')).toBe(true);
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });

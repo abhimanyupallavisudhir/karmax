@@ -39,6 +39,12 @@ export interface MaterializedLocalCheckout {
   repositories: Array<{ name: string; path: string; branch: string; head: string }>;
 }
 
+export interface LocalFileOpen {
+  path: string;
+  command: string;
+  materialized: boolean;
+}
+
 /** Git is the durable handoff boundary between a hosted world and a developer's
  * laptop. It keeps laptops out of the control plane and provider credentials out
  * of sandboxes while preserving the exact task branch in both directions. */
@@ -47,6 +53,40 @@ export class WorldHandoffService {
     private runners?: RunnerPoolService, private worldAccess?: WorldAccessService,
     private localRoot = paths().localCheckouts,
     private resources?: import('./resources.js').ProjectResourceService) {}
+
+  /** Resolve an agent-authored path into the corresponding host checkout and
+   * return a pasteable editor command. Remote worlds cross the normal Git
+   * handoff boundary first; local worktrees already are the host checkout. */
+  async openFile(taskId: string, view: TaskView, requestedPath: string, line?: number): Promise<LocalFileOpen> {
+    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!handle) throw new Error('task has no recoverable world');
+    const repositories = worldRepos(handle);
+    const requested = requestedPath.trim();
+    if (!requested) throw new Error('file path is required');
+    const absolute = path.resolve(path.isAbsolute(requested)
+      ? requested
+      : path.join(worldWorkingDirectory(handle), requested));
+    const remote = Boolean(this.worlds.get(handle.kind).capabilities?.remote);
+    // Script and just-do worlds may intentionally have no Git repository. A
+    // local one is already openable in place; a remote one has no durable Git
+    // boundary through which it could be materialized.
+    if (!repositories.length) {
+      if (remote) throw new Error('task world has no Git repository to materialize');
+      if (!pathInside(handle.root, absolute)) throw new Error('file path is outside the task world');
+      if (!fs.existsSync(absolute)) throw new Error('file is not present in the task world');
+      return localFileOpen(absolute, line, false);
+    }
+    const repoIndex = repositories.findIndex((repo) => pathInside(repo.root, absolute));
+    if (repoIndex < 0) throw new Error('file path is outside the task repositories');
+    const relative = path.relative(path.resolve(repositories[repoIndex]!.root), absolute);
+    const checkout = remote ? await this.materialize(taskId, view) : this.existingLocal(handle);
+    const localRepo = checkout.repositories[repoIndex];
+    if (!localRepo) throw new Error('local checkout does not contain the requested repository');
+    const localPath = path.resolve(localRepo.path, relative);
+    if (!pathInside(localRepo.path, localPath) || !fs.existsSync(localPath))
+      throw new Error('file is not present in the local checkout');
+    return localFileOpen(localPath, line, remote);
+  }
 
   /** Publish the exact committed cloud branch through the trusted broker, then
    * clone/update a durable checkout on the Karmax host. This is intentionally a
@@ -248,6 +288,16 @@ export class WorldHandoffService {
 function sh(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'`; }
 
 function safeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]/g, '-'); }
+
+function pathInside(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function localFileOpen(localPath: string, line: number | undefined, materialized: boolean): LocalFileOpen {
+  const location = Number.isInteger(line) && Number(line) > 0 ? `${localPath}:${line}` : localPath;
+  return { path: localPath, command: `code --goto ${sh(location)}`, materialized };
+}
 
 function gitEnvironment(root: string, credential: GitBrokerCredential): {
   env: Record<string, string>; directory: string;

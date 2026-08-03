@@ -6275,9 +6275,9 @@ function conversationTimeHtml(ts) {
 }
 
 // Render the small Markdown-link subset agents use for file citations without
-// changing the stored transcript. The anchor keeps the agent's exact href (so
-// Copy Link Address and every transcript/copy surface retain the original); a
-// click handler below may resolve it through the task's world instead.
+// changing the stored transcript. File anchors keep their exact target in a
+// data attribute while their browser href stays inert; a click resolves the
+// host checkout and copies an editor command instead of navigating into Krmax.
 function renderConversationText(text, role, v = S.view) {
   const source = String(text ?? '');
   if (role !== 'agent') return esc(source);
@@ -6287,8 +6287,10 @@ function renderConversationText(text, role, v = S.view) {
   for (const match of source.matchAll(link)) {
     html += esc(source.slice(at, match.index));
     const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
-    const worldFile = worldFileTarget(href, v?.worldPath);
-    html += `<a href="${esc(href)}" target="_blank" rel="noopener"${worldFile ? ` class="world-file-link" data-world-file="${esc(href)}"` : ''}>${esc(match[1])}</a>`;
+    const worldFile = worldFileTarget(href, v?.worldPath, !!v?.worldAvailable && !v?.worldPath && hostLocal());
+    html += worldFile
+      ? `<a href="#" class="world-file-link" data-world-file="${esc(href)}" title="Copy a command to open this file locally">${esc(match[1])}</a>`
+      : `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
   return html + esc(source.slice(at));
@@ -6296,8 +6298,8 @@ function renderConversationText(text, role, v = S.view) {
 
 // Agent links commonly carry editor-style locations (`file.ts:12:4` or
 // `file.ts#L12`). Separate that location from the path sent to the gateway.
-function worldFileTarget(raw, worldPath) {
-  if (!raw || !worldPath) return null;
+function worldFileTarget(raw, worldPath, allowUnknownRoot = false) {
+  if (!raw || (!worldPath && !allowUnknownRoot)) return null;
   let value = String(raw).trim();
   if (/^file:\/\//i.test(value)) {
     try { value = decodeURIComponent(new URL(value).pathname); } catch { return null; }
@@ -6318,7 +6320,7 @@ function worldFileTarget(raw, worldPath) {
   if (!value || value.startsWith('#') || value.startsWith('?')) return null;
   // Absolute paths must name this task's world. Relative paths are resolved by
   // the server against the world root and confined there authoritatively.
-  if (value.startsWith('/')) {
+  if (value.startsWith('/') && worldPath) {
     const root = String(worldPath).replace(/\/+$/, '');
     if (value !== root && !value.startsWith(`${root}/`)) return null;
   }
@@ -6338,8 +6340,11 @@ function setFileLinksEnabled(enabled) {
 // Markdown mode renders anchors itself; mark the in-world ones afterwards so
 // the same click interception (wireWorldFileLinks) applies in both modes.
 function annotateWorldFileLinks(html, v = S.view) {
+  const remote = !!v?.worldAvailable && !v?.worldPath && hostLocal();
   return String(html).replace(/<a href="([^"]*)"/g, (anchor, href) =>
-    worldFileTarget(href, v?.worldPath) ? `${anchor} class="world-file-link" data-world-file="${href}"` : anchor);
+    worldFileTarget(href, v?.worldPath, remote)
+      ? `<a href="#" class="world-file-link" data-world-file="${href}" title="Copy a command to open this file locally"`
+      : anchor);
 }
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
@@ -6370,58 +6375,37 @@ function renderConversationEntry(entry, v = S.view) {
   </div>`;
 }
 
-function fileViewerHtml(text, title, line) {
-  const rows = String(text).split('\n');
-  const code = rows.map((row, i) => `<div class="line${line === i + 1 ? ' selected' : ''}" id="L${i + 1}"><a href="#L${i + 1}">${i + 1}</a><span>${esc(row) || ' '}</span></div>`).join('');
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>
-    :root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#e6edf3;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
-    header{position:sticky;top:0;z-index:1;padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d;color:#b1bac4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    main{padding:8px 0 28px;min-width:max-content}.line{display:flex;min-height:20px}.line:target,.line.selected{background:#3b2e00}.line>a{width:64px;padding:0 14px;color:#6e7681;text-align:right;text-decoration:none;user-select:none}.line>span{white-space:pre;padding-right:24px}
-  </style></head><body><header>${esc(title)}</header><main>${code}</main></body></html>`;
-}
-
 async function openWorldFile(anchor, v) {
-  const target = worldFileTarget(anchor.dataset.worldFile, v?.worldPath);
+  if (anchor.dataset.opening === '1') return;
+  const target = worldFileTarget(anchor.dataset.worldFile, v?.worldPath, !!v?.worldAvailable && !v?.worldPath && hostLocal());
   if (!target) return;
-  const popup = window.open('', '_blank');
-  if (popup) {
-    popup.opener = null;
-    popup.document.title = 'Opening file…';
-    popup.document.body.textContent = 'Opening file…';
+  anchor.dataset.opening = '1';
+  const materializing = !v?.worldPath;
+  if (materializing) {
+    anchor.classList.add('materializing');
+    anchor.setAttribute('aria-busy', 'true');
+    anchor.setAttribute('title', 'Materializing a local checkout…');
   }
   try {
-    const url = `/api/tasks/${encodeURIComponent(v.taskId)}/file?path=${encodeURIComponent(target.path)}`;
-    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
-    if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || 'could not open file');
-    const type = res.headers.get('content-type') || '';
-    if (!/^text\//i.test(type) && !/json|javascript|xml/i.test(type)) {
-      const objectUrl = URL.createObjectURL(await res.blob());
-      if (popup) popup.location.replace(objectUrl);
-      else window.open(objectUrl, '_blank', 'noopener');
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
-      return;
-    }
-    const html = fileViewerHtml(await res.text(), anchor.dataset.worldFile, target.line);
-    if (popup) {
-      popup.document.open();
-      popup.document.write(html);
-      popup.document.close();
-      if (target.line) popup.location.hash = `L${target.line}`;
-    } else {
-      const objectUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-      window.open(objectUrl, '_blank', 'noopener');
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
-    }
+    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/open-command`, {
+      method: 'POST', body: JSON.stringify(target),
+    });
+    await copyToClipboard(result.command);
+    toast('open command copied');
   } catch (e) {
-    if (popup) popup.close();
     toast(e.message, true);
+  } finally {
+    delete anchor.dataset.opening;
+    anchor.classList.remove('materializing');
+    anchor.removeAttribute('aria-busy');
+    anchor.setAttribute('title', 'Copy a command to open this file locally');
   }
 }
 
 function wireWorldFileLinks(v) {
   document.querySelectorAll('.world-file-link').forEach((anchor) => anchor.addEventListener('click', (event) => {
-    if (!fileLinksEnabled()) return;
     event.preventDefault();
+    if (!fileLinksEnabled()) return;
     openWorldFile(anchor, v);
   }));
 }
@@ -11432,7 +11416,7 @@ function profileView() {
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
       <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Open agent file links in their task world</label></div>
+      <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Copy local open commands from agent file links</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card">

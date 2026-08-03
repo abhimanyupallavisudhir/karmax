@@ -383,6 +383,18 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(file.headers.get('content-type')).toContain('text/plain');
     expect(await file.text()).toContain('hello-artifact');
 
+    // Conversation clicks never navigate to the absolute world path. The host
+    // resolves it to its checkout and returns a pasteable editor command.
+    const openCommand = await fetch(`${base}/api/tasks/${task.id}/open-command`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ path: `${view.worldPath}/out.txt`, line: 1 }),
+    });
+    expect(openCommand.status).toBe(200);
+    expect(await openCommand.json()).toMatchObject({
+      path: `${view.worldPath}/out.txt`,
+      command: `code --goto '${view.worldPath}/out.txt:1'`,
+      materialized: false,
+    });
+
     // A bad index is rejected; neither artifact nor conversation-file paths may
     // traverse outside the task world.
     const bad = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 99 }) });
@@ -391,6 +403,10 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(escape.status).toBe(400);
     const fileEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=${encodeURIComponent('/etc/passwd')}`, { headers: auth() });
     expect(fileEscape.status).toBe(400);
+    const commandEscape = await fetch(`${base}/api/tasks/${task.id}/open-command`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ path: '/etc/passwd' }),
+    });
+    expect(commandEscape.status).toBe(409);
     await fs.promises.symlink('/etc/passwd', `${view.worldPath}/escape-link`);
     const symlinkEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=escape-link`, { headers: auth() });
     expect(symlinkEscape.status).toBe(400);

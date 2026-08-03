@@ -2827,6 +2827,20 @@ export class Gateway {
         try { return this.json(res, 200, await this.deps.handoffs.materialize(taskId, view)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      const openCommandMatch = p.match(/^\/api\/tasks\/([^/]+)\/open-command$/);
+      if (openCommandMatch && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        if (!this.hostLocal) return this.json(res, 409, { error: 'file open commands are available only on the machine running Krmax' });
+        const taskId = openCommandMatch[1]!;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        const body = await this.body(req);
+        const line = body.line == null ? undefined : Number(body.line);
+        if (line !== undefined && (!Number.isInteger(line) || line < 1))
+          return this.json(res, 400, { error: 'line must be a positive integer' });
+        try { return this.json(res, 200, await this.deps.handoffs.openFile(taskId, view, String(body.path ?? ''), line)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       if (p === '/api/agent/git/publish' && method === 'POST') {
         try { return this.json(res, 200, await api.publishTaskBranch(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
