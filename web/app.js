@@ -6323,7 +6323,7 @@ function conversationTimeHtml(ts) {
 // Render the small Markdown-link subset agents use for file citations without
 // changing the stored transcript. File anchors keep their exact target in a
 // data attribute while their browser href stays inert; a click resolves the
-// host checkout and copies an editor command instead of navigating into Krmax.
+// host checkout and copies an editor command instead of navigating into krmax.
 function renderConversationText(text, role, v = S.view) {
   const source = String(text ?? '');
   if (role !== 'agent') return esc(source);

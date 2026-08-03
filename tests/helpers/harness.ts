@@ -26,6 +26,7 @@ import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
 import { LoginManager } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/resources.js';
+import { WorldHandoffService } from '../../src/world/handoff.js';
 
 /** How long a teardown step may run before it is worth saying so out loud. Well
  *  clear of the ~1s a healthy teardown takes, so a normal run stays silent. */
@@ -152,6 +153,11 @@ export async function bootHarness(
         args: ['-c', 'echo "open https://example.com/dev?code=TEST"; exit 0'],
         env: {} as Record<string, string>,
       }));
+      // Production always wires the host↔world handoff service. Keep the HTTP
+      // harness at parity so checkout/materialization routes exercise their
+      // actual behavior instead of returning the optional-dependency 503.
+      const handoffs = new WorldHandoffService(store, worlds, {} as any, undefined, undefined,
+        path.join(worldsHome, 'local-checkouts'), resources);
       const gw = new Gateway({
         api,
         store,
@@ -174,6 +180,7 @@ export async function bootHarness(
         worlds,
         objects,
         resources,
+        handoffs,
       });
       const started = await gw.listen();
       gateways.push(started.close);
