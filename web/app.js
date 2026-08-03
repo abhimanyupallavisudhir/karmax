@@ -11080,8 +11080,33 @@ function wireGlobalSettings(organizationId) {
       btn.disabled = false;
       if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
       else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        out.innerHTML = `Open this URL to finish signing in (krmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}`;
+        const codeEntry = r.requiresCode
+          ? '<br><label class="form-row">Authorization code shown after sign-in<input id="login-authorization-code" autocomplete="off" /></label><button class="btn sm" id="login-code-submit">Submit code</button>'
+          : '';
+        out.innerHTML = `Open this URL to finish signing in (krmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`;
         out.style.color = 'var(--ink-1)';
+        out.querySelector('#login-code-submit')?.addEventListener('click', async () => {
+          const code = out.querySelector('#login-authorization-code')?.value.trim();
+          if (!code) return toast('authorization code required', true);
+          const submit = out.querySelector('#login-code-submit');
+          submit.disabled = true;
+          try {
+            const completed = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect/code`, {
+              method: 'POST', body: JSON.stringify({ provider, account, code }),
+            });
+            if (completed.status === 'logged_in') {
+              out.innerHTML = '🟢 Signed in.';
+              out.style.color = 'var(--ok, green)';
+              hydrateAccounts(organizationId);
+              hydrateProfiles('global', undefined, organizationId);
+            } else {
+              out.textContent = completed.detail || 'Authorization code submitted.';
+            }
+          } catch (e) {
+            submit.disabled = false;
+            toast(e.message, true);
+          }
+        });
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
       hydrateAccounts(organizationId);

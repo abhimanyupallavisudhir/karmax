@@ -7,7 +7,8 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
-import { LoginManager, defaultLoginCommand } from '../src/autonomy/login.js';
+import { LoginManager, defaultLoginCommand, parseLoginPrompt } from '../src/autonomy/login.js';
+import { localProviderCli } from '../src/agent/provider-cli.js';
 import { RemoteAccessController, remoteAccessPlan } from '../src/remote/access.js';
 
 describe('config homes + scrubbed env (SPEC §7.3)', () => {
@@ -153,6 +154,62 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
 });
 
 describe('account login (SPEC §7.3 / §6.2)', () => {
+  it('uses the provider CLIs shipped with Krmax instead of requiring global installs', () => {
+    for (const provider of ['claude', 'codex'] as const) {
+      const command = localProviderCli(provider);
+      expect(command).not.toBe(provider);
+      expect(command).toContain(`${path.sep}node_modules${path.sep}`);
+      expect(fs.existsSync(command)).toBe(true);
+    }
+  });
+
+  it('uses Codex device authorization on a hosted deployment', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-hosted-'));
+    const home = new ConfigHomeManager(dir).ensure('codex', 'work');
+    const previousDeployment = process.env.KARMAX_DEPLOYMENT;
+    const previousArgs = process.env.KARMAX_CODEX_LOGIN_ARGS;
+    process.env.KARMAX_DEPLOYMENT = 'hosted';
+    delete process.env.KARMAX_CODEX_LOGIN_ARGS;
+    try {
+      expect(defaultLoginCommand('codex', home, {})?.args).toEqual(['login', '--device-auth']);
+    } finally {
+      if (previousDeployment === undefined) delete process.env.KARMAX_DEPLOYMENT;
+      else process.env.KARMAX_DEPLOYMENT = previousDeployment;
+      if (previousArgs === undefined) delete process.env.KARMAX_CODEX_LOGIN_ARGS;
+      else process.env.KARMAX_CODEX_LOGIN_ARGS = previousArgs;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('parses the ANSI-decorated Codex device code prompt', () => {
+    expect(parseLoginPrompt([
+      '1. Open this link in your browser and sign in to your account',
+      '   \u001b[94mhttps://auth.openai.com/codex/device\u001b[0m',
+      '2. Enter this one-time code \u001b[90m(expires in 15 minutes)\u001b[0m',
+      '   \u001b[94m7GD3-0JLQ0\u001b[0m',
+    ].join('\n'))).toEqual({
+      loginUrl: 'https://auth.openai.com/codex/device',
+      verificationCode: '7GD3-0JLQ0',
+    });
+  });
+
+  it('returns a pasted Claude authorization code to the waiting login CLI', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-code-'));
+    const homes = new ConfigHomeManager(dir);
+    const login = new LoginManager(homes, (_provider, home) => ({
+      cmd: 'bash',
+      args: ['-c', `printf 'Visit https://claude.example/oauth\\nPaste code here if prompted > '; IFS= read -r code; printf '%s' "$code" > "$CLAUDE_CONFIG_DIR/submitted"; printf '%s' '{"claudeAiOauth":{"accessToken":"access"}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"`],
+      env: { ...process.env, CLAUDE_CONFIG_DIR: home } as Record<string, string>,
+    }));
+
+    const started = await login.connect('claude', 'work', { urlTimeoutMs: 2000 });
+    expect(started).toMatchObject({ status: 'awaiting_oauth', requiresCode: true });
+    const completed = await login.submitAuthorizationCode('claude', 'work', 'oauth-code-123');
+    expect(completed.status).toBe('logged_in');
+    expect(fs.readFileSync(path.join(started.configHome, 'submitted'), 'utf8')).toBe('oauth-code-123');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('mints a home and captures the device URL from the provider login', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-'));
     const homes = new ConfigHomeManager(dir);
