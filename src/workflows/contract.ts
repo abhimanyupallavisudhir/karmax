@@ -30,6 +30,7 @@ export type {
   SubTaskAction,
   RemotePolicy,
   TaskPullRequest,
+  GitHubMergeAuthorization,
   TaskCheckout,
   WorldHandleRef,
 } from '../domain/types.js';

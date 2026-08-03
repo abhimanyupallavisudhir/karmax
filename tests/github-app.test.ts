@@ -9,6 +9,34 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 
 describe('GitHub App integration', () => {
+  it('observes a user repository role without minting a krmax authorization', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-permission-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (url.pathname === '/user') return Response.json({ id: 42, login: 'octocat' });
+      if (url.pathname === '/repos/acme/widgets') return Response.json({
+        role_name: 'write', permissions: { pull: true, push: true },
+        allow_merge_commit: false, allow_squash_merge: true,
+      });
+      if (url.pathname === '/repos/acme/locked')
+        return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+    await service.authorizeUser('owner', 'oauth-code');
+    await expect(service.repositoryPermission('owner', 'acme/widgets', '42')).resolves.toMatchObject({
+      permission: 'write', roleName: 'write', canMerge: true, mergeMethod: 'squash',
+    });
+    await expect(service.repositoryPermission('owner', 'acme/locked', '42')).resolves.toMatchObject({
+      permission: 'none', canMerge: false,
+    });
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('keeps multiple personal accounts, selects an active one, and guards the last connection', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-accounts-'));
     const store = new Store(':memory:');

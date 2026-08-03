@@ -14,12 +14,25 @@
 
 export interface GithubPullRequest {
   number: number;
+  nodeId?: string;
   url: string;
   state: 'open' | 'closed';
   merged: boolean;
   title?: string;
   head?: string;
+  headSha?: string;
   base?: string;
+  mergeable?: boolean | null;
+  mergeableState?: string;
+  mergeCommitSha?: string;
+}
+
+export interface GithubMergeResult {
+  merged: boolean;
+  sha?: string;
+  message: string;
+  /** GitHub accepted the PR into its merge queue. */
+  queued?: boolean;
 }
 
 export interface GithubPrApiOptions {
@@ -47,12 +60,17 @@ export function taskIdOfBranch(branch: string | undefined): string | undefined {
 function normalize(raw: any): GithubPullRequest {
   return {
     number: Number(raw.number),
+    ...(raw.node_id ? { nodeId: String(raw.node_id) } : {}),
     url: String(raw.html_url ?? raw.url ?? ''),
     state: raw.state === 'closed' ? 'closed' : 'open',
     merged: Boolean(raw.merged ?? raw.merged_at),
     ...(raw.title ? { title: String(raw.title) } : {}),
     ...(raw.head?.ref ? { head: String(raw.head.ref) } : {}),
+    ...(raw.head?.sha ? { headSha: String(raw.head.sha) } : {}),
     ...(raw.base?.ref ? { base: String(raw.base.ref) } : {}),
+    ...(Object.prototype.hasOwnProperty.call(raw, 'mergeable') ? { mergeable: raw.mergeable == null ? null : Boolean(raw.mergeable) } : {}),
+    ...(raw.mergeable_state ? { mergeableState: String(raw.mergeable_state) } : {}),
+    ...(raw.merge_commit_sha ? { mergeCommitSha: String(raw.merge_commit_sha) } : {}),
   };
 }
 
@@ -118,7 +136,55 @@ export class GithubPrApi {
     await this.request(`/repos/${slug}/issues/${number}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
   }
 
-  private async request<T = any>(pathname: string, init: RequestInit = {}): Promise<T> {
+  /** Mirror an explicit krmax Human-confirm decision into GitHub's native PR
+   * review record. GitHub may reject self-approval or an already-settled review;
+   * callers treat that as non-fatal and let repository policy decide at merge. */
+  async approve(slug: string, number: number, headSha: string, body: string): Promise<void> {
+    await this.request(`/repos/${slug}/pulls/${number}/reviews`, {
+      method: 'POST', body: JSON.stringify({ commit_id: headSha, event: 'APPROVE', body }),
+    });
+  }
+
+  /** Ask GitHub to merge this exact reviewed head. GitHub remains the policy
+   * authority: branch protection, rulesets, required reviews and checks are all
+   * enforced by this endpoint. A moved head cannot be merged accidentally. */
+  async merge(slug: string, number: number, headSha: string,
+    mergeMethod: 'merge' | 'squash' | 'rebase' = 'merge'): Promise<GithubMergeResult> {
+    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/merge`, {
+      method: 'PUT',
+      body: JSON.stringify({ sha: headSha, merge_method: mergeMethod }),
+    }, [405, 409, 422]);
+    return {
+      merged: Boolean(value?.merged),
+      ...(value?.sha ? { sha: String(value.sha) } : {}),
+      message: String(value?.message ?? (value?.merged ? 'Pull request merged' : 'GitHub did not merge the pull request')),
+    };
+  }
+
+  /** Repositories configured with GitHub merge queues reject the direct REST
+   * merge. Enqueue the same PR through GraphQL; a mutation error simply means
+   * this repository is not queue-enabled (or its current policy is unmet). */
+  async enqueue(nodeId: string): Promise<GithubMergeResult> {
+    const value = await this.graphql<any>(
+      'mutation($id:ID!){ enqueuePullRequest(input:{pullRequestId:$id}){ mergeQueueEntry{ id } } }',
+      { id: nodeId },
+    );
+    return {
+      merged: false,
+      queued: Boolean(value?.data?.enqueuePullRequest?.mergeQueueEntry?.id),
+      message: value?.errors?.[0]?.message
+        ? String(value.errors[0].message)
+        : value?.data?.enqueuePullRequest?.mergeQueueEntry?.id
+          ? 'Pull request queued for merge'
+          : 'GitHub did not queue the pull request',
+    };
+  }
+
+  private async graphql<T = any>(query: string, variables: Record<string, unknown>): Promise<T> {
+    return this.request<T>('/graphql', { method: 'POST', body: JSON.stringify({ query, variables }) });
+  }
+
+  private async request<T = any>(pathname: string, init: RequestInit = {}, accepted: number[] = []): Promise<T> {
     const send = async (forceRefresh = false) => {
       const token = typeof this.token === 'function'
         ? await this.token(forceRefresh ? { forceRefresh: true } : undefined)
@@ -131,9 +197,10 @@ export class GithubPrApi {
     };
     let response = await send();
     if (response.status === 401 && typeof this.token === 'function') response = await send(true);
-    if (!response.ok) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    if (!response.ok && !accepted.includes(response.status)) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
     if (response.status === 204) return undefined as T;
-    return await response.json() as T;
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 }
 

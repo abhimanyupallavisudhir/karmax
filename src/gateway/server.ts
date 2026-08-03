@@ -213,6 +213,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
   if (/^\/api\/projects\/[^/]+\/resources/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
     return read ? 'project:settings:read' : 'project:settings:write';
@@ -2411,6 +2412,47 @@ export class Gateway {
           if (project) await this.ensureProjectWiki(project, session.userId);
           return this.json(res, 200, attached);
         }
+      }
+      const githubMergeEligibility = p.match(/^\/api\/projects\/([^/]+)\/github-merge-eligibility$/);
+      if (githubMergeEligibility && method === 'GET') {
+        const project = store.getProject(githubMergeEligibility[1]!);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp) return this.json(res, 200, {
+          remotePolicy: store.effectiveProjectConfig(project).remote ?? 'none', repositories: [], creatorCanMerge: false, eligibleUserIds: [],
+          detail: 'GitHub is not connected for this krmax organization.',
+        });
+        const repositories = [...new Set([
+          ...store.listProjectRepositories(project.id).map((linked) => `${linked.repository.owner}/${linked.repository.name}`),
+          ...(store.projectWiki(project.id)?.repository
+            ? [`${store.projectWiki(project.id)!.repository!.owner}/${store.projectWiki(project.id)!.repository!.name}`]
+            : []),
+        ])];
+        if (!repositories.length) return this.json(res, 200, {
+          remotePolicy: store.effectiveProjectConfig(project).remote ?? 'none', repositories, creatorCanMerge: false, eligibleUserIds: [],
+          detail: 'No GitHub repositories are connected to this project.',
+        });
+        const users = (project.organizationId ? store.listOrganizationMemberships(project.organizationId) : [])
+          .map((membership) => membership.userId)
+          .filter((userId) => store.userIsProjectMember(project.id, userId));
+        const eligibleUserIds: string[] = [];
+        const errors: Record<string, string> = {};
+        for (const userId of users) {
+          const accountId = this.deps.githubApp.activeUserAccountId(userId);
+          if (!accountId) continue;
+          const permissions = await Promise.all(repositories.map(async (slug) => {
+            try { return await this.deps.githubApp!.repositoryPermission(userId, slug, accountId); }
+            catch (error) { errors[userId] = error instanceof Error ? error.message : String(error); return undefined; }
+          }));
+          if (permissions.every((permission) => permission?.canMerge)) eligibleUserIds.push(userId);
+        }
+        return this.json(res, 200, {
+          remotePolicy: store.effectiveProjectConfig(project).remote ?? 'none',
+          repositories,
+          creatorCanMerge: eligibleUserIds.includes(session.userId),
+          eligibleUserIds,
+          ...(errors[session.userId] ? { detail: errors[session.userId] } : {}),
+        });
       }
       const projectRepositorySources = p.match(/^\/api\/projects\/([^/]+)\/repository-sources$/);
       if (projectRepositorySources) {

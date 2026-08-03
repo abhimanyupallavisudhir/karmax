@@ -63,6 +63,19 @@ export interface GitHubUserAccount extends GitHubUserIdentity {
   active: boolean;
 }
 
+/** A live observation from GitHub, never a krmax capability grant. `canMerge`
+ * is deliberately conservative: GitHub's push/maintain/admin repository roles
+ * may request a merge, while branch protection and rulesets still decide the
+ * exact pull request at merge time. */
+export interface GitHubRepositoryPermission {
+  slug: string;
+  permission: string;
+  roleName?: string;
+  canMerge: boolean;
+  /** Repository-supported method closest to krmax's merge-commit semantics. */
+  mergeMethod: 'merge' | 'squash' | 'rebase';
+}
+
 export interface GitHubAppOptions {
   appId?: string;
   appSlug?: string;
@@ -334,6 +347,41 @@ export class GitHubAppService {
     return this.userAccounts(userId)
       .filter((account) => this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
       .map((account) => ({ ...account, active: account.id === active }));
+  }
+
+  async repositoryPermission(userId: string, slug: string, accountId?: string): Promise<GitHubRepositoryPermission> {
+    if (!/^[^/\s]+\/[^/\s]+$/.test(slug)) throw new Error('invalid GitHub repository');
+    try {
+      // `GET /repos/{owner}/{repo}` reports the authenticated user's effective
+      // role in `permissions`. Unlike the collaborator-permission endpoint it
+      // does not require Administration(read), so the App keeps its existing
+      // least-privilege metadata/contents/PR permission set.
+      const value = await this.userRequest<any>(userId, `/repos/${slug}`, {}, accountId);
+      const effective = value?.permissions ?? {};
+      const permission = effective.admin ? 'admin'
+        : effective.maintain ? 'maintain'
+          : effective.push ? 'write'
+            : effective.triage ? 'triage'
+              : effective.pull ? 'read'
+                : 'none';
+      const roleName = value?.role_name ? String(value.role_name) : undefined;
+      return {
+        slug,
+        permission,
+        ...(roleName ? { roleName } : {}),
+        // Custom roles are represented by their effective permissions. For the
+        // built-ins, `push` covers write/maintain/admin; retain the names as a
+        // defensive fallback for older GitHub Enterprise payloads.
+        canMerge: Boolean(effective.push || effective.maintain || effective.admin),
+        mergeMethod: value?.allow_merge_commit !== false ? 'merge'
+          : value?.allow_squash_merge !== false ? 'squash'
+            : 'rebase',
+      };
+    } catch (error) {
+      if (error instanceof Error && /GitHub API 404\b/.test(error.message))
+        return { slug, permission: 'none', canMerge: false, mergeMethod: 'merge' };
+      throw error;
+    }
   }
 
   async setActiveUserAccount(userId: string, accountId: string): Promise<void> {

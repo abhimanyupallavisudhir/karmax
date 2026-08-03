@@ -170,6 +170,27 @@ describe('GitHub PR client', () => {
     expect(gh.prs[0].body).toBe('second');
   });
 
+  it('binds a merge to the reviewed head and can enter a GitHub merge queue', async () => {
+    const calls: Array<{ path: string; body: any }> = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      calls.push({ path: url.pathname, body });
+      if (url.pathname.endsWith('/pulls/7/reviews')) return Response.json({ id: 9 });
+      if (url.pathname.endsWith('/pulls/7/merge')) return Response.json({ merged: true, sha: 'merge-sha', message: 'merged' });
+      if (url.pathname === '/graphql') return Response.json({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'queue-1' } } } });
+      return Response.json({ message: 'not found' }, { status: 404 });
+    }) as typeof fetch;
+    const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+    await api.approve(SLUG, 7, 'reviewed-sha', 'approved in krmax');
+    await expect(api.merge(SLUG, 7, 'reviewed-sha')).resolves.toEqual({ merged: true, sha: 'merge-sha', message: 'merged' });
+    await expect(api.enqueue('PR_node')).resolves.toMatchObject({ queued: true, merged: false });
+    expect(calls[0]).toMatchObject({ path: `/repos/${SLUG}/pulls/7/reviews`,
+      body: { commit_id: 'reviewed-sha', event: 'APPROVE' } });
+    expect(calls[1]).toMatchObject({ path: `/repos/${SLUG}/pulls/7/merge`, body: { sha: 'reviewed-sha' } });
+    expect(calls[2]!.body).toMatchObject({ variables: { id: 'PR_node' } });
+  });
+
   it('refreshes a GitHub App user token once when GitHub rejects it', async () => {
     const forced: boolean[] = [];
     const fetcher = (async (_url: string, init: RequestInit = {}) => {
@@ -216,6 +237,72 @@ describe('GitHub PR client', () => {
       .catch((e) => e as Error);
     expect(result).toBeInstanceOf(Error); // both lookups blind → the 422 surfaces
     expect(gh.prs).toHaveLength(1);
+  });
+});
+
+describe('GitHub-authoritative merge activity', () => {
+  it('completes a no-change task without requiring a GitHub authorizer', async () => {
+    const core = await coreFor(fakeGithub());
+    await expect(core.mergeGithubPrs({ id: 'task_no_changes' } as any, []))
+      .resolves.toEqual({ status: 'merged', prs: [] });
+  });
+
+  it('uses an eligible confirming human and refuses to move beyond the reviewed head', async () => {
+    const requests: Array<{ auth: string; method: string; path: string; body: any }> = [];
+    let liveHead = 'reviewed-head';
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const auth = new Headers(init.headers).get('authorization') ?? '';
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      requests.push({ auth, method, path: url.pathname, body });
+      if (method === 'GET') return Response.json({
+        number: 7, node_id: 'PR_node', html_url: 'https://github.test/acme/widgets/pull/7', state: 'open',
+        merged: false, head: { ref: 'karmax/task_merge', sha: liveHead }, base: { ref: 'main' },
+      });
+      if (method === 'PUT' && url.pathname.endsWith('/merge'))
+        return Response.json({ merged: true, sha: 'merge-sha', message: 'merged' });
+      return Response.json({ message: 'not found' }, { status: 404 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: (userId: string) => `${userId}-account`,
+      repositoryPermission: async (userId: string) => ({ slug: SLUG, permission: userId === 'reviewer' ? 'write' : 'read', canMerge: userId === 'reviewer' }),
+      userAccessToken: async (userId: string) => `${userId}-token`,
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Merge authorization');
+    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
+    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
+    const task = core.store.createTask({ projectId: project.id, title: 'Merge me', workflow: 'software-dev',
+      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+      payload: { userId: 'reviewer', satisfied: true, githubMergeAuthorized: true,
+        githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'reviewed-head' }] } });
+    const result = await core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_merge',
+      base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 7,
+      url: 'https://github.test/acme/widgets/pull/7', state: 'open', headSha: 'reviewed-head' }]);
+    expect(result).toMatchObject({ status: 'merged', actorUserId: 'reviewer', sha: 'merge-sha' });
+    expect(requests.find((request) => request.method === 'PUT')).toMatchObject({
+      auth: 'Bearer reviewer-token', body: { sha: 'reviewed-head' },
+    });
+
+    liveHead = 'replacement-head';
+    const stale = await core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_merge',
+      base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 7,
+      url: 'https://github.test/acme/widgets/pull/7', state: 'open', headSha: 'reviewed-head' }]);
+    expect(stale).toMatchObject({ status: 'stale-review', eligibleUserIds: ['reviewer'] });
+    const unapprovedReplacement = await core.mergeGithubPrs({ id: task.id, kind: 'worktree',
+      branch: 'karmax/task_merge', base: 'main', repo: tmp, root: tmp } as any, stale.prs);
+    expect(unapprovedReplacement).toMatchObject({ status: 'needs-authorizer', eligibleUserIds: ['reviewer'] });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 2,
+      payload: { userId: 'reviewer', satisfied: true, githubMergeAuthorized: true,
+        githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'replacement-head' }] } });
+    await expect(core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_merge',
+      base: 'main', repo: tmp, root: tmp } as any, stale.prs)).resolves.toMatchObject({
+        status: 'merged', actorUserId: 'reviewer',
+      });
   });
 });
 

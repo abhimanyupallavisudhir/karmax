@@ -62,7 +62,7 @@ const remoteField = (): FieldSpec => ({
   name: 'remote',
   type: 'select',
   label: 'Remote policy',
-  help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — also open a GitHub PR at Review. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
+  help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — open the exact GitHub proposal before Review, then merge it under a confirming human’s GitHub authorization. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
   options: ['none', 'push', 'pr'],
   default: 'none',
   scopes: ['project', 'global'],
@@ -284,8 +284,8 @@ Do not implement the task yourself. Decide, then call confirm_decision.`,
 const SOFTWARE_DEV_STAGES: StageDef[] = [
   { key: 'setup', label: 'Setup' },
   { key: 'do', label: 'Do', ...(RESOLVE_AGENT_ENABLED ? { aliases: ['resolve'] } : {}) },
-  { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
+  { key: 'review', label: 'Review' },
   { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
   { key: 'done', label: 'End' },
 ];
@@ -355,8 +355,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.11.0',
-    description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
+    version: '1.12.0',
+    description: 'Branch/world → do → PR → review → GitHub-authorized merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -460,7 +460,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.11.0',
+    version: '1.12.0',
     description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],

@@ -34,6 +34,7 @@ import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 import { GithubPrApi, githubSlug, type GithubPrApiOptions } from '../integrations/github-pr.js';
+import type { GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
@@ -51,7 +52,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole, type Repository, type TaskPullRequest } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole, type Repository, type TaskPullRequest,
+  type GitHubMergeAuthorization } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -577,6 +579,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       throw new Error(`Your GitHub account cannot access ${slug}. Grant it access on GitHub, then reconnect GitHub on your profile.`);
     }
     return new GithubPrApi(token, deps.githubPr ?? {});
+  }
+
+  /** A merge is always attributed to the consenting human selected below. It
+   * never falls back to an installation token or an unrelated host credential. */
+  function prApiForUser(userId: string, accountId?: string): GithubPrApi {
+    if (!deps.githubApp) throw new Error('GitHub integration is unavailable');
+    return new GithubPrApi(
+      (options) => deps.githubApp!.userAccessToken(userId, { ...options, ...(accountId ? { accountId } : {}) }),
+      deps.githubPr ?? {},
+    );
   }
 
   /** Each world repo that a pull request can be opened against. A repo without
@@ -2161,11 +2173,159 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : details.title?.trim() || `karmax: ${repo.branch}`,
           body: prBody(handle, details, store.getTask(handle.id)?.num, changed.length > 1 ? repo.name : undefined),
         });
-        const ref: TaskPullRequest = { repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged };
+        const ref: TaskPullRequest = {
+          repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged,
+          ...(pr.headSha ? { headSha: pr.headSha } : {}),
+          ...(pr.nodeId ? { nodeId: pr.nodeId } : {}),
+        };
         record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base });
         opened.push(ref);
       }
       return opened;
+    },
+
+    /**
+     * GitHub-authoritative merge for current PR-policy workflows.
+     *
+     * krmax first selects a consenting human (the creator or someone who
+     * confirmed a human Review layer), then checks that person's repository
+     * role live and asks GitHub to merge the exact reviewed head SHA. The App
+     * installation is intentionally not a candidate: it may transport task
+     * branches, but it must not bypass a person's merge rights.
+     */
+    async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[]): Promise<GitHubMergeAuthorization> {
+      // A PR-policy task may legitimately make no changes. There is nothing
+      // external to authorize in that case, so do not manufacture a human gate.
+      if (!prs.length) return { status: 'merged', prs };
+      const task = store.getTask(handle.id);
+      if (!task || !deps.githubApp) {
+        return { status: 'needs-authorizer', prs, detail: 'GitHub is not connected for human-attributed merges.' };
+      }
+      const creator = store.taskCreatorUserId(handle.id);
+      const events = store.eventsSince(handle.id, 0);
+      const eventAuthorizesCurrentHeads = (event: { payload?: any }) => {
+        const heads = event.payload?.githubPrHeads;
+        return Array.isArray(heads) && prs.filter((ref) => !ref.merged).every((ref) =>
+          Boolean(ref.headSha) && heads.some((head: any) => head?.slug === ref.slug
+            && Number(head?.number) === ref.number && head?.headSha === ref.headSha));
+      };
+      const voters = events
+        .filter((event) => event.type === 'task.confirmation-voted'
+          && event.payload?.satisfied !== false && event.payload?.githubMergeAuthorized === true
+          && eventAuthorizesCurrentHeads(event))
+        .map((event) => typeof event.payload?.userId === 'string' ? event.payload.userId : undefined)
+        .filter((userId): userId is string => Boolean(userId));
+      // The most recent Review decision is the clearest explicit consent. The
+      // creator remains a valid sponsor when a task auto-confirms or uses an
+      // agent reviewer, but never after GitHub reports that the reviewed head
+      // moved: that replacement needs an exact-head human confirmation too.
+      const requiresFreshReview = events.some((event) => event.type === 'github.merge.review-stale'
+        && prs.some((ref) => event.payload?.slug === ref.slug && event.payload?.number === ref.number
+          && event.payload?.liveHead === ref.headSha));
+      const candidates = [...new Set([
+        ...voters.reverse(), ...(!requiresFreshReview && creator ? [creator] : []),
+      ])];
+      const accountFor = (userId: string) => userId === creator
+        ? (typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : deps.githubApp!.activeUserAccountId(userId))
+        : deps.githubApp!.activeUserAccountId(userId);
+
+      let actorUserId: string | undefined;
+      let actorPermissions = new Map<string, GitHubRepositoryPermission>();
+      for (const userId of candidates) {
+        const accountId = accountFor(userId);
+        if (!accountId) continue;
+        let eligible = true;
+        const permissions = new Map<string, GitHubRepositoryPermission>();
+        for (const ref of prs.filter((candidate) => !candidate.merged)) {
+          const permission = await deps.githubApp.repositoryPermission(userId, ref.slug, accountId).catch(() => undefined);
+          if (!permission?.canMerge) { eligible = false; break; }
+          permissions.set(ref.slug, permission);
+        }
+        if (eligible) { actorUserId = userId; actorPermissions = permissions; break; }
+      }
+
+      if (!actorUserId) {
+        const eligibleUserIds: string[] = [];
+        // This scan is advisory only (for the reviewer picker). Revalidation
+        // above always happens again immediately before a real merge request.
+        for (const userId of store.humanAudience(handle.id, ['@project'])) {
+          const accountId = deps.githubApp.activeUserAccountId(userId);
+          if (!accountId) continue;
+          const checks = await Promise.all(prs.filter((ref) => !ref.merged).map((ref) =>
+            deps.githubApp!.repositoryPermission(userId, ref.slug, accountId).catch(() => undefined)));
+          if (checks.length && checks.every((permission) => permission?.canMerge)) eligibleUserIds.push(userId);
+        }
+        record(handle.id, 'github.merge.authorization-required', { eligibleUserIds, repositories: prs.map((ref) => ref.slug) });
+        return {
+          status: 'needs-authorizer', prs,
+          detail: eligibleUserIds.length
+            ? 'The task creator cannot merge these pull requests. Ask a listed project member with GitHub merge access to confirm the merge.'
+            : 'No connected project member currently has GitHub merge access for every pull request.',
+          eligibleUserIds,
+        };
+      }
+
+      const accountId = accountFor(actorUserId);
+      const api = prApiForUser(actorUserId, accountId);
+      const settled: TaskPullRequest[] = [];
+      let lastSha: string | undefined;
+      let queued = false;
+      for (const ref of prs) {
+        const live = await api.get(ref.slug, ref.number);
+        const next = {
+          ...ref, state: live.state, merged: live.merged,
+          ...(live.headSha ? { headSha: live.headSha } : {}),
+          ...(live.nodeId ? { nodeId: live.nodeId } : {}),
+        };
+        if (live.merged) { lastSha = live.mergeCommitSha ?? lastSha; settled.push(next); continue; }
+        if (!ref.headSha || !live.headSha || ref.headSha !== live.headSha) {
+          record(handle.id, 'github.merge.review-stale', { ...ref, reviewedHead: ref.headSha, liveHead: live.headSha });
+          return {
+            status: 'stale-review', prs: [...settled, next, ...prs.slice(settled.length + 1)], actorUserId,
+            detail: `Pull request ${ref.slug}#${ref.number} changed after Review. Review the new head before merging.`,
+            eligibleUserIds: [actorUserId],
+          };
+        }
+        const alreadyMirrored = store.eventsSince(handle.id, 0).some((event) =>
+          event.type === 'github.pr.review-approved'
+          && event.payload?.slug === ref.slug && event.payload?.number === ref.number
+          && event.payload?.headSha === ref.headSha && event.payload?.actorUserId === actorUserId);
+        if (voters.includes(actorUserId) && !alreadyMirrored) {
+          await api.approve(ref.slug, ref.number, ref.headSha,
+            'Approved in krmax after reviewing this exact pull-request head.')
+            .then(() => record(handle.id, 'github.pr.review-approved', { ...ref, actorUserId }))
+            .catch((error) => record(handle.id, 'github.pr.review-skipped', {
+              ...ref, actorUserId, detail: error instanceof Error ? error.message : String(error),
+            }));
+        }
+        const merged = await api.merge(ref.slug, ref.number, ref.headSha,
+          actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge');
+        if (merged.merged) {
+          lastSha = merged.sha ?? lastSha;
+          settled.push({ ...next, state: 'closed', merged: true });
+          record(handle.id, 'github.pr.merged', { ...ref, sha: merged.sha, actorUserId });
+          continue;
+        }
+        let queueResult;
+        if (live.nodeId) queueResult = await api.enqueue(live.nodeId).catch(() => undefined);
+        if (queueResult?.queued) {
+          queued = true;
+          settled.push(next);
+          record(handle.id, 'github.pr.queued', { ...ref, actorUserId });
+          continue;
+        }
+        record(handle.id, 'github.pr.merge-waiting', { ...ref, actorUserId, detail: merged.message });
+        return {
+          status: 'waiting', prs: [...settled, next, ...prs.slice(settled.length + 1)], actorUserId,
+          detail: merged.message,
+        };
+      }
+      if (settled.every((ref) => ref.merged))
+        return { status: 'merged', prs: settled, actorUserId, ...(lastSha ? { sha: lastSha } : {}) };
+      return {
+        status: queued ? 'queued' : 'waiting', prs: settled, actorUserId,
+        detail: queued ? 'GitHub accepted the pull request into its merge queue.' : 'Waiting for GitHub merge policy.',
+      };
     },
 
     /**

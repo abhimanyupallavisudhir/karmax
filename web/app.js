@@ -4323,6 +4323,7 @@ async function openTaskForm(workflow, draft, seedText) {
               <div class="label-row"><label>Authorization</label></div>
               ${authorizationEditorHtml('tf-authorization', selectedAuthorization, authorizationProjects, projectId)}
             </div>
+            ${['software-dev', 'goal'].includes(wf) ? `<div class="form-row" data-row="__github-merge" id="tf-github-merge" style="display:none"></div>` : ''}
             ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
@@ -4393,6 +4394,45 @@ async function openTaskForm(workflow, draft, seedText) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
       row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
+  }
+  // GitHub authorization is external, live policy—not a krmax capability.
+  // Warn without blocking: the workflow revalidates at Merge and can hand the
+  // task to an eligible human then, so a developer may deliberately queue now.
+  const githubMergeBox = $('#tf-github-merge');
+  if (githubMergeBox) {
+    let eligibility;
+    const selectedMergeReviewer = () => {
+      if (!eligibility) return false;
+      const eligible = new Set(eligibility.eligibleUserIds || []);
+      const confirmer = fields.find((f) => f.type === 'confirmer');
+      const box = confirmer && $('#tf-body')?.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(confirmer.role || confirmer.name)}"]`);
+      const layers = box ? readConfirmerLayers(box) : [];
+      return layers.some((layer) => layer.kind === 'human' && (layer.audience || ['@creator']).some((selector) => {
+        if (selector === '@creator') return !!eligibility.creatorCanMerge;
+        if (selector === '@all' || selector === '@project') return eligible.size > 0;
+        if (selector === '@owners') return (S.organizationMembers || []).some((member) => member.role === 'owner' && eligible.has(member.userId));
+        if (selector.startsWith('user:')) return eligible.has(selector.slice(5));
+        return false;
+      }));
+    };
+    const paintEligibility = () => {
+      if (!eligibility) return;
+      if (eligibility.remotePolicy !== 'pr') { githubMergeBox.style.display = 'none'; return; }
+      const names = (eligibility.eligibleUserIds || []).map((userId) => principalLabel({ kind: 'user', userId }));
+      const routed = selectedMergeReviewer();
+      githubMergeBox.style.display = '';
+      githubMergeBox.innerHTML = eligibility.creatorCanMerge
+        ? `<div class="task-sub" style="color:var(--ok)">✓ Your connected GitHub account can request merges for ${esc((eligibility.repositories || []).join(', '))}. GitHub still enforces branch rules at Merge.</div>`
+        : routed
+          ? `<div class="task-sub" style="color:var(--ok)">✓ A selected human reviewer has live GitHub merge access (${esc(names.join(', '))}). Their confirmation can sponsor the merge.</div>`
+          : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub merge reviewer recommended</b><div class="task-sub" style="margin-top:4px">Your connected GitHub account cannot merge every repository in this task. ${names.length ? `Add a <b>Human confirms</b> step for ${esc(names.join(', '))}.` : 'No connected project member currently has merge access; grant access on GitHub or connect an eligible account.'} You can still queue the task—krmax will stop at Merge and ask for an eligible human.</div></div>`;
+    };
+    api(`/api/projects/${encodeURIComponent(projectId)}/github-merge-eligibility`)
+      .then((value) => { eligibility = value; paintEligibility(); })
+      .catch(() => { githubMergeBox.style.display = 'none'; });
+    $('#tf-body').addEventListener('change', (event) => {
+      if (event.target.closest?.('.confirmer-field')) paintEligibility();
+    });
   }
   // Image attachments for the full task form: pasting/dropping an image into any
   // text field attaches it to the prompt. State is local to this form instance.
@@ -7188,12 +7228,17 @@ function taskActions(v) {
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
+    const label = a.name === 'confirm' && v.stage === 'merge' && v.waitingFor?.kind === 'human'
+      ? 'Authorize GitHub merge'
+      : a.name === 'confirm' && v.stage === 'review' && (v.prs || []).length
+        ? 'Confirm & authorize merge'
+        : a.label;
     const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
     // `data-label` carries the bare label because the keyboard digit renders
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
     // actionToast's standard-verb match and produced "Confirm1 — done" instead
     // of "Confirmed" on the most-used control in the app.
-    html += `<button class="btn ${cls}" data-act="${a.name}" data-label="${esc(a.label)}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}${kbd}</button>`;
+    html += `<button class="btn ${cls}" data-act="${a.name}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
