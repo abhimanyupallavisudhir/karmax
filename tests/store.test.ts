@@ -245,7 +245,7 @@ describe('Store', () => {
     // A project is addressed at /<org>/<project> by the slug of its name, and an
     // organization owns the top URL segment — a name that slugifies to a built-in
     // route word (wiki, settings, dashboard, api, …) would be unreachable.
-    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'inbox', 'api', 'tasks', 'queue', ' Wiki ']) {
+    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'inbox', 'profile', 'api', 'tasks', 'queue', ' Wiki ']) {
       expect(() => store.createProject(name)).toThrow(/reserved/i);
       expect(() => store.createOrganization({ name })).toThrow(/reserved/i);
     }

@@ -7,7 +7,7 @@ const source = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
 describe('personal Git development settings', () => {
   it('sends a newly created account to its profile before the workspace dashboard', () => {
     expect(source).toContain('session.gitOnboarding');
-    expect(source).toContain("globalRoute('profile')");
+    expect(source).toContain('profileRoute()');
   });
 
   it('puts connected GitHub accounts and custom identity controls inside the main profile card', () => {

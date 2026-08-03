@@ -115,7 +115,7 @@ export class GitProfiles {
     const userId = userIdOfScope(userProfiles.organizationId);
     if (!userId) throw new Error('source must be a user Git profile');
     const source = userProfiles.resolve(undefined);
-    if (!source) throw new Error('configure a default Git profile on your user page first');
+    if (!source) throw new Error('Add a default Git identity on your profile, then try again.');
     const linked: GitProfile = {
       name: source.name,
       userName: source.userName,

@@ -108,6 +108,7 @@ export interface GatewayDeps {
 export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
+  if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
   if (p === '/api/resource-drivers') return 'workflow:read';
   if (p.startsWith('/api/resource-uploads/')) return 'project:settings:write';
@@ -1227,6 +1228,21 @@ export class Gateway {
         if (bearer) this.sessions.delete(bearer);
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/settings/access' && method === 'GET') {
+        if (!requestedScope.projectId && !requestedScope.organizationId)
+          return this.json(res, 400, { error: 'Choose a project or organization.' });
+        const allowed = (capability: string, scope: { projectId?: string; organizationId?: string } = {}) =>
+          this.deps.tokens.check(token, capability, scope).ok;
+        return this.json(res, 200, {
+          appearance: allowed('settings:write'),
+          capacity: allowed('queue:write'),
+          safeMode: allowed('safe-mode:write'),
+          organization: requestedScope.organizationId
+            ? allowed('organization:edit', { organizationId: requestedScope.organizationId }) : false,
+          project: requestedScope.projectId
+            ? allowed('project:delete', { projectId: requestedScope.projectId }) : false,
+        });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
@@ -3877,7 +3893,10 @@ export class Gateway {
             const b = await this.body(req);
             const action = connName[2];
             try {
-              if (action === 'connect') { connectors.connect(connName[1]!, String(b.secret ?? '')); return this.json(res, 200, { connected: true }); }
+              if (action === 'connect') {
+                const connector = await connectors.connect(connName[1]!, String(b.secret ?? ''));
+                return this.json(res, 200, { connected: true, connector });
+              }
               if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
               if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],

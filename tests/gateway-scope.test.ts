@@ -117,6 +117,22 @@ describe('gateway request scope for bare-id routes', () => {
     expect(store.getTag(own.id)?.name).toBe('defect');
   });
 
+  it('reports Advanced access from the scoped token without exposing unauthorized controls', async () => {
+    const readOnly = await fetch(`${base}/api/settings/access?projectId=${mine}`, { headers: auth() });
+    expect(readOnly.status).toBe(200);
+    expect(await readOnly.json()).toMatchObject({ project: false, organization: false });
+
+    const maintainer = tokens.mintPrincipal('user:a', ['project:read', 'project:delete'], mine, 60_000).token;
+    const allowed = await fetch(`${base}/api/settings/access?projectId=${mine}`, {
+      headers: { authorization: `Bearer ${maintainer}` },
+    });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toMatchObject({ project: true });
+
+    const foreign = await fetch(`${base}/api/settings/access?projectId=${theirs}`, { headers: auth() });
+    expect(foreign.status).toBe(403);
+  });
+
   it('serves routed permission requests in Approval Requests and enforces the approver capability', async () => {
     const task = store.createTask({
       projectId: mine,
