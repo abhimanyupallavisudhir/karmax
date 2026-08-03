@@ -37,6 +37,7 @@ global.inboxRoute = (filter) => `/personal/inbox${filter && filter !== 'all' ? `
 global.S = { inbox: [], inboxFilter: 'all', meta: { deliveryChannels: ['browser'] }, deliveryPreferences: null };
 
 global.globalRoute = (tab) => `/personal/${tab}`;
+global.profileRoute = () => '/profile';
 
 // A `const` inside a direct eval stays in the eval's own scope; hoist it out.
 eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
@@ -123,7 +124,7 @@ ok(!html.includes('Task 3'), 'a read row is not rendered while Show read is off'
 ok(!html.includes('Task 4'), 'All does not render an unread routine update');
 ok(html.includes('<span>2 unread</span>'), 'the All toolbar count excludes routine updates');
 // Behaviour lives in one place — the profile — not next to the list it affects.
-ok(html.includes(`href="/personal/profile#notifications"`), 'the panel points at the notification settings');
+ok(html.includes(`href="/profile#notifications"`), 'the panel points at the user-scoped notification settings');
 ok(!html.includes('id="save-delivery"'), 'delivery preferences are no longer configured from the list');
 
 console.log(`${pass} passed, ${fail} failed`);
