@@ -170,7 +170,9 @@ describe('hosted/local Git handoff', () => {
       command: 'npm start', server: true, openUrls: [] });
     store.setExecutionRunning('review-server');
     const worlds = new WorldRegistry();
-    worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world, open: async () => world, destroy: async () => {} } as any);
+    let worldOpens = 0;
+    worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world,
+      open: async () => { worldOpens++; return world; }, destroy: async () => {} } as any);
     const github = { brokerCredentials: async () => ({ env: { GIT_SSH_COMMAND: ssh } }) } as any;
     const result = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
       .openFile(task.id, view, `${cloud}/cloud.txt`, 7);
@@ -179,6 +181,25 @@ describe('hosted/local Git handoff', () => {
     expect(result.materialized).toBe(true);
     expect(fs.readFileSync(result.path, 'utf8')).toBe('from E2B\n');
     expect(store.eventsSince(task.id, 0).some((event) => event.type === 'push.branch')).toBe(true);
+
+    const materialized = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .materialize(task.id, view);
+    expect(materialized.cwd).toBe(path.join(localRoot, task.id, 'app'));
+    expect(materialized.repositories).toEqual([
+      expect.objectContaining({ name: 'app', path: path.join(localRoot, task.id, 'app'), branch }),
+    ]);
+    expect(worldOpens).toBe(1);
+    expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'push.branch')).toHaveLength(1);
+
+    await ensureIdentity(cloud);
+    fs.writeFileSync(path.join(cloud, 'after-review.txt'), 'new task work\n');
+    await gitOrThrow(cloud, ['add', '.']);
+    await gitOrThrow(cloud, ['commit', '-q', '-m', 'more cloud work']);
+    const refreshed = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .materialize(task.id, { ...view, updatedAt: 2 });
+    expect(worldOpens).toBe(2);
+    expect(fs.readFileSync(path.join(refreshed.cwd, 'after-review.txt'), 'utf8')).toBe('new task work\n');
+    expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'push.branch')).toHaveLength(2);
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 

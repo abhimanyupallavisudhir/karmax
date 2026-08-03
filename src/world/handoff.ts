@@ -45,6 +45,14 @@ export interface LocalFileOpen {
   materialized: boolean;
 }
 
+interface LocalMaterializationRecord {
+  version: 1;
+  source: string;
+  repositories: Array<{ name: string; branch: string; head: string }>;
+}
+
+const LOCAL_MATERIALIZATION_RECORD = '.karmax-materialization.json';
+
 /** Git is the durable handoff boundary between a hosted world and a developer's
  * laptop. It keeps laptops out of the control plane and provider credentials out
  * of sandboxes while preserving the exact task branch in both directions. */
@@ -104,6 +112,10 @@ export class WorldHandoffService {
       return this.existingLocal(handle);
     const worldRepositories = worldRepos(handle);
     if (!worldRepositories.length) throw new Error('task world has no Git repositories to materialize');
+    const root = path.join(this.localRoot, safeName(taskId));
+    const source = materializationSource(handle, view);
+    const cached = await cachedMaterialization(taskId, root, handle.branch, worldRepositories, source);
+    if (cached) return cached;
     const linked = this.store.listProjectRepositories(project.id);
     const auth: GitBrokerAuth = async (repo) => {
       if (repo.localPath) return {};
@@ -124,7 +136,6 @@ export class WorldHandoffService {
       await access?.release(true);
     }
 
-    const root = path.join(this.localRoot, safeName(taskId));
     fs.mkdirSync(root, { recursive: true });
     const repositories: MaterializedLocalCheckout['repositories'] = [];
     for (const repo of worldRepositories) {
@@ -155,6 +166,8 @@ export class WorldHandoffService {
         fs.rmSync(materialized.directory, { recursive: true, force: true });
       }
     }
+    saveMaterialization(root, { version: 1, source,
+      repositories: repositories.map(({ name, branch, head }) => ({ name, branch, head })) });
     return { taskId, root, cwd: repositories.length === 1 ? repositories[0]!.path : root,
       branch: handle.branch, repositories };
   }
@@ -297,6 +310,63 @@ function pathInside(root: string, candidate: string): boolean {
 function localFileOpen(localPath: string, line: number | undefined, materialized: boolean): LocalFileOpen {
   const location = Number.isInteger(line) && Number(line) > 0 ? `${localPath}:${line}` : localPath;
   return { path: localPath, command: `code --goto ${sh(location)}`, materialized };
+}
+
+function materializationSource(handle: WorldHandle, view: TaskView): string {
+  return JSON.stringify({
+    generation: handle.generation ?? 1,
+    // A checkpoint is the durable content version at a human boundary. Older
+    // worlds without checkpoints fall back to the workflow view revision.
+    revision: handle.checkpointId ?? view.updatedAt,
+    repositories: worldRepos(handle).map((repo) => ({
+      name: repo.name,
+      source: worldRepoSource(repo),
+      localPath: repo.localPath,
+      branch: repo.branch,
+    })),
+  });
+}
+
+/** Return an already materialized checkout only when both its source revision
+ * and every local Git worktree are unchanged. This makes repeated file-open and
+ * native-fork clicks cheap without masking local edits or stale checkouts. */
+async function cachedMaterialization(taskId: string, root: string, branch: string,
+  expected: ReturnType<typeof worldRepos>, source: string): Promise<MaterializedLocalCheckout | undefined> {
+  let record: LocalMaterializationRecord;
+  try {
+    record = JSON.parse(fs.readFileSync(path.join(root, LOCAL_MATERIALIZATION_RECORD), 'utf8')) as LocalMaterializationRecord;
+  } catch { return undefined; }
+  if (record.version !== 1 || record.source !== source || record.repositories.length !== expected.length)
+    return undefined;
+  const repositories: MaterializedLocalCheckout['repositories'] = [];
+  for (let index = 0; index < expected.length; index++) {
+    const repo = expected[index]!;
+    const saved = record.repositories[index];
+    const destination = path.join(root, safeName(repo.name));
+    if (!saved || saved.name !== repo.name || saved.branch !== repo.branch || !fs.existsSync(path.join(destination, '.git')))
+      return undefined;
+    const [status, currentBranch, head] = await Promise.all([
+      git(destination, ['status', '--porcelain']),
+      git(destination, ['branch', '--show-current']),
+      git(destination, ['rev-parse', 'HEAD']),
+    ]);
+    if (status.code !== 0 || status.stdout.trim() || currentBranch.code !== 0
+      || currentBranch.stdout.trim() !== repo.branch || head.code !== 0 || head.stdout.trim() !== saved.head)
+      return undefined;
+    repositories.push({ name: repo.name, path: destination, branch: repo.branch, head: saved.head });
+  }
+  return { taskId, root, cwd: repositories.length === 1 ? repositories[0]!.path : root, branch, repositories };
+}
+
+function saveMaterialization(root: string, record: LocalMaterializationRecord): void {
+  const destination = path.join(root, LOCAL_MATERIALIZATION_RECORD);
+  const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    fs.renameSync(temporary, destination);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
 }
 
 function gitEnvironment(root: string, credential: GitBrokerCredential): {
