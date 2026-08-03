@@ -63,6 +63,42 @@ describe('Bitwarden connector', () => {
     expect(items).toHaveLength(1);
     expect(items[0]!.secrets).toEqual({ password: 'p@ss', totp: 'SEED234' });
   });
+
+  it('only saves a session key after Bitwarden confirms it is usable', async () => {
+    const { items, broker, store } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden'), exec));
+
+    await expect(connectors.connect('bitwarden', '')).rejects.toThrow(/session key/i);
+    expect(connectors.secretFor('bitwarden')).toBeUndefined();
+
+    await expect(connectors.connect('bitwarden', 'sess')).resolves.toMatchObject({ available: true });
+    expect(connectors.secretFor('bitwarden')).toBe('sess');
+  });
+
+  it('does not replace a working connection when validation fails', async () => {
+    const { items, broker, store } = makeVault();
+    const connectorExec: Exec = async (_cmd, _args, opts) => {
+      if (opts?.env?.BW_SESSION === 'working') return JSON.stringify({ status: 'unlocked' });
+      return JSON.stringify({ status: 'unauthenticated' });
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden'), connectorExec));
+
+    await connectors.connect('bitwarden', 'working');
+    await expect(connectors.connect('bitwarden', 'wrong')).rejects.toThrow(/invalid|expired/i);
+    expect(connectors.secretFor('bitwarden')).toBe('working');
+  });
+
+  it('does not connect when the bw CLI is unavailable', async () => {
+    const { items, broker, store } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden'), async () => {
+      throw new Error('ENOENT');
+    }));
+    await expect(connectors.connect('bitwarden', 'sess')).rejects.toThrow(/bw.*CLI/i);
+    expect(connectors.secretFor('bitwarden')).toBeUndefined();
+  });
 });
 
 describe('1Password connector', () => {
@@ -79,6 +115,24 @@ describe('1Password connector', () => {
     const [pulled] = (await c.pull(['op1'])).items;
     expect(pulled!.username).toBe('octo');
     expect(pulled!.secrets).toEqual({ password: 'sw0rd', totp: '123456' });
+  });
+
+  it('does not connect without a service-account token', async () => {
+    const { items, broker, store } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password'), exec));
+    await expect(connectors.connect('1password', '   ')).rejects.toThrow(/service-account token/i);
+    expect(connectors.secretFor('1password')).toBeUndefined();
+  });
+
+  it('does not connect when the op CLI is unavailable', async () => {
+    const { items, broker, store } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password'), async () => {
+      throw new Error('ENOENT');
+    }));
+    await expect(connectors.connect('1password', 'ops_token')).rejects.toThrow(/op.*CLI/i);
+    expect(connectors.secretFor('1password')).toBeUndefined();
   });
 });
 

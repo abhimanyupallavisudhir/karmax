@@ -114,13 +114,21 @@ export class BitwardenConnector implements CredentialConnector {
     return key ? { BW_SESSION: key } : {};
   }
   async describe(): Promise<ConnectorInfo> {
+    if (!this.sessionKey()) return {
+      name: this.name,
+      label: 'Bitwarden',
+      available: false,
+      canPush: true,
+      detail: 'needs the `bw` CLI on this host.',
+    };
     try {
       const status = JSON.parse(await this.exec('bw', ['status'], { env: this.env() }));
       const unlocked = status?.status === 'unlocked';
       return { name: this.name, label: 'Bitwarden', available: unlocked, canPush: true,
-        detail: unlocked ? 'unlocked and ready to mirror' : `Bitwarden is ${status?.status ?? 'locked'} — unlock it in Connectors to sync` };
+        detail: unlocked ? 'ready' : 'The Bitwarden session key is invalid or expired.' };
     } catch {
-      return { name: this.name, label: 'Bitwarden', available: false, canPush: true, detail: 'the `bw` CLI is not installed or not logged in' };
+      return { name: this.name, label: 'Bitwarden', available: false, canPush: true,
+        detail: 'needs the `bw` CLI on this host.' };
     }
   }
   async list(): Promise<ExternalItem[]> {
@@ -188,11 +196,19 @@ export class OnePasswordConnector implements CredentialConnector {
     return t ? { OP_SERVICE_ACCOUNT_TOKEN: t } : {};
   }
   async describe(): Promise<ConnectorInfo> {
+    if (!this.token()) return {
+      name: this.name,
+      label: '1Password',
+      available: false,
+      canPush: true,
+      detail: 'needs the `op` CLI on this host.',
+    };
     try {
       await this.exec('op', ['whoami', '--format=json'], { env: this.env() });
-      return { name: this.name, label: '1Password', available: true, canPush: true, detail: 'service account connected' };
+      return { name: this.name, label: '1Password', available: true, canPush: true, detail: 'ready' };
     } catch {
-      return { name: this.name, label: '1Password', available: false, canPush: true, detail: 'paste a 1Password service-account token to connect (needs the `op` CLI on this host)' };
+      return { name: this.name, label: '1Password', available: false, canPush: true,
+        detail: 'Check the service-account token and make sure the `op` CLI is installed.' };
     }
   }
   async list(): Promise<ExternalItem[]> {
@@ -316,7 +332,7 @@ export class OnePasswordSdkConnector implements CredentialConnector {
       label: '1Password',
       available: false,
       canPush: true,
-      detail: 'paste a 1Password service-account token to connect',
+      detail: 'Enter a 1Password service-account token.',
     };
     try {
       await (await this.client(token)).vaults.list({ decryptDetails: true });
@@ -1086,9 +1102,31 @@ export class Connectors {
     return next;
   }
 
-  /** Store a connector's unlock secret (bw session key / op token) in the vault. */
-  connect(name: string, secret: string): void {
-    this.broker?.registerHandle(connectorAuthHandle(this.organizationId, name), secret);
+  /** Validate a connector secret before keeping it. A failed replacement restores
+   *  the previous working secret, so clicking Connect can never manufacture a
+   *  false-positive connection or break an existing one. */
+  async connect(name: string, secret: string): Promise<ConnectorInfo> {
+    const connector = this.get(name);
+    if (!connector) throw new Error(`no connector "${name}"`);
+    if (!this.broker) throw new Error('credential storage is unavailable');
+    const value = secret.trim();
+    const required = name === 'bitwarden' ? 'Enter a Bitwarden session key.'
+      : name === '1password' ? 'Enter a 1Password service-account token.'
+        : 'Enter the connector credential.';
+    if (!value) throw new Error(required);
+
+    const handle = connectorAuthHandle(this.organizationId, name);
+    const previous = this.secretFor(name);
+    this.broker.registerHandle(handle, value);
+    try {
+      const info = await connector.describe();
+      if (!info.available) throw new Error(info.detail);
+      return info;
+    } catch (error) {
+      if (previous === undefined) this.broker.deleteHandle(handle);
+      else this.broker.registerHandle(handle, previous);
+      throw error;
+    }
   }
   secretFor(name: string): string | undefined {
     const handle = connectorAuthHandle(this.organizationId, name);

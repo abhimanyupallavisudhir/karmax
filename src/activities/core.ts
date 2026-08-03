@@ -553,9 +553,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const token = await githubTokenFor(handle, slug);
     if (!token) {
       if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).oauthConfigured) {
-        throw new Error(`your GitHub identity is not connected for ${slug} — connect GitHub on your user page, then retry`);
+        throw new Error('Connect GitHub on your profile, then try again.');
       }
-      throw new Error(`no personal GitHub credential can act on ${slug} — connect GitHub on your user page, or add a fallback token to your Development Git identity`);
+      throw new Error(`Your GitHub account cannot access ${slug}. Grant it access on GitHub, then reconnect GitHub on your profile.`);
     }
     return new GithubPrApi(token, deps.githubPr ?? {});
   }
