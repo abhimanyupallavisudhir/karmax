@@ -198,10 +198,10 @@ export class GithubPrApi {
   /** Repositories configured with GitHub merge queues reject the direct REST
    * merge. Enqueue the same PR through GraphQL; a mutation error simply means
    * this repository is not queue-enabled (or its current policy is unmet). */
-  async enqueue(nodeId: string): Promise<GithubMergeResult> {
+  async enqueue(nodeId: string, headSha?: string): Promise<GithubMergeResult> {
     const value = await this.graphql<any>(
-      'mutation($id:ID!){ enqueuePullRequest(input:{pullRequestId:$id}){ mergeQueueEntry{ id } } }',
-      { id: nodeId },
+      'mutation($input:EnqueuePullRequestInput!){ enqueuePullRequest(input:$input){ mergeQueueEntry{ id } } }',
+      { input: { pullRequestId: nodeId, ...(headSha ? { expectedHeadOid: headSha } : {}) } },
     );
     return {
       merged: false,

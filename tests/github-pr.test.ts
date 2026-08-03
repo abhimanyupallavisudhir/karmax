@@ -184,11 +184,13 @@ describe('GitHub PR client', () => {
     const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
     await api.approve(SLUG, 7, 'reviewed-sha', 'approved in krmax');
     await expect(api.merge(SLUG, 7, 'reviewed-sha')).resolves.toEqual({ merged: true, sha: 'merge-sha', message: 'merged' });
-    await expect(api.enqueue('PR_node')).resolves.toMatchObject({ queued: true, merged: false });
+    await expect(api.enqueue('PR_node', 'reviewed-sha')).resolves.toMatchObject({ queued: true, merged: false });
     expect(calls[0]).toMatchObject({ path: `/repos/${SLUG}/pulls/7/reviews`,
       body: { commit_id: 'reviewed-sha', event: 'APPROVE' } });
     expect(calls[1]).toMatchObject({ path: `/repos/${SLUG}/pulls/7/merge`, body: { sha: 'reviewed-sha' } });
-    expect(calls[2]!.body).toMatchObject({ variables: { id: 'PR_node' } });
+    expect(calls[2]!.body).toMatchObject({ variables: { input: {
+      pullRequestId: 'PR_node', expectedHeadOid: 'reviewed-sha',
+    } } });
   });
 
   it('inspects review, checks, queue, and auto-merge readiness through GraphQL', async () => {
@@ -349,6 +351,45 @@ describe('GitHub-authoritative merge activity', () => {
       base: 'main', repo: tmp, root: tmp } as any, stale.prs)).resolves.toMatchObject({
         status: 'merged', actorUserId: 'reviewer',
       });
+  });
+
+  it('binds merge-queue and auto-merge fallback to the reviewed head', async () => {
+    const graphqlInputs: any[] = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return Response.json({
+        number: 8, node_id: 'PR_auto', html_url: 'https://github.test/acme/widgets/pull/8', state: 'open',
+        merged: false, head: { ref: 'karmax/task_auto', sha: 'exact-head' }, base: { ref: 'main' },
+      });
+      if (method === 'PUT') return Response.json({ merged: false, message: 'Required checks are pending' }, { status: 409 });
+      const body = JSON.parse(String(init.body));
+      graphqlInputs.push(body.variables.input);
+      if (String(body.query).includes('enqueuePullRequest'))
+        return Response.json({ errors: [{ message: 'This branch has no merge queue' }] });
+      return Response.json({ data: { enablePullRequestAutoMerge: { pullRequest: {
+        id: 'PR_auto', autoMergeRequest: { enabledAt: '2026-08-03T00:00:00Z', mergeMethod: 'SQUASH' },
+      } } } });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true, mergeMethod: 'squash' }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Auto merge');
+    const task = core.store.createTask({ projectId: project.id, title: 'Auto merge me', workflow: 'software-dev',
+      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } });
+    await expect(core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'karmax/task_auto',
+      base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 8,
+      url: 'https://github.test/acme/widgets/pull/8', state: 'open', headSha: 'exact-head' }]))
+      .resolves.toMatchObject({ status: 'queued', detail: expect.stringMatching(/auto-merge/) });
+    expect(graphqlInputs).toEqual([
+      { pullRequestId: 'PR_auto', expectedHeadOid: 'exact-head' },
+      { pullRequestId: 'PR_auto', expectedHeadOid: 'exact-head', mergeMethod: 'SQUASH' },
+    ]);
   });
 });
 

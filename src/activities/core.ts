@@ -2270,6 +2270,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const settled: TaskPullRequest[] = [];
       let lastSha: string | undefined;
       let queued = false;
+      let pendingDetail: string | undefined;
       for (const ref of prs) {
         const live = await api.get(ref.slug, ref.number);
         const next = {
@@ -2307,11 +2308,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           continue;
         }
         let queueResult;
-        if (live.nodeId) queueResult = await api.enqueue(live.nodeId).catch(() => undefined);
+        if (live.nodeId) queueResult = await api.enqueue(live.nodeId, ref.headSha).catch(() => undefined);
         if (queueResult?.queued) {
           queued = true;
+          pendingDetail = 'GitHub accepted the pull request into its merge queue.';
           settled.push(next);
           record(handle.id, 'github.pr.queued', { ...ref, actorUserId });
+          continue;
+        }
+        const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
+        const autoMerge = live.nodeId
+          ? await api.enableAutoMerge(live.nodeId, ref.headSha, mergeMethod).catch(() => undefined)
+          : undefined;
+        if (autoMerge?.enabled) {
+          queued = true;
+          pendingDetail = 'GitHub auto-merge is enabled for the reviewed pull-request head.';
+          settled.push(next);
+          record(handle.id, 'github.pr.auto-merge-enabled', { ...ref, actorUserId, mergeMethod });
           continue;
         }
         record(handle.id, 'github.pr.merge-waiting', { ...ref, actorUserId, detail: merged.message });
@@ -2324,7 +2337,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return { status: 'merged', prs: settled, actorUserId, ...(lastSha ? { sha: lastSha } : {}) };
       return {
         status: queued ? 'queued' : 'waiting', prs: settled, actorUserId,
-        detail: queued ? 'GitHub accepted the pull request into its merge queue.' : 'Waiting for GitHub merge policy.',
+        detail: queued ? pendingDetail : 'Waiting for GitHub merge policy.',
       };
     },
 
