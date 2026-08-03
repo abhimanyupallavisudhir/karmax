@@ -809,11 +809,18 @@ export class Gateway {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
         if (current) {
           const onboardingKey = `git:onboarding:${current.user.id}`;
+          // Better Auth creates social-login users inside its callback route,
+          // bypassing /api/signup. Complete the same karmax-side provisioning on
+          // their first authenticated session. The helper is idempotent.
+          if (this.provisionPersonalWorkspace(current.user.id, current.user.name)) {
+            this.deps.store.kvSet(onboardingKey, 'pending');
+          }
           const gitOnboarding = this.deps.store.kvGet(onboardingKey) === 'pending';
           if (gitOnboarding) this.deps.store.kvSet(onboardingKey, 'seen');
           return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user, gitOnboarding,
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
-          google: this.deps.identity.googleEnabled });
+          google: this.deps.identity.googleEnabled,
+          github: this.deps.identity.githubEnabled });
         }
         return this.json(res, 200, {
           authRequired: true,
@@ -822,6 +829,7 @@ export class Gateway {
           signupAvailable: this.deps.identity.hasUsers(),
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
           google: this.deps.identity.googleEnabled,
+          github: this.deps.identity.githubEnabled,
         });
       }
       // Legacy sessions are single-user by construction; minting one on a
@@ -1125,6 +1133,7 @@ export class Gateway {
         deliveryChannels: this.deps.deliveryChannels ?? ['browser'],
         sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
         google: this.deps.identity?.googleEnabled ?? false,
+        github: this.deps.identity?.githubEnabled ?? false,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -5623,15 +5632,17 @@ export class Gateway {
   /** Give a freshly self-registered user their own personal-workspace org (owner
    *  grant), so signup lands in a real workspace instead of the access-pending
    *  waiting room. Best-effort: a failure here never fails the signup itself. */
-  private provisionPersonalWorkspace(userId: string, name: string): void {
+  private provisionPersonalWorkspace(userId: string, name: string): boolean {
     try {
-      if (this.deps.store.listOrganizations(userId).length) return; // already has one
+      if (this.deps.store.listOrganizations(userId).length) return false; // already has one
       const label = (name || '').trim();
       const organization = this.deps.store.createOrganization({
         name: label ? `${label}'s workspace` : 'Personal workspace', kind: 'personal', ownerUserId: userId });
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
+      return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);
+      return false;
     }
   }
 

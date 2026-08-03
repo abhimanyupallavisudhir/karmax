@@ -163,6 +163,10 @@ async function main() {
       ? { google: { clientId: process.env.KARMAX_GOOGLE_CLIENT_ID.trim(),
           clientSecret: process.env.KARMAX_GOOGLE_CLIENT_SECRET.trim() } }
       : {}),
+    ...(process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim() && process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET?.trim()
+      ? { github: { clientId: process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID.trim(),
+          clientSecret: process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET.trim() } }
+      : {}),
   });
   const installationOwner = identity.listUsers()[0];
   if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);

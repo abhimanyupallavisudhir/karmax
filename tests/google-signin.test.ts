@@ -24,6 +24,7 @@ import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 const GOOGLE = { clientId: 'test-google-client-id.apps.googleusercontent.com', clientSecret: 'test-google-client-secret' };
+const GITHUB = { clientId: 'test-github-client-id', clientSecret: 'test-github-client-secret' };
 const OIDC = {
   providerId: 'enterprise',
   discoveryUrl: 'https://idp.example.com/.well-known/openid-configuration',
@@ -55,15 +56,63 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
   });
   const running = await gateway.listen(port);
   closers.push(() => running.close());
-  return { identity, base: running.url };
+  return { identity, store, base: running.url };
 }
 
 describe('Google sign-in is off unless configured', () => {
-  it('reports googleEnabled=false and google:false on /api/session', async () => {
+  it('reports social providers disabled on /api/session', async () => {
     const { identity, base } = await boot();
     expect(identity.googleEnabled).toBe(false);
+    expect(identity.githubEnabled).toBe(false);
     const session = await (await fetch(`${base}/api/session`)).json() as any;
     expect(session.google).toBe(false);
+    expect(session.github).toBe(false);
+  });
+});
+
+describe('GitHub sign-in when configured', () => {
+  it('advertises itself and builds an identity-only GitHub authorize URL', async () => {
+    const { identity, base } = await boot({ github: GITHUB });
+    expect(identity.githubEnabled).toBe(true);
+    const session = await (await fetch(`${base}/api/session`)).json() as any;
+    expect(session.github).toBe(true);
+
+    const res = await fetch(`${base}/api/auth/sign-in/social`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'github', callbackURL: '/' }),
+    });
+    expect(res.status).toBe(200);
+    const url = new URL((await res.json() as any).url);
+    expect(url.origin + url.pathname).toBe('https://github.com/login/oauth/authorize');
+    expect(url.searchParams.get('client_id')).toBe(GITHUB.clientId);
+    expect(url.searchParams.get('state')).toBeTruthy();
+    expect(url.searchParams.get('redirect_uri')).toMatch(/\/api\/auth\/callback\/github$/);
+    expect(new Set((url.searchParams.get('scope') ?? '').split(/[+\s]/).filter(Boolean)))
+      .toEqual(new Set(['read:user', 'user:email']));
+  });
+
+  it('trusts GitHub verified email as a link source but still requires a verified local account', async () => {
+    const { identity } = await boot({ google: GOOGLE, github: GITHUB });
+    const linking = identity.auth.options.account?.accountLinking;
+    expect(linking?.enabled).toBe(true);
+    expect(linking?.trustedProviders).toEqual(['google', 'github']);
+    expect(linking?.requireLocalEmailVerified).not.toBe(false);
+  });
+
+  it('provisions a personal workspace when a social callback creates a user', async () => {
+    const { identity, store, base } = await boot({ github: GITHUB });
+    // Better Auth's social callback creates its user and session before returning
+    // to the SPA. A direct identity signup gives us that same post-callback state
+    // without making a live request to GitHub.
+    const created = await identity.signUp({
+      name: 'Octo Cat', email: 'octo@example.com', password: 'long-enough-password',
+    });
+    const cookie = created.headers.get('set-cookie')?.split(';', 1)[0];
+    expect(cookie).toBeTruthy();
+    const session = await (await fetch(`${base}/api/session`, { headers: { cookie: cookie! } })).json() as any;
+    expect(session.authenticated).toBe(true);
+    expect(session.gitOnboarding).toBe(true);
+    expect(store.listOrganizations(session.user.id)).toHaveLength(1);
   });
 });
 
@@ -137,13 +186,15 @@ describe('Google sign-in when configured', () => {
 });
 
 describe('Google and enterprise OIDC coexist', () => {
-  it('keeps both slots working when both are configured', async () => {
-    const { identity, base } = await boot({ google: GOOGLE, oidc: OIDC });
+  it('keeps Google, GitHub, and enterprise slots working together', async () => {
+    const { identity, base } = await boot({ google: GOOGLE, github: GITHUB, oidc: OIDC });
     expect(identity.googleEnabled).toBe(true);
+    expect(identity.githubEnabled).toBe(true);
     expect(identity.oidcProviderId).toBe('enterprise');
 
     const session = await (await fetch(`${base}/api/session`)).json() as any;
     expect(session.google).toBe(true);
+    expect(session.github).toBe(true);
     expect(session.sso).toEqual({ providerId: 'enterprise' });
 
     // The generic-OAuth plugin is still installed and still owns its own

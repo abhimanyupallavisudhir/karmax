@@ -76,7 +76,7 @@ configure() {
 
   # This file is rewritten wholesale below, so anything the six managed keys
   # above do not carry over is deleted. Operators legitimately add their own
-  # settings here (a Google OAuth client, a mailer), and losing one at the next
+  # settings here (a social OAuth client, a mailer), and losing one at the next
   # `up` is invisible: no error, the feature just quietly stops existing. So
   # capture every other assignment now, before the truncation, and re-emit it.
   carried=''
