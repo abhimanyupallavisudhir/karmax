@@ -466,6 +466,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const found = candidates.find((candidate) => sameRepository(candidate.sshUrl, source));
       if (found) return found;
     }
+    if (repo.localPath) {
+      const catalog = store.listRepositories(store.getProject(projectId)?.organizationId ?? 'org_personal');
+      const found = [worldRepoSource(repo), repo.repo, repo.source]
+        .filter((value): value is string => Boolean(value))
+        .flatMap((source) => catalog.filter((candidate) => sameRepository(candidate.sshUrl, source)))[0];
+      if (found) return found;
+    }
     if (!isRemote(handle.kind)) {
       const origin = await hostGit(repo.root, ['config', '--get', 'remote.origin.url']);
       if (origin.code === 0) {
@@ -509,7 +516,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   /** Static-token compatibility for PR operations. Human work first resolves
    * its refreshable App user authorization in prApiFor(); this fallback retains
    * manually managed profiles, organization automation, and legacy host login. */
-  async function githubTokenFor(handle: WorldHandle, slug: string): Promise<string | undefined> {
+  async function githubTokenFor(
+    handle: WorldHandle,
+    slug: string,
+    authorizedRepository?: Repository,
+  ): Promise<string | undefined> {
     const projectId = typeof handle.meta?.projectId === 'string'
       ? handle.meta.projectId
       : store.getTask(handle.id)?.projectId;
@@ -520,7 +531,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // authorization (handled above), a manual profile fallback, or a setup error.
     if (gitBindingFromHandle(handle, handle.id).scope.startsWith('user:')) return undefined;
     if (projectId && deps.githubApp) {
-      const repository = enrolledGithubRepository(projectId, slug);
+      const repository = authorizedRepository ?? enrolledGithubRepository(projectId, slug);
       const connection = repository?.gitConnectionId ? store.getGitConnection(repository.gitConnectionId) : undefined;
       if (connection) return await deps.githubApp.installationToken(connection);
     }
@@ -534,13 +545,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } catch { return undefined; }
   }
 
-  async function prApiFor(handle: WorldHandle, slug: string): Promise<GithubPrApi> {
+  async function prApiFor(
+    handle: WorldHandle,
+    slug: string,
+    checkout?: ReturnType<typeof worldRepos>[number],
+  ): Promise<GithubPrApi> {
     const projectId = typeof handle.meta?.projectId === 'string'
       ? handle.meta.projectId
       : store.getTask(handle.id)?.projectId;
     const userId = store.taskCreatorUserId(handle.id);
     const accountId = taskGithubAccountId(handle.id) ?? (userId ? activeGithubAccountId(userId) : undefined);
-    const repository = enrolledGithubRepository(projectId, slug);
+    let repository = enrolledGithubRepository(projectId, slug);
+    if (!repository && checkout) {
+      const candidate = await enrolledRepositoryForCheckout(handle, checkout);
+      if (`${candidate?.owner}/${candidate?.name}`.toLowerCase() === slug.toLowerCase()) repository = candidate;
+    }
     // Connected development uses the SAME deployment App in two distinct
     // capacities: its installation owns repository transport, while this
     // per-user OAuth grant makes the PR attributable to the task creator.
@@ -550,7 +569,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         deps.githubPr ?? {},
       );
     }
-    const token = await githubTokenFor(handle, slug);
+    const token = await githubTokenFor(handle, slug, repository);
     if (!token) {
       if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).oauthConfigured) {
         throw new Error('Connect GitHub on your profile, then try again.');
@@ -576,7 +595,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(handle.id, 'pr.skipped', { repo: repo.name, reason: 'no GitHub origin remote' });
         continue;
       }
-      targets.push({ repo, slug, api: await prApiFor(handle, slug) });
+      targets.push({ repo, slug, api: await prApiFor(handle, slug, repo) });
     }
     return targets;
   }
