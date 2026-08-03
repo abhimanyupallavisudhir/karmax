@@ -23,6 +23,7 @@ global.renderMessageImages = () => '';
 global.markdownEnabled = () => false;
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
+global.hostLocal = () => true;
 const preferences = new Map();
 global.localStorage = {
   getItem: (key) => preferences.has(key) ? preferences.get(key) : null,
@@ -39,7 +40,7 @@ global.S = {
   ],
 };
 
-for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'renderAgentMessageBody', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -77,11 +78,16 @@ liveEntries = conversationEntries(transcript);
 ok(liveEntries.filter((entry) => entry.message?.id === 'u-live').length === 1, 'event and stored transcript copies are de-duplicated');
 
 const linked = renderConversationText('See [app.js](/work/task-1/web/app.js:42) and [docs](https://example.com).', 'agent', S.view);
-ok(linked.includes('href="/work/task-1/web/app.js:42"'), 'the agent-provided file href is preserved for copy behavior');
+ok(linked.includes('href="#"'), 'an agent file link has an inert browser href');
 ok(linked.includes('data-world-file="/work/task-1/web/app.js:42"'), 'an in-world file link is marked for click interception');
 ok(!linked.match(/data-world-file="https:/), 'external links are never treated as world files');
 ok(worldFileTarget('/work/task-1/web/app.js#L9', S.view.worldPath).line === 9, 'GitHub-style line fragments are parsed');
 ok(worldFileTarget('/other/task/app.js:3', S.view.worldPath) === null, 'absolute paths outside the task world are not intercepted');
+ok(worldFileTarget('/workspace/web/app.js:3', undefined, true).path === '/workspace/web/app.js', 'cloud-world file links are intercepted without leaking the remote root');
+const cloudLinked = renderConversationText('[app.js](/workspace/web/app.js:3)', 'agent', { taskId: 'task-cloud', worldAvailable: true });
+ok(cloudLinked.includes('data-world-file="/workspace/web/app.js:3"'), 'cloud-world file links are prepared for local materialization');
+const markdownLinked = annotateWorldFileLinks('<p><a href="/work/task-1/web/app.js:42" target="_blank">app.js</a></p>', S.view);
+ok(markdownLinked.includes('href="#"') && markdownLinked.includes('data-world-file="/work/task-1/web/app.js:42"'), 'the default Markdown path also makes file hrefs inert and interceptable');
 ok(renderConversationText('[app](/work/task-1/app.js)', 'user', S.view).includes('[app]('), 'user-authored Markdown remains literal');
 ok(fileLinksEnabled() === true, 'world file links default on');
 setFileLinksEnabled(false);
