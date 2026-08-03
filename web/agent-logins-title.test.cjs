@@ -1,5 +1,5 @@
-// The per-task credential-precedence control lists the agent logins, so its
-// section is titled "Agent logins" (not the vaguer "Credentials", which also
+// The per-task credential-precedence control lists the Codex/Claude accounts, so its
+// section is titled "Codex/Claude" (not the vaguer "Credentials", which also
 // collides with the separate "Vault credentials" button).
 // Run: node web/agent-logins-title.test.cjs
 const fs = require('fs');
@@ -35,15 +35,15 @@ global.paramsSection = () => '';
 global.authorizationSection = () => '';
 eval(extractFn('parametersTab'));
 const tab = parametersTab({});
-ok(/<div class="section-h">Agent logins<\/div>/.test(tab), 'Parameters tab titles the section "Agent logins"');
+ok(/<div class="section-h">Codex\/Claude<\/div>/.test(tab), 'Parameters tab titles the section "Codex/Claude"');
 ok(!/<div class="section-h">Credentials<\/div>/.test(tab), 'Parameters tab no longer titles it "Credentials"');
 
 // New-task form (openTaskForm) label.
-ok(/>Agent logins<\/label>/.test(src), 'new-task form labels the control "Agent logins"');
+ok(/>Codex\/Claude<\/label>/.test(src), 'new-task form labels the control "Codex/Claude"');
 
 // Series page (renderSeriesPage) details summary. The title is what's load-bearing
 // here; the trailing gloss is free to be reworded.
-ok(/<summary>Agent logins —/.test(src), 'series page summary is titled "Agent logins"');
+ok(/<summary>Codex\/Claude —/.test(src), 'series page summary is titled "Codex/Claude"');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

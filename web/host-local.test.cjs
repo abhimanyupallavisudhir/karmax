@@ -45,7 +45,6 @@ const gated = [
   ['id="resource-source-path"', 'resource import from a host directory'],
   ['id="resource-scan"', 'scan of the host checkout'],
   ['id="data-discover"', 'discovery of ignored files in the host checkout'],
-  ['currently comes from the host checkout', 'legacy copyGlobs migration'],
 ];
 for (const [marker, what] of gated) {
   const hits = lines.filter((l) => l.includes(marker));

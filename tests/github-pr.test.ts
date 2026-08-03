@@ -469,7 +469,7 @@ describe('PR stage (remote policy "pr")', () => {
     const repo = await repoWithGithubOrigin('nocred');
     const handle = await core.createWorld({ taskId: 'task_pr3', projectId: project.id, repo,
       base: 'main', target: 'main', kind: 'worktree' });
-    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/no personal GitHub credential can act on acme\/widgets/);
+    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/GitHub account cannot access acme\/widgets.*reconnect GitHub on your profile/i);
     await core.destroyWorld(handle);
   });
 });

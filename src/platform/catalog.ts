@@ -32,6 +32,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/projects/:projectId/members/user|team|organization/:principalId',
   ],
   organizations: [
+    'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     // POST needs a human account: it calls bootstrapOrganizationOwner, and a scoped
     // agent token has no session.userId. Same for /invitations/accept below.
     'GET|POST /api/organizations (POST requires a human identity — an agent token cannot own an organization)',

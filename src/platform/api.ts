@@ -281,7 +281,7 @@ export class KarmaxApi {
     const linked = this.deps.store.listProjectRepositories(projectId);
     const wiki = this.deps.store.projectWiki(projectId)?.repository;
     return async (repo) => {
-      if (!this.deps.githubApp) throw new Error('Git collaboration for a remote repository requires a connected GitHub App');
+      if (!this.deps.githubApp) throw new Error('Connect GitHub in organization settings, then try again.');
       const source = worldRepoSource(repo);
       const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
         ?? (wiki && sameRepository(wiki.sshUrl, source) ? wiki : undefined);
@@ -563,15 +563,12 @@ export class KarmaxApi {
     if (this.deps.hosted) {
       const linked = this.deps.store.listProjectRepositories(project.id);
       if (!linked.length) {
-        throw new Error(
-          `Workflow "${manifest.name}" works on a repository, but hosted project "${project.name}" has no attached ` +
-            `GitHub repository. Connect the organization GitHub App and attach a repository to this project before running the task.`,
-        );
+        throw new Error('Please connect GitHub in organization settings, then add a git repo in project settings.');
       }
       const enrolled = linked.map((candidate) => candidate.repository.sshUrl);
       const outside = effectiveRepos(resolved, project.config)
         .filter((repository) => !enrolled.some((candidate) => sameRepository(candidate, repository)));
-      if (outside.length) throw new Error(`Hosted project "${project.name}" references a repository that is not attached to it: ${outside[0]}`);
+      if (outside.length) throw new Error('Please choose a GitHub repo attached to this project in project settings.');
     }
     // Guard on the EFFECTIVE repo list the world will be built from (the resolved
     // settings overlay, falling back to project config) — the same value that
@@ -581,11 +578,7 @@ export class KarmaxApi {
     // silent scratch sandbox — the very footgun this guard exists to prevent.
     const configured = effectiveRepos(resolved, project.config).length > 0;
     if (!configured) {
-      throw new Error(
-        `Workflow "${manifest.name}" works on a repository, but project "${project.name}" has no repository ` +
-          `configured — it would run against an empty throwaway sandbox, not your code. Set the repository ` +
-          `directory in the project's Settings (an absolute path, or one starting with ~) before running this task.`,
-      );
+      throw new Error('Please add a git repo in project settings.');
     }
   }
 

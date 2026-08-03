@@ -75,8 +75,8 @@ describe('connector import (web)', () => {
     expect(app).toContain('/api/vault/import/bitwarden');
     expect(app).toContain('file.text()');
     expect(app).toContain('50 * 1024 * 1024');
-    expect(app).toContain('Write changes back');
-    expect(app).toContain('unavailable for file imports');
+    expect(app).toContain('Export your Bitwarden to a JSON file and import it here (no write-back).');
+    expect(app).not.toContain('Write changes back — unavailable for file imports');
     expect(app).toContain('one-way import');
   });
 

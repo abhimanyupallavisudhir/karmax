@@ -810,14 +810,14 @@ export class GitHubAppService {
   async userAccessToken(userId: string, opts: { forceRefresh?: boolean; accountId?: string } = {}): Promise<string> {
     const accountId = opts.accountId ?? this.activeUserAccountId(userId);
     const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
-    if (!this.broker.hasHandle(handle)) throw new Error('Connect your GitHub identity before acting on your behalf');
+    if (!this.broker.hasHandle(handle)) throw new Error('Connect GitHub on your profile, then try again.');
     const stored = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as {
       accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
     };
     if (!opts.forceRefresh && (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000)) return stored.accessToken;
     if (!stored.refreshToken || (stored.refreshExpiresAt && stored.refreshExpiresAt <= Date.now())) {
       this.broker.deleteHandle(handle);
-      throw new Error('GitHub authorization expired; reconnect your GitHub identity on your user page');
+      throw new Error('Reconnect GitHub on your profile, then try again.');
     }
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
     const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
@@ -828,8 +828,7 @@ export class GitHubAppService {
       // The refresh token itself is dead — GitHub returns an OAuth error body
       // (HTTP 200) rather than a token. Clearing here forces a clean reconnect.
       this.broker.deleteHandle(handle);
-      const reason = value.error_description || value.error;
-      throw new Error(`GitHub authorization expired; reconnect your GitHub identity on your user page${reason ? ` (${reason})` : ''}`);
+      throw new Error('Reconnect GitHub on your profile, then try again.');
     }
     this.saveTokenHandle(handle, value);
     return String(value.access_token);
