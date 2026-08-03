@@ -300,6 +300,43 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  it('uses the connected account for a configured local origin without a project attachment', async () => {
+    const gh = fakeGithub();
+    const repo = await repoWithGithubOrigin('connected-local');
+    const core = await coreFor(gh, {
+      status() { return { configured: true, oauthConfigured: true, userAuthorized: true }; },
+      activeUserAccountId() { return '77'; },
+      async userAccessToken(userId: string, options?: { accountId?: string }) {
+        expect(userId).toBe('jane');
+        expect(options?.accountId).toBe('77');
+        return 'connected-local-user-token';
+      },
+      async brokerCredentials() {
+        return { httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' } };
+      },
+    });
+    core.store.claimPersonalOrganization('jane');
+    const project = core.store.createProject('Connected local', { repos: [repo] });
+    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
+      gitConnectionId: connection.id });
+    expect(core.store.listProjectRepositories(project.id)).toHaveLength(0);
+    const task = core.store.createTask({ projectId: project.id, title: 'Connected local PR', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } });
+
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
+      base: 'main', target: 'main', kind: 'worktree' });
+    await fs.promises.writeFile(path.join(handle.workdir ?? handle.root, 'connected-local.txt'), 'x');
+    await git(handle.workdir ?? handle.root, ['add', '-A']);
+    await git(handle.workdir ?? handle.root, ['commit', '-q', '-m', 'connected local work']);
+
+    await expect(core.openPr(handle, 'main', { title: 'Connected local PR' })).resolves.toHaveLength(1);
+    expect(gh.tokens).toContain('Bearer connected-local-user-token');
+    await core.destroyWorld(handle);
+  });
+
   it('opens PRs only for changed checkouts and skips an unchanged companion wiki', async () => {
     const gh = fakeGithub();
     const core = await coreFor(gh);
