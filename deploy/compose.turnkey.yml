@@ -97,9 +97,11 @@ services:
       # Optional sign-in providers, empty unless set in .turnkey.env. This block
       # is a whitelist, so a variable missing from it never reaches the app —
       # the operator configures an OAuth client, restarts, and nothing happens.
-      # Empty defaults keep both optional: absent means the button is absent.
+      # Empty defaults keep every provider optional: absent means its button is absent.
       KARMAX_GOOGLE_CLIENT_ID: ${KARMAX_GOOGLE_CLIENT_ID:-}
       KARMAX_GOOGLE_CLIENT_SECRET: ${KARMAX_GOOGLE_CLIENT_SECRET:-}
+      KARMAX_GITHUB_OAUTH_CLIENT_ID: ${KARMAX_GITHUB_OAUTH_CLIENT_ID:-}
+      KARMAX_GITHUB_OAUTH_CLIENT_SECRET: ${KARMAX_GITHUB_OAUTH_CLIENT_SECRET:-}
       KARMAX_OIDC_ISSUER: ${KARMAX_OIDC_ISSUER:-}
       KARMAX_OIDC_DISCOVERY_URL: ${KARMAX_OIDC_DISCOVERY_URL:-}
       KARMAX_OIDC_CLIENT_ID: ${KARMAX_OIDC_CLIENT_ID:-}

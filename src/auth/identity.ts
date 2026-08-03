@@ -64,6 +64,7 @@ export interface IdentityOptions {
   secret?: string;
   oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
   google?: { clientId: string; clientSecret: string };
+  github?: { clientId: string; clientSecret: string };
 }
 
 /**
@@ -87,6 +88,10 @@ export class IdentityService {
    *  option and deliberately does not consume the single generic-OIDC enterprise
    *  slot above — an installation pointed at Okta must still be able to offer it. */
   readonly googleEnabled: boolean;
+  /** Whether installation-level GitHub sign-in is available. This is separate
+   *  from the organization-scoped GitHub App used for repositories: a new user
+   *  must be able to authenticate before they have an organization to connect. */
+  readonly githubEnabled: boolean;
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
     this.db = new DatabaseSync(dbFile);
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
@@ -101,42 +106,56 @@ export class IdentityService {
     }
     this.oidcProviderId = opts.oidc?.providerId;
     this.googleEnabled = !!opts.google;
+    this.githubEnabled = !!opts.github;
+    const trustedSocialProviders = [
+      ...(opts.google ? ['google' as const] : []),
+      ...(opts.github ? ['github' as const] : []),
+    ];
+    const socialProviders = {
+      ...(opts.google ? { google: {
+        clientId: opts.google.clientId,
+        clientSecret: opts.google.clientSecret,
+      } } : {}),
+      ...(opts.github ? { github: {
+        clientId: opts.github.clientId,
+        clientSecret: opts.github.clientSecret,
+      } } : {}),
+    };
     this.auth = betterAuth({
       appName: 'krmax',
       database: this.db,
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
-      // Native Better Auth social sign-in. No gateway route is needed: the
-      // gateway proxies /api/auth/* verbatim, so Better Auth's own
-      // POST /api/auth/sign-in/social and GET /api/auth/callback/google work as
-      // soon as this is present. Register that callback path with Google.
-      ...(opts.google ? { socialProviders: { google: {
-        clientId: opts.google.clientId,
-        clientSecret: opts.google.clientSecret,
-        // Only the default openid/email/profile scopes, and no `access_type:
-        // offline`: Google returns a refresh token only when explicitly asked,
-        // karmax needs identity and nothing else, and an unused refresh token is
-        // a long-lived secret to store and leak for no benefit.
-      } } } : {}),
-      // Account linking. A user who signed up with email+password and later
-      // clicks "Continue with Google" on the same address should land in the SAME
+      // Native Better Auth social sign-in. No gateway routes are needed:
+      // /api/auth/* is proxied verbatim, including each provider callback.
+      // Defaults are intentionally identity-only: Google uses openid/email/
+      // profile without offline access; GitHub uses read:user + user:email.
+      // Neither token is used for repository access — that remains the separate,
+      // explicit GitHub App authorization flow.
+      ...(trustedSocialProviders.length ? { socialProviders } : {}),
+      // Account linking. A user who signed up with email+password and later uses
+      // Google or GitHub on the same address should land in the SAME
       // account, not a duplicate. The merge key is the email address, so BOTH
       // sides of it have to be trustworthy, and only one of them is settled here:
       //
-      //  - the incoming side, via `trustedProviders`. Google asserts a verified
-      //    `email_verified`, so an address it hands us is one the signer-in
-      //    demonstrably controls. A provider that does NOT verify addresses in
-      //    this list would be an account-takeover path — a stranger registers the
-      //    victim's address there and is merged into the victim's karmax account.
+      //  - the incoming side, via `trustedProviders`. Google asserts
+      //    `email_verified`; Better Auth's GitHub adapter reads `user:email` and
+      //    checks GitHub's per-address `verified` bit. A provider that does NOT
+      //    verify addresses in this list would be an account-takeover path — a
+      //    stranger registers the victim's address there and is merged into the
+      //    victim's karmax account.
       //  - the LOCAL side is Better Auth's `requireLocalEmailVerified`, left at
       //    its default (true) deliberately. karmax's own signup never verified
       //    the address, so an unverified local account merely *claims* it; if
-      //    that were allowed to absorb a Google login, registering someone else's
-      //    address here would capture their Google sign-in. Which means linking
+      //    that were allowed to absorb a social login, registering someone else's
+      //    address here would capture their provider sign-in. Which means linking
       //    happens for a verified local account and is refused (`account_not_linked`)
       //    otherwise — a real user-facing case that web/app.js explains on the
       //    sign-in card rather than leaving on Better Auth's bare error page.
-      ...(opts.google ? { account: { accountLinking: { enabled: true, trustedProviders: ['google' as const] } } } : {}),
+      ...(trustedSocialProviders.length ? { account: { accountLinking: {
+        enabled: true,
+        trustedProviders: trustedSocialProviders,
+      } } } : {}),
       emailAndPassword: {
         enabled: true, minPasswordLength: 10,
         // Password reset is delivered by the installation's outbound mailer. A

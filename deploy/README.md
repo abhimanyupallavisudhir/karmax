@@ -55,12 +55,15 @@ to:
    registered businesses can instead connect Stripe Issuing (see `HOSTING.md`)
    to have Karmax mint capped, merchant-locked cards per agent or per task.
 
-### Optional: "Continue with Google"
+### Optional social sign-in
 
-Unlike the items above, this one is not a settings screen — it is a pair of
-variables, because the OAuth client belongs to the *installation*, not to a
-tenant. In the [Google Cloud console](https://console.cloud.google.com/auth/clients)
-create a **Web application** client whose authorized redirect URI is exactly
+Unlike the items above, these are not settings screens — each is a pair of
+variables, because a login OAuth client belongs to the *installation*, not to a
+tenant.
+
+For Google, create a **Web application** client in the
+[Google Cloud console](https://console.cloud.google.com/auth/clients) whose
+authorized redirect URI is exactly
 
 ```text
 https://karmax.example.com/api/auth/callback/google
@@ -76,9 +79,31 @@ KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-...
 
 Only the basic `openid`/`email`/`profile` scopes are requested, which is why the
 consent screen can be published without Google's verification review. Set both
-or neither — the button appears only when both are non-empty. `KARMAX_OIDC_*`
-(enterprise SSO) works the same way and is a separate slot, so an installation
-can offer both.
+or neither — the button appears only when both are non-empty.
+
+For GitHub, create an OAuth App in GitHub Developer settings with this
+authorization callback URL:
+
+```text
+https://karmax.example.com/api/auth/callback/github
+```
+
+Then add its credentials alongside the Google pair:
+
+```bash
+KARMAX_GITHUB_OAUTH_CLIENT_ID=Ov23li...
+KARMAX_GITHUB_OAUTH_CLIENT_SECRET=...
+```
+
+GitHub sign-in requests only `read:user` and `user:email`. These variables are
+deliberately named `GITHUB_OAUTH`: they identify people at the login screen and
+are separate from the organization-scoped GitHub App that owns repository
+installation and user authorization. Signing in never silently grants repository
+access.
+
+`KARMAX_OIDC_*` (enterprise SSO) is another separate slot, so an installation
+can offer Google, GitHub, and company SSO together. Every provider button appears
+only when its full credential pair is non-empty.
 
 That same HTTPS URL works from a phone—no VPN and no Karmax-specific native app
 are required. **Organization settings → Phone Access** offers an

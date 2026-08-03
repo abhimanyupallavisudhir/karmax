@@ -1994,13 +1994,19 @@ async function boot() {
     history.replaceState({ kx: 1 }, '', location.pathname);
   }
   // A social sign-in that Better Auth rejected comes back here with `?error=`
-  // (see wireGoogleBtn's errorCallbackURL). Same shape as `verified` above:
+  // (see wireSocialBtn's errorCallbackURL). Same shape as `verified` above:
   // read it, clear it from the URL, and let the card say what happened.
-  S.signInError = googleSignInError(new URLSearchParams(location.search));
-  if (S.signInError) history.replaceState({ kx: 1 }, '', location.pathname);
+  S.signInError = socialSignInError(new URLSearchParams(location.search));
+  if (S.signInError) {
+    const clean = new URL(location.href);
+    clean.searchParams.delete('error');
+    clean.searchParams.delete('auth_provider');
+    history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
+  }
   const session = await (await fetch('/api/session')).json();
   S.sso = session.sso || null;
   S.google = session.google || false;
+  S.github = session.github || false;
   if (session.setupRequired) return renderSetup();
   // An invite link opened while signed out: keep the token in the URL (boot
   // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
@@ -12713,37 +12719,55 @@ const googleBtn = (id) => S.google
     </button>`
   : '';
 
-// What a failed round trip to Google means, in the user's terms. Better Auth
+// GitHub's mark and high-contrast neutral treatment make the second identity
+// option immediately legible without borrowing Google's visual language. The
+// path is inline so authentication never depends on a third-party asset host.
+const githubBtn = (id) => S.github
+  ? `<button class="github-signin-btn" id="${id}" type="button">
+      <svg class="github-signin-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.11.79-.25.79-.56v-2.24c-3.23.7-3.91-1.37-3.91-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.77 2.72 1.26 3.38.96.1-.75.4-1.26.74-1.55-2.58-.29-5.29-1.29-5.29-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.47.11-3.05 0 0 .97-.31 3.16 1.18A10.9 10.9 0 0 1 12 6.1c.98 0 1.95.13 2.87.39 2.19-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.72 5.39-5.3 5.68.42.36.79 1.07.79 2.16v3.26c0 .31.21.68.8.56A11.5 11.5 0 0 0 12 .7Z" />
+      </svg>
+      <span>Continue with GitHub</span>
+      <span aria-hidden="true"></span>
+    </button>`
+  : '';
+
+// What a failed social-provider round trip means, in the user's terms. Better Auth
 // would otherwise land them on its own `/api/auth/error` page — a bare error
 // code and an "Ask AI" button, off karmax entirely, with no way back.
 //
 // `account_not_linked` is the one that is neither a bug nor a dead end, and it
 // has a real cause: karmax's email+password signup does not verify addresses, so
-// Better Auth refuses to merge a Google identity into a local account that only
+// Better Auth refuses to merge a social identity into a local account that only
 // *claims* that address (otherwise registering someone else's address here would
-// capture their Google sign-in). The password still works — say so.
-const GOOGLE_SIGN_IN_ERRORS = {
+// capture their provider sign-in). The password still works — say so.
+const SOCIAL_SIGN_IN_ERRORS = {
   account_not_linked: 'An account already exists for that email address with a password. '
-    + 'Sign in with that password instead — signing in with Google would require confirming the address first.',
+    + 'Sign in with that password instead — social sign-in requires confirming the address first.',
 };
 
-function googleSignInError(params) {
+function socialSignInError(params) {
   const code = params.get('error');
   if (!code) return undefined;
-  return GOOGLE_SIGN_IN_ERRORS[code] ?? `Google sign-in failed (${code}).`;
+  const provider = params.get('auth_provider') === 'github' ? 'GitHub' : 'Google';
+  return SOCIAL_SIGN_IN_ERRORS[code] ?? `${provider} sign-in failed (${code}).`;
 }
 
-function wireGoogleBtn(id, errSelector) {
+function wireSocialBtn(id, provider, errSelector) {
   $(`#${id}`)?.addEventListener('click', async () => {
     try {
       // errorCallbackURL keeps a rejected sign-in on karmax's own card: Better
       // Auth appends `?error=<code>`, which boot() reads back on the way in.
       const back = new URL(location.href);
       back.searchParams.delete('error');
+      back.searchParams.delete('auth_provider');
+      const errorBack = new URL(back);
+      errorBack.searchParams.set('auth_provider', provider);
       const response = await fetch('/api/auth/sign-in/social', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ provider: 'google', callbackURL: back.href, errorCallbackURL: back.href }) });
+        body: JSON.stringify({ provider, callbackURL: back.href, errorCallbackURL: errorBack.href }) });
       const result = await response.json();
-      if (!response.ok || !result.url) throw new Error(result.error || result.message || 'Google sign-in unavailable');
+      const label = provider === 'github' ? 'GitHub' : 'Google';
+      if (!response.ok || !result.url) throw new Error(result.error || result.message || `${label} sign-in unavailable`);
       location.href = result.url;
     } catch (error) { $(errSelector).textContent = error.message; }
   });
@@ -12758,6 +12782,7 @@ function renderLogin() {
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${googleBtn('google-btn')}
+    ${githubBtn('github-btn')}
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
@@ -12770,7 +12795,8 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
-  wireGoogleBtn('google-btn', '#login-err');
+  wireSocialBtn('google-btn', 'google', '#login-err');
+  wireSocialBtn('github-btn', 'github', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
     try {
       const response = await fetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
@@ -12859,6 +12885,7 @@ function renderSignup() {
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
     ${googleBtn('signup-google-btn')}
+    ${githubBtn('signup-github-btn')}
     <button class="btn" id="signup-back" style="width:100%;margin-top:8px">Back to sign in</button>
     <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
@@ -12880,7 +12907,8 @@ function renderSignup() {
     }
   };
   $('#signup-btn').addEventListener('click', go);
-  wireGoogleBtn('signup-google-btn', '#signup-err');
+  wireSocialBtn('signup-google-btn', 'google', '#signup-err');
+  wireSocialBtn('signup-github-btn', 'github', '#signup-err');
   $('#signup-back').addEventListener('click', renderLogin);
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }

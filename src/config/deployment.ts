@@ -46,6 +46,7 @@ const SECRET_FILE_ENV = [
   'KARMAX_AUTH_SECRET', 'KARMAX_VAULT_KEY', 'KARMAX_WORLD_REF_KEY',
   'KARMAX_TEMPORAL_API_KEY', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY',
   'KARMAX_S3_SESSION_TOKEN', 'KARMAX_OIDC_CLIENT_SECRET', 'KARMAX_GOOGLE_CLIENT_SECRET',
+  'KARMAX_GITHUB_OAUTH_CLIENT_SECRET',
   'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
   'KARMAX_GITHUB_APP_PRIVATE_KEY', 'KARMAX_GITHUB_WEBHOOK_SECRET',
   'KARMAX_GITHUB_CLIENT_SECRET',
@@ -69,7 +70,7 @@ export function hydrateSecretFiles(env: NodeJS.ProcessEnv = process.env,
  *
  * A managed cell gets its variables from compose and a secret manager. A
  * self-host is booted by hand with a bare `npm start`, so there was nowhere to
- * put an operator setting that has to outlive the shell — a Google OAuth client,
+ * put an operator setting that has to outlive the shell — a social OAuth client,
  * a mailer, a public URL survived only until the next reboot, and "configured"
  * silently meant "configured until you close the terminal".
  *

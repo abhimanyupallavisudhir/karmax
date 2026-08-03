@@ -125,22 +125,23 @@ describe('public edge (Caddy) image', () => {
 // A compose `environment:` block is a whitelist: a variable an operator sets in
 // .turnkey.env reaches the app ONLY if it is named here. Anything absent fails
 // silently and looks exactly like a bug in the feature — the operator sets a
-// Google OAuth client, restarts, and the sign-in button never appears.
+// social OAuth client, restarts, and the sign-in button never appears.
 describe('compose forwards optional identity providers', () => {
   const appService = (compose: string) => read(compose).split('\n  app:')[1]?.split('\n  caddy:')[0] ?? '';
 
   for (const compose of ['compose.turnkey.yml', 'compose.hosted.yml']) {
     for (const name of ['KARMAX_GOOGLE_CLIENT_ID', 'KARMAX_GOOGLE_CLIENT_SECRET',
+      'KARMAX_GITHUB_OAUTH_CLIENT_ID', 'KARMAX_GITHUB_OAUTH_CLIENT_SECRET',
       'KARMAX_OIDC_ISSUER', 'KARMAX_OIDC_DISCOVERY_URL', 'KARMAX_OIDC_CLIENT_ID', 'KARMAX_OIDC_CLIENT_SECRET']) {
       it(`${compose} passes ${name} through from the env file`, () => {
         expect(appService(compose)).toMatch(new RegExp(`^\\s+${name}:`, 'm'));
       });
     }
 
-    // Empty default, not `:?` — these are optional. An install with no Google
-    // client must still boot, with the button simply absent.
+    // Empty default, not `:?` — these are optional. An install with no social
+    // client must still boot, with the corresponding buttons simply absent.
     it(`${compose} keeps them optional so an install without them still boots`, () => {
-      for (const line of appService(compose).split('\n').filter((l) => /KARMAX_(GOOGLE|OIDC)_/.test(l))) {
+      for (const line of appService(compose).split('\n').filter((l) => /KARMAX_(GOOGLE|GITHUB_OAUTH|OIDC)_/.test(l))) {
         expect(line, line).not.toContain(':?');
       }
     });
@@ -149,7 +150,7 @@ describe('compose forwards optional identity providers', () => {
 
 // `./deploy/karmax up` is documented as "Configure or start", so operators re-run
 // it — and it regenerates .turnkey.env from scratch. Anything it does not know to
-// carry over is deleted, which is how a working Google sign-in disappears at the
+// carry over is deleted, which is how a working social sign-in disappears at the
 // next deploy with no error anywhere: the var is gone, so the button is gone.
 describe('deploy/karmax preserves operator settings across a re-run', () => {
   it('keeps variables it does not manage itself', () => {
@@ -160,11 +161,15 @@ describe('deploy/karmax preserves operator settings across a re-run', () => {
       'POSTGRES_PASSWORD=keep-me',
       'KARMAX_GOOGLE_CLIENT_ID=123.apps.googleusercontent.com',
       'KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-shh',
+      'KARMAX_GITHUB_OAUTH_CLIENT_ID=github-client',
+      'KARMAX_GITHUB_OAUTH_CLIENT_SECRET=github-secret',
       '',
     ].join('\n');
     const result = runConfigure(seeded);
     expect(result).toContain('KARMAX_GOOGLE_CLIENT_ID=123.apps.googleusercontent.com');
     expect(result).toContain('KARMAX_GOOGLE_CLIENT_SECRET=GOCSPX-shh');
+    expect(result).toContain('KARMAX_GITHUB_OAUTH_CLIENT_ID=github-client');
+    expect(result).toContain('KARMAX_GITHUB_OAUTH_CLIENT_SECRET=github-secret');
     // Without regressing what it already carried over.
     expect(result).toContain('POSTGRES_PASSWORD=keep-me');
     expect(result).toContain('KARMAX_CLOUD_WORLD_PROVIDER=daytona');

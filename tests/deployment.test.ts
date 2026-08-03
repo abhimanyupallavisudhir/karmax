@@ -106,10 +106,11 @@ describe('deployment profiles', () => {
 
   it('loads file-backed secrets without replacing explicit values', () => {
     const env: NodeJS.ProcessEnv = { KARMAX_AUTH_SECRET_FILE: '/auth', KARMAX_VAULT_KEY: 'explicit',
-      KARMAX_VAULT_KEY_FILE: '/vault' };
+      KARMAX_VAULT_KEY_FILE: '/vault', KARMAX_GITHUB_OAUTH_CLIENT_SECRET_FILE: '/github-oauth' };
     hydrateSecretFiles(env, (filename) => `${filename}-value\n`);
     expect(env.KARMAX_AUTH_SECRET).toBe('/auth-value');
     expect(env.KARMAX_VAULT_KEY).toBe('explicit');
+    expect(env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET).toBe('/github-oauth-value');
   });
 
   // A self-host is booted by hand (`npm start`) with no compose file and no
