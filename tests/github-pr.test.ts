@@ -191,6 +191,52 @@ describe('GitHub PR client', () => {
     expect(calls[2]!.body).toMatchObject({ variables: { id: 'PR_node' } });
   });
 
+  it('inspects review, checks, queue, and auto-merge readiness through GraphQL', async () => {
+    let request: any;
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      expect(new URL(String(input)).pathname).toBe('/graphql');
+      request = JSON.parse(String(init.body));
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_node', url: 'https://github.test/acme/widgets/pull/7', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'abc123', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+        reviewDecision: 'APPROVED', statusCheckRollup: { state: 'SUCCESS' },
+        mergeQueueEntry: { id: 'MQ_node' }, autoMergeRequest: { enabledAt: '2026-08-03T00:00:00Z', mergeMethod: 'SQUASH' },
+        viewerCanEnableAutoMerge: true, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 7)).resolves.toEqual({
+      nodeId: 'PR_node', url: 'https://github.test/acme/widgets/pull/7', state: 'open', draft: false,
+      merged: false, headSha: 'abc123', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      reviewDecision: 'APPROVED', checks: 'SUCCESS', mergeQueueEntryId: 'MQ_node',
+      autoMerge: { enabledAt: '2026-08-03T00:00:00Z', mergeMethod: 'squash' },
+      viewerCanEnableAutoMerge: true, viewerCanMergeAsAdmin: false,
+    });
+    expect(request.variables).toEqual({ owner: 'acme', name: 'widgets', number: 7 });
+    expect(request.query).toContain('mergeStateStatus');
+    expect(request.query).toContain('statusCheckRollup');
+  });
+
+  it('enables auto-merge only for the expected head SHA', async () => {
+    let request: any;
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      request = JSON.parse(String(init.body));
+      return Response.json({ data: { enablePullRequestAutoMerge: { pullRequest: {
+        id: 'PR_node', autoMergeRequest: { enabledAt: '2026-08-03T00:00:00Z', mergeMethod: 'REBASE' },
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.enableAutoMerge('PR_node', 'abc123', 'rebase')).resolves.toEqual({
+      enabled: true, pullRequestId: 'PR_node', enabledAt: '2026-08-03T00:00:00Z',
+      mergeMethod: 'rebase', message: 'Pull request auto-merge enabled',
+    });
+    expect(request.variables).toEqual({ input: {
+      pullRequestId: 'PR_node', expectedHeadOid: 'abc123', mergeMethod: 'REBASE',
+    } });
+  });
+
   it('refreshes a GitHub App user token once when GitHub rejects it', async () => {
     const forced: boolean[] = [];
     const fetcher = (async (_url: string, init: RequestInit = {}) => {
