@@ -12,6 +12,7 @@ import {
   softwareDevV1_10,
   softwareDevV1_11,
   softwareDevV1_12,
+  softwareDevV1_13,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -83,6 +84,11 @@ export async function goalV1_11(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** GitHub-authoritative human merge authorization. */
 export async function goalV1_12(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_12({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Proposal preparation stays with Do; Merge begins only after confirmation. */
+export async function goalV1_13(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_13({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

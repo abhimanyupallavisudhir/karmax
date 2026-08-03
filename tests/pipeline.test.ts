@@ -96,6 +96,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // @review sets the terse caption; the git-derived summary/changedFiles are added automatically.
     expect(review.reviewInfo?.caption).toContain('factorial');
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+    expect(review.transcripts.find((transcript: any) => transcript.role === 'merge')).toBeUndefined();
     // The agent called signal_completion (mock default), so the gate marks it as an
     // asserted finish rather than a silent stall.
     expect(review.reviewInfo?.completion).toBe('signalled');
@@ -104,6 +105,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const result = await handle.result();
     expect(result.stage).toBe('done');
     expect(result.sha).toBeTruthy();
+    expect((await view(handle)).transcripts.find((transcript: any) => transcript.role === 'merge')).toBeDefined();
 
     // the work really landed on main
     const onMain = await git(repo, ['show', 'main:factorial.js']);
