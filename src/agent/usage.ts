@@ -7,6 +7,7 @@ import { hasClaudeNativeCredential, scrubbedEnv } from '../autonomy/config-homes
 import { trackProcess } from '../util/processes.js';
 import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
+import { localProviderCli } from './provider-cli.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -320,7 +321,7 @@ export async function probeCodexUsage(
 
 /** Spawn `claude -p '/usage'` against a config dir; return combined stdout+stderr. */
 function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
-  const cmd = process.env.KARMAX_CLAUDE_USAGE_CMD ?? 'claude';
+  const cmd = process.env.KARMAX_CLAUDE_USAGE_CMD ?? localProviderCli('claude');
   const env = scrubbedEnv({ provider: 'claude', configHome: configDir });
   return new Promise((resolve, reject) => {
     let out = '';
@@ -348,7 +349,7 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
 }
 
 async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number): Promise<unknown> {
-  const cmd = process.env.KARMAX_CODEX_USAGE_CMD ?? process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
+  const cmd = process.env.KARMAX_CODEX_USAGE_CMD ?? process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
   const env = scrubbedEnv({ provider: 'codex', configHome });
   const child = spawn(cmd, ['app-server'], { env, stdio: ['pipe', 'pipe', 'ignore'] });
   const client = new CodexAppServerClient(child.stdin!, child.stdout!);

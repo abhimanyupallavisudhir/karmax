@@ -4,6 +4,7 @@ import path from 'node:path';
 import { ConfigHomeManager, scrubbedEnv, isLoggedIn, isFullyAuthed, KARMAX_TOKEN_FILE } from './config-homes.js';
 import { Provider } from '../domain/types.js';
 import { trackProcess } from '../util/processes.js';
+import { localProviderCli } from '../agent/provider-cli.js';
 
 /**
  * Provider account login (SPEC §7.6, §7.3). Mints an isolated config home per
@@ -21,6 +22,8 @@ export interface LoginResult {
   configHome: string;
   loginUrl?: string;
   verificationCode?: string;
+  /** The provider shows a code after OAuth that must be returned to its CLI. */
+  requiresCode?: boolean;
   status: 'awaiting_oauth' | 'logged_in' | 'failed';
   detail?: string;
 }
@@ -46,10 +49,14 @@ export const defaultLoginCommand: LoginCommand = (provider, home, opts) => {
     // Full OAuth login (writes a native `.credentials.json`) — pollable for usage (#6)
     // and read directly by the Agent SDK. `setup-token` remains available via override
     // (its token can't read usage). --claudeai = subscription (vs --console = metered).
-    return { cmd: process.env.KARMAX_CLAUDE_LOGIN_CMD ?? 'claude', args: (process.env.KARMAX_CLAUDE_LOGIN_ARGS ?? 'auth login --claudeai').split(' ').filter(Boolean), env };
+    return { cmd: process.env.KARMAX_CLAUDE_LOGIN_CMD ?? localProviderCli('claude'), args: (process.env.KARMAX_CLAUDE_LOGIN_ARGS ?? 'auth login --claudeai').split(' ').filter(Boolean), env };
   }
   if (provider === 'codex') {
-    return { cmd: process.env.KARMAX_CODEX_LOGIN_CMD ?? 'codex', args: (process.env.KARMAX_CODEX_LOGIN_ARGS ?? 'login').split(' ').filter(Boolean), env };
+    // A hosted server's localhost OAuth callback points at the user's laptop,
+    // not the Krmax container. Device auth is the provider's supported headless
+    // flow and yields a URL + code that can safely cross the gateway.
+    const defaultArgs = process.env.KARMAX_DEPLOYMENT === 'hosted' ? 'login --device-auth' : 'login';
+    return { cmd: process.env.KARMAX_CODEX_LOGIN_CMD ?? localProviderCli('codex'), args: (process.env.KARMAX_CODEX_LOGIN_ARGS ?? defaultArgs).split(' ').filter(Boolean), env };
   }
   if (provider === 'opencode') {
     // OpenCode's auth command is otherwise interactive. Its official
@@ -66,6 +73,8 @@ export const defaultLoginCommand: LoginCommand = (provider, home, opts) => {
 };
 
 export class LoginManager {
+  private pending = new Map<string, { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt> }>();
+
   constructor(
     private homes: ConfigHomeManager,
     private loginCommand: LoginCommand = defaultLoginCommand,
@@ -80,6 +89,11 @@ export class LoginManager {
     // Skip only if fully authed with a native credential. A setup-token-only home
     // re-runs login here to UPGRADE to a full, usage-pollable credential (#6).
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
+    const pendingKey = this.pendingKey(provider, account, organizationId);
+    const existing = this.pending.get(pendingKey);
+    if (existing && existing.child.exitCode === null && existing.prompt?.loginUrl) {
+      return { provider, account, configHome, ...existing.prompt, status: 'awaiting_oauth' };
+    }
     const spec = this.loginCommand(provider, configHome, opts);
     if (!spec) {
       const detail = provider === 'opencode'
@@ -90,10 +104,17 @@ export class LoginManager {
 
     let child: ChildProcess;
     try {
-      child = spawn(spec.cmd, spec.args, { env: spec.env, stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+      child = spawn(spec.cmd, spec.args, { env: spec.env, stdio: ['pipe', 'pipe', 'pipe'], detached: false });
     } catch (e) {
       return { provider, account, configHome, status: 'failed', detail: `could not launch ${spec.cmd}: ${String((e as Error).message ?? e)}` };
     }
+    const pending: { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt> } = { child };
+    this.pending.set(pendingKey, pending);
+    const forget = () => {
+      if (this.pending.get(pendingKey)?.child === child) this.pending.delete(pendingKey);
+    };
+    child.once('exit', forget);
+    child.once('error', forget);
     // Keep reading the child after the URL: `claude auth login` / `codex login`
     // write the native credential (`.credentials.json` / `auth.json`) directly, so
     // the account reads as signed-in. If someone overrides back to `setup-token`
@@ -105,6 +126,7 @@ export class LoginManager {
     }
     persistTokenWhenPrinted(child, configHome);
     const prompt = await captureLoginPrompt(child, opts.urlTimeoutMs ?? 8000);
+    pending.prompt = parseLoginPrompt(prompt.output);
     child.unref(); // let it keep running while the user completes OAuth
     if (prompt.error) {
       return {
@@ -115,13 +137,12 @@ export class LoginManager {
         detail: `could not launch ${spec.cmd}: ${prompt.error.message}`,
       };
     }
-    if (prompt.url) {
+    if (pending.prompt.loginUrl) {
       return {
         provider,
         account,
         configHome,
-        loginUrl: prompt.url,
-        ...(prompt.verificationCode ? { verificationCode: prompt.verificationCode } : {}),
+        ...pending.prompt,
         status: 'awaiting_oauth',
       };
     }
@@ -129,9 +150,39 @@ export class LoginManager {
     return { provider, account, configHome, status: 'failed', detail: 'no login URL captured (is the CLI installed?)' };
   }
 
+  /** Return the post-OAuth code to a provider CLI waiting on stdin (Claude). */
+  async submitAuthorizationCode(
+    provider: Provider,
+    account: string,
+    code: string,
+    organizationId = 'org_personal',
+  ): Promise<LoginResult> {
+    const configHome = this.homes.ensure(provider, account, organizationId);
+    const value = code.trim();
+    if (!value || value.length > 4096 || /[\r\n\0]/.test(value))
+      return { provider, account, configHome, status: 'failed', detail: 'invalid authorization code' };
+    const pending = this.pending.get(this.pendingKey(provider, account, organizationId));
+    if (!pending?.child.stdin?.writable)
+      return { provider, account, configHome, status: 'failed', detail: 'no login is waiting for an authorization code; start it again' };
+    pending.child.stdin.end(`${value}\n`);
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && pending.child.exitCode == null && !isFullyAuthed(provider, configHome)) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
+    if (pending.child.exitCode != null)
+      return { provider, account, configHome, status: 'failed', detail: 'the provider rejected the authorization code' };
+    return { provider, account, configHome, status: 'awaiting_oauth', detail: 'authorization code submitted; waiting for the provider' };
+  }
+
   status(provider: Provider, account: string, organizationId = 'org_personal'): { provider: Provider; account: string; configHome: string; loggedIn: boolean } {
     const configHome = this.homes.ensure(provider, account, organizationId);
     return { provider, account, configHome, loggedIn: isLoggedIn(provider, configHome) };
+  }
+
+  private pendingKey(provider: Provider, account: string, organizationId: string): string {
+    return JSON.stringify([organizationId, provider, account]);
   }
 }
 
@@ -167,18 +218,15 @@ function persistTokenWhenPrinted(child: ChildProcess, home: string): void {
 function captureLoginPrompt(
   child: ChildProcess,
   timeoutMs: number,
-): Promise<{ url?: string; verificationCode?: string; error?: Error }> {
+): Promise<{ output: string; error?: Error }> {
   return new Promise((resolve) => {
     let buf = '';
     let done = false;
     let spawnError: Error | undefined;
     let settleTimer: NodeJS.Timeout | undefined;
     const result = () => {
-      const url = buf.match(/https?:\/\/[^\s'"]+/)?.[0];
-      const verificationCode = buf.match(/(?:enter|user(?:_| )?)\s*code\s*[:=]\s*([A-Z0-9][A-Z0-9-]{3,})/i)?.[1];
       return {
-        ...(url ? { url } : {}),
-        ...(verificationCode ? { verificationCode } : {}),
+        output: buf,
         ...(spawnError ? { error: spawnError } : {}),
       };
     };
@@ -190,7 +238,7 @@ function captureLoginPrompt(
     };
     const onData = (b: Buffer) => {
       buf += b.toString();
-      if (result().url && !settleTimer) {
+      if (parseLoginPrompt(buf).loginUrl && !settleTimer) {
         // A device code may be printed immediately after the URL in another
         // chunk. Briefly settle so the browser receives both.
         settleTimer = setTimeout(finish, 150);
@@ -206,4 +254,18 @@ function captureLoginPrompt(
     child.once('exit', () => setTimeout(finish, 50));
     setTimeout(finish, timeoutMs).unref();
   });
+}
+
+/** Parse ANSI-decorated provider prompts without coupling the UI to CLI output. */
+export function parseLoginPrompt(output: string): Pick<LoginResult, 'loginUrl' | 'verificationCode' | 'requiresCode'> {
+  const text = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const loginUrl = text.match(/https?:\/\/[^\s'"]+/)?.[0];
+  const directCode = text.match(/(?:enter|user(?:_| )?)\s*code\s*[:=]\s*([A-Z0-9][A-Z0-9-]{3,})/i)?.[1];
+  const deviceCode = text.match(/(?:one-time|verification|device)\s+code[\s\S]{0,160}?\b([A-Z0-9]{4,}(?:-[A-Z0-9]{3,})+)\b/i)?.[1];
+  const verificationCode = directCode ?? deviceCode;
+  return {
+    ...(loginUrl ? { loginUrl } : {}),
+    ...(verificationCode ? { verificationCode } : {}),
+    ...(/paste (?:the )?(?:authorization )?code|paste code here/i.test(text) ? { requiresCode: true } : {}),
+  };
 }

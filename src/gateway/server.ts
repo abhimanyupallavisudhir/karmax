@@ -4240,6 +4240,21 @@ export class Gateway {
       }
       // connect an account login: mint a config home + launch the provider's own
       // OAuth, return the device URL for the user to complete (we never type creds).
+      if (resourcePath === '/api/accounts/connect/code' && method === 'POST') {
+        if (!this.deps.login) return this.json(res, 400, { error: 'no login manager configured' });
+        const b = await this.body(req);
+        if (!isLoginProvider(b.provider)) return this.json(res, 400, { error: `unsupported login provider: ${String(b.provider ?? '')}` });
+        if (!b.account || !b.code) return this.json(res, 400, { error: 'provider, account, and code required' });
+        const result = await this.deps.login.submitAuthorizationCode(
+          b.provider,
+          String(b.account),
+          String(b.code),
+          resourceOrganizationId,
+        );
+        await this.refreshLoginPool();
+        const { configHome, ...safe } = result;
+        return this.json(res, 200, safe);
+      }
       if (resourcePath === '/api/accounts/connect' && method === 'POST') {
         if (!this.deps.login) return this.json(res, 400, { error: 'no login manager configured' });
         const b = await this.body(req);

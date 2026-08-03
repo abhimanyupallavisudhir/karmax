@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { deploymentConfig, hostLocal, hydrateEnvFile, hydrateSecretFiles, validateDeployment } from '../src/config/deployment.js';
 
+const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+
 describe('deployment profiles', () => {
+  it('ships both subscription-login CLIs in production dependencies', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
+    expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBeTruthy();
+    expect(pkg.dependencies['@openai/codex']).toBe('0.144.5');
+    expect(dockerfile).toContain('npm ci --omit=dev');
+  });
+
   it('keeps local development zero-config', () => {
     expect(validateDeployment({})).toEqual({ hosted: false, singleNode: false, cellId: 'local', hostLocal: true });
   });

@@ -29,6 +29,7 @@
     "@daytona/sdk": "^0.196.0",
     "@e2b/desktop": "^2.3.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@openai/codex": "0.144.5",
     "@temporalio/activity": "^1.20.2",
     "@temporalio/client": "^1.20.2",
     "@temporalio/common": "^1.20.2",

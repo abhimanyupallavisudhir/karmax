@@ -18,6 +18,7 @@ import { activityDetail, codexItemActivity, toolActivityDetail } from './activit
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
   spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
+import { localProviderCli } from './provider-cli.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -314,7 +315,7 @@ export class CodexAdapter implements AgentAdapter {
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
   private async runCodexAppServer(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
+    const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? undefined;
     const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
     const cwd = worldWorkingDirectory(input.world.handle);
@@ -743,7 +744,7 @@ export class CodexAdapter implements AgentAdapter {
 
   // ─── Codex CLI on a ChatGPT subscription (`codex exec --json`) ───────────────
   private async runCodexExec(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
+    const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? 'gpt-5.5';
     const effort = codexReasoningEffort(model, input.profile.effort);
     const cwd = worldWorkingDirectory(input.world.handle);

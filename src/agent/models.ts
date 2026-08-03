@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { client, methods, ndJsonStream, PROTOCOL_VERSION, type SessionConfigOption } from '@agentclientprotocol/sdk';
 import { CodexAppServerClient } from './codex-app-server-client.js';
+import { localProviderCli } from './provider-cli.js';
 import { capturedToken, claudeAccessToken, scrubbedEnv } from '../autonomy/config-homes.js';
 import { withTimeout } from '../util/timeout.js';
 import type { Provider } from '../domain/types.js';
@@ -157,7 +158,7 @@ export async function claudeModels(
 /** Ask Codex app-server for its native model picker. This is account-aware and is
  * more useful than the OpenAI REST /models endpoint, which is a broad API catalog. */
 export async function codexModels(configHome?: string, timeoutMs = 10_000): Promise<AvailableModel[]> {
-  const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
+  const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
   const env = configHome
     ? scrubbedEnv({ provider: 'codex', configHome })
     : { ...(process.env as Record<string, string>) };
