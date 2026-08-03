@@ -80,6 +80,10 @@ export interface GitHubAppOptions {
   appId?: string;
   appSlug?: string;
   clientId?: string;
+  /** A managed deployment shares one App across tenants, so GitHub must allow
+   * accounts other than the App owner to install it. Personal/self-hosted Apps
+   * remain private to their owner. */
+  publicApp?: boolean;
   apiBase?: string;
   fetch?: typeof fetch;
   /** Injectable delay for rate-limit/5xx backoff (tests pass a no-op). */
@@ -231,7 +235,7 @@ export class GitHubAppService {
     const manifest: Record<string, unknown> = {
       name: `Krmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
       url: origin,
-      public: false,
+      public: this.options.publicApp === true,
       // Keep the CSRF state in the path. GitHub's manifest validator is
       // needlessly strict about some otherwise-valid callback query strings,
       // while the path form is still a full URL and survives the round trip.
