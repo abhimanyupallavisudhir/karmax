@@ -1948,6 +1948,36 @@ function toast(msg, err = false, action) {
   setTimeout(() => t.remove(), action ? 6500 : err ? 9000 : 3200);
 }
 
+function showTaskError(error, projectId) {
+  const message = error?.message || String(error);
+  if (/add a git repo in project settings/i.test(message)) {
+    return toast('Please add a git repo in', true, {
+      label: 'project settings',
+      fn: () => go(projectRoute(projectId, 'settings')),
+    });
+  }
+  if (/choose a GitHub repo .*project settings/i.test(message)) {
+    return toast('Please choose an attached GitHub repo in', true, {
+      label: 'project settings',
+      fn: () => go(projectRoute(projectId, 'settings')),
+    });
+  }
+  if (/connect GitHub in organization settings/i.test(message)) {
+    const project = projectById(projectId);
+    return toast('Please connect GitHub in', true, {
+      label: 'organization settings',
+      fn: () => go(`${globalRoute('organization', organizationById(project?.organizationId))}#settings-code`),
+    });
+  }
+  if (/(?:connect|reconnect) GitHub on your profile/i.test(message)) {
+    return toast(message.replace(/ on your profile.*$/i, ' in'), true, {
+      label: 'your profile',
+      fn: () => go(globalRoute('profile')),
+    });
+  }
+  return toast(message, true);
+}
+
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   // The emailed password-reset link lands here unauthenticated; handle it before
@@ -3813,7 +3843,7 @@ function wireTasksView() {
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
   );
   $('#main').querySelectorAll('[data-queue]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { showTaskError(e, taskRecord(b.dataset.queue)?.projectId); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -4305,7 +4335,7 @@ async function openTaskForm(workflow, draft, seedText) {
               </button>
             </div>
             <div class="form-row" data-row="__creds">
-              <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Agent logins</label></div>
+              <div class="label-row"><label title="Drag to reorder, toggle to disable — for this task only.">Codex/Claude</label></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
@@ -4638,7 +4668,7 @@ async function openTaskForm(workflow, draft, seedText) {
         ? (draftMode ? 'Moved to drafts' : 'Saved')
         : draftMode ? 'Draft saved' : draft ? 'Queued' : 'Task created');
       refreshTasks();
-    } catch (e) { toast(e.message, true); }
+    } catch (e) { showTaskError(e, projectId); }
   };
   $('#tf-draft').addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));
@@ -4712,7 +4742,7 @@ async function renderSeriesPage(rec) {
             <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
           </div>
           <details class="advanced" style="margin-top:10px">
-            <summary>Agent logins — which accounts run this, in what order</summary>
+            <summary>Codex/Claude — which accounts run this, in what order</summary>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
@@ -6585,7 +6615,7 @@ function parametersTab(v) {
   return `
     ${paramsSection(v)}
     ${authorizationSection(v)}
-    <div class="section-h">Agent logins</div>
+    <div class="section-h">Codex/Claude</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Drag to reorder, toggle to disable — for this task only.</p>
     <div id="cred-editor-task">Loading…</div>`;
 }
@@ -7842,7 +7872,7 @@ async function renderDashboard() {
               </div>
             </div>`;
           }).join('')
-        : `<div class="card" style="color:var(--ink-3)">No agent logins yet. Add one in Settings → Agent logins to spread turns across accounts.</div>`}`}`;
+        : `<div class="card" style="color:var(--ink-3)">No Codex/Claude accounts yet. Add one in Settings → Codex/Claude.</div>`}`}`;
     const recheck = async (btn, body) => {
       const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
       try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
@@ -8000,7 +8030,7 @@ function flashSaved(button) {
 }
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
-  .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile'].includes(field.name));
+  .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the Do/Merge agents it gates — not here.
@@ -8036,7 +8066,7 @@ function settingsForms(scope, projectId) {
       if (!fields.length) return '';
       const label = s.name === 'agent-queue' ? 'Host capacity' : s.name;
       const suffix = s.name === 'agent-queue' ? '' : '— workflow-specific';
-      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
+      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'agent-queue' ? 'data-settings-access="capacity" hidden' : ''} ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(label)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">${suffix}</span></summary>
         <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
         <button class="btn primary sm" data-save="${esc(s.name)}">${s.name === 'agent-queue' ? 'Save host capacity' : `Save ${esc(s.name)} defaults`}</button>
@@ -8674,7 +8704,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-access="project" hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -8693,9 +8723,9 @@ function settingsView(proj) {
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
-    <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
-    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
+    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     ${profilesCard('project')}
@@ -8707,15 +8737,15 @@ function settingsView(proj) {
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
-    <div class="settings-section-title" id="project-advanced"><div>Advanced<small>Rarely needed — and hard to undo</small></div></div>
-    <div class="card" style="border-color:var(--danger-weak)">
+    <div class="settings-section-title" id="project-advanced" data-settings-access="project" hidden><div>Advanced</div></div>
+    <div class="card" data-settings-access="project" hidden style="border-color:var(--danger-weak)">
       <div class="section-h" style="color:var(--danger)">Danger zone</div>
       <button class="btn danger" id="delete-project">Delete project</button>
     </div></div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
-  return `<div class="card"><div class="section-h">Where tasks run</div>
-    <p class="task-sub">Agent environments (worktree / container / E2B / Daytona), remote-provider connections, runner pools, and the organization budget are set up in <a class="organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-compute">Organization → Compute</a>. This section only tightens them for this project.</p>
+  return `<div class="card">
+    <p class="task-sub">Available providers and limits come from <a class="organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-compute">organization settings</a>.</p>
     <div id="project-execution">Loading organization execution policy…</div>
   </div>`;
 }
@@ -8776,7 +8806,6 @@ async function hydrateProjectData(proj) {
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when krmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
-      ${hostLocal() && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
@@ -8802,15 +8831,6 @@ async function hydrateProjectData(proj) {
           await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectData(proj);
         } catch (error) { toast(error.message, true); }
       });
-    });
-    $('#data-migrate-copyglobs')?.addEventListener('click', async () => {
-      if (!confirm('Migrate these copied files into typed project resources and disable copyGlobs?')) return;
-      try {
-        const result = await api(`/api/projects/${proj.id}/resources/import-copyglobs`, { method: 'POST', body: '{}' });
-        proj.config.copyGlobs = [];
-        toast(`Migrated ${result.environmentSecrets.length + result.fileSecrets.length} secret${result.environmentSecrets.length + result.fileSecrets.length === 1 ? '' : 's'} and ${result.data.length} data resource${result.data.length === 1 ? '' : 's'}`);
-        await Promise.all([hydrateProjectSecrets(proj), hydrateProjectData(proj)]);
-      } catch (error) { toast(error.message, true); }
     });
     $('#data-discover')?.addEventListener('click', async () => {
       try {
@@ -9180,6 +9200,7 @@ async function hydrateWorkflowPins(projectId) {
 }
 function wireSettingsView(proj) {
   wireSettingsNavigation();
+  hydrateSettingsAccess({ projectId: proj.id });
   $('#main').querySelectorAll('.organization-settings-link').forEach((link) => link.addEventListener('click', (event) => {
     event.preventDefault();
     go(link.getAttribute('href'));
@@ -9235,6 +9256,28 @@ function wireSettingsView(proj) {
     } catch (e) { toast(e.message, true); }
   });
 }
+
+// Advanced settings are action surfaces, not documentation. Keep every control
+// absent until the server confirms the current scoped token can perform the
+// corresponding write; this also handles customized authorization profiles,
+// which cannot be inferred safely from a role name in the browser.
+async function hydrateSettingsAccess(scope) {
+  const layout = document.querySelector('.settings-layout');
+  if (!layout) return;
+  const query = new URLSearchParams(scope).toString();
+  let access;
+  try { access = await api(`/api/settings/access?${query}`); }
+  catch { return; }
+  if (!layout.isConnected
+    || (scope.projectId && S.projectId !== scope.projectId)
+    || (scope.organizationId && S.organizationId !== scope.organizationId)) return;
+  for (const [key, allowed] of Object.entries(access)) {
+    layout.querySelectorAll(`[data-settings-access="${key}"]`).forEach((element) => { element.hidden = !allowed; });
+  }
+  const advanced = Object.values(access).some(Boolean);
+  layout.querySelectorAll('[data-settings-advanced]').forEach((element) => { element.hidden = !advanced; });
+  wireSettingsNavigation();
+}
 async function hydrateExecutionProviders(proj) {
   const box = $('#project-execution'); if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
@@ -9261,7 +9304,7 @@ async function hydrateExecutionProviders(proj) {
     </div>
     <details id="project-network-restrictions" ${networkMode === 'restricted' ? 'open' : ''}><summary class="task-sub">Project restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="project-execution-domains" value="${esc((networkOverride?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="project-execution-cidrs" value="${esc((networkOverride?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
     <div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
-    <button class="btn sm primary" id="project-execution-save">Save compute override</button>`;
+    <button class="btn sm primary" id="project-execution-save">Save</button>`;
     const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
     $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
     $('#project-execution-network')?.addEventListener('change', (event) => {
@@ -9280,11 +9323,11 @@ async function hydrateExecutionProviders(proj) {
             : { unrestricted: false, allowDomains: split('#project-execution-domains'), allowCidrs: split('#project-execution-cidrs') },
           monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         } }) });
-        await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
+        await loadProjects(); toast('Saved'); await hydrateExecutionProviders(proj);
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) {
-    if (renderIsCurrent()) toast(`Could not load compute providers: ${error.message}`, true);
+    if (renderIsCurrent()) toast(`Could not load where tasks run: ${error.message}`, true);
   }
 }
 
@@ -9292,7 +9335,7 @@ async function hydrateExecutionProviders(proj) {
 /** The brand icon is instance-wide, like host capacity: it is the same mark for
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
-  return `<div class="card" id="appearance-card">
+  return `<div class="card" id="appearance-card" data-settings-access="appearance" hidden>
       <div class="section-h">Icon <span class="chip">whole instance</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The mark in the top bar and on the sign-in screen, the browser favicon, and the installed app icon.</p>
       <div class="brand-picker" id="brand-picker">
@@ -9345,14 +9388,12 @@ function globalSettingsView(embedded = false) {
     ${vaultRequestsCard()}
     ${agentMailCard()}
     ${paymentsCard('global')}
-    <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
+    <div class="settings-section-title" id="settings-agents"><div>Codex/Claude</div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">This organization's logins and API keys. They are never offered to another organization. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude, Codex, or explicitly supported OpenCode subscription. Each gets an isolated config home you can switch between. krmax opens the provider's own login — you complete it; krmax never types your credentials.</p>
       <div class="form-row"><label>Connect a login</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <select id="login-provider"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
@@ -9384,7 +9425,6 @@ function globalSettingsView(embedded = false) {
           <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
           <button class="btn" id="acct-add">Register</button>
         </div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — krmax never sees it elsewhere.)</div>
       </div>
     </div>
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
@@ -10262,8 +10302,7 @@ function passwordsCard() {
     <div class="queue-item bitwarden-file-import" style="margin-bottom:8px">
       <div style="flex:1"><b>Bitwarden JSON export</b>
         <span class="chip">one-way import</span>
-        <div class="task-sub" style="color:var(--ink-3)">One-time import of logins, TOTP seeds, secure notes, and SSH keys. The plaintext export is processed once and not retained as a file; delete your local export afterward.</div>
-        <label class="task-sub" title="Bitwarden JSON is a snapshot, not a connected vault" style="display:inline-flex;align-items:center;gap:5px;color:var(--ink-3);margin-top:4px"><input type="checkbox" disabled /> Write changes back — unavailable for file imports</label></div>
+        <div class="task-sub" style="color:var(--ink-3)">Export your Bitwarden to a JSON file and import it here (no write-back).</div></div>
       <input class="bitwarden-file" type="file" accept=".json,application/json" hidden />
       <button class="btn sm primary" type="button" data-bitwarden-file>Import JSON…</button>
     </div>
@@ -10523,7 +10562,17 @@ async function wireVaultCards(organizationId) {
     list.querySelectorAll('[data-conn]').forEach((row) => {
       const name = row.dataset.conn;
       row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
-        try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) }); toast('Connected'); renderConnectors(); } catch (e) { toast(e.message, true); }
+        const button = row.querySelector('[data-conn-connect]');
+        button.disabled = true;
+        try {
+          const result = await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) });
+          const connection = result.connector;
+          toast(`${connection.label} connected`);
+          await renderConnectors();
+        } catch (e) {
+          button.disabled = false;
+          toast(e.message, true);
+        }
       });
       row.querySelector('[data-git-pass-connect]')?.addEventListener('click', () => openGitPassConnect(conns.find((c) => c.name === name)));
       row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
@@ -11439,7 +11488,6 @@ function profileView() {
     </div>
     <div class="card">
       <div class="section-h">Organizations</div>
-      <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
       <div class="profile-orgs">${orgList}</div>
     </div>
     ${notificationsCard()}
@@ -11714,7 +11762,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access" id="phone-access-nav" hidden>Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access" id="phone-access-nav" hidden>Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -11726,14 +11774,14 @@ function organizationView() {
     <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>Repository access and organization-owned automation</small></div></div>
     <div class="card"><div id="org-github">Loading…</div></div>
 
-    <div class="settings-section-title" id="settings-compute"><div>Compute<small>Where tasks run, how large each world is, and the monthly ceiling</small></div></div>
-    <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+    <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
+    <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
     ${globalSettingsView(true)}
 
-    <div class="settings-section-title" id="settings-advanced"><div>Advanced<small>Rarely needed — appearance, identity, safe mode, export</small></div></div><div id="org-misc-slot"></div>
-    <details class="card settings-disclosure"><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
-    <details class="card settings-disclosure"><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
+    <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div><div id="org-misc-slot"></div>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization, or permanently delete it.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
     </div></div></div>`;
 }
 
@@ -11763,6 +11811,7 @@ async function hydrateOrganizationView() {
   for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
+  hydrateSettingsAccess({ organizationId });
   await loadCollaboration().catch(() => {});
   if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);

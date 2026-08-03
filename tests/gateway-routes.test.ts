@@ -62,6 +62,13 @@ describe('gateway route capability binding', () => {
     expect(cap('POST', '/api/vault/import/bitwarden')).toBe('credential:write');
   });
 
+  it('scopes the settings access summary to the page being viewed', () => {
+    expect(routeCapability('GET', '/api/settings/access', new URL('http://x/api/settings/access?organizationId=o1')))
+      .toBe('organization:read');
+    expect(routeCapability('GET', '/api/settings/access', new URL('http://x/api/settings/access?projectId=p1')))
+      .toBe('project:read');
+  });
+
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
     expect(cap('GET', '/api/user/git-profiles')).toBe('none');
     expect(cap('POST', '/api/user/git-profiles')).toBe('none');

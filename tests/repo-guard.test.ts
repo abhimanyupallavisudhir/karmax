@@ -54,7 +54,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
     const p = store.createProject('NoRepo', {}); // repos unset
     await expect(
       api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'do a thing' }),
-    ).rejects.toThrow(/repository/i);
+    ).rejects.toThrow('Please add a git repo in project settings.');
     expect(started).toHaveLength(0); // the workflow was never started
   });
 
@@ -62,7 +62,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
     const p = store.createProject('Blank', { repos: ['', '   '] });
     await expect(
       api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }),
-    ).rejects.toThrow(/repository/i);
+    ).rejects.toThrow(/git repo/i);
     expect(started).toHaveLength(0);
   });
 
@@ -79,12 +79,12 @@ describe('repo-required guard (empty-repo footgun)', () => {
     api = new KarmaxApi({ store, client: { workflow: { start: async (...a: unknown[]) => { started.push(a); return {}; } } } as any,
       taskQueue: 'tq', tokens, hosted: true });
     await expect(api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }))
-      .rejects.toThrow(/attached GitHub repository/);
+      .rejects.toThrow(/connect GitHub in organization settings/i);
     const repository = store.upsertRepository({ organizationId: p.organizationId!, provider: 'github',
       owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'trunk', private: true });
     store.attachProjectRepository({ projectId: p.id, repositoryId: repository.id });
     await expect(api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x',
-      params: { repos: ['git@github.com:other/not-attached.git'] } })).rejects.toThrow(/not attached/);
+      params: { repos: ['git@github.com:other/not-attached.git'] } })).rejects.toThrow(/choose a GitHub repo attached/i);
     const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
     expect(task.workflow).toBe('software-dev');
     expect(store.getProject(p.id)?.config).toMatchObject({ repos: [repository.sshUrl], defaultBase: 'trunk', defaultTarget: 'trunk' });
@@ -131,7 +131,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
       draft: true,
     });
     expect(started).toHaveLength(0); // a draft starts nothing
-    await expect(api.queueTask(token, draft.id)).rejects.toThrow(/repository/i);
+    await expect(api.queueTask(token, draft.id)).rejects.toThrow(/git repo/i);
     expect(started).toHaveLength(0); // still not started after the refused queue
   });
 
@@ -210,7 +210,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
     store.setSettings(p.id, 'software-dev', { repos: ['   '] }); // whitespace-only overlay wins, resolves empty
     await expect(
       api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }),
-    ).rejects.toThrow(/repository/i);
+    ).rejects.toThrow(/git repo/i);
     expect(started).toHaveLength(0);
   });
 });
