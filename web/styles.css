@@ -1802,6 +1802,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 .vault-manager-list { min-height: 90px; max-height: 62vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
 .vault-manager-item { margin: 0; border: 0; border-radius: 0; border-bottom: 1px solid var(--line); padding: 10px; flex-wrap: wrap; }
 .vault-manager-item:last-of-type { border-bottom: 0; }
+.vault-reveal-panel { flex-basis: 100%; padding: 10px; border-radius: 7px; background: var(--surface-2); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.vault-reveal-panel[hidden], .vault-reveal-value[hidden] { display: none !important; }
+.vault-reveal-value { flex-basis: 100%; min-width: 0; }
+.vault-reveal-value pre { margin: 0 0 8px; padding: 9px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); user-select: text; }
 @media (max-width: 650px) {
   .vault-grant-item { align-items: stretch; flex-direction: column; }
   .vault-grant-policies { padding-left: 25px; justify-content: flex-start; }

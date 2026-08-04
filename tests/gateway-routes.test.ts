@@ -60,6 +60,7 @@ describe('gateway route capability binding', () => {
 
   it('gates a password-manager export import as a credential write', () => {
     expect(cap('POST', '/api/vault/import/bitwarden')).toBe('credential:write');
+    expect(cap('POST', '/api/vault/items/vi_1/reveal')).toBe('credential:write');
   });
 
   it('scopes the settings access summary to the page being viewed', () => {

@@ -3661,7 +3661,7 @@ export class Gateway {
         const callerTaskId = authRecord?.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
         const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
         const defaultField = (type: string): any =>
-          ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', note: 'note' })[type];
+          ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' })[type];
         const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
 
         if (p === '/api/vault/import/bitwarden' && method === 'POST') {
@@ -3728,6 +3728,28 @@ export class Gateway {
             }
           }
           return this.json(res, 200, { ...saved, ...(propagated ? { propagated } : {}) });
+        }
+        // Human vault inspection is deliberately separate from the agent
+        // `/api/vault/resolve` path. The item's `reveal` policy answers whether
+        // plaintext may be handed to a task agent; it must not make the vault
+        // opaque to an administrator who is responsible for its contents.
+        // Conversely, a task token carrying broad credential administration
+        // must never use this route as a shortcut around its item grant/policy.
+        const viReveal = p.match(/^\/api\/vault\/items\/([^/]+)\/reveal$/);
+        if (viReveal && method === 'POST') {
+          if (authRecord?.kind !== 'human')
+            return this.json(res, 403, { error: 'credential inspection requires a human vault administrator' });
+          const item = vault.get(viReveal[1]!);
+          if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
+          const b = await this.body(req);
+          const field = String(b.field ?? defaultField(item.type)) as any;
+          if (!ITEM_FIELDS[item.type].includes(field))
+            return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
+          if (!item.fields.includes(field))
+            return this.json(res, 400, { error: `item "${item.label}" has no stored ${field}` });
+          const value = vault.resolveField(item, field, { principal, mode: 'reveal' });
+          res.setHeader('cache-control', 'private, no-store');
+          return this.json(res, 200, { itemId: item.id, field, value });
         }
         const viDel = p.match(/^\/api\/vault\/items\/([^/]+)$/);
         if (viDel && method === 'DELETE') {

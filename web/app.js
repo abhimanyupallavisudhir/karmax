@@ -10469,7 +10469,7 @@ async function wireVaultCards(organizationId) {
     overlay.innerHTML = `<div class="modal-card vault-manager-modal" role="dialog" aria-modal="true" aria-labelledby="vault-manager-title">
       <div class="vault-manager-head">
         <div><div class="section-h" id="vault-manager-title">Vault credentials</div>
-          <p class="vault-grant-help">Manage organization defaults, rotate secrets, or remove credentials.</p></div>
+          <p class="vault-grant-help">Inspect, rotate, or remove credentials and manage organization defaults. Every reveal is recorded in the audit log.</p></div>
         <button type="button" class="icon-btn" data-vault-manager-close aria-label="Close">×</button>
       </div>
       <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
@@ -10497,8 +10497,21 @@ async function wireVaultCards(organizationId) {
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
           <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="Temporarily inspect one stored field (audited)" ${(i.fields || []).length ? '' : 'disabled'}>View</button>
           <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
-          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
+          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button>
+          <div class="vault-reveal-panel" hidden>
+            <label>Stored field <select class="vi-reveal-field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select></label>
+            <button type="button" class="btn sm primary" data-vi-reveal-load>Reveal</button>
+            <span class="task-sub">Hidden again after 60 seconds.</span>
+            <div class="vault-reveal-value" hidden>
+              <pre class="mono" tabindex="0"></pre>
+              <div style="display:flex;gap:6px">
+                <button type="button" class="btn sm" data-vi-reveal-copy>Copy</button>
+                <button type="button" class="btn sm" data-vi-reveal-hide>Hide</button>
+              </div>
+            </div>
+          </div></div>`).join('')
         : '<span class="vault-grant-empty">No passwords yet — sync from a password manager or add one by hand.</span>';
       list.insertAdjacentHTML('beforeend', '<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span>');
       list.querySelectorAll('[data-vi]').forEach((row) => {
@@ -10512,6 +10525,49 @@ async function wireVaultCards(organizationId) {
         };
         row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
         row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+      });
+      list.querySelectorAll('[data-vi-reveal]').forEach((button) => button.addEventListener('click', () => {
+        const row = button.closest('[data-vi]');
+        const panel = row.querySelector('.vault-reveal-panel');
+        panel.hidden = !panel.hidden;
+        if (panel.hidden) panel._conceal?.();
+        else panel.querySelector('[data-vi-reveal-load]').focus();
+      }));
+      list.querySelectorAll('.vault-reveal-panel').forEach((panel) => {
+        const row = panel.closest('[data-vi]');
+        const valueBox = panel.querySelector('.vault-reveal-value');
+        const value = valueBox.querySelector('pre');
+        const conceal = () => {
+          clearTimeout(panel._concealTimer);
+          panel._concealTimer = undefined;
+          value.textContent = '';
+          valueBox.hidden = true;
+        };
+        panel._conceal = conceal;
+        panel.querySelector('.vi-reveal-field').addEventListener('change', conceal);
+        panel.querySelector('[data-vi-reveal-load]').addEventListener('click', async (event) => {
+          const load = event.currentTarget;
+          load.disabled = true;
+          try {
+            const field = panel.querySelector('.vi-reveal-field').value;
+            const result = await api(`/api/vault/items/${encodeURIComponent(row.dataset.vi)}/reveal${oq}`, {
+              method: 'POST', body: JSON.stringify({ field }),
+            });
+            value.textContent = result.value;
+            valueBox.hidden = false;
+            clearTimeout(panel._concealTimer);
+            panel._concealTimer = setTimeout(conceal, 60_000);
+          } catch (e) { conceal(); toast(e.message, true); }
+          finally { load.disabled = false; }
+        });
+        panel.querySelector('[data-vi-reveal-copy]').addEventListener('click', async () => {
+          try {
+            if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable');
+            await navigator.clipboard.writeText(value.textContent);
+            toast('Copied to clipboard');
+          } catch (e) { toast(e.message, true); }
+        });
+        panel.querySelector('[data-vi-reveal-hide]').addEventListener('click', conceal);
       });
       list.querySelectorAll('[data-vi-rotate]').forEach((button) => button.addEventListener('click', async () => {
         const item = vaultItems.find((candidate) => candidate.id === button.dataset.viRotate);
@@ -10539,7 +10595,10 @@ async function wireVaultCards(organizationId) {
       filterRows();
     };
     paint();
-    const close = () => overlay.remove();
+    const close = () => {
+      overlay.querySelectorAll('.vault-reveal-panel').forEach((panel) => panel._conceal?.());
+      overlay.remove();
+    };
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
     overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
     overlay.querySelector('[data-vault-manager-close]').addEventListener('click', close);
