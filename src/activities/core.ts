@@ -41,7 +41,7 @@ import {
   type GithubPullRequestReadiness,
 } from '../integrations/github-pr.js';
 import type { GitHubRepositoryPermission } from '../integrations/github-app.js';
-import { cloudGitSource } from '../world/cloud-source.js';
+import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
@@ -58,7 +58,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole, type Repository, type TaskPullRequest,
+import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, type Repository, type TaskPullRequest,
   type GitHubMergeAuthorization } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
@@ -820,12 +820,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...developmentSources,
         ...(wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
       ];
-      const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
-      const worldSources = remote ? cloudSources.map((resolved) => resolved.source) : requestedSources;
-      for (let i = 0; i < cloudSources.length; i++) {
-        if (cloudSources[i]!.localPath)
+      const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
+      const githubIsAuthority = remotePolicyOf(executionConfig) === 'pr';
+      // Remote providers always need a network transport. Local PR worlds also
+      // resolve one when available so GitHub-backed sources can fork from the
+      // actual PR target; a local-only companion remains project-authoritative.
+      const sourceResolutions: CloudGitSource[] = remote
+        ? await Promise.all(requestedSources.map((source) => cloudGitSource(source)))
+        : githubIsAuthority
+          ? await Promise.all(requestedSources.map(async (source) => {
+              try { return await cloudGitSource(source); }
+              catch { return { source }; }
+            }))
+          : requestedSources.map((source) => ({ source }));
+      const transportSources = sourceResolutions.map((resolved) => resolved.source);
+      const worldSources = remote ? transportSources : requestedSources;
+      for (let i = 0; i < sourceResolutions.length; i++) {
+        if (remote && sourceResolutions[i]!.localPath)
           record(args.taskId, 'world.repository-resolved', {
-            localPath: cloudSources[i]!.localPath, remote: cloudSources[i]!.source,
+            localPath: sourceResolutions[i]!.localPath, remote: sourceResolutions[i]!.source,
           });
       }
       // Older/local workflow histories do not pass projectId into createWorld;
@@ -835,15 +848,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const organizationRepositories = project?.organizationId
         ? store.listRepositories(project.organizationId)
         : [];
-      const hasCatalogedLocalSource = worldSources.some((source, index) =>
-        Boolean(cloudSources[index]?.localPath)
-        && organizationRepositories.some((candidate) => sameRepository(candidate.sshUrl, source)));
-      const repositoryBranches = Object.fromEntries(worldSources.flatMap((source) => {
-        const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, source));
+      const hasCatalogedLocalSource = worldSources.some((_source, index) =>
+        Boolean(sourceResolutions[index]?.localPath)
+        && organizationRepositories.some((candidate) => sameRepository(candidate.sshUrl, transportSources[index]!)));
+      const repositoryBranches = Object.fromEntries(worldSources.flatMap((source, index) => {
+        const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, transportSources[index]!));
         if (!candidate) return [];
         const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
         return [[source, { base, target: candidate.targetBranch ?? base }]];
       }));
+      const repositoryAuthorities: Record<string, 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
+        githubIsAuthority && githubSlug(transportSources[index]!) ? [[source, 'origin' as const]] : []));
+      const repositoryOrigins = Object.fromEntries(worldSources.flatMap((source, index) =>
+        !remote && sourceResolutions[index]?.localPath && transportSources[index] !== source
+          ? [[source, transportSources[index]!]]
+          : []));
       if (wikiRoot && requestedSources.includes(wikiRoot))
         repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
         base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
@@ -852,25 +871,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
         for (const [index, source] of worldSources.entries()) {
-          const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, source));
+          const transportSource = transportSources[index]!;
+          const linked = linkedRepositories.find((candidate) => sameRepository(candidate.repository.sshUrl, transportSource));
           const repository = linked?.repository
-            ?? (wikiRepository && sameRepository(wikiRepository.sshUrl, source) ? wikiRepository : undefined)
+            ?? (wikiRepository && sameRepository(wikiRepository.sshUrl, transportSource) ? wikiRepository : undefined)
             // Local filesystem sources are explicitly configured project
             // authorities. In a cloud world their origin becomes the clone
             // transport; match that origin against the connected GitHub App
             // catalog even when the project predates repository attachments.
-            ?? (cloudSources[index]?.localPath
-              ? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, source))
+            ?? (sourceResolutions[index]?.localPath
+              ? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, transportSource))
               : undefined);
           if (!repository) {
-            // A configured host checkout is already the authority for this
-            // repository. cloudGitSource resolved its origin only as the cloud
-            // transport and copySources seeds the sandbox from the exact local
-            // commit, so it neither needs nor implies a GitHub catalog
-            // attachment. Requiring enrollment here discarded that provenance
-            // and made a correctly auto-detected local origin fail as soon as
-            // any other source (normally the project wiki) was enrolled.
-            if (cloudSources[index]?.localPath) continue;
+            // A configured host checkout remains usable without catalog
+            // enrollment. Under local policy it is the authority; under PR
+            // policy an un-enrolled GitHub transport can still use an explicit
+            // Git profile/host credential while origin owns the base.
+            if (sourceResolutions[index]?.localPath) continue;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             continue;
           }
@@ -880,7 +897,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // trusted provisioning and are removed before the agent starts.
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
       }
-      const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       const environmentSelection = projectId
         ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
         : { built: false, environment: executionConfig?.environment };
@@ -905,10 +921,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           branch: args.branch,
           resetBranch: args.resetBranch,
           copyGlobs: args.copyGlobs,
-          ...(remote ? { copySources: cloudSources.map((source) => source.localPath) } : {}),
+          ...(remote ? { copySources: sourceResolutions.map((source) => source.localPath) } : {}),
           gitIdentity,
           gitCredentials,
           ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
+          ...(Object.keys(repositoryAuthorities).length ? { repositoryAuthorities } : {}),
+          ...(Object.keys(repositoryOrigins).length ? { repositoryOrigins } : {}),
           network: executionConfig?.network,
           environment: environmentSelection.environment,
           resources: executionConfig?.resources,
