@@ -2227,11 +2227,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      *
      * krmax first selects a consenting human (the creator or someone who
      * confirmed a human Review layer), then checks that person's repository
-     * role live and asks GitHub to merge the exact reviewed head SHA. The App
-     * installation is intentionally not a candidate: it may transport task
-     * branches, but it must not bypass a person's merge rights.
+     * role live. Current tasks enter GitHub's native queue or atomically
+     * fast-forward the target to the exact validated head; historical versions
+     * retain direct PR merge behavior. The App installation is intentionally
+     * not a candidate: it may transport task branches, but it must not bypass a
+     * person's merge rights.
      */
-    async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[]): Promise<GitHubMergeAuthorization> {
+    async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: { mode?: 'submit' | 'observe' }): Promise<GitHubMergeAuthorization> {
       // A PR-policy task may legitimately make no changes. There is nothing
       // external to authorize in that case, so do not manufacture a human gate.
       if (!prs.length) return { status: 'merged', prs };
@@ -2239,6 +2241,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (!task || !deps.githubApp) {
         return { status: 'needs-authorizer', prs, detail: 'GitHub is not connected for human-attributed merges.' };
       }
+      const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
+      const classifiedGithubStates = workflowMinor >= 14;
+      const intentAuthorizedLanding = workflowMinor >= 15;
+      const observeOnly = intentAuthorizedLanding && options?.mode === 'observe';
       const creator = store.taskCreatorUserId(handle.id);
       const events = store.eventsSince(handle.id, 0);
       const eventAuthorizesCurrentHeads = (event: { payload?: any }) => {
@@ -2247,17 +2253,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           Boolean(ref.headSha) && heads.some((head: any) => head?.slug === ref.slug
             && Number(head?.number) === ref.number && head?.headSha === ref.headSha));
       };
-      const voters = events
+      const latestRevocation = intentAuthorizedLanding
+        ? events.map((event, index) => ({ event, index }))
+          .filter(({ event }) => event.type === 'github.merge.authorization-revoked').at(-1)?.index ?? -1
+        : -1;
+      const authorizationEvents = events.slice(latestRevocation + 1);
+      const currentHeadVoters = authorizationEvents
         .filter((event) => event.type === 'task.confirmation-voted'
           && event.payload?.satisfied !== false && event.payload?.githubMergeAuthorized === true
           && eventAuthorizesCurrentHeads(event))
         .map((event) => typeof event.payload?.userId === 'string' ? event.payload.userId : undefined)
         .filter((userId): userId is string => Boolean(userId));
+      const voters = intentAuthorizedLanding
+        ? authorizationEvents
+          .filter((event) => event.type === 'task.confirmation-voted'
+            && event.payload?.satisfied !== false
+            && (event.payload?.githubMergeIntentAuthorized === true
+              || (event.payload?.githubMergeAuthorized === true && eventAuthorizesCurrentHeads(event))))
+          .map((event) => typeof event.payload?.userId === 'string' ? event.payload.userId : undefined)
+          .filter((userId): userId is string => Boolean(userId))
+        : currentHeadVoters;
       // The most recent Review decision is the clearest explicit consent. The
       // creator remains a valid sponsor when a task auto-confirms or uses an
       // agent reviewer, but never after GitHub reports that the reviewed head
       // moved: that replacement needs an exact-head human confirmation too.
-      const requiresFreshReview = events.some((event) => event.type === 'github.merge.review-stale'
+      const requiresFreshReview = !intentAuthorizedLanding && events.some((event) => event.type === 'github.merge.review-stale'
         && prs.some((ref) => event.payload?.slug === ref.slug && event.payload?.number === ref.number
           && event.payload?.liveHead === ref.headSha));
       const candidates = [...new Set([
@@ -2309,8 +2329,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastSha: string | undefined;
       let queued = false;
       let pendingDetail: string | undefined;
-      const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
-      const classifiedGithubStates = workflowMinor >= 14;
       const errorDecision = (error: unknown, current: TaskPullRequest[]): GitHubMergeAuthorization => {
         const detail = error instanceof Error ? error.message : String(error);
         const rateLimited = error instanceof GithubApiError
@@ -2365,6 +2383,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!ref.headSha || !live.headSha || ref.headSha !== live.headSha) {
           record(handle.id, 'github.merge.review-stale', { ...ref, reviewedHead: ref.headSha, liveHead: live.headSha });
+          if (intentAuthorizedLanding) {
+            record(handle.id, 'github.merge.authorization-revoked', {
+              ...ref, reason: 'head-changed-outside-repair', reviewedHead: ref.headSha, liveHead: live.headSha,
+            });
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} changed outside krmax's authorized repair cycle. Inspect the new head and send the proposal through human Review before landing.`,
+              repair: { kind: 'head-changed', preserveAuthorization: false },
+            };
+          }
           return {
             status: 'stale-review', prs: [...settled, next, ...prs.slice(settled.length + 1)], actorUserId,
             detail: `Pull request ${ref.slug}#${ref.number} changed after Review. Review the new head before merging.`,
@@ -2386,7 +2414,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               status: 'needs-revision',
               prs: current,
               actorUserId,
-              detail: `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
+              detail: intentAuthorizedLanding
+                ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or merge group. GitHub has ejected this entry; resolve it against the newest target and reopen it for automated integration review.`
+                : `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
+              ...(intentAuthorizedLanding ? { repair: { kind: 'conflict' as const, preserveAuthorization: true } } : {}),
             };
           }
           if (classifiedGithubStates && readiness?.draft) {
@@ -2396,26 +2427,58 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           if (classifiedGithubStates && (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR')) {
-            return { status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness) };
+            return {
+              status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness),
+              ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+            };
           }
           if (classifiedGithubStates && readiness?.reviewDecision === 'CHANGES_REQUESTED') {
+            if (intentAuthorizedLanding)
+              record(handle.id, 'github.merge.authorization-revoked', { ...ref, reason: 'changes-requested' });
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `GitHub reviewers requested changes on pull request ${ref.slug}#${ref.number}. Inspect their review comments and update the proposal.`,
+              ...(intentAuthorizedLanding ? { repair: { kind: 'changes-requested' as const, preserveAuthorization: false } } : {}),
             };
           }
-          if (classifiedGithubStates && readiness?.mergeStateStatus === 'BEHIND') {
+          if (classifiedGithubStates && !intentAuthorizedLanding && readiness?.mergeStateStatus === 'BEHIND') {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `Pull request ${ref.slug}#${ref.number} must be updated with its target branch before it can merge. Refresh the task branch, resolve any resulting conflict, and review the new head.`,
             };
           }
         }
-        const alreadyMirrored = store.eventsSince(handle.id, 0).some((event) =>
+        if (intentAuthorizedLanding && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
+          const entryIds = readiness.mergeQueueEntryId ? [readiness.mergeQueueEntryId] : [];
+          return {
+            status: 'queued', prs: current, actorUserId,
+            detail: readiness.mergeQueueEntryId
+              ? 'GitHub is validating this pull request in its merge queue.'
+              : 'GitHub auto-merge is waiting for repository requirements.',
+            providerQueue: { state: 'validating', ...(entryIds.length ? { entryIds } : {}) },
+          };
+        }
+        const mirroredReviews = store.eventsSince(handle.id, 0).filter((event) =>
+          event.type === 'github.pr.review-approved'
+          && event.payload?.slug === ref.slug && event.payload?.number === ref.number
+          && event.payload?.actorUserId === actorUserId);
+        const alreadyMirrored = mirroredReviews.some((event) =>
           event.type === 'github.pr.review-approved'
           && event.payload?.slug === ref.slug && event.payload?.number === ref.number
           && event.payload?.headSha === ref.headSha && event.payload?.actorUserId === actorUserId);
-        if (voters.includes(actorUserId) && !alreadyMirrored) {
+        const exactHeadConfirmed = currentHeadVoters.includes(actorUserId);
+        if (intentAuthorizedLanding && readiness?.reviewDecision === 'REVIEW_REQUIRED'
+          && mirroredReviews.length > 0 && !exactHeadConfirmed) {
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `Repository policy requires a fresh human approval of repaired pull request ${ref.slug}#${ref.number}. This PR is parked outside the provider queue; confirm here after reviewing the current head, or approve it on GitHub and retry.`,
+            eligibleUserIds: [actorUserId],
+          };
+        }
+        const mayMirrorApproval = exactHeadConfirmed
+          || (!intentAuthorizedLanding && voters.includes(actorUserId))
+          || (intentAuthorizedLanding && mirroredReviews.length === 0 && voters.includes(actorUserId));
+        if (mayMirrorApproval && !alreadyMirrored) {
           await api.approve(ref.slug, ref.number, ref.headSha,
             'Approved in krmax after reviewing this exact pull-request head.')
             .then(() => record(handle.id, 'github.pr.review-approved', { ...ref, actorUserId }))
@@ -2433,11 +2496,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return errorDecision(error, current);
           }
           if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR')
-            return { status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness) };
+            return {
+              status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness),
+              ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+            };
           if (readiness.reviewDecision === 'CHANGES_REQUESTED') {
+            if (intentAuthorizedLanding)
+              record(handle.id, 'github.merge.authorization-revoked', { ...ref, reason: 'changes-requested' });
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `GitHub reviewers requested changes on pull request ${ref.slug}#${ref.number}. Inspect their review comments and update the proposal.`,
+              ...(intentAuthorizedLanding ? { repair: { kind: 'changes-requested' as const, preserveAuthorization: false } } : {}),
             };
           }
           if (readiness.reviewDecision === 'REVIEW_REQUIRED') {
@@ -2446,6 +2515,96 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: `Pull request ${ref.slug}#${ref.number} still requires a GitHub review under repository policy. Complete that review on GitHub, then retry here.`,
             };
           }
+        }
+        if (observeOnly) {
+          return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: `GitHub ejected pull request ${ref.slug}#${ref.number} from its merge queue without merging it. Inspect the merge-group checks and the newest target, repair the branch if needed, and revalidate before requeueing.`,
+            repair: { kind: 'ci', preserveAuthorization: true },
+          };
+        }
+        if (intentAuthorizedLanding) {
+          // The provider queue is the preferred owner because it builds and
+          // validates a merge group against the then-current target. Crucially,
+          // do this BEFORE a direct PR merge: GitHub's REST merge binds the head
+          // SHA but not the base SHA, so a target race could land a candidate CI
+          // never saw.
+          let queueResult;
+          let queueError: unknown;
+          if (live.nodeId) {
+            try { queueResult = await api.enqueue(live.nodeId, ref.headSha); }
+            catch (error) { queueError = error; }
+          }
+          if (queueResult?.queued) {
+            queued = true;
+            pendingDetail = 'GitHub accepted the pull request into its merge queue.';
+            settled.push(next);
+            record(handle.id, 'github.pr.queued', { ...ref, actorUserId });
+            continue;
+          }
+          if (queueError) return errorDecision(queueError, current);
+
+          // A repository without a native merge queue can still land safely,
+          // but only by advancing its target to the exact tested PR head. The
+          // head must contain the latest base, and GitHub's force:false ref
+          // update atomically rejects a target race as non-fast-forward.
+          if (readiness?.mergeStateStatus === 'BEHIND') {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} is behind its target and this repository did not accept it into a native merge queue. Repair the branch against the newest target and revalidate the exact resulting head.`,
+              repair: { kind: 'base-moved', preserveAuthorization: true },
+            };
+          }
+          if (readiness && ['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')) {
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: `Waiting for checks on the exact pull-request head before attempting an atomic fast-forward landing.`,
+            };
+          }
+          if (readiness && readiness.mergeStateStatus !== 'CLEAN') {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `GitHub did not accept pull request ${ref.slug}#${ref.number} into a merge queue and reports ${readiness.mergeStateStatus}. Resolve the repository policy, or enable a GitHub merge queue so candidate construction and CI remain provider-owned.`,
+              eligibleUserIds: [actorUserId],
+            };
+          }
+          const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
+          if (mergeMethod !== 'merge') {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `Repository policy requests ${mergeMethod} landing, but GitHub did not accept this PR into a merge queue. Enable the native queue for ${mergeMethod} landing; krmax will not substitute an unvalidated direct merge.`,
+              eligibleUserIds: [actorUserId],
+            };
+          }
+          if (!live.base) {
+            return {
+              status: 'retryable-error', prs: current, actorUserId,
+              detail: `GitHub did not report the target branch for pull request ${ref.slug}#${ref.number}; exact landing cannot proceed safely.`,
+            };
+          }
+          let advanced;
+          try { advanced = await api.fastForwardTarget(ref.slug, live.base, ref.headSha); }
+          catch (error) { return errorDecision(error, current); }
+          if (advanced.updated) {
+            lastSha = ref.headSha;
+            settled.push({ ...next, state: 'closed', merged: true });
+            record(handle.id, 'github.pr.merged', {
+              ...ref, sha: ref.headSha, actorUserId, strategy: 'exact-fast-forward',
+            });
+            continue;
+          }
+          if (/fast.?forward|behind|reference update failed|not a valid head/i.test(advanced.message)) {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `The target moved before GitHub could land exact head ${ref.headSha} for ${ref.slug}#${ref.number}: ${advanced.message}`,
+              repair: { kind: 'base-moved', preserveAuthorization: true },
+            };
+          }
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `GitHub refused the exact fast-forward landing for ${ref.slug}#${ref.number}: ${advanced.message}. The PR is outside every queue; fix its branch policy or enable the native merge queue, then retry.`,
+            eligibleUserIds: [actorUserId],
+          };
         }
         let merged;
         try {
@@ -2515,6 +2674,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return {
         status: queued ? 'queued' : 'waiting', prs: settled, actorUserId,
         detail: queued ? pendingDetail : 'Waiting for GitHub merge policy.',
+        ...(intentAuthorizedLanding && queued ? { providerQueue: { state: 'queued' as const } } : {}),
       };
     },
 

@@ -531,7 +531,7 @@ const NODES = [
   { key: 'do', label: 'Do' },
   { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
-  { key: 'merge', label: 'Merge', ponr: true },
+  { key: 'merge', label: 'Landing' },
   { key: 'done', label: 'End' },
 ];
 
@@ -5280,6 +5280,9 @@ function renderTaskPage() {
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${mergeQueueBadge(v)}
+          ${v.landing?.provider && v.landing.provider !== 'none'
+            ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>`
+            : ''}
           ${pullRequestLinks(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
@@ -7526,8 +7529,11 @@ function queueRank(t, domain) {
 }
 
 function mergeQueuePanel() {
-  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
+  const providerOwned = S.tasks.filter((t) => ['queued', 'validating'].includes(t.lastView?.landing?.provider));
+  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage)
+    && !['queued', 'validating'].includes(t.lastView?.landing?.provider));
+  if (!inMerge.length && !providerOwned.length)
+    return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -7541,7 +7547,7 @@ function mergeQueuePanel() {
     }
   }
   const multi = groups.size > 1;
-  return [...groups.entries()]
+  const internal = [...groups.entries()]
     .map(([domain, tasks]) => {
       tasks.sort((a, b) => queueRank(a, domain) - queueRank(b, domain));
       const rows = tasks
@@ -7563,6 +7569,17 @@ function mergeQueuePanel() {
       return `${label}<div class="queue-list" data-domain="${esc(domain)}">${rows}</div>`;
     })
     .join('');
+  const provider = providerOwned.length
+    ? `<div class="queue-domain">GitHub landing queue</div><div class="queue-list">${providerOwned.map((t) => {
+        const v = t.lastView || {};
+        return `<div class="queue-item" data-id="${t.id}" tabindex="0">
+          <span class="drag-handle placeholder"></span><span class="pos">⇱</span>
+          <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">GitHub ${esc(v.landing?.provider || 'queued')}</span></div>
+            <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span>${v.landing?.detail ? ` · ${esc(v.landing.detail)}` : ''}</div></div>
+        </div>`;
+      }).join('')}</div>`
+    : '';
+  return `${internal}${provider}`;
 }
 
 function agentQueuePanel() {
