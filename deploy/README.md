@@ -57,9 +57,8 @@ to:
 
 ### Optional social sign-in
 
-Unlike the items above, these are not settings screens — each is a pair of
-variables, because a login OAuth client belongs to the *installation*, not to a
-tenant.
+Social sign-in belongs to the *installation*, not to a tenant. Google is an
+operator-provided client; GitHub reuses the deployment GitHub App.
 
 For Google, create a **Web application** client in the
 [Google Cloud console](https://console.cloud.google.com/auth/clients) whose
@@ -81,25 +80,21 @@ Only the basic `openid`/`email`/`profile` scopes are requested, which is why the
 consent screen can be published without Google's verification review. Set both
 or neither — the button appears only when both are non-empty.
 
-For GitHub, create an OAuth App in GitHub Developer settings with this
-authorization callback URL:
+GitHub sign-in needs no second OAuth App. The deployment-wide GitHub App created
+from **Organization settings → Git & GitHub** supplies its OAuth client and both
+callback URLs. On the next Karmax start, **Continue with GitHub** is enabled and
+the same user grant becomes that person's GitHub development identity. Installing
+the App on repositories remains a separate organization-owner action.
 
-```text
-https://karmax.example.com/api/auth/callback/github
-```
+`KARMAX_GITHUB_OAUTH_CLIENT_ID` and `KARMAX_GITHUB_OAUTH_CLIENT_SECRET` remain a
+legacy fallback for installations that have not configured the GitHub App. When
+the shared App is configured, its vaulted credentials take precedence.
 
-Then add its credentials alongside the Google pair:
-
-```bash
-KARMAX_GITHUB_OAUTH_CLIENT_ID=Ov23li...
-KARMAX_GITHUB_OAUTH_CLIENT_SECRET=...
-```
-
-GitHub sign-in requests only `read:user` and `user:email`. These variables are
-deliberately named `GITHUB_OAUTH`: they identify people at the login screen and
-are separate from the organization-scoped GitHub App that owns repository
-installation and user authorization. Signing in never silently grants repository
-access.
+Apps created by an older Karmax release need a one-time edit in GitHub App
+settings: add `https://karmax.example.com/api/auth/callback/github` as a callback
+URL and grant read-only **Email addresses** account permission. GitHub does not
+expose registration settings through its App API, so this upgrade cannot be
+applied by Karmax itself.
 
 `KARMAX_OIDC_*` (enterprise SSO) is another separate slot, so an installation
 can offer Google, GitHub, and company SSO together. Every provider button appears
