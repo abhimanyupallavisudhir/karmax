@@ -57,6 +57,12 @@ describe('websocket reconnect', () => {
 });
 
 describe('profile account controls', () => {
+  it('offers a plain-language export of all data linked to the signed-in user', () => {
+    expect(app).toContain('id="export-user-data"');
+    expect(app).toContain('Export your data');
+    expect(app).toContain('/api/user/export');
+  });
+
   it('lets an unverified user resend their confirmation email from the email row', () => {
     expect(app).toContain('id="profile-resend-confirmation"');
     expect(app).toContain('Resend confirmation email');

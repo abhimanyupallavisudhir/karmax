@@ -122,6 +122,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  if (p === '/api/user/export') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -1239,6 +1240,30 @@ export class Gateway {
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
       }
+      if (p === '/api/user/export' && method === 'GET') {
+        // Broad task-agent capabilities never imply ownership of a human's
+        // personal archive. Only a verified browser identity has `session.userId`.
+        if (!session.userId || !this.deps.identity)
+          return this.json(res, 401, { error: 'a signed-in user account is required' });
+        const identityData = this.deps.identity.exportUserData(session.userId);
+        const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
+        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId));
+        const linked = store.exportUserData(session.userId, String(identityData.profile.email ?? session.email ?? ''));
+        const { format, version, exportedAt, security, ...linkedData } = linked;
+        const value = {
+          format,
+          version,
+          exportedAt,
+          profile: identityData.profile,
+          authentication: identityData.authentication,
+          git: { defaultProfile: gitProfiles.defaultProfile() ?? null, profiles: gitProfiles.list() },
+          security,
+          ...linkedData,
+        };
+        const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
+          .split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'user';
+        return this.downloadJson(res, `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+      }
       if (p === '/api/settings/access' && method === 'GET') {
         if (!requestedScope.projectId && !requestedScope.organizationId)
           return this.json(res, 400, { error: 'Choose a project or organization.' });
@@ -1330,8 +1355,7 @@ export class Gateway {
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
         const value = store.exportOrganization(organizationExport[1]!);
-        res.setHeader('Content-Disposition', `attachment; filename="krmax-${organizationExport[1]!}-export.json"`);
-        return this.json(res, 200, value);
+        return this.downloadJson(res, `krmax-${organizationExport[1]!}-export.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
         const organizationId = organizationMatch[1]!;
@@ -5739,6 +5763,18 @@ export class Gateway {
     const body = JSON.stringify(toPublicPayload(obj ?? null));
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8',
       'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.end(body);
+  }
+  private downloadJson(res: http.ServerResponse, filename: string, obj: unknown) {
+    const body = `${JSON.stringify(toPublicPayload(obj ?? null), null, 2)}\n`;
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-disposition': `attachment; filename="${filename.replace(/["\\\r\n]/g, '_')}"`,
+      'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff',
+      'content-length': String(Buffer.byteLength(body)),
+      'x-karmax-cell': this.deps.cellId ?? 'local',
+    });
     res.end(body);
   }
   private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {

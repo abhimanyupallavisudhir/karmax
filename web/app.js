@@ -11602,6 +11602,15 @@ function profileView() {
       <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Copy local open commands from agent file links</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
+    <div class="card profile-data-card">
+      <div class="profile-data-mark" aria-hidden="true"><span>{ }</span><i></i></div>
+      <div class="profile-data-copy">
+        <div class="section-h">Your data</div>
+        <p class="task-sub">Download a readable JSON archive of your profile and the krmax records directly linked to you across organizations.</p>
+        <p class="profile-data-note">Passwords, session tokens, OAuth tokens, and stored credentials are never included.</p>
+      </div>
+      <button class="btn" id="export-user-data" type="button">Export your data</button>
+    </div>
     <div class="card">
       <div class="section-h">Session</div>
       <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
@@ -11781,6 +11790,7 @@ function wireProfileView() {
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
   $('#profile-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
+  $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();

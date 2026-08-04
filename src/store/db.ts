@@ -1091,6 +1091,124 @@ export class Store {
       identityPolicy: { ...identityPolicy, scimTokenId: undefined }, tables };
   }
 
+  /** A user-centered portability export. Unlike an organization export, this
+   * follows only records that name the person directly: membership/access rows,
+   * their tasks and notifications, and their own authorization history. It must
+   * never become a shortcut for downloading every organization they belong to. */
+  exportUserData(userId: string, email?: string): Record<string, unknown> {
+    const principalId = `user:${userId}`;
+    const memberships = selectRows(this.db, 'organization_memberships', 'userId=?', [userId]);
+    const invitations = email
+      ? selectRows(this.db, 'organization_invitations', 'lower(email)=lower(?) OR invitedBy IN (?,?)', [email, userId, principalId])
+      : selectRows(this.db, 'organization_invitations', 'invitedBy IN (?,?)', [userId, principalId]);
+    const inbox = selectRows(this.db, 'inbox', 'userId=?', [userId]);
+    const teamMemberships = selectRows(this.db, 'team_memberships', 'userId=?', [userId]);
+    const teams = rowsFor(this.db, 'teams', 'id', teamMemberships.map((row) => String(row.teamId)));
+    const projectMemberships = selectRows(this.db, 'project_memberships', 'principalKey=?', [principalId]);
+    const wikiEdits = selectRows(this.db, 'organization_wiki_versions', 'principal IN (?,?)', [userId, principalId]);
+    const previewLeases = selectRows(this.db, 'preview_leases', 'createdBy IN (?,?)', [userId, principalId])
+      .map(({ tokenHash: _tokenHash, ...row }) => row);
+    const spendRequests = selectRows(this.db, 'payment_spend_requests', 'resolvedBy IN (?,?)', [userId, principalId]);
+    const subscribedTaskIds = selectRows(this.db, 'task_subscribers', 'principalKey=?', [principalId])
+      .map((row) => String(row.taskId));
+    const votes = selectRows(this.db, 'confirmation_votes', 'userId=?', [userId]);
+    const directTaskIds = (this.db.prepare(`SELECT id FROM tasks WHERE
+      (json_extract(createdBy, '$.kind')='user' AND json_extract(createdBy, '$.userId')=?) OR
+      (json_extract(assignee, '$.kind')='user' AND json_extract(assignee, '$.userId')=?) OR
+      (json_extract(delegate, '$.kind')='user' AND json_extract(delegate, '$.userId')=?)`).all(userId, userId, userId) as any[])
+      .map((row) => String(row.id));
+    const taskIds = [...new Set([
+      ...directTaskIds,
+      ...subscribedTaskIds,
+      ...votes.map((row) => String(row.taskId)),
+      ...inbox.map((row) => String(row.taskId)),
+    ])];
+    const tasks = taskIds.map((id) => this.getTask(id)).filter(Boolean) as TaskRecord[];
+    const projectIds = [...new Set([
+      ...tasks.map((task) => task.projectId),
+      ...projectMemberships.map((row) => String(row.projectId)),
+    ])];
+    const projects = rowsFor(this.db, 'projects', 'id', projectIds);
+    const projectById = new Map(projects.map((project) => [String(project.id), rowToProject(project)]));
+    const organizationIds = [...new Set([
+      ...memberships.map((row) => String(row.organizationId)),
+      ...invitations.map((row) => String(row.organizationId)),
+      ...teams.map((row) => String(row.organizationId)),
+      ...projects.map((row) => String(row.organizationId)),
+      ...inbox.map((row) => String(row.organizationId)),
+      ...wikiEdits.map((row) => String(row.organizationId)),
+      ...previewLeases.map((row) => String(row.organizationId)),
+      ...spendRequests.map((row) => String(row.organizationId)),
+    ])];
+    const organizations = organizationIds.map((organizationId) => {
+      const organization = this.getOrganization(organizationId);
+      if (!organization) return undefined;
+      const organizationProjectIds = new Set(projects
+        .filter((project) => project.organizationId === organizationId).map((project) => String(project.id)));
+      const organizationInbox = inbox.filter((row) => row.organizationId === organizationId);
+      const deliveryRow = this.db.prepare('SELECT json FROM delivery_preferences WHERE userId=? AND organizationId=?')
+        .get(userId, organizationId) as any;
+      return {
+        organization,
+        membership: memberships.find((row) => row.organizationId === organizationId) ?? null,
+        invitations: invitations.filter((row) => row.organizationId === organizationId)
+          .map(({ tokenHash: _tokenHash, ...row }) => row),
+        teams: teamMemberships.flatMap((membership) => {
+          const team = teams.find((candidate) => candidate.id === membership.teamId
+            && candidate.organizationId === organizationId);
+          return team ? [{ team: rowToTeam(team), membership }] : [];
+        }),
+        projectMemberships: projectMemberships.flatMap((membership) => {
+          const project = projectById.get(String(membership.projectId));
+          if (!project || project.organizationId !== organizationId) return [];
+          return [{ project, membership: {
+            projectId: membership.projectId,
+            principal: parseJsonOptional<PrincipalRef>(membership.principal),
+            role: membership.role,
+            joinedAt: membership.joinedAt,
+          } }];
+        }),
+        tasks: tasks.filter((task) => organizationProjectIds.has(task.projectId))
+          .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+          .map((task) => ({
+            project: projectById.get(task.projectId),
+            task,
+            events: this.eventsSince(task.id, 0),
+            inbox: organizationInbox.filter((row) => row.taskId === task.id).map(rowToInbox),
+            confirmationVotes: votes.filter((row) => row.taskId === task.id),
+          })),
+        inbox: organizationInbox.map(rowToInbox),
+        deliveryOutbox: rowsFor(this.db, 'delivery_outbox', 'inboxId',
+          organizationInbox.map((row) => String(row.id))),
+        deliveryPreferences: deliveryRow ? JSON.parse(deliveryRow.json) : null,
+        activity: {
+          wikiEdits: wikiEdits.filter((row) => row.organizationId === organizationId),
+          previews: previewLeases.filter((row) => row.organizationId === organizationId),
+          spendDecisions: spendRequests.filter((row) => row.organizationId === organizationId).map((request) => ({
+            request,
+            transactions: selectRows(this.db, 'payment_transactions', 'spendRequestId=?', [request.id]),
+          })),
+        },
+      };
+    }).filter(Boolean);
+    const auditLog = selectRows(this.db, 'audit_log', 'principalId=?', [principalId])
+      .map((row) => ({ ...row, detail: parseJsonOptional(row.detail) ?? {} }));
+    return {
+      format: 'karmax-user-export',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      security: {
+        secretsIncluded: false,
+        omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles'],
+      },
+      organizations,
+      authorization: {
+        grants: this.listPrincipalGrants(principalId),
+        auditLog,
+      },
+    };
+  }
+
   projectResources(projectId: string): { worlds: WorldHandleRef[]; objectKeys: string[];
     attachmentIds: string[]; leases: Array<{ id: string; provider: string }> } {
     const taskIds = (this.db.prepare('SELECT id FROM tasks WHERE projectId=?').all(projectId) as any[]).map((r) => String(r.id));
