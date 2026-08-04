@@ -9,10 +9,10 @@ import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { accountCoordinatorId } from '../src/coordinators/names.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
+function input(over: { taskId: string; projectId?: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
   return {
     taskId: over.taskId,
-    projectId: 'p1',
+    projectId: over.projectId ?? 'p1',
     title: over.title ?? 'Task',
     prompt: over.prompt,
     base: 'main',
@@ -29,6 +29,7 @@ const view = (h: any) => h.query('view') as Promise<any>;
 describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   let cancellationCleanupFinishedAt = 0;
+  let releaseResourceCandidateTurn: (() => void) | undefined;
   beforeAll(async () => {
     const mock = new MockAdapter();
     const restartSession = 'restart-regression-session';
@@ -38,6 +39,10 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        if (input.messages.some((m) => m.text.includes('@resource-candidate-regression'))) {
+          await new Promise<void>((resolve) => { releaseResourceCandidateTurn = resolve; });
+          return mock.runTurn(input, ctx);
+        }
         if (input.messages.some((m) => m.text.includes('@cancel-cleanup-regression'))) {
           const pulse = setInterval(() => {
             try { ctx.heartbeat?.(); } catch { /* cancellation is delivered through the signal */ }
@@ -110,6 +115,42 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('export const f');
   });
+
+  it('v1.17 blocks Review on staged resources and wakes on an actual decision', async () => {
+    const repo = await h.makeRepo('resource-candidate-review');
+    const project = h.store.createProject('Resource candidate review', { repos: [repo] });
+    const task = h.store.createTask({ projectId: project.id, title: 'Install model', workflow: 'software-dev',
+      workflowVersion: '1.17.0', params: { prompt: 'install it' } });
+    const handle = await h.client.workflow.start('softwareDev@1.17.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,
+        prompt: '@resource-candidate-regression\n@write model.js :: export const installed = true;\n@review Installed model' })],
+    });
+
+    await expect.poll(() => h.store.currentWorld(task.id), { timeout: 30_000 }).toBeTruthy();
+    const taskWorld = h.store.currentWorld(task.id)!;
+    fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'model.bin'), Buffer.alloc(1024, 7));
+    const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
+      target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
+    await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+    releaseResourceCandidateTurn!();
+    releaseResourceCandidateTurn = undefined;
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
+      .toContain('must be Adopted or Discarded');
+    expect((await view(handle)).actions.map((action: any) => action.name)).not.toContain('confirm');
+    await handle.signal('confirm'); // ignored while the resource decision is open
+    await h.resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
+    await handle.signal('resourceResolved');
+    await expect.poll(async () => (await view(handle)).actions.map((action: any) => action.name), { timeout: 30_000 })
+      .toContain('confirm');
+    expect((await view(handle)).stage).toBe('review');
+
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(h.store.getResourceAttachment(proposed.attachment.id)).toMatchObject({ enabled: true });
+  }, 120_000);
 
   it('v1.13 waits for input until Open PR is explicitly requested', async () => {
     const repo = await h.makeRepo('explicit-open-pr');

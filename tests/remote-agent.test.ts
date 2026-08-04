@@ -204,6 +204,7 @@ describe('remote subscription agents', () => {
     expect(metadata.payload.dynamic_tools).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'function', name: 'list_events' }),
       expect.objectContaining({ type: 'function', name: 'publish_task_branch' }),
+      expect.objectContaining({ type: 'function', name: 'propose_project_resource' }),
       expect.objectContaining({ type: 'function', name: 'message_agent' }),
     ]));
   });
