@@ -47,6 +47,7 @@ import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCook
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
+import { inheritPersonalGithubProfile, saveGithubUserIdentity } from '../integrations/github-user.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
@@ -5591,9 +5592,7 @@ export class Gateway {
   private async saveGithubIdentity(userId: string,
     identity: import('../integrations/github-app.js').GitHubUserIdentity): Promise<void> {
     if (!this.deps.broker) throw new Error('GitHub identity storage is unavailable');
-    const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
-    new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(userId))
-      .saveGithubIdentity(identity);
+    saveGithubUserIdentity(this.deps.store, this.deps.broker, userId, identity);
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
@@ -5654,6 +5653,7 @@ export class Gateway {
       const organization = this.deps.store.createOrganization({
         name: label ? `${label}'s workspace` : 'Personal workspace', kind: 'personal', ownerUserId: userId });
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
+      if (this.deps.broker) inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);

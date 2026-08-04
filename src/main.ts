@@ -30,6 +30,7 @@ import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService } from './auth/identity.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
+import { inheritPersonalGithubProfile, saveGithubUserIdentity } from './integrations/github-user.js';
 import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
 import { WorldCheckpointService } from './world/checkpoint.js';
 import { RunnerPoolService, WorldLifecycleManager } from './world/runners.js';
@@ -125,6 +126,25 @@ async function main() {
   // ── Core services ──
   const store = new Store(path.join(p.state, 'karmax.db'));
   const authorization = new AuthorizationService(store);
+  const broker = new CredentialBroker(new Vault(p.vault));
+  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
+  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
+    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET);
+  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET);
+  // The same GitHub App can identify people at sign-in and later provide the
+  // organization installation. A dedicated OAuth App remains a supported
+  // override for existing deployments.
+  const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
+    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
+    publicApp: deployment.hosted });
+  const explicitGithubIdentity = process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim()
+    && process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET?.trim()
+    ? { clientId: process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID.trim(),
+        clientSecret: process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET.trim() }
+    : undefined;
+  const githubIdentityProvider = explicitGithubIdentity ?? githubApp.identityProviderCredentials();
   const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '');
   const publicHost = (() => { try { return publicUrl ? new URL(publicUrl).hostname : undefined; } catch { return undefined; } })();
   const configuredAuthHosts = [
@@ -163,13 +183,23 @@ async function main() {
       ? { google: { clientId: process.env.KARMAX_GOOGLE_CLIENT_ID.trim(),
           clientSecret: process.env.KARMAX_GOOGLE_CLIENT_SECRET.trim() } }
       : {}),
-    ...(process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim() && process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET?.trim()
-      ? { github: { clientId: process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID.trim(),
-          clientSecret: process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET.trim() } }
-      : {}),
+    ...(githubIdentityProvider ? { github: githubIdentityProvider } : {}),
   });
+  identity.githubAccountLinked = async (account) => {
+    try {
+      const githubIdentity = await githubApp.adoptUserAuthorization(account.userId, account);
+      saveGithubUserIdentity(store, broker, account.userId, githubIdentity);
+    } catch (error) {
+      // Authentication has already succeeded. A transient GitHub/profile sync
+      // failure must not turn a valid social login into a dead callback page.
+      console.error('[github] could not adopt social sign-in:', error instanceof Error ? error.message : error);
+    }
+  };
   const installationOwner = identity.listUsers()[0];
-  if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
+  if (installationOwner) {
+    store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
+    inheritPersonalGithubProfile(store, broker, installationOwner.id);
+  }
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();
@@ -177,7 +207,6 @@ async function main() {
   seedProfiles(store, provider);
   const bus = new KarmaxBus();
   const tokens = new TokenAuthority(store);
-  const broker = new CredentialBroker(new Vault(p.vault));
   // Installation-wide outbound email (account confirmation, password reset, org
   // invites). Reads its live config + vaulted secret on each send, so connecting
   // a provider in Settings takes effect without a restart. Handed to identity so
@@ -194,18 +223,6 @@ async function main() {
     (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
-  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
-  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
-    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET);
-  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET);
-  // The service is always present. A fresh hosted instance configures it from
-  // the browser through GitHub's App Manifest flow; environment values are only
-  // an upgrade/enterprise bootstrap path.
-  const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
-    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
-    publicApp: deployment.hosted });
   const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
     ? new S3ObjectStore({
         endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),

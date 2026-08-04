@@ -183,6 +183,17 @@ export class GitHubAppService {
     return Boolean(this.options.appId?.trim() && this.broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE));
   }
 
+  /** Credentials for Better Auth's GitHub provider. Kept inside the process;
+   * the gateway status response never includes the secret. */
+  identityProviderCredentials(): { clientId: string; clientSecret: string } | undefined {
+    if (!this.options.clientId || !this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)) return undefined;
+    return {
+      clientId: this.options.clientId,
+      clientSecret: this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
+        { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] }),
+    };
+  }
+
   status(userId?: string): { configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
     webhookConfigured: boolean; syncMode: 'webhook' | 'on-demand'; userAuthorized: boolean } {
     let syncMode: 'webhook' | 'on-demand' = 'on-demand';
@@ -242,7 +253,7 @@ export class GitHubAppService {
       redirect_url: `${origin}/api/github/manifest/callback/${encodeURIComponent(state)}`,
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
-      callback_urls: [`${origin}/api/github/oauth/callback`],
+      callback_urls: [`${origin}/api/github/oauth/callback`, `${origin}/api/auth/callback/github`],
       default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
@@ -304,6 +315,31 @@ export class GitHubAppService {
     if (options.makeActive || !this.activeUserAccountId(userId))
       this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
     return identity;
+  }
+
+  /** Adopt the token Better Auth already obtained during GitHub sign-in. This
+   * avoids sending the person through GitHub a second time merely to connect
+   * the same identity to their profile. */
+  async adoptUserAuthorization(userId: string, value: { accountId: string; accessToken: string;
+    refreshToken?: string; accessTokenExpiresAt?: Date; refreshTokenExpiresAt?: Date }): Promise<GitHubUserIdentity> {
+    const identity = await this.identityForToken(value.accessToken);
+    if (identity.id !== value.accountId)
+      throw new Error(`GitHub signed in @${identity.login}, but the provider account id did not match`);
+    this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
+      accessToken: value.accessToken,
+      ...(value.accessTokenExpiresAt ? { expiresAt: value.accessTokenExpiresAt.getTime() } : {}),
+      ...(value.refreshToken ? { refreshToken: value.refreshToken } : {}),
+      ...(value.refreshTokenExpiresAt ? { refreshExpiresAt: value.refreshTokenExpiresAt.getTime() } : {}),
+    }));
+    const accounts = this.userAccounts(userId);
+    const prior = accounts.find((account) => account.id === identity.id);
+    this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), { ...prior, ...identity }]);
+    if (!this.activeUserAccountId(userId)) this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
+    return identity;
+  }
+
+  hasUserAuthorization(userId: string, accountId: string): boolean {
+    return this.broker.hasHandle(githubUserTokenHandle(userId, accountId));
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply
