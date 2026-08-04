@@ -1812,6 +1812,28 @@ html[data-theme="dark"] .github-signin-btn:active,
 .info-dot:hover { color: var(--accent); }
 .vault-custom summary { color: var(--ink-2); font-size: 13px; }
 .vault-custom summary:hover { color: var(--ink); }
+.totp-secret-control { position: relative; min-width: 0; }
+.totp-secret-control .vi-totp-input { box-sizing: border-box; width: 100%; transition: padding-right .14s ease; }
+.totp-secret-control.has-qr .vi-totp-input { padding-right: 136px; }
+.totp-qr-preview {
+  position: absolute; inset: 3px 3px 3px auto; display: flex; align-items: center; gap: 5px;
+  max-width: 130px; padding: 2px 3px; overflow: hidden; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--surface); color: var(--ink-2); box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+}
+.totp-qr-preview[hidden] { display: none; }
+.totp-qr-preview img { width: 26px; height: 26px; flex: none; border-radius: 3px; object-fit: cover; image-rendering: pixelated; }
+.totp-qr-status { min-width: 0; overflow: hidden; font-size: 10px; font-weight: 650; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
+.totp-qr-preview[data-state="ready"] .totp-qr-status { color: var(--ok, #26865b); }
+.totp-qr-preview[data-state="error"] .totp-qr-status { color: var(--danger); }
+.totp-qr-remove {
+  display: grid; width: 18px; height: 18px; flex: none; padding: 0; place-items: center;
+  border: 0; border-radius: 4px; background: transparent; color: var(--ink-3); font: inherit; cursor: pointer;
+}
+.totp-qr-remove:hover, .totp-qr-remove:focus-visible { background: var(--surface-2); color: var(--ink); outline: none; }
+@media (max-width: 480px) {
+  .totp-secret-control.has-qr .vi-totp-input { padding-right: 70px; }
+  .totp-qr-status { display: none; }
+}
 
 /* Live-socket gap. The console is websocket-driven, so when the socket is down
    the page is frozen rather than empty — say so instead of showing stale state
