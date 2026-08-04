@@ -16,6 +16,17 @@ import { materializeGitCredential } from './git-credential.js';
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
 
+function listPlainFiles(root: string, relative = ''): string[] {
+  const directory = relative ? path.join(root, relative) : root;
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const next = relative ? path.join(relative, entry.name) : entry.name;
+    if (entry.isDirectory()) files.push(...listPlainFiles(root, next));
+    else if (entry.isFile() || entry.isSymbolicLink()) files.push(next.split(path.sep).join('/'));
+  }
+  return files;
+}
+
 /**
  * Local git-worktree world (SPEC §11.2, the default backend). Each task gets an
  * isolated worktree on a `karmax/<taskId>` branch off the project's base. Work
@@ -61,19 +72,16 @@ export class WorktreeProvider implements WorldProvider {
         );
       }
     }
-    if (spec.scratch && resolvedSources.length) {
-      const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
-      resolvedSources.unshift({ repo: scratch, source: 'scratch', managed: false });
-    }
-
     const repos: WorldRepo[] = [];
     const warnings: string[] = [];
     const ephemeralPaths: string[] = [];
+    let scratchWorkdir: string | undefined;
     if (resolvedSources.length === 0) {
-      // No repo configured — a scratch sandbox (the world itself is the deliverable).
-      const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
-      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings, undefined, ephemeralPaths));
-    } else if (resolvedSources.length === 1 && spec.layout !== 'nested') {
+      // Zero-repo worlds still need a cwd for agent runtimes and commands, but
+      // there is no Git deliverable: create only a plain task directory.
+      if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+      fs.mkdirSync(root, { recursive: true });
+    } else if (resolvedSources.length === 1 && spec.layout !== 'nested' && !spec.scratch) {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
@@ -85,7 +93,12 @@ export class WorktreeProvider implements WorldProvider {
       // named after the repo (deduped on collision).
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });
-      const names = uniqueNames(resolvedSources.map((resolved) => repoName(resolved.source)));
+      const names = uniqueNames([...(spec.scratch ? ['scratch'] : []),
+        ...resolvedSources.map((resolved) => repoName(resolved.source))]);
+      if (spec.scratch) {
+        scratchWorkdir = path.join(root, names.shift()!);
+        fs.mkdirSync(scratchWorkdir, { recursive: true });
+      }
       for (let i = 0; i < resolvedSources.length; i++) {
         const name = names[i]!;
         const resolved = resolvedSources[i]!;
@@ -103,10 +116,11 @@ export class WorktreeProvider implements WorldProvider {
       // point the agent at the checkout rather than at the container holding it.
       // With several repos the agent is meant to see them side by side at the
       // root, and createWorld picks the workdir for companion-repo layouts.
-      ...(spec.layout === 'nested' && repos.length === 1 ? { workdir: repos[0]!.root } : {}),
+      ...(scratchWorkdir ? { workdir: scratchWorkdir }
+        : spec.layout === 'nested' && repos.length === 1 ? { workdir: repos[0]!.root } : {}),
       branch,
       base: spec.base,
-      repo: repos[0]!.repo,
+      ...(repos[0] ? { repo: repos[0].repo } : {}),
       target: spec.target,
       repos,
       ...(ephemeralPaths.length ? { meta: { ephemeralPaths } } : {}),
@@ -253,18 +267,6 @@ export class WorktreeProvider implements WorldProvider {
       await git(wt, ['config', '--worktree', 'user.signingKey', id.signingKeyPath]);
       await git(wt, ['config', '--worktree', 'commit.gpgsign', 'true']);
     }
-  }
-
-  private async makeScratchRepo(taskId: string, base: string): Promise<string> {
-    const repo = path.join(this.home, `scratch-${taskId}`);
-    fs.mkdirSync(repo, { recursive: true });
-    await gitOrThrow(repo, ['init', '-q', '-b', base || 'main']);
-    await ensureIdentity(repo);
-    const readme = path.join(repo, 'README.md');
-    if (!fs.existsSync(readme)) fs.writeFileSync(readme, `# karmax scratch repo\n`);
-    await git(repo, ['add', '-A']);
-    await git(repo, ['commit', '-q', '-m', 'init']);
-    return repo;
   }
 
   /**
@@ -428,9 +430,10 @@ class WorktreeWorld implements World {
 
   async listFiles(): Promise<string[]> {
     const repos = worldRepos(this.handle);
+    if (!repos.length) return listPlainFiles(this.handle.root);
     // Single-repo world: root is the worktree, list it directly.
-    if (repos.length <= 1) {
-      const dir = repos[0]?.root ?? this.handle.root;
+    if (repos.length === 1) {
+      const dir = repos[0]!.root;
       const r = await git(dir, ['ls-files', '--cached', '--others', '--exclude-standard']);
       return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
     }

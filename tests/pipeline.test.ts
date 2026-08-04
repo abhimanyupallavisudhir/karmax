@@ -111,6 +111,40 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it('v1.14 runs repository-less work through Do and Review without Git or Merge', async () => {
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.14.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        taskId,
+        projectId: 'p1',
+        title: 'State-only task',
+        prompt: '@run test ! -e .git\n@review State action completed',
+        base: 'main',
+        target: 'main',
+        project: { repos: [], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.branch).toBeUndefined();
+    expect(review.base).toBeUndefined();
+    expect(review.targetBranch).toBeUndefined();
+    expect(review.state.mergeDomain).toBeUndefined();
+    expect(review.actions.map((action: any) => action.label)).toContain('Confirm');
+    expect(review.actions.map((action: any) => action.label)).not.toContain('Confirm PR');
+    expect(review.messages.map((message: any) => message.text).join('\n')).toContain('ran: test ! -e .git (exit 0)');
+
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result).toEqual({ stage: 'done' });
+    const final = await view(handle);
+    expect(final.reviewInfo.summary).toMatch(/no repository merge required/i);
+    expect(h.store.eventsSince(taskId, 0).some((event) => event.type === 'merge.completed')).toBe(false);
+  }, 120_000);
+
   it('v1.13 waits for input until Open PR is explicitly requested', async () => {
     const repo = await h.makeRepo('explicit-open-pr');
     const taskId = newId('task');

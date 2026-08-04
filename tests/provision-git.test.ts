@@ -30,6 +30,13 @@ describe('shared cloud world git provisioning', () => {
     delete process.env.KARMAX_WORLD_CLONE_RETRY_MS;
   });
 
+  it('creates a plain directory without invoking Git when there are no repositories', async () => {
+    const { target, commands } = fakeTarget(() => undefined);
+    const provisioned = await provisionGitRepos(target, { taskId: 't0', base: 'main', repos: [] }, OPTIONS);
+    expect(provisioned).toMatchObject({ root: '/w', repos: [] });
+    expect(commands.some((command) => /\bgit\b/.test(command))).toBe(false);
+  });
+
   it('retries a transient clone failure after clearing the partial checkout', async () => {
     process.env.KARMAX_WORLD_CLONE_RETRY_MS = '0';
     let cloneAttempts = 0;
@@ -109,7 +116,7 @@ describe('shared cloud world git provisioning', () => {
     }
   });
 
-  it('keeps a scratch workspace beside a companion repository', async () => {
+  it('keeps a plain workspace beside a companion repository', async () => {
     const { target, commands } = fakeTarget((command) => {
       if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n` };
       return undefined;
@@ -122,7 +129,7 @@ describe('shared cloud world git provisioning', () => {
       repo: 'git@github.com:acme/project-wiki.git',
       root: '/w/project-wiki',
     });
-    expect(commands.some((command) => command.includes("git -C '/w/scratch' init"))).toBe(true);
+    expect(commands.some((command) => command.includes("git -C '/w/scratch' init"))).toBe(false);
   });
 });
 

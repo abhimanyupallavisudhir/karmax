@@ -799,20 +799,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
       }
-      // The project wiki is a platform-owned companion repository. Add it at
-      // provisioning time (rather than to deterministic workflow input), so
-      // old workflow histories remain replay-compatible.
+      const developmentSources = (args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
+        .map((source) => source.trim()).filter(Boolean);
+      // The project wiki is a platform-owned companion repository for source
+      // work. A zero-repo task reads and mutates project state through the
+      // platform API, so attaching the wiki there would secretly reintroduce a
+      // branch, worktree, Git credential, and merge into an otherwise non-Git run.
       const wikiRoot = project
         ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
         : undefined;
       if (project && !store.projectWiki(project.id)) store.setProjectWikiRepository(project.id);
       const wikiRepository = project ? store.projectWiki(project.id)?.repository : undefined;
-      if (remote && project && (!wikiRepository || !wikiRepository.private))
+      if (remote && developmentSources.length > 0 && project && (!wikiRepository || !wikiRepository.private))
         throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
-      const developmentSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
       const requestedSources = [
         ...developmentSources,
-        ...(wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
+        ...(developmentSources.length > 0 && wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
       ];
       const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
       const worldSources = remote ? cloudSources.map((resolved) => resolved.source) : requestedSources;
@@ -1874,7 +1876,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
-      const roots = repos.length ? repos : [{ name: '', root: handle.root }];
+      if (!repos.length) {
+        const changedFiles = (await world.listFiles()).map((file) => `${file} (new)`);
+        const summary = changedFiles.length ? `${changedFiles.length} file(s) in the task workspace.` : 'No file changes detected.';
+        record(handle.id, 'review.built', { files: changedFiles.length });
+        return { summary, changedFiles };
+      }
+      const roots = repos;
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {

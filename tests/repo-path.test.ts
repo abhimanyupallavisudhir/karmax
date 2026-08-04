@@ -83,10 +83,12 @@ describe('WorktreeProvider repo resolution (regression: ~ path silently scratche
     }
   });
 
-  it('still creates a scratch repo only when NO repo is configured', async () => {
+  it('creates a plain non-Git workspace when no repo is configured', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'rp3', base: 'main' });
-    expect(world.handle.repo).toMatch(/scratch-/);
+    expect(world.handle.repo).toBeUndefined();
+    expect(world.handle.repos).toEqual([]);
+    expect(fs.existsSync(path.join(world.handle.root, '.git'))).toBe(false);
     await world.destroy();
   });
 });

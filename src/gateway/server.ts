@@ -4803,10 +4803,9 @@ export class Gateway {
    * `onActivate` prep task — "make this project karmax-ready" — as the first task on
    * the list. The manifest supplies hosted-specific copy because isolated cloud
    * worlds do not need the local-worktree resource-collision scan. It's created as
-   * a **draft**: a project is usually created (name only)
-   * before its repository is configured, and a repo-oriented task can't run without
-   * one — so the prep task waits on the list for the user to queue once the repo is
-   * set, rather than failing creation or running against an empty sandbox.
+   * a **draft** so project creation never immediately spends an agent turn. The
+   * user may queue it before attaching a repository; software-dev treats that as
+   * its supported state-only, zero-repo case.
    * Best-effort: a failure here must never fail project creation.
    */
   private async spawnProjectPrepTask(token: string, projectId: string): Promise<void> {

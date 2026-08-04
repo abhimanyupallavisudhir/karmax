@@ -304,13 +304,19 @@ export async function softwareDevV1_13(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.13.0');
 }
 
+/** Repository-less projects use the ordinary Do and Review lifecycle without
+ * inventing a Git branch, pull request, merge queue lease, or merge activity. */
+export async function softwareDevV1_14(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.14.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -358,6 +364,8 @@ async function softwareDevImpl(
   // New activity calls in an existing stage would break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
   const githubPrLifecycle = minor >= 8;
+  const repositoryless = minor >= 14
+    && !(input.project.repos ?? []).some((repo) => typeof repo === 'string' && repo.trim().length > 0);
   // A PR can only name committed history. Earlier versions allowed Do to leave
   // a dirty tree for Merge, but opened the PR before the Merge agent ran; GitHub
   // therefore rejected exactly that valid workflow state with "no commits".
@@ -367,9 +375,9 @@ async function softwareDevImpl(
   // GitHub is the authoritative merge surface for PR-policy repositories. The
   // PR is opened before Review so the decision binds to its exact head SHA; the
   // merge itself uses a consenting human's user token and GitHub rules.
-  const githubAuthoritativeMerge = minor >= 12 && remotePolicyOf(input.project) === 'pr';
-  const proposalBeforeReview = minor >= 12;
-  const explicitPrCycle = minor >= 13;
+  const githubAuthoritativeMerge = !repositoryless && minor >= 12 && remotePolicyOf(input.project) === 'pr';
+  const proposalBeforeReview = !repositoryless && minor >= 12;
+  const explicitPrCycle = !repositoryless && minor >= 13;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -382,7 +390,7 @@ async function softwareDevImpl(
   // Multi-PR (SPEC §11.1): adopting a branch the Do agent added, and the
   // per-checkout Review gate. Gated from 1.9 on so an execution recorded before
   // it keeps the single-branch Review semantics on replay.
-  const multiPrEnabled = minor >= 9 && !!input.project.multiPr;
+  const multiPrEnabled = !repositoryless && minor >= 9 && !!input.project.multiPr;
   const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   // Activity retry options are recorded with the ScheduleActivityTask command, so
   // bounding the coordinator's unlimited default is a versioned behavior change.
@@ -668,7 +676,7 @@ async function softwareDevImpl(
         ...(explicitPrCycle && stage === 'do' ? [openPr] : []),
         ...(stage === 'review' ? [confirm] : []),
         ...(pausedRole ? [followUp] : []),
-        ...(stage === 'do' || stage === 'review' ? [setTarget] : []),
+        ...(!repositoryless && (stage === 'do' || stage === 'review') ? [setTarget] : []),
         cancel,
       ];
     }
@@ -677,9 +685,10 @@ async function softwareDevImpl(
       case 'setup':
         return [cancel];
       case 'do':
-        return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp, setTarget, cancel];
+        return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp,
+          ...(!repositoryless ? [setTarget] : []), cancel];
       case 'review':
-        return [confirm, followUp, setTarget, cancel];
+        return [confirm, followUp, ...(!repositoryless ? [setTarget] : []), cancel];
       case 'pr':
         return [cancel];
       case 'merge':
@@ -729,8 +738,8 @@ async function softwareDevImpl(
         worldReady: !!world,
         mergeGranted,
         targetLocked,
-        mergeDomain: world ? mergeQueueDomains(world, target, input.projectId)[0] : undefined,
-        ...(publishesAllMergeDomains && world
+        mergeDomain: world && !repositoryless ? mergeQueueDomains(world, target, input.projectId)[0] : undefined,
+        ...(publishesAllMergeDomains && world && !repositoryless
           ? { mergeDomains: mergeQueueDomains(world, target, input.projectId) }
           : {}),
         // A failed Temporal execution is terminal. Persist the full handle needed
@@ -740,9 +749,7 @@ async function softwareDevImpl(
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
       },
-      branch: world?.branch,
-      base,
-      targetBranch: target,
+      ...(!repositoryless ? { branch: world?.branch, base, targetBranch: target } : {}),
       world,
       worldPath: world?.workdir ?? world?.root,
       pr,
@@ -2256,6 +2263,25 @@ async function softwareDevImpl(
       continue;
     }
   }
+  }
+
+  if (repositoryless) {
+    stage = 'done';
+    status = 'done';
+    reviewInfo = {
+      ...reviewInfo,
+      summary: reviewInfo?.summary
+        ? `${reviewInfo.summary}\n\nCompleted; no repository merge required.`
+        : 'Completed; no repository merge required.',
+    };
+    await publish();
+    const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
+    await core.destroyWorld(world as any);
+    if (remoteWorld) {
+      world = undefined;
+      await publish();
+    }
+    return { stage };
   }
 
   // ── PR (optional) ──

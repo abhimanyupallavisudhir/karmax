@@ -122,13 +122,11 @@ export interface WorldSpec {
   /** Tenant used to resolve the provider connection inside the trusted activity.
    * It is non-secret and is sealed into remote handles for later resume. */
   organizationId?: string;
-  /** Source repo (worktree). When absent (and `repos` is empty) a scratch repo is created. */
+  /** Source repo (worktree). When absent (and `repos` is empty), the world is a plain directory. */
   repo?: string;
-  /** Source repos for a multi-repo world. Takes precedence over `repo`. Empty ⇒ scratch. */
+  /** Source repos for a multi-repo world. Takes precedence over `repo`. Empty means no Git checkout. */
   repos?: string[];
-  /** Keep a scratch working directory in addition to configured companion
-   * repositories. Used by repository-less projects whose wiki still branches
-   * with the task, without turning the wiki checkout into the task workspace. */
+  /** Keep a plain working directory in addition to configured companion repos. */
   scratch?: boolean;
   base: string;
   target?: string;

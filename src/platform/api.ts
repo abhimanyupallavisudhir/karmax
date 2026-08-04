@@ -549,36 +549,23 @@ export class KarmaxApi {
     }
   }
 
-  /**
-   * A repo-oriented workflow — one whose manifest declares a `repos` param — run
-   * against a project with no repository configured would silently get a
-   * throwaway scratch repo from the world provider (worktree.ts): the agent ends
-   * up in an empty README-only sandbox instead of the user's code, with no signal
-   * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
-   * rather than let a whole attempt burn against the wrong world.
-   */
-  private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
+  /** Validate configured repository selections without making repositories a
+   * prerequisite. An empty effective list is the supported zero-repo form of a
+   * workflow; hosted repository enrollment applies only when a repo was chosen. */
+  private assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
-    if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
+    if (!needsRepo) return;
+    const repositories = effectiveRepos(resolved, project.config);
+    if (!repositories.length) return;
     if (this.deps.hosted) {
       const linked = this.deps.store.listProjectRepositories(project.id);
       if (!linked.length) {
         throw new Error('Please connect GitHub in organization settings, then add a git repo in project settings.');
       }
       const enrolled = linked.map((candidate) => candidate.repository.sshUrl);
-      const outside = effectiveRepos(resolved, project.config)
+      const outside = repositories
         .filter((repository) => !enrolled.some((candidate) => sameRepository(candidate, repository)));
       if (outside.length) throw new Error('Please choose a GitHub repo attached to this project in project settings.');
-    }
-    // Guard on the EFFECTIVE repo list the world will be built from (the resolved
-    // settings overlay, falling back to project config) — the same value that
-    // reaches createWorld — not project.config alone. Those two can diverge (an
-    // empty settings-overlay repos list resolving to nothing while config still
-    // holds a repo), and checking config-only let that case slip through into a
-    // silent scratch sandbox — the very footgun this guard exists to prevent.
-    const configured = effectiveRepos(resolved, project.config).length > 0;
-    if (!configured) {
-      throw new Error('Please add a git repo in project settings.');
     }
   }
 
@@ -666,10 +653,9 @@ export class KarmaxApi {
     // against that task's project before anything is created.
     this.authorizeResumeSources(token, taskOverrides);
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
-    // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
-    // (drafts may still be saved without one, then checked again at queueTask).
-    // Checked after resolution so the guard sees the same repos the world will.
-    if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
+    // Validate any repository selection after resolution so this sees the exact
+    // effective list the world will. An empty list is a supported zero-repo run.
+    if (!args.draft) this.assertRepositoriesValid(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     const callerRef = principalRefOf(caller.principal, caller.kind);
@@ -1091,7 +1077,7 @@ export class KarmaxApi {
     if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
     this.assertHumanRoutes(task, manifest, resolved);
     // Same guard as createTask, on the resolved effective repos, before we clear the draft.
-    this.assertRepoConfigured(manifest, project, resolved);
+    this.assertRepositoriesValid(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
