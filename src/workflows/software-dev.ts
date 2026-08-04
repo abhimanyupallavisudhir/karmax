@@ -176,6 +176,9 @@ export interface SoftwareDevInput extends TaskInput {
    *  sub-agents were still running when its turn returned — interruptible by a human
    *  follow-up. Overridable so tests don't wait the full interval. */
   subagentWaitMs?: number;
+  /** Test/embedding override for GitHub policy polling. Production uses the
+   * durable 30-second poll from the domain contract. */
+  githubPollMs?: number;
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
@@ -203,6 +206,9 @@ const DEFAULT_SUBAGENT_WAIT_MS = 10_000;
  *  be a dev server the task deliberately left running, so we must not park on it long.
  *  After the budget we proceed to Review with a note. */
 const MAX_SHELL_NUDGES = 3;
+/** Transient GitHub/API failures are retried automatically, but unlike a real
+ * pending check they are not allowed to disguise a permanent outage forever. */
+const MAX_GITHUB_ERROR_POLLS = 3;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -304,13 +310,19 @@ export async function softwareDevV1_13(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.13.0');
 }
 
+/** GitHub policy states are classified into Do repair, targeted human input,
+ * bounded infrastructure retry, or a genuine checks/queue wait. */
+export async function softwareDevV1_14(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.14.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -370,6 +382,7 @@ async function softwareDevImpl(
   const githubAuthoritativeMerge = minor >= 12 && remotePolicyOf(input.project) === 'pr';
   const proposalBeforeReview = minor >= 12;
   const explicitPrCycle = minor >= 13;
+  const classifiedGithubStates = minor >= 14;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -683,7 +696,9 @@ async function softwareDevImpl(
       case 'pr':
         return [cancel];
       case 'merge':
-        return waitingFor?.kind === 'human' ? [confirm, cancel] : [cancel];
+        return waitingFor?.kind === 'human'
+          ? [confirm, ...(classifiedGithubStates ? [followUp] : []), cancel]
+          : [cancel];
       case 'resolve':
         return [cancel];
       case 'escalated':
@@ -2304,6 +2319,7 @@ async function softwareDevImpl(
   let mergeAttempts = 0;
   let mergeConflict: string | undefined;
   let mergeDirty: string | undefined;
+  let githubErrorPolls = 0;
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -2400,7 +2416,11 @@ async function softwareDevImpl(
         }
       } catch (err) {
         if (githubAuthoritativeMerge) {
-          githubResult = { status: 'waiting', prs, detail: String(err) };
+          githubResult = {
+            status: classifiedGithubStates ? 'retryable-error' : 'waiting',
+            prs,
+            detail: String(err),
+          };
         } else {
           result = { merged: false, landedFiles: [], note: String(err) };
         }
@@ -2439,36 +2459,68 @@ async function softwareDevImpl(
         checkoutApprovals = {};
         stage = 'do';
         status = 'active';
+        githubErrorPolls = 0;
         continue proposalCycle;
       }
-      if (decision.status === 'needs-authorizer' || decision.status === 'stale-review') {
-        // A controlled terminal human layer. It does not rewrite the configured
-        // Review route (already consumed/frozen); its only meaning is consent to
-        // retry this unchanged GitHub proposal under the confirming person's
-        // token. Every retry re-checks repository permission live.
-        confirmed = false;
+      if (classifiedGithubStates && decision.status === 'retryable-error'
+        && ++githubErrorPolls < MAX_GITHUB_ERROR_POLLS) {
         status = 'waiting';
-        const eligible = decision.eligibleUserIds ?? [];
-        const audience = eligible.length
-          ? [...eligible.map((userId) => `user:${userId}`), '@creator']
-          : ['@creator'];
         waitingFor = {
-          kind: 'human', audience,
-          detail: decision.detail ?? (decision.status === 'stale-review'
-            ? 'The pull request changed after Review; review and confirm the new head.'
-            : 'A connected human with GitHub merge access must confirm this merge.'),
+          kind: 'github',
+          detail: `${decision.detail ?? 'GitHub is temporarily unavailable'} Retrying automatically (${githubErrorPolls}/${MAX_GITHUB_ERROR_POLLS}).`,
         };
         await publish();
-        await condition(() => confirmed || cancelled);
+        await condition(() => cancelled, input.githubPollMs ?? MERGE_POLL);
         waitingFor = undefined;
         if (cancelled) return await abort();
-        confirmed = false;
         continue;
       }
+      if (decision.status === 'needs-authorizer'
+        || (classifiedGithubStates && (decision.status === 'needs-human' || decision.status === 'retryable-error'))) {
+        // A controlled human layer. Authorization failures retry under the
+        // confirming person's live token; PR-policy decisions (draft/closed/
+        // required review) retry after the human changes GitHub. A follow-up has
+        // a different meaning: return the preserved proposal to Do.
+        confirmed = false;
+        status = 'waiting';
+        const audience = [...new Set([
+          ...(decision.eligibleUserIds ?? []).map((userId) => `user:${userId}`),
+          ...(decision.actorUserId ? [`user:${decision.actorUserId}`] : []),
+          '@creator',
+        ])];
+        const waitSeen = msgs.length;
+        const exhausted = decision.status === 'retryable-error'
+          ? ` GitHub failed ${githubErrorPolls} consecutive times; retry after fixing the connection, or send a follow-up to return this task to Do.`
+          : '';
+        waitingFor = {
+          kind: 'human', audience,
+          detail: `${decision.detail ?? (decision.status === 'needs-authorizer'
+            ? 'A connected human with GitHub merge access must confirm this merge.'
+            : 'The pull request needs human attention on GitHub.')}${exhausted}`,
+        };
+        await publish();
+        await condition(() => confirmed || cancelled || msgs.length > waitSeen);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (msgs.length > waitSeen) {
+          confirmed = false;
+          prRequested = false;
+          branchPreparedForPr = false;
+          checkoutApprovals = {};
+          githubErrorPolls = 0;
+          stage = 'do';
+          status = 'active';
+          continue proposalCycle;
+        }
+        confirmed = false;
+        githubErrorPolls = 0;
+        continue;
+      }
+      githubErrorPolls = 0;
       status = 'waiting';
       waitingFor = { kind: 'github', detail: decision.detail ?? 'Waiting for GitHub checks or merge queue.' };
       await publish();
-      await condition(() => cancelled, '30s');
+      await condition(() => cancelled, classifiedGithubStates ? (input.githubPollMs ?? MERGE_POLL) : '30s');
       waitingFor = undefined;
       if (cancelled) return await abort();
       continue;

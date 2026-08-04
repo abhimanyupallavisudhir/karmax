@@ -456,6 +456,25 @@ describe('task stage transitions', () => {
     expect(held?.actions[0]?.roles).toEqual(['do']);
     await expect(f.api.signalTask(f.token, f.task.id, 'followUp', 'redirect this', 'do'))
       .resolves.toBeDefined();
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'do' });
+  });
+
+  it('offers an explicit Merge-to-Do repair transition and preserves the PR checkpoint', async () => {
+    const f = fixture();
+    const prs = [{ repo: 'app', slug: 'acme/app', number: 7, url: 'https://github.test/acme/app/pull/7',
+      state: 'open' as const, headSha: 'reviewed-head' }];
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'merge',
+      status: 'waiting',
+      waitingFor: { kind: 'github', detail: 'policy blocked' },
+      prs,
+    });
+
+    const merge = await f.api.getTaskView(f.token, f.task.id);
+    expect(merge?.stageTransitions?.map((move) => move.target)).toEqual(['human', 'do', 'draft', 'done']);
+    await f.api.moveTaskStage(f.token, f.task.id, 'do');
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', prs });
   });
 
   it('does not advertise a lossy human hold from the internal Resolve frame', async () => {
