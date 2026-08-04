@@ -5891,19 +5891,39 @@ function wireReviewActions(v) {
 const resourceReviewCache = new Map();
 async function wireResourceReview(v, force = false) {
   const wrap = document.getElementById('review-resources');
-  if (!wrap || !v.reviewInfo) return;
+  if (!wrap || v.stage !== 'review') return;
   try {
     const cached = resourceReviewCache.get(v.taskId);
     let items;
     if (!force && cached && Date.now() - cached.at < 15_000) items = cached.items;
     else {
-      items = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources`);
-      resourceReviewCache.set(v.taskId, { at: Date.now(), items });
+      const [loaded, inventory] = await Promise.all([
+        api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources`),
+        api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/inventory`).catch(() => ({ entries: [], truncated: false })),
+      ]);
+      items = loaded;
+      resourceReviewCache.set(v.taskId, { at: Date.now(), items, inventory });
     }
-    if (!document.body.contains(wrap) || !items.length) return;
+    const inventory = resourceReviewCache.get(v.taskId)?.inventory ?? { entries: [], truncated: false };
+    if (!document.body.contains(wrap) || (!items.length && !inventory.entries?.length)) return;
     wrap.classList.remove('hidden');
     wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
       const resource = item.resource;
+      if (item.candidate) {
+        const candidate = item.candidate;
+        const target = resource.target?.kind === 'path' ? resource.target.path : resource.target?.name;
+        const source = candidate.sourceKind === 'path' ? candidate.sourcePath : `vault item ${candidate.vaultItemId}`;
+        const size = item.revision ? `${formatBytes(item.revision.bytes)} · ${item.revision.files ?? 0} file${item.revision.files === 1 ? '' : 's'}`
+          : candidate.sourceKind === 'path' ? 'snapshot incomplete — discard this candidate' : 'credential value remains in the vault';
+        const state = candidate.state === 'pending'
+          ? `<div class="inline-form"><button class="btn sm primary candidate-adopt" data-candidate-id="${esc(candidate.id)}">Adopt as project resource</button><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Discard candidate</button></div>`
+          : candidate.state === 'discarding'
+            ? `<div class="inline-form"><span class="chip">Discard interrupted</span><button class="btn sm candidate-discard" data-candidate-id="${esc(candidate.id)}">Retry discard</button></div>`
+          : `<span class="chip">${candidate.state === 'adopted' ? 'Adopted into project' : candidate.state === 'discarding' ? 'Discarding staged bytes…' : 'Discarded'}</span>`;
+        return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name || 'Resource candidate')}</b>
+          <div class="task-sub">${esc(size)} · ${esc(source || '')} → ${esc(target || '')} · ${esc(resource.access || 'read')} access</div>
+          <div class="task-sub">Bound to world generation ${esc(String(candidate.worldGeneration))}; staged bytes are encrypted and retained until Adopt/Discard. Estimated retained cost: $0.00 under the current deployment storage policy (usage is recorded).</div></div>${state}</div>`;
+      }
       if (item.discarded) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub">Task fork discarded; project baseline unchanged.</div></div>`;
       if (item.error) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub" style="color:var(--warn)">${esc(item.error)}</div></div>`;
       const summary = item.summary;
@@ -5918,7 +5938,25 @@ async function wireResourceReview(v, force = false) {
         : `<span class="chip">${resource.publish === 'discard' ? 'Task fork will be discarded' : 'Unchanged'}</span>`;
       return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
         <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
-    }).join('')}`;
+    }).join('')}${inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
+      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; Krmax did not upload their contents.</div>
+      <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : ''}`;
+    wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
+      button.disabled = true; button.textContent = 'Adopting…';
+      try {
+        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resource-candidates/${encodeURIComponent(button.dataset.candidateId)}/adopt`, { method: 'POST' });
+        toast('Resource adopted into the project'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
+      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Adopt as project resource'; }
+    }));
+    wrap.querySelectorAll('.candidate-discard').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm('Discard this staged candidate? Its encrypted snapshot will be deleted; Git changes are unaffected.')) return;
+      button.disabled = true;
+      try {
+        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resource-candidates/${encodeURIComponent(button.dataset.candidateId)}/discard`, { method: 'POST' });
+        toast('Resource candidate discarded'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    }));
     wrap.querySelectorAll('.resource-promote').forEach((button) => {
       button.addEventListener('click', async () => {
         button.disabled = true;
@@ -6162,15 +6200,15 @@ function overviewTab(v) {
       : v.reviewInfo?.completion === 'raised'
         ? `<div class="task-sub" style="color:var(--ink-3);margin:0 0 6px">↑ Agent raised for a decision</div>`
         : '';
-  const review = v.reviewInfo
+  const review = v.reviewInfo || v.stage === 'review'
     ? `<div class="section-h">${v.stage === 'review' ? 'Review' : 'Work summary'}</div>
        <div class="review">
          ${completionBadge}
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
-         ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
+         ${v.reviewInfo?.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
-         ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
+         ${v.reviewInfo?.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
+         ${v.reviewInfo?.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
          <div id="review-resources" class="hidden"></div>
        </div>`
     : '';

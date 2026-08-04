@@ -13,6 +13,9 @@ import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
 import { ensureWorldExcluded } from '../src/world/secret-exclude.js';
+import { itemHandle, VaultItems } from '../src/autonomy/vault-items.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
+import { CapabilityError, KarmaxApi } from '../src/platform/api.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -183,6 +186,192 @@ describe('project resources', () => {
     await resources.deleteAttachment(attachment.id);
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stages a task-created ignored dataset and adopts it after the world is gone', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-candidate-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'downloads/\n');
+    fs.writeFileSync(path.join(repo, 'README.md'), 'base\n');
+    await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const store = new Store(':memory:'); const project = store.createProject('Candidates', { repos: [repo] });
+    const task = store.createTask({ projectId: project.id, title: 'Download model', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'download it' } });
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.exec('mkdir', ['-p', 'downloads']);
+    await world.writeFileBuffer!('downloads/model.bin', Buffer.from('agent-created-model'));
+
+    const proposed = await resources.proposePath(task.id, {
+      path: 'downloads', name: 'Downloaded model', target: { kind: 'path', path: 'models/downloaded' },
+      access: 'read', publish: 'discard',
+    });
+    expect(proposed.candidate).toMatchObject({ taskId: task.id, worldId: world.handle.id,
+      worldGeneration: world.handle.generation ?? 1, state: 'pending', sourceKind: 'path', sourcePath: 'downloads' });
+    expect(proposed.attachment.enabled).toBe(false);
+    expect(proposed.revision).toMatchObject({ bytes: Buffer.byteLength('agent-created-model'), files: 1,
+      createdByTaskId: task.id });
+
+    await world.destroy();
+    const adopted = await resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
+    expect(adopted.attachment.enabled).toBe(true);
+    expect(adopted.candidate).toMatchObject({ state: 'adopted', resolvedBy: 'user:reviewer' });
+    const consumer = store.createTask({ projectId: project.id, title: 'Use model', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'use it' } });
+    const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });
+    consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
+    expect(await consumerWorld.readFileBuffer('models/downloaded/model.bin')).toEqual(Buffer.from('agent-created-model'));
+    await resources.release(consumerWorld.handle); await consumerWorld.destroy();
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('discards staged candidates, preserves vault items, and inventories undeclared ignored paths without content', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-candidate-discard-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'generated/\n.env.local\nscratch.bin\n');
+    await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const store = new Store(':memory:'); const project = store.createProject('Candidates', { repos: [repo] });
+    const task = store.createTask({ projectId: project.id, title: 'Generate', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'generate' } });
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.exec('mkdir', ['-p', 'generated']); await world.writeFile('generated/data.bin', 'candidate bytes');
+    await world.writeFile('.env.local', 'API_KEY=must-not-be-read'); await world.writeFile('scratch.bin', 'scratch-content');
+    const staged = await resources.proposePath(task.id, { path: 'generated', name: 'Generated data',
+      target: { kind: 'path', path: 'data/generated' }, access: 'read', publish: 'discard' });
+
+    const inventory = await resources.ignoredInventory(task.id);
+    expect(inventory.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: '.env.local', likelySecret: true }),
+      expect.objectContaining({ path: 'scratch.bin', bytes: Buffer.byteLength('scratch-content') }),
+    ]));
+    expect(inventory.entries.some((entry) => entry.path.startsWith('generated'))).toBe(false);
+    expect(JSON.stringify(inventory)).not.toContain('must-not-be-read');
+    expect(JSON.stringify(inventory)).not.toContain('scratch-content');
+
+    await resources.discardCandidate(task.id, staged.candidate.id, 'user:reviewer');
+    expect(store.getResourceCandidate(staged.candidate.id)).toMatchObject({ state: 'discarded' });
+    expect(store.getResourceAttachment(staged.attachment.id)).toBeUndefined();
+    expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
+
+    const handle = itemHandle('vi_generated', 'secret');
+    broker.registerHandle(handle, 'generated-api-key');
+    const credential = await resources.proposeCredential(task.id, {
+      itemId: 'vi_generated', field: 'secret', credentialHandle: handle, name: 'Generated API key',
+      driver: 'secret@1', target: { kind: 'environment', name: 'GENERATED_API_KEY' }, access: 'read',
+    });
+    await resources.discardCandidate(task.id, credential.candidate.id, 'user:reviewer');
+    expect(broker.hasHandle(handle)).toBe(true);
+    await world.destroy(); store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adopts an agent-created vault item as a secret attachment without revealing it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-vault-candidate-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'base\n'); await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const store = new Store(':memory:'); const project = store.createProject('Credentials', { repos: [repo] });
+    const task = store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'create it' } });
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    const handle = itemHandle('vi_agent_key', 'secret'); broker.registerHandle(handle, 'sk-agent-created');
+    const proposed = await resources.proposeCredential(task.id, {
+      itemId: 'vi_agent_key', field: 'secret', credentialHandle: handle, name: 'Agent API key', driver: 'secret@1',
+      target: { kind: 'environment', name: 'AGENT_API_KEY' }, access: 'read',
+    });
+    expect(JSON.stringify(proposed)).not.toContain('sk-agent-created');
+    const adopted = await resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
+    expect(adopted.attachment.source).toMatchObject({ adoptedFromCandidate: proposed.candidate.id });
+    expect(adopted.attachment.source.candidate).toBeUndefined();
+    const consumer = store.createTask({ projectId: project.id, title: 'Consume', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'consume' } });
+    const consumerWorld = await worlds.create('worktree', { taskId: consumer.id, repo, base: 'main' });
+    consumerWorld.handle = await resources.materialize(project.id, consumer.id, consumerWorld, 1);
+    const wrapped = resources.withEnvironment(consumerWorld);
+    expect((await wrapped.exec('bash', ['-lc', 'printf %s "$AGENT_API_KEY"'])).stdout).toBe('sk-agent-created');
+    expect(JSON.stringify(consumerWorld.handle)).not.toContain('sk-agent-created');
+    await resources.release(consumerWorld.handle); await consumerWorld.destroy(); await world.destroy();
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('allows only the calling task’s vault items and current generation through the platform proposal', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-proposal-auth-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'base\n'); await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const store = new Store(':memory:'); const project = store.createProject('Authorization', { repos: [repo] });
+    const task = store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'create it' } });
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    const vault = new VaultItems(store, broker, path.join(dir, 'state'), project.organizationId!);
+    const own = vault.save({ type: 'api-key', label: 'Own', secrets: { secret: 'own-secret' },
+      provenance: { source: `task:${task.id}`, taskId: task.id } });
+    const foreign = vault.save({ type: 'api-key', label: 'Foreign', secrets: { secret: 'foreign-secret' },
+      provenance: { source: 'manual' } });
+    const tokens = new TokenAuthority();
+    const mint = (generation: number) => tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do',
+      principal: 'user:creator', projectId: project.id, organizationId: project.organizationId,
+      ceiling: ['task:review:write'], grantorCaps: ['task:review:write'], worldGeneration: generation }).token;
+    const signals: Array<{ taskId: string; signal: string }> = [];
+    const client = { workflow: { getHandle: (taskId: string) => ({
+      signal: async (signal: string) => { signals.push({ taskId, signal }); },
+    }) } } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'karmax', tokens, worlds, resources, broker });
+    const proposal = (token: string, itemId: string) => api.proposeProjectResource(token, {
+      source: { kind: 'vault-item', itemId }, name: 'API key', driver: 'secret@1',
+      target: { kind: 'environment', name: 'API_KEY' }, access: 'read',
+    });
+    await expect(proposal(mint((world.handle.generation ?? 1) + 1), own.id)).rejects.toBeInstanceOf(CapabilityError);
+    await expect(proposal(mint(world.handle.generation ?? 1), foreign.id)).rejects.toBeInstanceOf(CapabilityError);
+    const ownProposal = await proposal(mint(world.handle.generation ?? 1), own.id);
+    expect(ownProposal).toMatchObject({
+      candidate: { taskId: task.id, vaultItemId: own.id, state: 'pending' },
+    });
+    const agentReviewer = tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
+      principal: 'user:reviewer', projectId: project.id, organizationId: project.organizationId,
+      ceiling: ['task:review:execute'], grantorCaps: ['task:review:execute'] }).token;
+    await expect(api.adoptProjectResource(agentReviewer, task.id, ownProposal.candidate.id))
+      .rejects.toBeInstanceOf(CapabilityError);
+    const reviewer = tokens.mintPrincipal('user:reviewer', ['task:review:execute'], project.id,
+      undefined, project.organizationId).token;
+    await api.adoptProjectResource(reviewer, task.id, ownProposal.candidate.id);
+    expect(signals).toContainEqual({ taskId: task.id, signal: 'resourceResolved' });
+    await expect(api.proposeProjectResource(mint(world.handle.generation ?? 1), {
+      source: { kind: 'vault-item', itemId: own.id }, name: 'Writable database', driver: 'database@1',
+      target: { kind: 'service', name: 'DATABASE_URL' }, access: 'write',
+    })).rejects.toBeInstanceOf(CapabilityError);
+    const sharedWrite = tokens.mint({ taskId: task.id, profileId: 'maintainer', role: 'do',
+      principal: 'user:creator', projectId: project.id, organizationId: project.organizationId,
+      ceiling: ['task:review:write', 'project:resource:shared-write'],
+      grantorCaps: ['task:review:write', 'project:resource:shared-write'],
+      worldGeneration: world.handle.generation ?? 1 }).token;
+    await expect(api.proposeProjectResource(sharedWrite, {
+      source: { kind: 'vault-item', itemId: own.id }, name: 'Writable database', driver: 'database@1',
+      target: { kind: 'service', name: 'DATABASE_URL' }, access: 'write',
+    })).resolves.toMatchObject({ attachment: { access: 'write', isolation: 'shared' } });
+    await world.destroy(); store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 

@@ -215,6 +215,9 @@ export interface WorldCheckpoint {
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
   resources?: Array<{ attachmentId: string; revisionId: string }>;
+  /** Metadata-only inventory of ignored paths omitted from the portable delta.
+   * Contents are never read or uploaded by this safety net. */
+  ignored?: IgnoredResourceInventory;
   /** Accepted provider-neutral runtime declarations pinned at checkpoint time.
    * Provider snapshots remain accelerators; generated endpoints are excluded. */
   environment?: ProjectEnvironmentSpec;
@@ -531,6 +534,32 @@ export interface ResourceRevision {
   metadata?: Record<string, unknown>;
   createdByTaskId?: string;
   createdAt: number;
+}
+
+/** A task-owned proposal to make newly-created non-Git state a project
+ * resource. The attachment is kept disabled until Review adopts it; snapshot
+ * bytes are already durable so provider loss cannot race the decision. */
+export interface ResourceCandidate {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  taskId: string;
+  worldId: string;
+  worldGeneration: number;
+  attachmentId: string;
+  sourceKind: 'path' | 'vault-item';
+  sourcePath?: string;
+  vaultItemId?: string;
+  vaultField?: string;
+  state: 'pending' | 'adopted' | 'discarding' | 'discarded';
+  createdAt: number;
+  resolvedAt?: number;
+  resolvedBy?: string;
+}
+
+export interface IgnoredResourceInventory {
+  entries: Array<{ checkout?: string; path: string; bytes: number; likelySecret: boolean }>;
+  truncated: boolean;
 }
 
 export type ResourceLeaseState = 'preparing' | 'active' | 'released' | 'failed';

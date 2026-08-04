@@ -51,6 +51,7 @@ import {
   ResourceAttachment,
   ResourceRevision,
   ResourceLease,
+  ResourceCandidate,
   DEFAULT_URGENCY,
   URGENCY_LEVELS,
   normalizeUrgency,
@@ -397,6 +398,13 @@ export class Store {
         bytes INTEGER NOT NULL,
         PRIMARY KEY(organizationId, chunkId)
       );
+      CREATE TABLE IF NOT EXISTS resource_candidates (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        taskId TEXT NOT NULL, worldId TEXT NOT NULL, worldGeneration INTEGER NOT NULL,
+        attachmentId TEXT NOT NULL UNIQUE, sourceKind TEXT NOT NULL, sourcePath TEXT,
+        vaultItemId TEXT, vaultField TEXT, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
+        resolvedAt INTEGER, resolvedBy TEXT
+      );
       CREATE TABLE IF NOT EXISTS runner_pools (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT NOT NULL, region TEXT, mode TEXT NOT NULL, capacity TEXT NOT NULL,
@@ -586,6 +594,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_resource_attachments_project ON resource_attachments(projectId, createdAt);
       CREATE INDEX IF NOT EXISTS idx_resource_revisions_attachment ON resource_revisions(attachmentId, createdAt DESC);
       CREATE INDEX IF NOT EXISTS idx_resource_leases_world ON resource_leases(worldId, worldGeneration);
+      CREATE INDEX IF NOT EXISTS idx_resource_candidates_task ON resource_candidates(taskId, state, createdAt);
       CREATE INDEX IF NOT EXISTS idx_runner_pools_org ON runner_pools(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_provider_connections_org ON world_provider_connections(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_leases_pool ON world_leases(runnerPoolId, state, priority DESC, createdAt);
@@ -957,6 +966,7 @@ export class Store {
         .map((row) => String(row.id));
       deleteRows(this.db, 'resource_leases', 'attachmentId', resourceIds);
       deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
+      this.db.prepare('DELETE FROM resource_candidates WHERE projectId=?').run(id);
       this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
       this.deletePermissionRequestKv(project.organizationId, taskIds);
       this.deleteProjectKv([id], taskIds);
@@ -1033,6 +1043,8 @@ export class Store {
         .map(({ sealedRef: _sealedRef, ...row }) => row),
       resource_leases: rowsFor(this.db, 'resource_leases', 'taskId', taskIds)
         .map(({ sealedDriverRef: _sealed, ...row }) => row),
+      resource_candidates: rowsFor(this.db, 'resource_candidates', 'taskId', taskIds)
+        .map(({ vaultItemId: _item, vaultField: _field, ...row }) => row),
       project_memberships: rowsFor(this.db, 'project_memberships', 'projectId', projectIds),
       task_lists: rowsFor(this.db, 'task_lists', 'projectId', projectIds),
       tasks: rowsFor(this.db, 'tasks', 'projectId', projectIds),
@@ -3443,6 +3455,84 @@ export class Store {
       .map(resourceRevisionRow);
   }
 
+  createResourceCandidate(input: Omit<ResourceCandidate, 'id' | 'createdAt' | 'state'>
+    & Partial<Pick<ResourceCandidate, 'id' | 'createdAt' | 'state'>>): ResourceCandidate {
+    const task = this.getTask(input.taskId);
+    const attachment = this.getResourceAttachment(input.attachmentId);
+    if (!task || task.projectId !== input.projectId) throw new Error('resource candidate task does not belong to project');
+    if (!attachment || attachment.projectId !== input.projectId || attachment.enabled)
+      throw new Error('resource candidate requires a disabled attachment in the same project');
+    const value: ResourceCandidate = { ...input, id: input.id ?? newId('resource-candidate'),
+      state: input.state ?? 'pending', createdAt: input.createdAt ?? Date.now() };
+    if (!['path', 'vault-item'].includes(value.sourceKind)) throw new Error('invalid resource candidate source');
+    this.db.prepare(`INSERT INTO resource_candidates (id, organizationId, projectId, taskId, worldId,
+      worldGeneration, attachmentId, sourceKind, sourcePath, vaultItemId, vaultField, state, createdAt,
+      resolvedAt, resolvedBy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        value.id, value.organizationId, value.projectId, value.taskId, value.worldId, value.worldGeneration,
+        value.attachmentId, value.sourceKind, value.sourcePath ?? null, value.vaultItemId ?? null,
+        value.vaultField ?? null, value.state, value.createdAt, value.resolvedAt ?? null, value.resolvedBy ?? null);
+    return value;
+  }
+
+  getResourceCandidate(id: string): ResourceCandidate | undefined {
+    const row = this.db.prepare('SELECT * FROM resource_candidates WHERE id=?').get(id) as any;
+    return row ? resourceCandidateRow(row) : undefined;
+  }
+
+  listResourceCandidates(taskId: string, includeResolved = true): ResourceCandidate[] {
+    const rows = includeResolved
+      ? this.db.prepare('SELECT * FROM resource_candidates WHERE taskId=? ORDER BY createdAt').all(taskId)
+      : this.db.prepare("SELECT * FROM resource_candidates WHERE taskId=? AND state='pending' ORDER BY createdAt").all(taskId);
+    return (rows as any[]).map(resourceCandidateRow);
+  }
+
+  resolveResourceCandidate(id: string, state: 'adopted' | 'discarded', resolvedBy: string): ResourceCandidate {
+    const current = this.getResourceCandidate(id);
+    if (!current) throw new Error('resource candidate not found');
+    const expected = state === 'discarded' ? 'discarding' : 'pending';
+    if (current.state !== expected) throw new Error(`resource candidate is already ${current.state}`);
+    const now = Date.now();
+    this.db.prepare('UPDATE resource_candidates SET state=?, resolvedAt=?, resolvedBy=? WHERE id=? AND state=?')
+      .run(state, now, resolvedBy, id, expected);
+    return this.getResourceCandidate(id)!;
+  }
+
+  beginDiscardResourceCandidate(id: string, taskId: string): ResourceCandidate {
+    const current = this.getResourceCandidate(id);
+    if (!current || current.taskId !== taskId) throw new Error('resource candidate does not belong to task');
+    if (current.state === 'discarding') return current;
+    if (current.state !== 'pending') throw new Error(`resource candidate is already ${current.state}`);
+    const claimed = this.db.prepare("UPDATE resource_candidates SET state='discarding' WHERE id=? AND state='pending'").run(id);
+    if (!Number(claimed.changes)) throw new Error('resource candidate changed during discard');
+    return this.getResourceCandidate(id)!;
+  }
+
+  adoptResourceCandidate(id: string, taskId: string, resolvedBy: string): { candidate: ResourceCandidate; attachment: ResourceAttachment } {
+    const current = this.getResourceCandidate(id);
+    if (!current || current.taskId !== taskId) throw new Error('resource candidate does not belong to task');
+    if (current.state !== 'pending') throw new Error(`resource candidate is already ${current.state}`);
+    const attachment = this.getResourceAttachment(current.attachmentId);
+    if (!attachment || attachment.enabled) throw new Error('resource candidate attachment is unavailable');
+    if (current.sourceKind === 'path' && !attachment.currentRevisionId)
+      throw new Error('resource candidate snapshot is incomplete and must be discarded');
+    const now = Date.now();
+    const source: Record<string, unknown> = { ...attachment.source, adoptedFromCandidate: current.id };
+    delete source.candidate;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const enabled = this.db.prepare('UPDATE resource_attachments SET enabled=1, source=?, updatedAt=? WHERE id=? AND enabled=0')
+        .run(JSON.stringify(source), now, attachment.id);
+      const resolved = this.db.prepare("UPDATE resource_candidates SET state='adopted', resolvedAt=?, resolvedBy=? WHERE id=? AND state='pending'")
+        .run(now, resolvedBy, id);
+      if (!Number(enabled.changes) || !Number(resolved.changes)) throw new Error('resource candidate changed during adoption');
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return { candidate: this.getResourceCandidate(id)!, attachment: this.getResourceAttachment(attachment.id)! };
+  }
+
   promoteResourceRevision(attachmentId: string, revisionId: string, expectedRevisionId?: string): ResourceAttachment {
     const revision = this.getResourceRevision(revisionId);
     if (!revision || revision.attachmentId !== attachmentId) throw new Error('resource revision does not belong to attachment');
@@ -4353,6 +4443,15 @@ function resourceLeaseRow(row: any): ResourceLease {
     state: row.state, sealedDriverRef: row.sealedDriverRef ?? undefined, createdAt: Number(row.createdAt),
     expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt),
     releasedAt: row.releasedAt == null ? undefined : Number(row.releasedAt) };
+}
+
+function resourceCandidateRow(row: any): ResourceCandidate {
+  return { id: row.id, organizationId: row.organizationId, projectId: row.projectId,
+    taskId: row.taskId, worldId: row.worldId, worldGeneration: Number(row.worldGeneration),
+    attachmentId: row.attachmentId, sourceKind: row.sourceKind,
+    sourcePath: row.sourcePath ?? undefined, vaultItemId: row.vaultItemId ?? undefined,
+    vaultField: row.vaultField ?? undefined, state: row.state, createdAt: Number(row.createdAt),
+    resolvedAt: row.resolvedAt == null ? undefined : Number(row.resolvedAt), resolvedBy: row.resolvedBy ?? undefined };
 }
 
 function selectRows(db: DatabaseSyncType, table: string, where: string, args: any[]): any[] {

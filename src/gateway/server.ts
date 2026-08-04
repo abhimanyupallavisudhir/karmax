@@ -218,6 +218,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
     return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
+  if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
@@ -229,6 +230,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (p === '/api/agent/resource-candidates') return 'task:review:write';
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
@@ -1972,12 +1974,14 @@ export class Gateway {
       // write-only; .env example files provide lazy suggestions.
       const projectSecrets = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
       if (projectSecrets && ['GET', 'POST', 'DELETE'].includes(method)) {
+        if (method !== 'GET' && this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents must store generated credentials in the vault and propose them for Review' });
         const project = store.getProject(projectSecrets[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.broker || !this.deps.resources)
           return this.json(res, 503, { error: 'project resources are unavailable' });
         const resources = store.listResourceAttachments(project.id, true)
-          .filter((resource) => resource.driver === 'secret@1');
+          .filter((resource) => resource.driver === 'secret@1' && !stagedResourceCandidate(resource));
         const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
         if (method === 'GET' && !encodedName) {
           const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
@@ -2120,12 +2124,14 @@ export class Gateway {
             const body = await this.body(req);
             if (body.seedResourceId) {
               const resource = store.getResourceAttachment(String(body.seedResourceId));
-              if (!resource || resource.projectId !== project.id || resource.target.kind !== 'path')
+              if (!resource || resource.projectId !== project.id || !resource.enabled
+                || stagedResourceCandidate(resource) || resource.target.kind !== 'path')
                 return this.json(res, 400, { error: 'seed resource must be a path resource in this project' });
             }
             if (body.connectionResourceId) {
               const resource = store.getResourceAttachment(String(body.connectionResourceId));
-              if (!resource || resource.projectId !== project.id || !credentialResource(resource))
+              if (!resource || resource.projectId !== project.id || !resource.enabled
+                || stagedResourceCandidate(resource) || !credentialResource(resource))
                 return this.json(res, 400, { error: 'connection resource must be a secret/service attachment in this project' });
             }
             return this.json(res, 200, { service: services.save(project.id, body as any) });
@@ -2146,11 +2152,14 @@ export class Gateway {
         const project = store.getProject(projectResources[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
-        if (method === 'GET') return this.json(res, 200, store.listResourceAttachments(project.id, true).map((resource) => ({
+        if (method === 'GET') return this.json(res, 200, store.listResourceAttachments(project.id, true)
+          .filter((resource) => !stagedResourceCandidate(resource)).map((resource) => ({
           ...redactResource(resource),
           revision: resource.currentRevisionId ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined,
         })));
         if (method === 'POST') {
+          if (this.deps.tokens.verify(token)?.kind === 'agent')
+            return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
           const b = await this.body(req, 600 * 1024 * 1024);
           const id = newId('resource');
           const driver = String(b.driver ?? 'volume@1');
@@ -2196,6 +2205,8 @@ export class Gateway {
       }
       const copyGlobsMigration = p.match(/^\/api\/projects\/([^/]+)\/resources\/import-copyglobs$/);
       if (copyGlobsMigration && method === 'POST') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'copyGlobs migration is a human project-settings operation' });
         const project = store.getProject(copyGlobsMigration[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         // `hostLocal`, not `hosted` — the same gate as the scan/import routes above,
@@ -2219,6 +2230,10 @@ export class Gateway {
       if (projectResource) {
         const resource = store.getResourceAttachment(projectResource[2]!);
         if (!resource || resource.projectId !== projectResource[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'this staged resource must be adopted or discarded from its task Review' });
+        if ((method === 'PATCH' || method === 'DELETE') && this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents cannot administer durable project resources directly' });
         if (method === 'GET') return this.json(res, 200, { ...redactResource(resource),
           revisions: store.listResourceRevisions(resource.id).map(redactResourceRevision) });
         if (method === 'PATCH') {
@@ -2254,6 +2269,8 @@ export class Gateway {
       }
       const projectResourceScan = p.match(/^\/api\/projects\/([^/]+)\/resources\/scan$/);
       if (projectResourceScan && method === 'GET') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents can inventory only their own current world' });
         const project = store.getProject(projectResourceScan[1]!);
         if (!project) return this.json(res, 404, { error: 'project not found' });
         // `hosted` and `hostLocal` are orthogonal: a self-host served on a public
@@ -2266,8 +2283,12 @@ export class Gateway {
       }
       const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
       if (resourceUploadCreate && method === 'POST') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceUploadCreate[2]!);
         if (!resource || resource.projectId !== resourceUploadCreate[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'staged resource candidates cannot be modified before Review' });
         if (!isSnapshotResourceDriver(resource.driver) || !this.deps.objects) return this.json(res, 400, { error: 'resumable uploads require a snapshot resource and object store' });
         const id = newId('resource-upload');
         const upload: ResourceUploadSession = { id, organizationId: resource.organizationId, projectId: resource.projectId,
@@ -2277,6 +2298,8 @@ export class Gateway {
       }
       const resourceUpload = p.match(/^\/api\/resource-uploads\/([^/]+)$/);
       if (resourceUpload) {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents cannot modify durable project resource uploads directly' });
         const upload = resourceUploadSession(store, resourceUpload[1]!);
         if (!upload || upload.projectId !== url.searchParams.get('projectId')) return this.json(res, 404, { error: 'resource upload not found' });
         if (!this.deps.objects || !this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
@@ -2316,8 +2339,12 @@ export class Gateway {
       }
       const resourceImport = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/import$/);
       if (resourceImport && method === 'POST') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceImport[2]!);
         if (!resource || resource.projectId !== resourceImport[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'staged resource candidates cannot be modified before Review' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
         const b = await this.body(req, 600 * 1024 * 1024);
         try {
@@ -2335,7 +2362,10 @@ export class Gateway {
         const task = store.getTask(taskResources[1]!);
         if (!task || !this.deps.resources) return this.json(res, task ? 503 : 404, { error: task ? 'project resources are unavailable' : 'task not found' });
         const summaries = [];
+        const candidates = store.listResourceCandidates(task.id);
+        const candidateAttachments = new Set(candidates.map((candidate) => candidate.attachmentId));
         for (const resource of store.listResourceAttachments(task.projectId)) {
+          if (candidateAttachments.has(resource.id)) continue;
           if (resource.access !== 'write' || resource.target.kind !== 'path') continue;
           try { summaries.push({ resource: redactResource(resource), summary: await this.deps.resources.summarize(task.id, resource.id) }); }
           catch (error) {
@@ -2345,7 +2375,24 @@ export class Gateway {
               : { resource: redactResource(resource), error: message });
           }
         }
+        for (const candidate of candidates) {
+          const resource = store.getResourceAttachment(candidate.attachmentId);
+          summaries.push({ candidate,
+            ...(resource ? { resource: redactResource(resource), revision: resource.currentRevisionId
+              ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined }
+              : { resource: { id: candidate.attachmentId, name: 'Resource candidate' } }) });
+        }
         return this.json(res, 200, summaries);
+      }
+      const taskResourceInventory = p.match(/^\/api\/tasks\/([^/]+)\/resources\/inventory$/);
+      if (taskResourceInventory && method === 'GET') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        try { return this.json(res, 200, await this.deps.resources.ignoredInventory(taskResourceInventory[1]!)); }
+        catch (error) {
+          const checkpointed = store.latestWorldCheckpoint(taskResourceInventory[1]!)?.ignored;
+          if (checkpointed) return this.json(res, 200, checkpointed);
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const taskResourcePromote = p.match(/^\/api\/tasks\/([^/]+)\/resources\/([^/]+)\/promote$/);
       if (taskResourcePromote && method === 'POST') {
@@ -2364,6 +2411,16 @@ export class Gateway {
           await this.deps.resources.discard(taskResourceDiscard[1]!, taskResourceDiscard[2]!);
           return this.json(res, 200, { discarded: true });
         } catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const taskResourceCandidate = p.match(/^\/api\/tasks\/([^/]+)\/resource-candidates\/([^/]+)\/(adopt|discard)$/);
+      if (taskResourceCandidate && method === 'POST') {
+        try {
+          const result = taskResourceCandidate[3] === 'adopt'
+            ? await api.adoptProjectResource(token, taskResourceCandidate[1]!, taskResourceCandidate[2]!)
+            : await api.discardProjectResource(token, taskResourceCandidate[1]!, taskResourceCandidate[2]!);
+          return this.json(res, 200, result);
+        } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
       if (projectMembers) {
@@ -2921,6 +2978,12 @@ export class Gateway {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/resource-candidates' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.proposeProjectResource(token, b as any)); }
+        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/escalate' && method === 'POST') {
         const b = await this.body(req);
@@ -5967,6 +6030,10 @@ function parseEnvironmentValues(text: string): Array<{ name: string; value: stri
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
   const { credentialHandles, ...safe } = resource;
   return { ...safe, credentialConfigured: credentialHandles.length > 0 };
+}
+
+function stagedResourceCandidate(resource: ResourceAttachment): boolean {
+  return resource.enabled === false && resource.source.candidate === true;
 }
 
 function redactResourceRevision(revision: ResourceRevision | undefined): Omit<ResourceRevision, 'sealedRef'> | undefined {

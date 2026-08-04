@@ -355,7 +355,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.13.0',
+    version: '1.14.0',
     description: 'Branch/world → do/wait → explicit PR → review → authorized merge → end, with the Do agent owning proposal repairs.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -417,7 +417,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.4.0',
+    version: '1.5.0',
     description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
     selectable: false,
     requires: [],
@@ -460,7 +460,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.13.0',
+    version: '1.14.0',
     description: 'Software Dev in autonomous completion mode; the Do agent explicitly opens the finished proposal for review.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],

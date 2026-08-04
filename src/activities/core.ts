@@ -2124,6 +2124,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
       const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
       try {
+        if (store.getTask(handle.id)?.lastView?.status === 'cancelled')
+          await deps.resources?.discardTaskCandidates(handle.id, 'system:task-cancel');
         await deps.resources?.release(current);
         const world = await worlds.open(handle);
         await world.destroy();
@@ -2139,6 +2141,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await destroyWorldServices(handle.id).catch(() => undefined);
         if (leaseId) deps.runners?.release(leaseId, current.kind);
       }
+    },
+
+    async pendingResourceCandidates(taskId: string): Promise<number> {
+      return store.listResourceCandidates(taskId).filter((candidate) =>
+        candidate.state === 'pending' || candidate.state === 'discarding').length;
     },
 
     /**
