@@ -19,6 +19,8 @@ const REMOTE = `git@github.com:${SLUG}.git`;
 const prs: any[] = [];
 const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
+let githubReadiness: Record<string, unknown> = {};
+let mergeHttpStatus: number | undefined;
 
 const fetcher = (async (url: string, init: RequestInit = {}) => {
   const u = new URL(String(url));
@@ -40,10 +42,25 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     await hook?.();
     return json(201, pr);
   }
+  if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('PullRequestReadiness')) {
+    const pr = prs.find((candidate) => candidate.number === Number(body.variables?.number)) ?? prs[0];
+    return json(200, { data: { repository: { pullRequest: {
+      id: pr?.node_id ?? 'PR_1', url: pr?.html_url ?? `https://github.com/${SLUG}/pull/1`,
+      state: pr?.state === 'closed' ? 'CLOSED' : 'OPEN', isDraft: false, merged: Boolean(pr?.merged_at),
+      headRefOid: pr?.head?.sha ?? 'reviewed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
+      viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      ...githubReadiness,
+    } } } });
+  }
   const merge = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)/merge$`));
   if (merge && method === 'PUT') {
     const pr = prs.find((candidate) => candidate.number === Number(merge[1]));
     if (!pr) return json(404, {});
+    if (mergeHttpStatus) return json(mergeHttpStatus, {
+      merged: false,
+      message: mergeHttpStatus >= 500 ? 'GitHub merge service unavailable' : 'GitHub refused the merge',
+    });
     if (body.sha !== pr.head.sha) return json(409, { merged: false, message: 'Head branch was modified' });
     pr.state = 'closed'; pr.merged_at = new Date().toISOString();
     return json(200, { merged: true, sha: 'github-merge-sha', message: 'merged' });
@@ -107,7 +124,13 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await h?.stop();
     if (originDir) fs.rmSync(originDir, { recursive: true, force: true });
   });
-  beforeEach(() => { prs.length = 0; comments.length = 0; afterPrOpened = undefined; });
+  beforeEach(() => {
+    prs.length = 0;
+    comments.length = 0;
+    afterPrOpened = undefined;
+    githubReadiness = {};
+    mergeHttpStatus = undefined;
+  });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
    *  local bare repo (so the push is real). */
@@ -242,6 +265,88 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     // bare origin's target is intentionally untouched by this stub merge.
     const origin = path.join(originDir, 'github-authoritative.git');
     expect((await git(origin, ['show', 'main:proposal.md'])).code).not.toBe(0);
+  }, 120_000);
+
+  it('v1.14 returns terminal CI failures to Do with failed-check context, then reviews the repaired head again', async () => {
+    const repo = await repoWithOrigin('github-ci-repair');
+    const project = h.store.createProject('GitHub CI repair', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '43', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '78',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Repair failing CI', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.14.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Repair failing CI',
+        prompt: '@write ci.md :: tested proposal\n@review Ready for CI', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: 'https://github.test/checks/ci-repair', output: { summary: 'expected green, received red' },
+      }] } },
+    };
+    await handle.signal('confirm');
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      const context = current.messages.map((message: any) => message.text).join('\n');
+      return `${current.stage}/${/unit tests.*ci-repair.*expected green/is.test(context)}`;
+    }, { timeout: 30_000 }).toBe('review/true');
+    githubReadiness = {};
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
+  }, 120_000);
+
+  it('v1.14 bounds transient GitHub errors and lets a Merge wait follow-up return to Do', async () => {
+    const repo = await repoWithOrigin('github-error-recovery');
+    const project = h.store.createProject('GitHub error recovery', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '44', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '79',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Recover GitHub', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.14.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Recover GitHub',
+        prompt: '@write retry.md :: retry proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    mergeHttpStatus = 503;
+    await handle.signal('confirm');
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}/${current.waitingFor?.kind}/${current.actions.map((action: any) => action.name).join(',')}`;
+    }, { timeout: 30_000 }).toMatch(/merge\/waiting\/human\/.*followUp/);
+
+    mergeHttpStatus = undefined;
+    await handle.signal('followUp', { id: 'repair-github', role: 'user', text: 'Retry from Do after the GitHub outage.', ts: Date.now() }, 'do');
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.messages.some((message: any) => message.text.includes('Retry from Do'))}`;
+    }, { timeout: 30_000 }).toBe('review/true');
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
   }, 120_000);
 
   /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its
