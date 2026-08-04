@@ -4249,6 +4249,13 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
 // tell it has been superseded and bail — otherwise its timer fires against the new
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
+// Existing drafts begin with a durable baseline, so opening and immediately
+// closing one must not write a stale snapshot back over a newer edit. A new form
+// has no durable baseline yet: its initial state may already contain text carried
+// from the quick composer, and closing it must materialise that text as a draft.
+function initialTaskFormSaveSignature(draft, signature) {
+  return draft ? signature : null;
+}
 async function openTaskForm(workflow, draft, seedText) {
   const formToken = (activeFormToken = {});
   // The shell (topbar/rail) stays live behind the page, so the user can navigate
@@ -4567,13 +4574,12 @@ async function openTaskForm(workflow, draft, seedText) {
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
   const stateSig = (st) => JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
-  // Seed the baseline with the freshly-loaded form's own signature so simply OPENING
-  // and dismissing a draft never re-writes it. Without this `lastSaved` starts null,
-  // so an *untouched* form still flushes a full `replace:true` on close — and a passive
-  // copy left open in another karmax tab clobbers a newer edit made elsewhere, or a
-  // stale snapshot reverts it. That is the "saved draft contents disappear" bug: only a
-  // real change in THIS form (its signature diverging from the seed) now triggers a write.
-  let lastSaved = stateSig(formState());
+  // Seed the baseline only for a freshly-loaded EXISTING draft. A brand-new form
+  // may already contain quick-composer text before its first input event; keeping
+  // its baseline null makes the close flush persist that text. Existing drafts keep
+  // their loaded signature so an untouched form cannot write a stale snapshot over
+  // a newer edit from another tab.
+  let lastSaved = initialTaskFormSaveSignature(draft, stateSig(formState()));
   // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
   // if a debounced create is still in flight when the user types more or closes the
   // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
