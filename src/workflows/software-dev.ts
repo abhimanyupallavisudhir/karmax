@@ -316,13 +316,19 @@ export async function softwareDevV1_14(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.14.0');
 }
 
+/** Conflict-message fallback and recovery for executions pinned before the
+ * complete GitHub state classifier shipped. */
+export async function softwareDevV1_15(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.15.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -2446,11 +2452,19 @@ async function softwareDevImpl(
         pointOfNoReturnPassed = true;
         break;
       }
-      if (explicitPrCycle && (decision.status === 'needs-revision' || decision.status === 'stale-review')) {
+      // `needs-revision` is deliberately handled for every pinned PR-policy
+      // execution, not only the version that introduced the explicit PR cycle.
+      // Activities are not replay-pinned: a newly observed conflict may return
+      // this result to an old workflow. Historical activity results were
+      // `waiting`, so this branch is replay-safe and is what lets already-running
+      // tasks escape an otherwise infinite 30-second poll.
+      if (decision.status === 'needs-revision' || decision.status === 'stale-review') {
         msgs.push({
           id: `merge-revise-${msgs.length}`,
           role: 'user',
-          text: `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`,
+          text: explicitPrCycle
+            ? `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`
+            : `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, and run the relevant tests. Finish the Do turn only when the repaired proposal is ready to go through Review again.`,
           ts: msgs.length,
         });
         confirmed = false;
@@ -2462,7 +2476,7 @@ async function softwareDevImpl(
         githubErrorPolls = 0;
         continue proposalCycle;
       }
-      if (classifiedGithubStates && decision.status === 'retryable-error'
+      if (decision.status === 'retryable-error'
         && ++githubErrorPolls < MAX_GITHUB_ERROR_POLLS) {
         status = 'waiting';
         waitingFor = {
@@ -2476,7 +2490,7 @@ async function softwareDevImpl(
         continue;
       }
       if (decision.status === 'needs-authorizer'
-        || (classifiedGithubStates && (decision.status === 'needs-human' || decision.status === 'retryable-error'))) {
+        || decision.status === 'needs-human' || decision.status === 'retryable-error') {
         // A controlled human layer. Authorization failures retry under the
         // confirming person's live token; PR-policy decisions (draft/closed/
         // required review) retry after the human changes GitHub. A follow-up has

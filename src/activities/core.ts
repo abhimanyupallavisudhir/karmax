@@ -2309,8 +2309,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastSha: string | undefined;
       let queued = false;
       let pendingDetail: string | undefined;
-      const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
-      const classifiedGithubStates = workflowMinor >= 14;
       const errorDecision = (error: unknown, current: TaskPullRequest[]): GitHubMergeAuthorization => {
         const detail = error instanceof Error ? error.message : String(error);
         const rateLimited = error instanceof GithubApiError
@@ -2347,7 +2345,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         try {
           live = await api.get(ref.slug, ref.number);
         } catch (error) {
-          if (!classifiedGithubStates) throw error;
           return errorDecision(error, [...settled, ref, ...prs.slice(settled.length + 1)]);
         }
         const next = {
@@ -2357,7 +2354,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
         if (live.merged) { lastSha = live.mergeCommitSha ?? lastSha; settled.push(next); continue; }
         const current = [...settled, next, ...prs.slice(settled.length + 1)];
-        if (classifiedGithubStates && live.state === 'closed') {
+        if (live.state === 'closed') {
           return {
             status: 'needs-human', prs: current, actorUserId,
             detail: `Pull request ${ref.slug}#${ref.number} was closed without merging. Reopen it on GitHub and retry, send the task back to Do, or cancel it.`,
@@ -2375,11 +2372,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // proposal failures return to Do, external decisions wait for a human,
         // and only genuinely transient checks/queues remain a polling wait.
         let readiness: GithubPullRequestReadiness | undefined;
-        if (workflowMinor >= 13 && live.nodeId) {
+        let readinessError: unknown;
+        if (live.nodeId) {
           try {
             readiness = await api.readiness(ref.slug, ref.number);
           } catch (error) {
-            if (classifiedGithubStates) return errorDecision(error, current);
+            // Readiness enriches the decision, but the head-bound REST merge is
+            // still authoritative and may succeed even when GraphQL is degraded
+            // or an older GitHub Enterprise endpoint lacks one queried field.
+            // Preserve the error and surface it only if every landing path fails.
+            readinessError = error;
           }
           if (readiness?.mergeable === 'CONFLICTING' || readiness?.mergeStateStatus === 'DIRTY') {
             return {
@@ -2389,22 +2391,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
             };
           }
-          if (classifiedGithubStates && readiness?.draft) {
+          if (readiness?.draft) {
             return {
               status: 'needs-human', prs: current, actorUserId,
               detail: `Pull request ${ref.slug}#${ref.number} is a draft. Mark it ready for review on GitHub and retry, send it back to Do, or cancel it.`,
             };
           }
-          if (classifiedGithubStates && (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR')) {
+          if (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR') {
             return { status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness) };
           }
-          if (classifiedGithubStates && readiness?.reviewDecision === 'CHANGES_REQUESTED') {
+          if (readiness?.reviewDecision === 'CHANGES_REQUESTED') {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `GitHub reviewers requested changes on pull request ${ref.slug}#${ref.number}. Inspect their review comments and update the proposal.`,
             };
           }
-          if (classifiedGithubStates && readiness?.mergeStateStatus === 'BEHIND') {
+          if (readiness?.mergeStateStatus === 'BEHIND') {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `Pull request ${ref.slug}#${ref.number} must be updated with its target branch before it can merge. Refresh the task branch, resolve any resulting conflict, and review the new head.`,
@@ -2412,7 +2414,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
         const alreadyMirrored = store.eventsSince(handle.id, 0).some((event) =>
-          event.type === 'github.pr.review-approved'
+          (event.type === 'github.pr.review-approved'
+            || (event.type === 'github.pr.review-skipped'
+              && /cannot approve your own pull request|can not approve your own pull request/i.test(String(event.payload?.detail ?? ''))))
           && event.payload?.slug === ref.slug && event.payload?.number === ref.number
           && event.payload?.headSha === ref.headSha && event.payload?.actorUserId === actorUserId);
         if (voters.includes(actorUserId) && !alreadyMirrored) {
@@ -2426,7 +2430,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A mirrored approval may have satisfied GitHub's own required-review
         // rule. Re-read only when that rule was previously blocking; if it still
         // is, this is a real external-human wait rather than an opaque merge poll.
-        if (classifiedGithubStates && readiness?.reviewDecision === 'REVIEW_REQUIRED') {
+        if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
           try {
             readiness = await api.readiness(ref.slug, ref.number);
           } catch (error) {
@@ -2452,7 +2456,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           merged = await api.merge(ref.slug, ref.number, ref.headSha,
             actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge');
         } catch (error) {
-          if (!classifiedGithubStates) throw error;
           return errorDecision(error, current);
         }
         if (merged.merged) {
@@ -2487,8 +2490,35 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           record(handle.id, 'github.pr.auto-merge-enabled', { ...ref, actorUserId, mergeMethod });
           continue;
         }
-        if (classifiedGithubStates && fallbackError) return errorDecision(fallbackError, current);
-        if (classifiedGithubStates && readiness
+        const refusal = [merged.message, queueResult?.message, autoMerge?.message].filter(Boolean).join('; ');
+        if (/head branch was modified|head (?:sha|oid).*(?:changed|mismatch)|expected head/i.test(refusal)) {
+          return {
+            status: 'stale-review', prs: current, actorUserId,
+            detail: `Pull request ${ref.slug}#${ref.number} changed while GitHub was attempting to merge it. Re-inspect and repair the live head before opening it for Review again.`,
+            eligibleUserIds: [actorUserId],
+          };
+        }
+        if (/merge conflicts?|conflict(?:ing)? with (?:the )?(?:base|target)|not mergeable|base branch was modified|update (?:the )?branch/i.test(refusal)) {
+          return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: `Pull request ${ref.slug}#${ref.number} conflicts with its target. ${refusal} Resolve it in the task branch, then reopen and review the updated proposal.`,
+          };
+        }
+        if (/changes? (?:have been |were )?requested/i.test(refusal)) {
+          return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: `GitHub reviewers requested changes on pull request ${ref.slug}#${ref.number}. Inspect their comments and update the proposal.`,
+          };
+        }
+        if (/draft pull request|pull request is (?:a )?draft|review is required|required approving review/i.test(refusal)) {
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `GitHub requires a human PR-state or review decision for ${ref.slug}#${ref.number}: ${refusal}`,
+          };
+        }
+        if (fallbackError) return errorDecision(fallbackError, current);
+        if (readinessError) return errorDecision(readinessError, current);
+        if (readiness
           && !['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')
           && ['BLOCKED', 'DRAFT', 'HAS_HOOKS'].includes(readiness.mergeStateStatus)) {
           return {
@@ -2496,14 +2526,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             detail: `GitHub policy is blocking pull request ${ref.slug}#${ref.number} (${readiness.mergeStateStatus}). Inspect the repository rule or PR state, then retry or send the task back to Do.`,
           };
         }
-        if (classifiedGithubStates && readiness
-          && !['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')
-          && !['UNKNOWN', 'UNSTABLE'].includes(readiness.mergeStateStatus)) {
-          return {
-            status: 'retryable-error', prs: current, actorUserId,
-            detail: `GitHub refused to merge pull request ${ref.slug}#${ref.number}: ${merged.message}`,
-          };
-        }
+        const explicitlyPending = Boolean(readiness && ['PENDING', 'EXPECTED'].includes(readiness.checks ?? ''))
+          || /(?:checks?|status checks?).*(?:pending|expected)|(?:pending|expected).*(?:checks?|status checks?)/i.test(refusal);
+        if (!explicitlyPending) return {
+          status: 'retryable-error', prs: current, actorUserId,
+          detail: `GitHub refused to merge pull request ${ref.slug}#${ref.number}: ${refusal || merged.message}`,
+        };
         record(handle.id, 'github.pr.merge-waiting', { ...ref, actorUserId, detail: merged.message });
         return {
           status: 'waiting', prs: [...settled, next, ...prs.slice(settled.length + 1)], actorUserId,

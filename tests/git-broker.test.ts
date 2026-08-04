@@ -165,10 +165,17 @@ describe('cloud Git broker', () => {
     expect((await git(source, ['rev-parse', '--verify', 'refs/heads/karmax/cloud-local-task'])).code).toBe(0);
     expect((await git(remote, ['show-ref', 'refs/heads/karmax/cloud-local-task'])).code).not.toBe(0);
 
-    // refresh_upstream serves the LOCAL target state, so the merge agent can
-    // resolve conflicts against the same history the merge will land on.
+    // Project-authority refresh serves the LOCAL target state, so a local merge
+    // agent resolves against the same history the merge will land on.
     const refreshed = await brokerRefreshUpstream(world, env, 'main');
     expect(refreshed.refs[0]!.sha).toBe((await git(source, ['rev-parse', 'main'])).stdout.trim());
+
+    // PR-policy tasks land on GitHub instead. Their refresh must bypass the
+    // local authority and may need to force-correct a divergent seeded
+    // origin/* ref back to the actual remote tip.
+    const remoteRefreshed = await brokerRefreshUpstream(world, env, 'main', 'origin');
+    expect(remoteRefreshed.refs[0]!.sha).toBe(originMainBefore);
+    expect((await git(world.handle.root, ['rev-parse', 'refs/remotes/origin/main'])).stdout.trim()).toBe(originMainBefore);
 
     const result = await brokerFinalizeMerge(world, 'main', { name: 'Karmax Test', email: 'karmax@example.com' }, env);
     expect(result.merged).toBe(true);

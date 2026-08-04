@@ -14,6 +14,7 @@ import {
   softwareDevV1_12,
   softwareDevV1_13,
   softwareDevV1_14,
+  softwareDevV1_15,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -95,6 +96,11 @@ export async function goalV1_13(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** Classified GitHub policy transitions and bounded GitHub error recovery. */
 export async function goalV1_14(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_14({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Conflict-message fallback and recovery for already-running PR tasks. */
+export async function goalV1_15(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_15({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

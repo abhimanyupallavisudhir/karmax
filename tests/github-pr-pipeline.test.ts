@@ -21,6 +21,7 @@ const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
 let githubReadiness: Record<string, unknown> = {};
 let mergeHttpStatus: number | undefined;
+let mergeFailureMessage: string | undefined;
 
 const fetcher = (async (url: string, init: RequestInit = {}) => {
   const u = new URL(String(url));
@@ -53,13 +54,16 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
       ...githubReadiness,
     } } } });
   }
+  if (u.pathname === '/graphql' && method === 'POST') {
+    return json(200, { errors: [{ message: mergeFailureMessage ?? 'GitHub did not accept the merge operation' }] });
+  }
   const merge = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)/merge$`));
   if (merge && method === 'PUT') {
     const pr = prs.find((candidate) => candidate.number === Number(merge[1]));
     if (!pr) return json(404, {});
     if (mergeHttpStatus) return json(mergeHttpStatus, {
       merged: false,
-      message: mergeHttpStatus >= 500 ? 'GitHub merge service unavailable' : 'GitHub refused the merge',
+      message: mergeFailureMessage ?? (mergeHttpStatus >= 500 ? 'GitHub merge service unavailable' : 'GitHub refused the merge'),
     });
     if (body.sha !== pr.head.sha) return json(409, { merged: false, message: 'Head branch was modified' });
     pr.state = 'closed'; pr.merged_at = new Date().toISOString();
@@ -130,6 +134,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     afterPrOpened = undefined;
     githubReadiness = {};
     mergeHttpStatus = undefined;
+    mergeFailureMessage = undefined;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -305,6 +310,46 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       return `${current.stage}/${/unit tests.*ci-repair.*expected green/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
     githubReadiness = {};
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
+  }, 120_000);
+
+  it('unsticks a v1.12 execution when GitHub reports a conflict only in the merge refusal', async () => {
+    const repo = await repoWithOrigin('github-legacy-conflict');
+    const project = h.store.createProject('Legacy GitHub conflict', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '45', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '80',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Unstick legacy conflict', workflow: 'software-dev',
+      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.12.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Unstick legacy conflict',
+        prompt: '@write legacy-conflict.md :: repaired proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
+    mergeHttpStatus = 409;
+    mergeFailureMessage = 'Pull Request has merge conflicts';
+    await handle.signal('confirm');
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      const context = current.messages.map((message: any) => message.text).join('\n');
+      return `${current.stage}/${/merge conflicts.*Finish the Do turn/is.test(context)}`;
+    }, { timeout: 30_000 }).toBe('review/true');
+
+    githubReadiness = {};
+    mergeHttpStatus = undefined;
+    mergeFailureMessage = undefined;
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
   }, 120_000);
