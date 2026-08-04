@@ -355,8 +355,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.14.0',
-    description: 'World → do/wait → review → optional repository proposal and authorized merge → end.',
+    version: '1.15.0',
+    description: 'World → do/wait → review → optional repository proposal and policy-aware authorized merge → end, with the Do agent owning proposal and CI repairs.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -460,8 +460,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.14.0',
-    description: 'Software Dev in autonomous completion mode; the Do agent explicitly opens the finished proposal for review.',
+    version: '1.15.0',
+    description: 'Software Dev in autonomous completion mode, including repository-less work, classified GitHub policy waits, and CI repair.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],

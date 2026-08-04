@@ -1734,7 +1734,7 @@ export class KarmaxApi {
   /** Honest action set for the short replacement-start window before first publish. */
   private resumedActions(actions: TaskView['actions'], stage: Stage): TaskView['actions'] {
     const allowed = stage === 'do'
-      ? new Set(['followUp', 'setTarget', 'cancel'])
+      ? new Set(['openPr', 'followUp', 'setTarget', 'cancel'])
       : stage === 'review'
         ? new Set(['confirm', 'followUp', 'setTarget', 'cancel'])
         : stage === 'escalated'
@@ -1802,8 +1802,14 @@ export class KarmaxApi {
     } else if (resumable && view.stage !== 'escalated' && view.stage !== 'resolve' && view.waitingFor?.kind !== 'human') {
       add({ target: 'human', label: 'Waiting for human input', description: 'Stop current activity and hold this attempt for a person.' });
     }
-    if (resumable && view.stage === 'review' && !origin)
-      add({ target: 'do', label: 'Do', description: 'Return the reviewed work to the Do agent.' });
+    if (resumable && (view.stage === 'review' || view.stage === 'merge') && !origin)
+      add({
+        target: 'do',
+        label: 'Do',
+        description: view.stage === 'merge'
+          ? 'Return the pending pull request to Do for repair; it must be opened and reviewed again.'
+          : 'Return the reviewed work to the Do agent.',
+      });
     if (!jayadratha && !view.pointOfNoReturnPassed)
       add({ target: 'draft', label: 'Draft', description: 'Discard all execution progress and make the attempt editable.', danger: true });
     add({ target: 'done', label: 'Done', description: 'Stop all activity and mark this attempt done manually.' });
@@ -2739,9 +2745,14 @@ export class KarmaxApi {
       };
       const nextView = this.withConversationMessage(heldView, holdRole, followUp);
       await this.stopTaskActivity(scopedTask, heldView, `Human supplied input for the ${stageName(heldOrigin)} hold`);
-      // Review feedback has its normal meaning: return the task to Do. At other
-      // origins the addressed agent resumes the interrupted stage.
-      await this.startTransitionReplacement(scopedTask, nextView, heldOrigin === 'review' ? 'do' : heldOrigin);
+      // Review feedback has its normal meaning: return the task to Do. A Merge
+      // hold can also deliberately fall back to Do when the current explicit-PR
+      // workflow has no Merge agent; resume the conversation that actually
+      // received the message, not a mechanical stage that cannot consume it.
+      const resumeStage = heldOrigin === 'review' || (heldOrigin === 'merge' && holdRole === 'do')
+        ? 'do'
+        : heldOrigin;
+      await this.startTransitionReplacement(scopedTask, nextView, resumeStage);
       this.publishConversationMessage(taskId, holdRole, followUp);
       return followUp;
     }

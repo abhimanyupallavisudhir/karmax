@@ -33,7 +33,13 @@ import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js'
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { materializeGitCredential } from '../world/git-credential.js';
-import { GithubPrApi, githubSlug, type GithubPrApiOptions } from '../integrations/github-pr.js';
+import {
+  GithubApiError,
+  GithubPrApi,
+  githubSlug,
+  type GithubPrApiOptions,
+  type GithubPullRequestReadiness,
+} from '../integrations/github-pr.js';
 import type { GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
@@ -2311,14 +2317,60 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastSha: string | undefined;
       let queued = false;
       let pendingDetail: string | undefined;
+      const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
+      const classifiedGithubStates = workflowMinor >= 14;
+      const errorDecision = (error: unknown, current: TaskPullRequest[]): GitHubMergeAuthorization => {
+        const detail = error instanceof Error ? error.message : String(error);
+        const rateLimited = error instanceof GithubApiError
+          && (error.status === 429 || (error.status === 403 && /rate.?limit|secondary limit|abuse/i.test(detail)));
+        if (!rateLimited && error instanceof GithubApiError && (error.status === 401 || error.status === 403)) {
+          return {
+            status: 'needs-authorizer', prs: current, actorUserId,
+            detail: `${detail} Reconnect GitHub or ask another selected project member with merge access to continue.`,
+          };
+        }
+        if (error instanceof GithubApiError && [404, 410, 422].includes(error.status)) {
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `${detail} The pull request or branch needs human attention on GitHub before krmax can continue.`,
+          };
+        }
+        return {
+          status: 'retryable-error', prs: current, actorUserId,
+          detail: `GitHub could not be inspected or updated: ${detail}`,
+        };
+      };
+      const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness) => {
+        const failures = (readiness.failedChecks ?? []).slice(0, 12).map((check) => {
+          const detail = check.detail?.replace(/\s+/g, ' ').trim();
+          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${detail ? ` — ${detail.slice(0, 500)}` : ''}`;
+        });
+        return [
+          `Pull request ${ref.slug}#${ref.number} has terminally failing CI (${readiness.checks}).`,
+          ...(failures.length ? failures : ['GitHub did not expose an individual failed-check summary; inspect the PR checks page.']),
+        ].join('\n');
+      };
       for (const ref of prs) {
-        const live = await api.get(ref.slug, ref.number);
+        let live;
+        try {
+          live = await api.get(ref.slug, ref.number);
+        } catch (error) {
+          if (!classifiedGithubStates) throw error;
+          return errorDecision(error, [...settled, ref, ...prs.slice(settled.length + 1)]);
+        }
         const next = {
           ...ref, state: live.state, merged: live.merged,
           ...(live.headSha ? { headSha: live.headSha } : {}),
           ...(live.nodeId ? { nodeId: live.nodeId } : {}),
         };
         if (live.merged) { lastSha = live.mergeCommitSha ?? lastSha; settled.push(next); continue; }
+        const current = [...settled, next, ...prs.slice(settled.length + 1)];
+        if (classifiedGithubStates && live.state === 'closed') {
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `Pull request ${ref.slug}#${ref.number} was closed without merging. Reopen it on GitHub and retry, send the task back to Do, or cancel it.`,
+          };
+        }
         if (!ref.headSha || !live.headSha || ref.headSha !== live.headSha) {
           record(handle.id, 'github.merge.review-stale', { ...ref, reviewedHead: ref.headSha, liveHead: live.headSha });
           return {
@@ -2327,19 +2379,43 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             eligibleUserIds: [actorUserId],
           };
         }
-        // Current explicit-PR workflows route a genuinely conflicting GitHub
-        // proposal back to the Do agent. Checks/reviews/queues remain durable
-        // GitHub waits; only a code conflict requires changing the proposal and
-        // therefore replaying Open PR + Review.
-        const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
+        // Current explicit-PR workflows classify GitHub's live policy state:
+        // proposal failures return to Do, external decisions wait for a human,
+        // and only genuinely transient checks/queues remain a polling wait.
+        let readiness: GithubPullRequestReadiness | undefined;
         if (workflowMinor >= 13 && live.nodeId) {
-          const readiness = await api.readiness(ref.slug, ref.number).catch(() => undefined);
+          try {
+            readiness = await api.readiness(ref.slug, ref.number);
+          } catch (error) {
+            if (classifiedGithubStates) return errorDecision(error, current);
+          }
           if (readiness?.mergeable === 'CONFLICTING' || readiness?.mergeStateStatus === 'DIRTY') {
             return {
               status: 'needs-revision',
-              prs: [...settled, next, ...prs.slice(settled.length + 1)],
+              prs: current,
               actorUserId,
               detail: `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
+            };
+          }
+          if (classifiedGithubStates && readiness?.draft) {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} is a draft. Mark it ready for review on GitHub and retry, send it back to Do, or cancel it.`,
+            };
+          }
+          if (classifiedGithubStates && (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR')) {
+            return { status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness) };
+          }
+          if (classifiedGithubStates && readiness?.reviewDecision === 'CHANGES_REQUESTED') {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `GitHub reviewers requested changes on pull request ${ref.slug}#${ref.number}. Inspect their review comments and update the proposal.`,
+            };
+          }
+          if (classifiedGithubStates && readiness?.mergeStateStatus === 'BEHIND') {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} must be updated with its target branch before it can merge. Refresh the task branch, resolve any resulting conflict, and review the new head.`,
             };
           }
         }
@@ -2355,8 +2431,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               ...ref, actorUserId, detail: error instanceof Error ? error.message : String(error),
             }));
         }
-        const merged = await api.merge(ref.slug, ref.number, ref.headSha,
-          actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge');
+        // A mirrored approval may have satisfied GitHub's own required-review
+        // rule. Re-read only when that rule was previously blocking; if it still
+        // is, this is a real external-human wait rather than an opaque merge poll.
+        if (classifiedGithubStates && readiness?.reviewDecision === 'REVIEW_REQUIRED') {
+          try {
+            readiness = await api.readiness(ref.slug, ref.number);
+          } catch (error) {
+            return errorDecision(error, current);
+          }
+          if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR')
+            return { status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness) };
+          if (readiness.reviewDecision === 'CHANGES_REQUESTED') {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `GitHub reviewers requested changes on pull request ${ref.slug}#${ref.number}. Inspect their review comments and update the proposal.`,
+            };
+          }
+          if (readiness.reviewDecision === 'REVIEW_REQUIRED') {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} still requires a GitHub review under repository policy. Complete that review on GitHub, then retry here.`,
+            };
+          }
+        }
+        let merged;
+        try {
+          merged = await api.merge(ref.slug, ref.number, ref.headSha,
+            actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge');
+        } catch (error) {
+          if (!classifiedGithubStates) throw error;
+          return errorDecision(error, current);
+        }
         if (merged.merged) {
           lastSha = merged.sha ?? lastSha;
           settled.push({ ...next, state: 'closed', merged: true });
@@ -2364,7 +2470,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           continue;
         }
         let queueResult;
-        if (live.nodeId) queueResult = await api.enqueue(live.nodeId, ref.headSha).catch(() => undefined);
+        let fallbackError: unknown;
+        if (live.nodeId) {
+          try { queueResult = await api.enqueue(live.nodeId, ref.headSha); }
+          catch (error) { fallbackError = error; }
+        }
         if (queueResult?.queued) {
           queued = true;
           pendingDetail = 'GitHub accepted the pull request into its merge queue.';
@@ -2373,15 +2483,34 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           continue;
         }
         const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
-        const autoMerge = live.nodeId
-          ? await api.enableAutoMerge(live.nodeId, ref.headSha, mergeMethod).catch(() => undefined)
-          : undefined;
+        let autoMerge;
+        if (live.nodeId) {
+          try { autoMerge = await api.enableAutoMerge(live.nodeId, ref.headSha, mergeMethod); }
+          catch (error) { fallbackError ??= error; }
+        }
         if (autoMerge?.enabled) {
           queued = true;
           pendingDetail = 'GitHub auto-merge is enabled for the reviewed pull-request head.';
           settled.push(next);
           record(handle.id, 'github.pr.auto-merge-enabled', { ...ref, actorUserId, mergeMethod });
           continue;
+        }
+        if (classifiedGithubStates && fallbackError) return errorDecision(fallbackError, current);
+        if (classifiedGithubStates && readiness
+          && !['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')
+          && ['BLOCKED', 'DRAFT', 'HAS_HOOKS'].includes(readiness.mergeStateStatus)) {
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `GitHub policy is blocking pull request ${ref.slug}#${ref.number} (${readiness.mergeStateStatus}). Inspect the repository rule or PR state, then retry or send the task back to Do.`,
+          };
+        }
+        if (classifiedGithubStates && readiness
+          && !['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')
+          && !['UNKNOWN', 'UNSTABLE'].includes(readiness.mergeStateStatus)) {
+          return {
+            status: 'retryable-error', prs: current, actorUserId,
+            detail: `GitHub refused to merge pull request ${ref.slug}#${ref.number}: ${merged.message}`,
+          };
         }
         record(handle.id, 'github.pr.merge-waiting', { ...ref, actorUserId, detail: merged.message });
         return {
