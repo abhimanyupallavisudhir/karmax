@@ -42,6 +42,17 @@ export type GithubPullRequestMergeState =
 export type GithubPullRequestReviewDecision = 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED';
 export type GithubStatusCheckState = 'ERROR' | 'EXPECTED' | 'FAILURE' | 'PENDING' | 'SUCCESS';
 
+/** One terminally failing context from GitHub's combined check rollup. Check
+ * runs and legacy commit statuses have different schemas; this is the small,
+ * provider-neutral packet the Do agent needs to identify and inspect the
+ * failure without scraping an opaque merge error. */
+export interface GithubFailedCheck {
+  name: string;
+  state: string;
+  url?: string;
+  detail?: string;
+}
+
 /** GitHub's live merge-policy observations. This intentionally does not reduce
  * branch rules, reviews, checks, and queue state to a local `ready` boolean. */
 export interface GithubPullRequestReadiness {
@@ -55,6 +66,7 @@ export interface GithubPullRequestReadiness {
   mergeStateStatus: GithubPullRequestMergeState;
   reviewDecision?: GithubPullRequestReviewDecision;
   checks?: GithubStatusCheckState;
+  failedChecks?: GithubFailedCheck[];
   mergeQueueEntryId?: string;
   autoMerge?: { enabledAt: string; mergeMethod: GithubMergeMethod };
   viewerCanEnableAutoMerge: boolean;
@@ -72,6 +84,15 @@ export interface GithubAutoMergeResult {
 export interface GithubPrApiOptions {
   apiBase?: string;
   fetch?: typeof fetch;
+}
+
+/** Preserve GitHub's HTTP classification across the integration boundary so
+ * callers can distinguish re-auth/user action from a transient service error. */
+export class GithubApiError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'GithubApiError';
+  }
 }
 
 /** A refreshable GitHub App user authorization. A forced resolution follows a
@@ -223,7 +244,19 @@ export class GithubPrApi {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           id url state isDraft merged headRefOid mergeable mergeStateStatus reviewDecision
-          statusCheckRollup { state }
+          statusCheckRollup {
+            state
+            contexts(first: 50) {
+              nodes {
+                __typename
+                ... on CheckRun {
+                  databaseId name status conclusion detailsUrl
+                  output { title summary text }
+                }
+                ... on StatusContext { context state targetUrl description }
+              }
+            }
+          }
           mergeQueueEntry { id }
           autoMergeRequest { enabledAt mergeMethod }
           viewerCanEnableAutoMerge viewerCanMergeAsAdmin
@@ -232,10 +265,63 @@ export class GithubPrApi {
     }`, { owner, name, number });
     if (value?.errors?.length) {
       const message = value.errors.map((error: any) => String(error?.message ?? 'Unknown error')).join('; ');
-      throw new Error(`GitHub GraphQL: ${message.slice(0, 300)}`);
+      const kinds = value.errors.map((error: any) => String(error?.type ?? error?.extensions?.type ?? '').toUpperCase());
+      const status = /rate.?limit|secondary limit|abuse/i.test(message)
+        ? 429
+        : kinds.some((kind: string) => kind === 'FORBIDDEN' || kind === 'UNAUTHORIZED')
+          ? 403
+          : kinds.some((kind: string) => kind === 'NOT_FOUND')
+            ? 404
+            : 502;
+      throw new GithubApiError(status, `GitHub GraphQL: ${message.slice(0, 300)}`);
     }
     const raw = value?.data?.repository?.pullRequest;
-    if (!raw) throw new Error(`GitHub pull request ${slug}#${number} was not found`);
+    if (!raw) throw new GithubApiError(404, `GitHub pull request ${slug}#${number} was not found`);
+    const failedCheckCandidates = (raw.statusCheckRollup?.contexts?.nodes ?? []).flatMap((node: any) => {
+      if (node?.__typename === 'CheckRun') {
+        const state = String(node.conclusion ?? node.status ?? 'UNKNOWN');
+        if (!['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) return [];
+        const output = [node.output?.title, node.output?.summary, node.output?.text]
+          .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join('\n').slice(0, 1200);
+        return [{
+          name: String(node.name ?? 'GitHub check'), state,
+          ...(node.databaseId ? { databaseId: Number(node.databaseId) } : {}),
+          ...(node.detailsUrl ? { url: String(node.detailsUrl) } : {}),
+          ...(output ? { detail: output } : {}),
+        }];
+      }
+      if (node?.__typename === 'StatusContext') {
+        const state = String(node.state ?? 'UNKNOWN');
+        if (!['ERROR', 'FAILURE'].includes(state)) return [];
+        return [{
+          name: String(node.context ?? 'GitHub status'), state,
+          ...(node.targetUrl ? { url: String(node.targetUrl) } : {}),
+          ...(node.description ? { detail: String(node.description).slice(0, 1200) } : {}),
+        }];
+      }
+      return [];
+    }) as Array<GithubFailedCheck & { databaseId?: number }>;
+    // GitHub check output is often just a headline; annotations carry the file,
+    // line, and assertion/compiler message the Do agent can act on. They are
+    // best-effort because third-party status contexts and restricted Apps may
+    // expose only the details URL.
+    for (const check of failedCheckCandidates) {
+      if (!check.databaseId) continue;
+      const annotations = await this.request<any[]>(
+        `/repos/${slug}/check-runs/${check.databaseId}/annotations?per_page=10`,
+      ).catch(() => undefined);
+      if (!Array.isArray(annotations) || !annotations.length) continue;
+      const rendered = annotations.slice(0, 10).map((annotation) => {
+        const location = annotation.path
+          ? `${annotation.path}${annotation.start_line ? `:${annotation.start_line}` : ''}`
+          : undefined;
+        const message = [annotation.title, annotation.message, annotation.raw_details]
+          .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join(' — ');
+        return `${location ? `${location}: ` : ''}${message || annotation.annotation_level || 'check annotation'}`;
+      }).join('\n');
+      check.detail = [check.detail, rendered].filter(Boolean).join('\n').slice(0, 2400);
+    }
+    const failedChecks: GithubFailedCheck[] = failedCheckCandidates.map(({ databaseId: _databaseId, ...check }) => check);
     return {
       nodeId: String(raw.id),
       url: String(raw.url),
@@ -247,6 +333,7 @@ export class GithubPrApi {
       mergeStateStatus: raw.mergeStateStatus as GithubPullRequestMergeState,
       ...(raw.reviewDecision ? { reviewDecision: raw.reviewDecision as GithubPullRequestReviewDecision } : {}),
       ...(raw.statusCheckRollup?.state ? { checks: raw.statusCheckRollup.state as GithubStatusCheckState } : {}),
+      ...(failedChecks.length ? { failedChecks } : {}),
       ...(raw.mergeQueueEntry?.id ? { mergeQueueEntryId: String(raw.mergeQueueEntry.id) } : {}),
       ...(raw.autoMergeRequest ? { autoMerge: { enabledAt: String(raw.autoMergeRequest.enabledAt),
         mergeMethod: String(raw.autoMergeRequest.mergeMethod).toLowerCase() as GithubMergeMethod } } : {}),
@@ -293,7 +380,8 @@ export class GithubPrApi {
     };
     let response = await send();
     if (response.status === 401 && typeof this.token === 'function') response = await send(true);
-    if (!response.ok && !accepted.includes(response.status)) throw new Error(`GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    if (!response.ok && !accepted.includes(response.status))
+      throw new GithubApiError(response.status, `GitHub API ${response.status}: ${(await response.text()).slice(0, 300)}`);
     if (response.status === 204) return undefined as T;
     const text = await response.text();
     return (text ? JSON.parse(text) : undefined) as T;
