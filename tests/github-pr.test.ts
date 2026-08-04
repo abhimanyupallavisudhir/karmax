@@ -218,6 +218,37 @@ describe('GitHub PR client', () => {
     expect(request.variables).toEqual({ owner: 'acme', name: 'widgets', number: 7 });
     expect(request.query).toContain('mergeStateStatus');
     expect(request.query).toContain('statusCheckRollup');
+    expect(request.query).toContain('contexts(first: 50)');
+  });
+
+  it('extracts actionable details from failed check runs and legacy statuses', async () => {
+    const fetcher = (async (input: string | URL | Request) => {
+      if (new URL(String(input)).pathname.endsWith('/check-runs/101/annotations')) return Response.json([{
+        path: 'src/math.test.ts', start_line: 42, annotation_level: 'failure',
+        title: 'AssertionError', message: 'expected 2, received 3',
+      }]);
+      return Response.json({ data: { repository: { pullRequest: {
+      id: 'PR_failed', url: 'https://github.test/acme/widgets/pull/9', state: 'OPEN', isDraft: false,
+      merged: false, headRefOid: 'failed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
+        { __typename: 'CheckRun', databaseId: 101, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+          detailsUrl: 'https://github.test/checks/1', output: { title: '2 tests failed', summary: 'Expected 2, received 3' } },
+        { __typename: 'StatusContext', context: 'lint', state: 'ERROR',
+          targetUrl: 'https://ci.test/lint', description: 'runner crashed' },
+        { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      ] } },
+      viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+    } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 9)).resolves.toMatchObject({
+      checks: 'FAILURE',
+      failedChecks: [
+        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/2 tests failed.*src\/math\.test\.ts:42.*AssertionError/is) },
+        { name: 'lint', state: 'ERROR', url: 'https://ci.test/lint', detail: 'runner crashed' },
+      ],
+    });
   });
 
   it('enables auto-merge only for the expected head SHA', async () => {
@@ -393,6 +424,104 @@ describe('GitHub-authoritative merge activity', () => {
         detail: expect.stringMatching(/conflicts with its target/i),
       });
     expect(methods).not.toContain('PUT');
+  });
+
+  it('classifies terminal CI, GitHub review, draft/closed PRs, and stale targets instead of polling forever', async () => {
+    let liveState: 'open' | 'closed' = 'open';
+    let readiness: any = {};
+    const methods: string[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const method = init.method ?? 'GET';
+      methods.push(method);
+      if (method === 'GET') return Response.json({
+        number: 21, node_id: 'PR_policy', html_url: 'https://github.test/acme/widgets/pull/21', state: liveState,
+        merged: false, head: { ref: 'karmax/task_policy', sha: 'reviewed-head' }, base: { ref: 'main' },
+      });
+      if (method === 'POST') return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_policy', url: 'https://github.test/acme/widgets/pull/21', state: liveState.toUpperCase(),
+        isDraft: false, merged: false, headRefOid: 'reviewed-head', mergeable: 'MERGEABLE',
+        mergeStateStatus: 'CLEAN', viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+        ...readiness,
+      } } } });
+      return Response.json({ merged: false, message: 'merge must not be attempted' }, { status: 409 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('GitHub policy classification');
+    const task = core.store.createTask({ projectId: project.id, title: 'Classify me', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } });
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_policy', base: 'main', repo: tmp, root: tmp } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 21, nodeId: 'PR_policy',
+      url: 'https://github.test/acme/widgets/pull/21', state: 'open', headSha: 'reviewed-head' }];
+
+    readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
+      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21',
+        output: { summary: 'three assertions failed' } },
+    ] } } };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
+      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21.*three assertions failed/is),
+    });
+
+    readiness = { reviewDecision: 'CHANGES_REQUESTED' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
+      status: 'needs-revision', detail: expect.stringMatching(/requested changes/i),
+    });
+
+    readiness = { isDraft: true, mergeStateStatus: 'DRAFT' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'needs-human', detail: expect.stringMatching(/draft/i) });
+
+    readiness = { reviewDecision: 'REVIEW_REQUIRED' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'needs-human', detail: expect.stringMatching(/requires a GitHub review/i) });
+    expect(methods).not.toContain('PUT');
+    methods.length = 0;
+
+    readiness = { mergeStateStatus: 'BLOCKED' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'needs-human', detail: expect.stringMatching(/GitHub policy is blocking/i) });
+
+    readiness = { mergeStateStatus: 'BEHIND' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'needs-revision', detail: expect.stringMatching(/updated with its target/i) });
+
+    liveState = 'closed';
+    readiness = {};
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'needs-human', detail: expect.stringMatching(/closed without merging/i) });
+
+    liveState = 'open';
+    readiness = { mergeStateStatus: 'BLOCKED', statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'waiting', detail: expect.stringMatching(/merge must not be attempted/i) });
+    expect(methods).toContain('PUT');
+  });
+
+  it('separates transient GitHub outages from authorization failures', async () => {
+    let status = 503;
+    let message = 'Service unavailable';
+    const fetcher = (async () => Response.json({ message }, { status })) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('GitHub error classification');
+    const task = core.store.createTask({ projectId: project.id, title: 'Retry me', workflow: 'software-dev',
+      workflowVersion: '1.14.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const ref = { repo: 'widgets', slug: SLUG, number: 22, url: 'https://github.test/acme/widgets/pull/22',
+      state: 'open', headSha: 'reviewed-head' } as TaskPullRequest;
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_error', base: 'main', repo: tmp, root: tmp } as any;
+
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({ status: 'retryable-error', detail: expect.stringMatching(/503/) });
+    status = 401;
+    message = 'Bad credentials';
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({ status: 'needs-authorizer', detail: expect.stringMatching(/reconnect GitHub/i) });
+    status = 403;
+    message = 'API rate limit exceeded';
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({ status: 'retryable-error', detail: expect.stringMatching(/rate limit/i) });
   });
 
   it('binds merge-queue and auto-merge fallback to the reviewed head', async () => {

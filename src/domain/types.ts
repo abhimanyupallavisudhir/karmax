@@ -662,7 +662,7 @@ export interface TaskPullRequest {
 }
 
 export interface GitHubMergeAuthorization {
-  status: 'merged' | 'queued' | 'waiting' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
+  status: 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */
   actorUserId?: string;
