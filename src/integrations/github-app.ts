@@ -183,6 +183,15 @@ export class GitHubAppService {
     return Boolean(this.options.appId?.trim() && this.broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE));
   }
 
+  /** OAuth client owned by this deployment's App. Kept behind the service so
+   * callers do not need to know the vault handle or durable metadata keys. */
+  oauthCredentials(): { clientId: string; clientSecret: string } | undefined {
+    const clientId = this.options.clientId?.trim();
+    if (!clientId || !this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)) return undefined;
+    return { clientId, clientSecret: this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
+      { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] }) };
+  }
+
   status(userId?: string): { configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
     webhookConfigured: boolean; syncMode: 'webhook' | 'on-demand'; userAuthorized: boolean } {
     let syncMode: 'webhook' | 'on-demand' = 'on-demand';
@@ -242,8 +251,8 @@ export class GitHubAppService {
       redirect_url: `${origin}/api/github/manifest/callback/${encodeURIComponent(state)}`,
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
-      callback_urls: [`${origin}/api/github/oauth/callback`],
-      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+      callback_urls: [`${origin}/api/github/oauth/callback`, `${origin}/api/auth/callback/github`],
+      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write', emails: 'read' },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
     // cannot reach them. Local Karmax instances reconcile installations on
@@ -297,13 +306,38 @@ export class GitHubAppService {
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
     this.saveUserToken(userId, identity.id, value);
+    this.saveUserIdentity(userId, identity, options.makeActive);
+    return identity;
+  }
+
+  /** Reuse the user access token Better Auth just received while signing in.
+   * This links identity and development authorship without a second OAuth flow. */
+  async adoptUserAuthorization(userId: string, expectedAccountId: string, authorization: {
+    accessToken: string;
+    refreshToken?: string;
+    accessTokenExpiresAt?: Date;
+    refreshTokenExpiresAt?: Date;
+  }): Promise<GitHubUserIdentity> {
+    const identity = await this.identityForToken(authorization.accessToken);
+    if (identity.id !== expectedAccountId)
+      throw new Error(`GitHub signed in as @${identity.login}, but returned a mismatched account id`);
+    this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
+      accessToken: authorization.accessToken,
+      ...(authorization.accessTokenExpiresAt ? { expiresAt: authorization.accessTokenExpiresAt.getTime() } : {}),
+      ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
+      ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
+    }));
+    this.saveUserIdentity(userId, identity, false);
+    return identity;
+  }
+
+  private saveUserIdentity(userId: string, identity: GitHubUserIdentity, makeActive = false): void {
     const accounts = this.userAccounts(userId);
     const prior = accounts.find((account) => account.id === identity.id);
     const next = [...accounts.filter((account) => account.id !== identity.id), { ...prior, ...identity }];
     this.saveUserAccounts(userId, next);
-    if (options.makeActive || !this.activeUserAccountId(userId))
+    if (makeActive || !this.activeUserAccountId(userId))
       this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
-    return identity;
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply

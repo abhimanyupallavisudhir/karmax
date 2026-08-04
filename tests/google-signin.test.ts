@@ -71,8 +71,8 @@ describe('Google sign-in is off unless configured', () => {
 });
 
 describe('GitHub sign-in when configured', () => {
-  it('advertises itself and builds an identity-only GitHub authorize URL', async () => {
-    const { identity, base } = await boot({ github: GITHUB });
+  it('advertises itself and builds a shared GitHub App authorize URL', async () => {
+    const { identity, base } = await boot({ github: { ...GITHUB, app: true } });
     expect(identity.githubEnabled).toBe(true);
     const session = await (await fetch(`${base}/api/session`)).json() as any;
     expect(session.github).toBe(true);
@@ -87,8 +87,29 @@ describe('GitHub sign-in when configured', () => {
     expect(url.searchParams.get('client_id')).toBe(GITHUB.clientId);
     expect(url.searchParams.get('state')).toBeTruthy();
     expect(url.searchParams.get('redirect_uri')).toMatch(/\/api\/auth\/callback\/github$/);
-    expect(new Set((url.searchParams.get('scope') ?? '').split(/[+\s]/).filter(Boolean)))
-      .toEqual(new Set(['read:user', 'user:email']));
+    expect(url.searchParams.get('scope')).toBe('');
+  });
+
+  it('hands new and refreshed GitHub App tokens to the personal connection', async () => {
+    const adopted: any[] = [];
+    const { identity } = await boot({ github: { ...GITHUB, app: true,
+      onAuthorization: async (authorization) => { adopted.push(authorization); } } });
+    const account = {
+      id: 'account-row', providerId: 'github', accountId: '42', userId: 'user-1',
+      accessToken: 'user-token', refreshToken: 'refresh-token',
+      accessTokenExpiresAt: new Date('2030-01-01T00:00:00Z'),
+      refreshTokenExpiresAt: new Date('2030-06-01T00:00:00Z'),
+      createdAt: new Date(), updatedAt: new Date(),
+    };
+    const hooks = identity.auth.options.databaseHooks.account;
+
+    await hooks.create.after(account, null);
+    await hooks.update.after({ ...account, accessToken: 'fresh-token' }, null);
+
+    expect(adopted).toEqual([
+      expect.objectContaining({ userId: 'user-1', accountId: '42', accessToken: 'user-token', refreshToken: 'refresh-token' }),
+      expect.objectContaining({ userId: 'user-1', accountId: '42', accessToken: 'fresh-token' }),
+    ]);
   });
 
   it('trusts GitHub verified email as a link source but still requires a verified local account', async () => {
