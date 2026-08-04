@@ -101,6 +101,19 @@ describe('profile account controls', () => {
   });
 });
 
+describe('organization data controls', () => {
+  it('puts a clearly described full-data export in Advanced settings', () => {
+    const start = app.indexOf('id="settings-advanced"');
+    const end = app.indexOf('function pendingInvitationRow', start);
+    expect(start).toBeGreaterThan(-1);
+    const advanced = app.slice(start, end);
+    expect(advanced).toContain('Export organization data');
+    expect(advanced).toContain('readable JSON archive');
+    expect(advanced).toContain('Passwords, tokens, and stored credentials are never included.');
+    expect(advanced).toContain('id="export-organization"');
+  });
+});
+
 describe('animations', () => {
   it('defines @keyframes pulse exactly once', () => {
     expect([...css.matchAll(/@keyframes pulse(?![-\w])/g)]).toHaveLength(1);

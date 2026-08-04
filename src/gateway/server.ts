@@ -1354,8 +1354,13 @@ export class Gateway {
       }
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
-        const value = store.exportOrganization(organizationExport[1]!);
-        return this.downloadJson(res, `krmax-${organizationExport[1]!}-export.json`, value);
+        const organizationId = organizationExport[1]!;
+        const organization = store.getOrganization(organizationId);
+        const value = store.exportOrganization(organizationId);
+        const label = String(organization?.slug || organizationId).toLowerCase()
+          .replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'organization';
+        return this.downloadJson(res,
+          `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
         const organizationId = organizationMatch[1]!;

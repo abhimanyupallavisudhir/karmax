@@ -1086,9 +1086,20 @@ export class Store {
       audit_log: rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       attachment_scopes: rowsFor(this.db, 'attachment_scopes', 'projectId', projectIds),
     };
-    return { format: 'karmax-organization-export', version: 1, exportedAt: new Date().toISOString(),
-      organization, executionPolicy: this.getOrganizationExecutionPolicy(organizationId),
-      identityPolicy: { ...identityPolicy, scimTokenId: undefined }, tables };
+    return {
+      format: 'karmax-organization-export',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      security: {
+        secretsIncluded: false,
+        omitted: ['password hashes', 'session and API tokens', 'OAuth tokens and state',
+          'credential values and handles', 'SCIM tokens', 'preview tokens'],
+      },
+      organization,
+      executionPolicy: this.getOrganizationExecutionPolicy(organizationId),
+      identityPolicy: { ...identityPolicy, scimTokenId: undefined },
+      tables,
+    };
   }
 
   /** A user-centered portability export. Unlike an organization export, this

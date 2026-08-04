@@ -103,9 +103,12 @@ describe('user data export', () => {
     const organizationText = await organizationResponse.text();
     expect(organizationResponse.status).toBe(200);
     expect(organizationResponse.headers.get('content-disposition'))
-      .toBe(`attachment; filename="krmax-${organization.id}-export.json"`);
+      .toMatch(/attachment; filename="krmax-personal-export-\d{4}-\d{2}-\d{2}\.json"/);
     expect(organizationText).toContain('\n  "format": "karmax-organization-export"');
-    expect(JSON.parse(organizationText).organization.id).toBe(organization.id);
+    expect(JSON.parse(organizationText)).toMatchObject({
+      organization: { id: organization.id },
+      security: { secretsIncluded: false },
+    });
   });
 
   it('does not allow an agent bearer token to use the self-service export', async () => {
