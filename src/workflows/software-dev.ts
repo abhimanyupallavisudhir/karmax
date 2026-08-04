@@ -12,6 +12,7 @@ import {
   isCancellation,
   ApplicationFailure,
   log,
+  patched,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
@@ -337,6 +338,20 @@ type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0'
  * construction instead of needing an edit nobody would notice was missing. */
 function behaviorMinor(behaviorVersion: BehaviorVersion): number {
   return Number(behaviorVersion.split('.')[1] ?? 0);
+}
+
+/**
+ * Activity results recorded before GitHub merge refusals were classified used
+ * the generic `waiting` status even when the detail was a permanent proposal
+ * conflict. Keep this deliberately narrow: pending checks and merge queues are
+ * real waits, while these messages can only be resolved by changing the head.
+ */
+export function githubWaitNeedsProposalRevision(
+  decision: Pick<GitHubMergeAuthorization, 'status' | 'detail'>,
+): boolean {
+  return decision.status === 'waiting'
+    && /(?:merge conflicts?|conflict(?:ing|s)? with (?:the )?(?:base|target)|not mergeable|base branch was modified|update (?:the )?branch)/i
+      .test(decision.detail ?? '');
 }
 
 /**
@@ -2454,11 +2469,16 @@ async function softwareDevImpl(
       }
       // `needs-revision` is deliberately handled for every pinned PR-policy
       // execution, not only the version that introduced the explicit PR cycle.
-      // Activities are not replay-pinned: a newly observed conflict may return
-      // this result to an old workflow. Historical activity results were
-      // `waiting`, so this branch is replay-safe and is what lets already-running
-      // tasks escape an otherwise infinite 30-second poll.
-      if (decision.status === 'needs-revision' || decision.status === 'stale-review') {
+      // Activities are not replay-pinned, so newly completed calls use the
+      // classifier above. Already-recorded activity results are different: old
+      // workers journaled a merge-conflict refusal as generic `waiting`, and a
+      // plain new branch here would make their old timer history nondeterministic.
+      // Evaluate the patch on every merge iteration: it is false while replaying
+      // marker-less waits, then records/flips true at the live edge and releases
+      // the execution to Do without rewriting any command already in history.
+      const repairsLegacyConflictWait = patched('software-dev-github-conflict-wait-recovery-v1');
+      if (decision.status === 'needs-revision' || decision.status === 'stale-review'
+        || (repairsLegacyConflictWait && githubWaitNeedsProposalRevision(decision))) {
         msgs.push({
           id: `merge-revise-${msgs.length}`,
           role: 'user',
