@@ -69,6 +69,16 @@ describe('gateway route capability binding', () => {
       .toBe('project:read');
   });
 
+  it('binds installation surfaces to installation settings capabilities', () => {
+    expect(cap('GET', '/api/settings/installation')).toBe('settings:read');
+    expect(cap('PUT', '/api/organizations/o1/payments/stripe/platform')).toBe('settings:write');
+    expect(cap('POST', '/api/organizations/o1/github/app-manifest')).toBe('settings:write');
+    expect(cap('PUT', '/api/organizations/o1/github/app')).toBe('settings:write');
+    // Tenant-owned connections stay tenant capabilities.
+    expect(cap('POST', '/api/organizations/o1/payments/connect')).toBe('payment:write');
+    expect(cap('POST', '/api/organizations/o1/github/install-url')).toBe('repository:write');
+  });
+
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
     expect(cap('GET', '/api/user/git-profiles')).toBe('none');
     expect(cap('POST', '/api/user/git-profiles')).toBe('none');

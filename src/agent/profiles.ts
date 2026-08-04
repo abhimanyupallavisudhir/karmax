@@ -68,6 +68,29 @@ export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfi
   };
 }
 
+/** Stable ids for the two editable profile-default layers. The unprefixed
+ * `<role>-default` records remain the bundled/legacy installation fallback. */
+export const organizationProfileId = (organizationId: string, role: AgentRole | string) =>
+  `organization:${organizationId}::${role}-default`;
+export const projectProfileId = (projectId: string, role: AgentRole | string) =>
+  `${projectId}::${role}-default`;
+
+/** Resolve the editable defaults without letting one organization's choice
+ * become another's fallback: project → organization → bundled/legacy. */
+export function roleDefaultProfile(store: Store, role: AgentRole | string,
+  projectId?: string, organizationId?: string): AgentProfile | undefined {
+  if (projectId) {
+    const project = store.getProfile(projectProfileId(projectId, role));
+    if (project) return project;
+    organizationId ??= store.getProject(projectId)?.organizationId;
+  }
+  if (organizationId) {
+    const organization = store.getProfile(organizationProfileId(organizationId, role));
+    if (organization) return organization;
+  }
+  return store.getProfile(`${role}-default`);
+}
+
 /** Resolves the profile for a role, honoring explicit/task/default precedence. */
 export class ProfileResolver {
   constructor(
@@ -81,12 +104,7 @@ export class ProfileResolver {
       const p = this.store.getProfile(id);
       if (p) return p;
     }
-    // Project overlay (SPEC §9): a project-scoped role default overrides the global one.
-    if (projectId) {
-      const proj = this.store.getProfile(`${projectId}::${role}-default`);
-      if (proj) return proj;
-    }
-    const def = this.store.getProfile(`${role}-default`);
+    const def = roleDefaultProfile(this.store, role, projectId);
     if (def) return def;
     // Synthesize a minimal default if the store has no profile yet.
     const model = defaultModel(this.fallbackProvider);

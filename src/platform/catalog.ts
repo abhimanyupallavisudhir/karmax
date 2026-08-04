@@ -33,6 +33,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   organizations: [
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
+    'GET /api/settings/installation (global operator-only Installation page probe)',
     // POST needs a human account: it calls bootstrapOrganizationOwner, and a scoped
     // agent token has no session.userId. Same for /invitations/accept below.
     'GET|POST /api/organizations (POST requires a human identity — an agent token cannot own an organization)',
@@ -57,7 +58,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/organizations/:organizationId/repositories',
     'POST /api/organizations/:organizationId/repositories/create (requires an authorized human GitHub identity)',
     'GET /api/organizations/:organizationId/git-connections',
-    'GET /api/organizations/:organizationId/github/app',
+    'GET|PUT /api/organizations/:organizationId/github/app',
     'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize|refresh (OAuth/install redirects require a human identity)',
   ],
   tasks: [
@@ -110,6 +111,11 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/settings/global/:workflow', 'GET|PUT /api/settings/project/:projectId/:workflow',
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
     'POST /api/skills', 'POST /api/safe-mode',
+  ],
+  installation: [
+    'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
+    'GET /api/email', 'POST /api/email/connect|test',
+    'GET|POST /api/remote-access',
   ],
   credentials: [
     'GET /api/user/github-accounts', 'POST /api/user/github-accounts/:accountId/active',

@@ -88,6 +88,8 @@ const S = {
   modelCatalog: null, // provider-native model metadata loaded from the gateway
   worldProviderConnections: [], // org's connected remote sandbox providers → Agent-environment options
   inviteNotice: null,
+  installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
+  installationInfo: null,
 };
 
 // Non-principal attempts are intentionally absent from S.tasks because the list
@@ -107,6 +109,7 @@ function taskRecord(id) {
 // Scheme:
 //   /                                    → home (redirects into the current org)
 //   /profile                             → the current user's profile
+//   /installation                        → global operator-only installation controls
 //   /<org>                               → org home (redirects to a project or dashboard)
 //   /<org>/dashboard                     → organization dashboard
 //   /<org>/settings                      → organization settings
@@ -176,6 +179,7 @@ function parseRoute(url) {
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
   if (seg[0] === 'profile') return { name: 'profile' };
+  if (seg[0] === 'installation') return { name: 'installation' };
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
@@ -234,6 +238,8 @@ function globalRoute(tab, org = currentOrg()) {
   return `${orgBase(org)}/${seg}`;
 }
 
+function installationRoute() { return '/installation'; }
+
 // The profile belongs to the signed-in user, not to the selected organization.
 function profileRoute() { return '/profile'; }
 
@@ -291,6 +297,14 @@ async function applyRoute() {
     if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
     closeTaskDom();
     S.tab = 'profile';
+    renderRail();
+    renderMain();
+    return;
+  }
+  if (r.name === 'installation') {
+    if (!S.installationAccess) return go(globalRoute('dashboard'), { replace: true });
+    closeTaskDom();
+    S.tab = 'installation';
     renderRail();
     renderMain();
     return;
@@ -2032,6 +2046,13 @@ async function boot() {
     }
   }
   S.meta = await api('/api/meta');
+  try {
+    S.installationInfo = await api('/api/settings/installation');
+    S.installationAccess = S.installationInfo?.canManage === true;
+  } catch {
+    S.installationInfo = null;
+    S.installationAccess = false;
+  }
   await loadOrganizations().catch(() => {});
   try { await loadProjects(); }
   catch (e) {
@@ -2700,7 +2721,8 @@ function renderRail() {
     <div class="label">Organization</div>
     <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
     <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>`;
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
+    ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
@@ -2891,6 +2913,7 @@ function renderMain() {
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
   else if (S.tab === 'inbox') content = inboxView();
   else if (S.tab === 'organization') content = organizationView();
+  else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
   else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'profile') content = profileView();
@@ -2914,6 +2937,7 @@ function renderMain() {
   if (S.tab === 'inbox') wireInboxView();
   if (S.tab === 'profile') wireProfileView();
   if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
+  if (S.tab === 'installation') wireInstallationSettings();
 
   restoreFocus(main, focusState);
   updateBell();
@@ -8151,8 +8175,8 @@ async function saveCommonSettings(scope, projectId, organizationId, ownNames, co
 const quickAgentFields = () => schemaFor('software-dev').filter((field) => field.type === 'agent');
 function settingsForms(scope, projectId) {
   const wfs = S.schema
-    .filter((s) => WORKFLOWS.some((w) => w.id === s.name) || (scope === 'global' && s.name === 'agent-queue'))
-    .sort((a, b) => Number(b.name === 'agent-queue') - Number(a.name === 'agent-queue'));
+    // Host admission is installation-wide and has a dedicated operator card.
+    .filter((s) => s.name !== 'agent-queue' && WORKFLOWS.some((w) => w.id === s.name));
   const common = `<div class="card" data-wf="__common__" data-schema-wf="software-dev">
       <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
       <button class="btn primary sm" data-save="__common__">Save task defaults</button>
@@ -8161,16 +8185,40 @@ function settingsForms(scope, projectId) {
     .map((s) => {
       const fields = settingsFields(s.name, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       if (!fields.length) return '';
-      const label = s.name === 'agent-queue' ? 'Host capacity' : s.name;
-      const suffix = s.name === 'agent-queue' ? '' : '— workflow-specific';
-      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'agent-queue' ? 'data-settings-access="capacity" hidden' : ''} ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
-        <summary style="cursor:pointer;font-weight:600">${esc(label)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">${suffix}</span></summary>
+      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
+        <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— workflow-specific</span></summary>
         <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
-        <button class="btn primary sm" data-save="${esc(s.name)}">${s.name === 'agent-queue' ? 'Save host capacity' : `Save ${esc(s.name)} defaults`}</button>
+        <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
       </details>`;
     })
     .join('');
   return common + unique;
+}
+
+function hostCapacityCard() {
+  const fields = settingsFields('agent-queue', 'global');
+  return `<div class="card" id="host-capacity-card" data-wf="agent-queue">
+    <div class="section-h">Agent turns</div>
+    <p class="task-sub">One host-wide limit protects model subprocesses from competing for the same memory and CPU.</p>
+    <div class="wf-form parameter-fields">${renderFields(fields)}</div>
+    <button class="btn primary sm" id="host-capacity-save">Save host capacity</button>
+  </div>`;
+}
+
+async function wireHostCapacityCard() {
+  const card = $('#host-capacity-card');
+  if (!card) return;
+  const fields = settingsFields('agent-queue', 'global');
+  let own = {};
+  try { own = await api('/api/settings/global/agent-queue'); } catch {}
+  card.querySelector('.wf-form').innerHTML = renderFields(fields, own, {});
+  card.querySelector('#host-capacity-save')?.addEventListener('click', async (event) => {
+    const values = collectForm(card.querySelector('.wf-form'), fields);
+    try {
+      await api('/api/settings/global/agent-queue', { method: 'PUT', body: JSON.stringify({ values }) });
+      flashSaved(event.currentTarget);
+    } catch (error) { toast(error.message, true); }
+  });
 }
 
 async function hydrateSettingsForms(scope, projectId, organizationId) {
@@ -9239,7 +9287,9 @@ async function hydrateProjectAccess(proj) {
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
-      ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
+      ${!githubApp.configured ? `<div class="inline-form">${S.installationAccess
+        ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
+        : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
         : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>
           ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
@@ -9252,7 +9302,6 @@ async function hydrateProjectAccess(proj) {
     wireRepositoryRemoves();
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
-    $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
@@ -9432,7 +9481,7 @@ async function hydrateExecutionProviders(proj) {
 /** The brand icon is instance-wide, like host capacity: it is the same mark for
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
-  return `<div class="card" id="appearance-card" data-settings-access="appearance" hidden>
+  return `<div class="card" id="appearance-card">
       <div class="section-h">Icon <span class="chip">whole instance</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The mark in the top bar and on the sign-in screen, the browser favicon, and the installed app icon.</p>
       <div class="brand-picker" id="brand-picker">
@@ -9476,7 +9525,6 @@ function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    ${appearanceCard()}
     ${profilesCard('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
@@ -9538,12 +9586,7 @@ function globalSettingsView(embedded = false) {
         <div id="wf-install-result" style="font-size:12px;margin-top:6px"></div>
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
-    </div>
-    <div class="card" id="resilience-card" hidden></div>
-    ${hostLocal() ? `<div class="settings-section-title" id="settings-access" hidden><div>Phone Access<small>Open krmax securely from your phone</small></div></div>
-    <div class="card phone-access-card" id="phone-access-card" hidden>
-      <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
-    </div>` : ''}`;
+    </div>`;
 }
 
 function phoneInstallHelp() {
@@ -9780,7 +9823,7 @@ async function hydratePhoneAccess() {
 }
 
 function revealPhoneAccess() {
-  for (const selector of ['#phone-access-nav', '#settings-access', '#phone-access-card']) {
+  for (const selector of ['#installation-access', '#phone-access-card']) {
     const element = $(selector);
     if (element) element.hidden = false;
   }
@@ -9831,8 +9874,7 @@ function paymentsCard(scope) {
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
-      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px" hidden></div>
-      <div class="pay-providers-list"></div>
+      ${scope === 'global' ? `<div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
       <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
         <p class="task-sub">Stripe’s compliance record for the person or company legally authorized to use the card. Stripe may require verification.</p>
@@ -9870,6 +9912,44 @@ function paymentsCard(scope) {
     ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
       <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
+}
+
+function stripePlatformCard() {
+  return '<div class="card" id="stripe-platform-card"><div class="task-sub">Loading Stripe platform setup…</div></div>';
+}
+
+async function wireStripePlatformCard() {
+  const box = $('#stripe-platform-card');
+  if (!box || !S.organizationId) return;
+  const endpoint = `/api/organizations/${encodeURIComponent(S.organizationId)}/payments/stripe/platform`;
+  let platform;
+  try { platform = await api(endpoint); }
+  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  const status = platform.configured ? '<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>' : '<span class="chip">setup required</span>';
+  const webhook = platform.webhookConfigured ? '<span class="chip" style="color:var(--ok,#4ec9a3)">webhook ready</span>' : '<span class="chip">webhook secret missing</span>';
+  box.innerHTML = `<div class="section-h">Stripe Connect ${status} ${webhook}</div>
+    <p class="task-sub">This application identifies the installation and receives callbacks. Organizations connect and fund their own Stripe accounts separately.</p>
+    <p class="task-sub">Create or open the application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>, then register the callback and webhook URLs below.</p>
+    <div class="settings-grid">
+      <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" /></label>
+      <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" /></label>
+      <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
+      <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
+      <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
+    </div>
+    <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
+    ${platform.source === 'environment' ? '<p class="task-sub">Environment values currently supply this setup. Saved replacements use the encrypted vault and take precedence.</p>' : ''}`;
+  box.querySelector('.stripe-platform-save')?.addEventListener('click', async (event) => {
+    try {
+      await api(endpoint, { method: 'PUT', body: JSON.stringify({
+        clientId: box.querySelector('.stripe-platform-client').value,
+        secretKey: box.querySelector('.stripe-platform-secret').value || undefined,
+        webhookSecret: box.querySelector('.stripe-platform-webhook-secret').value || undefined,
+      }) });
+      toast('Stripe platform setup saved');
+      await wireStripePlatformCard();
+    } catch (error) { toast(error.message, true); }
+  });
 }
 // ── card fields ──────────────────────────────────────────────────────────────
 // Card number, expiry and CVC behave like any checkout form: separators appear
@@ -9957,52 +10037,10 @@ async function wirePaymentProviders(box, organizationId, onChange) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
-  let platform;
   const paymentsBase = organizationId
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
   try { data = await api(`${paymentsBase}/providers`); } catch {}
-  if (organizationId) {
-    try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
-  }
-  const platformBox = box.querySelector('.pay-stripe-platform');
-  // The shared Connect application is installation-wide, so the box ships hidden
-  // and only `canManage` reveals it — a tenant is never shown the operator's form,
-  // not even for the frame between render and the answer coming back.
-  if (platformBox && platform?.canManage) {
-    platformBox.hidden = false;
-    const status = platform.configured
-      ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
-      : '<span class="chip">setup required</span>';
-    const webhook = platform.webhookConfigured
-      ? '<span class="chip" style="color:var(--ok,#4ec9a3)">webhook ready</span>'
-      : '<span class="chip">webhook secret missing</span>';
-    platformBox.innerHTML = `<details ${platform.configured && platform.webhookConfigured ? '' : 'open'}>
-      <summary style="cursor:pointer;font-weight:600">Stripe platform setup ${status} ${webhook}</summary>
-      <p class="task-sub">One Stripe Connect application identifies this krmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
-      <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
-      <div class="settings-grid">
-        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" /></label>
-        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" /></label>
-        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
-        <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
-        <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
-      </div>
-      <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
-      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in krmax’s encrypted vault and makes them take precedence.</p>' : ''}
-    </details>`;
-    platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
-      try {
-        await api(`${paymentsBase}/stripe/platform`, { method: 'PUT', body: JSON.stringify({
-          clientId: platformBox.querySelector('.stripe-platform-client').value,
-          secretKey: platformBox.querySelector('.stripe-platform-secret').value || undefined,
-          webhookSecret: platformBox.querySelector('.stripe-platform-webhook-secret').value || undefined,
-        }) });
-        toast('Stripe platform setup saved securely');
-        await wirePaymentProviders(box, organizationId, onChange);
-      } catch (e) { toast(e.message, true); }
-    });
-  }
   // Only OAuth rails need a connect surface; the vault-card rail needs nothing
   // and the mock rail is a development fixture, not a user-facing choice.
   const connectable = data.providers.filter((p) => p.kind === 'oauth');
@@ -10936,11 +10974,12 @@ async function wireOutboundEmailCard() {
 }
 
 function profileRow(p, scope) {
-  const inherited = scope === 'project' && p.scope === 'inherited';
+  const inherited = p.scope === 'inherited';
+  const ownScope = scope === 'project' ? 'project' : 'organization';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
-      ${inherited ? '<span class="chip" title="Using the organization/installation default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
+      ${inherited ? `<span class="chip" title="Using the next default up; edit to create a ${ownScope} override">inherited</span>` : `<span class="chip">${ownScope} override</span>`}</div>
     <div class="agent-profile-controls">
       <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
@@ -10953,12 +10992,12 @@ function profileRow(p, scope) {
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
-      ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
+      ${p.scope === ownScope ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
     </div>
   </div>`;
 }
 
-// Render + wire the agents editor for a scope (global or a project). Software
+// Render + wire the agents editor for a scope (organization or project). Software
 // Dev has only a Do agent; the remaining Merge profile belongs to merge-only and
 // is therefore shown honestly as its own role instead of being coupled to Do.
 // The standing Confirm-agent profile is not shown: review agents are configured
@@ -10968,7 +11007,9 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   if (!list) return;
   const renderIsCurrent = beginAsyncElementRender(list);
   let profiles = [];
-  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  const query = projectId ? `?projectId=${encodeURIComponent(projectId)}`
+    : `?organizationId=${encodeURIComponent(organizationId)}`;
+  try { profiles = await api(`/api/profiles${query}`); } catch {}
   if (!renderIsCurrent()) return;
   profiles = profiles.filter((p) => p.role !== 'confirm');
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
@@ -10993,9 +11034,10 @@ async function hydrateProfiles(scope, projectId, organizationId) {
     const targets = [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
     try {
       for (const orig of targets) {
-        await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
-          role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
+        await api(`/api/profiles${query}`, { method: 'PUT', body: JSON.stringify({
+          role: orig.role, name: orig.name,
           projectId: scope === 'project' ? projectId : undefined,
+          organizationId: scope === 'global' ? organizationId : undefined,
           ...knobs,
         }) });
       }
@@ -11006,7 +11048,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
     const ids = [b.dataset.resetprofile];
     try {
-      for (const id of ids) await api(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      for (const id of ids) await api(`/api/profiles/${encodeURIComponent(id)}${query}`, { method: 'DELETE' });
       toast('Reset to inherited');
       hydrateProfiles(scope, projectId, organizationId);
     } catch (e) { toast(e.message, true); }
@@ -11063,9 +11105,6 @@ function profilesCard(scope) {
 }
 
 function wireGlobalSettings(organizationId) {
-  if (hostLocal()) hydratePhoneAccess();
-  hydrateResilienceCard();
-  wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
@@ -11076,7 +11115,6 @@ function wireGlobalSettings(organizationId) {
   wireVaultCards(organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
-  wireOutboundEmailCard();
   $('#wf-install')?.addEventListener('click', async () => {
     const url = $('#wf-url').value.trim();
     const ref = $('#wf-ref').value.trim();
@@ -11418,9 +11456,8 @@ async function startUserGithubConnection(githubApp, mode, accountId) {
   const organizationId = S.organizationId || currentOrg()?.id;
   if (!organizationId) throw new Error('Choose an organization before connecting GitHub.');
   if (!githubApp?.configured) {
-    return submitGithubManifest(await api(`/api/organizations/${organizationId}/github/app-manifest`, {
-      method: 'POST', body: JSON.stringify({ publicUrl: location.origin, returnTo: 'profile' }),
-    }));
+    if (S.installationAccess) return go(`${installationRoute()}#installation-github`);
+    throw new Error('The installation operator must set up the shared GitHub App first.');
   }
   const result = await api(`/api/organizations/${organizationId}/github/authorize`, {
     method: 'POST', body: JSON.stringify({ returnTo: 'profile', mode, accountId }),
@@ -11858,6 +11895,74 @@ function cycleSettingsPane(delta) {
   links[(at + delta + links.length) % links.length]?.click();
 }
 
+function installationGithubCard() {
+  return '<div class="card" id="installation-github-card"><div class="task-sub">Loading GitHub App setup…</div></div>';
+}
+
+async function wireInstallationGithubCard() {
+  const box = $('#installation-github-card');
+  if (!box || !S.organizationId) return;
+  const base = `/api/organizations/${encodeURIComponent(S.organizationId)}/github`;
+  let status;
+  try { status = await api(`${base}/app`); }
+  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  if (!status.configured) {
+    box.innerHTML = `<div class="section-h">GitHub App <span class="chip">setup required</span></div>
+      <p class="task-sub">Create the one GitHub App this installation uses for repository transport and personal GitHub authorization. Organizations choose their own App installations and repositories afterwards.</p>
+      <button class="btn primary" id="installation-github-setup">Set up GitHub App</button>`;
+    $('#installation-github-setup')?.addEventListener('click', async () => {
+      try {
+        submitGithubManifest(await api(`${base}/app-manifest`, { method: 'POST',
+          body: JSON.stringify({ publicUrl: location.origin }) }));
+      } catch (error) { toast(error.message, true); }
+    });
+    return;
+  }
+  box.innerHTML = `<div class="section-h">GitHub App <span class="chip" style="color:var(--ok,#4ec9a3)">ready</span></div>
+    <p class="task-sub">Shared by every organization for repository transport and personal GitHub authorization.</p>
+    <div class="settings-grid">
+      <label class="form-row">App slug<input value="${esc(status.appSlug || '')}" readonly /></label>
+      <label class="form-row">App ID<input value="${esc(status.appId || '')}" readonly /></label>
+      <label class="form-row">User authorization<input value="${status.oauthConfigured ? 'Configured' : 'Client credentials missing'}" readonly /></label>
+      <label class="form-row">Webhook verification<input value="${status.webhookConfigured ? 'Configured' : 'Signing secret missing'}" readonly /></label>
+    </div>`;
+}
+
+function installationView() {
+  const phone = hostLocal()
+    ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
+    : '<div class="card"><p class="task-sub">Phone Access can be changed only from a browser on the machine running krmax.</p></div>';
+  return `<div class="organization-settings installation-settings"><div class="settings-header"><div>
+    <h1 class="page-title">Installation</h1><p class="settings-intro">Controls that affect every organization and the machine running krmax</p>
+  </div><span class="chip">operator only</span></div>
+  <div class="settings-layout">
+    <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-stripe">Stripe</a><a href="#installation-email">Email</a>
+      <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+    </nav><div class="settings-content">
+      <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
+      <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
+      <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
+      <div class="settings-section-title" id="installation-stripe"><div>Stripe<small>The shared Connect application; organizations keep separate accounts and funds</small></div></div>${stripePlatformCard()}
+      <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
+      <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
+      <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
+    </div>
+  </div></div>`;
+}
+
+function wireInstallationSettings() {
+  wireSettingsNavigation();
+  wireAppearanceCard();
+  wireHostCapacityCard();
+  wireInstallationGithubCard();
+  wireStripePlatformCard();
+  wireOutboundEmailCard();
+  hydrateResilienceCard();
+  if (hostLocal()) hydratePhoneAccess();
+}
+
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
@@ -11865,15 +11970,13 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a>${hostLocal() ? '<a href="#settings-access" id="phone-access-nav" hidden>Phone Access</a>' : ''}<a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
-    ${outboundEmailCard()}
-
     <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>Repository access and organization-owned automation</small></div></div>
     <div class="card"><div id="org-github">Loading…</div></div>
 
@@ -11909,10 +12012,6 @@ async function hydrateOrganizationView() {
   const renderIsCurrent = () => S.organizationViewEpoch === epoch
     && S.organizationId === organizationId
     && !!$('#org-members');
-  // Instance-wide cards render inside globalSettingsView but belong under
-  // Advanced, not among the task defaults. Moving the node keeps its listeners.
-  for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
-    if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
   await loadCollaboration().catch(() => {});
@@ -11946,11 +12045,16 @@ async function hydrateOrganizationView() {
   const githubManageUrl = (connection) => connection.accountType === 'Organization'
     ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
     : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
+  const githubSetup = !githubApp.configured
+    ? (S.installationAccess
+      ? `<a class="btn primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
+      : '<span class="task-sub">The installation operator must set up the shared GitHub App before this organization can connect repositories.</span>')
+    : `<button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}`;
   $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => `<div class="github-account-row" data-connection="${esc(connection.id)}">
     <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b></span>
     <span class="github-account-actions"><a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
   </div>`).join('')}</div>
-  <div class="github-org-actions"><button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}</div>`;
+  <div class="github-org-actions">${githubSetup}</div>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   S.worldProviderConnections = providerConnections;
   // The default Agent environment moved to Task defaults (below) and can be
@@ -12017,13 +12121,8 @@ async function hydrateOrganizationView() {
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#connect-github')?.addEventListener('click', async () => {
     try {
-      if (githubApp.configured) {
-        const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' });
-        location.assign(result.url);
-        return;
-      }
-      const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) });
-      submitGithubManifest(result);
+      const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' });
+      location.assign(result.url);
     } catch (error) { toast(error.message, true); }
   });
   $('#org-github-custom')?.addEventListener('click', () => openGitIdentityDialog({

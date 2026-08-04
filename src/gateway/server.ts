@@ -17,7 +17,7 @@ import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
-import { defaultModel, defaultEffort } from '../agent/profiles.js';
+import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { defaultBranch } from '../world/git.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
@@ -133,10 +133,13 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
-  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/app-manifest$/.test(p)) return 'settings:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/app$/.test(p)) return read ? 'repository:read' : 'settings:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:authorize|install-url|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
@@ -191,7 +194,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/defaults/')) return 'task:read';
-  if (p.startsWith('/api/profiles')) return read ? 'profile:read' : 'profile:write';
+  if (p.startsWith('/api/profiles')) {
+    const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
+    return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
+  }
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments') return 'task:create';
@@ -1245,14 +1251,15 @@ export class Gateway {
         const allowed = (capability: string, scope: { projectId?: string; organizationId?: string } = {}) =>
           this.deps.tokens.check(token, capability, scope).ok;
         return this.json(res, 200, {
-          appearance: allowed('settings:write'),
-          capacity: allowed('queue:write'),
-          safeMode: allowed('safe-mode:write'),
           organization: requestedScope.organizationId
             ? allowed('organization:edit', { organizationId: requestedScope.organizationId }) : false,
           project: requestedScope.projectId
             ? allowed('project:delete', { projectId: requestedScope.projectId }) : false,
         });
+      }
+      if (p === '/api/settings/installation' && method === 'GET') {
+        return this.json(res, 200, { canManage: this.deps.tokens.check(token, 'settings:write').ok,
+          hostLocal: this.hostLocal });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
@@ -1538,7 +1545,7 @@ export class Gateway {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
         if (method === 'PUT') {
-          if (!this.deps.tokens.check(token, 'user:write').ok)
+          if (!this.deps.tokens.check(token, 'settings:write').ok)
             return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });
           const b = await this.body(req);
           try {
@@ -1552,7 +1559,7 @@ export class Gateway {
       if (githubManifest && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
-        if (!this.deps.tokens.check(token, 'user:write').ok)
+        if (!this.deps.tokens.check(token, 'settings:write').ok)
           return this.json(res, 403, { error: 'Only a Krmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
@@ -3426,8 +3433,8 @@ export class Gateway {
         return this.json(res, 200, api.pinWorkflow(token, { projectId: pinsMatch[1]!, workflow: String(b.workflow), version: b.version ? String(b.version) : undefined }));
       }
 
-      // profiles (agent role profiles). Global scope by default; a project overlay
-      // (id `<projectId>::<role>-default`) overrides global per project (SPEC §7/§9).
+      // Agent-role defaults resolve project → organization → bundled/legacy.
+      // Unscoped access is reserved for the operator-owned fallback records.
       if (p === '/api/profiles' && method === 'GET') {
         // Annotate each profile with the workflow(s) that declare its role, so the
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
@@ -3454,12 +3461,21 @@ export class Gateway {
         };
         const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
-        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
-        // effective per-role view: the project override if present, else global (inherited)
+        const requestedOrganizationId = url.searchParams.get('organizationId') ?? undefined;
         const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr));
-        const view = globals.map((g) => {
-          const proj = store.getProfile(`${pid}::${g.role}-default`);
-          return withRole({ ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g });
+        if (!pid && !requestedOrganizationId) return this.json(res, 200, globals.map(withRole));
+        const organizationId = requestedOrganizationId ?? (pid ? store.getProject(pid)?.organizationId : undefined);
+        if (!organizationId) return this.json(res, 404, { error: 'organization not found' });
+        const organizations = globals.map((global) => {
+          const own = store.getProfile(organizationProfileId(organizationId, global.role));
+          return withRole({ ...(own ?? global), id: organizationProfileId(organizationId, global.role), role: global.role,
+            scope: own ? 'organization' : 'inherited', inherited: global });
+        });
+        if (!pid) return this.json(res, 200, organizations);
+        const view = organizations.map((organization) => {
+          const own = store.getProfile(projectProfileId(pid, organization.role));
+          return withRole({ ...(own ?? organization), id: projectProfileId(pid, organization.role), role: organization.role,
+            scope: own ? 'project' : 'inherited', inherited: organization });
         });
         return this.json(res, 200, view);
       }
@@ -3480,10 +3496,18 @@ export class Gateway {
         }
         const { roleDef } = await import('../contrib/manifests.js');
         if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
-        const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
+        const queryProjectId = url.searchParams.get('projectId') ?? undefined;
+        const queryOrganizationId = url.searchParams.get('organizationId') ?? undefined;
+        if (b.projectId && String(b.projectId) !== queryProjectId)
+          return this.json(res, 400, { error: 'project profile scope must match the request' });
+        if (b.organizationId && String(b.organizationId) !== queryOrganizationId)
+          return this.json(res, 400, { error: 'organization profile scope must match the request' });
+        const id = queryProjectId ? projectProfileId(queryProjectId, String(b.role))
+          : queryOrganizationId ? organizationProfileId(queryOrganizationId, String(b.role)) : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
         const {
           projectId: _pid,
+          organizationId: _oid,
           scope: _s,
           inherited: _i,
           modelProvider: _legacyModelProvider,
@@ -3497,10 +3521,19 @@ export class Gateway {
         store.upsertProfile({ provider: 'claude', ...rest, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
-      // reset a project profile override back to the global default
+      // Reset one scoped override back to the next inherited layer.
       const profDelMatch = p.match(/^\/api\/profiles\/(.+)$/);
       if (profDelMatch && method === 'DELETE') {
-        store.deleteProfile(decodeURIComponent(profDelMatch[1]!));
+        const id = decodeURIComponent(profDelMatch[1]!);
+        const queryProjectId = url.searchParams.get('projectId') ?? undefined;
+        const queryOrganizationId = url.searchParams.get('organizationId') ?? undefined;
+        if (queryProjectId && !id.startsWith(`${queryProjectId}::`))
+          return this.json(res, 400, { error: 'project profile scope must match the request' });
+        if (queryOrganizationId && !id.startsWith(`organization:${queryOrganizationId}::`))
+          return this.json(res, 400, { error: 'organization profile scope must match the request' });
+        if (!queryProjectId && !queryOrganizationId && id.includes('::'))
+          return this.json(res, 400, { error: 'scoped profile deletion needs its project or organization' });
+        store.deleteProfile(id);
         return this.json(res, 200, { ok: true });
       }
 
@@ -3514,12 +3547,12 @@ export class Gateway {
         const publicUrl = this.publicUrl(req);
         if (method === 'GET') return this.json(res, 200, {
           ...provider.platformStatus(),
-          canManage: this.deps.tokens.check(token, 'user:write').ok,
+          canManage: this.deps.tokens.check(token, 'settings:write').ok,
           callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
           webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
         });
         if (method === 'PUT') {
-          if (!this.deps.tokens.check(token, 'user:write').ok)
+          if (!this.deps.tokens.check(token, 'settings:write').ok)
             return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared Stripe Connect application' });
           const b = await this.body(req);
           try {
@@ -5050,9 +5083,7 @@ export class Gateway {
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
-      const prof =
-        (projectId ? this.deps.store.getProfile(`${projectId}::${f.role}-default`) : undefined) ??
-        this.deps.store.getProfile(`${f.role}-default`);
+      const prof = roleDefaultProfile(this.deps.store, f.role, projectId);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
