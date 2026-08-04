@@ -1757,6 +1757,15 @@ export class KarmaxApi {
     return actions.filter((action) => allowed.has(action.name));
   }
 
+  /** Resolve/Escalated are stack frames around a failed public operation, not
+   * restartable pipeline positions. Historical views did not persist that
+   * operation, so Do is the only conservative replacement destination: it
+   * preserves the branch and conversation without pretending to replay a lost
+   * closure or skipping Review. */
+  private safeRecoveryStage(stage: Stage): Stage {
+    return stage === 'resolve' || stage === 'escalated' ? 'do' : stage;
+  }
+
   /** The single transition policy shared by the selected task header, every
    * attempt row, and the mutation endpoint. */
   private availableStageTransitions(
@@ -1782,17 +1791,32 @@ export class KarmaxApi {
     }
     if (view.status === 'done') {
       if (manuallyDoneFrom) {
-        add({
-          target: manuallyDoneFrom,
-          label: manuallyDoneFrom === 'draft' ? 'Back to Draft' : `Restore ${stageName(manuallyDoneFrom)}`,
-          description: 'Undo the manual completion and restore its prior stage.',
-        });
+        const terminalSnapshot = manuallyDoneFrom === 'cancelled' || manuallyDoneFrom === 'failed';
+        if (resumable || terminalSnapshot || manuallyDoneFrom === 'draft' || manuallyDoneFrom === 'human') {
+          const restore = manuallyDoneFrom === 'draft' || manuallyDoneFrom === 'human' || terminalSnapshot
+            ? manuallyDoneFrom
+            : this.safeRecoveryStage(manuallyDoneFrom);
+          add({
+            target: restore,
+            label: restore === 'draft' ? 'Back to Draft' : `Restore ${stageName(restore)}`,
+            description: restore === manuallyDoneFrom
+              ? 'Undo the manual completion and restore its prior stage and prerequisites.'
+              : `The prior ${stageName(manuallyDoneFrom)} frame cannot be replayed safely; recover the preserved work in ${stageName(restore)}.`,
+          });
+        }
       }
       return result; // natural completion is immutable
     }
     if (view.status === 'cancelled') {
       if (resumable && cancelledFrom && cancelledFrom !== 'cancelled') {
-        add({ target: cancelledFrom, label: `Restore ${stageName(cancelledFrom)}`, description: 'Resume from the stage active when this attempt was cancelled.' });
+        const restore = this.safeRecoveryStage(cancelledFrom);
+        add({
+          target: restore,
+          label: `Restore ${stageName(restore)}`,
+          description: restore === cancelledFrom
+            ? 'Recreate the stage prerequisites, then resume where this attempt was cancelled.'
+            : `The cancelled ${stageName(cancelledFrom)} frame cannot be replayed safely; recover the preserved work in ${stageName(restore)}.`,
+        });
       }
       if (!jayadratha) add({ target: 'draft', label: 'Draft', description: 'Discard progress and make this attempt editable again.', danger: true });
       add({ target: 'done', label: 'Done', description: 'Mark this cancelled attempt done manually.' });
@@ -1807,6 +1831,11 @@ export class KarmaxApi {
       return result;
     }
 
+    // Once a merge has actually landed, workflow cleanup/finalization is the
+    // only safe continuation. Terminating it for a synthetic hold/Done move can
+    // leave remote PR state or a multi-repo landing half reconciled.
+    if (view.pointOfNoReturnPassed) return result;
+
     if (origin) {
       add({ target: origin, label: `Resume ${stageName(origin)}`, description: 'Leave the human hold and resume the originating stage.' });
     // Resolve is an internal recovery frame rather than a resumable public
@@ -1816,13 +1845,13 @@ export class KarmaxApi {
     } else if (resumable && view.stage !== 'escalated' && view.stage !== 'resolve' && view.waitingFor?.kind !== 'human') {
       add({ target: 'human', label: 'Waiting for human input', description: 'Stop current activity and hold this attempt for a person.' });
     }
-    if (resumable && (view.stage === 'review' || view.stage === 'merge') && !origin)
+    if (resumable && (view.stage === 'pr' || view.stage === 'review' || view.stage === 'merge') && !origin)
       add({
         target: 'do',
         label: 'Do',
-        description: view.stage === 'merge'
-          ? 'Return the pending pull request to Do for repair; it must be opened and reviewed again.'
-          : 'Return the reviewed work to the Do agent.',
+        description: view.stage === 'review' || view.stage === 'merge'
+          ? 'Return the proposal to Do for repair; it must be opened and reviewed again.'
+          : 'Stop proposal publication and return the preserved branch to Do.',
       });
     if (!jayadratha && !view.pointOfNoReturnPassed)
       add({ target: 'draft', label: 'Draft', description: 'Discard all execution progress and make the attempt editable.', danger: true });
@@ -1964,13 +1993,19 @@ export class KarmaxApi {
       transitionCheckpoint: _transitionCheckpoint,
       humanPauseOrigin: _humanPauseOrigin,
       cancelledFrom: _cancelledFrom,
+      restoringTo: _restoringTo,
       ...priorState
     } = view.state;
+    const versionMinor = Number(String(version).split('.')[1] ?? 0);
+    const restoringProposal = !pausedForHuman
+      && versionMinor >= 15
+      && (resumeStage === 'pr' || resumeStage === 'review' || resumeStage === 'merge');
+    const initialStage: Stage = restoringProposal ? 'pr' : resumeStage;
     const starting: TaskView = {
       ...view,
-      stage: resumeStage,
+      stage: initialStage,
       status: pausedForHuman ? 'waiting' : 'active',
-      actions: pausedForHuman ? this.lifecycleActions(view) : this.resumedActions(view.actions, resumeStage),
+      actions: pausedForHuman ? this.lifecycleActions(view) : this.resumedActions(view.actions, initialStage),
       waitingFor: pausedForHuman
         ? {
             kind: 'human',
@@ -1984,6 +2019,7 @@ export class KarmaxApi {
         ...priorState,
         cancelled: false,
         ...(pausedForHuman ? { humanPauseOrigin: resumeStage } : {}),
+        ...(restoringProposal ? { restoringTo: resumeStage } : {}),
         recoveryWorld: input.recovery.world,
       },
       updatedAt: Date.now(),

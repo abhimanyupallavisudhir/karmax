@@ -2564,9 +2564,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     /** Close the task's still-open PRs (cancellation). Best-effort: a task that
      *  is going away must not be held up by GitHub being unreachable. */
     async closePrs(handle: WorldHandle, prs: TaskPullRequest[], reason: string): Promise<void> {
+      // Opening a PR can authorize a local checkout by matching its configured
+      // GitHub origin against the organization repository catalog. Preserve the
+      // same checkout context here; resolving only by project attachment made
+      // cancellation unable to close exactly those otherwise-valid PRs.
+      const world = await openWorld(handle).catch(() => undefined);
+      const checkouts = world ? worldRepos(world.handle) : [];
       for (const ref of prs) {
         try {
-          const api = await prApiFor(handle, ref.slug);
+          const checkout = checkouts.find((candidate) => candidate.name === ref.repo);
+          const api = await prApiFor(handle, ref.slug, checkout);
           if ((await api.get(ref.slug, ref.number)).state === 'closed') continue;
           await api.comment(ref.slug, ref.number, reason);
           await api.update(ref.slug, ref.number, { state: 'closed' });

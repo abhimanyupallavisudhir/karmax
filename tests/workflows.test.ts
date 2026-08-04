@@ -227,6 +227,53 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('done');
   });
 
+  it('software-dev v1.15: restored Review replays the configured confirmer layers', async () => {
+    const repo = await h.makeRepo('stage-restored-layers');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.15.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'Restored layered review',
+        prompt: '@confirm confirm',
+        confirm: { layers: [{ kind: 'agent', provider: 'mock' }, { kind: 'human' }] },
+        recovery: {
+          messages: [{ id: 'm0', role: 'user', text: 'Review the preserved clean proposal.', ts: 0 }],
+          seen: 1,
+          target: 'main',
+          resumeStage: 'review',
+        },
+      })],
+    });
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 })
+      .toBe('restored confirm layer 2/2');
+    expect((await view(handle)).transcripts?.find((transcript: any) => transcript.role === 'confirm')?.messages
+      .some((message: any) => message.text.includes('confirm_decision: confirm'))).toBe(true);
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  });
+
+  it('goal v1.15: restored Review retains the zero-layer autonomous route', async () => {
+    const repo = await h.makeRepo('goal-restored-review');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('goal@1.15.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'Autonomous restored review',
+        recovery: {
+          messages: [{ id: 'm0', role: 'user', text: 'The preserved proposal is complete.', ts: 0 }],
+          seen: 1,
+          target: 'main',
+          resumeStage: 'review',
+        },
+      })],
+    });
+
+    expect((await handle.result()).stage).toBe('done');
+  });
+
   it('goal: a clean partial return triggers another turn until explicit completion', async () => {
     const repo = await h.makeRepo('goal-persist');
     const taskId = newId('task');

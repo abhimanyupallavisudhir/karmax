@@ -316,13 +316,20 @@ export async function softwareDevV1_14(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.14.0');
 }
 
+/** Replacement executions restore the prerequisites of their requested public
+ * stage: PRs are reconciled before Review/Merge, and a moved proposal is
+ * reviewed again instead of inheriting approval for another head. */
+export async function softwareDevV1_15(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.15.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -383,6 +390,7 @@ async function softwareDevImpl(
   const proposalBeforeReview = minor >= 12;
   const explicitPrCycle = minor >= 13;
   const classifiedGithubStates = minor >= 14;
+  const restoresStagePrerequisites = minor >= 15;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -419,7 +427,7 @@ async function softwareDevImpl(
   const followUpWakesEscalation = minor >= 10;
   const taskId = input.taskId;
   const recovery = input.recovery;
-  const recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
+  let recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
   let stage: Stage = recoveryStage;
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = recovery
@@ -480,7 +488,11 @@ async function softwareDevImpl(
   let pointOfNoReturnPassed = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
-  let targetLocked = false;
+  // Replacement runs must retain the target freeze established by an opened
+  // proposal even when they deliberately return to Do for repair. Otherwise a
+  // stage move quietly re-enabled a parameter whose value already names a PR.
+  let targetLocked = restoresStagePrerequisites && !!recovery
+    && (['pr', 'review', 'merge'].includes(recoveryStage) || !!recovery.prs?.length);
   let mergeGranted = false;
   let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
   // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
@@ -538,6 +550,7 @@ async function softwareDevImpl(
   // `confirm` once the Review gate it drives has fully passed (a gate that sends the
   // task back to Do will play again, so the route is not consumed yet).
   const consumed = new Set<string>();
+  if (restoresStagePrerequisites && recoveryStage === 'merge') consumed.add('confirm');
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
   const paramEditable = (name: string): boolean =>
     !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: isConsumed(name), pointOfNoReturnPassed });
@@ -1794,6 +1807,70 @@ async function softwareDevImpl(
     humanPauseActive = false;
   }
 
+  // A public stage is a promise about its prerequisites, not an instruction
+  // pointer. Cancellation closes open PRs, manual Done can interrupt PR
+  // creation, and GitHub may move a branch while a task is stopped. Reconcile
+  // the proposal before restoring PR/Review/Merge so Review always has an open
+  // proposal and Merge never inherits approval for a different head.
+  if (restoresStagePrerequisites && recovery && ['pr', 'review', 'merge'].includes(recoveryStage)) {
+    const requestedStage = recoveryStage;
+    const reviewedPrs = prs.map((candidate) => ({ ...candidate }));
+    stage = 'pr';
+    status = 'active';
+    waitingFor = undefined;
+    await publish();
+    if (cancelled) return await abort();
+
+    const readiness = await withResolve('pr', () => core.checkProposal(world as any));
+    if (!readiness.ready) {
+      const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
+      msgs.push({
+        id: `restore-pr-refused-${msgs.length}`,
+        role: 'user',
+        text: `Could not restore ${requestedStage}: ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nRepair the task branch, verify it, then call open_pr. The proposal must pass Review again.`,
+        ts: msgs.length,
+      });
+      recoveryStage = 'do';
+      prRequested = false;
+      branchPreparedForPr = false;
+      checkoutApprovals = {};
+      consumed.delete('confirm');
+    } else {
+      targetLocked = true;
+      if (githubAuthoritativeMerge) {
+        const opened = await withResolve('pr', () => core.openPr(world as any, target, {
+          title: input.title,
+          summary: reviewInfo?.summary ?? lastOutputs(msgs),
+        }));
+        prs = opened ?? [];
+        pr = prs[0];
+
+        const sameReviewedProposal = reviewedPrs.length === prs.length
+          && reviewedPrs.every((reviewed) => prs.some((live) =>
+            reviewed.slug === live.slug
+            && reviewed.number === live.number
+            && !!reviewed.headSha
+            && reviewed.headSha === live.headSha));
+        if (requestedStage === 'merge' && !sameReviewedProposal) {
+          recoveryStage = 'review';
+          checkoutApprovals = {};
+          consumed.delete('confirm');
+          msgs.push({
+            id: `restore-review-stale-${msgs.length}`,
+            role: 'system',
+            text: 'The restored pull-request set or head changed while the task was stopped. Review is required again before Merge.',
+            ts: msgs.length,
+          });
+        }
+      }
+      branchPreparedForPr = true;
+      prRequested = false;
+      if (requestedStage === 'pr') recoveryStage = 'review';
+      const preparedReview = await core.buildReview(world as any, base).catch(() => undefined);
+      if (preparedReview) reviewInfo = { ...reviewInfo, ...preparedReview };
+    }
+  }
+
   // Restoring a cancelled/manual-done Review returns to the decision gate without
   // rerunning completed Do work. The action that released a Review-origin hold
   // keeps its normal meaning: Confirm advances, feedback returns to Do, while an
@@ -1803,18 +1880,109 @@ async function softwareDevImpl(
     recoveryStage === 'review'
     && (pauseWake?.kind === 'followUp' || pauseWake?.kind === 'workflowChange');
   if (recoveryStage === 'review' && !restoredReviewApproved && !restoredReviewBackToDo) {
-    stage = 'review';
-    status = 'waiting';
-    waitingFor = { kind: 'human', audience: ['@creator'], detail: 'Restored review' };
-    confirmed = false;
-    const reviewSeen = msgs.length;
-    await publish();
-    await condition(() => confirmed || cancelled || msgs.length > reviewSeen);
-    waitingFor = undefined;
-    if (cancelled) return await abort();
-    restoredReviewApproved = confirmed;
-    confirmed = restoredReviewApproved;
-    status = 'active';
+    if (!restoresStagePrerequisites) {
+      stage = 'review';
+      status = 'waiting';
+      waitingFor = { kind: 'human', audience: ['@creator'], detail: 'Restored review' };
+      confirmed = false;
+      const reviewSeen = msgs.length;
+      await publish();
+      await condition(() => confirmed || cancelled || msgs.length > reviewSeen);
+      waitingFor = undefined;
+      if (cancelled) return await abort();
+      restoredReviewApproved = confirmed;
+      confirmed = restoredReviewApproved;
+      status = 'active';
+    } else {
+      // Replay the configured confirmer route rather than manufacturing a
+      // creator-only gate. Agent layers, multiple human layers, parent review,
+      // and Goal's zero-layer policy keep exactly their ordinary semantics.
+      if (multiPrEnabled) checkoutHeads = await core.checkoutHeads(world as any).catch(() => checkoutHeads);
+      stage = 'review';
+      status = 'waiting';
+      if (clearsConfirmOnGate) confirmed = false;
+      let backToDo = false;
+      if (input.parentTaskId) {
+        waitingFor = { kind: 'parent', detail: 'Restored review' };
+        const reviewSeen = msgs.length;
+        await notifyParent('needs_confirmation', reviewInfo?.summary);
+        await publish();
+        await condition(() => confirmed || cancelled || msgs.length > reviewSeen);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        backToDo = !confirmed;
+      } else {
+        let li = 0;
+        const gatesNow = () => modeSwitching
+          ? (goalMode ? [] : softwareDevConfirmLayers)
+          : softwareDevConfirmLayers;
+        while (!backToDo) {
+          const gates = gatesNow();
+          if (li >= gates.length) break;
+          const epoch = confirmEpoch;
+          const layer = gates[li]!;
+          const gateDetail = gates.length > 1
+            ? `restored confirm layer ${li + 1}/${gates.length}`
+            : 'Restored review';
+          if (layer.kind === 'agent') {
+            waitingFor = { kind: 'confirm', detail: gateDetail };
+            await publish();
+            const decision = await confirmTurn(layer);
+            waitingFor = undefined;
+            if (cancelled) return await abort();
+            if (confirmEpoch !== epoch) { li = 0; continue; }
+            if (decision?.action === 'confirm') { li++; continue; }
+            if (decision?.action === 'reject') {
+              if (decision.text) msgs.push({
+                id: `restore-review-reject-${msgs.length}`,
+                role: 'system',
+                text: `Confirm agent rejected the restored proposal: ${decision.text}`,
+                ts: msgs.length,
+              });
+              cancelled = true;
+              return await abort();
+            }
+            if (decision?.action === 'revise') {
+              msgs.push({
+                id: `restore-review-revise-${msgs.length}`,
+                role: 'user',
+                text: decision.text || 'Please revise the restored proposal per the reviewer feedback.',
+                ts: msgs.length,
+              });
+              backToDo = true;
+              continue;
+            }
+            // A missing agent verdict degrades this layer to its human gate.
+          }
+          const reviewSeen = msgs.length;
+          waitingFor = {
+            kind: 'human',
+            detail: gateDetail,
+            audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
+          };
+          await publish();
+          await condition(() => confirmed || cancelled || msgs.length > reviewSeen || confirmEpoch !== epoch);
+          waitingFor = undefined;
+          if (cancelled) return await abort();
+          if (confirmEpoch !== epoch) { li = 0; confirmed = false; continue; }
+          if (confirmed && multiPrEnabled && world)
+            checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
+          if (!confirmed) backToDo = true;
+          confirmed = false;
+          li++;
+        }
+      }
+      status = 'active';
+      if (backToDo) {
+        recoveryStage = 'do';
+        restoredReviewApproved = false;
+        confirmed = false;
+      } else {
+        consumed.add('confirm');
+        restoredReviewApproved = true;
+        confirmed = true;
+      }
+    }
   }
 
   let sha: string | undefined;

@@ -53,6 +53,8 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
       ...githubReadiness,
     } } } });
   }
+  if (u.pathname === '/graphql' && method === 'POST')
+    return json(200, { data: {}, errors: [{ message: 'This test repository has no merge queue or auto-merge.' }] });
   const merge = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)/merge$`));
   if (merge && method === 'PUT') {
     const pr = prs.find((candidate) => candidate.number === Number(merge[1]));
@@ -113,6 +115,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         status: () => ({ userAuthorized: true, oauthConfigured: true }),
         activeUserAccountId: (userId: string) => `${userId}-github`,
         repositoryPermission: async (_userId: string, slug: string) => ({ slug, permission: 'write', canMerge: true }),
+        repositoryCloneToken: async () => 'installation-token',
         userAccessToken: async (userId: string) => `${userId}-token`,
         brokerCredentials: async () => ({ env: {} }),
       } as any,
@@ -347,6 +350,111 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     }, { timeout: 30_000 }).toBe('review/true');
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done' });
+  }, 120_000);
+
+  it('v1.15 reopens a cancelled Review PR before restoring the review gate', async () => {
+    const repo = await repoWithOrigin('github-review-restore');
+    const project = h.store.createProject('GitHub Review restore', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '45', accountLogin: 'acme', accountType: 'Organization' });
+    h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '80',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Restore Review', workflow: 'software-dev',
+      workflowVersion: '1.15.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.15.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Restore Review',
+        prompt: '@write restore.md :: preserved proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => `${(await view(handle)).stage}/${prs[0]?.state}`, { timeout: 30_000 })
+      .toBe('review/open');
+    await handle.signal('cancel');
+    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
+    expect(prs).toHaveLength(1);
+    expect(prs[0].state).toBe('closed');
+
+    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    const starting = await h.api.moveTaskStage(token, task.id, 'review');
+    expect(starting).toMatchObject({ stage: 'pr', state: { restoringTo: 'review' } });
+    const replacement = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => {
+      const current = await view(replacement);
+      return `${current.stage}/${current.waitingFor?.kind}/${current.prs?.[0]?.state}/${prs.length}`;
+    }, { timeout: 30_000 }).toBe('review/human/open/1');
+    expect((await view(replacement)).editableParams).not.toContain('target');
+
+    await replacement.signal('confirm');
+    expect(await replacement.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
+  }, 120_000);
+
+  it('v1.15 reopens a cancelled Merge PR but sends a changed restored head through Review again', async () => {
+    const repo = await repoWithOrigin('github-merge-restore');
+    const project = h.store.createProject('GitHub Merge restore', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '46', accountLogin: 'acme', accountType: 'Organization' });
+    h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '81',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Restore Merge', workflow: 'software-dev',
+      workflowVersion: '1.15.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.15.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Restore Merge',
+        prompt: '@write restore-merge.md :: preserved proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
+    };
+    mergeHttpStatus = 409;
+    await handle.signal('confirm');
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).waitingFor?.kind}`, { timeout: 30_000 })
+      .toBe('merge/github');
+    await handle.signal('cancel');
+    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
+    expect(prs[0].state).toBe('closed');
+
+    // An unchanged exact head may resume Merge after the PR is reopened; it
+    // must not manufacture a second Review for work that was already approved.
+    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    await h.api.moveTaskStage(token, task.id, 'merge');
+    const exactReplacement = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => {
+      const current = await view(exactReplacement);
+      return `${current.stage}/${current.waitingFor?.kind}/${current.prs?.[0]?.state}`;
+    }, { timeout: 30_000 }).toBe('merge/github/open');
+    await exactReplacement.signal('cancel');
+    expect(await exactReplacement.result()).toMatchObject({ stage: 'cancelled' });
+    expect(prs[0].state).toBe('closed');
+
+    // The remote proposal changed while stopped. Reopening is necessary, but
+    // the old exact-head approval must not carry onto this replacement head.
+    prs[0].head.sha = 'moved-head';
+    githubReadiness = {};
+    mergeHttpStatus = undefined;
+    await h.api.moveTaskStage(token, task.id, 'merge');
+    const replacement = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => {
+      const current = await view(replacement);
+      const transcript = current.messages.map((message: any) => message.text).join('\n');
+      return `${current.stage}/${current.waitingFor?.kind}/${current.prs?.[0]?.state}/${/head changed.*Review is required/is.test(transcript)}`;
+    }, { timeout: 30_000 }).toBe('review/human/open/true');
+
+    await replacement.signal('cancel');
+    expect(await replacement.result()).toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
   /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its

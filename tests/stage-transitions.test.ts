@@ -112,8 +112,18 @@ describe('task stage transitions', () => {
     expect(cancelled?.stageTransitions?.map((move) => move.target)).toEqual(['review', 'draft', 'done']);
 
     const restored = await f.api.moveTaskStage(f.token, f.task.id, 'review');
-    expect(restored).toMatchObject({ stage: 'review', status: 'active' });
+    // Review is not projected until its proposal has been reconciled. The
+    // replacement starts honestly in PR, while retaining Review as its target.
+    expect(restored).toMatchObject({ stage: 'pr', status: 'active', state: { restoringTo: 'review' } });
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'review' });
+
+    // Model the replacement workflow's next publish after it reopens the PR.
+    f.store.saveView(f.task.id, {
+      ...restored,
+      stage: 'review',
+      status: 'waiting',
+      state: { ...restored.state, restoringTo: undefined },
+    });
 
     const held = await f.api.moveTaskStage(f.token, f.task.id, 'human');
     expect(held).toMatchObject({
@@ -475,6 +485,65 @@ describe('task stage transitions', () => {
     expect(merge?.stageTransitions?.map((move) => move.target)).toEqual(['human', 'do', 'draft', 'done']);
     await f.api.moveTaskStage(f.token, f.task.id, 'do');
     expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', prs });
+  });
+
+  it('normalizes every cancelled public/internal stage to a safe recovery destination', async () => {
+    const cases: Array<[TaskView['stage'], string]> = [
+      ['setup', 'setup'],
+      ['do', 'do'],
+      ['pr', 'pr'],
+      ['review', 'review'],
+      ['merge', 'merge'],
+      ['resolve', 'do'],
+      ['escalated', 'do'],
+    ];
+    for (const [cancelledFrom, expected] of cases) {
+      const f = fixture();
+      f.store.saveView(f.task.id, {
+        ...f.view,
+        stage: 'cancelled',
+        status: 'cancelled',
+        state: { ...f.view.state, cancelled: true, cancelledFrom },
+      });
+      const cancelled = await f.api.getTaskView(f.token, f.task.id);
+      expect(cancelled?.stageTransitions?.[0]?.target, cancelledFrom).toBe(expected);
+    }
+  });
+
+  it('normalizes manual-Done restoration and does not advertise false undo for non-recoverable workflows', async () => {
+    for (const [origin, expected] of [
+      ['setup', 'setup'], ['do', 'do'], ['pr', 'pr'], ['review', 'review'], ['merge', 'merge'],
+      ['resolve', 'do'], ['escalated', 'do'],
+    ] as Array<[TaskView['stage'], string]>) {
+      const f = fixture();
+      f.store.saveView(f.task.id, { ...f.view, stage: origin });
+      const done = await f.api.moveTaskStage(f.token, f.task.id, 'done');
+      expect(done.stageTransitions?.[0]?.target, origin).toBe(expected);
+    }
+
+    const legacy = fixture();
+    legacy.store.setTaskWorkflow(legacy.task.id, 'just-do');
+    legacy.store.saveView(legacy.task.id, { ...legacy.view, workflow: 'just-do' });
+    const done = await legacy.api.moveTaskStage(legacy.token, legacy.task.id, 'done');
+    expect(done.stageTransitions).toEqual([]);
+  });
+
+  it('offers PR-to-Do repair but no lifecycle termination after the merge point of no return', async () => {
+    const publication = fixture();
+    publication.store.saveView(publication.task.id, { ...publication.view, stage: 'pr' });
+    expect((await publication.api.getTaskView(publication.token, publication.task.id))?.stageTransitions?.map((move) => move.target))
+      .toEqual(['human', 'do', 'draft', 'done']);
+
+    const landed = fixture();
+    landed.store.saveView(landed.task.id, {
+      ...landed.view,
+      stage: 'merge',
+      pointOfNoReturnPassed: true,
+      state: { ...landed.view.state, mergeGranted: true },
+    });
+    expect((await landed.api.getTaskView(landed.token, landed.task.id))?.stageTransitions).toEqual([]);
+    await expect(landed.api.moveTaskStage(landed.token, landed.task.id, 'done'))
+      .rejects.toThrow(/cannot move/i);
   });
 
   it('does not advertise a lossy human hold from the internal Resolve frame', async () => {
