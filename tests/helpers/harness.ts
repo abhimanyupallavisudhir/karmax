@@ -196,6 +196,21 @@ export async function bootHarness(
       // the information missing (it cost a bisect across three CI runs). Name
       // each step while it is still running, so a hang identifies itself.
       await stopPhase('gateways', async () => { for (const close of gateways) await close().catch(() => {}); });
+      // Every harness owns an isolated Temporal server, so no execution in its
+      // namespace should outlive the test. In particular, gateway tests can
+      // leave durable singleton coordinators or waiting tasks running. Asking
+      // the worker to drain first then waits forever for activities owned by
+      // executions that nobody will signal again (and CI eventually reports an
+      // afterAll timeout even though every assertion passed). Close the logical
+      // work before draining the process that serves it.
+      await stopPhase('workflowTerminate', async () => {
+        const terminations: Promise<unknown>[] = [];
+        for await (const execution of client.workflow.list({ query: "ExecutionStatus='Running'" })) {
+          terminations.push(client.workflow.getHandle(execution.workflowId, execution.runId)
+            .terminate('test harness shutdown').catch(() => undefined));
+        }
+        await Promise.all(terminations);
+      });
       await stopPhase('workerDrain', async () => { worker.shutdown(); await runPromise.catch(() => {}); });
       await stopPhase('clientClose', () => c.close());
       await stopPhase('serverStop', () => server.stop());

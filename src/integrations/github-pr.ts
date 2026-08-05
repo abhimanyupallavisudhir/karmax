@@ -35,6 +35,11 @@ export interface GithubMergeResult {
   queued?: boolean;
 }
 
+export interface GithubRefUpdateResult {
+  updated: boolean;
+  message: string;
+}
+
 export type GithubMergeMethod = 'merge' | 'squash' | 'rebase';
 export type GithubPullRequestMergeable = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
 export type GithubPullRequestMergeState =
@@ -200,9 +205,9 @@ export class GithubPrApi {
     });
   }
 
-  /** Ask GitHub to merge this exact reviewed head. GitHub remains the policy
-   * authority: branch protection, rulesets, required reviews and checks are all
-   * enforced by this endpoint. A moved head cannot be merged accidentally. */
+  /** Historical direct-merge primitive. It binds the head SHA but GitHub's API
+   * exposes no expected base SHA, so current landing first uses a native queue
+   * and otherwise advances the exact validated head with force:false. */
   async merge(slug: string, number: number, headSha: string,
     mergeMethod: GithubMergeMethod = 'merge'): Promise<GithubMergeResult> {
     const value = await this.request<any>(`/repos/${slug}/pulls/${number}/merge`, {
@@ -232,6 +237,22 @@ export class GithubPrApi {
         : value?.data?.enqueuePullRequest?.mergeQueueEntry?.id
           ? 'Pull request queued for merge'
           : 'GitHub did not queue the pull request',
+    };
+  }
+
+  /** Atomically advance a target ref to the exact candidate that CI inspected.
+   * `force:false` is the compare-and-swap property we need: if the target moved
+   * beyond a commit contained in `headSha`, GitHub rejects the non-fast-forward
+   * update instead of manufacturing a different, unvalidated merge result. */
+  async fastForwardTarget(slug: string, target: string, headSha: string): Promise<GithubRefUpdateResult> {
+    const value = await this.request<any>(
+      `/repos/${slug}/git/refs/heads/${target.split('/').map(encodeURIComponent).join('/')}`,
+      { method: 'PATCH', body: JSON.stringify({ sha: headSha, force: false }) },
+      [409, 422],
+    );
+    return {
+      updated: Boolean(value?.ref && value?.object?.sha === headSha),
+      message: String(value?.message ?? (value?.ref ? 'Target advanced to the validated pull-request head' : 'GitHub did not advance the target ref')),
     };
   }
 

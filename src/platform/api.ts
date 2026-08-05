@@ -1825,7 +1825,7 @@ export class KarmaxApi {
         target: 'do',
         label: 'Do',
         description: view.stage === 'merge'
-          ? 'Return the pending pull request to Do for repair; it must be opened and reviewed again.'
+          ? 'Return the pending pull request to Do for repair; preserved intent authorization is revalidated automatically unless the repair changes scope.'
           : 'Return the reviewed work to the Do agent.',
       });
     if (!jayadratha && !view.pointOfNoReturnPassed)
@@ -1852,6 +1852,7 @@ export class KarmaxApi {
       ...(view.checkouts?.some((checkout) => checkout.approved)
         ? { checkoutApprovals: Object.fromEntries(view.checkouts.filter((c) => c.approved && c.head).map((c) => [c.name, c.head!])) }
         : {}),
+      ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
     };
     return {
       ...source,
@@ -1863,7 +1864,22 @@ export class KarmaxApi {
       // A saved checkpoint predates the current human hold. Prefer the live PR
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
+      ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
       resumeStage,
+      // A deliberate Landing → Do move is an integration repair, not a fresh
+      // proposal. Keep intent authorization but require automated review of the
+      // changed head before it can be re-admitted to the provider queue.
+      ...(resumeStage === 'do' && view.stage === 'merge' && view.landing?.authorization === 'authorized'
+        ? {
+            repairValidationPending: true,
+            landing: {
+              ...view.landing,
+              validation: 'failed' as const,
+              provider: 'ejected' as const,
+              detail: view.landing.detail ?? 'Returned from Landing for repair.',
+            },
+          }
+        : {}),
       ...(pausedForHuman ? { pausedForHuman: true } : {}),
     };
   }
@@ -2699,6 +2715,13 @@ export class KarmaxApi {
             userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
             githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
               && (scopedTask.lastView.stage === 'review' || scopedTask.lastView.stage === 'merge')),
+            // Current software-dev treats a Review confirmation as durable
+            // authorization of the task intent, including bounded automated
+            // integration repairs. An exceptional Landing confirmation still
+            // records the exact current heads below for strict GitHub policy.
+            githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
+              && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
+              && scopedTask.lastView.stage === 'review'),
             githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
               slug: ref.slug, number: ref.number, headSha: ref.headSha,
             })),

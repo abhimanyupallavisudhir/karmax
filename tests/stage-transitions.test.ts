@@ -469,12 +469,28 @@ describe('task stage transitions', () => {
       status: 'waiting',
       waitingFor: { kind: 'github', detail: 'policy blocked' },
       prs,
+      landing: {
+        authorization: 'authorized',
+        validation: 'pending',
+        provider: 'queued',
+        authorizedHeads: { 'acme/app#7': 'reviewed-head' },
+      },
     });
 
     const merge = await f.api.getTaskView(f.token, f.task.id);
     expect(merge?.stageTransitions?.map((move) => move.target)).toEqual(['human', 'do', 'draft', 'done']);
     await f.api.moveTaskStage(f.token, f.task.id, 'do');
-    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', prs });
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'do',
+      prs,
+      repairValidationPending: true,
+      landing: {
+        authorization: 'authorized',
+        validation: 'failed',
+        provider: 'ejected',
+        authorizedHeads: { 'acme/app#7': 'reviewed-head' },
+      },
+    });
   });
 
   it('does not advertise a lossy human hold from the internal Resolve frame', async () => {
