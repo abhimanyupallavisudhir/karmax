@@ -2,6 +2,8 @@
 // A dispatch board: tasks advance along the stage pipeline; the operator acts at
 // the decision points. Talks only to the gateway (SPEC §3.4).
 
+const { decodeTotpQrImage } = globalThis.TotpQr;
+
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -10258,7 +10260,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
 const VAULT_SECRET_LABELS = {
-  login: [['password', 'password'], ['totp', 'TOTP seed (base32 or otpauth:// URI)']],
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)']],
   'api-key': [['secret', 'API key']],
   'ssh-key': [['privateKey', 'private key (PEM)']],
   env: [['env', '.env contents (KEY=VALUE per line)']],
@@ -10277,6 +10279,71 @@ const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent
 // function` on every tap — silently breaking the affordance for exactly the
 // touch users it was added for.
 function policyTip(text) { return `<button type="button" class="info-dot" title="${esc(text)}" aria-label="${esc(text)}">ⓘ</button>`; }
+
+function clearTotpQrPreview(control, clearValue = false) {
+  if (!control) return;
+  control.totpQrPaste = null;
+  const preview = control.querySelector('.totp-qr-preview');
+  const image = preview?.querySelector('img');
+  const objectUrl = preview?.dataset.objectUrl;
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  if (preview) {
+    preview.hidden = true;
+    preview.dataset.objectUrl = '';
+    preview.dataset.state = '';
+  }
+  image?.removeAttribute('src');
+  control.classList.remove('has-qr');
+  if (clearValue) control.querySelector('.vi-totp-input').value = '';
+}
+
+function wireTotpQrPaste(root) {
+  root.querySelectorAll('.totp-secret-control').forEach((control) => {
+    const input = control.querySelector('.vi-totp-input');
+    const preview = control.querySelector('.totp-qr-preview');
+    const imageElement = preview.querySelector('img');
+    const status = preview.querySelector('.totp-qr-status');
+    input.addEventListener('paste', async (event) => {
+      const item = [...(event.clipboardData?.items || [])].find((item) => item.type.startsWith('image/'));
+      const image = item?.getAsFile();
+      if (!image) return;
+      event.preventDefault();
+      if (image.size > 10 * 1024 * 1024) {
+        toast('TOTP QR image is larger than 10 MB', true);
+        return;
+      }
+      clearTotpQrPreview(control);
+      input.value = '';
+      const objectUrl = URL.createObjectURL(image);
+      preview.dataset.objectUrl = objectUrl;
+      preview.dataset.state = 'reading';
+      preview.hidden = false;
+      imageElement.src = objectUrl;
+      status.textContent = 'Reading QR…';
+      control.classList.add('has-qr');
+      const paste = Symbol('totp-qr-paste');
+      control.totpQrPaste = paste;
+      try {
+        const value = await decodeTotpQrImage(image);
+        if (control.totpQrPaste !== paste) return;
+        input.value = value;
+        preview.dataset.state = 'ready';
+        status.textContent = 'QR added';
+      } catch (error) {
+        if (control.totpQrPaste !== paste) return;
+        preview.dataset.state = 'error';
+        status.textContent = 'Not readable';
+        toast(error.message, true);
+      }
+    });
+    input.addEventListener('input', () => clearTotpQrPreview(control));
+    preview.querySelector('.totp-qr-remove').addEventListener('click', () => {
+      control.totpQrPaste = null;
+      clearTotpQrPreview(control, true);
+      input.focus();
+    });
+  });
+}
 
 function credentialRequestTaskLink(request) {
   const task = request.task || taskRecord(request.taskId);
@@ -10432,7 +10499,7 @@ function passwordsCard() {
     </div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
-    <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
+    <details class="vault-custom" open><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
       <div style="margin-top:8px">
       <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
         <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
@@ -10464,12 +10531,22 @@ async function wireVaultCards(organizationId) {
   // Vault items + requests are organization-scoped; every call carries the org.
   const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
   const secretRows = () => {
+    box.querySelectorAll('.totp-secret-control').forEach((control) => clearTotpQrPreview(control));
     const type = box.querySelector('.vi-type').value;
     box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
     box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label]) =>
       `<div class="form-row"><label>${esc(label)}</label>${field === 'env' || field === 'privateKey' || field === 'note'
         ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
+        : field === 'totp' ? `<div class="totp-secret-control">
+            <input class="vi-secret vi-totp-input" data-field="totp" type="password" autocomplete="off" />
+            <div class="totp-qr-preview" role="status" aria-live="polite" hidden>
+              <img alt="Pasted TOTP QR code" />
+              <span class="totp-qr-status">Reading QR…</span>
+              <button type="button" class="totp-qr-remove" aria-label="Remove pasted QR code">×</button>
+            </div>
+          </div>`
         : `<input class="vi-secret" data-field="${field}" type="password" autocomplete="off" />`}</div>`).join('');
+    wireTotpQrPaste(box.querySelector('.vault-secret-rows'));
   };
   secretRows();
   box.querySelector('.vi-type').addEventListener('change', secretRows);
@@ -10785,6 +10862,7 @@ async function wireVaultCards(organizationId) {
         secrets,
       }) });
       box.querySelectorAll('.vi-label,.vi-domains,.vi-username,.vi-envvar,.vi-secret').forEach((el) => (el.value = ''));
+      box.querySelectorAll('.totp-secret-control').forEach((control) => clearTotpQrPreview(control));
       toast('Added');
       await renderItems();
       renderRequests();
