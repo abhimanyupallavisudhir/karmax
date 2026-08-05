@@ -228,8 +228,9 @@ class CredentialDenied extends Error {}
 
 /**
  * The software-development workflow (SPEC §5): Setup → Do/wait → explicit PR
- * → Review → Merge → End. Ordinary input waits never publish a proposal;
- * landing repair returns to the same Do agent. Merge is the point of no return.
+ * → Review → Landing → End. Ordinary input waits never publish a proposal;
+ * landing repair returns to the same Do agent. Only the provider merge/ref
+ * update crosses the point of no return.
  */
 export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.1.0');
@@ -321,10 +322,16 @@ export async function softwareDevV1_14(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.14.0');
 }
 
-/** Intent-scoped authorization, candidate-scoped integration validation, and
- * provider-owned non-blocking merge queues. */
+/** Conflict-message fallback and recovery for executions pinned before the
+ * complete GitHub state classifier shipped. */
 export async function softwareDevV1_15(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.15.0');
+}
+
+/** Intent-scoped authorization, candidate-scoped integration validation, and
+ * provider-owned non-blocking merge queues. */
+export async function softwareDevV1_16(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.16.0');
 }
 
 /** Replay-compatible entry for executions already recorded as
@@ -333,7 +340,7 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -394,7 +401,7 @@ async function softwareDevImpl(
   const proposalBeforeReview = minor >= 12;
   const explicitPrCycle = minor >= 13;
   const classifiedGithubStates = minor >= 14;
-  const intentAuthorizedLanding = minor >= 15;
+  const intentAuthorizedLanding = minor >= 16;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -478,7 +485,7 @@ async function softwareDevImpl(
   let providerQueueAccepted = intentAuthorizedLanding
     && recoveryStage === 'merge'
     && (landing.provider === 'queued' || landing.provider === 'validating');
-  // v1.15's in-process coordinator is only a short admission mutex. Once a PR
+  // v1.16's in-process coordinator is only a short admission mutex. Once a PR
   // has been handed to GitHub's queue, publishing its domains would make the UI
   // falsely present it as occupying karmax's own durable merge queue.
   let internalMergeAdmissionActive = false;
@@ -2618,7 +2625,9 @@ Inspect the complete current diff and specifically compare the repair delta from
           landing = { ...landing, validation: 'passed', provider: 'none', detail: 'GitHub merged the validated integration candidate.' };
         break;
       }
-      if (explicitPrCycle && (decision.status === 'needs-revision' || decision.status === 'stale-review')) {
+      // Activities are not replay-pinned. Handle a newly classified conflict
+      // for every PR-policy execution so historical tasks cannot poll forever.
+      if (decision.status === 'needs-revision' || decision.status === 'stale-review') {
         if (intentAuthorizedLanding) {
           const preservesIntent = decision.repair?.preserveAuthorization === true;
           const attempts = preservesIntent ? (landing.repairAttempts ?? 0) + 1 : 0;
@@ -2668,7 +2677,9 @@ Inspect the complete current diff and specifically compare the repair delta from
             ? `${decision.detail ?? 'The pull request must be repaired before it can land'}\nInspect the live branch, repair it against the newest target, run the relevant tests, then call open_pr again. ${decision.repair?.preserveAuthorization === true
               ? 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
               : 'This change invalidated the prior authorization, so the updated proposal must pass human Review.'}`
-            : `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`,
+            : explicitPrCycle
+              ? `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`
+              : `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, and run the relevant tests. Finish the Do turn only when the repaired proposal is ready to go through Review again.`,
           ts: msgs.length,
         });
         confirmed = false;
@@ -2697,7 +2708,7 @@ Inspect the complete current diff and specifically compare the repair delta from
         if (cancelled) return await abort();
         continue;
       }
-      if (classifiedGithubStates && decision.status === 'retryable-error'
+      if (decision.status === 'retryable-error'
         && ++githubErrorPolls < MAX_GITHUB_ERROR_POLLS) {
         status = 'waiting';
         waitingFor = {
@@ -2711,7 +2722,7 @@ Inspect the complete current diff and specifically compare the repair delta from
         continue;
       }
       if (decision.status === 'needs-authorizer'
-        || (classifiedGithubStates && (decision.status === 'needs-human' || decision.status === 'retryable-error'))) {
+        || decision.status === 'needs-human' || decision.status === 'retryable-error') {
         // A controlled human layer. Authorization failures retry under the
         // confirming person's live token; PR-policy decisions (draft/closed/
         // required review) retry after the human changes GitHub. A follow-up has

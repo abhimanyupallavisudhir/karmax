@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -435,7 +435,11 @@ export class KarmaxApi {
     const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
-      return await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch);
+      const project = this.deps.store.getProject(task.projectId);
+      const targetAuthority = remotePolicyOf(project ? this.deps.store.effectiveProjectConfig(project) : undefined) === 'pr'
+        ? 'origin'
+        : 'project';
+      return await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch, targetAuthority);
     } finally { await access.release(); }
   }
 
@@ -2716,7 +2720,7 @@ export class KarmaxApi {
             // integration repairs. An exceptional Landing confirmation still
             // records the exact current heads below for strict GitHub policy.
             githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 15
+              && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
               && scopedTask.lastView.stage === 'review'),
             githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
               slug: ref.slug, number: ref.number, headSha: ref.headSha,
