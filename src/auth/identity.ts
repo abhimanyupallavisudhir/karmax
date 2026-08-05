@@ -67,6 +67,15 @@ export interface IdentityOptions {
   github?: { clientId: string; clientSecret: string };
 }
 
+export interface GithubSocialAccount {
+  userId: string;
+  accountId: string;
+  accessToken: string;
+  refreshToken?: string;
+  accessTokenExpiresAt?: Date;
+  refreshTokenExpiresAt?: Date;
+}
+
 /**
  * Authentication boundary. Better Auth owns passwords, hashing, cookies,
  * sessions, rate limits, and account records; karmax only consumes the verified
@@ -83,14 +92,17 @@ export class IdentityService {
    *  it just cannot confirm addresses or reset passwords by mail. */
   mailer?: Mailer;
 
+  /** Installed by main after the credential broker and GitHub service exist.
+   * Better Auth owns the social callback; this bridge lets the resulting grant
+   * become the same user GitHub connection the profile flow creates. */
+  githubAccountLinked?: (account: GithubSocialAccount) => Promise<void>;
+
   readonly oidcProviderId?: string;
   /** Whether "Continue with Google" is offered. Google is a *consumer* identity
    *  option and deliberately does not consume the single generic-OIDC enterprise
    *  slot above — an installation pointed at Okta must still be able to offer it. */
   readonly googleEnabled: boolean;
-  /** Whether installation-level GitHub sign-in is available. This is separate
-   *  from the organization-scoped GitHub App used for repositories: a new user
-   *  must be able to authenticate before they have an organization to connect. */
+  /** Whether installation-level GitHub sign-in is available. */
   readonly githubEnabled: boolean;
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
     this.db = new DatabaseSync(dbFile);
@@ -128,10 +140,10 @@ export class IdentityService {
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
       // Native Better Auth social sign-in. No gateway routes are needed:
       // /api/auth/* is proxied verbatim, including each provider callback.
-      // Defaults are intentionally identity-only: Google uses openid/email/
-      // profile without offline access; GitHub uses read:user + user:email.
-      // Neither token is used for repository access — that remains the separate,
-      // explicit GitHub App authorization flow.
+      // Google remains identity-only (openid/email/profile, no offline access).
+      // GitHub uses read:user + user:email; its resulting grant is adopted as the
+      // person's GitHub connection, while repository transport remains bounded
+      // by an explicit organization GitHub App installation.
       ...(trustedSocialProviders.length ? { socialProviders } : {}),
       // Account linking. A user who signed up with email+password and later uses
       // Google or GitHub on the same address should land in the SAME
@@ -156,6 +168,12 @@ export class IdentityService {
         enabled: true,
         trustedProviders: trustedSocialProviders,
       } } } : {}),
+      databaseHooks: {
+        account: {
+          create: { after: async (account: any) => this.forwardGithubAccount(account) },
+          update: { after: async (account: any) => this.forwardGithubAccount(account) },
+        },
+      },
       emailAndPassword: {
         enabled: true, minPasswordLength: 10,
         // Password reset is delivered by the installation's outbound mailer. A
@@ -287,6 +305,19 @@ export class IdentityService {
 
   providersForUser(userId: string): string[] {
     return (this.db.prepare('SELECT providerId FROM account WHERE userId=?').all(userId) as any[]).map((row) => String(row.providerId));
+  }
+
+  private async forwardGithubAccount(account: any): Promise<void> {
+    if (account?.providerId !== 'github' || !account?.userId || !account?.accountId
+      || !account?.accessToken || !this.githubAccountLinked) return;
+    await this.githubAccountLinked({
+      userId: String(account.userId),
+      accountId: String(account.accountId),
+      accessToken: String(account.accessToken),
+      ...(account.refreshToken ? { refreshToken: String(account.refreshToken) } : {}),
+      ...(account.accessTokenExpiresAt ? { accessTokenExpiresAt: new Date(account.accessTokenExpiresAt) } : {}),
+      ...(account.refreshTokenExpiresAt ? { refreshTokenExpiresAt: new Date(account.refreshTokenExpiresAt) } : {}),
+    });
   }
 
   revokeUserSessions(userId: string): void {

@@ -71,6 +71,20 @@ describe('Google sign-in is off unless configured', () => {
 });
 
 describe('GitHub sign-in when configured', () => {
+  it('hands a newly linked GitHub social account to the user-connection bridge', async () => {
+    const { identity } = await boot({ github: GITHUB });
+    const seen: any[] = [];
+    identity.githubAccountLinked = async (account) => { seen.push(account); };
+    const afterCreate = identity.auth.options.databaseHooks?.account?.create?.after;
+    expect(afterCreate).toBeTypeOf('function');
+
+    await afterCreate({ providerId: 'github', accountId: '42', userId: 'jane', accessToken: 'token',
+      refreshToken: 'refresh', accessTokenExpiresAt: new Date(123_000) }, null);
+    await afterCreate({ providerId: 'google', accountId: 'google-1', userId: 'jane', accessToken: 'ignored' }, null);
+
+    expect(seen).toEqual([expect.objectContaining({ accountId: '42', userId: 'jane', accessToken: 'token' })]);
+  });
+
   it('advertises itself and builds an identity-only GitHub authorize URL', async () => {
     const { identity, base } = await boot({ github: GITHUB });
     expect(identity.githubEnabled).toBe(true);

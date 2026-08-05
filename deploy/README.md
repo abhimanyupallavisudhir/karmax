@@ -96,10 +96,12 @@ KARMAX_GITHUB_OAUTH_CLIENT_SECRET=...
 ```
 
 GitHub sign-in requests only `read:user` and `user:email`. These variables are
-deliberately named `GITHUB_OAUTH`: they identify people at the login screen and
-are separate from the organization-scoped GitHub App that owns repository
-installation and user authorization. Signing in never silently grants repository
-access.
+an optional dedicated OAuth App override. If they are absent, a configured krmax
+GitHub App supplies the sign-in client too; App manifests created by current
+versions register both callback URLs. The resulting grant becomes the person's
+GitHub connection and default Git identity. Repository transport is still
+bounded by the Personal/organization GitHub App installation, so signing in
+never silently installs repository access.
 
 `KARMAX_OIDC_*` (enterprise SSO) is another separate slot, so an installation
 can offer Google, GitHub, and company SSO together. Every provider button appears
