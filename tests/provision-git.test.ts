@@ -193,6 +193,35 @@ describe('seeding a cloud world from its local checkout', () => {
     expect(fs.existsSync(path.join(world, '.karmax-seed.bundle'))).toBe(false);
   });
 
+  it('keeps the cloned origin target authoritative for PR-policy worlds', async () => {
+    const { root, source, env } = await makeRepoPair('karmax-provision-origin-');
+    const writer = path.join(root, 'writer');
+    await gitOrThrow(root, ['clone', '-q', path.join(root, 'remote.git'), writer]);
+    await ensureIdentity(writer);
+    fs.writeFileSync(path.join(writer, 'remote-only.txt'), 'new target state\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'advance origin']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'main']);
+    const remoteMain = (await git(writer, ['rev-parse', 'main'])).stdout.trim();
+    const localMain = (await git(source, ['rev-parse', 'main'])).stdout.trim();
+    expect(remoteMain).not.toBe(localMain);
+
+    const remoteSource = 'git@example:remote.git';
+    const world = path.join(root, 'world');
+    const { repos, warnings } = await provisionGitRepos(hostTarget(env), {
+      taskId: 'origin-task', repos: [remoteSource], base: 'main', copySources: [source],
+      repositoryAuthorities: { [remoteSource]: 'origin' },
+    }, { root: world, home: root, sshUrlError: 'ssh required', copyGlobsWarning: 'no host checkout' });
+
+    expect(warnings).toEqual([]);
+    expect(repos[0]).toMatchObject({
+      repo: remoteSource, localPath: source, sourceAuthority: 'origin', baseSha: remoteMain,
+    });
+    expect((await git(world, ['rev-parse', 'refs/remotes/origin/main'])).stdout.trim()).toBe(remoteMain);
+    expect((await git(world, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(remoteMain);
+    expect(fs.readFileSync(path.join(world, 'remote-only.txt'), 'utf8')).toContain('new target state');
+  });
+
   it('reviews a branch that exists only in the local checkout', async () => {
     const { root, source, env } = await makeRepoPair('karmax-provision-branch-');
     await gitOrThrow(source, ['branch', 'karmax/other-task']);

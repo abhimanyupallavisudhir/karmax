@@ -531,7 +531,7 @@ const NODES = [
   { key: 'do', label: 'Do' },
   { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
-  { key: 'merge', label: 'Merge', ponr: true },
+  { key: 'merge', label: 'Landing' },
   { key: 'done', label: 'End' },
 ];
 
@@ -4244,6 +4244,14 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
+// A persisted draft's loaded signature is already saved. The same is true for a
+// blank new form, which should not become a draft just because it was opened.
+// Text carried in from the quick composer is different: it is rendered into the
+// form, but has not reached the server yet, so its initial state must stay dirty.
+function initialTaskFormSavedSignature(draft, seedText, signature) {
+  return draft || !seedText ? signature : null;
+}
+
 // Identity of the task form currently mounted in the overlay. Opening a new form
 // bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
 // tell it has been superseded and bail — otherwise its timer fires against the new
@@ -4568,12 +4576,14 @@ async function openTaskForm(workflow, draft, seedText) {
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
   const stateSig = (st) => JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
   // Seed the baseline with the freshly-loaded form's own signature so simply OPENING
-  // and dismissing a draft never re-writes it. Without this `lastSaved` starts null,
+  // and dismissing a draft never re-writes it. Quick-composer text is the exception:
+  // it is visible here but has never been saved, so the helper leaves that state dirty.
+  // Without this baseline `lastSaved` starts null,
   // so an *untouched* form still flushes a full `replace:true` on close — and a passive
   // copy left open in another karmax tab clobbers a newer edit made elsewhere, or a
   // stale snapshot reverts it. That is the "saved draft contents disappear" bug: only a
   // real change in THIS form (its signature diverging from the seed) now triggers a write.
-  let lastSaved = stateSig(formState());
+  let lastSaved = initialTaskFormSavedSignature(draft, seedText, stateSig(formState()));
   // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
   // if a debounced create is still in flight when the user types more or closes the
   // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
@@ -5280,6 +5290,9 @@ function renderTaskPage() {
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${mergeQueueBadge(v)}
+          ${v.landing?.provider && v.landing.provider !== 'none'
+            ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>`
+            : ''}
           ${pullRequestLinks(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
@@ -7526,8 +7539,11 @@ function queueRank(t, domain) {
 }
 
 function mergeQueuePanel() {
-  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
+  const providerOwned = S.tasks.filter((t) => ['queued', 'validating'].includes(t.lastView?.landing?.provider));
+  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage)
+    && !['queued', 'validating'].includes(t.lastView?.landing?.provider));
+  if (!inMerge.length && !providerOwned.length)
+    return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -7541,7 +7557,7 @@ function mergeQueuePanel() {
     }
   }
   const multi = groups.size > 1;
-  return [...groups.entries()]
+  const internal = [...groups.entries()]
     .map(([domain, tasks]) => {
       tasks.sort((a, b) => queueRank(a, domain) - queueRank(b, domain));
       const rows = tasks
@@ -7563,6 +7579,17 @@ function mergeQueuePanel() {
       return `${label}<div class="queue-list" data-domain="${esc(domain)}">${rows}</div>`;
     })
     .join('');
+  const provider = providerOwned.length
+    ? `<div class="queue-domain">GitHub landing queue</div><div class="queue-list">${providerOwned.map((t) => {
+        const v = t.lastView || {};
+        return `<div class="queue-item" data-id="${t.id}" tabindex="0">
+          <span class="drag-handle placeholder"></span><span class="pos">⇱</span>
+          <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">GitHub ${esc(v.landing?.provider || 'queued')}</span></div>
+            <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span>${v.landing?.detail ? ` · ${esc(v.landing.detail)}` : ''}</div></div>
+        </div>`;
+      }).join('')}</div>`
+    : '';
+  return `${internal}${provider}`;
 }
 
 function agentQueuePanel() {

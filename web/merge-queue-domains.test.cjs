@@ -87,6 +87,19 @@ const pinned = mergeQueuePanel();
 ok(pinned.indexOf('Merging') < pinned.indexOf('Queued'), 'the leased task sorts first');
 ok(pinned.includes('class="queue-item current"'), 'the leased task is marked as merging');
 
+// Once GitHub owns the durable queue, the task remains observable but is no
+// longer presented as reorderable in karmax's admission queue.
+global.S.tasks = [
+  { id: 'provider', num: 3, title: 'Provider owned', lastView: view({
+    state: {}, landing: { provider: 'validating', detail: 'running merge-group CI' },
+  }) },
+];
+const provider = mergeQueuePanel();
+ok(provider.includes('GitHub landing queue'), 'provider-owned entries get their own clearly labelled queue');
+ok(provider.includes('GitHub validating'), 'the provider validation state is visible');
+ok(!provider.includes('draggable="true"'), 'provider-owned order cannot be changed through the karmax coordinator');
+ok(!provider.includes('data-domain=""'), 'provider-owned entries are not placed in the unnamed internal queue');
+
 // An empty queue still reads as empty, not as a stray group.
 global.S.tasks = [];
 ok(mergeQueuePanel().includes('Merge queue is empty'), 'no tasks ⇒ the empty state');

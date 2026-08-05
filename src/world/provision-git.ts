@@ -135,7 +135,9 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
       : tokenIndex >= 0 ? githubHttpsAuthPrefix(options.home, tokenIndex) : '';
     await cloneWithRetry(target, `${auth}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
     const localPath = spec.copySources?.[index];
-    if (localPath) await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
+    const sourceAuthority = spec.repositoryAuthorities?.[source] ?? 'project';
+    if (localPath && sourceAuthority !== 'origin')
+      await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
     const requested = spec.branch ?? base;
     const remoteRef = `refs/remotes/origin/${requested}`;
     const refCheck = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(remoteRef)}`, 120_000);
@@ -148,7 +150,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     await configureRepo(target, repoRoot, spec, branch, true, remoteRefExists, base);
     repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base,
       ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target), baseSha,
-      ...(localPath ? { localPath } : {}) });
+      ...(localPath ? { localPath } : {}), ...(sourceAuthority === 'origin' ? { sourceAuthority } : {}) });
   }
   if (spec.copyGlobs?.length) {
     let copied = 0;

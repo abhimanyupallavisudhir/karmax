@@ -41,6 +41,7 @@ eval(extractFn('adjacentCheckinPane'));
 eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
 eval(extractFn('quickTaskSubmitMode'));
 eval(extractFn('quickTaskPayload'));
+eval(extractFn('initialTaskFormSavedSignature'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -143,6 +144,17 @@ const sent = quickTaskPayload('run it', 'script-exec', [], false);
 const draft = quickTaskPayload('save it', 'software-dev', ['image-1'], true);
 ok(sent.quick === true && sent.command === 'run it' && sent.draft === undefined, 'quick send starts immediately');
 ok(draft.quick === true && draft.draft === true && draft.images[0] === 'image-1', 'quick draft uses the same payload plus draft=true');
+
+// The text carried by Enter into the full form has never been persisted. Closing
+// that form immediately must therefore see a dirty state and create a draft.
+ok(extractFn('openTaskForm').includes('initialTaskFormSavedSignature(draft, seedText, stateSig(formState()))'),
+  'the expanded form uses the carried-text-aware saved baseline');
+ok(initialTaskFormSavedSignature(undefined, 'carried quick text', 'seeded-state') === null,
+  'quick text starts the expanded form with an unsaved signature');
+ok(initialTaskFormSavedSignature(undefined, '', 'empty-state') === 'empty-state',
+  'opening an empty expanded form does not make it dirty');
+ok(initialTaskFormSavedSignature({ id: 'draft-1' }, 'ignored seed', 'stored-state') === 'stored-state',
+  'opening an existing draft keeps its loaded state as the saved baseline');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
