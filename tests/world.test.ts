@@ -42,6 +42,56 @@ describe('WorktreeProvider (real git)', () => {
     expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
   });
 
+  it('forks a PR-policy task from origin without moving a stale local base', async () => {
+    const remote = path.join(home, 'origin.git');
+    const writer = path.join(home, 'writer');
+    await gitOrThrow(home, ['clone', '-q', '--bare', repo, remote]);
+    await gitOrThrow(repo, ['remote', 'add', 'origin', remote]);
+    const localBase = (await git(repo, ['rev-parse', 'main'])).stdout.trim();
+
+    await gitOrThrow(home, ['clone', '-q', remote, writer]);
+    await ensureIdentity(writer);
+    fs.writeFileSync(path.join(writer, 'remote-only.txt'), 'new target state\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'advance remote']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'main']);
+    const remoteBase = (await git(writer, ['rev-parse', 'main'])).stdout.trim();
+
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({
+      taskId: 'pr-origin', repo, base: 'main', target: 'main',
+      repositoryAuthorities: { [repo]: 'origin' },
+      repositoryOrigins: { [repo]: remote },
+    });
+    try {
+      expect((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(remoteBase);
+      expect((await git(repo, ['rev-parse', 'main'])).stdout.trim()).toBe(localBase);
+      expect(world.handle.repos?.[0]).toMatchObject({ source: remote, sourceAuthority: 'origin', baseSha: remoteBase });
+      expect(world.handle.warnings?.join('\n')).toMatch(/local main differs from origin\/main.*forked off origin/i);
+      expect(fs.readFileSync(path.join(world.handle.root, 'remote-only.txt'), 'utf8')).toContain('new target state');
+    } finally {
+      await world.destroy();
+    }
+
+    await gitOrThrow(writer, ['switch', '-q', '-c', 'review']);
+    fs.writeFileSync(path.join(writer, 'review-only.txt'), 'existing proposal\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'review branch']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'review']);
+    const reviewBase = (await git(writer, ['rev-parse', 'review'])).stdout.trim();
+    const reviewWorld = await provider.create({
+      taskId: 'pr-review', repo, base: 'main', branch: 'review',
+      repositoryAuthorities: { [repo]: 'origin' },
+      repositoryOrigins: { [repo]: remote },
+    });
+    try {
+      expect((await git(reviewWorld.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(reviewBase);
+      expect(fs.readFileSync(path.join(reviewWorld.handle.root, 'review-only.txt'), 'utf8')).toContain('existing proposal');
+    } finally {
+      await reviewWorld.destroy();
+    }
+  });
+
   it('feeds ExecOptions.input to a command over stdin (secret channel for in-world fill)', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'stdin', repo, base: 'main', target: 'main' });

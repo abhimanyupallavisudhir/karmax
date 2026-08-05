@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -435,7 +435,11 @@ export class KarmaxApi {
     const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
-      return await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch);
+      const project = this.deps.store.getProject(task.projectId);
+      const targetAuthority = remotePolicyOf(project ? this.deps.store.effectiveProjectConfig(project) : undefined) === 'pr'
+        ? 'origin'
+        : 'project';
+      return await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch, targetAuthority);
     } finally { await access.release(); }
   }
 
@@ -1748,7 +1752,7 @@ export class KarmaxApi {
   /** Honest action set for the short replacement-start window before first publish. */
   private resumedActions(actions: TaskView['actions'], stage: Stage): TaskView['actions'] {
     const allowed = stage === 'do'
-      ? new Set(['followUp', 'setTarget', 'cancel'])
+      ? new Set(['openPr', 'followUp', 'setTarget', 'cancel'])
       : stage === 'review'
         ? new Set(['confirm', 'followUp', 'setTarget', 'cancel'])
         : stage === 'escalated'
@@ -1816,8 +1820,14 @@ export class KarmaxApi {
     } else if (resumable && view.stage !== 'escalated' && view.stage !== 'resolve' && view.waitingFor?.kind !== 'human') {
       add({ target: 'human', label: 'Waiting for human input', description: 'Stop current activity and hold this attempt for a person.' });
     }
-    if (resumable && view.stage === 'review' && !origin)
-      add({ target: 'do', label: 'Do', description: 'Return the reviewed work to the Do agent.' });
+    if (resumable && (view.stage === 'review' || view.stage === 'merge') && !origin)
+      add({
+        target: 'do',
+        label: 'Do',
+        description: view.stage === 'merge'
+          ? 'Return the pending pull request to Do for repair; preserved intent authorization is revalidated automatically unless the repair changes scope.'
+          : 'Return the reviewed work to the Do agent.',
+      });
     if (!jayadratha && !view.pointOfNoReturnPassed)
       add({ target: 'draft', label: 'Draft', description: 'Discard all execution progress and make the attempt editable.', danger: true });
     add({ target: 'done', label: 'Done', description: 'Stop all activity and mark this attempt done manually.' });
@@ -1842,6 +1852,7 @@ export class KarmaxApi {
       ...(view.checkouts?.some((checkout) => checkout.approved)
         ? { checkoutApprovals: Object.fromEntries(view.checkouts.filter((c) => c.approved && c.head).map((c) => [c.name, c.head!])) }
         : {}),
+      ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
     };
     return {
       ...source,
@@ -1853,7 +1864,22 @@ export class KarmaxApi {
       // A saved checkpoint predates the current human hold. Prefer the live PR
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
+      ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
       resumeStage,
+      // A deliberate Landing → Do move is an integration repair, not a fresh
+      // proposal. Keep intent authorization but require automated review of the
+      // changed head before it can be re-admitted to the provider queue.
+      ...(resumeStage === 'do' && view.stage === 'merge' && view.landing?.authorization === 'authorized'
+        ? {
+            repairValidationPending: true,
+            landing: {
+              ...view.landing,
+              validation: 'failed' as const,
+              provider: 'ejected' as const,
+              detail: view.landing.detail ?? 'Returned from Landing for repair.',
+            },
+          }
+        : {}),
       ...(pausedForHuman ? { pausedForHuman: true } : {}),
     };
   }
@@ -2689,6 +2715,13 @@ export class KarmaxApi {
             userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
             githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
               && (scopedTask.lastView.stage === 'review' || scopedTask.lastView.stage === 'merge')),
+            // Current software-dev treats a Review confirmation as durable
+            // authorization of the task intent, including bounded automated
+            // integration repairs. An exceptional Landing confirmation still
+            // records the exact current heads below for strict GitHub policy.
+            githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
+              && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
+              && scopedTask.lastView.stage === 'review'),
             githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
               slug: ref.slug, number: ref.number, headSha: ref.headSha,
             })),
@@ -2753,9 +2786,14 @@ export class KarmaxApi {
       };
       const nextView = this.withConversationMessage(heldView, holdRole, followUp);
       await this.stopTaskActivity(scopedTask, heldView, `Human supplied input for the ${stageName(heldOrigin)} hold`);
-      // Review feedback has its normal meaning: return the task to Do. At other
-      // origins the addressed agent resumes the interrupted stage.
-      await this.startTransitionReplacement(scopedTask, nextView, heldOrigin === 'review' ? 'do' : heldOrigin);
+      // Review feedback has its normal meaning: return the task to Do. A Merge
+      // hold can also deliberately fall back to Do when the current explicit-PR
+      // workflow has no Merge agent; resume the conversation that actually
+      // received the message, not a mechanical stage that cannot consume it.
+      const resumeStage = heldOrigin === 'review' || (heldOrigin === 'merge' && holdRole === 'do')
+        ? 'do'
+        : heldOrigin;
+      await this.startTransitionReplacement(scopedTask, nextView, resumeStage);
       this.publishConversationMessage(taskId, holdRole, followUp);
       return followUp;
     }

@@ -286,7 +286,10 @@ const SOFTWARE_DEV_STAGES: StageDef[] = [
   { key: 'do', label: 'Do', ...(RESOLVE_AGENT_ENABLED ? { aliases: ['resolve'] } : {}) },
   { key: 'pr', label: 'PR' },
   { key: 'review', label: 'Review' },
-  { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
+  // `merge` is the durable key, but Landing can spend an arbitrary time queued
+  // and remains cancellable. The actual point of no return is the provider's
+  // atomic merge, represented by TaskView.pointOfNoReturnPassed—not this stage.
+  { key: 'merge', label: 'Landing' },
   { key: 'done', label: 'End' },
 ];
 
@@ -355,8 +358,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.13.0',
-    description: 'Branch/world → do/wait → explicit PR → review → authorized merge → end, with the Do agent owning proposal repairs.',
+    version: '1.16.0',
+    description: 'Branch/world → do/wait → explicit PR → intent review → provider-queued candidate validation → end, with automated repair review.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -460,8 +463,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.13.0',
-    description: 'Software Dev in autonomous completion mode; the Do agent explicitly opens the finished proposal for review.',
+    version: '1.16.0',
+    description: 'Software Dev in autonomous completion mode with intent-authorized, provider-queued candidate validation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
