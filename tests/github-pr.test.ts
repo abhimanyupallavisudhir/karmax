@@ -504,6 +504,27 @@ describe('GitHub-authoritative merge activity', () => {
     expect(methods).toContain('PUT');
   });
 
+  it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
+    const { githubWaitNeedsProposalRevision } = await import('../src/workflows/software-dev.js');
+
+    expect(githubWaitNeedsProposalRevision({
+      status: 'waiting',
+      detail: 'Pull Request has merge conflicts',
+    })).toBe(true);
+    expect(githubWaitNeedsProposalRevision({
+      status: 'waiting',
+      detail: 'GitHub says the branch is conflicting with the target branch.',
+    })).toBe(true);
+    expect(githubWaitNeedsProposalRevision({
+      status: 'waiting',
+      detail: 'Required status checks are pending.',
+    })).toBe(false);
+    expect(githubWaitNeedsProposalRevision({
+      status: 'queued',
+      detail: 'Pull Request has merge conflicts',
+    })).toBe(false);
+  });
+
   it('returns an explicit merge-conflict refusal to Do for legacy pinned tasks and does not repeat impossible self-approval', async () => {
     let reviewPosts = 0;
     let mergeMessage = 'Pull Request has merge conflicts';

@@ -12,6 +12,7 @@ import {
   isCancellation,
   ApplicationFailure,
   log,
+  patched,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
@@ -349,6 +350,20 @@ type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0'
  * construction instead of needing an edit nobody would notice was missing. */
 function behaviorMinor(behaviorVersion: BehaviorVersion): number {
   return Number(behaviorVersion.split('.')[1] ?? 0);
+}
+
+/**
+ * Activity results recorded before GitHub merge refusals were classified used
+ * the generic `waiting` status even when the detail was a permanent proposal
+ * conflict. Keep this deliberately narrow: pending checks and merge queues are
+ * real waits, while these messages can only be resolved by changing the head.
+ */
+export function githubWaitNeedsProposalRevision(
+  decision: Pick<GitHubMergeAuthorization, 'status' | 'detail'>,
+): boolean {
+  return decision.status === 'waiting'
+    && /(?:merge conflicts?|conflict(?:ing|s)? with (?:the )?(?:base|target)|not mergeable|base branch was modified|update (?:the )?branch)/i
+      .test(decision.detail ?? '');
 }
 
 /**
@@ -2627,7 +2642,12 @@ Inspect the complete current diff and specifically compare the repair delta from
       }
       // Activities are not replay-pinned. Handle a newly classified conflict
       // for every PR-policy execution so historical tasks cannot poll forever.
-      if (decision.status === 'needs-revision' || decision.status === 'stale-review') {
+      // Already-recorded activity results from old workers used generic
+      // `waiting`; the patch marker reaches that decision only at the live edge
+      // without changing its recorded timer history.
+      const repairsLegacyConflictWait = patched('software-dev-github-conflict-wait-recovery-v1');
+      if (decision.status === 'needs-revision' || decision.status === 'stale-review'
+        || (repairsLegacyConflictWait && githubWaitNeedsProposalRevision(decision))) {
         if (intentAuthorizedLanding) {
           const preservesIntent = decision.repair?.preserveAuthorization === true;
           const attempts = preservesIntent ? (landing.repairAttempts ?? 0) + 1 : 0;
