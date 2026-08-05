@@ -5939,7 +5939,7 @@ async function wireResourceReview(v, force = false) {
       return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
         <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
     }).join('')}${inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
-      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; Krmax did not upload their contents.</div>
+      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; krmax did not upload their contents.</div>
       <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : ''}`;
     wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
