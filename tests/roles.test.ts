@@ -156,9 +156,10 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
 
 describe('workflow-owned lifecycle stages (SPEC §5 — the pipeline the UI renders)', () => {
   const keys = (wf: string) => (manifest(wf)!.stages ?? []).map((s) => s.key);
-  it('software-dev declares the full merge lifecycle with a point of no return', () => {
+  it('software-dev declares cancellable Landing; the actual ref update is the point of no return', () => {
     expect(keys('software-dev')).toEqual(['setup', 'do', 'pr', 'review', 'merge', 'done']);
-    expect(manifest('software-dev')!.stages!.find((s) => s.key === 'merge')!.ponr).toBe(true);
+    expect(manifest('software-dev')!.stages!.find((s) => s.key === 'merge')).toMatchObject({ label: 'Landing' });
+    expect(manifest('software-dev')!.stages!.find((s) => s.key === 'merge')!.ponr).toBeUndefined();
     expect(manifest('software-dev')!.stages!.some((s) => s.key === 'resolve' || s.aliases?.includes('resolve'))).toBe(false);
     expect(manifest('software-dev')!.params.some((f) => f.role === 'resolve')).toBe(false);
   });

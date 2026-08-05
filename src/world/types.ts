@@ -56,12 +56,14 @@ export interface WorldRepo {
    *  providers keep the URL directly in `repo`, so this is normally absent. */
   source?: string;
   /** Host checkout this repo was provisioned from (remote worlds whose project
-   *  repo is a local path). When present, that checkout is the AUTHORITATIVE
-   *  repository: broker merges land there and upstream refreshes read from it
-   *  — `repo` (the SSH remote) is only the sandbox's clone transport. Without
-   *  it, cloud and local merges would land in two different places (origin vs
-   *  the local repo) and the two histories would silently diverge. */
+   *  repo is a local path). It is authoritative by default; an explicit
+   *  `sourceAuthority: 'origin'` keeps it only as compatibility-file provenance
+   *  because GitHub owns PR-policy base and landing history. */
   localPath?: string;
+  /** Which repository owns the protected/base history for this checkout.
+   * Host-local project state is the default for backwards compatibility;
+   * GitHub-backed checkouts under remote policy `pr` use `origin`. */
+  sourceAuthority?: 'project' | 'origin';
   /** Absolute worktree path (where this repo is checked out in the world). */
   root: string;
   /** The branch work happens on in this repo. */
@@ -159,6 +161,15 @@ export interface WorldSpec {
   /** Per-repository branch policy supplied by first-class hosted repository
    * attachments. Keys are the exact SSH URLs in `repos`. */
   repositoryBranches?: Record<string, { base: string; target: string }>;
+  /** Per-source authority selected by the trusted create-world activity. A PR
+   * checkout forks from and later publishes through origin; local-only and
+   * none/push checkouts retain the configured project repository. */
+  repositoryAuthorities?: Record<string, 'project' | 'origin'>;
+  /** Network identity behind a configured local path. Providers retain it on
+   * WorldRepo.source so the trusted broker can address origin later. */
+  repositoryOrigins?: Record<string, string>;
+  /** Provider-internal per-repository projection of repositoryAuthorities. */
+  sourceAuthority?: 'project' | 'origin';
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
   resources?: { cpu?: number; memoryMb?: number; gpu?: number };

@@ -15,6 +15,8 @@ import {
   softwareDevV1_13,
   softwareDevV1_14,
   softwareDevV1_15,
+  softwareDevV1_16,
+  softwareDevV1_17,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -98,9 +100,19 @@ export async function goalV1_14(input: TaskInput): Promise<{ stage: Stage; sha?:
   return softwareDevV1_14({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
-/** Repository-less completion without Git or merge machinery. */
+/** Conflict-message fallback and recovery for already-running PR tasks. */
 export async function goalV1_15(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_15({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Intent-authorized, provider-queued landing with automated repair review. */
+export async function goalV1_16(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_16({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Repository-less completion without Git or merge machinery. */
+export async function goalV1_17(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_17({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

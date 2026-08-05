@@ -84,9 +84,10 @@ export class WorktreeProvider implements WorldProvider {
     } else if (resolvedSources.length === 1 && spec.layout !== 'nested' && !spec.scratch) {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
+      const source = spec.repositoryOrigins?.[resolved.source] ?? (resolved.managed ? resolved.source : undefined);
       repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
-        this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined, ephemeralPaths,
-        '', Boolean(spec.repositoryBranches?.[resolved.source]?.target)));
+        this.repoSpec(spec, resolved.source), warnings, source, ephemeralPaths,
+        '', Boolean(spec.repositoryBranches?.[resolved.source]?.target), resolved.source));
     } else {
       // Multi-repo (or a lone repo a multi-PR task asked to nest): the world root
       // is a parent dir holding one worktree per checkout, each in a subdirectory
@@ -102,9 +103,10 @@ export class WorktreeProvider implements WorldProvider {
       for (let i = 0; i < resolvedSources.length; i++) {
         const name = names[i]!;
         const resolved = resolvedSources[i]!;
+        const source = spec.repositoryOrigins?.[resolved.source] ?? (resolved.managed ? resolved.source : undefined);
         repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, branch,
-          this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined,
-          ephemeralPaths, name, Boolean(spec.repositoryBranches?.[resolved.source]?.target)));
+          this.repoSpec(spec, resolved.source), warnings, source,
+          ephemeralPaths, name, Boolean(spec.repositoryBranches?.[resolved.source]?.target), resolved.source));
       }
     }
 
@@ -134,10 +136,21 @@ export class WorktreeProvider implements WorldProvider {
    * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
    */
   private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec,
-    warnings?: string[], source?: string, ephemeralPaths?: string[], worldPrefix = '', pinnedTarget = false): Promise<WorldRepo> {
+    warnings?: string[], source?: string, ephemeralPaths?: string[], worldPrefix = '', pinnedTarget = false,
+    credentialSource = source ?? repo): Promise<WorldRepo> {
     // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
     let baseRef = spec.base;
-    const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
+    let baseSha: string | undefined;
+    if (spec.sourceAuthority === 'origin') {
+      const refreshed = await this.refreshOriginRefs(repo, spec.base, spec.branch, credentialSource, spec);
+      baseRef = refreshed.ref;
+      baseSha = refreshed.sha;
+      const local = await git(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${spec.base}`]);
+      if (local.code === 0 && local.stdout.trim() !== baseSha) {
+        warnings?.push(`repo "${name}": local ${spec.base} differs from origin/${spec.base} — PR policy forked off origin`);
+      }
+    }
+    const verify = await git(repo, ['rev-parse', '--verify', baseRef]);
     if (verify.code !== 0) {
       baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
       // Don't fork off the wrong ref silently — surface that the configured base
@@ -159,8 +172,16 @@ export class WorktreeProvider implements WorldProvider {
       if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
       // Reuse the branch if it already exists, else create it.
       const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
+      const originBranch = spec.sourceAuthority === 'origin' && spec.branch && !spec.resetBranch
+        ? `refs/remotes/origin/${spec.branch}`
+        : undefined;
+      const originBranchExists = originBranch
+        ? (await git(repo, ['rev-parse', '--verify', originBranch])).code === 0
+        : false;
       const addArgs = branchExists
         ? ['worktree', 'add', wt, branch]
+        : originBranchExists
+          ? ['worktree', 'add', '-b', branch, wt, originBranch!]
         : ['worktree', 'add', '-b', branch, wt, baseRef];
       await gitOrThrow(repo, addArgs);
     });
@@ -181,13 +202,57 @@ export class WorktreeProvider implements WorldProvider {
     }
 
     return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base,
-      ...(spec.target ? { target: spec.target } : {}), targetPinned: pinnedTarget };
+      ...(spec.target ? { target: spec.target } : {}), targetPinned: pinnedTarget,
+      ...(baseSha ? { baseSha } : {}), ...(spec.sourceAuthority === 'origin' ? { sourceAuthority: 'origin' as const } : {}) };
   }
 
   /** Apply a first-class repository attachment's per-repo branch policy. */
   private repoSpec(spec: WorldSpec, source: string): WorldSpec {
     const policy = spec.repositoryBranches?.[source];
-    return policy ? { ...spec, base: policy.base, target: policy.target } : spec;
+    const sourceAuthority = spec.repositoryAuthorities?.[source] ?? spec.sourceAuthority;
+    return {
+      ...spec,
+      ...(policy ? { base: policy.base, target: policy.target } : {}),
+      ...(sourceAuthority ? { sourceAuthority } : {}),
+    };
+  }
+
+  /** Refresh only the requested PR base into a remote-tracking ref. The user's
+   * local branch is never moved: it may deliberately contain local-policy work,
+   * while a `pr` task must start from GitHub's protected target. Credentials are
+   * materialized for this one trusted fetch and removed immediately. */
+  private async refreshOriginRefs(repo: string, base: string, branch: string | undefined, credentialSource: string,
+    spec: WorldSpec): Promise<{ ref: string; sha: string }> {
+    const origin = await git(repo, ['remote']);
+    const names = origin.stdout.split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
+    const remote = names.includes('origin') ? 'origin' : names.length === 1 ? names[0]! : undefined;
+    if (!remote) throw new Error(`PR-policy repository "${credentialSource}" needs an origin (or exactly one Git remote)`);
+
+    const credentialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pr-base-'));
+    const key = spec.gitCredentials?.repositories?.[credentialSource] ?? spec.gitCredentials?.sshKey;
+    const httpsToken = spec.gitCredentials?.httpsTokens?.[credentialSource];
+    const baseEnv: Record<string, string> = spec.gitCredentials?.isolated ? isolatedGitEnvironment() : {};
+    const { env } = materializeGitCredential(credentialDir, {
+      ...(key ? { sshKey: key } : {}),
+      ...(httpsToken ? { httpsToken } : {}),
+      env: baseEnv,
+    });
+    const ref = `refs/remotes/origin/${base}`;
+    try {
+      const wanted = [...new Set([base, branch].filter((value): value is string => Boolean(value)))];
+      const fetched = await git(repo, ['fetch', '--no-tags', remote, ...wanted.map((name) =>
+        `+refs/heads/${name}:refs/remotes/origin/${name}`)], { env, timeoutMs: 10 * 60_000 });
+      if (fetched.code !== 0) {
+        throw new Error(`Could not refresh PR base "${base}" from ${remote}: ${fetched.stderr || fetched.stdout}`);
+      }
+      const resolved = await git(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
+      const sha = resolved.stdout.trim();
+      if (resolved.code !== 0 || !/^[0-9a-f]{40,64}$/i.test(sha))
+        throw new Error(`PR base "${base}" fetched from ${remote} has no resolvable commit`);
+      return { ref, sha };
+    } finally {
+      fs.rmSync(credentialDir, { recursive: true, force: true });
+    }
   }
 
   /** Clone a configured URL once into Karmax-owned storage. The clone is the
