@@ -333,6 +333,50 @@ describe('GitHub-authoritative merge activity', () => {
       .resolves.toEqual({ status: 'merged', prs: [] });
   });
 
+  it('does not complete a provider merge until the enrolled local target is fast-forwarded', async () => {
+    const repo = await repoWithGithubOrigin('mirror-after-merge');
+    const writer = path.join(tmp, 'provider-writer');
+    await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'mirror-after-merge-origin.git'), writer]);
+    await ensureIdentity(writer);
+    fs.writeFileSync(path.join(writer, 'landed.txt'), 'landed by GitHub\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'provider merge']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'main']);
+    const landedSha = (await gitOrThrow(writer, ['rev-parse', 'HEAD'])).trim();
+
+    const fetcher = (async () => Response.json({
+      number: 91, html_url: 'https://github.test/acme/widgets/pull/91', state: 'closed', merged: true,
+      merged_at: '2026-08-04T00:00:00Z', merge_commit_sha: landedSha,
+      head: { ref: 'karmax/task_mirror', sha: landedSha }, base: { ref: 'main' },
+    })) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Provider mirror');
+    const task = core.store.createTask({ projectId: project.id, title: 'Mirror me', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const handle = {
+      id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_mirror', base: 'main',
+      repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', repo, root: repo,
+        branch: 'karmax/task_mirror', base: 'main', target: 'main', localPath: repo, sourceAuthority: 'origin' }],
+    } as any;
+    const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 91,
+      url: 'https://github.test/acme/widgets/pull/91', state: 'open', headSha: landedSha };
+
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
+      status: 'merged', sha: landedSha,
+    });
+    expect((await gitOrThrow(repo, ['rev-parse', 'main'])).trim()).toBe(landedSha);
+    expect(fs.readFileSync(path.join(repo, 'landed.txt'), 'utf8')).toBe('landed by GitHub\n');
+    expect(core.store.eventsSince(task.id, 0).map((event: any) => event.type)).toEqual(
+      expect.arrayContaining(['checkout.synced', 'merge.result']),
+    );
+  });
+
   it('uses an eligible confirming human and refuses to move beyond the reviewed head', async () => {
     const requests: Array<{ auth: string; method: string; path: string; body: any }> = [];
     let liveHead = 'reviewed-head';

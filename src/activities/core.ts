@@ -64,6 +64,7 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
+import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
   AGENT_QUEUE_WORKFLOW,
@@ -519,6 +520,75 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }
+  }
+
+  /** Mirror a provider-owned PR target back into the configured host checkout.
+   * GitHub may be the protected-history authority while the local checkout is
+   * still the source this Karmax process loaded. A task is not locally complete
+   * until that branch is a clean fast-forward mirror; a divergent/dirty target
+   * is preserved and surfaced outside every merge queue. */
+  async function syncGithubTargetToLocal(
+    handle: WorldHandle,
+    ref: TaskPullRequest,
+    target: string,
+    expectedLandedSha?: string,
+  ): Promise<LocalTargetSyncResult> {
+    const checkout = worldRepos(handle).find((candidate) => candidate.name === ref.repo);
+    const authority = checkout?.localPath
+      ?? (checkout?.repo && path.isAbsolute(checkout.repo) ? checkout.repo : undefined);
+    if (!checkout || !authority) return { coherent: true, target };
+
+    const repository = await enrolledRepositoryForCheckout(handle, checkout);
+    const trackingRef = `refs/remotes/origin/${target}`;
+    const fetched = await hostGitWithRepositoryCredential(repository, authority, [
+      'fetch', '--no-tags', 'origin', `+refs/heads/${target}:${trackingRef}`,
+    ], { GIT_TERMINAL_PROMPT: '0', ...gitEnvFor(handle, handle.id) });
+    if (fetched.code !== 0) {
+      return {
+        coherent: false,
+        retryable: true,
+        target,
+        detail: `GitHub merged the pull request, but Karmax could not fetch origin/${target} into the enrolled local checkout: ${fetched.stderr || fetched.stdout}`,
+      };
+    }
+
+    let result = await syncLocalTarget(authority, target, trackingRef);
+    if (result.coherent && expectedLandedSha) {
+      const containsLanding = await hostGit(authority, [
+        'merge-base', '--is-ancestor', expectedLandedSha, trackingRef,
+      ]);
+      if (containsLanding.code !== 0) {
+        result = {
+          coherent: false,
+          retryable: true,
+          target,
+          sha: result.sha,
+          checkout: result.checkout,
+          detail: `GitHub reports ${expectedLandedSha} landed, but the fetched origin/${target} does not contain it yet.`,
+        };
+      }
+    }
+    record(handle.id, result.coherent ? 'checkout.synced' : 'checkout.sync-blocked', {
+      repo: checkout.name,
+      target,
+      sha: result.sha,
+      updated: result.updated,
+      checkout: result.checkout ?? authority,
+      detail: result.detail,
+    });
+    if (result.coherent) {
+      // The live-restart loop keys off the same event as deterministic local
+      // landing. It can now restart npm-start Karmax after a GitHub PR advances
+      // the checkout this process loaded, instead of continuing on stale code.
+      record(handle.id, 'merge.result', {
+        merged: true,
+        sha: result.sha,
+        target,
+        checkout: result.checkout ?? authority,
+        provider: 'github',
+      });
+    }
+    return result;
   }
 
   /** Static-token compatibility for PR operations. Human work first resolves
@@ -2367,6 +2437,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: `GitHub could not be inspected or updated: ${detail}`,
         };
       };
+      const localSyncDecision = (
+        result: LocalTargetSyncResult,
+        current: TaskPullRequest[],
+      ): GitHubMergeAuthorization | undefined => {
+        if (result.coherent) return undefined;
+        return {
+          status: result.retryable ? 'retryable-error' : 'needs-human',
+          prs: current,
+          actorUserId,
+          detail: result.detail
+            ?? `GitHub landed the pull request, but the local ${result.target} checkout is not coherent with it.`,
+        };
+      };
       const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness) => {
         const failures = (readiness.failedChecks ?? []).slice(0, 12).map((check) => {
           const detail = check.detail?.replace(/\s+/g, ' ').trim();
@@ -2389,8 +2472,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(live.headSha ? { headSha: live.headSha } : {}),
           ...(live.nodeId ? { nodeId: live.nodeId } : {}),
         };
-        if (live.merged) { lastSha = live.mergeCommitSha ?? lastSha; settled.push(next); continue; }
         const current = [...settled, next, ...prs.slice(settled.length + 1)];
+        if (live.merged) {
+          if (!live.base) {
+            return {
+              status: 'retryable-error', prs: current, actorUserId,
+              detail: `GitHub reports pull request ${ref.slug}#${ref.number} merged but did not report its target branch; local coherence cannot be established yet.`,
+            };
+          }
+          const localSync = await syncGithubTargetToLocal(handle, ref, live.base, live.mergeCommitSha);
+          const blocked = localSyncDecision(localSync, current);
+          if (blocked) return blocked;
+          lastSha = live.mergeCommitSha ?? localSync.sha ?? lastSha;
+          settled.push(next);
+          continue;
+        }
         if (live.state === 'closed') {
           return {
             status: 'needs-human', prs: current, actorUserId,
@@ -2608,8 +2704,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           try { advanced = await api.fastForwardTarget(ref.slug, live.base, ref.headSha); }
           catch (error) { return errorDecision(error, current); }
           if (advanced.updated) {
+            const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
+            const landedPrs = [...settled, landed, ...prs.slice(settled.length + 1)];
+            const localSync = await syncGithubTargetToLocal(handle, ref, live.base, ref.headSha);
+            const blocked = localSyncDecision(localSync, landedPrs);
+            if (blocked) return blocked;
             lastSha = ref.headSha;
-            settled.push({ ...next, state: 'closed', merged: true });
+            settled.push(landed);
             record(handle.id, 'github.pr.merged', {
               ...ref, sha: ref.headSha, actorUserId, strategy: 'exact-fast-forward',
             });
@@ -2636,8 +2737,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return errorDecision(error, current);
         }
         if (merged.merged) {
-          lastSha = merged.sha ?? lastSha;
-          settled.push({ ...next, state: 'closed', merged: true });
+          if (!live.base) {
+            return {
+              status: 'retryable-error', prs: current, actorUserId,
+              detail: `GitHub merged pull request ${ref.slug}#${ref.number} but did not report its target branch; local coherence cannot be established yet.`,
+            };
+          }
+          const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
+          const landedPrs = [...settled, landed, ...prs.slice(settled.length + 1)];
+          const localSync = await syncGithubTargetToLocal(handle, ref, live.base, merged.sha);
+          const blocked = localSyncDecision(localSync, landedPrs);
+          if (blocked) return blocked;
+          lastSha = merged.sha ?? localSync.sha ?? lastSha;
+          settled.push(landed);
           record(handle.id, 'github.pr.merged', { ...ref, sha: merged.sha, actorUserId });
           continue;
         }
