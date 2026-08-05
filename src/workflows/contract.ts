@@ -31,6 +31,7 @@ export type {
   RemotePolicy,
   TaskPullRequest,
   GitHubMergeAuthorization,
+  TaskLandingState,
   TaskCheckout,
   WorldHandleRef,
 } from '../domain/types.js';

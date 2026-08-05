@@ -13,6 +13,9 @@ import {
   softwareDevV1_11,
   softwareDevV1_12,
   softwareDevV1_13,
+  softwareDevV1_14,
+  softwareDevV1_15,
+  softwareDevV1_16,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -89,6 +92,21 @@ export async function goalV1_12(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** Explicit Open PR lifecycle; the Do agent owns proposal preparation. */
 export async function goalV1_13(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_13({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Classified GitHub policy transitions and bounded GitHub error recovery. */
+export async function goalV1_14(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_14({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Conflict-message fallback and recovery for already-running PR tasks. */
+export async function goalV1_15(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_15({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Intent-authorized, provider-queued landing with automated repair review. */
+export async function goalV1_16(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_16({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */
