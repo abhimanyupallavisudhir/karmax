@@ -4244,6 +4244,14 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
+// A persisted draft's loaded signature is already saved. The same is true for a
+// blank new form, which should not become a draft just because it was opened.
+// Text carried in from the quick composer is different: it is rendered into the
+// form, but has not reached the server yet, so its initial state must stay dirty.
+function initialTaskFormSavedSignature(draft, seedText, signature) {
+  return draft || !seedText ? signature : null;
+}
+
 // Identity of the task form currently mounted in the overlay. Opening a new form
 // bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
 // tell it has been superseded and bail — otherwise its timer fires against the new
@@ -4568,12 +4576,14 @@ async function openTaskForm(workflow, draft, seedText) {
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
   const stateSig = (st) => JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
   // Seed the baseline with the freshly-loaded form's own signature so simply OPENING
-  // and dismissing a draft never re-writes it. Without this `lastSaved` starts null,
+  // and dismissing a draft never re-writes it. Quick-composer text is the exception:
+  // it is visible here but has never been saved, so the helper leaves that state dirty.
+  // Without this baseline `lastSaved` starts null,
   // so an *untouched* form still flushes a full `replace:true` on close — and a passive
   // copy left open in another karmax tab clobbers a newer edit made elsewhere, or a
   // stale snapshot reverts it. That is the "saved draft contents disappear" bug: only a
   // real change in THIS form (its signature diverging from the seed) now triggers a write.
-  let lastSaved = stateSig(formState());
+  let lastSaved = initialTaskFormSavedSignature(draft, seedText, stateSig(formState()));
   // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
   // if a debounced create is still in flight when the user types more or closes the
   // form (which flushes), `draftId` is still null, so the next save POSTs a *second*

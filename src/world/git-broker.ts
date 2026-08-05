@@ -214,7 +214,7 @@ export async function brokerImportTaskBranch(destination: World, source: import(
 /** Refresh an upstream branch without putting a clone key in the sandbox. The
  * resulting origin/* ref behaves exactly like a normal git fetch to the agent. */
 export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
-  requestedBranch?: string): Promise<GitBrokerRefreshResult> {
+  requestedBranch?: string, targetAuthority: 'project' | 'origin' = 'project'): Promise<GitBrokerRefreshResult> {
   const refreshed: ImportedGitRef[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
@@ -223,7 +223,7 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
       const branch = requestedBranch ?? repo.target ?? repo.base;
       if (!safeBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
       const ref = `refs/remotes/origin/${branch}`;
-      const sha = await brokerFetchRef(world, repo, branch, ref, auth);
+      const sha = await brokerFetchRef(world, repo, branch, ref, auth, targetAuthority === 'origin');
       refreshed.push({ repo: repo.name, branch, ref, sha });
     } catch (error) {
       skipped.push(repo.name);
@@ -235,7 +235,7 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
 }
 
 async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: string, destinationRef: string,
-  auth: GitBrokerAuth): Promise<string> {
+  auth: GitBrokerAuth, preferOrigin = false): Promise<string> {
   if (!safeBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-import-'));
   const bundleName = `.karmax-import-${cryptoSafeName(destinationRepo.name)}.bundle`;
@@ -243,13 +243,16 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
   try {
     const known = await world.exec('git', ['rev-parse', '--verify', '--quiet', destinationRef], { cwd: destinationRepo.root });
     const bundlePath = await authorityBundle(temp, destinationRepo, branch, auth,
-      known.code === 0 ? known.stdout.trim() : undefined, sharesHostRefDatabase(world.handle.kind));
+      known.code === 0 ? known.stdout.trim() : undefined, sharesHostRefDatabase(world.handle.kind), preferOrigin);
     const data = fs.readFileSync(bundlePath);
     const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
     if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
     if (!world.writeFileBuffer) throw new Error('world provider cannot receive binary Git handoffs');
     await world.writeFileBuffer(bundleRelative, data);
-    const fetched = await world.exec('git', ['fetch', bundleName, `refs/heads/${branch}:${destinationRef}`],
+    // These are imported tracking/staging refs, never a checked-out branch. A
+    // local-project seed may have moved origin/* to a divergent local commit;
+    // refreshing a GitHub PR target must be allowed to restore origin's truth.
+    const fetched = await world.exec('git', ['fetch', bundleName, `+refs/heads/${branch}:${destinationRef}`],
       { cwd: destinationRepo.root, timeoutMs: 10 * 60_000 });
     if (fetched.code !== 0) throw new Error(`world could not import branch "${branch}": ${fetched.stderr || fetched.stdout}`);
     const head = await world.exec('git', ['rev-parse', destinationRef], { cwd: destinationRepo.root });
@@ -269,9 +272,9 @@ function cryptoSafeName(value: string): string { return value.replace(/[^A-Za-z0
  * otherwise an authenticated clone of the SSH remote. `basisSha`, when the
  * receiver already holds it, thins the bundle to just the missing history. */
 async function authorityBundle(temp: string, repo: WorldRepo, branch: string, auth: GitBrokerAuth,
-  basisSha?: string, worldRepoIsLocal = false): Promise<string> {
+  basisSha?: string, worldRepoIsLocal = false, preferOrigin = false): Promise<string> {
   const bundlePath = path.join(temp, 'incoming.bundle');
-  const local = await localAuthority(repo, worldRepoIsLocal);
+  const local = preferOrigin ? undefined : await localAuthority(repo, worldRepoIsLocal);
   if (local && (await git(local, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0) {
     const basis = basisSha && (await git(local, ['cat-file', '-e', `${basisSha}^{commit}`])).code === 0
       ? ['--not', basisSha] : [];
