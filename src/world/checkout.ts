@@ -59,6 +59,7 @@ export function planCheckout(handle: WorldHandle, spec: WorldCheckoutSpec): { fr
     repo: from.repo,
     ...(from.source ? { source: from.source } : {}),
     ...(from.localPath ? { localPath: from.localPath } : {}),
+    ...(from.sourceAuthority ? { sourceAuthority: from.sourceAuthority } : {}),
     root: path.posix.join(handle.root, name),
     branch,
     base,
