@@ -102,7 +102,7 @@ describe('GitHub App integration', () => {
       setup_on_update: true, callback_urls: [
         'https://karmax.example/api/github/oauth/callback',
         'https://karmax.example/api/auth/callback/github',
-      ], default_permissions: { emails: 'read' } });
+      ], default_permissions: { email_addresses: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
     expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review']);

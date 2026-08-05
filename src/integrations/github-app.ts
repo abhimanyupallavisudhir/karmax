@@ -252,7 +252,7 @@ export class GitHubAppService {
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
       callback_urls: [`${origin}/api/github/oauth/callback`, `${origin}/api/auth/callback/github`],
-      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write', emails: 'read' },
+      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write', email_addresses: 'read' },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
     // cannot reach them. Local Karmax instances reconcile installations on
