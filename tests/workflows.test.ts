@@ -203,6 +203,37 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('cancelled');
   });
 
+  it('software-dev v1.16: preserves a targeted human hold after the workflow publishes', async () => {
+    const repo = await h.makeRepo('stage-targeted-human-hold');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'Targeted pause',
+        recovery: {
+          messages: [{ id: 'm0', role: 'user', text: 'Waiting for design.', ts: 0 }],
+          seen: 1,
+          target: 'main',
+          resumeStage: 'do',
+          pausedForHuman: true,
+          humanWait: {
+            audience: ['@team:design'],
+            detail: 'Choose the final interaction pattern.',
+          },
+        },
+      })],
+    });
+
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 15_000 }).toMatchObject({
+      kind: 'human',
+      audience: ['@team:design'],
+      detail: 'Choose the final interaction pattern.',
+    });
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
   it('software-dev v1.7: Confirm releases a Review-origin hold and approves it once', async () => {
     const repo = await h.makeRepo('stage-human-confirm');
     const taskId = newId('task');

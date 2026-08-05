@@ -323,13 +323,19 @@ export async function softwareDevV1_15(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.15.0');
 }
 
+/** Human holds preserve their exact route, and a held Review confirmation is
+ * credited only to the proposal identity/head that was actually reviewed. */
+export async function softwareDevV1_16(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.16.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -391,6 +397,8 @@ async function softwareDevImpl(
   const explicitPrCycle = minor >= 13;
   const classifiedGithubStates = minor >= 14;
   const restoresStagePrerequisites = minor >= 15;
+  const preservesHumanHoldContext = minor >= 16;
+  const interlocksMergeTransitions = minor >= 16;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -486,6 +494,7 @@ async function softwareDevImpl(
   /** Requests already settled — guards against a settle that beats its request. */
   const settledCollaborations = new Set<string>();
   let pointOfNoReturnPassed = false;
+  let lifecycleTransitionBlocked = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
   // Replacement runs must retain the target freeze established by an opened
@@ -679,7 +688,11 @@ async function softwareDevImpl(
       args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
       ...(responsiveHumanHold && humanPauseActive && pausedRole ? { roles: [pausedRole] } : {}),
     };
-    const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: !pointOfNoReturnPassed, danger: true };
+    const cancel: DeclaredAction = {
+      name: 'cancel', kind: 'signal', label: 'Cancel',
+      enabled: !pointOfNoReturnPassed && !lifecycleTransitionBlocked,
+      danger: true,
+    };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: explicitPrCycle ? 'Confirm PR' : 'Confirm', enabled: true };
     const openPr: DeclaredAction = { name: 'openPr', kind: 'signal', label: 'Open PR', enabled: true };
     const setTarget: DeclaredAction = {
@@ -767,6 +780,7 @@ async function softwareDevImpl(
         recoveryWorld: world,
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
+        ...(interlocksMergeTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
       },
       branch: world?.branch,
       base,
@@ -872,7 +886,7 @@ async function softwareDevImpl(
     if (head) checkoutApprovals = { ...checkoutApprovals, [name]: head };
   });
   setHandler(cancelSignal, () => {
-    if (!pointOfNoReturnPassed) {
+    if (!pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
       cancelled = true;
       activeTurn?.cancel(); // abort an in-flight agent turn immediately (SPEC §5.6)
       cancelChildren(); // and tear down any running sub-task agents
@@ -905,7 +919,7 @@ async function softwareDevImpl(
         humanPauseWake = { kind: 'retry' };
     }
     else if (resp.action === 'cancel') {
-      if (!pointOfNoReturnPassed) {
+      if (!pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
         cancelled = true;
         activeTurn?.cancel();
       }
@@ -1791,7 +1805,13 @@ async function softwareDevImpl(
   if (recovery?.pausedForHuman) {
     stage = recoveryStage;
     status = 'waiting';
-    waitingFor = { kind: 'human', audience: ['@creator'], detail: `Paused during ${recoveryStage}` };
+    waitingFor = {
+      kind: 'human',
+      audience: preservesHumanHoldContext ? (recovery.humanWait?.audience ?? ['@creator']) : ['@creator'],
+      detail: preservesHumanHoldContext
+        ? (recovery.humanWait?.detail ?? `Paused during ${recoveryStage}`)
+        : `Paused during ${recoveryStage}`,
+    };
     retryRequested = false;
     await publish();
     if (responsiveHumanHold)
@@ -1812,6 +1832,7 @@ async function softwareDevImpl(
   // creation, and GitHub may move a branch while a task is stopped. Reconcile
   // the proposal before restoring PR/Review/Merge so Review always has an open
   // proposal and Merge never inherits approval for a different head.
+  let restoredProposalMatches = true;
   if (restoresStagePrerequisites && recovery && ['pr', 'review', 'merge'].includes(recoveryStage)) {
     const requestedStage = recoveryStage;
     const reviewedPrs = prs.map((candidate) => ({ ...candidate }));
@@ -1823,6 +1844,7 @@ async function softwareDevImpl(
 
     const readiness = await withResolve('pr', () => core.checkProposal(world as any));
     if (!readiness.ready) {
+      restoredProposalMatches = false;
       const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
       msgs.push({
         id: `restore-pr-refused-${msgs.length}`,
@@ -1845,13 +1867,8 @@ async function softwareDevImpl(
         prs = opened ?? [];
         pr = prs[0];
 
-        const sameReviewedProposal = reviewedPrs.length === prs.length
-          && reviewedPrs.every((reviewed) => prs.some((live) =>
-            reviewed.slug === live.slug
-            && reviewed.number === live.number
-            && !!reviewed.headSha
-            && reviewed.headSha === live.headSha));
-        if (requestedStage === 'merge' && !sameReviewedProposal) {
+        restoredProposalMatches = sameProposalIdentity(reviewedPrs, prs);
+        if (requestedStage === 'merge' && !restoredProposalMatches) {
           recoveryStage = 'review';
           checkoutApprovals = {};
           consumed.delete('confirm');
@@ -1862,10 +1879,24 @@ async function softwareDevImpl(
             ts: msgs.length,
           });
         }
+        if (requestedStage === 'review' && pauseWake?.kind === 'confirm' && !restoredProposalMatches) {
+          msgs.push({
+            id: `restore-held-review-stale-${msgs.length}`,
+            role: 'system',
+            text: 'The pull-request set or head changed while Review was held. The earlier confirmation was not applied; Review is required for the current proposal.',
+            ts: msgs.length,
+          });
+        }
       }
       branchPreparedForPr = true;
       prRequested = false;
-      if (requestedStage === 'pr') recoveryStage = 'review';
+      if (requestedStage === 'pr') {
+        // Pre-1.12 workflows reviewed the local proposal before creating its PR.
+        // An explicit hold confirmation checkpoints that verdict; opening the
+        // first PR is the expected next step, not a reason for a second Review.
+        recoveryStage = preservesHumanHoldContext && recovery.reviewConfirmed ? 'merge' : 'review';
+        if (recoveryStage === 'merge') consumed.add('confirm');
+      }
       const preparedReview = await core.buildReview(world as any, base).catch(() => undefined);
       if (preparedReview) reviewInfo = { ...reviewInfo, ...preparedReview };
     }
@@ -1875,7 +1906,13 @@ async function softwareDevImpl(
   // rerunning completed Do work. The action that released a Review-origin hold
   // keeps its normal meaning: Confirm advances, feedback returns to Do, while an
   // explicit Resume merely restores the still-pending Review gate.
-  let restoredReviewApproved = recoveryStage === 'review' && pauseWake?.kind === 'confirm';
+  // A Confirm releases only the Review that was actually held. It must not
+  // approve a new Review synthesized because a Merge-origin proposal changed,
+  // nor a Review whose GitHub identity/head moved during the hold.
+  let restoredReviewApproved = recoveryStage === 'review'
+    && pauseWake?.kind === 'confirm'
+    && recovery?.resumeStage === 'review'
+    && restoredProposalMatches;
   const restoredReviewBackToDo =
     recoveryStage === 'review'
     && (pauseWake?.kind === 'followUp' || pauseWake?.kind === 'workflowChange');
@@ -2572,15 +2609,27 @@ async function softwareDevImpl(
           prs = refreshed;
           pr = prs[0];
         }
-        if (githubAuthoritativeMerge) {
-          // The proposal was already prepared and reviewed. Do not create a
-          // second local merge and push it with the installation credential;
-          // request the exact reviewed PR merge under a consenting human token.
-          githubResult = await core.mergeGithubPrs(world as any, prs);
-        } else {
-          // …then the authoritative, deterministic local merge that guarantees
-          // work lands for non-PR and replay-pinned historical workflows.
-          result = await long.finalizeMergeActivity(world as any, target);
+        if (interlocksMergeTransitions) {
+          lifecycleTransitionBlocked = true;
+          await publish();
+          if (cancelled) {
+            lifecycleTransitionBlocked = false;
+            return await abort();
+          }
+        }
+        try {
+          if (githubAuthoritativeMerge) {
+            // The proposal was already prepared and reviewed. Do not create a
+            // second local merge and push it with the installation credential;
+            // request the exact reviewed PR merge under a consenting human token.
+            githubResult = await core.mergeGithubPrs(world as any, prs);
+          } else {
+            // …then the authoritative, deterministic local merge that guarantees
+            // work lands for non-PR and replay-pinned historical workflows.
+            result = await long.finalizeMergeActivity(world as any, target);
+          }
+        } finally {
+          lifecycleTransitionBlocked = false;
         }
       } catch (err) {
         if (githubAuthoritativeMerge) {
@@ -2828,6 +2877,15 @@ async function softwareDevImpl(
 
 function lastOutputs(msgs: Message[]): string {
   return msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n');
+}
+
+function sameProposalIdentity(reviewed: TaskPullRequest[], live: TaskPullRequest[]): boolean {
+  return reviewed.length === live.length
+    && reviewed.every((candidate) => live.some((current) =>
+      candidate.slug === current.slug
+      && candidate.number === current.number
+      && !!candidate.headSha
+      && candidate.headSha === current.headSha));
 }
 
 /** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */

@@ -19,6 +19,7 @@ function fixture() {
   const starts: Array<{ type: string; options: any }> = [];
   const terminated: string[] = [];
   const signalled: Array<{ id: string; signal: string; args: unknown[] }> = [];
+  let liveView: TaskView | undefined;
   const hiddenTurnIds = ['hidden-account-turn'];
   const client = {
     workflow: {
@@ -30,6 +31,7 @@ function fixture() {
             return { workflow: options.args[0] };
           },
           async query(name: string) {
+            if (name === 'view') return liveView ?? store.getTask(id)?.lastView;
             if (name === QRY_AGENT_QUEUE)
               return { queue: [{ taskId: task.id, turnId: 'hidden-agent-turn' }], current: [] };
             if (name === QRY_ACCOUNT_TASK_LEASES) return hiddenTurnIds;
@@ -68,7 +70,10 @@ function fixture() {
     updatedAt: 1,
   };
   store.saveView(task.id, view);
-  return { store, project, tokens, token, api, task, view, starts, terminated, signalled };
+  return {
+    store, project, tokens, token, api, task, view, starts, terminated, signalled,
+    setLiveView(next: TaskView | undefined) { liveView = next; },
+  };
 }
 
 describe('task stage transitions', () => {
@@ -142,6 +147,25 @@ describe('task stage transitions', () => {
     expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'review', pausedForHuman: true });
   });
 
+  it('moves from the authoritative live stage when the persisted projection lags', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, { ...f.view, stage: 'pr' });
+    f.setLiveView({
+      ...f.view,
+      stage: 'review',
+      status: 'waiting',
+      waitingFor: { kind: 'confirm', detail: 'reviewing the published head' },
+    });
+
+    const held = await f.api.moveTaskStage(f.token, f.task.id, 'human');
+    expect(held).toMatchObject({
+      stage: 'review',
+      status: 'waiting',
+      state: { humanPauseOrigin: 'review' },
+    });
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'review' });
+  });
+
   it('lets an agent escalate its own task to a chosen human team and notifies only that audience', async () => {
     const f = fixture();
     for (const userId of ['designer', 'developer'])
@@ -180,6 +204,13 @@ describe('task stage transitions', () => {
       },
       state: { humanPauseOrigin: 'do' },
     });
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      pausedForHuman: true,
+      humanWait: {
+        audience: ['@team:design'],
+        detail: 'Please choose the final interaction pattern.',
+      },
+    });
     expect(f.terminated.at(-1)).toContain('Escalated to @team:design');
     expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -195,6 +226,20 @@ describe('task stage transitions', () => {
       expect.objectContaining({ taskId: f.task.id, kind: 'escalated', actionable: true, unread: true }),
     ]);
     expect(f.store.listInbox('developer', 'org_personal')).toEqual([]);
+
+    // Manual Done is reversible to the same hold, including its selected people
+    // and concrete question—not a generic creator-only pause.
+    const done = await f.api.moveTaskStage(f.token, f.task.id, 'done');
+    expect(done.stageTransitions?.map((move) => move.target)).toEqual(['human']);
+    await f.api.moveTaskStage(f.token, f.task.id, 'human');
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'do',
+      pausedForHuman: true,
+      humanWait: {
+        audience: ['@team:design'],
+        detail: 'Please choose the final interaction pattern.',
+      },
+    });
   });
 
   it('rejects an escalation to a missing audience and prevents an agent escalating another task', async () => {
@@ -384,7 +429,10 @@ describe('task stage transitions', () => {
       stage: 'review',
     });
     await confirm.api.signalTask(confirm.token, confirm.task.id, 'confirm');
-    expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
+    expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'pr',
+      reviewConfirmed: true,
+    });
   });
 
   it('lets the selected human open a PR from a Do-stage input wait', async () => {
@@ -543,6 +591,18 @@ describe('task stage transitions', () => {
     });
     expect((await landed.api.getTaskView(landed.token, landed.task.id))?.stageTransitions).toEqual([]);
     await expect(landed.api.moveTaskStage(landed.token, landed.task.id, 'done'))
+      .rejects.toThrow(/cannot move/i);
+
+    const merging = fixture();
+    const locked = {
+      ...merging.view,
+      stage: 'merge' as const,
+      state: { ...merging.view.state, lifecycleTransitionBlocked: true },
+    };
+    merging.store.saveView(merging.task.id, locked);
+    merging.setLiveView(locked);
+    expect((await merging.api.getTaskView(merging.token, merging.task.id))?.stageTransitions).toEqual([]);
+    await expect(merging.api.moveTaskStage(merging.token, merging.task.id, 'done'))
       .rejects.toThrow(/cannot move/i);
   });
 

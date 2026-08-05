@@ -355,8 +355,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.15.0',
-    description: 'Branch/world → do/wait → explicit PR → review → policy-aware authorized merge → end, with prerequisite-aware lifecycle restoration.',
+    version: '1.16.0',
+    description: 'Branch/world → do/wait → explicit PR → review → policy-aware authorized merge → end, with head-bound lifecycle restoration and exact human routing.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -460,8 +460,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.15.0',
-    description: 'Software Dev in autonomous completion mode, including classified GitHub policy waits and prerequisite-aware lifecycle restoration.',
+    version: '1.16.0',
+    description: 'Software Dev in autonomous completion mode, including classified GitHub policy waits, head-bound lifecycle restoration, and exact human routing.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],

@@ -1395,6 +1395,12 @@ export interface TaskRecoveryCheckpoint {
   resumeStage?: Stage;
   /** Start parked for a human, retaining `resumeStage` as the return route. */
   pausedForHuman?: boolean;
+  /** Exact routing and question for a cross-cutting human hold. This belongs to
+   * the checkpoint because the replacement workflow republishes its own view. */
+  humanWait?: { audience: string[]; detail: string };
+  /** The human already approved the Review represented by this checkpoint.
+   * This is needed by historical versions that opened their PR after Review. */
+  reviewConfirmed?: boolean;
   /** Multi-PR Review approvals (checkout name -> approved head sha). Carried so a
    *  replacement execution does not make a human re-approve branches nothing has
    *  touched; an approval whose branch moved lapses on its own either way. */

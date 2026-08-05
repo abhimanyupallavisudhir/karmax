@@ -1614,6 +1614,29 @@ export class KarmaxApi {
     }
   }
 
+  /** Lifecycle mutations must not act on `lastView`: publishing that snapshot is
+   * an activity, so the deterministic workflow can already be in the next stage
+   * while the store still shows the previous one. A stale read here can hold,
+   * terminate, or restore the wrong stage. Terminal views have no live execution
+   * to query; every active/waiting mutation requires the authoritative query and
+   * fails closed when it cannot be obtained. */
+  private async transitionSourceView(task: TaskRecord): Promise<TaskView> {
+    const snapshot = task.lastView;
+    if (!snapshot) throw new Error('task has no lifecycle state yet');
+    if (['done', 'cancelled', 'failed'].includes(snapshot.status)) return snapshot;
+    try {
+      const query = this.deps.client.workflow.getHandle(task.id).query('view') as Promise<TaskView>;
+      query.catch(() => undefined);
+      const view = await withTimeout(query, QUERY_TIMEOUT_MS);
+      if (!view || typeof view !== 'object' || !view.stage || !view.status) {
+        throw new Error('the workflow returned no lifecycle view');
+      }
+      return view;
+    } catch (error) {
+      throw new Error(`Cannot move ${task.title}: the live workflow stage is unavailable (${unwrapCause(error)}). Try again once the worker is healthy.`);
+    }
+  }
+
   /** Drawer-only projection for an unqueued attempt, which has no workflow view. */
   getDraftView(
     token: string,
@@ -1831,6 +1854,12 @@ export class KarmaxApi {
       return result;
     }
 
+    // The workflow publishes this interlock immediately before invoking the
+    // one activity that may land the reviewed head. Terminating/replacing that
+    // execution mid-call cannot determine whether the external merge happened,
+    // so no lifecycle move is honest until the activity returns and clears it.
+    if (view.state?.lifecycleTransitionBlocked) return result;
+
     // Once a merge has actually landed, workflow cleanup/finalization is the
     // only safe continuation. Terminating it for a synthetic hold/Done move can
     // leave remote PR state or a multi-repo landing half reconciled.
@@ -1859,7 +1888,13 @@ export class KarmaxApi {
     return result;
   }
 
-  private transitionCheckpoint(view: TaskView, resumeStage: Stage, pausedForHuman = false): TaskRecoveryCheckpoint {
+  private transitionCheckpoint(
+    view: TaskView,
+    resumeStage: Stage,
+    pausedForHuman = false,
+    humanWait?: { audience: string[]; detail: string },
+    reviewConfirmed = false,
+  ): TaskRecoveryCheckpoint {
     const saved = view.state?.transitionCheckpoint as TaskRecoveryCheckpoint | undefined;
     const source = saved ?? {
       world: view.status === 'cancelled'
@@ -1878,8 +1913,21 @@ export class KarmaxApi {
         ? { checkoutApprovals: Object.fromEntries(view.checkouts.filter((c) => c.approved && c.head).map((c) => [c.name, c.head!])) }
         : {}),
     };
+    const {
+      humanWait: savedHumanWait,
+      reviewConfirmed: _savedReviewConfirmed,
+      ...stableSource
+    } = source;
+    const held = humanWait ?? savedHumanWait ?? (view.waitingFor?.kind === 'human'
+      ? {
+          audience: view.waitingFor.audience?.length ? [...view.waitingFor.audience] : ['@creator'],
+          detail: view.waitingFor.detail ?? `Paused during ${resumeStage}`,
+        }
+      : { audience: ['@creator'], detail: `Paused during ${resumeStage}` });
+    const preservesHeldQuestion = pausedForHuman
+      || Boolean(view.state?.humanPauseOrigin && view.waitingFor?.kind === 'human');
     return {
-      ...source,
+      ...stableSource,
       messages: source.messages.map((message) => ({ ...message })),
       transcripts: source.transcripts?.map((transcript) => ({
         ...transcript,
@@ -1890,6 +1938,8 @@ export class KarmaxApi {
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
       resumeStage,
       ...(pausedForHuman ? { pausedForHuman: true } : {}),
+      ...(preservesHeldQuestion ? { humanWait: { audience: [...held.audience], detail: held.detail } } : {}),
+      ...(reviewConfirmed ? { reviewConfirmed: true } : {}),
     };
   }
 
@@ -1975,9 +2025,10 @@ export class KarmaxApi {
     resumeStage: Stage,
     pausedForHuman = false,
     humanWait?: { audience: string[]; detail: string },
+    reviewConfirmed = false,
   ): Promise<TaskView> {
     const { startType, input, version } = await this.buildStart(task, true);
-    input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman);
+    input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman, humanWait, reviewConfirmed);
     await withTimeout(this.deps.client.workflow.start(startType, {
       taskQueue: this.deps.taskQueue,
       workflowId: task.id,
@@ -2009,8 +2060,8 @@ export class KarmaxApi {
       waitingFor: pausedForHuman
         ? {
             kind: 'human',
-            audience: humanWait?.audience ?? ['@creator'],
-            detail: humanWait?.detail ?? `Paused during ${resumeStage}`,
+            audience: input.recovery.humanWait?.audience ?? ['@creator'],
+            detail: input.recovery.humanWait?.detail ?? `Paused during ${resumeStage}`,
           }
         : undefined,
       agentTurn: undefined,
@@ -2037,7 +2088,7 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'signal_task', { projectId: task?.projectId, taskId });
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    const view = task.params.draft ? this.getDraftView(token, taskId) : task.lastView;
+    const view = task.params.draft ? this.getDraftView(token, taskId) : await this.transitionSourceView(task);
     if (!view) throw new Error('task has no lifecycle state yet');
     const move = this.availableStageTransitions(task, view).find((candidate) => candidate.target === target);
     if (!move) throw new Error(`cannot move this attempt from ${stageName(view.stage)} to ${stageName(target)}`);
@@ -2140,8 +2191,7 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId });
     if (!task) throw new Error(`no task ${taskId}`);
-    const view = task.lastView;
-    if (!view) throw new Error('task has no lifecycle state yet');
+    const view = await this.transitionSourceView(task);
     if (!this.availableStageTransitions(task, view).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
@@ -2243,7 +2293,7 @@ export class KarmaxApi {
       // A scoped token is immutable. End the requesting turn and park the exact
       // workflow stage so an approval can wake this role in a fresh turn whose
       // normally minted token includes the durable extension.
-      const view = task.lastView;
+      const view = await this.transitionSourceView(task);
       if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
         await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
         await this.startTransitionReplacement(task, view, view.stage, true, {
@@ -2813,7 +2863,7 @@ export class KarmaxApi {
     if (signal === SIG.confirm && scopedTask && heldView && heldOrigin === 'review') {
       await this.stopTaskActivity(scopedTask, heldView, 'Human confirmed the Review held for input');
       const minor = Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0);
-      await this.startTransitionReplacement(scopedTask, heldView, minor >= 12 ? 'merge' : 'pr');
+      await this.startTransitionReplacement(scopedTask, heldView, minor >= 12 ? 'merge' : 'pr', false, undefined, true);
       return;
     }
 

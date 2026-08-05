@@ -55,10 +55,10 @@ describe('gateway request scope for bare-id routes', () => {
     store.updateProjectConfig(mine, { repos: [home] });
     const client = {
       workflow: {
-        getHandle: () => ({
+        getHandle: (taskId: string) => ({
           terminate: async () => {},
           signal: async () => {},
-          query: async () => [],
+          query: async (name: string) => name === 'view' ? store.getTask(taskId)?.lastView : [],
         }),
         signalWithStart: async () => {},
         start: async () => ({}),

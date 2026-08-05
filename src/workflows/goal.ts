@@ -15,6 +15,7 @@ import {
   softwareDevV1_13,
   softwareDevV1_14,
   softwareDevV1_15,
+  softwareDevV1_16,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -101,6 +102,11 @@ export async function goalV1_14(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** Prerequisite-aware restoration for PR, Review, and Merge stage moves. */
 export async function goalV1_15(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_15({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Exact human-hold routing and head-bound restored Review confirmation. */
+export async function goalV1_16(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_16({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

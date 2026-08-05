@@ -6,6 +6,7 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git, gitOrThrow } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
+import { WorkflowIdReusePolicy } from '@temporalio/client';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { worldRepos } from '../src/world/types.js';
@@ -455,6 +456,69 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
     await replacement.signal('cancel');
     expect(await replacement.result()).toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  it('v1.16 does not let a held Review confirmation approve a head changed during the hold', async () => {
+    const repo = await repoWithOrigin('github-held-review-head');
+    const project = h.store.createProject('GitHub held Review head', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '47', accountLogin: 'acme', accountType: 'Organization' });
+    h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '82',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Hold Review', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const original = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Hold Review',
+        prompt: '@write held-review.md :: preserved proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => `${(await view(original)).stage}/${(await view(original)).waitingFor?.kind}/${prs[0]?.head?.sha}`, { timeout: 30_000 })
+      .toMatch(/^review\/human\/.+/);
+    const reviewedHead = prs[0].head.sha;
+    const reviewed = await view(original);
+    await original.signal('cancel');
+    expect(await original.result()).toMatchObject({ stage: 'cancelled' });
+
+    const held = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Hold Review',
+        prompt: '@write held-review.md :: preserved proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        recovery: {
+          messages: reviewed.messages,
+          reviewInfo: reviewed.reviewInfo,
+          prs: reviewed.prs,
+          seen: reviewed.state.turnsSeen,
+          target: 'main',
+          resumeStage: 'review',
+          pausedForHuman: true,
+          humanWait: { audience: ['@creator'], detail: 'Inspect the held proposal.' },
+        },
+      }],
+    });
+    await expect.poll(async () => `${(await view(held)).stage}/${(await view(held)).waitingFor?.kind}`, { timeout: 30_000 })
+      .toBe('review/human');
+
+    prs[0].head.sha = `${reviewedHead}-changed`;
+    await held.signal('confirm');
+    await expect.poll(async () => {
+      const current = await view(held);
+      const transcript = current.messages.map((message: any) => message.text).join('\n');
+      return `${current.stage}/${current.waitingFor?.kind}/${/head changed while Review was held.*Review is required/is.test(transcript)}`;
+    }, { timeout: 30_000 }).toBe('review/human/true');
+    expect(prs[0].merged_at).toBeNull();
+
+    await held.signal('cancel');
+    expect(await held.result()).toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
   /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its
