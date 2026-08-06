@@ -1994,9 +1994,17 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
 
   let sha: string | undefined;
+  // A recovery checkpoint may enter directly at PR/Landing, skipping completed
+  // Do work exactly once. If that recovered candidate later needs a repair, the
+  // loop must stop honoring the original entry point and actually run Do.
+  // Otherwise every `continue proposalCycle` silently resubmits the unchanged
+  // stale head and exact-candidate verification repeats forever.
+  let recoveredLandingNeedsDo = false;
   proposalCycle: for (;;) {
   // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
-  if (!restoredReviewApproved && recoveryStage !== 'pr' && recoveryStage !== 'merge') {
+  if (!restoredReviewApproved
+    && (recoveredLandingNeedsDo || (recoveryStage !== 'pr' && recoveryStage !== 'merge'))) {
+  recoveredLandingNeedsDo = false;
   for (;;) {
     // Each iteration starts fresh in Do — clears any park state left by a prior
     // sub-task wait (status 'waiting'/waitingFor 'subtask').
@@ -2889,6 +2897,12 @@ Inspect the complete current diff and specifically compare its delta from the re
         stage = 'do';
         status = 'active';
         githubErrorPolls = 0;
+        // Patch at the repair decision's live edge. Historical recovered runs
+        // preserve their recorded first loop-back; the next live rejection can
+        // adopt the fix and enter Do without replacing the execution again.
+        if ((recoveryStage === 'pr' || recoveryStage === 'merge')
+          && patched('software-dev-recovered-landing-repair-do-v1'))
+          recoveredLandingNeedsDo = true;
         continue proposalCycle;
       }
       if (intentAuthorizedLanding && decision.status === 'queued') {
