@@ -747,6 +747,35 @@ describe('GitHub-authoritative merge activity', () => {
         status: 'needs-human',
         detail: expect.stringMatching(/fresh human approval.*parked outside the provider queue/is),
       });
+
+    // v1.17 separates read-only exact-candidate certification from the atomic
+    // landing mutation and never asks GitHub's provider queue to own ordering.
+    liveHead = 'reviewed-head';
+    readiness = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    refUpdateMessage = undefined;
+    const task17 = core.store.createTask({ projectId: project.id, title: 'Front-held landing', workflow: 'software-dev',
+      workflowVersion: '1.17.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task17.id, type: 'task.confirmation-voted', ts: 3, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
+    } });
+    const handle17 = { ...handle, id: task17.id };
+    const enqueueBefore = requests.filter((request) => request.query?.includes('enqueuePullRequest')).length;
+    const patchBefore = requests.filter((request) => request.method === 'PATCH').length;
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'candidate-ready', prs: [expect.objectContaining({ headSha: 'reviewed-head' })],
+    });
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
+    expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
+    refUpdateMessage = 'Update is not a fast forward';
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'submit-exact' })).resolves.toMatchObject({
+      status: 'needs-revision', repair: { kind: 'base-moved', preserveAuthorization: true },
+    });
+    refUpdateMessage = undefined;
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'submit-exact' })).resolves.toMatchObject({
+      status: 'merged', sha: 'reviewed-head',
+    });
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
   });
 
   it('separates transient GitHub outages from authorization failures', async () => {

@@ -1868,7 +1868,7 @@ export class KarmaxApi {
       resumeStage,
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
-      // changed head before it can be re-admitted to the provider queue.
+      // changed head before it can be re-admitted to the landing queue.
       ...(resumeStage === 'do' && view.stage === 'merge' && view.landing?.authorization === 'authorized'
         ? {
             repairValidationPending: true,
@@ -2805,6 +2805,27 @@ export class KarmaxApi {
       await this.stopTaskActivity(scopedTask, heldView, 'Human confirmed the Review held for input');
       const minor = Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0);
       await this.startTransitionReplacement(scopedTask, heldView, minor >= 12 ? 'merge' : 'pr');
+      return;
+    }
+
+    // v1.16 executions already parked at their ordinary Review gate must not
+    // continue into the provider-owned landing protocol after v1.17 ships. The
+    // confirmation above has already been authorized and journalled, so replace
+    // the old execution at the exact Review -> Landing boundary. This preserves
+    // its PR/head checkpoint, consumes the one human decision exactly once, and
+    // lets the latest workflow reconstruct intent authorization before entering
+    // the front-held exact-candidate queue. Older versions did not journal durable
+    // intent authorization, so they retain their historical semantics.
+    const scopedMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
+    if (signal === SIG.confirm
+      && scopedTask?.workflow === 'software-dev'
+      && scopedMinor === 16
+      && heldView?.stage === 'review'
+      && heldView.status === 'waiting'
+      && heldView.waitingFor?.kind === 'human'
+      && !heldOrigin) {
+      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading Landing protocol to v1.17');
+      await this.startTransitionReplacement(scopedTask, heldView, 'merge');
       return;
     }
 
