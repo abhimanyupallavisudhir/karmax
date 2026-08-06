@@ -310,6 +310,57 @@ describe('project resources', () => {
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('allows resource proposals only for workflow versions with the Review gate', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-version-gate-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'base\n'); await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const store = new Store(':memory:'); const project = store.createProject('Version gate', { repos: [repo] });
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const resources = new ProjectResourceService(store, worlds,
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const tokens = new TokenAuthority();
+    const api = new KarmaxApi({ store, client: { workflow: {} } as any, taskQueue: 'karmax',
+      tokens, worlds, resources, broker });
+    const activeWorlds = [];
+    const cases = [
+      { workflow: 'software-dev', version: '1.18.0', supported: false },
+      { workflow: 'goal', version: '1.18.0', supported: false },
+      { workflow: 'software-dev', version: '1.19.0', supported: true },
+      { workflow: 'goal', version: '1.19.0', supported: true },
+    ] as const;
+    try {
+      for (const [index, value] of cases.entries()) {
+        const task = store.createTask({ projectId: project.id, title: `${value.workflow} ${value.version}`,
+          workflow: value.workflow, workflowVersion: value.version, params: { prompt: 'create data' } });
+        const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
+        world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+        activeWorlds.push(world);
+        await world.writeFile('generated.bin', `${value.workflow}-${value.version}`);
+        const token = tokens.mint({ taskId: task.id, profileId: 'developer', role: 'do',
+          principal: 'user:creator', projectId: project.id, organizationId: project.organizationId,
+          ceiling: ['task:review:write'], grantorCaps: ['task:review:write'],
+          worldGeneration: world.handle.generation ?? 1 }).token;
+        const proposal = api.proposeProjectResource(token, {
+          source: { kind: 'path', path: 'generated.bin' }, name: 'Generated data', driver: 'volume@1',
+          target: { kind: 'path', path: `data/generated-${index}.bin` }, access: 'read',
+        });
+        if (!value.supported) {
+          await expect(proposal).rejects.toThrow('workflow version does not support');
+        } else {
+          const proposed = await proposal;
+          expect(proposed.candidate).toMatchObject({ taskId: task.id, state: 'pending' });
+          await resources.discardCandidate(task.id, proposed.candidate.id, 'system:test-cleanup');
+        }
+      }
+    } finally {
+      for (const world of activeWorlds.reverse()) await world.destroy();
+      store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('allows only the calling task’s vault items and current generation through the platform proposal', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-proposal-auth-'));
     const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);

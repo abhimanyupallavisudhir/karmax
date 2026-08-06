@@ -432,7 +432,7 @@ export class KarmaxApi {
     if (!this.deps.resources) throw new Error('project resources are unavailable');
     const task = this.deps.store.getTask(caller.taskId);
     if (!task) throw new NotFoundError('calling task not found');
-    const resourceReviewMinor = task.workflow === 'software-dev' || task.workflow === 'goal' ? 14
+    const resourceReviewMinor = task.workflow === 'software-dev' || task.workflow === 'goal' ? 19
       : task.workflow === 'just-do' ? 5 : undefined;
     const [taskMajor, taskMinor] = task.workflowVersion.split('.').map(Number);
     const supportsResourceReview = resourceReviewMinor !== undefined && Number.isFinite(taskMajor)
