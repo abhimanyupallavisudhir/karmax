@@ -377,9 +377,9 @@ describe('task stage transitions', () => {
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
-  it('upgrades a v1.16 task at its successful Review boundary into v1.17 Landing', async () => {
+  it.each(['1.16.0', '1.17.0'])('upgrades a %s task at its successful Review boundary into same-Do Landing', async (version) => {
     const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, '1.16.0');
+    f.store.setTaskWorkflowVersion(f.task.id, version);
     f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'review',
@@ -391,7 +391,7 @@ describe('task stage transitions', () => {
 
     await f.api.signalTask(f.token, f.task.id, 'confirm');
 
-    expect(f.terminated.at(-1)).toMatch(/upgrading Landing protocol to v1\.17/);
+    expect(f.terminated.at(-1)).toMatch(/upgrading to same-Do Landing verification/);
     expect(f.starts.at(-1)!.type).toBe(`softwareDev@${bundledVersion('software-dev')}`);
     expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
       resumeStage: 'merge',

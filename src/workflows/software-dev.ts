@@ -212,7 +212,7 @@ const MAX_SHELL_NUDGES = 3;
  * pending check they are not allowed to disguise a permanent outage forever. */
 const MAX_GITHUB_ERROR_POLLS = 3;
 /** Landing repairs are automatic, but after this many consecutive failures a
- * person is asked for guidance instead of spending agent turns—and, in v1.17,
+ * person is asked for guidance instead of spending agent turns—and, from v1.17,
  * blocking the front landing slot—forever. */
 const MAX_AUTOMATED_LANDING_REPAIRS = 5;
 
@@ -341,13 +341,19 @@ export async function softwareDevV1_17(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.17.0');
 }
 
+/** Final exact-candidate verification is another turn in the existing Do
+ * conversation; it never selects or displays a separate integration reviewer. */
+export async function softwareDevV1_18(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.18.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -428,6 +434,10 @@ async function softwareDevImpl(
   // karmax's durable per-target lease as the authoritative landing queue, checks
   // the exact CI-green head there, and advances the target atomically.
   const frontHeldLanding = minor >= 17;
+  // The exact-candidate check belongs to the agent that authored and repaired
+  // the proposal. Re-enter its Do conversation so it retains both context and
+  // configured provider; no synthetic Confirm/integration-review role exists.
+  const doOwnsIntegrationReview = minor >= 18;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -1700,17 +1710,51 @@ async function softwareDevImpl(
   }
 
   /** Validate the exact integration candidate without replaying human Review.
-   * Human authorization is about task intent; this fresh Confirm-agent turn is
-   * about the current CI-green proposal head. It compares the last fully reviewed
-   * heads with the candidate and may approve, return actionable feedback to Do,
-   * or declare the delta ambiguous enough to require a person. */
+   * Human authorization is about task intent. v1.18 resumes the same Do agent
+   * and conversation to inspect the CI-green proposal head; older pins retain
+   * the historical Confirm-agent commands exactly for replay compatibility. */
   async function integrationReview(): Promise<'confirm' | 'revise' | 'human'> {
-    const configured = softwareDevConfirmLayers.filter((layer) => layer.kind === 'agent');
-    const layers: ConfirmLayer[] = configured.length ? configured : [{ kind: 'agent' }];
     const reviewed = Object.entries(landing.authorizedHeads ?? {})
       .map(([key, head]) => `- ${key}: ${head}`).join('\n') || '- no prior head was recorded';
     const repaired = Object.entries(prHeadMap(prs))
       .map(([key, head]) => `- ${key}: ${head}`).join('\n') || '- no changed PR head';
+
+    if (doOwnsIntegrationReview) {
+      const prompt = `This is the FINAL AUTOMATED INTEGRATION verification of the exact candidate at the front of the landing queue. A person already authorized the task's intent; do not ask them to re-review a mechanical base update merely because the commit SHA changed.
+
+Original task intent:
+-----
+${input.prompt}
+-----
+
+Heads that received the last full Review:
+${reviewed}
+
+Current exact candidate heads:
+${repaired}
+
+Inspect the complete current diff and specifically compare its delta from the reviewed heads. Confirm the candidate includes the current target, and run relevant tests. This is a verification turn: do not edit or commit files, and do not call open_pr. Call confirm_decision exactly once:
+- action:"confirm" only when this exact candidate remains within the authorized intent and is safe to land now;
+- action:"revise" with actionable text when you can repair it in your next Do turn;
+- action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.`;
+      msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: msgs.length });
+      const turn = await doTurn();
+      const decision = turn.confirmDecision;
+      if (decision?.action === 'confirm') return 'confirm';
+      if (decision?.action === 'revise') {
+        msgs.push({
+          id: `ir-${msgs.length}`,
+          role: 'user',
+          text: decision.text || 'Your exact-candidate verification found that the proposal still needs changes. Repair it, verify it, and call open_pr again.',
+          ts: msgs.length,
+        });
+        return 'revise';
+      }
+      return 'human';
+    }
+
+    const configured = softwareDevConfirmLayers.filter((layer) => layer.kind === 'agent');
+    const layers: ConfirmLayer[] = configured.length ? configured : [{ kind: 'agent' }];
     for (const layer of layers) {
       const guidance = layer.prompt?.trim()
         ? `\n\nAdditional configured review guidance:\n${layer.prompt.trim()}`
@@ -2647,9 +2691,16 @@ Inspect the complete current diff and specifically compare its delta from the re
               landing = {
                 ...landing,
                 validation: 'pending', provider: 'validating',
-                detail: 'CI passed on the exact candidate; the integration agent is reviewing it at the front of the landing queue.',
+                detail: doOwnsIntegrationReview
+                  ? 'CI passed on the exact candidate; the Do agent is verifying it at the front of the landing queue.'
+                  : 'CI passed on the exact candidate; the integration agent is reviewing it at the front of the landing queue.',
               };
-              waitingFor = { kind: 'confirm', detail: 'Final exact-candidate integration review' };
+              waitingFor = {
+                kind: doOwnsIntegrationReview ? 'agentSlot' : 'confirm',
+                detail: doOwnsIntegrationReview
+                  ? 'Do-agent exact-candidate verification'
+                  : 'Final exact-candidate integration review',
+              };
               await publish();
               const candidateReview = await integrationReview();
               waitingFor = undefined;
@@ -2658,19 +2709,25 @@ Inspect the complete current diff and specifically compare its delta from the re
               if (candidateReview === 'confirm') {
                 landing = {
                   ...landing, validation: 'passed', provider: 'validating',
-                  detail: 'The exact candidate passed CI and integration-agent review; landing atomically.',
+                  detail: doOwnsIntegrationReview
+                    ? 'The exact candidate passed CI and Do-agent verification; landing atomically.'
+                    : 'The exact candidate passed CI and integration-agent review; landing atomically.',
                 };
                 githubResult = await core.mergeGithubPrs(world as any, prs, { mode: 'submit-exact' });
               } else if (candidateReview === 'revise') {
                 githubResult = {
                   status: 'needs-revision', prs,
-                  detail: 'The integration agent found a fixable problem in the exact landing candidate.',
+                  detail: doOwnsIntegrationReview
+                    ? 'The Do agent found a fixable problem while verifying the exact landing candidate.'
+                    : 'The integration agent found a fixable problem in the exact landing candidate.',
                   repair: { kind: 'ci', preserveAuthorization: true },
                 };
               } else {
                 githubResult = {
                   status: 'needs-revision', prs,
-                  detail: 'The integration agent found an ambiguous or substantive candidate change that needs human Review.',
+                  detail: doOwnsIntegrationReview
+                    ? 'The Do agent found an ambiguous or substantive candidate change that needs human Review.'
+                    : 'The integration agent found an ambiguous or substantive candidate change that needs human Review.',
                   repair: { kind: 'head-changed', preserveAuthorization: false },
                 };
               }
@@ -2802,7 +2859,9 @@ Inspect the complete current diff and specifically compare its delta from the re
           text: intentAuthorizedLanding
             ? `${decision.detail ?? 'The pull request must be repaired before it can land'}\nInspect the live branch, repair it against the newest target, run the relevant tests, then call open_pr again. ${decision.repair?.preserveAuthorization === true
               ? frontHeldLanding
-                ? 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and integration-agent review before landing.'
+                ? doOwnsIntegrationReview
+                  ? 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and return to this same Do conversation for verification before landing.'
+                  : 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and integration-agent review before landing.'
                 : 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
               : 'This change invalidated the prior authorization, so the updated proposal must pass human Review.'}`
             : explicitPrCycle

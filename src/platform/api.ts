@@ -2808,8 +2808,9 @@ export class KarmaxApi {
       return;
     }
 
-    // v1.16 executions already parked at their ordinary Review gate must not
-    // continue into the provider-owned landing protocol after v1.17 ships. The
+    // Executions on the pre-v1.18 Landing protocols already parked at their
+    // ordinary Review gate must not continue into a separate integration-agent
+    // path. The
     // confirmation above has already been authorized and journalled, so replace
     // the old execution at the exact Review -> Landing boundary. This preserves
     // its PR/head checkpoint, consumes the one human decision exactly once, and
@@ -2819,12 +2820,13 @@ export class KarmaxApi {
     const scopedMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
     if (signal === SIG.confirm
       && scopedTask?.workflow === 'software-dev'
-      && scopedMinor === 16
+      && scopedMinor >= 16
+      && scopedMinor < 18
       && heldView?.stage === 'review'
       && heldView.status === 'waiting'
       && heldView.waitingFor?.kind === 'human'
       && !heldOrigin) {
-      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading Landing protocol to v1.17');
+      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading to same-Do Landing verification');
       await this.startTransitionReplacement(scopedTask, heldView, 'merge');
       return;
     }

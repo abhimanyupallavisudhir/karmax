@@ -695,7 +695,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     env: Record<string, string>,
     repos: ReturnType<typeof worldRepos>,
   ) {
-    if (isRemote(handle.kind)) return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos);
+    const priorPrs = store.getTask(handle.id)?.lastView?.prs ?? [];
+    const expectedRemoteHeads = Object.fromEntries(priorPrs
+      .filter((candidate) => candidate.headSha)
+      .map((candidate) => [candidate.repo, candidate.headSha!]));
+    if (isRemote(handle.kind))
+      return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos, expectedRemoteHeads);
     const pushed: string[] = [];
     const skipped: string[] = [];
     const errors: Record<string, string> = {};
@@ -704,10 +709,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // GitHub App installation tokens are short-lived HTTPS credentials. Use
       // them from the trusted host even for a local/container worktree, so a
       // connected repository never needs the person's SSH private key or PAT.
-      const push = repository?.gitConnectionId && deps.githubApp
+      let push = repository?.gitConnectionId && deps.githubApp
         ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', '-u', 'origin', repo.branch], env)
         : await world.exec('git', ['push', '-u', 'origin', repo.branch],
           { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
+      const expected = expectedRemoteHeads[repo.name];
+      if (push.code !== 0 && expected && /non-fast-forward|fetch first|rejected/i.test(push.stderr || push.stdout)) {
+        const lease = `--force-with-lease=refs/heads/${repo.branch}:${expected}`;
+        push = repository?.gitConnectionId && deps.githubApp
+          ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', lease, '-u', 'origin', repo.branch], env)
+          : await world.exec('git', ['push', lease, '-u', 'origin', repo.branch],
+            { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
+      }
       if (push.code === 0) pushed.push(repo.name);
       else {
         skipped.push(repo.name);
