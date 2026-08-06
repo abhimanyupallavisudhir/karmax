@@ -1868,7 +1868,7 @@ export class KarmaxApi {
       resumeStage,
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
-      // changed head before it can be re-admitted to the provider queue.
+      // changed head before it can be re-admitted to the landing queue.
       ...(resumeStage === 'do' && view.stage === 'merge' && view.landing?.authorization === 'authorized'
         ? {
             repairValidationPending: true,

@@ -358,8 +358,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.16.0',
-    description: 'Branch/world → do/wait → explicit PR → intent review → provider-queued candidate validation → end, with automated repair review.',
+    version: '1.17.0',
+    description: 'Branch/world → do/wait → explicit PR → intent review → front-held exact-candidate CI and agent review → atomic landing, with bounded in-place repair.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -463,8 +463,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.16.0',
-    description: 'Software Dev in autonomous completion mode with intent-authorized, provider-queued candidate validation.',
+    version: '1.17.0',
+    description: 'Software Dev in autonomous completion mode with front-held exact-candidate validation and bounded in-place repair.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
