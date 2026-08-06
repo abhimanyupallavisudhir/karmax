@@ -1854,8 +1854,24 @@ export class KarmaxApi {
         : {}),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
     };
+    // A lifecycle replacement is a new Temporal history, not a new agent
+    // conversation. Resume the Do provider session when its credential home can
+    // be leased again; the copied transcript remains the provider-independent
+    // fallback when it cannot.
+    const session = source.session ?? (this.deps.store.kvGet(`session:${view.taskId}:do`) || undefined);
+    let sessionHome = source.sessionHome;
+    if (!sessionHome) {
+      try {
+        const meta = JSON.parse(this.deps.store.kvGet(`sessionmeta:${view.taskId}:do`) ?? '{}');
+        sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
+      } catch {
+        /* malformed legacy metadata: the transcript still preserves context */
+      }
+    }
     return {
       ...source,
+      ...(session ? { session } : {}),
+      ...(sessionHome ? { sessionHome } : {}),
       messages: source.messages.map((message) => ({ ...message })),
       transcripts: source.transcripts?.map((transcript) => ({
         ...transcript,
@@ -1869,7 +1885,8 @@ export class KarmaxApi {
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
       // changed head before it can be re-admitted to the landing queue.
-      ...(resumeStage === 'do' && view.stage === 'merge' && view.landing?.authorization === 'authorized'
+      ...(resumeStage === 'do' && (view.stage === 'merge' || view.stage === 'escalated')
+        && view.landing?.authorization === 'authorized'
         ? {
             repairValidationPending: true,
             landing: {
@@ -2764,6 +2781,34 @@ export class KarmaxApi {
         });
         return;
       }
+    }
+
+    // Retry is also the explicit migration boundary for Landing failures that
+    // are parked in a still-running historical execution. Retrying that same
+    // pin would reproduce either the separate Confirm credential selection or
+    // the unguarded task-branch push. Replace it with the current workflow while
+    // retaining the world, PRs, intent authorization, and Do conversation.
+    const retryMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
+    if (signal === SIG.retry
+      && scopedTask?.workflow === 'software-dev'
+      && retryMinor >= 16
+      && retryMinor < 18
+      && heldView?.stage === 'escalated'
+      && heldView.status === 'blocked'
+      && !heldView.pointOfNoReturnPassed
+      && heldView.landing?.authorization === 'authorized') {
+      const now = Date.now();
+      const message: Message = {
+        id: `landing-upgrade-${now}`,
+        role: 'user',
+        text: `Karmax upgraded this attempt to the current Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the already-authorized intent, inspect the current repaired proposal, make only necessary fixes, verify it, and call open_pr again. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
+        ts: now,
+      };
+      const nextView = this.withConversationMessage(heldView, 'do', message);
+      await this.stopTaskActivity(scopedTask, heldView, 'Retrying authorized Landing failure on same-Do protocol');
+      await this.startTransitionReplacement(scopedTask, nextView, 'do');
+      this.publishConversationMessage(taskId, 'do', message);
+      return message;
     }
 
     // A cross-cutting human hold is not a second decision gate. Supplying agent
