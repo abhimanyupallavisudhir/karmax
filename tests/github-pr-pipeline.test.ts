@@ -30,6 +30,8 @@ let blockFrontHeldRepair = false;
 let frontHeldRepairStarted = false;
 let releaseFrontHeldRepair: (() => void) | undefined;
 let frontHeldRepairGate: Promise<void> = Promise.resolve();
+const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
+let exactCandidateRevisions = 0;
 
 async function remoteForBranch(branch: string): Promise<string | undefined> {
   if (!originDir || !fs.existsSync(originDir)) return undefined;
@@ -176,6 +178,39 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
             }],
           }, ctx);
         }
+        if (input.role === 'do'
+          && input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')) {
+          exactCandidateTurns.push({
+            role: input.role,
+            session: input.session,
+            messages: input.messages.map((message) => message.text),
+          });
+          githubReadiness = {};
+          const verdict = exactCandidateRevisions > 0
+            ? (exactCandidateRevisions--, '@confirm revise :: Add the missing exact-candidate repair.')
+            : '@confirm confirm';
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-verdict-${input.messages.length}`,
+              role: 'user',
+              text: verdict,
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
+        if (input.role === 'do'
+          && input.messages.at(-1)?.text.includes('Add the missing exact-candidate repair.')) {
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-repair-${input.messages.length}`,
+              role: 'user',
+              text: '@write front.md :: exact candidate repaired\n@openpr',
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
         // One test below needs a competent Merge agent that resolves a conflict
         // introduced after PR creation. Keep the ordinary mock behavior for every
         // other turn, including the existing "cannot resolve" pipeline coverage.
@@ -221,6 +256,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     frontHeldRepairStarted = false;
     releaseFrontHeldRepair = undefined;
     frontHeldRepairGate = Promise.resolve();
+    exactCandidateTurns.length = 0;
+    exactCandidateRevisions = 0;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -487,7 +524,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
-  it('v1.17 keeps a repair at the front, reviews the final exact head, and never enters GitHub\'s queue', async () => {
+  it('v1.18 keeps a repair at the front and has the same Do session verify the exact head', async () => {
     const repo = await repoWithOrigin('github-front-held-repair');
     const project = h.store.createProject('Front-held exact landing', { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -496,9 +533,9 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
     h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
     const task = h.store.createTask({ projectId: project.id, title: 'Repair at the front', workflow: 'software-dev',
-      workflowVersion: '1.17.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      workflowVersion: '1.18.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
       createdBy: { kind: 'user', userId: 'a' } });
-    useMergeQueue = true; // v1.17 must deliberately ignore provider queue admission.
+    useMergeQueue = true; // The front-held protocol deliberately ignores provider queue admission.
     githubReadiness = {
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
@@ -507,8 +544,9 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       }] } },
     };
     blockFrontHeldRepair = true;
+    exactCandidateRevisions = 1;
     frontHeldRepairGate = new Promise<void>((resolve) => { releaseFrontHeldRepair = resolve; });
-    const handle = await h.client.workflow.start('softwareDev@1.17.0', {
+    const handle = await h.client.workflow.start('softwareDev@1.18.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
       args: [{
@@ -536,8 +574,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       releaseFrontHeldRepair = undefined;
       expect(await handle.result()).toMatchObject({ stage: 'done', sha: expect.any(String) });
       const final = await view(handle);
+      expect(exactCandidateTurns).toHaveLength(2);
+      expect(exactCandidateTurns).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'do', session: expect.stringMatching(/^mock-/) }),
+      ]));
+      expect(new Set(exactCandidateTurns.map((turn) => turn.session)).size).toBe(1);
+      expect(final.transcripts.find((transcript: any) => transcript.role === 'do')?.messages
+        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION verification'))).toBe(true);
       expect(final.transcripts.find((transcript: any) => transcript.role === 'confirm')?.messages
-        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION review'))).toBe(true);
+        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION verification')) ?? false).toBe(false);
       expect(final.landing).toMatchObject({ authorization: 'authorized', validation: 'passed', provider: 'none' });
       expect(mergeQueueAccepted).toBe(false);
     } finally {

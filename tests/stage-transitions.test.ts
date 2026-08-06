@@ -377,9 +377,9 @@ describe('task stage transitions', () => {
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
-  it('upgrades a v1.16 task at its successful Review boundary into v1.17 Landing', async () => {
+  it.each(['1.16.0', '1.17.0'])('upgrades a %s task at its successful Review boundary into same-Do Landing', async (version) => {
     const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, '1.16.0');
+    f.store.setTaskWorkflowVersion(f.task.id, version);
     f.store.saveView(f.task.id, {
       ...f.view,
       stage: 'review',
@@ -391,7 +391,7 @@ describe('task stage transitions', () => {
 
     await f.api.signalTask(f.token, f.task.id, 'confirm');
 
-    expect(f.terminated.at(-1)).toMatch(/upgrading Landing protocol to v1\.17/);
+    expect(f.terminated.at(-1)).toMatch(/upgrading to same-Do Landing verification/);
     expect(f.starts.at(-1)!.type).toBe(`softwareDev@${bundledVersion('software-dev')}`);
     expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
       resumeStage: 'merge',
@@ -405,6 +405,46 @@ describe('task stage transitions', () => {
       }),
     ]));
     expect(f.signalled.some((item) => item.id === f.task.id && item.signal === 'confirm')).toBe(false);
+  });
+
+  it.each(['1.16.0', '1.17.0'])('upgrades a blocked authorized %s Landing retry and resumes its Do session', async (version) => {
+    const f = fixture();
+    f.store.setTaskWorkflowVersion(f.task.id, version);
+    f.store.kvSet(`session:${f.task.id}:do`, 'codex-session-existing');
+    f.store.kvSet(`sessionmeta:${f.task.id}:do`, JSON.stringify({ home: '/profiles/codex' }));
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'escalated',
+      status: 'blocked',
+      error: 'could not push task branch: non-fast-forward',
+      prs: [{ repo: 'repo', slug: 'owner/repo', number: 52, url: 'https://github.test/owner/repo/pull/52', state: 'open', headSha: 'reviewed-head' }],
+      landing: {
+        authorization: 'authorized',
+        validation: 'failed',
+        provider: 'ejected',
+        authorizedHeads: { 'owner/repo#52': 'reviewed-head' },
+      },
+    });
+
+    const message = await f.api.signalTask(f.token, f.task.id, 'retry');
+
+    expect(message?.text).toMatch(/same Do conversation/);
+    expect(f.terminated.at(-1)).toMatch(/same-Do protocol/);
+    expect(f.starts.at(-1)!.type).toBe(`softwareDev@${bundledVersion('software-dev')}`);
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'do',
+      session: 'codex-session-existing',
+      sessionHome: '/profiles/codex',
+      repairValidationPending: true,
+      landing: {
+        authorization: 'authorized',
+        validation: 'failed',
+        provider: 'ejected',
+        authorizedHeads: { 'owner/repo#52': 'reviewed-head' },
+      },
+      prs: [{ number: 52, headSha: 'reviewed-head' }],
+    });
+    expect(f.store.getTask(f.task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
   });
 
   it('lets the selected human open a PR from a Do-stage input wait', async () => {

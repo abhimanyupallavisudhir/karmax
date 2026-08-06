@@ -696,7 +696,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'confirm_decision',
     description:
-      'Confirm agents ONLY. Review the already-open proposal; do NOT keep building it. action: "confirm" (accept the PR; it proceeds to merge), "revise" (send it back to the Do agent with specific feedback in `text`), or "reject" (cancel the task and say why). Calling this ends your turn.',
+      'Confirm agents, or a Do agent explicitly asked by the workflow to perform final exact-candidate verification. Review the already-open proposal; do NOT keep building it in this turn. action: "confirm" (accept the candidate), "revise" (return specific repair feedback in `text`), or "reject" (require human Review when the workflow says so). Calling this ends your turn.',
     parameters: {
       type: 'object',
       properties: {
