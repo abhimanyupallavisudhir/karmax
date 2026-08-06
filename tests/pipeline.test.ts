@@ -116,12 +116,12 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
-  it('v1.17 blocks Review on staged resources and wakes on an actual decision', async () => {
+  it('v1.19 blocks Review on staged resources and wakes on an actual decision', async () => {
     const repo = await h.makeRepo('resource-candidate-review');
     const project = h.store.createProject('Resource candidate review', { repos: [repo] });
     const task = h.store.createTask({ projectId: project.id, title: 'Install model', workflow: 'software-dev',
-      workflowVersion: '1.17.0', params: { prompt: 'install it' } });
-    const handle = await h.client.workflow.start('softwareDev@1.17.0', {
+      workflowVersion: '1.19.0', params: { prompt: 'install it' } });
+    const handle = await h.client.workflow.start('softwareDev@1.19.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
       args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,

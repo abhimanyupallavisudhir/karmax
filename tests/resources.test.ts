@@ -283,7 +283,7 @@ describe('project resources', () => {
     await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
     const store = new Store(':memory:'); const project = store.createProject('Credentials', { repos: [repo] });
     const task = store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
-      workflowVersion: '1.17.0', params: { prompt: 'create it' } });
+      workflowVersion: '1.19.0', params: { prompt: 'create it' } });
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,
@@ -318,7 +318,7 @@ describe('project resources', () => {
     await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
     const store = new Store(':memory:'); const project = store.createProject('Authorization', { repos: [repo] });
     const task = store.createTask({ projectId: project.id, title: 'Create key', workflow: 'software-dev',
-      workflowVersion: '1.17.0', params: { prompt: 'create it' } });
+      workflowVersion: '1.19.0', params: { prompt: 'create it' } });
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault'))); const worlds = new WorldRegistry();
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const resources = new ProjectResourceService(store, worlds,

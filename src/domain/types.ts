@@ -691,7 +691,7 @@ export interface TaskPullRequest {
 }
 
 export interface GitHubMergeAuthorization {
-  status: 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
+  status: 'candidate-ready' | 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */
   actorUserId?: string;
@@ -705,14 +705,14 @@ export interface GitHubMergeAuthorization {
     kind: 'conflict' | 'base-moved' | 'ci' | 'changes-requested' | 'head-changed';
     preserveAuthorization: boolean;
   };
-  /** Provider-owned durable queue state. Once accepted, krmax's own merge
-   * coordinator is only an admission lock and must no longer be shown as the
-   * authoritative queue. */
+  /** Provider-owned durable queue state. Used by replay-pinned v1.16 landing;
+   * v1.17 keeps the karmax target lease through exact-candidate validation and
+   * automated repair instead. */
   providerQueue?: { state: 'queued' | 'validating'; entryIds?: string[] };
 }
 
 /** Human authorization is intent-scoped; integration validation is bound to a
- * disposable candidate and is invalidated whenever GitHub rebuilds or ejects it. */
+ * disposable exact candidate and is invalidated whenever its head changes. */
 export interface TaskLandingState {
   authorization: 'none' | 'authorized' | 'reapproval-required';
   validation: 'none' | 'pending' | 'passed' | 'failed';
