@@ -432,7 +432,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       const context = current.messages.map((message: any) => message.text).join('\n');
-      return `${current.stage}/${/unit tests.*ci-repair.*expected green/is.test(context)}`;
+      // CheckRun output text requires an additional GitHub App permission and
+      // is deliberately not part of readiness. The actionable, permission-safe
+      // packet is the terminal classification plus check name and details URL.
+      return `${current.stage}/${/terminally failing CI.*unit tests.*ci-repair/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
     githubReadiness = {};
     await handle.signal('confirm');
