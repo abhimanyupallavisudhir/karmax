@@ -2750,6 +2750,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: 'Waiting for CI on the exact pull-request head while this task retains the front landing slot.',
             };
           }
+          // GitHub commonly reports UNKNOWN for a short window while it
+          // recomputes mergeability after the target moves. That is neither a
+          // repository-policy decision nor grounds to eject the task: keep the
+          // authoritative front slot and poll until GitHub has a real answer.
+          if (readiness.mergeable === 'UNKNOWN' || readiness.mergeStateStatus === 'UNKNOWN') {
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: `GitHub is still computing mergeability for ${ref.slug}#${ref.number}; this task retains the front landing slot and will retry automatically.`,
+            };
+          }
           if (readiness.mergeStateStatus !== 'CLEAN') {
             return {
               status: 'needs-human', prs: current, actorUserId,
