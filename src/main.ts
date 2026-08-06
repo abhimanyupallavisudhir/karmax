@@ -18,16 +18,16 @@ import { TokenAuthority } from './platform/tokens.js';
 import { CredentialBroker } from './autonomy/broker.js';
 import { Vault } from './autonomy/vault.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
-import { GitProfiles } from './autonomy/git-profiles.js';
+import { GitProfiles, userGitScope } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
 import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { RemoteAccessController, remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
-import { registerAppInstance } from './util/instance.js';
+import { duplicateInstanceMessage, registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
-import { IdentityService } from './auth/identity.js';
+import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
@@ -88,19 +88,15 @@ async function main() {
   console.log('\n  krmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
   if (envFile) console.log(`  • Operator settings from ${envFile}`);
 
-  // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
-  // running against one KARMAX_HOME — each with its own worker fanning out agent
-  // turns, multiplying RAM pressure for no gain (one app serves the whole list).
-  // Advisory, not a lock: a fast Ctrl-C→restart is intentional, so we warn loudly
-  // and let the operator decide rather than refusing to boot.
+  // Duplicate app-instance guard (karmax#4): more than one worker against the
+  // same Temporal queue is a correctness bug, not just excess RAM. A duplicate
+  // can claim an activity and disappear or run it under divergent code while the
+  // UI is served by another process. Graceful restart releases before spawning
+  // its successor, so refusing a genuinely live duplicate is safe.
   const instance = registerAppInstance();
   if (instance.others.length) {
-    console.warn(
-      `\n  ⚠  ${instance.others.length} other krmax app instance(s) already running against ${p.home}` +
-        ` (pids ${instance.others.join(', ')}).\n` +
-        `     Each runs its own worker + agent fan-out and competes for the same RAM —\n` +
-        `     the exact condition behind the July-5 OOM (karmax#4). Stop the extras unless this is deliberate.\n`,
-    );
+    instance.release();
+    throw new Error(duplicateInstanceMessage(p.home, instance.others));
   }
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
   // One long-lived server, reused across restarts/reloads (see dev-server.ts):
@@ -125,6 +121,27 @@ async function main() {
   // ── Core services ──
   const store = new Store(path.join(p.state, 'karmax.db'));
   const authorization = new AuthorizationService(store);
+  const broker = new CredentialBroker(new Vault(p.vault));
+  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
+  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
+    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET);
+  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET);
+  // One deployment App owns repository installations and user OAuth. Environment
+  // values remain an upgrade/enterprise bootstrap path; the normal path is the
+  // browser manifest, whose converted client credentials persist in Store/Vault.
+  const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
+    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
+    publicApp: deployment.hosted });
+  const sharedGithubOauth = githubApp.oauthCredentials();
+  // A separately managed OAuth App remains a compatibility fallback only. Once
+  // the deployment GitHub App exists, it is the single OAuth client.
+  const legacyGithubOauth = process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim()
+    && process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET?.trim()
+    ? { clientId: process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID.trim(),
+        clientSecret: process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET.trim() }
+    : undefined;
   const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '');
   const publicHost = (() => { try { return publicUrl ? new URL(publicUrl).hostname : undefined; } catch { return undefined; } })();
   const configuredAuthHosts = [
@@ -163,10 +180,11 @@ async function main() {
       ? { google: { clientId: process.env.KARMAX_GOOGLE_CLIENT_ID.trim(),
           clientSecret: process.env.KARMAX_GOOGLE_CLIENT_SECRET.trim() } }
       : {}),
-    ...(process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim() && process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET?.trim()
-      ? { github: { clientId: process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID.trim(),
-          clientSecret: process.env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET.trim() } }
-      : {}),
+    ...(sharedGithubOauth ? { github: { ...sharedGithubOauth, app: true,
+      onAuthorization: async (authorization: GitHubAuthorization) => {
+        const githubIdentity = await githubApp.adoptUserAuthorization(authorization.userId, authorization.accountId, authorization);
+        new GitProfiles(store, broker, p.state, userGitScope(authorization.userId)).saveGithubIdentity(githubIdentity);
+      } } } : legacyGithubOauth ? { github: legacyGithubOauth } : {}),
   });
   const installationOwner = identity.listUsers()[0];
   if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
@@ -177,7 +195,6 @@ async function main() {
   seedProfiles(store, provider);
   const bus = new KarmaxBus();
   const tokens = new TokenAuthority(store);
-  const broker = new CredentialBroker(new Vault(p.vault));
   // Installation-wide outbound email (account confirmation, password reset, org
   // invites). Reads its live config + vaulted secret on each send, so connecting
   // a provider in Settings takes effect without a restart. Handed to identity so
@@ -194,18 +211,6 @@ async function main() {
     (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
-  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
-    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
-  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
-    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET);
-  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
-    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET);
-  // The service is always present. A fresh hosted instance configures it from
-  // the browser through GitHub's App Manifest flow; environment values are only
-  // an upgrade/enterprise bootstrap path.
-  const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
-    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
-    publicApp: deployment.hosted });
   const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
     ? new S3ObjectStore({
         endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),

@@ -185,6 +185,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/cards/:id',
   ],
   administration: [
+    'GET /api/user/export (human identity only; all data directly linked to the signed-in user)',
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',

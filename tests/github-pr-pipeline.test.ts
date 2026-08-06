@@ -424,7 +424,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/ci-repair', output: { summary: 'expected green, received red' },
+        detailsUrl: 'https://github.test/checks/ci-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -432,7 +432,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       const context = current.messages.map((message: any) => message.text).join('\n');
-      return `${current.stage}/${/unit tests.*ci-repair.*expected green/is.test(context)}`;
+      // CheckRun output text requires an additional GitHub App permission and
+      // is deliberately not part of readiness. The actionable, permission-safe
+      // packet is the terminal classification plus check name and details URL.
+      return `${current.stage}/${/terminally failing CI.*unit tests.*ci-repair/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
     githubReadiness = {};
     await handle.signal('confirm');
@@ -467,7 +470,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/intent-repair', output: { summary: 'base interaction failed' },
+        detailsUrl: 'https://github.test/checks/intent-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -540,7 +543,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/front-held', output: { summary: 'repair me' },
+        detailsUrl: 'https://github.test/checks/front-held',
       }] } },
     };
     blockFrontHeldRepair = true;

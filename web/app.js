@@ -11745,6 +11745,15 @@ function profileView() {
       <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Copy local open commands from agent file links</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
+    <div class="card data-export-card">
+      <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
+      <div class="data-export-copy">
+        <div class="section-h">Your data</div>
+        <p class="task-sub">Download a readable JSON archive of your profile and the krmax records directly linked to you across organizations.</p>
+        <p class="data-export-note">Passwords, session tokens, OAuth tokens, and stored credentials are never included.</p>
+      </div>
+      <button class="btn" id="export-user-data" type="button">Export your data</button>
+    </div>
     <div class="card">
       <div class="section-h">Session</div>
       <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
@@ -11924,6 +11933,7 @@ function wireProfileView() {
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
   $('#profile-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
+  $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
@@ -12027,7 +12037,14 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div><div id="org-misc-slot"></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
-    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization, or permanently delete it.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
+    <div class="card data-export-card" data-settings-access="organization" hidden>
+      <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
+      <div class="data-export-copy"><div class="section-h">Export organization data</div>
+        <p class="task-sub">Download a readable JSON archive of this organization, grouped into complete record collections.</p>
+        <p class="data-export-note">Passwords, tokens, and stored credentials are never included.</p></div>
+      <button class="btn sm" id="export-organization" type="button">Export organization data</button>
+    </div>
+    ${org?.kind === 'team' ? '<details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Delete organization</b><span>Permanently remove this organization and its data</span></summary><p class="task-sub">This cannot be undone. Export the organization first if you need to keep a copy.</p><button class="btn sm danger" id="delete-organization">Delete organization</button></details>' : ''}
     </div></div></div>`;
 }
 
