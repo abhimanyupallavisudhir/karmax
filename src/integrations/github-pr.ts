@@ -261,13 +261,13 @@ export class GithubPrApi {
   async readiness(slug: string, number: number): Promise<GithubPullRequestReadiness> {
     const [owner, name, ...extra] = slug.split('/');
     if (!owner || !name || extra.length) throw new Error(`Invalid GitHub repository slug: ${slug}`);
-    const value = await this.graphql<any>(`query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
+    const query = (withCheckDetails: boolean) => `query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           id url state isDraft merged headRefOid mergeable mergeStateStatus reviewDecision
           statusCheckRollup {
             state
-            contexts(first: 50) {
+            ${withCheckDetails ? `contexts(first: 50) {
               nodes {
                 __typename
                 ... on CheckRun {
@@ -275,14 +275,24 @@ export class GithubPrApi {
                 }
                 ... on StatusContext { context state targetUrl description }
               }
-            }
+            }` : ''}
           }
           mergeQueueEntry { id }
           autoMergeRequest { enabledAt mergeMethod }
           viewerCanEnableAutoMerge viewerCanMergeAsAdmin
         }
       }
-    }`, { owner, name, number });
+    }`;
+    let value = await this.graphql<any>(query(true), { owner, name, number });
+    const firstError = value?.errors?.map((error: any) => String(error?.message ?? '')).join('; ') ?? '';
+    // Some GitHub App installations can read the aggregate status rollup but
+    // not enumerate CheckRun nodes. GitHub rejects the whole GraphQL response in
+    // that case, so retry the same readiness query without optional details.
+    // The gate still gets exact PENDING/FAILURE/SUCCESS state and never treats a
+    // permission error as green; only names/URLs are omitted.
+    if (value?.errors?.length && /resource not accessible by integration/i.test(firstError)) {
+      value = await this.graphql<any>(query(false), { owner, name, number });
+    }
     if (value?.errors?.length) {
       const message = value.errors.map((error: any) => String(error?.message ?? 'Unknown error')).join('; ');
       const kinds = value.errors.map((error: any) => String(error?.type ?? error?.extensions?.type ?? '').toUpperCase());
