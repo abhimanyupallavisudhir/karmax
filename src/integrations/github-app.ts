@@ -243,7 +243,13 @@ export class GitHubAppService {
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
       callback_urls: [`${origin}/api/github/oauth/callback`],
-      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+      // Landing certifies the exact PR head only after GitHub's combined check
+      // rollup is successful. `checks` covers CheckRun contexts (including
+      // Actions); `statuses` covers legacy commit-status contexts. Both are
+      // read-only and are required to distinguish pending CI from failed CI.
+      default_permissions: {
+        checks: 'read', contents: 'write', metadata: 'read', pull_requests: 'write', statuses: 'read',
+      },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
     // cannot reach them. Local Karmax instances reconcile installations on

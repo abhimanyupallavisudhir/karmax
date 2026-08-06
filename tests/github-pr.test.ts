@@ -283,6 +283,33 @@ describe('GitHub PR client', () => {
     expect(requests[1].query).not.toContain('contexts(first: 50)');
   });
 
+  it('fails closed on policy state when an older App cannot read any CI rollup', async () => {
+    const requests: any[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const request = JSON.parse(String(init.body));
+      requests.push(request);
+      if (request.query.includes('statusCheckRollup')) {
+        return Response.json({ errors: [{ type: 'FORBIDDEN', path: ['repository', 'pullRequest', 'statusCheckRollup'],
+          message: 'Resource not accessible by integration' }] });
+      }
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_legacy_app', url: 'https://github.test/acme/widgets/pull/11', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'legacy-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('legacy-app-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 11)).resolves.toMatchObject({
+      headSha: 'legacy-head', mergeStateStatus: 'UNSTABLE', checksUnavailable: true,
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[0].query).toContain('contexts(first: 50)');
+    expect(requests[1].query).toContain('statusCheckRollup');
+    expect(requests[1].query).not.toContain('contexts(first: 50)');
+    expect(requests[2].query).not.toContain('statusCheckRollup');
+  });
+
   it('enables auto-merge only for the expected head SHA', async () => {
     let request: any;
     const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
@@ -654,6 +681,7 @@ describe('GitHub-authoritative merge activity', () => {
   it('v1.16 preserves intent across repairable failures and hands durable queueing to GitHub', async () => {
     let liveHead = 'reviewed-head';
     let readiness: any = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    let denyChecks = false;
     let queueEnabled = true;
     let refUpdateMessage: string | undefined;
     const requests: Array<{ method: string; path: string; query?: string }> = [];
@@ -666,12 +694,15 @@ describe('GitHub-authoritative merge activity', () => {
         number: 31, node_id: 'PR_landing', html_url: 'https://github.test/acme/widgets/pull/31', state: 'open',
         merged: false, head: { ref: 'karmax/task_landing', sha: liveHead }, base: { ref: 'main' },
       });
-      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+        if (denyChecks && String(body.query).includes('statusCheckRollup'))
+          return Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
         return Response.json({ data: { repository: { pullRequest: {
           id: 'PR_landing', url: 'https://github.test/acme/widgets/pull/31', state: 'OPEN', isDraft: false,
           merged: false, headRefOid: liveHead, mergeable: 'MERGEABLE', viewerCanEnableAutoMerge: false,
           viewerCanMergeAsAdmin: false, ...readiness,
         } } } });
+      }
       if (url.pathname.endsWith('/reviews')) return Response.json({ id: 1 });
       if (method === 'PUT') return Response.json({ merged: false, message: 'merge queue required' }, { status: 409 });
       if (url.pathname === '/graphql' && String(body.query).includes('enqueuePullRequest')) {
@@ -789,6 +820,11 @@ describe('GitHub-authoritative merge activity', () => {
     await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
       status: 'candidate-ready', prs: [expect.objectContaining({ headSha: 'reviewed-head' })],
     });
+    denyChecks = true;
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/read access to CI.*Checks and Commit statuses.*retry automatically/is),
+    });
+    denyChecks = false;
     expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
     expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
     refUpdateMessage = 'Update is not a fast forward';
