@@ -424,7 +424,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/ci-repair', summary: 'expected green, received red',
+        detailsUrl: 'https://github.test/checks/ci-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -467,7 +467,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/intent-repair', summary: 'base interaction failed',
+        detailsUrl: 'https://github.test/checks/intent-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -540,7 +540,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/front-held', summary: 'repair me',
+        detailsUrl: 'https://github.test/checks/front-held',
       }] } },
     };
     blockFrontHeldRepair = true;

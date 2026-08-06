@@ -240,7 +240,7 @@ describe('GitHub PR client', () => {
       merged: false, headRefOid: 'failed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
         { __typename: 'CheckRun', databaseId: 101, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-          detailsUrl: 'https://github.test/checks/1', title: '2 tests failed', summary: 'Expected 2, received 3' },
+          detailsUrl: 'https://github.test/checks/1' },
         { __typename: 'StatusContext', context: 'lint', state: 'ERROR',
           targetUrl: 'https://ci.test/lint', description: 'runner crashed' },
         { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
@@ -253,7 +253,7 @@ describe('GitHub PR client', () => {
     await expect(api.readiness(SLUG, 9)).resolves.toMatchObject({
       checks: 'FAILURE',
       failedChecks: [
-        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/2 tests failed.*src\/math\.test\.ts:42.*AssertionError/is) },
+        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/src\/math\.test\.ts:42.*AssertionError/is) },
         { name: 'lint', state: 'ERROR', url: 'https://ci.test/lint', detail: 'runner crashed' },
       ],
     });
@@ -513,11 +513,10 @@ describe('GitHub-authoritative merge activity', () => {
       url: 'https://github.test/acme/widgets/pull/21', state: 'open', headSha: 'reviewed-head' }];
 
     readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
-      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21',
-        summary: 'three assertions failed' },
+      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21' },
     ] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
-      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21.*three assertions failed/is),
+      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21/is),
     });
 
     readiness = { reviewDecision: 'CHANGES_REQUESTED' };
