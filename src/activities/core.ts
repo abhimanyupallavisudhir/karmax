@@ -2435,17 +2435,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // installation instead: it has the exact repository-scoped Checks and
       // Commit-status permissions declared by the App, without lending those
       // observations the human's identity.
-      const inspectionApiFor = (slug: string): GithubPrApi => {
+      const inspectionFor = (slug: string): { api: GithubPrApi; connectionId?: string } => {
         const repository = enrolledGithubRepository(task.projectId, slug);
         const connection = repository?.gitConnectionId
           ? store.getGitConnection(repository.gitConnectionId)
           : undefined;
         return connection && typeof (deps.githubApp as any).installationToken === 'function'
-          ? new GithubPrApi(
-            () => deps.githubApp!.installationToken(connection),
-            deps.githubPr ?? {},
-          )
-          : api;
+          ? {
+            api: new GithubPrApi(
+              () => deps.githubApp!.installationToken(connection),
+              deps.githubPr ?? {},
+            ),
+            connectionId: connection.id,
+          }
+          : { api };
       };
       const settled: TaskPullRequest[] = [];
       let lastSha: string | undefined;
@@ -2551,7 +2554,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // and only genuinely transient checks/queues remain a polling wait.
         let readiness: GithubPullRequestReadiness | undefined;
         let readinessError: unknown;
-        const inspectionApi = inspectionApiFor(ref.slug);
+        const inspection = inspectionFor(ref.slug);
+        const inspectionApi = inspection.api;
         if (live.nodeId) {
           try {
             readiness = await inspectionApi.readiness(ref.slug, ref.number);
@@ -2607,6 +2611,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
         }
         if (frontHeldExact && readiness?.checksUnavailable) {
+          if (inspection.connectionId && typeof (deps.githubApp as any).invalidateInstallationToken === 'function')
+            deps.githubApp.invalidateInstallationToken(inspection.connectionId);
           const appSlug = typeof (deps.githubApp as any).status === 'function'
             ? deps.githubApp.status().appSlug
             : undefined;
