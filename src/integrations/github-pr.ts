@@ -271,7 +271,7 @@ export class GithubPrApi {
               nodes {
                 __typename
                 ... on CheckRun {
-                  databaseId name status conclusion detailsUrl title summary text
+                  databaseId name status conclusion detailsUrl
                 }
                 ... on StatusContext { context state targetUrl description }
               }
@@ -301,13 +301,10 @@ export class GithubPrApi {
       if (node?.__typename === 'CheckRun') {
         const state = String(node.conclusion ?? node.status ?? 'UNKNOWN');
         if (!['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) return [];
-        const output = [node.title, node.summary, node.text]
-          .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join('\n').slice(0, 1200);
         return [{
           name: String(node.name ?? 'GitHub check'), state,
           ...(node.databaseId ? { databaseId: Number(node.databaseId) } : {}),
           ...(node.detailsUrl ? { url: String(node.detailsUrl) } : {}),
-          ...(output ? { detail: output } : {}),
         }];
       }
       if (node?.__typename === 'StatusContext') {
@@ -321,11 +318,11 @@ export class GithubPrApi {
       }
       return [];
     }) as Array<GithubFailedCheck & { databaseId?: number }>;
-    // CheckRun exposes title/summary/text directly (there is no nested `output`
-    // field). Annotations additionally carry the file, line, and
-    // assertion/compiler message the Do agent can act on. They are best-effort
-    // because third-party status contexts and restricted Apps may expose only
-    // the details URL.
+    // Optional CheckRun summary/text fields require GitHub App Checks permission;
+    // asking for them makes the entire readiness query fail for an otherwise
+    // authorized user token. Fetch annotations separately as best-effort
+    // enrichment: third-party contexts and restricted Apps retain the check name,
+    // state and details URL even when that REST call is forbidden.
     for (const check of failedCheckCandidates) {
       if (!check.databaseId) continue;
       const annotations = await this.request<any[]>(
