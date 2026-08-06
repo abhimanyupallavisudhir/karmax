@@ -25,7 +25,7 @@ import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { RemoteAccessController, remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
-import { registerAppInstance } from './util/instance.js';
+import { duplicateInstanceMessage, registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
@@ -88,19 +88,15 @@ async function main() {
   console.log('\n  krmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
   if (envFile) console.log(`  • Operator settings from ${envFile}`);
 
-  // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
-  // running against one KARMAX_HOME — each with its own worker fanning out agent
-  // turns, multiplying RAM pressure for no gain (one app serves the whole list).
-  // Advisory, not a lock: a fast Ctrl-C→restart is intentional, so we warn loudly
-  // and let the operator decide rather than refusing to boot.
+  // Duplicate app-instance guard (karmax#4): more than one worker against the
+  // same Temporal queue is a correctness bug, not just excess RAM. A duplicate
+  // can claim an activity and disappear or run it under divergent code while the
+  // UI is served by another process. Graceful restart releases before spawning
+  // its successor, so refusing a genuinely live duplicate is safe.
   const instance = registerAppInstance();
   if (instance.others.length) {
-    console.warn(
-      `\n  ⚠  ${instance.others.length} other krmax app instance(s) already running against ${p.home}` +
-        ` (pids ${instance.others.join(', ')}).\n` +
-        `     Each runs its own worker + agent fan-out and competes for the same RAM —\n` +
-        `     the exact condition behind the July-5 OOM (karmax#4). Stop the extras unless this is deliberate.\n`,
-    );
+    instance.release();
+    throw new Error(duplicateInstanceMessage(p.home, instance.others));
   }
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
   // One long-lived server, reused across restarts/reloads (see dev-server.ts):
