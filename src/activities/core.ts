@@ -2430,6 +2430,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       const accountId = accountFor(actorUserId);
       const api = prApiForUser(actorUserId, accountId);
+      // PR authorship, approval and landing remain attributable to the selected
+      // human. Read-only policy/CI inspection belongs to the repository
+      // installation instead: it has the exact repository-scoped Checks and
+      // Commit-status permissions declared by the App, without lending those
+      // observations the human's identity.
+      const inspectionApiFor = (slug: string): GithubPrApi => {
+        const repository = enrolledGithubRepository(task.projectId, slug);
+        const connection = repository?.gitConnectionId
+          ? store.getGitConnection(repository.gitConnectionId)
+          : undefined;
+        return connection && typeof (deps.githubApp as any).installationToken === 'function'
+          ? new GithubPrApi(
+            () => deps.githubApp!.installationToken(connection),
+            deps.githubPr ?? {},
+          )
+          : api;
+      };
       const settled: TaskPullRequest[] = [];
       let lastSha: string | undefined;
       let queued = false;
@@ -2534,9 +2551,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // and only genuinely transient checks/queues remain a polling wait.
         let readiness: GithubPullRequestReadiness | undefined;
         let readinessError: unknown;
+        const inspectionApi = inspectionApiFor(ref.slug);
         if (live.nodeId) {
           try {
-            readiness = await api.readiness(ref.slug, ref.number);
+            readiness = await inspectionApi.readiness(ref.slug, ref.number);
           } catch (error) {
             // Readiness enriches the decision, but a head-bound REST landing
             // may still succeed when GraphQL is degraded or incomplete.
@@ -2588,6 +2606,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             eligibleUserIds: [actorUserId],
           };
         }
+        if (frontHeldExact && readiness?.checksUnavailable) {
+          const appSlug = typeof (deps.githubApp as any).status === 'function'
+            ? deps.githubApp.status().appSlug
+            : undefined;
+          return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: `GitHub has not granted krmax read access to CI for ${ref.slug}#${ref.number}. `
+              + 'Grant the GitHub App read-only Checks and Commit statuses permissions, then approve the updated installation permissions; '
+              + `this task will retain the front landing slot and retry automatically.${appSlug
+                ? ` App settings: https://github.com/settings/apps/${appSlug}/permissions`
+                : ''}`,
+          };
+        }
         if (!frontHeldExact && intentAuthorizedLanding && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
           const entryIds = readiness.mergeQueueEntryId ? [readiness.mergeQueueEntryId] : [];
           return {
@@ -2634,7 +2665,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // is, this is a real external-human wait rather than an opaque merge poll.
         if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
           try {
-            readiness = await api.readiness(ref.slug, ref.number);
+            readiness = await inspectionApi.readiness(ref.slug, ref.number);
           } catch (error) {
             return errorDecision(error, current);
           }
