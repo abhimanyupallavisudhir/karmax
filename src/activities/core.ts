@@ -1351,6 +1351,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
       }
+      // A remote world cannot inherit the host CLI's ambient subscription by
+      // process environment: the adapter has to seed that home into the remote
+      // sandbox. Normally the account coordinator supplies it. Keep passthrough
+      // correct too, both for installations with no coordinator and for recovery
+      // histories that already recorded a transient pool-size probe as zero.
+      // API keys still win and hosted tenants must never inherit operator auth.
+      if (!resolvedAuth && organizationId === 'org_personal' && isRemote(args.worldHandle.kind)) {
+        const envKey = profile.provider === 'claude' ? process.env.ANTHROPIC_API_KEY
+          : profile.provider === 'codex' ? process.env.OPENAI_API_KEY
+          : undefined;
+        const ambientHome = profile.provider === 'claude'
+          ? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude')
+          : profile.provider === 'codex'
+            ? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')
+            : undefined;
+        if (!envKey && ambientHome) {
+          const authPresent = profile.provider === 'codex'
+            ? fs.existsSync(path.join(ambientHome, 'auth.json'))
+            : fs.existsSync(path.join(ambientHome, '.credentials.json'))
+              || fs.existsSync(path.join(path.dirname(ambientHome), '.credentials.json'));
+          if (authPresent) {
+            const tok = tokenToInject(ambientHome);
+            resolvedAuth = { configHome: ambientHome, ...(tok ? { oauthToken: tok } : {}) };
+          }
+        }
+      }
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
