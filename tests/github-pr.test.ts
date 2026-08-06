@@ -259,6 +259,30 @@ describe('GitHub PR client', () => {
     });
   });
 
+  it('falls back to aggregate check state when the App cannot enumerate CheckRuns', async () => {
+    const requests: any[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const request = JSON.parse(String(init.body));
+      requests.push(request);
+      if (request.query.includes('contexts(first: 50)')) {
+        return Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
+      }
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_limited', url: 'https://github.test/acme/widgets/pull/10', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'limited-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        statusCheckRollup: { state: 'FAILURE' }, viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('limited-app-user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 10)).resolves.toMatchObject({
+      headSha: 'limited-head', checks: 'FAILURE',
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[0].query).toContain('contexts(first: 50)');
+    expect(requests[1].query).not.toContain('contexts(first: 50)');
+  });
+
   it('enables auto-merge only for the expected head SHA', async () => {
     let request: any;
     const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
