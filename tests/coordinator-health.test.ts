@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { WorkflowNotFoundError } from '@temporalio/client';
 import { healCoordinators } from '../src/platform/coordinator-health.js';
 import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { SIG_ENQUEUE, mergeQueueId } from '../src/coordinators/names.js';
@@ -235,5 +236,24 @@ describe('the merge wait repopulates a rebuilt queue', () => {
     expect(await make({ queue: ['task_me'], current: 'x' }).mergeQueuePosition(DOMAIN, 'task_me'))
       .toMatchObject({ position: 1, total: 2 });
     expect(signals).toEqual([]);
+  });
+});
+
+describe('account-pool discovery', () => {
+  const activity = (query: () => Promise<unknown>) => makeCoordinatorActivities({
+    client: { workflow: { getHandle: () => ({ query }) } } as never,
+    taskQueue: 'karmax',
+  });
+
+  it('returns zero only when the optional coordinator does not exist', async () => {
+    await expect(activity(async () => {
+      throw new WorkflowNotFoundError('missing', 'account-coordinator', undefined);
+    }).accountPoolSize()).resolves.toBe(0);
+  });
+
+  it('rethrows transient query failures so Temporal retries instead of bypassing credentials', async () => {
+    await expect(activity(async () => {
+      throw new Error('query task expired during worker replay');
+    }).accountPoolSize()).rejects.toThrow('query task expired');
   });
 });
