@@ -167,6 +167,9 @@ export class GitHubAppService {
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
+  /** Bounds refreshes while an installation owner is still approving a newly
+   * requested permission; without this, every landing poll would mint a token. */
+  private tokenInvalidatedAt = new Map<string, number>();
 
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
     this.options = {
@@ -582,6 +585,18 @@ export class GitHubAppService {
     })().finally(() => this.tokenMints.delete(connection.id));
     this.tokenMints.set(connection.id, mint);
     return mint;
+  }
+
+  /** Drop a token minted before an installation-permission upgrade. Calls are
+   * deliberately rate-limited: a held landing task polls while the human is on
+   * GitHub's approval screen, and token minting must not follow that poll rate. */
+  invalidateInstallationToken(connectionId: string, cooldownMs = 60_000): boolean {
+    const now = Date.now();
+    const last = this.tokenInvalidatedAt.get(connectionId) ?? 0;
+    if (now - last < cooldownMs) return false;
+    this.tokenInvalidatedAt.set(connectionId, now);
+    this.tokenCache.delete(connectionId);
+    return true;
   }
 
   async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {
