@@ -226,6 +226,7 @@ describe('GitHub PR client', () => {
     expect(request.query).toContain('mergeStateStatus');
     expect(request.query).toContain('statusCheckRollup');
     expect(request.query).toContain('contexts(first: 50)');
+    expect(request.query).not.toContain('output {');
   });
 
   it('extracts actionable details from failed check runs and legacy statuses', async () => {
@@ -239,7 +240,7 @@ describe('GitHub PR client', () => {
       merged: false, headRefOid: 'failed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
         { __typename: 'CheckRun', databaseId: 101, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-          detailsUrl: 'https://github.test/checks/1', output: { title: '2 tests failed', summary: 'Expected 2, received 3' } },
+          detailsUrl: 'https://github.test/checks/1' },
         { __typename: 'StatusContext', context: 'lint', state: 'ERROR',
           targetUrl: 'https://ci.test/lint', description: 'runner crashed' },
         { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
@@ -252,10 +253,61 @@ describe('GitHub PR client', () => {
     await expect(api.readiness(SLUG, 9)).resolves.toMatchObject({
       checks: 'FAILURE',
       failedChecks: [
-        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/2 tests failed.*src\/math\.test\.ts:42.*AssertionError/is) },
+        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/src\/math\.test\.ts:42.*AssertionError/is) },
         { name: 'lint', state: 'ERROR', url: 'https://ci.test/lint', detail: 'runner crashed' },
       ],
     });
+  });
+
+  it('falls back to aggregate check state when the App cannot enumerate CheckRuns', async () => {
+    const requests: any[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const request = JSON.parse(String(init.body));
+      requests.push(request);
+      if (request.query.includes('contexts(first: 50)')) {
+        return Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
+      }
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_limited', url: 'https://github.test/acme/widgets/pull/10', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'limited-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        statusCheckRollup: { state: 'FAILURE' }, viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('limited-app-user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 10)).resolves.toMatchObject({
+      headSha: 'limited-head', checks: 'FAILURE',
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[0].query).toContain('contexts(first: 50)');
+    expect(requests[1].query).not.toContain('contexts(first: 50)');
+  });
+
+  it('fails closed on policy state when an older App cannot read any CI rollup', async () => {
+    const requests: any[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const request = JSON.parse(String(init.body));
+      requests.push(request);
+      if (request.query.includes('statusCheckRollup')) {
+        return Response.json({ errors: [{ type: 'FORBIDDEN', path: ['repository', 'pullRequest', 'statusCheckRollup'],
+          message: 'Resource not accessible by integration' }] });
+      }
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_legacy_app', url: 'https://github.test/acme/widgets/pull/11', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'legacy-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('legacy-app-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 11)).resolves.toMatchObject({
+      headSha: 'legacy-head', mergeStateStatus: 'UNSTABLE', checksUnavailable: true,
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[0].query).toContain('contexts(first: 50)');
+    expect(requests[1].query).toContain('statusCheckRollup');
+    expect(requests[1].query).not.toContain('contexts(first: 50)');
+    expect(requests[2].query).not.toContain('statusCheckRollup');
   });
 
   it('enables auto-merge only for the expected head SHA', async () => {
@@ -512,11 +564,10 @@ describe('GitHub-authoritative merge activity', () => {
       url: 'https://github.test/acme/widgets/pull/21', state: 'open', headSha: 'reviewed-head' }];
 
     readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
-      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21',
-        output: { summary: 'three assertions failed' } },
+      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21' },
     ] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
-      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21.*three assertions failed/is),
+      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21/is),
     });
 
     readiness = { reviewDecision: 'CHANGES_REQUESTED' };
@@ -630,6 +681,7 @@ describe('GitHub-authoritative merge activity', () => {
   it('v1.16 preserves intent across repairable failures and hands durable queueing to GitHub', async () => {
     let liveHead = 'reviewed-head';
     let readiness: any = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    let denyChecks = false;
     let queueEnabled = true;
     let refUpdateMessage: string | undefined;
     const requests: Array<{ method: string; path: string; query?: string }> = [];
@@ -642,12 +694,15 @@ describe('GitHub-authoritative merge activity', () => {
         number: 31, node_id: 'PR_landing', html_url: 'https://github.test/acme/widgets/pull/31', state: 'open',
         merged: false, head: { ref: 'karmax/task_landing', sha: liveHead }, base: { ref: 'main' },
       });
-      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+        if (denyChecks && String(body.query).includes('statusCheckRollup'))
+          return Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
         return Response.json({ data: { repository: { pullRequest: {
           id: 'PR_landing', url: 'https://github.test/acme/widgets/pull/31', state: 'OPEN', isDraft: false,
           merged: false, headRefOid: liveHead, mergeable: 'MERGEABLE', viewerCanEnableAutoMerge: false,
           viewerCanMergeAsAdmin: false, ...readiness,
         } } } });
+      }
       if (url.pathname.endsWith('/reviews')) return Response.json({ id: 1 });
       if (method === 'PUT') return Response.json({ merged: false, message: 'merge queue required' }, { status: 409 });
       if (url.pathname === '/graphql' && String(body.query).includes('enqueuePullRequest')) {
@@ -762,9 +817,23 @@ describe('GitHub-authoritative merge activity', () => {
     const handle17 = { ...handle, id: task17.id };
     const enqueueBefore = requests.filter((request) => request.query?.includes('enqueuePullRequest')).length;
     const patchBefore = requests.filter((request) => request.method === 'PATCH').length;
+    readiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/still computing mergeability.*retains the front landing slot.*retry automatically/is),
+    });
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
+    expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
       status: 'candidate-ready', prs: [expect.objectContaining({ headSha: 'reviewed-head' })],
     });
+    denyChecks = true;
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/read access to CI.*Checks and Commit statuses.*retry automatically/is),
+    });
+    denyChecks = false;
     expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
     expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
     refUpdateMessage = 'Update is not a fast forward';

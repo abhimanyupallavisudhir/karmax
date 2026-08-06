@@ -1351,6 +1351,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
       }
+      // A remote world cannot inherit the host CLI's ambient subscription by
+      // process environment: the adapter has to seed that home into the remote
+      // sandbox. Normally the account coordinator supplies it. Keep passthrough
+      // correct too, both for installations with no coordinator and for recovery
+      // histories that already recorded a transient pool-size probe as zero.
+      // API keys still win and hosted tenants must never inherit operator auth.
+      if (!resolvedAuth && organizationId === 'org_personal' && isRemote(args.worldHandle.kind)) {
+        const envKey = profile.provider === 'claude' ? process.env.ANTHROPIC_API_KEY
+          : profile.provider === 'codex' ? process.env.OPENAI_API_KEY
+          : undefined;
+        const ambientHome = profile.provider === 'claude'
+          ? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude')
+          : profile.provider === 'codex'
+            ? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')
+            : undefined;
+        if (!envKey && ambientHome) {
+          const authPresent = profile.provider === 'codex'
+            ? fs.existsSync(path.join(ambientHome, 'auth.json'))
+            : fs.existsSync(path.join(ambientHome, '.credentials.json'))
+              || fs.existsSync(path.join(path.dirname(ambientHome), '.credentials.json'));
+          if (authPresent) {
+            const tok = tokenToInject(ambientHome);
+            resolvedAuth = { configHome: ambientHome, ...(tok ? { oauthToken: tok } : {}) };
+          }
+        }
+      }
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
@@ -2231,6 +2257,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
       const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
       try {
+        if (store.getTask(handle.id)?.lastView?.status === 'cancelled')
+          await deps.resources?.discardTaskCandidates(handle.id, 'system:task-cancel');
         await deps.resources?.release(current);
         const world = await worlds.open(handle);
         await world.destroy();
@@ -2246,6 +2274,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await destroyWorldServices(handle.id).catch(() => undefined);
         if (leaseId) deps.runners?.release(leaseId, current.kind);
       }
+    },
+
+    async pendingResourceCandidates(taskId: string): Promise<number> {
+      return store.listResourceCandidates(taskId).filter((candidate) =>
+        candidate.state === 'pending' || candidate.state === 'discarding').length;
     },
 
     /**
@@ -2430,6 +2463,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       const accountId = accountFor(actorUserId);
       const api = prApiForUser(actorUserId, accountId);
+      // PR authorship, approval and landing remain attributable to the selected
+      // human. Read-only policy/CI inspection belongs to the repository
+      // installation instead: it has the exact repository-scoped Checks and
+      // Commit-status permissions declared by the App, without lending those
+      // observations the human's identity.
+      const inspectionFor = (slug: string): { api: GithubPrApi; connectionId?: string } => {
+        const repository = enrolledGithubRepository(task.projectId, slug);
+        const connection = repository?.gitConnectionId
+          ? store.getGitConnection(repository.gitConnectionId)
+          : undefined;
+        return connection && typeof (deps.githubApp as any).installationToken === 'function'
+          ? {
+            api: new GithubPrApi(
+              () => deps.githubApp!.installationToken(connection),
+              deps.githubPr ?? {},
+            ),
+            connectionId: connection.id,
+          }
+          : { api };
+      };
       const settled: TaskPullRequest[] = [];
       let lastSha: string | undefined;
       let queued = false;
@@ -2534,9 +2587,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // and only genuinely transient checks/queues remain a polling wait.
         let readiness: GithubPullRequestReadiness | undefined;
         let readinessError: unknown;
+        const inspection = inspectionFor(ref.slug);
+        const inspectionApi = inspection.api;
         if (live.nodeId) {
           try {
-            readiness = await api.readiness(ref.slug, ref.number);
+            readiness = await inspectionApi.readiness(ref.slug, ref.number);
           } catch (error) {
             // Readiness enriches the decision, but a head-bound REST landing
             // may still succeed when GraphQL is degraded or incomplete.
@@ -2588,6 +2643,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             eligibleUserIds: [actorUserId],
           };
         }
+        if (frontHeldExact && readiness?.checksUnavailable) {
+          if (inspection.connectionId && typeof (deps.githubApp as any).invalidateInstallationToken === 'function')
+            deps.githubApp.invalidateInstallationToken(inspection.connectionId);
+          const appSlug = typeof (deps.githubApp as any).status === 'function'
+            ? deps.githubApp.status().appSlug
+            : undefined;
+          return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: `GitHub has not granted krmax read access to CI for ${ref.slug}#${ref.number}. `
+              + 'Grant the GitHub App read-only Checks and Commit statuses permissions, then approve the updated installation permissions; '
+              + `this task will retain the front landing slot and retry automatically.${appSlug
+                ? ` App settings: https://github.com/settings/apps/${appSlug}/permissions`
+                : ''}`,
+          };
+        }
         if (!frontHeldExact && intentAuthorizedLanding && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
           const entryIds = readiness.mergeQueueEntryId ? [readiness.mergeQueueEntryId] : [];
           return {
@@ -2634,7 +2704,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // is, this is a real external-human wait rather than an opaque merge poll.
         if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
           try {
-            readiness = await api.readiness(ref.slug, ref.number);
+            readiness = await inspectionApi.readiness(ref.slug, ref.number);
           } catch (error) {
             return errorDecision(error, current);
           }
@@ -2678,6 +2748,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return {
               status: 'waiting', prs: current, actorUserId,
               detail: 'Waiting for CI on the exact pull-request head while this task retains the front landing slot.',
+            };
+          }
+          // GitHub commonly reports UNKNOWN for a short window while it
+          // recomputes mergeability after the target moves. That is neither a
+          // repository-policy decision nor grounds to eject the task: keep the
+          // authoritative front slot and poll until GitHub has a real answer.
+          if (readiness.mergeable === 'UNKNOWN' || readiness.mergeStateStatus === 'UNKNOWN') {
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: `GitHub is still computing mergeability for ${ref.slug}#${ref.number}; this task retains the front landing slot and will retry automatically.`,
             };
           }
           if (readiness.mergeStateStatus !== 'CLEAN') {

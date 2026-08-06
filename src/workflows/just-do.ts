@@ -15,6 +15,7 @@ import { confirmLayersOf } from '../domain/confirm.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
+import { SIG } from './names.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 // Agent turns heartbeat every ~1s; a 2-minute gap = dead/slept worker → Temporal
@@ -45,6 +46,7 @@ const boundedCoord = proxyActivities<coordinatorActivities>({
 export const followUpSignal = defineSignal<[Message]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
+export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const viewQuery = defineQuery<TaskView>('view');
@@ -75,6 +77,11 @@ export async function justDoV1_4(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true, true, true, true, true);
 }
 
+/** Review-gated adoption of task-created durable project resources. */
+export async function justDoV1_5(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
@@ -90,6 +97,7 @@ async function justDoImpl(
   // Review gate opened recorded that gate returning instantly, so clearing the token
   // on replay would park where history says it proceeded. Pinned to justDo@1.4.0.
   clearsConfirmOnGate = false,
+  resourceCandidateReview = false,
 ): Promise<{ stage: Stage }> {
   const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const coordinator = boundedCoordinatorRetries ? boundedCoord : coord;
@@ -101,6 +109,8 @@ async function justDoImpl(
     : [];
   let confirmed = false;
   let cancelled = false;
+  let resourceResolutionEpoch = 0;
+  let awaitingResourceDecision = false;
   let world: WorldHandleLike | undefined;
   let session: string | undefined;
   let reviewInfo: ReviewInfo | undefined;
@@ -121,7 +131,7 @@ async function justDoImpl(
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true };
     const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: 'Done', enabled: true };
-    if (stage === 'review') return [confirm, followUp, cancel];
+    if (stage === 'review') return [...(awaitingResourceDecision ? [] : [confirm]), followUp, cancel];
     if (stage === 'do' || stage === 'setup') return [followUp, cancel];
     return [];
   }
@@ -206,7 +216,11 @@ async function justDoImpl(
     if (!msgs.some((candidate) => candidate.id === message.id))
       msgs.push({ ...message, ts: message.ts || msgs.length });
   });
+  setHandler(resourceResolvedSignal, () => {
+    resourceResolutionEpoch++;
+  });
   setHandler(confirmSignal, () => {
+    if (awaitingResourceDecision) return;
     confirmed = true;
   });
   setHandler(cancelSignal, () => {
@@ -286,6 +300,29 @@ async function justDoImpl(
     // Play the confirm layers in order (SPEC §5.2): every layer must approve; a
     // revise/follow-up returns to Do and the next Review replays from the first.
     let backToDo = false;
+    if (resourceCandidateReview) {
+      let resolutionAtWait = resourceResolutionEpoch;
+      let pending = await core.pendingResourceCandidates(taskId);
+      while (pending && !cancelled && msgs.length === seen) {
+        if (resourceResolutionEpoch !== resolutionAtWait) {
+          resolutionAtWait = resourceResolutionEpoch;
+          pending = await core.pendingResourceCandidates(taskId);
+          continue;
+        }
+        awaitingResourceDecision = true;
+        waitingFor = { kind: 'human', audience: ['@creator'],
+          detail: `${pending} staged project resource candidate${pending === 1 ? '' : 's'} must be Adopted or Discarded before this proposal can continue.` };
+        await publish();
+        await condition(() => cancelled || msgs.length > seen
+          || resourceResolutionEpoch !== resolutionAtWait);
+        if (cancelled || msgs.length > seen) break;
+        resolutionAtWait = resourceResolutionEpoch;
+        pending = await core.pendingResourceCandidates(taskId);
+      }
+      awaitingResourceDecision = false;
+      waitingFor = undefined;
+      if (msgs.length > seen) backToDo = true;
+    }
     for (let li = 0; li < confirmLayers.length && !backToDo && !cancelled; li++) {
       const layer = confirmLayers[li]!;
       if (layer.kind === 'agent') {

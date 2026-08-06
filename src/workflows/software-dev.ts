@@ -45,7 +45,7 @@ import {
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
-import { SIG_AGENT_TURN_STATE } from './names.js';
+import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -99,6 +99,7 @@ const boundedCoord = proxyActivities<coordinatorActivities>({
 export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
+export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
 export const confirmSignal = defineSignal('confirm');
 /** Explicit transition from Do/waiting-for-input into PR preparation. */
 export const openPrSignal = defineSignal('openPr');
@@ -347,13 +348,18 @@ export async function softwareDevV1_18(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.18.0');
 }
 
+/** Review-gated adoption of task-created durable project resources. */
+export async function softwareDevV1_19(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.19.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -407,6 +413,7 @@ async function softwareDevImpl(
   behaviorVersion: BehaviorVersion,
 ): Promise<{ stage: Stage; sha?: string }> {
   const minor = behaviorMinor(behaviorVersion);
+  const resourceCandidateReview = minor >= 19;
   const liveAgentStates = behaviorVersion !== '1.0.0';
   const providerTerminalCompletion = minor >= 2;
   const modeSwitching = minor >= 3;
@@ -492,6 +499,8 @@ async function softwareDevImpl(
   let checkoutHeads: Record<string, string> = {};
   let cancelled = false;
   let retryRequested = false;
+  let resourceResolutionEpoch = 0;
+  let awaitingResourceDecision = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
@@ -754,7 +763,7 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive) {
       return [
         ...(explicitPrCycle && stage === 'do' ? [openPr] : []),
-        ...(stage === 'review' ? [confirm] : []),
+        ...(stage === 'review' && !awaitingResourceDecision ? [confirm] : []),
         ...(pausedRole ? [followUp] : []),
         ...(stage === 'do' || stage === 'review' ? [setTarget] : []),
         cancel,
@@ -767,7 +776,7 @@ async function softwareDevImpl(
       case 'do':
         return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp, setTarget, cancel];
       case 'review':
-        return [confirm, followUp, setTarget, cancel];
+        return [...(awaitingResourceDecision ? [] : [confirm]), followUp, setTarget, cancel];
       case 'pr':
         return [cancel];
       case 'merge':
@@ -927,7 +936,11 @@ async function softwareDevImpl(
     if (!msgs.some((candidate) => candidate.id === message.id))
       msgs.push({ ...message, ts: message.ts || msgs.length });
   });
+  setHandler(resourceResolvedSignal, () => {
+    resourceResolutionEpoch++;
+  });
   setHandler(confirmSignal, () => {
+    if (awaitingResourceDecision) return;
     confirmed = true;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
@@ -1994,9 +2007,17 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
 
   let sha: string | undefined;
+  // A recovery checkpoint may enter directly at PR/Landing, skipping completed
+  // Do work exactly once. If that recovered candidate later needs a repair, the
+  // loop must stop honoring the original entry point and actually run Do.
+  // Otherwise every `continue proposalCycle` silently resubmits the unchanged
+  // stale head and exact-candidate verification repeats forever.
+  let recoveredLandingNeedsDo = false;
   proposalCycle: for (;;) {
   // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
-  if (!restoredReviewApproved && recoveryStage !== 'pr' && recoveryStage !== 'merge') {
+  if (!restoredReviewApproved
+    && (recoveredLandingNeedsDo || (recoveryStage !== 'pr' && recoveryStage !== 'merge'))) {
+  recoveredLandingNeedsDo = false;
   for (;;) {
     // Each iteration starts fresh in Do — clears any park state left by a prior
     // sub-task wait (status 'waiting'/waitingFor 'subtask').
@@ -2214,6 +2235,19 @@ Inspect the complete current diff and specifically compare its delta from the re
         const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
+      // At the front of the landing queue, returning to Do is an automated
+      // repair cycle, not a new proposal decision. The human already authorized
+      // the intent, and the repaired head still has to pass proposal validation,
+      // CI, and exact-candidate Do verification below. A successful Do turn must
+      // therefore resubmit the existing PR even if the model forgot the open_pr
+      // tool after saying it had finished; parking on the ordinary human Open PR
+      // gate here leaks the front queue lease and blocks every later merge.
+      const autoSubmitFrontHeldRepair = frontHeldLanding
+        && repairValidationPending
+        && turnFinished
+        && !turn.raise
+        && patched('software-dev-front-held-repair-auto-pr-v1');
+      if (autoSubmitFrontHeldRepair) prRequested = true;
       if (explicitPrCycle) {
         // Ending a Do turn is not a shipping decision. Unless the agent called
         // open_pr, park in Do for ordinary input; a follow-up resumes the same
@@ -2387,6 +2421,38 @@ Inspect the complete current diff and specifically compare its delta from the re
       // that predate the gate are deliberately dropped; the confirmer is re-shown
       // the gate and can click again.
       if (clearsConfirmOnGate) confirmed = false;
+      const waitForResourceDecisions = async (): Promise<boolean> => {
+        let resolutionAtWait = resourceResolutionEpoch;
+        let pending = await core.pendingResourceCandidates(taskId);
+        if (!pending) return false;
+        const messagesAtWait = msgs.length;
+        while (pending && !cancelled && msgs.length === messagesAtWait) {
+          // A decision can land after the activity read the store but before its
+          // completion resumes us. Re-read instead of parking on a signal whose
+          // epoch already changed.
+          if (resourceResolutionEpoch !== resolutionAtWait) {
+            resolutionAtWait = resourceResolutionEpoch;
+            pending = await core.pendingResourceCandidates(taskId);
+            continue;
+          }
+          awaitingResourceDecision = true;
+          waitingFor = { kind: 'human', audience: ['@creator'],
+            detail: `${pending} staged project resource candidate${pending === 1 ? '' : 's'} must be Adopted or Discarded before this proposal can continue.` };
+          await publish();
+          await condition(() => cancelled || msgs.length > messagesAtWait
+            || resourceResolutionEpoch !== resolutionAtWait);
+          if (cancelled || msgs.length > messagesAtWait) break;
+          resolutionAtWait = resourceResolutionEpoch;
+          pending = await core.pendingResourceCandidates(taskId);
+        }
+        awaitingResourceDecision = false;
+        waitingFor = undefined;
+        return msgs.length > messagesAtWait;
+      };
+      if (resourceCandidateReview && await waitForResourceDecisions()) {
+        stage = 'do'; status = 'active'; continue proposalCycle;
+      }
+      if (cancelled) return await abort();
       // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
       // task plays its confirm layers in order (each a human click or a Confirm agent).
       if (input.parentTaskId) {
@@ -2876,6 +2942,12 @@ Inspect the complete current diff and specifically compare its delta from the re
         stage = 'do';
         status = 'active';
         githubErrorPolls = 0;
+        // Patch at the repair decision's live edge. Historical recovered runs
+        // preserve their recorded first loop-back; the next live rejection can
+        // adopt the fix and enter Do without replacing the execution again.
+        if ((recoveryStage === 'pr' || recoveryStage === 'merge')
+          && patched('software-dev-recovered-landing-repair-do-v1'))
+          recoveredLandingNeedsDo = true;
         continue proposalCycle;
       }
       if (intentAuthorizedLanding && decision.status === 'queued') {

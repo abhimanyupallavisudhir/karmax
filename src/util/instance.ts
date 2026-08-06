@@ -9,11 +9,11 @@ import { paths } from '../config/paths.js';
  * with no benefit: one app already serves the whole todo list. Nothing enforced
  * "one app per home", so nothing warned.
  *
- * This is advisory, not a hard lock: karmax deliberately supports a fast restart
- * (Ctrl-C then re-run) and the shared Temporal server is reused across boots — a
- * hard singleton lock would fight that. So we keep a directory of live-instance
- * pidfiles under the state dir and log a LOUD warning when another live app is
- * already registered against the same home; the operator decides.
+ * Admission is exclusive. Two workers polling the same Temporal queue can load
+ * different workflow/activity code, steal each other's activities, duplicate
+ * agent fan-out, and make a task appear permanently stuck. Graceful restart
+ * releases its registration before spawning the successor, so exclusivity does
+ * not interfere with the supported fast-restart path.
  */
 
 /** Default liveness probe: signal 0 tests existence without delivering a signal.
@@ -83,6 +83,11 @@ export interface InstanceRegistration {
   others: number[];
   /** Remove this instance's pidfile. Idempotent; wire into shutdown. */
   release: () => void;
+}
+
+export function duplicateInstanceMessage(home: string, others: number[]): string {
+  return `another krmax app instance is already running against ${home} (pid${others.length === 1 ? '' : 's'} ${others.join(', ')}). `
+    + 'Stop that instance before starting another; concurrent workers can steal activities and corrupt workflow coherence.';
 }
 
 /**

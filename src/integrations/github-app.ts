@@ -167,6 +167,9 @@ export class GitHubAppService {
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
+  /** Bounds refreshes while an installation owner is still approving a newly
+   * requested permission; without this, every landing poll would mint a token. */
+  private tokenInvalidatedAt = new Map<string, number>();
 
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
     this.options = {
@@ -181,6 +184,15 @@ export class GitHubAppService {
 
   configured(): boolean {
     return Boolean(this.options.appId?.trim() && this.broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE));
+  }
+
+  /** OAuth client owned by this deployment's App. Kept behind the service so
+   * callers do not need to know the vault handle or durable metadata keys. */
+  oauthCredentials(): { clientId: string; clientSecret: string } | undefined {
+    const clientId = this.options.clientId?.trim();
+    if (!clientId || !this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)) return undefined;
+    return { clientId, clientSecret: this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
+      { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] }) };
   }
 
   status(userId?: string): { configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
@@ -242,8 +254,17 @@ export class GitHubAppService {
       redirect_url: `${origin}/api/github/manifest/callback/${encodeURIComponent(state)}`,
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
-      callback_urls: [`${origin}/api/github/oauth/callback`],
-      default_permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+      callback_urls: [`${origin}/api/github/oauth/callback`, `${origin}/api/auth/callback/github`],
+      // Landing certifies the exact PR head only after GitHub's combined check
+      // rollup is successful. `checks` covers CheckRun contexts (including
+      // Actions); `statuses` covers legacy commit-status contexts. Both are
+      // read-only and are required to distinguish pending CI from failed CI.
+      // Better Auth also reads the user's verified email addresses when linking
+      // a GitHub sign-in to an existing Karmax account.
+      default_permissions: {
+        checks: 'read', contents: 'write', email_addresses: 'read', metadata: 'read',
+        pull_requests: 'write', statuses: 'read',
+      },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
     // cannot reach them. Local Karmax instances reconcile installations on
@@ -297,13 +318,38 @@ export class GitHubAppService {
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
     this.saveUserToken(userId, identity.id, value);
+    this.saveUserIdentity(userId, identity, options.makeActive);
+    return identity;
+  }
+
+  /** Reuse the user access token Better Auth just received while signing in.
+   * This links identity and development authorship without a second OAuth flow. */
+  async adoptUserAuthorization(userId: string, expectedAccountId: string, authorization: {
+    accessToken: string;
+    refreshToken?: string;
+    accessTokenExpiresAt?: Date;
+    refreshTokenExpiresAt?: Date;
+  }): Promise<GitHubUserIdentity> {
+    const identity = await this.identityForToken(authorization.accessToken);
+    if (identity.id !== expectedAccountId)
+      throw new Error(`GitHub signed in as @${identity.login}, but returned a mismatched account id`);
+    this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
+      accessToken: authorization.accessToken,
+      ...(authorization.accessTokenExpiresAt ? { expiresAt: authorization.accessTokenExpiresAt.getTime() } : {}),
+      ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
+      ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
+    }));
+    this.saveUserIdentity(userId, identity, false);
+    return identity;
+  }
+
+  private saveUserIdentity(userId: string, identity: GitHubUserIdentity, makeActive = false): void {
     const accounts = this.userAccounts(userId);
     const prior = accounts.find((account) => account.id === identity.id);
     const next = [...accounts.filter((account) => account.id !== identity.id), { ...prior, ...identity }];
     this.saveUserAccounts(userId, next);
-    if (options.makeActive || !this.activeUserAccountId(userId))
+    if (makeActive || !this.activeUserAccountId(userId))
       this.store.kvSet(githubUserActiveAccountKey(userId), identity.id);
-    return identity;
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply
@@ -576,6 +622,18 @@ export class GitHubAppService {
     })().finally(() => this.tokenMints.delete(connection.id));
     this.tokenMints.set(connection.id, mint);
     return mint;
+  }
+
+  /** Drop a token minted before an installation-permission upgrade. Calls are
+   * deliberately rate-limited: a held landing task polls while the human is on
+   * GitHub's approval screen, and token minting must not follow that poll rate. */
+  invalidateInstallationToken(connectionId: string, cooldownMs = 60_000): boolean {
+    const now = Date.now();
+    const last = this.tokenInvalidatedAt.get(connectionId) ?? 0;
+    if (now - last < cooldownMs) return false;
+    this.tokenInvalidatedAt.set(connectionId, now);
+    this.tokenCache.delete(connectionId);
+    return true;
   }
 
   async brokerCredentials(repository: Repository): Promise<{ httpsToken: string; env: Record<string, string> }> {

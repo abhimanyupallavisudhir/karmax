@@ -49,7 +49,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action',
         'escalate_to_human', 'request_permission',
-        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'describe_platform', 'platform_request', 'list_world_providers',
+        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
       ]),
@@ -65,6 +65,20 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
     expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
+  });
+
+  it('forwards a task resource proposal without adopting it', async () => {
+    const seen: unknown[] = [];
+    const stub = { proposeProjectResource: async (args: unknown) => { seen.push(args); return { candidate: { id: 'candidate-1' } }; } } as any;
+    const server = createPlatformMcpServer(stub);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair(); await server.connect(serverT);
+    const c = new Client({ name: 'resource-test', version: '1.0.0' }); await c.connect(clientT);
+    const result: any = await c.callTool({ name: 'propose_project_resource', arguments: {
+      path: 'downloads/model', name: 'Model', driver: 'volume@1', targetPath: 'models/main', access: 'read',
+    } });
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([{ source: { kind: 'path', path: 'downloads/model' }, name: 'Model', driver: 'volume@1',
+      target: { kind: 'path', path: 'models/main' }, access: 'read', publish: undefined }]);
   });
 
   it('forwards a dedicated human escalation with its chosen audience and reason', async () => {

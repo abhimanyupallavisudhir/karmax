@@ -71,6 +71,10 @@ export interface GithubPullRequestReadiness {
   mergeStateStatus: GithubPullRequestMergeState;
   reviewDecision?: GithubPullRequestReviewDecision;
   checks?: GithubStatusCheckState;
+  /** The installed App predates CI-read permissions. `mergeStateStatus` remains
+   * fail-closed, but pending and failed checks cannot be distinguished until the
+   * installation owner approves the App's read-only Checks/Statuses upgrade. */
+  checksUnavailable?: true;
   failedChecks?: GithubFailedCheck[];
   mergeQueueEntryId?: string;
   autoMerge?: { enabledAt: string; mergeMethod: GithubMergeMethod };
@@ -261,29 +265,49 @@ export class GithubPrApi {
   async readiness(slug: string, number: number): Promise<GithubPullRequestReadiness> {
     const [owner, name, ...extra] = slug.split('/');
     if (!owner || !name || extra.length) throw new Error(`Invalid GitHub repository slug: ${slug}`);
-    const value = await this.graphql<any>(`query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
+    const query = (checkLevel: 'details' | 'aggregate' | 'none') => `query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
           id url state isDraft merged headRefOid mergeable mergeStateStatus reviewDecision
-          statusCheckRollup {
+          ${checkLevel === 'none' ? '' : `statusCheckRollup {
             state
-            contexts(first: 50) {
+            ${checkLevel === 'details' ? `contexts(first: 50) {
               nodes {
                 __typename
                 ... on CheckRun {
                   databaseId name status conclusion detailsUrl
-                  output { title summary text }
                 }
                 ... on StatusContext { context state targetUrl description }
               }
-            }
-          }
+            }` : ''}
+          }`}
           mergeQueueEntry { id }
           autoMergeRequest { enabledAt mergeMethod }
           viewerCanEnableAutoMerge viewerCanMergeAsAdmin
         }
       }
-    }`, { owner, name, number });
+    }`;
+    let value = await this.graphql<any>(query('details'), { owner, name, number });
+    const firstError = value?.errors?.map((error: any) => String(error?.message ?? '')).join('; ') ?? '';
+    // Some GitHub App installations can read the aggregate status rollup but
+    // not enumerate CheckRun nodes. GitHub rejects the whole GraphQL response in
+    // that case, so retry the same readiness query without optional details.
+    // The gate still gets exact PENDING/FAILURE/SUCCESS state and never treats a
+    // permission error as green; only names/URLs are omitted.
+    if (value?.errors?.length && /resource not accessible by integration/i.test(firstError)) {
+      value = await this.graphql<any>(query('aggregate'), { owner, name, number });
+    }
+    let checksUnavailable = false;
+    const aggregateError = value?.errors?.map((error: any) => String(error?.message ?? '')).join('; ') ?? '';
+    // Apps created before CI inspection was part of landing have neither the
+    // Checks nor Commit-status repository permission. The rollup field itself is
+    // then forbidden. Fetch the remaining policy state for diagnosis, but mark
+    // CI unavailable so exact landing waits fail-closed for the installation
+    // owner to approve the read-only upgrade.
+    if (value?.errors?.length && /resource not accessible by integration/i.test(aggregateError)) {
+      value = await this.graphql<any>(query('none'), { owner, name, number });
+      checksUnavailable = true;
+    }
     if (value?.errors?.length) {
       const message = value.errors.map((error: any) => String(error?.message ?? 'Unknown error')).join('; ');
       const kinds = value.errors.map((error: any) => String(error?.type ?? error?.extensions?.type ?? '').toUpperCase());
@@ -302,13 +326,10 @@ export class GithubPrApi {
       if (node?.__typename === 'CheckRun') {
         const state = String(node.conclusion ?? node.status ?? 'UNKNOWN');
         if (!['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) return [];
-        const output = [node.output?.title, node.output?.summary, node.output?.text]
-          .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join('\n').slice(0, 1200);
         return [{
           name: String(node.name ?? 'GitHub check'), state,
           ...(node.databaseId ? { databaseId: Number(node.databaseId) } : {}),
           ...(node.detailsUrl ? { url: String(node.detailsUrl) } : {}),
-          ...(output ? { detail: output } : {}),
         }];
       }
       if (node?.__typename === 'StatusContext') {
@@ -322,10 +343,11 @@ export class GithubPrApi {
       }
       return [];
     }) as Array<GithubFailedCheck & { databaseId?: number }>;
-    // GitHub check output is often just a headline; annotations carry the file,
-    // line, and assertion/compiler message the Do agent can act on. They are
-    // best-effort because third-party status contexts and restricted Apps may
-    // expose only the details URL.
+    // Optional CheckRun summary/text fields require GitHub App Checks permission;
+    // asking for them makes the entire readiness query fail for an otherwise
+    // authorized user token. Fetch annotations separately as best-effort
+    // enrichment: third-party contexts and restricted Apps retain the check name,
+    // state and details URL even when that REST call is forbidden.
     for (const check of failedCheckCandidates) {
       if (!check.databaseId) continue;
       const annotations = await this.request<any[]>(
@@ -354,6 +376,7 @@ export class GithubPrApi {
       mergeStateStatus: raw.mergeStateStatus as GithubPullRequestMergeState,
       ...(raw.reviewDecision ? { reviewDecision: raw.reviewDecision as GithubPullRequestReviewDecision } : {}),
       ...(raw.statusCheckRollup?.state ? { checks: raw.statusCheckRollup.state as GithubStatusCheckState } : {}),
+      ...(checksUnavailable ? { checksUnavailable: true as const } : {}),
       ...(failedChecks.length ? { failedChecks } : {}),
       ...(raw.mergeQueueEntry?.id ? { mergeQueueEntryId: String(raw.mergeQueueEntry.id) } : {}),
       ...(raw.autoMergeRequest ? { autoMerge: { enabledAt: String(raw.autoMergeRequest.enabledAt),

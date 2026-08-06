@@ -61,6 +61,10 @@ export interface PlatformOps {
   publishTaskBranch(): Promise<unknown>;
   importTaskBranch(sourceTaskId: string): Promise<unknown>;
   refreshUpstream(branch?: string): Promise<unknown>;
+  proposeProjectResource(a: { source: { kind: 'path'; path: string } | { kind: 'vault-item'; itemId: string; field?: string };
+    name: string; driver?: 'volume@1' | 'object-tree@1' | 'secret@1' | 'service@1' | 'database@1';
+    target: { kind: 'path'; path: string } | { kind: 'environment' | 'service'; name: string };
+    access?: 'read' | 'write'; publish?: 'discard' | 'review' }): Promise<unknown>;
   listWorldProviders(organizationId: string): Promise<unknown>;
   connectWorldProvider(a: { organizationId: string; provider: 'e2b' | 'daytona'; apiKey?: string;
     name?: string; template?: string; snapshot?: string; image?: string; desktopTemplate?: string;
@@ -118,6 +122,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     publishTaskBranch: () => api.publishTaskBranch(getToken()),
     importTaskBranch: (sourceTaskId) => api.importTaskBranch(getToken(), sourceTaskId),
     refreshUpstream: (branch) => api.refreshUpstream(getToken(), branch),
+    proposeProjectResource: (a) => api.proposeProjectResource(getToken(), a),
     listWorldProviders: (organizationId) => Promise.resolve(api.listWorldProviderConnections(getToken(), organizationId)),
     connectWorldProvider: (a) => Promise.resolve(api.saveWorldProviderConnection(getToken(), {
       organizationId: a.organizationId, provider: a.provider, apiKey: a.apiKey, name: a.name,
@@ -203,6 +208,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     publishTaskBranch: () => req('/api/agent/git/publish', { method: 'POST', body: '{}' }),
     importTaskBranch: (sourceTaskId) => req('/api/agent/git/import', { method: 'POST', body: JSON.stringify({ sourceTaskId }) }),
     refreshUpstream: (branch) => req('/api/agent/git/refresh-upstream', { method: 'POST', body: JSON.stringify({ branch }) }),
+    proposeProjectResource: (a) => req('/api/agent/resource-candidates', { method: 'POST', body: JSON.stringify(a) }),
     listWorldProviders: (organizationId) => req(`/api/organizations/${organizationId}/world-providers`),
     connectWorldProvider: (a) => req(`/api/organizations/${a.organizationId}/world-providers/${a.provider}`, {
       method: 'PUT', body: JSON.stringify({ apiKey: a.apiKey, name: a.name,
@@ -445,6 +451,27 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world. Returns refreshed refs plus per-repository skipped/errors diagnostics for any partial failure.',
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
+  server.registerTool('propose_project_resource', {
+    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored.',
+    inputSchema: {
+      path: z.string().optional(), vaultItemId: z.string().optional(), field: z.string().optional(), name: z.string(),
+      driver: z.enum(['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1']).optional(),
+      targetPath: z.string().optional(), targetEnvironment: z.string().optional(), targetService: z.string().optional(),
+      access: z.enum(['read', 'write']).optional(), publish: z.enum(['discard', 'review']).optional(),
+    },
+  }, async (a) => wrap(() => {
+    const sources = Number(Boolean(a.path)) + Number(Boolean(a.vaultItemId));
+    const targets = Number(Boolean(a.targetPath)) + Number(Boolean(a.targetEnvironment)) + Number(Boolean(a.targetService));
+    if (sources !== 1) throw new Error('provide exactly one of path or vaultItemId');
+    if (targets !== 1) throw new Error('provide exactly one targetPath, targetEnvironment, or targetService');
+    return ops.proposeProjectResource({
+      source: a.path ? { kind: 'path', path: a.path } : { kind: 'vault-item', itemId: a.vaultItemId!, field: a.field },
+      name: a.name, driver: a.driver, access: a.access, publish: a.publish,
+      target: a.targetPath ? { kind: 'path', path: a.targetPath }
+        : a.targetService ? { kind: 'service', name: a.targetService }
+          : { kind: 'environment', name: a.targetEnvironment! },
+    });
+  }));
   // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's
   // /api/vault surface so the pull model is first-class, not buried behind
   // platform_request. Available on the gateway-backed bridge; the in-process

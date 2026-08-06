@@ -50,6 +50,7 @@ const developer = [
 ] satisfies Capability[];
 const maintainer = [
   ...developer, 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
+  'project:resource:shared-write',
   'workflow:install', 'workflow:edit', 'team:write', 'repository:write',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
@@ -58,6 +59,7 @@ const maintainer = [
 // tenant-owned credentials and payments but cannot cross that boundary.
 const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
+  'project:resource:shared-write',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:read', 'vault:store', 'use-credential:*', 'skill:write',
   'use-card:*',
@@ -68,6 +70,7 @@ const PROJECT_GRANT_CEILING: Capability[] = [
 const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*',
+  'project:resource:shared-write',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
   'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',

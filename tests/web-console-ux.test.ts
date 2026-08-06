@@ -57,6 +57,12 @@ describe('websocket reconnect', () => {
 });
 
 describe('profile account controls', () => {
+  it('offers a plain-language export of all data linked to the signed-in user', () => {
+    expect(app).toContain('id="export-user-data"');
+    expect(app).toContain('Export your data');
+    expect(app).toContain('/api/user/export');
+  });
+
   it('lets an unverified user resend their confirmation email from the email row', () => {
     expect(app).toContain('id="profile-resend-confirmation"');
     expect(app).toContain('Resend confirmation email');
@@ -92,6 +98,19 @@ describe('profile account controls', () => {
     expect(notifications).not.toContain('data-delivery=');
     expect(notifications).not.toContain('Outcome updates for tasks I follow');
     expect(app).not.toContain("$('#save-delivery')");
+  });
+});
+
+describe('organization data controls', () => {
+  it('puts a clearly described full-data export in Advanced settings', () => {
+    const start = app.indexOf('id="settings-advanced"');
+    const end = app.indexOf('function pendingInvitationRow', start);
+    expect(start).toBeGreaterThan(-1);
+    const advanced = app.slice(start, end);
+    expect(advanced).toContain('Export organization data');
+    expect(advanced).toContain('readable JSON archive');
+    expect(advanced).toContain('Passwords, tokens, and stored credentials are never included.');
+    expect(advanced).toContain('id="export-organization"');
   });
 });
 

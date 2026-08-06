@@ -358,8 +358,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.18.0',
-    description: 'Branch/world → do/wait → explicit PR → intent review → front-held exact-candidate CI and verification by the same Do conversation → atomic landing, with bounded in-place repair.',
+    version: '1.19.0',
+    description: 'Branch/world → do/wait → explicit PR → intent review → front-held exact-candidate CI and verification by the same Do conversation → atomic landing, with bounded in-place repair and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -420,7 +420,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.4.0',
+    version: '1.5.0',
     description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
     selectable: false,
     requires: [],
@@ -463,8 +463,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.18.0',
-    description: 'Software Dev in autonomous completion mode with front-held exact-candidate validation by the same Do conversation and bounded in-place repair.',
+    version: '1.19.0',
+    description: 'Software Dev in autonomous completion mode with front-held exact-candidate validation by the same Do conversation, bounded in-place repair, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
