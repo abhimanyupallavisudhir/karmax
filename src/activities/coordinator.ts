@@ -1,4 +1,4 @@
-import type { Client } from '@temporalio/client';
+import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
@@ -264,8 +264,15 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       try {
         const view = (await client.workflow.getHandle(accountCoordinatorId()).query(QRY_ACCOUNTS)) as { accounts: unknown[] };
         return view.accounts.length;
-      } catch {
-        return 0;
+      } catch (error) {
+        // "No coordinator yet" genuinely means the optional pool is disabled.
+        // A timeout / unavailable workflow task is different: returning 0 here
+        // permanently bakes credential passthrough into the task execution. That
+        // is fatal for a recovered remote world, whose provider subscription must
+        // be copied from the leased config home. Let Temporal retry transient
+        // query failures under the workflow's bounded coordinator policy.
+        if (error instanceof WorkflowNotFoundError) return 0;
+        throw error;
       }
     },
   };

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { scanInstances, isInsideDir } from '../src/util/instance.js';
+import { duplicateInstanceMessage, scanInstances, isInsideDir } from '../src/util/instance.js';
 
 // Cheap unit test (no Temporal, no worker): duplicate app-instance detection
 // against a temp "instances" dir with an injected liveness probe (karmax#4).
@@ -19,6 +19,10 @@ afterEach(() => {
 const write = (pid: number) => fs.writeFileSync(path.join(dir, `${pid}.pid`), JSON.stringify({ pid }));
 
 describe('scanInstances', () => {
+  it('renders duplicate admission as a correctness failure', () => {
+    expect(duplicateInstanceMessage('/srv/karmax', [1001, 1002]))
+      .toMatch(/already running.*pids 1001, 1002.*steal activities.*workflow coherence/i);
+  });
   it('reports live OTHER instances and excludes self', () => {
     write(1001);
     write(1002);
