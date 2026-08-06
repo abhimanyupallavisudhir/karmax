@@ -377,6 +377,36 @@ describe('task stage transitions', () => {
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
+  it('upgrades a v1.16 task at its successful Review boundary into v1.17 Landing', async () => {
+    const f = fixture();
+    f.store.setTaskWorkflowVersion(f.task.id, '1.16.0');
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'review',
+      status: 'waiting',
+      prs: [{ repo: 'repo', slug: 'owner/repo', number: 52, url: 'https://github.test/owner/repo/pull/52', state: 'open', headSha: 'abc123' }],
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true }],
+    });
+
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+
+    expect(f.terminated.at(-1)).toMatch(/upgrading Landing protocol to v1\.17/);
+    expect(f.starts.at(-1)!.type).toBe(`softwareDev@${bundledVersion('software-dev')}`);
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({
+      resumeStage: 'merge',
+      prs: [{ slug: 'owner/repo', number: 52, headSha: 'abc123' }],
+    });
+    expect(f.store.getTask(f.task.id)?.workflowVersion).toBe(bundledVersion('software-dev'));
+    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'task.confirmation-voted',
+        payload: expect.objectContaining({ githubMergeIntentAuthorized: true }),
+      }),
+    ]));
+    expect(f.signalled.some((item) => item.id === f.task.id && item.signal === 'confirm')).toBe(false);
+  });
+
   it('lets the selected human open a PR from a Do-stage input wait', async () => {
     const f = fixture();
     f.store.saveView(f.task.id, {
