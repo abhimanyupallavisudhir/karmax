@@ -226,6 +226,7 @@ describe('GitHub PR client', () => {
     expect(request.query).toContain('mergeStateStatus');
     expect(request.query).toContain('statusCheckRollup');
     expect(request.query).toContain('contexts(first: 50)');
+    expect(request.query).not.toContain('output {');
   });
 
   it('extracts actionable details from failed check runs and legacy statuses', async () => {
@@ -239,7 +240,7 @@ describe('GitHub PR client', () => {
       merged: false, headRefOid: 'failed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
         { __typename: 'CheckRun', databaseId: 101, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-          detailsUrl: 'https://github.test/checks/1', output: { title: '2 tests failed', summary: 'Expected 2, received 3' } },
+          detailsUrl: 'https://github.test/checks/1', title: '2 tests failed', summary: 'Expected 2, received 3' },
         { __typename: 'StatusContext', context: 'lint', state: 'ERROR',
           targetUrl: 'https://ci.test/lint', description: 'runner crashed' },
         { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
@@ -513,7 +514,7 @@ describe('GitHub-authoritative merge activity', () => {
 
     readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
       { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21',
-        output: { summary: 'three assertions failed' } },
+        summary: 'three assertions failed' },
     ] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
       status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21.*three assertions failed/is),
