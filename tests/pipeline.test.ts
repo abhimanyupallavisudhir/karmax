@@ -111,7 +111,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
-  it.each(['1.15.0', '1.17.0'])('v%s runs repository-less work through Do and Review without Git or Merge', async (version) => {
+  it.each(['1.15.0', '1.19.0'])('v%s runs repository-less work through Do and Review without Git or Merge', async (version) => {
     const taskId = newId('task');
     const handle = await h.client.workflow.start(`softwareDev@${version}`, {
       taskQueue: TASK_QUEUE,

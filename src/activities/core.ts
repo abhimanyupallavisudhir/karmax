@@ -695,7 +695,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     env: Record<string, string>,
     repos: ReturnType<typeof worldRepos>,
   ) {
-    if (isRemote(handle.kind)) return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos);
+    const priorPrs = store.getTask(handle.id)?.lastView?.prs ?? [];
+    const expectedRemoteHeads = Object.fromEntries(priorPrs
+      .filter((candidate) => candidate.headSha)
+      .map((candidate) => [candidate.repo, candidate.headSha!]));
+    if (isRemote(handle.kind))
+      return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos, expectedRemoteHeads);
     const pushed: string[] = [];
     const skipped: string[] = [];
     const errors: Record<string, string> = {};
@@ -704,10 +709,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // GitHub App installation tokens are short-lived HTTPS credentials. Use
       // them from the trusted host even for a local/container worktree, so a
       // connected repository never needs the person's SSH private key or PAT.
-      const push = repository?.gitConnectionId && deps.githubApp
+      let push = repository?.gitConnectionId && deps.githubApp
         ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', '-u', 'origin', repo.branch], env)
         : await world.exec('git', ['push', '-u', 'origin', repo.branch],
           { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
+      const expected = expectedRemoteHeads[repo.name];
+      if (push.code !== 0 && expected && /non-fast-forward|fetch first|rejected/i.test(push.stderr || push.stdout)) {
+        const lease = `--force-with-lease=refs/heads/${repo.branch}:${expected}`;
+        push = repository?.gitConnectionId && deps.githubApp
+          ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', lease, '-u', 'origin', repo.branch], env)
+          : await world.exec('git', ['push', lease, '-u', 'origin', repo.branch],
+            { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
+      }
       if (push.code === 0) pushed.push(repo.name);
       else {
         skipped.push(repo.name);
@@ -2329,7 +2342,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * not a candidate: it may transport task branches, but it must not bypass a
      * person's merge rights.
      */
-    async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: { mode?: 'submit' | 'observe' }): Promise<GitHubMergeAuthorization> {
+    async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: {
+      mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact';
+    }): Promise<GitHubMergeAuthorization> {
       // A PR-policy task may legitimately make no changes. There is nothing
       // external to authorize in that case, so do not manufacture a human gate.
       if (!prs.length) return { status: 'merged', prs };
@@ -2340,6 +2355,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
       const intentAuthorizedLanding = workflowMinor >= 16;
       const observeOnly = intentAuthorizedLanding && options?.mode === 'observe';
+      const inspectExact = workflowMinor >= 17 && options?.mode === 'inspect-exact';
+      const submitExact = workflowMinor >= 17 && options?.mode === 'submit-exact';
+      const frontHeldExact = inspectExact || submitExact;
       const creator = store.taskCreatorUserId(handle.id);
       const events = store.eventsSince(handle.id, 0);
       const eventAuthorizesCurrentHeads = (event: { payload?: any }) => {
@@ -2420,6 +2438,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       const accountId = accountFor(actorUserId);
       const api = prApiForUser(actorUserId, accountId);
+      // PR authorship, approval and landing remain attributable to the selected
+      // human. Read-only policy/CI inspection belongs to the repository
+      // installation instead: it has the exact repository-scoped Checks and
+      // Commit-status permissions declared by the App, without lending those
+      // observations the human's identity.
+      const inspectionFor = (slug: string): { api: GithubPrApi; connectionId?: string } => {
+        const repository = enrolledGithubRepository(task.projectId, slug);
+        const connection = repository?.gitConnectionId
+          ? store.getGitConnection(repository.gitConnectionId)
+          : undefined;
+        return connection && typeof (deps.githubApp as any).installationToken === 'function'
+          ? {
+            api: new GithubPrApi(
+              () => deps.githubApp!.installationToken(connection),
+              deps.githubPr ?? {},
+            ),
+            connectionId: connection.id,
+          }
+          : { api };
+      };
       const settled: TaskPullRequest[] = [];
       let lastSha: string | undefined;
       let queued = false;
@@ -2524,9 +2562,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // and only genuinely transient checks/queues remain a polling wait.
         let readiness: GithubPullRequestReadiness | undefined;
         let readinessError: unknown;
+        const inspection = inspectionFor(ref.slug);
+        const inspectionApi = inspection.api;
         if (live.nodeId) {
           try {
-            readiness = await api.readiness(ref.slug, ref.number);
+            readiness = await inspectionApi.readiness(ref.slug, ref.number);
           } catch (error) {
             // Readiness enriches the decision, but a head-bound REST landing
             // may still succeed when GraphQL is degraded or incomplete.
@@ -2571,7 +2611,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
         }
-        if (intentAuthorizedLanding && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
+        if (frontHeldExact && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `Pull request ${ref.slug}#${ref.number} is already controlled by GitHub's merge queue or auto-merge. Remove it there before retrying: this workflow keeps one authoritative karmax queue position through exact-candidate review and repair.`,
+            eligibleUserIds: [actorUserId],
+          };
+        }
+        if (frontHeldExact && readiness?.checksUnavailable) {
+          if (inspection.connectionId && typeof (deps.githubApp as any).invalidateInstallationToken === 'function')
+            deps.githubApp.invalidateInstallationToken(inspection.connectionId);
+          const appSlug = typeof (deps.githubApp as any).status === 'function'
+            ? deps.githubApp.status().appSlug
+            : undefined;
+          return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: `GitHub has not granted krmax read access to CI for ${ref.slug}#${ref.number}. `
+              + 'Grant the GitHub App read-only Checks and Commit statuses permissions, then approve the updated installation permissions; '
+              + `this task will retain the front landing slot and retry automatically.${appSlug
+                ? ` App settings: https://github.com/settings/apps/${appSlug}/permissions`
+                : ''}`,
+          };
+        }
+        if (!frontHeldExact && intentAuthorizedLanding && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
           const entryIds = readiness.mergeQueueEntryId ? [readiness.mergeQueueEntryId] : [];
           return {
             status: 'queued', prs: current, actorUserId,
@@ -2617,7 +2679,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // is, this is a real external-human wait rather than an opaque merge poll.
         if (readiness?.reviewDecision === 'REVIEW_REQUIRED') {
           try {
-            readiness = await api.readiness(ref.slug, ref.number);
+            readiness = await inspectionApi.readiness(ref.slug, ref.number);
           } catch (error) {
             return errorDecision(error, current);
           }
@@ -2641,6 +2703,81 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: `Pull request ${ref.slug}#${ref.number} still requires a GitHub review under repository policy. Complete that review on GitHub, then retry here.`,
             };
           }
+        }
+        if (frontHeldExact) {
+          if (!readiness) {
+            if (readinessError) return errorDecision(readinessError, current);
+            return {
+              status: 'retryable-error', prs: current, actorUserId,
+              detail: `GitHub did not expose policy and check state for ${ref.slug}#${ref.number}; karmax cannot certify the exact candidate yet.`,
+            };
+          }
+          if (readiness.mergeStateStatus === 'BEHIND') {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `Pull request ${ref.slug}#${ref.number} is behind its target. While this task retains the front landing slot, update the task branch from the target, resolve any conflicts, and rebuild the exact candidate.`,
+              repair: { kind: 'base-moved', preserveAuthorization: true },
+            };
+          }
+          if (['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')) {
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: 'Waiting for CI on the exact pull-request head while this task retains the front landing slot.',
+            };
+          }
+          if (readiness.mergeStateStatus !== 'CLEAN') {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `GitHub reports ${readiness.mergeStateStatus} for ${ref.slug}#${ref.number}. The task is being released from the landing queue until repository policy or PR state is resolved.`,
+              eligibleUserIds: [actorUserId],
+            };
+          }
+          const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
+          if (mergeMethod !== 'merge') {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `Repository policy requests ${mergeMethod} landing for ${ref.slug}, but an exact reviewed head can only be advanced atomically with a merge commit strategy. Change the repository landing policy or use a workflow that can validate the provider-generated ${mergeMethod} candidate.`,
+              eligibleUserIds: [actorUserId],
+            };
+          }
+          if (!live.base) {
+            return {
+              status: 'retryable-error', prs: current, actorUserId,
+              detail: `GitHub did not report the target branch for pull request ${ref.slug}#${ref.number}; exact landing cannot proceed safely.`,
+            };
+          }
+          if (inspectExact) {
+            settled.push(next);
+            continue;
+          }
+          let advanced;
+          try { advanced = await api.fastForwardTarget(ref.slug, live.base, ref.headSha); }
+          catch (error) { return errorDecision(error, current); }
+          if (advanced.updated) {
+            const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
+            const landedPrs = [...settled, landed, ...prs.slice(settled.length + 1)];
+            const localSync = await syncGithubTargetToLocal(handle, ref, live.base, ref.headSha);
+            const blocked = localSyncDecision(localSync, landedPrs);
+            if (blocked) return blocked;
+            lastSha = ref.headSha;
+            settled.push(landed);
+            record(handle.id, 'github.pr.merged', {
+              ...ref, sha: ref.headSha, actorUserId, strategy: 'front-held-exact-fast-forward',
+            });
+            continue;
+          }
+          if (/fast.?forward|behind|reference update failed|not a valid head/i.test(advanced.message)) {
+            return {
+              status: 'needs-revision', prs: current, actorUserId,
+              detail: `The target moved outside karmax's landing coordinator before exact head ${ref.headSha} could land for ${ref.slug}#${ref.number}: ${advanced.message}. Repair against that live target while retaining the front slot.`,
+              repair: { kind: 'base-moved', preserveAuthorization: true },
+            };
+          }
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `GitHub refused the exact landing for ${ref.slug}#${ref.number}: ${advanced.message}. The task is being released from the landing queue until repository policy is fixed.`,
+            eligibleUserIds: [actorUserId],
+          };
         }
         if (observeOnly) {
           return {
@@ -2835,6 +2972,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: merged.message,
         };
       }
+      if (inspectExact && settled.length === prs.length)
+        return {
+          status: 'candidate-ready', prs: settled, actorUserId,
+          detail: 'The exact pull-request head is current, CI-complete, and ready for integration review.',
+        };
       if (settled.every((ref) => ref.merged))
         return { status: 'merged', prs: settled, actorUserId, ...(lastSha ? { sha: lastSha } : {}) };
       return {

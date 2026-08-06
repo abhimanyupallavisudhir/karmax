@@ -102,9 +102,26 @@ async function verifySharedWorktreeBranch(world: World, repo: WorldRepo, localRe
   }
 }
 
-async function pushBranchToOrigin(world: World, repo: WorldRepo, auth: GitBrokerAuth): Promise<void> {
+async function pushBranchToOrigin(
+  world: World,
+  repo: WorldRepo,
+  auth: GitBrokerAuth,
+  expectedRemoteHead?: string,
+): Promise<void> {
   await withTransferredRepo(world, repo, auth, async (clone, env) => {
-    const result = await git(clone, ['push', 'origin', `refs/heads/${repo.branch}:refs/heads/${repo.branch}`], { env });
+    const ref = `refs/heads/${repo.branch}`;
+    let result = await git(clone, ['push', 'origin', `${ref}:${ref}`], { env });
+    // Integration repair commonly rebases the task-owned proposal branch. That
+    // deliberately makes its new tip a non-descendant of the prior PR head, so
+    // an ordinary push cannot publish it. Replace only the exact head Karmax
+    // previously observed: a concurrent writer makes the lease fail instead of
+    // being overwritten. With no recorded PR head we never force an existing
+    // branch—the collision needs investigation rather than an ownership guess.
+    if (result.code !== 0 && expectedRemoteHead && /non-fast-forward|fetch first|rejected/i.test(result.stderr || result.stdout)) {
+      result = await git(clone, [
+        'push', `--force-with-lease=${ref}:${expectedRemoteHead}`, 'origin', `${ref}:${ref}`,
+      ], { env });
+    }
     if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
   });
 }
@@ -385,13 +402,14 @@ export async function brokerPushBranches(
   world: World,
   auth: GitBrokerAuth,
   repos: WorldRepo[] = worldRepos(world.handle),
+  expectedRemoteHeads: Record<string, string> = {},
 ): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
   for (const repo of repos) {
     try {
-      await pushBranchToOrigin(world, repo, auth);
+      await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name]);
       pushed.push(repo.name);
     } catch (error) {
       skipped.push(repo.name);

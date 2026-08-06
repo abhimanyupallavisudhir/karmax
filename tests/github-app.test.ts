@@ -103,6 +103,8 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
     expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review']);
+    expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'read');
+    expect(manifest.manifest).toHaveProperty('default_permissions.statuses', 'read');
     expect(manifest.manifest).not.toHaveProperty('default_permissions.administration');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
@@ -645,6 +647,12 @@ describe('GitHub App failure and suspension handling', () => {
     const [a, b, c] = await Promise.all([service.installationToken(fresh), service.installationToken(fresh), service.installationToken(fresh)]);
     expect([a, b, c]).toEqual([a, a, a]);
     expect(mints).toBe(2);
+    // A permission-upgrade observation drops the old token once, but repeated
+    // landing polls inside the cooldown do not create a mint storm.
+    expect(service.invalidateInstallationToken(connection.id)).toBe(true);
+    expect(service.invalidateInstallationToken(connection.id)).toBe(false);
+    expect(await service.installationToken(connection)).toBe('t-3');
+    expect(mints).toBe(3);
     // A suspended connection is refused even while a valid token is cached.
     store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'User', suspendedAt: Date.now() });
