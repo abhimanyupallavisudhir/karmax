@@ -64,6 +64,11 @@ export interface GitProfileStore {
   kvSet(k: string, v: string): void;
 }
 
+export interface PersonalGithubProfileStore extends GitProfileStore {
+  listOrganizations(userId: string): Array<{ id: string; kind: 'personal' | 'team' }>;
+  listGitConnections(organizationId: string): unknown[];
+}
+
 export class GitProfiles {
   constructor(
     private store: GitProfileStore,
@@ -452,4 +457,26 @@ export class GitProfiles {
     if (!this.broker) throw new Error('git profiles: no credential broker configured');
     return this.broker;
   }
+}
+
+/**
+ * Give a user's otherwise-empty personal workspace a live reference to their
+ * GitHub-backed profile. This is intentionally identity/config inheritance,
+ * not credential copying: repository transport still requires the workspace's
+ * own GitHub App installation.
+ *
+ * The helper is safe to call from either side of onboarding. GitHub social auth
+ * can create the user profile before the gateway provisions the workspace,
+ * while email/password users normally receive the workspace first and connect
+ * GitHub later.
+ */
+export function inheritPersonalGithubProfile(store: PersonalGithubProfileStore,
+  broker: CredentialBroker | undefined, userId: string): GitProfile | undefined {
+  const personal = store.listOrganizations(userId).find((organization) => organization.kind === 'personal');
+  if (!personal || store.listGitConnections(personal.id).length) return undefined;
+  const organizationProfiles = new GitProfiles(store, broker, undefined, personal.id);
+  if (organizationProfiles.list().length || organizationProfiles.defaultProfile()) return undefined;
+  const userProfiles = new GitProfiles(store, broker, undefined, userGitScope(userId));
+  if (!userProfiles.resolve(undefined)?.github) return undefined;
+  return organizationProfiles.reuseUserProfile(userProfiles);
 }

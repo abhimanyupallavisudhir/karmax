@@ -22,6 +22,7 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { GitProfiles, userGitScope } from '../src/autonomy/git-profiles.js';
 
 const GOOGLE = { clientId: 'test-google-client-id.apps.googleusercontent.com', clientSecret: 'test-google-client-secret' };
 const GITHUB = { clientId: 'test-github-client-id', clientSecret: 'test-github-client-secret' };
@@ -180,12 +181,20 @@ describe('GitHub sign-in when configured', () => {
     const created = await identity.signUp({
       name: 'Octo Cat', email: 'octo@example.com', password: 'long-enough-password',
     });
+    const signedUp = await created.clone().json() as any;
+    new GitProfiles(store, undefined, undefined, userGitScope(String(signedUp.user.id)))
+      .saveGithubIdentity({ id: '42', login: 'octocat', name: 'Octo Cat' });
     const cookie = created.headers.get('set-cookie')?.split(';', 1)[0];
     expect(cookie).toBeTruthy();
     const session = await (await fetch(`${base}/api/session`, { headers: { cookie: cookie! } })).json() as any;
     expect(session.authenticated).toBe(true);
     expect(session.gitOnboarding).toBe(true);
-    expect(store.listOrganizations(session.user.id)).toHaveLength(1);
+    const [personal] = store.listOrganizations(session.user.id);
+    expect(personal).toBeTruthy();
+    expect(new GitProfiles(store, undefined, undefined, personal!.id).resolve(undefined)).toMatchObject({
+      github: { id: '42', login: 'octocat' },
+      source: { kind: 'user', userId: session.user.id, profile: 'github' },
+    });
   });
 });
 
