@@ -142,7 +142,7 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   // resumes the interrupted session. isResourceKill is the shared predicate
   // (src/agent/limits.ts) the software-dev auto-resolve task reuses.
   if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
-  if (isTransportError(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
+  if (isTransportError(err)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
 }
 
@@ -1018,6 +1018,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
       } catch (error) {
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        if (remote && isTransportError(error)) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw ApplicationFailure.create({
+            message,
+            type: 'world-infra',
+            nonRetryable: false,
+            cause: error instanceof Error ? error : undefined,
+          });
+        }
         throw error;
       }
       try {
@@ -1212,7 +1221,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         profile = { ...profile, modelProvider: leasedCredentialProvider };
       }
       const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
-      const world = await openWorld(args.worldHandle, args.taskId);
+      let world: World;
+      try {
+        world = await openWorld(args.worldHandle, args.taskId);
+      } catch (error) {
+        // Reconnecting/resuming a cloud sandbox is part of the turn's transport
+        // boundary. A control-plane outage here is no more agent-actionable than
+        // a PTY or filesystem request failing after the adapter starts.
+        throw classifyTurnError(error, profile.provider);
+      }
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.

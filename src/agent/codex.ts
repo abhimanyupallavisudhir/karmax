@@ -16,7 +16,7 @@ import { classifyLimitError, providerErrorFromMessage, providerFailure, type Pro
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity, toolActivityDetail } from './activity.js';
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
-  spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+  spawnRemoteAgentProcess, syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 import { localProviderCli } from './provider-cli.js';
 
@@ -713,8 +713,13 @@ export class CodexAdapter implements AgentAdapter {
       if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
       else child.kill('SIGTERM');
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
-      if (remoteHome && input.resolvedAuth?.configHome)
-        await syncRemoteAgentHome(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
+      if (remoteHome && input.resolvedAuth?.configHome) {
+        const failure = await syncRemoteAgentHomeBestEffort(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
+        if (failure) ctx.emitActivity({
+          id: 'codex-remote-state-sync', kind: 'error', phase: 'failed',
+          title: 'Could not preserve remote Codex state', detail: failure.message.slice(0, 1000),
+        });
+      }
     }
 
     // A limit can also arrive as a rejected request (handshake/turn) or a subprocess
