@@ -12,6 +12,8 @@ import { classifyLimitError, type LimitClassification, type ProviderFailureMetad
  *   'agent-limit'  usage/session/billing limit — non-retryable; typed metadata in
  *                  details tells account leasing whether to rotate/park/escalate
  *   'agent-error'  everything else — non-retryable; the Resolve path
+ *   'world-infra'  cloud world create/connect transport failure — retryable;
+ *                  setup uses the same outage backoff instead of Resolve
  *
  * Temporal-generated timeouts count as infrastructure too: a heartbeat gap
  * means the worker/host died or slept (2026-07-07: a closed laptop lid ate a
@@ -22,7 +24,7 @@ export function isInfraFailure(err: unknown): boolean {
   if (!(err instanceof ActivityFailure)) return false;
   const cause = err.cause;
   if (cause instanceof TimeoutFailure) return true;
-  return cause instanceof ApplicationFailure && cause.type === 'agent-infra';
+  return cause instanceof ApplicationFailure && (cause.type === 'agent-infra' || cause.type === 'world-infra');
 }
 
 /** Recover provider-ground-truth limit metadata serialized by runAgentTurn. Old

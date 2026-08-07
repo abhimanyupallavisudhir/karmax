@@ -155,6 +155,16 @@ describe('isTransportError', () => {
     expect(isTransportError('EMFILE: too many open files')).toBe(true);
   });
 
+  it('recognizes E2B timeout wording and structured transport errors', () => {
+    expect(isTransportError('The operation was aborted due to timeout')).toBe(true);
+    expect(isTransportError('could not export remote codex state: [canceled] Request handshake timed out after 60000ms')).toBe(true);
+    expect(isTransportError(Object.assign(new Error('E2B request failed'), { code: 'ETIMEDOUT' }))).toBe(true);
+    expect(isTransportError(Object.assign(new Error('E2B request failed'), { statusCode: 503 }))).toBe(true);
+    expect(isTransportError(new Error('E2B request failed', {
+      cause: Object.assign(new Error('socket ended'), { code: 'ECONNRESET' }),
+    }))).toBe(true);
+  });
+
   it('does NOT swallow agent/semantic errors into the retry path', () => {
     expect(isTransportError('boom goes the agent')).toBe(false);
     expect(isTransportError('mock failure')).toBe(false);

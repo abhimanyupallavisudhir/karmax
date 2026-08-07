@@ -10,6 +10,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { ApplicationFailure } from '@temporalio/common';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -40,6 +41,30 @@ describe('WorktreeProvider (real git)', () => {
     expect(fs.existsSync(world.handle.root)).toBe(false);
     // branch is preserved after destroy
     expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
+  });
+
+  it('tags remote sandbox transport failures for outage-tolerant workflow backoff', async () => {
+    const store = new Store(':memory:');
+    const worlds = new WorldRegistry();
+    worlds.register({
+      kind: 'fake-remote',
+      capabilities: { remote: true },
+      async create() {
+        throw Object.assign(new Error('E2B sandbox creation failed'), { code: 'ETIMEDOUT' });
+      },
+      async open() { throw new Error('unused'); },
+      async destroy() {},
+    } as any);
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const failure = await core.createWorld({ taskId: 'transport-timeout', base: 'main',
+        target: 'main', kind: 'fake-remote' as any }).catch((error) => error);
+      expect(failure).toBeInstanceOf(ApplicationFailure);
+      expect(failure).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    } finally {
+      store.close();
+    }
   });
 
   it('forks a PR-policy task from origin without moving a stale local base', async () => {

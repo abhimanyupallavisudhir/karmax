@@ -175,6 +175,37 @@ describe('remote subscription agents', () => {
     expect(world.dynamicTools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'list_events' })]));
   });
 
+  it('preserves a successful Codex turn when best-effort remote state export times out', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-sync-timeout-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    const world = fakeWorld(true);
+    const exec = world.exec.bind(world);
+    let stateListings = 0;
+    world.exec = async (command, args, options) => {
+      if (command === 'bash' && args[1]?.includes('-type f -print') && ++stateListings > 1)
+        throw new Error('[canceled] Request handshake timed out after 60000ms');
+      return exec(command, args, options);
+    };
+    const activities: any[] = [];
+
+    const result = await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world,
+      messages: [{ id: 'm', role: 'user', text: 'edit the repository', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity: (activity: any) => activities.push(activity),
+      platformRequest: async () => [{ type: 'ok' }] } as any);
+
+    expect(result).toMatchObject({
+      termination: { kind: 'success', status: 'completed' },
+      session: 'remote-thread', output: 'done remotely',
+    });
+    expect(activities).toContainEqual(expect.objectContaining({
+      kind: 'error', phase: 'failed', title: expect.stringMatching(/remote Codex state/i),
+      detail: expect.stringContaining('Request handshake timed out'),
+    }));
+  });
+
   it.each([
     { fork: false, method: 'thread/resume' },
     { fork: true, method: 'thread/fork' },

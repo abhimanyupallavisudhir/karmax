@@ -81,28 +81,46 @@ function termsNear(tokens: string[], left: Set<string>, right: Set<string>, dist
 /**
  * Transient transport/infrastructure failure: the stream or socket died under
  * the turn (host slept, network dropped, provider hiccuped) — nothing the agent
- * said or did. Pure (a string parse). Deliberately conservative: an
+ * said or did. Pure (structured error inspection plus a string parse).
+ * Deliberately conservative: an
  * unrecognized error is NOT transport, so it keeps flowing to the Resolve path
  * instead of being blindly retried. Check limits FIRST — a 429 is a quota
  * signal, not transport.
  */
-export function isTransportError(message: string): boolean {
-  const lc = String(message ?? '').toLowerCase();
-  return (
-    /connection (closed|error|refused|reset|terminated|timed? out)|socket hang ?up|network error|network is unreachable|no route to host|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|request timed? out|operation timed? out|tls handshake timeout|temporary failure in name resolution|unexpected eof|broken pipe|econnreset|econnrefused|etimedout|epipe|enetunreach|ehostunreach|eai_again|enotfound|\boverloaded\b|service unavailable|gateway timeout|upstream (?:connect )?error|internal server error|\bserver_error\b/.test(
-      lc,
-    ) ||
-    // Codex app-server reports a dropped connection as a reconnect banner. In
-    // task #225 the only terminal text after five internal reconnect attempts was
-    // a model-refresh child-process timeout, so neither the old socket matcher nor
-    // the HTTP-status matcher recognized the outage.
-    /\breconnecting(?:\.{3}|\s)*\s*\d+\s*\/\s*\d+\b/.test(lc) ||
-    /timeout waiting for (?:a |the )?child process to exit/.test(lc) ||
-    // Short-lived host process-table / descriptor pressure. Disk-full and
-    // permission errors are intentionally absent: those need intervention.
-    /\b(?:eagain|emfile|enfile)\b/.test(lc) ||
-    /\b(?:408|50[0234]|529)\b/.test(lc)
-  );
+export function isTransportError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  const inspect = (value: unknown): boolean => {
+    if (value && typeof value === 'object') {
+      if (seen.has(value)) return false;
+      seen.add(value);
+      const structured = value as Record<string, unknown>;
+      const code = String(structured.code ?? structured.errno ?? '').toUpperCase();
+      if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH',
+        'EAI_AGAIN', 'ENOTFOUND', 'EAGAIN', 'EMFILE', 'ENFILE'].includes(code)) return true;
+      const status = Number(structured.statusCode ?? structured.status);
+      if ([408, 500, 502, 503, 504, 529].includes(status)) return true;
+      if (/timeout/i.test(String(structured.name ?? ''))) return true;
+      if (inspect(structured.cause) || inspect(structured.error) || inspect(structured.response)) return true;
+      if (Array.isArray(structured.errors) && structured.errors.some(inspect)) return true;
+    }
+    const lc = String(value instanceof Error ? value.message : value ?? '').toLowerCase();
+    return (
+      /connection (closed|error|refused|reset|terminated|timed? out)|socket hang ?up|network error|network is unreachable|no route to host|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|request(?:\s+[a-z-]+){0,3}\s+timed?\s*out|operation (?:timed?\s*out|(?:was )?aborted due to (?:a )?timeout)|tls handshake timeout|temporary failure in name resolution|unexpected eof|broken pipe|econnreset|econnrefused|etimedout|epipe|enetunreach|ehostunreach|eai_again|enotfound|\boverloaded\b|service unavailable|gateway timeout|upstream (?:connect )?error|internal server error|\bserver_error\b/.test(
+        lc,
+      ) ||
+      // Codex app-server reports a dropped connection as a reconnect banner. In
+      // task #225 the only terminal text after five internal reconnect attempts was
+      // a model-refresh child-process timeout, so neither the old socket matcher nor
+      // the HTTP-status matcher recognized the outage.
+      /\breconnecting(?:\.{3}|\s)*\s*\d+\s*\/\s*\d+\b/.test(lc) ||
+      /timeout waiting for (?:a |the )?child process to exit/.test(lc) ||
+      // Short-lived host process-table / descriptor pressure. Disk-full and
+      // permission errors are intentionally absent: those need intervention.
+      /\b(?:eagain|emfile|enfile)\b/.test(lc) ||
+      /\b(?:408|50[0234]|529)\b/.test(lc)
+    );
+  };
+  return inspect(error);
 }
 
 /**

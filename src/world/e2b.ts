@@ -346,8 +346,7 @@ class E2BWorld implements World {
         return { stdout: String(result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
           code: Number(result?.exitCode ?? 0) };
       } catch (error: any) {
-        return { stdout: String(error?.stdout ?? ''), stderr: String(error?.stderr ?? error?.message ?? error),
-          code: Number(error?.exitCode ?? error?.code ?? 1) };
+        return commandErrorResult(error);
       }
     }
     try {
@@ -358,11 +357,7 @@ class E2BWorld implements World {
         code: Number(result?.exitCode ?? result?.code ?? 0),
       };
     } catch (error: any) {
-      return {
-        stdout: String(error?.stdout ?? ''),
-        stderr: String(error?.stderr ?? error?.message ?? error),
-        code: Number(error?.exitCode ?? error?.code ?? 1),
-      };
+      return commandErrorResult(error);
     }
   }
 
@@ -585,6 +580,20 @@ class E2BWorld implements World {
     timer.unref();
     return () => { if (!stopped) { stopped = true; clearInterval(timer); } };
   }
+}
+
+/** E2B uses CommandExitError with a numeric exitCode for ordinary process
+ * failures. Timeout/socket/control-plane failures have no numeric process exit;
+ * rethrow those intact so the activity boundary can inspect their structured
+ * code/cause instead of receiving an invalid `ExecResult.code = NaN`. */
+function commandErrorResult(error: any): ExecResult {
+  const code = Number(error?.exitCode ?? error?.code);
+  if (!Number.isFinite(code)) throw error;
+  return {
+    stdout: String(error?.stdout ?? ''),
+    stderr: String(error?.stderr ?? error?.message ?? error),
+    code,
+  };
 }
 
 /** Trusted-provisioning adapter over the sandbox SDK. Never catches: real SDK
