@@ -3,13 +3,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
-import type { Project, ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
+import type { IgnoredResourceInventory, Project, ResourceAttachment, ResourceAccess, ResourceCandidate,
+  ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { worldRelativePath } from './types.js';
+import { worldRelativePath, worldRepos } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
   SIG_ENQUEUE_RESOURCE_PUBLISH, SIG_RELEASE_RESOURCE_PUBLISH,
@@ -35,6 +36,12 @@ export interface CopyGlobsMigrationResult {
   data: string[];
   reused: string[];
   skipped: string[];
+}
+
+export interface ProposedResourceCandidate {
+  candidate: ResourceCandidate;
+  attachment: ResourceAttachment;
+  revision?: ResourceRevision;
 }
 
 /** Replaceable snapshot data-plane contract (SPEC §11.4). The built-in engine
@@ -302,12 +309,18 @@ export class ProjectResourceService {
 
   async release(handle: WorldHandle): Promise<void> {
     await this.scrubSecrets(handle);
+    const world = await this.worlds.open(handle).catch(() => undefined);
     const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object')
       for (const value of Object.values(serviceHandles as Record<string, unknown>))
         if (typeof value === 'string') this.broker.deleteHandle(value);
     for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
+      // Read-only projections remove write permission recursively. Restore owner
+      // write permission before a local/provider cleanup tries to unlink them;
+      // otherwise a perfectly released resource can make world destruction fail.
+      if (world && attachment?.access === 'read' && attachment.target.kind === 'path')
+        await world.exec('chmod', ['-R', 'u+w', safePath(attachment.target.path)]).catch(() => undefined);
       this.store.updateResourceLease(lease.id, 'released');
       if (attachment) this.store.appendAudit({ principalId: `task:${lease.taskId}`, action: 'resource:release',
         scopeKey: `project:${attachment.projectId}`, detail: { attachmentId: attachment.id, leaseId: lease.id } });
@@ -438,7 +451,11 @@ export class ProjectResourceService {
     const attachment = this.store.getResourceAttachment(attachmentId);
     if (!attachment) return;
     for (const revision of this.store.listResourceRevisions(attachmentId)) await this.engine.delete?.(revision);
-    for (const handle of attachment.credentialHandles) this.broker.deleteHandle(handle);
+    // An attachment may project a first-class vault item. Removing the
+    // projection must not destroy the underlying credential, which may already
+    // control a live external account or be used by another project.
+    if (typeof attachment.source.vaultItemId !== 'string')
+      for (const handle of attachment.credentialHandles) this.broker.deleteHandle(handle);
     this.store.deleteResourceAttachment(attachmentId);
   }
 
@@ -451,6 +468,171 @@ export class ProjectResourceService {
 
   deleteOrganizationKey(organizationId: string): void {
     this.broker.deleteHandle(`${RESOURCE_KEY_PREFIX}${organizationId}`);
+  }
+
+  /** Stage a declared non-secret path from the caller's current generation.
+   * The disabled attachment reserves its accepted shape, while the encrypted
+   * revision makes the bytes durable before a reviewer decides. */
+  async proposePath(taskId: string, input: { path: string; name: string; target: ResourceTarget;
+    access?: ResourceAccess; publish?: ResourcePublishPolicy; driver?: 'volume@1' | 'object-tree@1' }): Promise<ProposedResourceCandidate> {
+    const { task, project, handle, world } = await this.currentTaskWorld(taskId);
+    const sourcePath = safePath(input.path);
+    if (sourcePath === '.' || sourcePath === '.env' || sourcePath === '.git' || sourcePath.startsWith('.git/')
+      || sourcePath.startsWith('.karmax-injection/'))
+      throw new Error('candidate path must name declared non-secret task output, not the world root or an injection path');
+    const projections = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>);
+    if (projections.some((projection) => projection.target && pathsOverlap(projection.target, sourcePath)))
+      throw new Error('path already belongs to an attached resource; promote that resource instead');
+    if (this.store.listResourceCandidates(taskId, false).some((candidate) => candidate.sourcePath
+      && pathsOverlap(candidate.sourcePath, sourcePath)))
+      throw new Error('path is already staged as a resource candidate');
+    const kind = await world.exec('bash', ['-lc', `if test -f ${quote(sourcePath)}; then printf file; elif test -d ${quote(sourcePath)}; then printf directory; else exit 1; fi`]);
+    if (kind.code !== 0) throw new Error('candidate path must be an existing regular file or directory in this task world');
+    const links = await world.exec('bash', ['-lc',
+      `test ! -L ${quote(sourcePath)} && test -z "$(find ${quote(sourcePath)} -type l -print -quit)"`]);
+    if (links.code !== 0) throw new Error('candidate paths cannot contain symbolic links');
+    const access = input.access ?? 'read';
+    const publish = access === 'write' ? (input.publish ?? 'review') : 'discard';
+    const attachment = this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: input.name, driver: input.driver ?? 'volume@1', target: input.target, access, isolation: 'fork',
+      source: { candidate: true, createdByTaskId: task.id, sourcePath, shape: kind.stdout === 'file' ? 'file' : 'directory' },
+      credentialHandles: [], publish, enabled: false });
+    // Create the task/world-generation ownership record before the potentially
+    // long snapshot. If the control plane stops mid-stream, Review can still
+    // see and discard the incomplete attachment instead of leaking an orphan.
+    const candidate = this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+      taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1, attachmentId: attachment.id,
+      sourceKind: 'path', sourcePath });
+    try {
+      const captured = await this.engine.capture(attachment, filesFromWorld(world, sourcePath, attachment));
+      const revision = this.store.saveResourceRevision({ attachmentId: attachment.id, engine: this.engine.id,
+        ...captured, metadata: { candidate: true, sourcePath }, createdByTaskId: task.id });
+      this.store.promoteResourceRevision(attachment.id, revision.id);
+      this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
+        worldId: handle.id, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes, unit: 'byte',
+        costMicros: 0, startedAt: candidate.createdAt, endedAt: candidate.createdAt,
+        metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } });
+      this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
+        scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
+          sourcePath, worldGeneration: candidate.worldGeneration, bytes: captured.bytes, files: captured.files } });
+      return { candidate, attachment: this.store.getResourceAttachment(attachment.id)!, revision };
+    } catch (error) {
+      await this.discardCandidate(taskId, candidate.id, 'system:resource-stage-failed').catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Create a reviewable projection of a vault item without resolving its
+   * plaintext. Authorization/provenance of the item is checked by KarmaxApi. */
+  async proposeCredential(taskId: string, input: { itemId: string; field: string; credentialHandle: string;
+    name: string; driver: 'secret@1' | 'service@1' | 'database@1'; target: ResourceTarget;
+    access?: ResourceAccess; source?: Record<string, unknown> }): Promise<ProposedResourceCandidate> {
+    const { task, project, handle } = await this.currentTaskWorld(taskId);
+    if (!this.broker.hasHandle(input.credentialHandle)) throw new Error('vault item field is not stored');
+    const shared = input.driver === 'service@1' || input.driver === 'database@1';
+    const attachment = this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+      name: input.name, driver: input.driver, target: input.target, access: input.access ?? 'read',
+      isolation: shared ? 'shared' : 'fork', source: { ...input.source, candidate: true,
+        createdByTaskId: task.id, vaultItemId: input.itemId, vaultField: input.field },
+      credentialHandles: [input.credentialHandle], publish: 'discard', enabled: false });
+    try {
+      const candidate = this.store.createResourceCandidate({ organizationId: project.organizationId!, projectId: project.id,
+        taskId, worldId: handle.id, worldGeneration: handle.generation ?? 1, attachmentId: attachment.id,
+        sourceKind: 'vault-item', vaultItemId: input.itemId, vaultField: input.field });
+      this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
+        scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,
+          vaultItemId: input.itemId, vaultField: input.field, worldGeneration: candidate.worldGeneration } });
+      return { candidate, attachment };
+    } catch (error) {
+      this.store.deleteResourceAttachment(attachment.id);
+      throw error;
+    }
+  }
+
+  adoptCandidate(taskId: string, candidateId: string, resolvedBy: string): ProposedResourceCandidate {
+    const candidate = this.requiredCandidate(taskId, candidateId);
+    if (candidate.state === 'adopted') {
+      const attachment = this.store.getResourceAttachment(candidate.attachmentId);
+      if (!attachment?.enabled) throw new Error('adopted resource candidate attachment is unavailable');
+      const revision = attachment.currentRevisionId
+        ? this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+      return { candidate, attachment, revision };
+    }
+    const adopted = this.store.adoptResourceCandidate(candidate.id, taskId, resolvedBy);
+    const revision = adopted.attachment.currentRevisionId
+      ? this.store.getResourceRevision(adopted.attachment.currentRevisionId) : undefined;
+    this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-adopt',
+      scopeKey: `project:${candidate.projectId}`, detail: { candidateId, attachmentId: candidate.attachmentId,
+        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } });
+    return { ...adopted, revision };
+  }
+
+  async discardCandidate(taskId: string, candidateId: string, resolvedBy: string): Promise<ResourceCandidate> {
+    const existing = this.store.getResourceCandidate(candidateId);
+    if (!existing || existing.taskId !== taskId) throw new Error('resource candidate does not belong to task');
+    if (existing.state === 'discarded') return existing;
+    const candidate = this.store.beginDiscardResourceCandidate(candidateId, taskId);
+    await this.deleteAttachment(candidate.attachmentId);
+    const discarded = this.store.resolveResourceCandidate(candidate.id, 'discarded', resolvedBy);
+    this.store.appendAudit({ principalId: resolvedBy, action: 'resource:candidate-discard',
+      scopeKey: `project:${candidate.projectId}`, detail: { candidateId, attachmentId: candidate.attachmentId,
+        taskId, worldId: candidate.worldId, worldGeneration: candidate.worldGeneration } });
+    return discarded;
+  }
+
+  async discardTaskCandidates(taskId: string, resolvedBy: string): Promise<void> {
+    for (const candidate of this.store.listResourceCandidates(taskId)
+      .filter((value) => value.state === 'pending' || value.state === 'discarding'))
+      await this.discardCandidate(taskId, candidate.id, resolvedBy);
+  }
+
+  /** Metadata-only safety net for ignored output that has neither an attachment
+   * nor a staged candidate. No bytes are read and the bounded result is safe to
+   * show at checkpoint/Review. */
+  async ignoredInventory(taskId: string, limit = 100): Promise<IgnoredResourceInventory> {
+    const { handle, world } = await this.currentTaskWorld(taskId);
+    const excluded = [
+      ...Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
+        .map((projection) => projection.target).filter((value): value is string => Boolean(value)),
+      ...this.store.listResourceCandidates(taskId, false).map((candidate) => candidate.sourcePath)
+        .filter((value): value is string => Boolean(value)),
+    ];
+    const found: IgnoredResourceInventory['entries'] = [];
+    let truncated = false;
+    const repos = worldRepos(handle);
+    for (const repo of repos) {
+      const listed = await world.exec('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], { cwd: repo.root });
+      if (listed.code !== 0) continue;
+      for (const raw of listed.stdout.split('\0').filter(Boolean)) {
+        const local = raw.replace(/\/$/, '');
+        const relative = repos.length > 1 ? `${repo.name}/${local}` : local;
+        if (excluded.some((root) => pathsOverlap(root, relative))) continue;
+        if (found.length >= Math.max(1, Math.min(limit, 500))) { truncated = true; break; }
+        const sized = await world.exec('du', ['-sb', '--', local], { cwd: repo.root });
+        const bytes = sized.code === 0 ? Number(sized.stdout.trim().split(/\s+/)[0]) : 0;
+        found.push({ ...(repos.length > 1 ? { checkout: repo.name } : {}), path: relative,
+          bytes: Number.isFinite(bytes) ? bytes : 0, likelySecret: likelySecretPath(relative) });
+      }
+      if (truncated) break;
+    }
+    return { entries: found, truncated };
+  }
+
+  private async currentTaskWorld(taskId: string) {
+    const task = this.store.getTask(taskId);
+    if (!task) throw new Error('calling task not found');
+    const project = this.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new Error('calling task project is unavailable');
+    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!handle) throw new Error('calling task has no active world');
+    this.store.assertCurrentWorld(handle);
+    return { task, project, handle, world: await this.worlds.open(handle) };
+  }
+
+  private requiredCandidate(taskId: string, candidateId: string): ResourceCandidate {
+    const candidate = this.store.getResourceCandidate(candidateId);
+    if (!candidate || candidate.taskId !== taskId) throw new Error('resource candidate does not belong to task');
+    return candidate;
   }
 
   async summarize(taskId: string, attachmentId: string): Promise<ResourceChangeSummary> {
@@ -697,6 +879,21 @@ function compareManifests(attachmentId: string, baseRevisionId: string | undefin
 
 function emptyManifest(attachmentId: string): SnapshotManifest {
   return { version: 1, attachmentId, files: [], rootDigest: sha256(Buffer.from('[]')), bytes: 0 };
+}
+
+function pathContains(root: string, value: string): boolean {
+  const normalizedRoot = root.replace(/\\/g, '/').replace(/\/$/, '');
+  const normalizedValue = value.replace(/\\/g, '/').replace(/\/$/, '');
+  return normalizedValue === normalizedRoot || normalizedValue.startsWith(`${normalizedRoot}/`);
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return pathContains(left, right) || pathContains(right, left);
+}
+
+function likelySecretPath(value: string): boolean {
+  const base = path.posix.basename(value).toLowerCase();
+  return /^\.env(?:\.|$)/.test(base) || /(?:secret|credential|token|private[-_.]?key|\.pem$|\.p12$|\.key$)/i.test(base);
 }
 
 async function* asAsync(values: Iterable<SnapshotInputFile> | AsyncIterable<SnapshotInputFile>): AsyncGenerator<SnapshotInputFile> {

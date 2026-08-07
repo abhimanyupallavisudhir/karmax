@@ -99,7 +99,10 @@ describe('GitHub App integration', () => {
     expect(manifest.action).toBe('https://github.com/settings/apps/new');
     expect(manifest.manifest).toMatchObject({ setup_url: 'https://karmax.example/api/github/callback',
       redirect_url: 'https://karmax.example/api/github/manifest/callback/state',
-      setup_on_update: true, callback_urls: ['https://karmax.example/api/github/oauth/callback'] });
+      setup_on_update: true, callback_urls: [
+        'https://karmax.example/api/github/oauth/callback',
+        'https://karmax.example/api/auth/callback/github',
+      ], default_permissions: { email_addresses: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
     expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review']);
@@ -108,6 +111,7 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).not.toHaveProperty('default_permissions.administration');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
+    expect(service.oauthCredentials()).toEqual({ clientId: 'Iv1.client', clientSecret: 'client-secret' });
     expect(service.status('owner')).toMatchObject({ configured: true, appSlug: 'karmax-acme', oauthConfigured: true,
       webhookConfigured: true, userAuthorized: false });
     expect(JSON.stringify(service.status('owner'))).not.toContain('secret');
@@ -125,6 +129,33 @@ describe('GitHub App integration', () => {
     expect(calls.some((call) => call.path.endsWith('/keys'))).toBe(false);
     expect(calls.some((call) => call.path === '/user/installations/42/repositories/77' && call.method === 'PUT')).toBe(true);
     expect(calls.find((call) => call.path === '/login/oauth/access_token')?.body).toContain('redirect_uri=');
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adopts a sign-in authorization as a personal GitHub connection', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-signin-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/user' && String((init.headers as Record<string, string>)?.authorization) === 'Bearer sign-in-token')
+        return Response.json({ id: 42, login: 'octocat', name: 'The Octocat' });
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+
+    await expect(service.adoptUserAuthorization('user-1', '42', {
+      accessToken: 'sign-in-token',
+      refreshToken: 'refresh-token',
+      accessTokenExpiresAt: new Date(Date.now() + 28_800_000),
+      refreshTokenExpiresAt: new Date(Date.now() + 15_552_000_000),
+    })).resolves.toEqual({ id: '42', login: 'octocat', name: 'The Octocat' });
+    await expect(service.listUserAccounts('user-1')).resolves.toEqual([
+      expect.objectContaining({ id: '42', login: 'octocat', active: true }),
+    ]);
+    await expect(service.userAccessToken('user-1')).resolves.toBe('sign-in-token');
+
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 

@@ -17,7 +17,7 @@ import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
-import { defaultModel, defaultEffort } from '../agent/profiles.js';
+import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { defaultBranch } from '../world/git.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
@@ -122,6 +122,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  if (p === '/api/user/export') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -133,10 +134,13 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
-  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/app-manifest$/.test(p)) return 'settings:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/app$/.test(p)) return read ? 'repository:read' : 'settings:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:authorize|install-url|refresh|identity)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
@@ -191,7 +195,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/defaults/')) return 'task:read';
-  if (p.startsWith('/api/profiles')) return read ? 'profile:read' : 'profile:write';
+  if (p.startsWith('/api/profiles')) {
+    const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
+    return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
+  }
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments') return 'task:create';
@@ -218,6 +225,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
     return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
+  if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
@@ -229,6 +237,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (p === '/api/agent/resource-candidates') return 'task:review:write';
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
@@ -1239,20 +1248,45 @@ export class Gateway {
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
       }
+      if (p === '/api/user/export' && method === 'GET') {
+        // Broad task-agent capabilities never imply ownership of a human's
+        // personal archive. Only a verified browser identity has `session.userId`.
+        if (!session.userId || !this.deps.identity)
+          return this.json(res, 401, { error: 'a signed-in user account is required' });
+        const identityData = this.deps.identity.exportUserData(session.userId);
+        const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
+        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId));
+        const linked = store.exportUserData(session.userId, String(identityData.profile.email ?? session.email ?? ''));
+        const { format, version, exportedAt, security, ...linkedData } = linked;
+        const value = {
+          format,
+          version,
+          exportedAt,
+          profile: identityData.profile,
+          authentication: identityData.authentication,
+          git: { defaultProfile: gitProfiles.defaultProfile() ?? null, profiles: gitProfiles.list() },
+          security,
+          ...linkedData,
+        };
+        const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
+          .split('@')[0]!.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'user';
+        return this.downloadJson(res, `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
+      }
       if (p === '/api/settings/access' && method === 'GET') {
         if (!requestedScope.projectId && !requestedScope.organizationId)
           return this.json(res, 400, { error: 'Choose a project or organization.' });
         const allowed = (capability: string, scope: { projectId?: string; organizationId?: string } = {}) =>
           this.deps.tokens.check(token, capability, scope).ok;
         return this.json(res, 200, {
-          appearance: allowed('settings:write'),
-          capacity: allowed('queue:write'),
-          safeMode: allowed('safe-mode:write'),
           organization: requestedScope.organizationId
             ? allowed('organization:edit', { organizationId: requestedScope.organizationId }) : false,
           project: requestedScope.projectId
             ? allowed('project:delete', { projectId: requestedScope.projectId }) : false,
         });
+      }
+      if (p === '/api/settings/installation' && method === 'GET') {
+        return this.json(res, 200, { canManage: this.deps.tokens.check(token, 'settings:write').ok,
+          hostLocal: this.hostLocal });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
@@ -1329,9 +1363,13 @@ export class Gateway {
       }
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
-        const value = store.exportOrganization(organizationExport[1]!);
-        res.setHeader('Content-Disposition', `attachment; filename="krmax-${organizationExport[1]!}-export.json"`);
-        return this.json(res, 200, value);
+        const organizationId = organizationExport[1]!;
+        const organization = store.getOrganization(organizationId);
+        const value = store.exportOrganization(organizationId);
+        const label = String(organization?.slug || organizationId).toLowerCase()
+          .replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'organization';
+        return this.downloadJson(res,
+          `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
         const organizationId = organizationMatch[1]!;
@@ -1538,7 +1576,7 @@ export class Gateway {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
         if (method === 'PUT') {
-          if (!this.deps.tokens.check(token, 'user:write').ok)
+          if (!this.deps.tokens.check(token, 'settings:write').ok)
             return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });
           const b = await this.body(req);
           try {
@@ -1552,7 +1590,7 @@ export class Gateway {
       if (githubManifest && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
-        if (!this.deps.tokens.check(token, 'user:write').ok)
+        if (!this.deps.tokens.check(token, 'settings:write').ok)
           return this.json(res, 403, { error: 'Only a Krmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
@@ -1972,12 +2010,14 @@ export class Gateway {
       // write-only; .env example files provide lazy suggestions.
       const projectSecrets = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
       if (projectSecrets && ['GET', 'POST', 'DELETE'].includes(method)) {
+        if (method !== 'GET' && this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents must store generated credentials in the vault and propose them for Review' });
         const project = store.getProject(projectSecrets[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.broker || !this.deps.resources)
           return this.json(res, 503, { error: 'project resources are unavailable' });
         const resources = store.listResourceAttachments(project.id, true)
-          .filter((resource) => resource.driver === 'secret@1');
+          .filter((resource) => resource.driver === 'secret@1' && !stagedResourceCandidate(resource));
         const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
         if (method === 'GET' && !encodedName) {
           const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
@@ -2120,12 +2160,14 @@ export class Gateway {
             const body = await this.body(req);
             if (body.seedResourceId) {
               const resource = store.getResourceAttachment(String(body.seedResourceId));
-              if (!resource || resource.projectId !== project.id || resource.target.kind !== 'path')
+              if (!resource || resource.projectId !== project.id || !resource.enabled
+                || stagedResourceCandidate(resource) || resource.target.kind !== 'path')
                 return this.json(res, 400, { error: 'seed resource must be a path resource in this project' });
             }
             if (body.connectionResourceId) {
               const resource = store.getResourceAttachment(String(body.connectionResourceId));
-              if (!resource || resource.projectId !== project.id || !credentialResource(resource))
+              if (!resource || resource.projectId !== project.id || !resource.enabled
+                || stagedResourceCandidate(resource) || !credentialResource(resource))
                 return this.json(res, 400, { error: 'connection resource must be a secret/service attachment in this project' });
             }
             return this.json(res, 200, { service: services.save(project.id, body as any) });
@@ -2146,11 +2188,14 @@ export class Gateway {
         const project = store.getProject(projectResources[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
-        if (method === 'GET') return this.json(res, 200, store.listResourceAttachments(project.id, true).map((resource) => ({
+        if (method === 'GET') return this.json(res, 200, store.listResourceAttachments(project.id, true)
+          .filter((resource) => !stagedResourceCandidate(resource)).map((resource) => ({
           ...redactResource(resource),
           revision: resource.currentRevisionId ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined,
         })));
         if (method === 'POST') {
+          if (this.deps.tokens.verify(token)?.kind === 'agent')
+            return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
           const b = await this.body(req, 600 * 1024 * 1024);
           const id = newId('resource');
           const driver = String(b.driver ?? 'volume@1');
@@ -2196,6 +2241,8 @@ export class Gateway {
       }
       const copyGlobsMigration = p.match(/^\/api\/projects\/([^/]+)\/resources\/import-copyglobs$/);
       if (copyGlobsMigration && method === 'POST') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'copyGlobs migration is a human project-settings operation' });
         const project = store.getProject(copyGlobsMigration[1]!);
         if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
         // `hostLocal`, not `hosted` — the same gate as the scan/import routes above,
@@ -2219,6 +2266,10 @@ export class Gateway {
       if (projectResource) {
         const resource = store.getResourceAttachment(projectResource[2]!);
         if (!resource || resource.projectId !== projectResource[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'this staged resource must be adopted or discarded from its task Review' });
+        if ((method === 'PATCH' || method === 'DELETE') && this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents cannot administer durable project resources directly' });
         if (method === 'GET') return this.json(res, 200, { ...redactResource(resource),
           revisions: store.listResourceRevisions(resource.id).map(redactResourceRevision) });
         if (method === 'PATCH') {
@@ -2254,6 +2305,8 @@ export class Gateway {
       }
       const projectResourceScan = p.match(/^\/api\/projects\/([^/]+)\/resources\/scan$/);
       if (projectResourceScan && method === 'GET') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents can inventory only their own current world' });
         const project = store.getProject(projectResourceScan[1]!);
         if (!project) return this.json(res, 404, { error: 'project not found' });
         // `hosted` and `hostLocal` are orthogonal: a self-host served on a public
@@ -2266,8 +2319,12 @@ export class Gateway {
       }
       const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
       if (resourceUploadCreate && method === 'POST') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceUploadCreate[2]!);
         if (!resource || resource.projectId !== resourceUploadCreate[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'staged resource candidates cannot be modified before Review' });
         if (!isSnapshotResourceDriver(resource.driver) || !this.deps.objects) return this.json(res, 400, { error: 'resumable uploads require a snapshot resource and object store' });
         const id = newId('resource-upload');
         const upload: ResourceUploadSession = { id, organizationId: resource.organizationId, projectId: resource.projectId,
@@ -2277,6 +2334,8 @@ export class Gateway {
       }
       const resourceUpload = p.match(/^\/api\/resource-uploads\/([^/]+)$/);
       if (resourceUpload) {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents cannot modify durable project resource uploads directly' });
         const upload = resourceUploadSession(store, resourceUpload[1]!);
         if (!upload || upload.projectId !== url.searchParams.get('projectId')) return this.json(res, 404, { error: 'resource upload not found' });
         if (!this.deps.objects || !this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
@@ -2316,8 +2375,12 @@ export class Gateway {
       }
       const resourceImport = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/import$/);
       if (resourceImport && method === 'POST') {
+        if (this.deps.tokens.verify(token)?.kind === 'agent')
+          return this.json(res, 403, { error: 'task agents must use propose_project_resource and wait for Review' });
         const resource = store.getResourceAttachment(resourceImport[2]!);
         if (!resource || resource.projectId !== resourceImport[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(resource)) return this.json(res, 409,
+          { error: 'staged resource candidates cannot be modified before Review' });
         if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
         const b = await this.body(req, 600 * 1024 * 1024);
         try {
@@ -2335,7 +2398,10 @@ export class Gateway {
         const task = store.getTask(taskResources[1]!);
         if (!task || !this.deps.resources) return this.json(res, task ? 503 : 404, { error: task ? 'project resources are unavailable' : 'task not found' });
         const summaries = [];
+        const candidates = store.listResourceCandidates(task.id);
+        const candidateAttachments = new Set(candidates.map((candidate) => candidate.attachmentId));
         for (const resource of store.listResourceAttachments(task.projectId)) {
+          if (candidateAttachments.has(resource.id)) continue;
           if (resource.access !== 'write' || resource.target.kind !== 'path') continue;
           try { summaries.push({ resource: redactResource(resource), summary: await this.deps.resources.summarize(task.id, resource.id) }); }
           catch (error) {
@@ -2345,7 +2411,24 @@ export class Gateway {
               : { resource: redactResource(resource), error: message });
           }
         }
+        for (const candidate of candidates) {
+          const resource = store.getResourceAttachment(candidate.attachmentId);
+          summaries.push({ candidate,
+            ...(resource ? { resource: redactResource(resource), revision: resource.currentRevisionId
+              ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined }
+              : { resource: { id: candidate.attachmentId, name: 'Resource candidate' } }) });
+        }
         return this.json(res, 200, summaries);
+      }
+      const taskResourceInventory = p.match(/^\/api\/tasks\/([^/]+)\/resources\/inventory$/);
+      if (taskResourceInventory && method === 'GET') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        try { return this.json(res, 200, await this.deps.resources.ignoredInventory(taskResourceInventory[1]!)); }
+        catch (error) {
+          const checkpointed = store.latestWorldCheckpoint(taskResourceInventory[1]!)?.ignored;
+          if (checkpointed) return this.json(res, 200, checkpointed);
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const taskResourcePromote = p.match(/^\/api\/tasks\/([^/]+)\/resources\/([^/]+)\/promote$/);
       if (taskResourcePromote && method === 'POST') {
@@ -2364,6 +2447,16 @@ export class Gateway {
           await this.deps.resources.discard(taskResourceDiscard[1]!, taskResourceDiscard[2]!);
           return this.json(res, 200, { discarded: true });
         } catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const taskResourceCandidate = p.match(/^\/api\/tasks\/([^/]+)\/resource-candidates\/([^/]+)\/(adopt|discard)$/);
+      if (taskResourceCandidate && method === 'POST') {
+        try {
+          const result = taskResourceCandidate[3] === 'adopt'
+            ? await api.adoptProjectResource(token, taskResourceCandidate[1]!, taskResourceCandidate[2]!)
+            : await api.discardProjectResource(token, taskResourceCandidate[1]!, taskResourceCandidate[2]!);
+          return this.json(res, 200, result);
+        } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
       if (projectMembers) {
@@ -2922,6 +3015,12 @@ export class Gateway {
         try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      if (p === '/api/agent/resource-candidates' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.proposeProjectResource(token, b as any)); }
+        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
+      }
       if (p === '/api/agent/escalate' && method === 'POST') {
         const b = await this.body(req);
         try {
@@ -3426,8 +3525,8 @@ export class Gateway {
         return this.json(res, 200, api.pinWorkflow(token, { projectId: pinsMatch[1]!, workflow: String(b.workflow), version: b.version ? String(b.version) : undefined }));
       }
 
-      // profiles (agent role profiles). Global scope by default; a project overlay
-      // (id `<projectId>::<role>-default`) overrides global per project (SPEC §7/§9).
+      // Agent-role defaults resolve project → organization → bundled/legacy.
+      // Unscoped access is reserved for the operator-owned fallback records.
       if (p === '/api/profiles' && method === 'GET') {
         // Annotate each profile with the workflow(s) that declare its role, so the
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
@@ -3454,12 +3553,21 @@ export class Gateway {
         };
         const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
-        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
-        // effective per-role view: the project override if present, else global (inherited)
+        const requestedOrganizationId = url.searchParams.get('organizationId') ?? undefined;
         const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr));
-        const view = globals.map((g) => {
-          const proj = store.getProfile(`${pid}::${g.role}-default`);
-          return withRole({ ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g });
+        if (!pid && !requestedOrganizationId) return this.json(res, 200, globals.map(withRole));
+        const organizationId = requestedOrganizationId ?? (pid ? store.getProject(pid)?.organizationId : undefined);
+        if (!organizationId) return this.json(res, 404, { error: 'organization not found' });
+        const organizations = globals.map((global) => {
+          const own = store.getProfile(organizationProfileId(organizationId, global.role));
+          return withRole({ ...(own ?? global), id: organizationProfileId(organizationId, global.role), role: global.role,
+            scope: own ? 'organization' : 'inherited', inherited: global });
+        });
+        if (!pid) return this.json(res, 200, organizations);
+        const view = organizations.map((organization) => {
+          const own = store.getProfile(projectProfileId(pid, organization.role));
+          return withRole({ ...(own ?? organization), id: projectProfileId(pid, organization.role), role: organization.role,
+            scope: own ? 'project' : 'inherited', inherited: organization });
         });
         return this.json(res, 200, view);
       }
@@ -3480,10 +3588,18 @@ export class Gateway {
         }
         const { roleDef } = await import('../contrib/manifests.js');
         if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
-        const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
+        const queryProjectId = url.searchParams.get('projectId') ?? undefined;
+        const queryOrganizationId = url.searchParams.get('organizationId') ?? undefined;
+        if (b.projectId && String(b.projectId) !== queryProjectId)
+          return this.json(res, 400, { error: 'project profile scope must match the request' });
+        if (b.organizationId && String(b.organizationId) !== queryOrganizationId)
+          return this.json(res, 400, { error: 'organization profile scope must match the request' });
+        const id = queryProjectId ? projectProfileId(queryProjectId, String(b.role))
+          : queryOrganizationId ? organizationProfileId(queryOrganizationId, String(b.role)) : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
         const {
           projectId: _pid,
+          organizationId: _oid,
           scope: _s,
           inherited: _i,
           modelProvider: _legacyModelProvider,
@@ -3497,10 +3613,19 @@ export class Gateway {
         store.upsertProfile({ provider: 'claude', ...rest, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
-      // reset a project profile override back to the global default
+      // Reset one scoped override back to the next inherited layer.
       const profDelMatch = p.match(/^\/api\/profiles\/(.+)$/);
       if (profDelMatch && method === 'DELETE') {
-        store.deleteProfile(decodeURIComponent(profDelMatch[1]!));
+        const id = decodeURIComponent(profDelMatch[1]!);
+        const queryProjectId = url.searchParams.get('projectId') ?? undefined;
+        const queryOrganizationId = url.searchParams.get('organizationId') ?? undefined;
+        if (queryProjectId && !id.startsWith(`${queryProjectId}::`))
+          return this.json(res, 400, { error: 'project profile scope must match the request' });
+        if (queryOrganizationId && !id.startsWith(`organization:${queryOrganizationId}::`))
+          return this.json(res, 400, { error: 'organization profile scope must match the request' });
+        if (!queryProjectId && !queryOrganizationId && id.includes('::'))
+          return this.json(res, 400, { error: 'scoped profile deletion needs its project or organization' });
+        store.deleteProfile(id);
         return this.json(res, 200, { ok: true });
       }
 
@@ -3514,12 +3639,12 @@ export class Gateway {
         const publicUrl = this.publicUrl(req);
         if (method === 'GET') return this.json(res, 200, {
           ...provider.platformStatus(),
-          canManage: this.deps.tokens.check(token, 'user:write').ok,
+          canManage: this.deps.tokens.check(token, 'settings:write').ok,
           callbackUrl: `${publicUrl}/api/payments/stripe/callback`,
           webhookUrl: `${publicUrl}/api/payments/stripe/webhook`,
         });
         if (method === 'PUT') {
-          if (!this.deps.tokens.check(token, 'user:write').ok)
+          if (!this.deps.tokens.check(token, 'settings:write').ok)
             return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared Stripe Connect application' });
           const b = await this.body(req);
           try {
@@ -5049,9 +5174,7 @@ export class Gateway {
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
-      const prof =
-        (projectId ? this.deps.store.getProfile(`${projectId}::${f.role}-default`) : undefined) ??
-        this.deps.store.getProfile(`${f.role}-default`);
+      const prof = roleDefaultProfile(this.deps.store, f.role, projectId);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
@@ -5740,6 +5863,18 @@ export class Gateway {
       'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
+  private downloadJson(res: http.ServerResponse, filename: string, obj: unknown) {
+    const body = `${JSON.stringify(toPublicPayload(obj ?? null), null, 2)}\n`;
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-disposition': `attachment; filename="${filename.replace(/["\\\r\n]/g, '_')}"`,
+      'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff',
+      'content-length': String(Buffer.byteLength(body)),
+      'x-karmax-cell': this.deps.cellId ?? 'local',
+    });
+    res.end(body);
+  }
   private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {
     const body = `<!doctype html><meta charset="utf-8"><title>Krmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
@@ -5966,6 +6101,10 @@ function parseEnvironmentValues(text: string): Array<{ name: string; value: stri
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
   const { credentialHandles, ...safe } = resource;
   return { ...safe, credentialConfigured: credentialHandles.length > 0 };
+}
+
+function stagedResourceCandidate(resource: ResourceAttachment): boolean {
+  return resource.enabled === false && resource.source.candidate === true;
 }
 
 function redactResourceRevision(revision: ResourceRevision | undefined): Omit<ResourceRevision, 'sealedRef'> | undefined {

@@ -25,6 +25,7 @@ describe('portable world checkpoints', () => {
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
     await ensureIdentity(repo);
     fs.writeFileSync(path.join(repo, 'tracked.txt'), 'before\n');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored-data/\n');
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
 
@@ -36,12 +37,14 @@ describe('portable world checkpoints', () => {
     worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
-    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker);
+    const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker);
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker, undefined, resources);
     const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main' });
     world.handle.meta = { projectId: project.id, ephemeralPaths: ['private.bin'] };
     world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
     const stale = { ...world.handle };
     await world.writeFileBuffer!('binary.dat', Buffer.from([0, 1, 2, 255]));
+    await world.writeFileBuffer!('ignored-data/model.bin', Buffer.alloc(321, 9));
     await world.writeFile('private.bin', 'injected credential material');
     await world.writeFile('tracked.txt', 'after\n');
     expect((await world.exec('git', ['mv', 'tracked.txt', 'renamed.txt'])).code).toBe(0);
@@ -50,6 +53,8 @@ describe('portable world checkpoints', () => {
     const encrypted = await objects.get(checkpoint.filesystemDelta!.objectKey);
     expect(encrypted.subarray(0, 4).toString()).toBe('KMX1');
     expect(encrypted.toString()).not.toContain('after');
+    expect(checkpoint.ignored?.entries).toContainEqual(expect.objectContaining({ path: 'ignored-data' }));
+    expect(checkpoint.ignored!.entries[0]!.bytes).toBeGreaterThanOrEqual(321);
     await world.destroy();
 
     const restoredHandle = await checkpoints.restore(checkpoint.id, 'worktree');
