@@ -153,6 +153,8 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
       args: [routed({ taskId, repo, prompt: '@write r.txt :: hi\n@review done' }, [human('@creator')])],
     });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 10_000 })
+      .toMatchObject({ kind: 'human', audience: ['@creator'] });
 
     const v0 = await view(handle);
     expect(v0.editableParams).toContain('confirm'); // NOT frozen at queue
@@ -231,7 +233,8 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     // cannot answer "is user:ghost a human here?", so the gate must never park on one.
     await expect(h.api.updateParams(token, task.id, { confirm: { layers: [human('user:ghost')] } }))
       .rejects.toThrow(/does not resolve to a human/i);
-    expect((await view(handle)).waitingFor?.audience).toEqual(['@creator']); // untouched
+    await expect.poll(async () => (await view(handle)).waitingFor?.audience, { timeout: 10_000 })
+      .toEqual(['@creator']); // untouched
 
     const applied = await h.api.updateParams(token, task.id, { confirm: { layers: [] } });
     expect(applied.applied).toEqual(['confirm']);
