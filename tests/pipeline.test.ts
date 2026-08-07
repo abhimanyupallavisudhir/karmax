@@ -30,6 +30,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   let cancellationCleanupFinishedAt = 0;
   let releaseResourceCandidateTurn: (() => void) | undefined;
+  let resourceCandidateTurnIntercepted = false;
   beforeAll(async () => {
     const mock = new MockAdapter();
     const restartSession = 'restart-regression-session';
@@ -39,7 +40,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
-        if (input.messages.some((m) => m.text.includes('@resource-candidate-regression'))) {
+        if (!resourceCandidateTurnIntercepted
+          && input.messages.some((m) => m.text.includes('@resource-candidate-regression'))) {
+          resourceCandidateTurnIntercepted = true;
           await new Promise<void>((resolve) => { releaseResourceCandidateTurn = resolve; });
           return mock.runTurn(input, ctx);
         }
@@ -128,29 +131,42 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
         prompt: '@resource-candidate-regression\n@write model.js :: export const installed = true;\n@review Installed model' })],
     });
 
-    await expect.poll(() => h.store.currentWorld(task.id), { timeout: 30_000 }).toBeTruthy();
-    const taskWorld = h.store.currentWorld(task.id)!;
-    fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'model.bin'), Buffer.alloc(1024, 7));
-    const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
-      target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
-    await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
-    releaseResourceCandidateTurn!();
-    releaseResourceCandidateTurn = undefined;
+    try {
+      await expect.poll(() => h.store.currentWorld(task.id), { timeout: 30_000 }).toBeTruthy();
+      const taskWorld = h.store.currentWorld(task.id)!;
+      fs.writeFileSync(path.join(taskWorld.workdir ?? taskWorld.root, 'model.bin'), Buffer.alloc(1024, 7));
+      const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
+        target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
+      await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+      releaseResourceCandidateTurn!();
+      releaseResourceCandidateTurn = undefined;
 
-    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
-      .toContain('must be Adopted or Discarded');
-    expect((await view(handle)).actions.map((action: any) => action.name)).not.toContain('confirm');
-    await handle.signal('confirm'); // ignored while the resource decision is open
-    await h.resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
-    await handle.signal('resourceResolved');
-    await expect.poll(async () => (await view(handle)).actions.map((action: any) => action.name), { timeout: 30_000 })
-      .toContain('confirm');
-    expect((await view(handle)).stage).toBe('review');
+      await expect.poll(async () => {
+        const current = await view(handle);
+        const candidates = h.store.listResourceCandidates(task.id).map((candidate: any) => candidate.state).join(',');
+        return JSON.stringify({ stage: current.stage, status: current.status, waitingFor: current.waitingFor,
+          candidates, lastMessage: current.messages?.at(-1)?.text });
+      }, { timeout: 60_000 })
+        .toContain('must be Adopted or Discarded');
+      expect((await view(handle)).actions.map((action: any) => action.name)).not.toContain('confirm');
+      await handle.signal('confirm'); // ignored while the resource decision is open
+      await h.resources.adoptCandidate(task.id, proposed.candidate.id, 'user:reviewer');
+      await handle.signal('resourceResolved');
+      await expect.poll(async () => (await view(handle)).actions.map((action: any) => action.name), { timeout: 30_000 })
+        .toContain('confirm');
+      expect((await view(handle)).stage).toBe('review');
 
-    await handle.signal('confirm');
-    expect(await handle.result()).toMatchObject({ stage: 'done' });
-    expect(h.store.getResourceAttachment(proposed.attachment.id)).toMatchObject({ enabled: true });
-  }, 120_000);
+      await handle.signal('confirm');
+      expect(await handle.result()).toMatchObject({ stage: 'done' });
+      expect(h.store.getResourceAttachment(proposed.attachment.id)).toMatchObject({ enabled: true });
+    } finally {
+      // A failed assertion must not leave the deliberately blocked mock turn
+      // consuming the shared worker and cascading timeouts through this file.
+      releaseResourceCandidateTurn?.();
+      releaseResourceCandidateTurn = undefined;
+      await handle.terminate('resource-candidate test cleanup').catch(() => undefined);
+    }
+  }, 180_000);
 
   it('v1.13 waits for input until Open PR is explicitly requested', async () => {
     const repo = await h.makeRepo('explicit-open-pr');
