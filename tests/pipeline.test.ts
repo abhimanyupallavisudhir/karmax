@@ -456,13 +456,20 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       text: '@write hello.txt :: hi there\n@review done now',
       ts: 0,
     });
+    // Do not let the poll below observe the Review state from before the signal was
+    // handled. Wait for proof that the follow-up turn actually ran first.
+    await expect
+      .poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('wrote hello.txt')), {
+        timeout: 30_000,
+      })
+      .toBe(true);
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
     const onMain = await git(repo, ['show', 'main:hello.txt']);
     expect(onMain.stdout).toContain('hi there');
-  });
+  }, 60_000);
 
   it('injects a follow-up sent WHILE a turn is running INTO that live turn (SPEC §5.6)', async () => {
     // A follow-up that arrives mid-turn is polled from the workflow (pendingMessages
@@ -505,7 +512,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:mid.txt']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('delivered after all');
-  });
+  }, 60_000);
 
   it('confirm=auto: lands the work without any human confirmation', async () => {
     const repo = await h.makeRepo('auto');
