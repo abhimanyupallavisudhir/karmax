@@ -18,6 +18,7 @@ import {
   softwareDevV1_16,
   softwareDevV1_17,
   softwareDevV1_18,
+  softwareDevV1_19,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -119,6 +120,11 @@ export async function goalV1_17(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** Exact-candidate verification resumes the existing Do conversation. */
 export async function goalV1_18(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_18({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Review-gated adoption of task-created durable project resources. */
+export async function goalV1_19(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_19({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

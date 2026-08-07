@@ -817,6 +817,15 @@ describe('GitHub-authoritative merge activity', () => {
     const handle17 = { ...handle, id: task17.id };
     const enqueueBefore = requests.filter((request) => request.query?.includes('enqueuePullRequest')).length;
     const patchBefore = requests.filter((request) => request.method === 'PATCH').length;
+    readiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/still computing mergeability.*retains the front landing slot.*retry automatically/is),
+    });
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
+    expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
       status: 'candidate-ready', prs: [expect.objectContaining({ headSha: 'reviewed-head' })],
     });

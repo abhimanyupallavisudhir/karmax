@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
+import { ProfileResolver } from '../src/agent/profiles.js';
 
-describe('profile + account management (Global settings backend)', () => {
+describe('profile + account management settings backend', () => {
   let h: Harness;
   let base: string;
   let token: string;
@@ -126,7 +127,7 @@ describe('profile + account management (Global settings backend)', () => {
     expect(doRow.id).toBe(`${project.id}::do-default`);
 
     // create a project override
-    await fetch(`${base}/api/profiles`, {
+    await fetch(`${base}/api/profiles?projectId=${project.id}`, {
       method: 'PUT',
       headers: auth(),
       body: JSON.stringify({ projectId: project.id, role: 'do', name: 'Do agent', provider: 'codex', capabilities: [], effort: 'low' }),
@@ -140,9 +141,39 @@ describe('profile + account management (Global settings backend)', () => {
     expect(globals.every((p: any) => !p.id.includes('::'))).toBe(true);
 
     // reset the override → back to inherited
-    await fetch(`${base}/api/profiles/${encodeURIComponent(`${project.id}::do-default`)}`, { method: 'DELETE', headers: auth() });
+    await fetch(`${base}/api/profiles/${encodeURIComponent(`${project.id}::do-default`)}?projectId=${project.id}`, { method: 'DELETE', headers: auth() });
     view = await fetch(`${base}/api/profiles?projectId=${project.id}`, { headers: auth() }).then(J);
     expect(view.find((p: any) => p.role === 'do').scope).toBe('inherited');
+  });
+
+  it('isolates organization profile defaults and resolves projects through their organization', async () => {
+    const acme = h.store.createOrganization({ name: 'Profiles Acme' });
+    const beta = h.store.createOrganization({ name: 'Profiles Beta' });
+    const acmeProject = h.store.createProject('Acme agents', {}, acme.id);
+    const betaProject = h.store.createProject('Beta agents', {}, beta.id);
+
+    await fetch(`${base}/api/profiles?organizationId=${acme.id}`, {
+      method: 'PUT', headers: auth(),
+      body: JSON.stringify({ organizationId: acme.id, role: 'do', name: 'Do agent', provider: 'codex', model: 'gpt-acme' }),
+    });
+    await fetch(`${base}/api/profiles?organizationId=${beta.id}`, {
+      method: 'PUT', headers: auth(),
+      body: JSON.stringify({ organizationId: beta.id, role: 'do', name: 'Do agent', provider: 'claude', model: 'claude-beta' }),
+    });
+
+    const [acmeProfiles, betaProfiles, acmeProjectProfiles, betaProjectProfiles] = await Promise.all([
+      fetch(`${base}/api/profiles?organizationId=${acme.id}`, { headers: auth() }).then(J),
+      fetch(`${base}/api/profiles?organizationId=${beta.id}`, { headers: auth() }).then(J),
+      fetch(`${base}/api/profiles?projectId=${acmeProject.id}`, { headers: auth() }).then(J),
+      fetch(`${base}/api/profiles?projectId=${betaProject.id}`, { headers: auth() }).then(J),
+    ]);
+    expect(acmeProfiles.find((p: any) => p.role === 'do')).toMatchObject({ model: 'gpt-acme', scope: 'organization' });
+    expect(betaProfiles.find((p: any) => p.role === 'do')).toMatchObject({ model: 'claude-beta', scope: 'organization' });
+    expect(acmeProjectProfiles.find((p: any) => p.role === 'do')).toMatchObject({ model: 'gpt-acme', scope: 'inherited' });
+    expect(betaProjectProfiles.find((p: any) => p.role === 'do')).toMatchObject({ model: 'claude-beta', scope: 'inherited' });
+    const resolver = new ProfileResolver(h.store, 'mock');
+    expect(resolver.resolve('do', undefined, undefined, acmeProject.id)).toMatchObject({ model: 'gpt-acme' });
+    expect(resolver.resolve('do', undefined, undefined, betaProject.id)).toMatchObject({ model: 'claude-beta' });
   });
 
   it('exposes payment providers + a connect flow (1g)', async () => {

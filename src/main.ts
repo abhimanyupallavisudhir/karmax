@@ -407,7 +407,7 @@ async function main() {
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, providerConnections, worlds,
-    worldAccess, githubApp, bus });
+    worldAccess, resources, broker, githubApp, bus });
 
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency prerequisites are met and a schedule/event activates it. Runs

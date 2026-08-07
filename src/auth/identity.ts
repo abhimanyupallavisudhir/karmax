@@ -282,6 +282,25 @@ export class IdentityService {
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
   }
 
+  /** Public account data for a self-service portability export. Password hashes,
+   * OAuth tokens, verification values and sessions are deliberately unreachable:
+   * this method projects an allowlist instead of redacting a raw auth database. */
+  exportUserData(userId: string): { profile: Record<string, unknown>; authentication: { providers: string[] } } {
+    const row = this.db.prepare('SELECT * FROM user WHERE id=?').get(userId) as any;
+    if (!row) throw new Error('user not found');
+    const profile: Record<string, unknown> = {
+      id: String(row.id),
+      name: String(row.name ?? ''),
+      email: String(row.email ?? ''),
+      emailVerified: Boolean(row.emailVerified),
+      ...(row.image ? { image: String(row.image) } : {}),
+      ...(row.role ? { role: String(row.role) } : {}),
+      createdAt: new Date(row.createdAt).toISOString(),
+      updatedAt: new Date(row.updatedAt).toISOString(),
+    };
+    return { profile, authentication: { providers: this.providersForUser(userId).sort() } };
+  }
+
   async session(headers: Headers): Promise<IdentitySession | undefined> {
     const result = await this.auth.api.getSession({ headers }).catch(() => null);
     return result?.session && result?.user ? result as IdentitySession : undefined;

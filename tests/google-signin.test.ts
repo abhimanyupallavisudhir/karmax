@@ -40,11 +40,12 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
   const port = await findFreePortFrom(47990);
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}`, ...opts });
   const store = new Store(':memory:');
+  const tokens = new TokenAuthority();
   const gateway = new Gateway({
     api: {} as any,
     store,
     bus: new KarmaxBus(),
-    tokens: new TokenAuthority(),
+    tokens,
     contributions: new ContributionRegistry(),
     overlays: new Overlays(),
     client: {} as any,
@@ -57,7 +58,7 @@ async function boot(opts: Parameters<typeof IdentityService.open>[1] = {}) {
   });
   const running = await gateway.listen(port);
   closers.push(() => running.close());
-  return { identity, store, base: running.url };
+  return { identity, store, tokens, base: running.url };
 }
 
 describe('Google sign-in is off unless configured', () => {
@@ -68,6 +69,57 @@ describe('Google sign-in is off unless configured', () => {
     const session = await (await fetch(`${base}/api/session`)).json() as any;
     expect(session.google).toBe(false);
     expect(session.github).toBe(false);
+  });
+});
+
+describe('user data export', () => {
+  it('downloads only the signed-in person’s readable, secret-free data as formatted JSON', async () => {
+    const { identity, store, base } = await boot();
+    const signup = await fetch(`${base}/api/setup`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Alice', email: 'alice@example.com', password: 'long-enough-password' }),
+    });
+    const cookie = signup.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
+    const user = identity.listUsers().find((candidate) => candidate.email === 'alice@example.com')!;
+    const organization = store.listOrganizations(user.id)[0]!;
+    store.createProject('Alice project', {}, organization.id);
+
+    const response = await fetch(`${base}/api/user/export`, { headers: { cookie } });
+    const text = await response.text();
+    const exported = JSON.parse(text);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-disposition')).toMatch(/attachment; filename="krmax-alice-export-\d{4}-\d{2}-\d{2}\.json"/);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    expect(text).toContain('\n  "format": "karmax-user-export"');
+    expect(exported.profile).toMatchObject({ id: user.id, name: 'Alice', email: 'alice@example.com' });
+    expect(exported.authentication.providers).toEqual(['credential']);
+    expect(exported.git).toEqual({ defaultProfile: null, profiles: [] });
+    expect(JSON.stringify(exported)).not.toMatch(/"(?:passwordHash|sessionToken|accessToken|refreshToken)"\s*:/i);
+    expect(exported.security).toMatchObject({ secretsIncluded: false });
+
+    const organizationResponse = await fetch(`${base}/api/organizations/${organization.id}/export`, {
+      headers: { cookie },
+    });
+    const organizationText = await organizationResponse.text();
+    expect(organizationResponse.status).toBe(200);
+    expect(organizationResponse.headers.get('content-disposition'))
+      .toMatch(/attachment; filename="krmax-personal-export-\d{4}-\d{2}-\d{2}\.json"/);
+    expect(organizationText).toContain('\n  "format": "karmax-organization-export"');
+    expect(JSON.parse(organizationText)).toMatchObject({
+      organization: { id: organization.id },
+      security: { secretsIncluded: false },
+    });
+  });
+
+  it('does not allow an agent bearer token to use the self-service export', async () => {
+    const { store, tokens, base } = await boot();
+    const project = store.createProject('Agent project');
+    const token = tokens.mintPrincipal('user:somebody', ['*'], project.id).token;
+    const response = await fetch(`${base}/api/user/export`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(401);
   });
 });
 

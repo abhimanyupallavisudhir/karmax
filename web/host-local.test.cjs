@@ -77,29 +77,23 @@ for (const l of lines.filter((l) => /localPath:/.test(l)))
   ok(l.includes('localWorldPath(v)'), 'a rendered world localPath goes through localWorldPath');
 
 // ── Phone Access is setup for reaching a loopback karmax from elsewhere ──────
-// Off-machine there is nothing to set up: you are already reading this page at
-// the URL the section would help you obtain, and /api/remote-access 503s (it
-// drives tailscale/pkexec on the host), so rendering the card only produces a
-// permanent "Needs attention" error.
-for (const marker of ['id="settings-access"', '#settings-access'])
-  for (const l of lines.filter((l) => l.includes(marker) && /<(?:a|div)\b/.test(l)))
-    ok(l.includes('hostLocal()'), `the Phone Access ${marker} is gated on hostLocal()`);
-// The card itself sits on its own line inside that gated template, so check it
-// structurally: it must fall between the gate's `${hostLocal() ?` and its `: ''}`.
-const gateStart = src.indexOf('${hostLocal() ? `<div class="settings-section-title" id="settings-access"');
-const gateEnd = src.indexOf(": ''}", gateStart);
-ok(gateStart > 0 && gateEnd > gateStart, 'the Phone Access section is wrapped in a hostLocal() gate');
-ok(src.indexOf('id="phone-access-card"') > gateStart && src.indexOf('id="phone-access-card"') < gateEnd,
-  'the Phone Access card renders only inside that gate');
+// Off-machine the Installation page explains why this host control is
+// unavailable instead of attempting tailscale/pkexec.
+const gateStart = src.indexOf('const phone = hostLocal()');
+const gateEnd = src.indexOf("function wireInstallationSettings()", gateStart);
+ok(gateStart > 0 && gateEnd > gateStart, 'the Installation Phone Access body is hostLocal-gated');
+ok(src.indexOf('id="phone-access-card"', gateStart) < gateEnd,
+  'the live Phone Access card renders only inside the Installation gate');
 ok(lines.some((l) => l.includes('hostLocal()') && l.includes('hydratePhoneAccess()')),
   'the Phone Access status is not fetched when the endpoint is withdrawn');
 
 // Phone Access is also an installation-wide host control: an organization
 // administrator may manage their tenant but must not see a control that drives
 // this machine's Tailscale/pkexec. Like the other installation cards below, it
-// ships hidden and is revealed only after its settings:read endpoint succeeds.
-ok(/id="phone-access-nav"[^>]*\shidden/.test(src), 'the Phone Access nav link ships hidden');
-ok(/id="settings-access"[^>]*\shidden/.test(src), 'the Phone Access section title ships hidden');
+// lives behind the operator-only Installation route and is revealed only after
+// its settings endpoint succeeds.
+ok(src.includes("if (!S.installationAccess) return go(globalRoute('dashboard')"),
+  'the Installation route refuses a non-operator before rendering host controls');
 ok(/id="phone-access-card"[^>]*\shidden/.test(src), 'the Phone Access card ships hidden');
 ok(/error\?\.status === 403\) return/.test(src), 'a refused Phone Access read leaves the control absent');
 ok(/function revealPhoneAccess\(\)/.test(src), 'Phone Access has an explicit post-authorization reveal');
@@ -137,8 +131,8 @@ for (const [id, endpoint] of [['resilience-card', '/api/safe-mode'], ['outbound-
   ok(new RegExp(`hydrateInstallationCard\\('#${id}', '${endpoint.replace(/\//g, '\\/')}'`).test(src),
     `#${id} is hydrated through the shared installation-card helper`);
 }
-ok(/class="pay-stripe-platform"[^>]*\shidden>/.test(src), 'the shared Stripe Connect box ships hidden too');
-ok(/platformBox\.hidden = false/.test(src), 'the Stripe box is revealed only once the server allows managing it');
+ok(/id="stripe-platform-card"/.test(src), 'the shared Stripe Connect setup has its own Installation card');
+ok(!/class="pay-stripe-platform"/.test(src), 'organization Payments no longer embeds shared Stripe setup');
 
 // Nothing may render an installation control and take it away afterwards.
 for (const dead of ['card.remove()', 'platformBox.remove()', "platform.canManage ? '' : 'disabled'"])
