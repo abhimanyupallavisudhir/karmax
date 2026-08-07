@@ -225,7 +225,10 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
       projectId: project.id, workflow: 'software-dev', prompt: '@write s.txt :: hi\n@review ok',
     });
     const handle = h.client.workflow.getHandle(task.id);
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.waitingFor?.audience?.join(',') ?? '-'}`;
+    }, { timeout: 15_000 }).toBe('review/@creator');
 
     // A route nobody can see is rejected platform-side: the deterministic sandbox
     // cannot answer "is user:ghost a human here?", so the gate must never park on one.
