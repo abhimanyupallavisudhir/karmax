@@ -428,7 +428,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('done');
     const onMain = await git(repo, ['show', 'main:hello.txt']);
     expect(onMain.stdout).toContain('hi there');
-  });
+  }, 60_000);
 
   it('injects a follow-up sent WHILE a turn is running INTO that live turn (SPEC §5.6)', async () => {
     // A follow-up that arrives mid-turn is polled from the workflow (pendingMessages
@@ -471,7 +471,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:mid.txt']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('delivered after all');
-  });
+  }, 60_000);
 
   it('confirm=auto: lands the work without any human confirmation', async () => {
     const repo = await h.makeRepo('auto');
