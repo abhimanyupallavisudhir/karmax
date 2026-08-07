@@ -30,6 +30,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   let cancellationCleanupFinishedAt = 0;
   let releaseResourceCandidateTurn: (() => void) | undefined;
+  let resourceCandidateTurnReleased = false;
   beforeAll(async () => {
     const mock = new MockAdapter();
     const restartSession = 'restart-regression-session';
@@ -39,7 +40,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
-        if (input.messages.some((m) => m.text.includes('@resource-candidate-regression'))) {
+        if (!resourceCandidateTurnReleased
+          && input.messages.some((m) => m.text.includes('@resource-candidate-regression'))) {
           await new Promise<void>((resolve) => { releaseResourceCandidateTurn = resolve; });
           return mock.runTurn(input, ctx);
         }
@@ -168,6 +170,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
       target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
     await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+    resourceCandidateTurnReleased = true;
     releaseResourceCandidateTurn!();
     releaseResourceCandidateTurn = undefined;
 
