@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream } from '../src/world/git-broker.js';
+import { brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 
 describe('cloud Git broker', () => {
@@ -96,6 +96,92 @@ describe('cloud Git broker', () => {
       .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
   });
 
+  it('publishes an origin-authoritative local worktree through the remote broker', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-pr-worktree-'));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    const remote = path.join(root, 'remote.git');
+    const worlds = path.join(root, 'worlds');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(root, ['clone', '-q', '--bare', source, remote]);
+
+    const provider = new WorktreeProvider(worlds);
+    const world = await provider.create({ taskId: 'pr-publish', repo: source, base: 'main' });
+    await world.writeFile('feature.txt', 'published to GitHub authority\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'feature']);
+
+    const sshRemote = 'git@example:remote.git';
+    Object.assign(world.handle.repos![0]!, { source: sshRemote, localPath: source, sourceAuthority: 'origin' });
+    const env = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'git@example:',
+    };
+    expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+    expect((await git(remote, ['rev-parse', 'refs/heads/karmax/pr-publish'])).stdout.trim())
+      .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
+  });
+
+  it('replaces a rebased task branch only when its recorded remote-head lease still matches', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-lease-'));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    const remote = path.join(root, 'remote.git');
+    const worlds = path.join(root, 'worlds');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(root, ['clone', '-q', '--bare', source, remote]);
+
+    const provider = new WorktreeProvider(worlds);
+    const world = await provider.create({ taskId: 'lease-repair', repo: source, base: 'main' });
+    await world.writeFile('feature.txt', 'first proposal\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'first proposal']);
+    const firstHead = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+
+    const sshRemote = 'git@example:remote.git';
+    world.handle.repo = sshRemote;
+    world.handle.repos![0]!.repo = sshRemote;
+    const env = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'git@example:',
+    };
+    expect(await brokerPushBranches(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+
+    // Model a repair rebase: replace the proposal commit instead of merging the
+    // old task branch, making an ordinary push non-fast-forward by design.
+    await gitOrThrow(world.handle.root, ['reset', '--hard', '-q', 'main']);
+    await world.writeFile('feature.txt', 'repaired proposal\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'repaired proposal']);
+    const repairedHead = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+    expect(await brokerPushBranches(world, env, undefined, { source: firstHead }))
+      .toEqual({ pushed: ['source'], skipped: [] });
+    expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
+
+    // A stale lease cannot overwrite a newer writer.
+    await gitOrThrow(world.handle.root, ['reset', '--hard', '-q', 'main']);
+    await world.writeFile('feature.txt', 'another repair\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'another repair']);
+    const refused = await brokerPushBranches(world, env, undefined, { source: firstHead });
+    expect(refused.pushed).toEqual([]);
+    expect(refused.skipped).toEqual(['source']);
+    expect(refused.errors?.source).toMatch(/stale info|rejected/i);
+    expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
+  });
+
   it('preserves the underlying error for every skipped repository', async () => {
     const world = {
       handle: {
@@ -165,10 +251,17 @@ describe('cloud Git broker', () => {
     expect((await git(source, ['rev-parse', '--verify', 'refs/heads/karmax/cloud-local-task'])).code).toBe(0);
     expect((await git(remote, ['show-ref', 'refs/heads/karmax/cloud-local-task'])).code).not.toBe(0);
 
-    // refresh_upstream serves the LOCAL target state, so the merge agent can
-    // resolve conflicts against the same history the merge will land on.
+    // Project-authority refresh serves the LOCAL target state, so a local merge
+    // agent resolves against the same history the merge will land on.
     const refreshed = await brokerRefreshUpstream(world, env, 'main');
     expect(refreshed.refs[0]!.sha).toBe((await git(source, ['rev-parse', 'main'])).stdout.trim());
+
+    // PR-policy tasks land on GitHub instead. Their refresh must bypass the
+    // local authority and may need to force-correct a divergent seeded
+    // origin/* ref back to the actual remote tip.
+    const remoteRefreshed = await brokerRefreshUpstream(world, env, 'main', 'origin');
+    expect(remoteRefreshed.refs[0]!.sha).toBe(originMainBefore);
+    expect((await git(world.handle.root, ['rev-parse', 'refs/remotes/origin/main'])).stdout.trim()).toBe(originMainBefore);
 
     const result = await brokerFinalizeMerge(world, 'main', { name: 'Karmax Test', email: 'karmax@example.com' }, env);
     expect(result.merged).toBe(true);

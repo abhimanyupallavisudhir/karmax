@@ -104,4 +104,13 @@ describe('installation-wide settings report who may manage them', () => {
     if (forTenant.ok) expect((await forTenant.json() as any).canManage).toBe(false);
     else expect(forTenant.status).toBe(403);
   });
+
+  it('exposes the Installation page probe only to the operator', async () => {
+    const allowed = await fetch(`${base}/api/settings/installation`, { headers: as(operator) });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toMatchObject({ canManage: true });
+
+    const refused = await fetch(`${base}/api/settings/installation`, { headers: as(tenant) });
+    expect(refused.status).toBe(403);
+  });
 });

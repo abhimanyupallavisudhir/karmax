@@ -31,12 +31,10 @@ export function describePublishFailures(result: GitBrokerPublishResult): string 
  * removes the checkout. Credentials remain JIT host process environment only.
  *
  * Every repo has exactly ONE authoritative repository. A repo provisioned from
- * a host-local checkout (`WorldRepo.localPath`) is authoritative to that
- * checkout: branches and merges land THERE — the same place worktree worlds
- * land — and origin is only the sandbox's clone transport. Repos configured by
- * URL are authoritative to origin (the pre-existing broker behavior). Without
- * this split, cloud merges land on origin while local merges land in the
- * checkout, and the two histories silently diverge.
+ * a host-local checkout (`WorldRepo.localPath`) normally lands there — the same
+ * place worktree worlds land — while an explicit `sourceAuthority: 'origin'`
+ * records the PR-policy exception where GitHub owns base and landing history.
+ * Without this distinction, cloud and local operations silently diverge.
  */
 export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
@@ -72,6 +70,10 @@ export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Pr
  * `worldRepoIsLocal` means "this world's checkouts live on the host", i.e. the
  * caller has already established `capabilities.remote === false`. */
 async function localAuthority(repo: WorldRepo, worldRepoIsLocal = false): Promise<string | undefined> {
+  // PR-policy worlds explicitly name GitHub as their authority. `localPath`
+  // remains useful for compatibility files and diagnostics, but must not make
+  // the broker route branches or target reads back through a stale checkout.
+  if (repo.sourceAuthority === 'origin') return undefined;
   if (repo.localPath) {
     if (!(await isGitRepo(repo.localPath)))
       throw new Error(`repo "${repo.name}" was provisioned from local checkout ${repo.localPath}, which is no longer a git repository`);
@@ -100,9 +102,26 @@ async function verifySharedWorktreeBranch(world: World, repo: WorldRepo, localRe
   }
 }
 
-async function pushBranchToOrigin(world: World, repo: WorldRepo, auth: GitBrokerAuth): Promise<void> {
+async function pushBranchToOrigin(
+  world: World,
+  repo: WorldRepo,
+  auth: GitBrokerAuth,
+  expectedRemoteHead?: string,
+): Promise<void> {
   await withTransferredRepo(world, repo, auth, async (clone, env) => {
-    const result = await git(clone, ['push', 'origin', `refs/heads/${repo.branch}:refs/heads/${repo.branch}`], { env });
+    const ref = `refs/heads/${repo.branch}`;
+    let result = await git(clone, ['push', 'origin', `${ref}:${ref}`], { env });
+    // Integration repair commonly rebases the task-owned proposal branch. That
+    // deliberately makes its new tip a non-descendant of the prior PR head, so
+    // an ordinary push cannot publish it. Replace only the exact head Karmax
+    // previously observed: a concurrent writer makes the lease fail instead of
+    // being overwritten. With no recorded PR head we never force an existing
+    // branch—the collision needs investigation rather than an ownership guess.
+    if (result.code !== 0 && expectedRemoteHead && /non-fast-forward|fetch first|rejected/i.test(result.stderr || result.stdout)) {
+      result = await git(clone, [
+        'push', `--force-with-lease=${ref}:${expectedRemoteHead}`, 'origin', `${ref}:${ref}`,
+      ], { env });
+    }
     if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
   });
 }
@@ -214,7 +233,7 @@ export async function brokerImportTaskBranch(destination: World, source: import(
 /** Refresh an upstream branch without putting a clone key in the sandbox. The
  * resulting origin/* ref behaves exactly like a normal git fetch to the agent. */
 export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
-  requestedBranch?: string): Promise<GitBrokerRefreshResult> {
+  requestedBranch?: string, targetAuthority: 'project' | 'origin' = 'project'): Promise<GitBrokerRefreshResult> {
   const refreshed: ImportedGitRef[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
@@ -223,7 +242,7 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
       const branch = requestedBranch ?? repo.target ?? repo.base;
       if (!safeBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
       const ref = `refs/remotes/origin/${branch}`;
-      const sha = await brokerFetchRef(world, repo, branch, ref, auth);
+      const sha = await brokerFetchRef(world, repo, branch, ref, auth, targetAuthority === 'origin');
       refreshed.push({ repo: repo.name, branch, ref, sha });
     } catch (error) {
       skipped.push(repo.name);
@@ -235,7 +254,7 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
 }
 
 async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: string, destinationRef: string,
-  auth: GitBrokerAuth): Promise<string> {
+  auth: GitBrokerAuth, preferOrigin = false): Promise<string> {
   if (!safeBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-import-'));
   const bundleName = `.karmax-import-${cryptoSafeName(destinationRepo.name)}.bundle`;
@@ -243,13 +262,16 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
   try {
     const known = await world.exec('git', ['rev-parse', '--verify', '--quiet', destinationRef], { cwd: destinationRepo.root });
     const bundlePath = await authorityBundle(temp, destinationRepo, branch, auth,
-      known.code === 0 ? known.stdout.trim() : undefined, sharesHostRefDatabase(world.handle.kind));
+      known.code === 0 ? known.stdout.trim() : undefined, sharesHostRefDatabase(world.handle.kind), preferOrigin);
     const data = fs.readFileSync(bundlePath);
     const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
     if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
     if (!world.writeFileBuffer) throw new Error('world provider cannot receive binary Git handoffs');
     await world.writeFileBuffer(bundleRelative, data);
-    const fetched = await world.exec('git', ['fetch', bundleName, `refs/heads/${branch}:${destinationRef}`],
+    // These are imported tracking/staging refs, never a checked-out branch. A
+    // local-project seed may have moved origin/* to a divergent local commit;
+    // refreshing a GitHub PR target must be allowed to restore origin's truth.
+    const fetched = await world.exec('git', ['fetch', bundleName, `+refs/heads/${branch}:${destinationRef}`],
       { cwd: destinationRepo.root, timeoutMs: 10 * 60_000 });
     if (fetched.code !== 0) throw new Error(`world could not import branch "${branch}": ${fetched.stderr || fetched.stdout}`);
     const head = await world.exec('git', ['rev-parse', destinationRef], { cwd: destinationRepo.root });
@@ -269,9 +291,9 @@ function cryptoSafeName(value: string): string { return value.replace(/[^A-Za-z0
  * otherwise an authenticated clone of the SSH remote. `basisSha`, when the
  * receiver already holds it, thins the bundle to just the missing history. */
 async function authorityBundle(temp: string, repo: WorldRepo, branch: string, auth: GitBrokerAuth,
-  basisSha?: string, worldRepoIsLocal = false): Promise<string> {
+  basisSha?: string, worldRepoIsLocal = false, preferOrigin = false): Promise<string> {
   const bundlePath = path.join(temp, 'incoming.bundle');
-  const local = await localAuthority(repo, worldRepoIsLocal);
+  const local = preferOrigin ? undefined : await localAuthority(repo, worldRepoIsLocal);
   if (local && (await git(local, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0) {
     const basis = basisSha && (await git(local, ['cat-file', '-e', `${basisSha}^{commit}`])).code === 0
       ? ['--not', basisSha] : [];
@@ -282,11 +304,12 @@ async function authorityBundle(temp: string, repo: WorldRepo, branch: string, au
     if (bundled.code !== 0) throw new Error(`could not package branch "${branch}": ${bundled.stderr || bundled.stdout}`);
     return bundlePath;
   }
-  if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error('Git broker requires an SSH remote');
+  const source = worldRepoSource(repo);
+  if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const credential = await resolveCredential(auth, repo);
   const { env } = materializeGitCredential(temp, credential);
   const clone = path.join(temp, 'repo');
-  const cloned = await git(temp, ['clone', '-q', '--branch', branch, '--single-branch', repo.repo, clone],
+  const cloned = await git(temp, ['clone', '-q', '--branch', branch, '--single-branch', source, clone],
     { env, timeoutMs: 10 * 60_000 });
   if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
   const bundled = await git(clone, ['bundle', 'create', bundlePath, `refs/heads/${branch}`]);
@@ -379,13 +402,14 @@ export async function brokerPushBranches(
   world: World,
   auth: GitBrokerAuth,
   repos: WorldRepo[] = worldRepos(world.handle),
+  expectedRemoteHeads: Record<string, string> = {},
 ): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
   for (const repo of repos) {
     try {
-      await pushBranchToOrigin(world, repo, auth);
+      await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name]);
       pushed.push(repo.name);
     } catch (error) {
       skipped.push(repo.name);
@@ -446,7 +470,8 @@ async function withTransferredRepo<T>(
   auth: GitBrokerAuth,
   use: (clone: string, env: Record<string, string>) => Promise<T>,
 ): Promise<T> {
-  if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error('Git broker requires an SSH remote');
+  const source = worldRepoSource(repo);
+  if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const transferred = await readBranchBundle(world, repo);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   try {
@@ -455,7 +480,7 @@ async function withTransferredRepo<T>(
     const bundlePath = path.join(temp, 'world.bundle');
     await fs.promises.writeFile(bundlePath, transferred, { mode: 0o600 });
     const clone = path.join(temp, 'repo');
-    const cloned = await git(temp, ['clone', '-q', '--no-checkout', repo.repo, clone], { env, timeoutMs: 10 * 60_000 });
+    const cloned = await git(temp, ['clone', '-q', '--no-checkout', source, clone], { env, timeoutMs: 10 * 60_000 });
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
     const fetched = await git(clone, ['fetch', bundlePath, `refs/heads/${repo.branch}:refs/heads/${repo.branch}`]);
     if (fetched.code !== 0) throw new Error(`bundle import failed: ${fetched.stderr || fetched.stdout}`);

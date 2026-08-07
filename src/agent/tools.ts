@@ -302,6 +302,27 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'propose_project_resource',
+    description:
+      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service).',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'World-relative non-secret file/directory in this task’s current generation.' },
+        vault_item_id: { type: 'string', description: 'Agent-created vault item returned by store_credential.' },
+        field: { type: 'string', description: 'Vault field; defaults to the item’s first stored field.' },
+        name: { type: 'string', description: 'Human-facing project resource name.' },
+        driver: { type: 'string', enum: ['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1'] },
+        target_path: { type: 'string', description: 'World-relative path where adopted data/secret files materialize.' },
+        target_environment: { type: 'string', description: 'Uppercase environment variable for an adopted secret/connection.' },
+        target_service: { type: 'string', description: 'Uppercase connection variable for an adopted service/database.' },
+        access: { type: 'string', enum: ['read', 'write'], description: 'Future task access; defaults to read.' },
+        publish: { type: 'string', enum: ['discard', 'review'], description: 'Future changes to writable snapshot resources; defaults to review.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
     name: 'check_agent_mail',
     description:
       'Read your organization\'s agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Use it to complete "check your email for a code / confirmation link" steps: returns the address to register with plus recent messages with any verification `code` and `link` already extracted. Mailboxes are per organization; you can only read your own. For a code sent to the user\'s own address instead, escalate with raise_to_parent.',
@@ -696,7 +717,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'confirm_decision',
     description:
-      'Confirm agents ONLY. Review the already-open proposal; do NOT keep building it. action: "confirm" (accept the PR; it proceeds to merge), "revise" (send it back to the Do agent with specific feedback in `text`), or "reject" (cancel the task and say why). Calling this ends your turn.',
+      'Confirm agents, or a Do agent explicitly asked by the workflow to perform final exact-candidate verification. Review the already-open proposal; do NOT keep building it in this turn. action: "confirm" (accept the candidate), "revise" (return specific repair feedback in `text`), or "reject" (require human Review when the workflow says so). Calling this ends your turn.',
     parameters: {
       type: 'object',
       properties: {
@@ -902,6 +923,23 @@ export function platformToolHandlers(
         id: args?.id, type: args?.type, label: args?.label, domains: args?.domains,
         username: args?.username, envVar: args?.env_var, secrets: args?.secrets,
       }));
+    },
+    async propose_project_resource(args) {
+      const sources = Number(Boolean(args?.path)) + Number(Boolean(args?.vault_item_id));
+      const targets = Number(Boolean(args?.target_path)) + Number(Boolean(args?.target_environment))
+        + Number(Boolean(args?.target_service));
+      if (sources !== 1) throw new Error('provide exactly one of path or vault_item_id');
+      if (targets !== 1) throw new Error('provide exactly one target_path, target_environment, or target_service');
+      const result = await platformRequest('POST', '/api/agent/resource-candidates', {
+        source: args.path ? { kind: 'path', path: String(args.path) }
+          : { kind: 'vault-item', itemId: String(args.vault_item_id), ...(args.field ? { field: String(args.field) } : {}) },
+        name: String(args.name ?? ''), driver: args.driver, access: args.access, publish: args.publish,
+        target: args.target_path ? { kind: 'path', path: String(args.target_path) }
+          : args.target_service ? { kind: 'service', name: String(args.target_service) }
+            : { kind: 'environment', name: String(args.target_environment) },
+      });
+      ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      return JSON.stringify(result);
     },
     async check_agent_mail(args) {
       const q = new URLSearchParams();

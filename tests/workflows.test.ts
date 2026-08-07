@@ -203,10 +203,10 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('cancelled');
   });
 
-  it('software-dev v1.16: preserves a targeted human hold after the workflow publishes', async () => {
+  it('software-dev v1.20: preserves a targeted human hold after the workflow publishes', async () => {
     const repo = await h.makeRepo('stage-targeted-human-hold');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('softwareDev@1.16.0', {
+    const handle = await h.client.workflow.start('softwareDev@1.20.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [baseInput(taskId, repo, {
@@ -258,10 +258,10 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('done');
   });
 
-  it('software-dev v1.15: restored Review replays the configured confirmer layers', async () => {
+  it('software-dev v1.20: restored Review replays the configured confirmer layers', async () => {
     const repo = await h.makeRepo('stage-restored-layers');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('softwareDev@1.15.0', {
+    const handle = await h.client.workflow.start('softwareDev@1.20.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [baseInput(taskId, repo, {
@@ -285,10 +285,10 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('done');
   });
 
-  it('goal v1.15: restored Review retains the zero-layer autonomous route', async () => {
+  it('goal v1.20: restored Review retains the zero-layer autonomous route', async () => {
     const repo = await h.makeRepo('goal-restored-review');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('goal@1.15.0', {
+    const handle = await h.client.workflow.start('goal@1.20.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       args: [baseInput(taskId, repo, {

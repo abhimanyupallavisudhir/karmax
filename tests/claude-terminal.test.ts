@@ -134,7 +134,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
       expect(sdkState.options.mcpServers.karmax).toBeUndefined();
       expect(sdkState.options.mcpServers.karmax_control.tools.map((tool: any) => tool.name))
-        .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream']));
+        .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource']));
       expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).toContain('subscription');
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });

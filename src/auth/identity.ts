@@ -59,12 +59,28 @@ function secretFor(dbFile: string, supplied?: string): string {
   return value;
 }
 
+export interface GitHubAuthorization {
+  userId: string;
+  accountId: string;
+  accessToken: string;
+  refreshToken?: string;
+  accessTokenExpiresAt?: Date;
+  refreshTokenExpiresAt?: Date;
+}
+
 export interface IdentityOptions {
   baseURL?: string | { allowedHosts: string[]; fallback?: string };
   secret?: string;
   oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
   google?: { clientId: string; clientSecret: string };
-  github?: { clientId: string; clientSecret: string };
+  github?: {
+    clientId: string;
+    clientSecret: string;
+    /** GitHub Apps use fine-grained permissions, not OAuth App scopes. */
+    app?: boolean;
+    /** Adopt the sign-in grant as the user's development GitHub identity. */
+    onAuthorization?: (authorization: GitHubAuthorization) => Promise<void>;
+  };
 }
 
 /**
@@ -88,9 +104,8 @@ export class IdentityService {
    *  option and deliberately does not consume the single generic-OIDC enterprise
    *  slot above — an installation pointed at Okta must still be able to offer it. */
   readonly googleEnabled: boolean;
-  /** Whether installation-level GitHub sign-in is available. This is separate
-   *  from the organization-scoped GitHub App used for repositories: a new user
-   *  must be able to authenticate before they have an organization to connect. */
+  /** Whether GitHub sign-in is available through the deployment App (or the
+   * legacy standalone OAuth fallback). */
   readonly githubEnabled: boolean;
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
     this.db = new DatabaseSync(dbFile);
@@ -119,7 +134,26 @@ export class IdentityService {
       ...(opts.github ? { github: {
         clientId: opts.github.clientId,
         clientSecret: opts.github.clientSecret,
+        disableDefaultScope: opts.github.app === true,
       } } : {}),
+    };
+    const adoptGithubAuthorization = async (account: Record<string, any>) => {
+      if (account.providerId !== 'github' || !account.accessToken || !opts.github?.onAuthorization) return;
+      try {
+        await opts.github.onAuthorization({
+          userId: String(account.userId),
+          accountId: String(account.accountId),
+          accessToken: String(account.accessToken),
+          ...(account.refreshToken ? { refreshToken: String(account.refreshToken) } : {}),
+          ...(account.accessTokenExpiresAt ? { accessTokenExpiresAt: new Date(account.accessTokenExpiresAt) } : {}),
+          ...(account.refreshTokenExpiresAt ? { refreshTokenExpiresAt: new Date(account.refreshTokenExpiresAt) } : {}),
+        });
+      } catch (error) {
+        // Authentication is the recovery path for a stale development grant.
+        // A transient adoption failure must not turn a valid GitHub sign-in into
+        // a Karmax lockout; the next sign-in/update retries the same hook.
+        console.error('[github] could not connect sign-in authorization:', error instanceof Error ? error.message : error);
+      }
     };
     this.auth = betterAuth({
       appName: 'krmax',
@@ -128,11 +162,14 @@ export class IdentityService {
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
       // Native Better Auth social sign-in. No gateway routes are needed:
       // /api/auth/* is proxied verbatim, including each provider callback.
-      // Defaults are intentionally identity-only: Google uses openid/email/
-      // profile without offline access; GitHub uses read:user + user:email.
-      // Neither token is used for repository access — that remains the separate,
-      // explicit GitHub App authorization flow.
+      // Google uses openid/email/profile without offline access. A shared GitHub
+      // App uses its fine-grained account/repository permissions (OAuth scopes do
+      // not apply) and its user grant is also adopted by the development profile.
       ...(trustedSocialProviders.length ? { socialProviders } : {}),
+      ...(opts.github?.onAuthorization ? { databaseHooks: { account: {
+        create: { after: adoptGithubAuthorization },
+        update: { after: adoptGithubAuthorization },
+      } } } : {}),
       // Account linking. A user who signed up with email+password and later uses
       // Google or GitHub on the same address should land in the SAME
       // account, not a duplicate. The merge key is the email address, so BOTH
@@ -243,6 +280,25 @@ export class IdentityService {
   listUsers(): IdentityUser[] {
     return (this.db.prepare('SELECT id, email, name, role, createdAt FROM user ORDER BY createdAt').all() as any[])
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
+  }
+
+  /** Public account data for a self-service portability export. Password hashes,
+   * OAuth tokens, verification values and sessions are deliberately unreachable:
+   * this method projects an allowlist instead of redacting a raw auth database. */
+  exportUserData(userId: string): { profile: Record<string, unknown>; authentication: { providers: string[] } } {
+    const row = this.db.prepare('SELECT * FROM user WHERE id=?').get(userId) as any;
+    if (!row) throw new Error('user not found');
+    const profile: Record<string, unknown> = {
+      id: String(row.id),
+      name: String(row.name ?? ''),
+      email: String(row.email ?? ''),
+      emailVerified: Boolean(row.emailVerified),
+      ...(row.image ? { image: String(row.image) } : {}),
+      ...(row.role ? { role: String(row.role) } : {}),
+      createdAt: new Date(row.createdAt).toISOString(),
+      updatedAt: new Date(row.updatedAt).toISOString(),
+    };
+    return { profile, authentication: { providers: this.providersForUser(userId).sort() } };
   }
 
   async session(headers: Headers): Promise<IdentitySession | undefined> {

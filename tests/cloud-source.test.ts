@@ -45,7 +45,7 @@ describe('cloud repository source resolution', () => {
     const store = new Store(':memory:');
     store.claimPersonalOrganization('owner');
     const project = store.createProject('Local source', {
-      repos: [app], worldProvider: 'fake-cloud', defaultBase: 'main', defaultTarget: 'main',
+      repos: [app], worldProvider: 'fake-cloud', defaultBase: 'main', defaultTarget: 'main', remote: 'pr',
     });
     const task = store.createTask({
       projectId: project.id, title: 'Cloud work', workflow: 'software-dev',
@@ -115,8 +115,90 @@ describe('cloud repository source resolution', () => {
         'git@github.com:acme/app.git': 'app clone token',
         [wikiUrl]: 'wiki clone token',
       });
+      expect(received.repositoryAuthorities).toEqual({
+        'git@github.com:acme/app.git': 'origin',
+        [wikiUrl]: 'origin',
+      });
       expect(tokenRequests).toEqual([appRepository.id, wiki.id]);
       expect(handle.repos?.find((repo) => repo.name === 'app')?.localPath).toBe(app);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('keys PR authority and clone credentials to local worktree sources', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-pr-source-')); dirs.push(root);
+    const app = path.join(root, 'app');
+    const content = path.join(root, 'content');
+    fs.mkdirSync(app);
+    await gitOrThrow(app, ['init', '-q', '-b', 'main']);
+    await gitOrThrow(app, ['remote', 'add', 'origin', 'git@github.com:acme/app.git']);
+
+    const store = new Store(':memory:');
+    store.claimPersonalOrganization('owner');
+    const project = store.createProject('Local PR source', {
+      repos: [app], worldProvider: 'fake-local', defaultBase: 'main', defaultTarget: 'main', remote: 'pr',
+    });
+    const task = store.createTask({
+      projectId: project.id, title: 'Local PR work', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' },
+    });
+    const connection = store.upsertGitConnection({
+      organizationId: project.organizationId!, provider: 'github', installationId: '42',
+      accountLogin: 'acme', accountType: 'Organization',
+    });
+    const appRepository = store.upsertRepository({
+      organizationId: project.organizationId!, provider: 'github', providerId: '7', owner: 'acme', name: 'app',
+      sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true, gitConnectionId: connection.id,
+    });
+    const wikiUrl = 'git@github.com:acme/project-wiki.git';
+    const wiki = store.upsertRepository({
+      organizationId: project.organizationId!, provider: 'github', owner: 'acme', name: 'project-wiki',
+      sshUrl: wikiUrl, defaultBranch: 'main', private: true,
+    });
+    store.setProjectWikiRepository(project.id, wiki.id);
+    const wikiRoot = ensureProjectWikiRepository(content, project.id);
+    await gitOrThrow(wikiRoot, ['remote', 'add', 'origin', wikiUrl]);
+
+    let received: any;
+    const worlds = new WorldRegistry();
+    worlds.register({
+      kind: 'fake-local', capabilities: { remote: false },
+      async create(spec: any) {
+        received = spec;
+        const sources: string[] = spec.repos ?? [spec.repo];
+        return {
+          handle: {
+            kind: 'fake-local', id: spec.taskId, root: '/workspace', branch: `karmax/${spec.taskId}`, base: spec.base,
+            repos: sources.map((repo, index) => ({
+              name: index === 0 ? 'app' : 'project-wiki', repo, root: `/workspace/${index}`,
+              branch: `karmax/${spec.taskId}`, base: spec.base,
+            })),
+          },
+          async destroy() {},
+        } as any;
+      },
+      async open() { throw new Error('unused'); },
+      async destroy() {},
+    } as any);
+    const core = makeCoreActivities({
+      store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock'), contentDir: content,
+      githubApp: {
+        async repositoryCloneToken(repository: { id: string }) {
+          return repository.id === appRepository.id ? 'app clone token' : 'wiki clone token';
+        },
+      } as any,
+    });
+
+    try {
+      await core.createWorld({ taskId: task.id, repos: [app], base: 'main', target: 'main', kind: 'fake-local' as any });
+      expect(received.repos).toEqual([app, wikiRoot]);
+      expect(received.repositoryAuthorities).toEqual({ [app]: 'origin', [wikiRoot]: 'origin' });
+      expect(received.repositoryOrigins).toEqual({ [app]: 'git@github.com:acme/app.git', [wikiRoot]: wikiUrl });
+      expect(received.gitCredentials.httpsTokens).toEqual({
+        [app]: 'app clone token',
+        [wikiRoot]: 'wiki clone token',
+      });
     } finally {
       store.close();
     }

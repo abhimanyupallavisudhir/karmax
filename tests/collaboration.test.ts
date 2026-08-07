@@ -232,6 +232,7 @@ describe('organization and collaboration domain', () => {
 
     const exported = store.exportOrganization(organization.id) as any;
     expect(exported.organization.name).toBe('Delete me');
+    expect(exported.security).toMatchObject({ secretsIncluded: false });
     expect(exported.tables.tasks[0].title).toBe('Private task');
     expect(exported.tables.organization_invitations[0].tokenHash).toBeUndefined();
     expect(exported.identityPolicy.scimTokenId).toBeUndefined();

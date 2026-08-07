@@ -178,17 +178,24 @@ describe('GitHub PR client', () => {
       calls.push({ path: url.pathname, body });
       if (url.pathname.endsWith('/pulls/7/reviews')) return Response.json({ id: 9 });
       if (url.pathname.endsWith('/pulls/7/merge')) return Response.json({ merged: true, sha: 'merge-sha', message: 'merged' });
+      if (url.pathname.endsWith('/git/refs/heads/main'))
+        return Response.json({ ref: 'refs/heads/main', object: { sha: body.sha } });
       if (url.pathname === '/graphql') return Response.json({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'queue-1' } } } });
       return Response.json({ message: 'not found' }, { status: 404 });
     }) as typeof fetch;
     const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
     await api.approve(SLUG, 7, 'reviewed-sha', 'approved in krmax');
     await expect(api.merge(SLUG, 7, 'reviewed-sha')).resolves.toEqual({ merged: true, sha: 'merge-sha', message: 'merged' });
+    await expect(api.fastForwardTarget(SLUG, 'main', 'reviewed-sha')).resolves.toEqual({
+      updated: true, message: 'Target advanced to the validated pull-request head',
+    });
     await expect(api.enqueue('PR_node', 'reviewed-sha')).resolves.toMatchObject({ queued: true, merged: false });
     expect(calls[0]).toMatchObject({ path: `/repos/${SLUG}/pulls/7/reviews`,
       body: { commit_id: 'reviewed-sha', event: 'APPROVE' } });
     expect(calls[1]).toMatchObject({ path: `/repos/${SLUG}/pulls/7/merge`, body: { sha: 'reviewed-sha' } });
-    expect(calls[2]!.body).toMatchObject({ variables: { input: {
+    expect(calls[2]).toMatchObject({ path: `/repos/${SLUG}/git/refs/heads/main`,
+      body: { sha: 'reviewed-sha', force: false } });
+    expect(calls[3]!.body).toMatchObject({ variables: { input: {
       pullRequestId: 'PR_node', expectedHeadOid: 'reviewed-sha',
     } } });
   });
@@ -219,6 +226,7 @@ describe('GitHub PR client', () => {
     expect(request.query).toContain('mergeStateStatus');
     expect(request.query).toContain('statusCheckRollup');
     expect(request.query).toContain('contexts(first: 50)');
+    expect(request.query).not.toContain('output {');
   });
 
   it('extracts actionable details from failed check runs and legacy statuses', async () => {
@@ -232,7 +240,7 @@ describe('GitHub PR client', () => {
       merged: false, headRefOid: 'failed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
         { __typename: 'CheckRun', databaseId: 101, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-          detailsUrl: 'https://github.test/checks/1', output: { title: '2 tests failed', summary: 'Expected 2, received 3' } },
+          detailsUrl: 'https://github.test/checks/1' },
         { __typename: 'StatusContext', context: 'lint', state: 'ERROR',
           targetUrl: 'https://ci.test/lint', description: 'runner crashed' },
         { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
@@ -245,10 +253,61 @@ describe('GitHub PR client', () => {
     await expect(api.readiness(SLUG, 9)).resolves.toMatchObject({
       checks: 'FAILURE',
       failedChecks: [
-        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/2 tests failed.*src\/math\.test\.ts:42.*AssertionError/is) },
+        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/src\/math\.test\.ts:42.*AssertionError/is) },
         { name: 'lint', state: 'ERROR', url: 'https://ci.test/lint', detail: 'runner crashed' },
       ],
     });
+  });
+
+  it('falls back to aggregate check state when the App cannot enumerate CheckRuns', async () => {
+    const requests: any[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const request = JSON.parse(String(init.body));
+      requests.push(request);
+      if (request.query.includes('contexts(first: 50)')) {
+        return Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
+      }
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_limited', url: 'https://github.test/acme/widgets/pull/10', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'limited-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        statusCheckRollup: { state: 'FAILURE' }, viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('limited-app-user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 10)).resolves.toMatchObject({
+      headSha: 'limited-head', checks: 'FAILURE',
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[0].query).toContain('contexts(first: 50)');
+    expect(requests[1].query).not.toContain('contexts(first: 50)');
+  });
+
+  it('fails closed on policy state when an older App cannot read any CI rollup', async () => {
+    const requests: any[] = [];
+    const fetcher = (async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const request = JSON.parse(String(init.body));
+      requests.push(request);
+      if (request.query.includes('statusCheckRollup')) {
+        return Response.json({ errors: [{ type: 'FORBIDDEN', path: ['repository', 'pullRequest', 'statusCheckRollup'],
+          message: 'Resource not accessible by integration' }] });
+      }
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_legacy_app', url: 'https://github.test/acme/widgets/pull/11', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'legacy-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('legacy-app-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 11)).resolves.toMatchObject({
+      headSha: 'legacy-head', mergeStateStatus: 'UNSTABLE', checksUnavailable: true,
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[0].query).toContain('contexts(first: 50)');
+    expect(requests[1].query).toContain('statusCheckRollup');
+    expect(requests[1].query).not.toContain('contexts(first: 50)');
+    expect(requests[2].query).not.toContain('statusCheckRollup');
   });
 
   it('enables auto-merge only for the expected head SHA', async () => {
@@ -324,6 +383,50 @@ describe('GitHub-authoritative merge activity', () => {
     const core = await coreFor(fakeGithub());
     await expect(core.mergeGithubPrs({ id: 'task_no_changes' } as any, []))
       .resolves.toEqual({ status: 'merged', prs: [] });
+  });
+
+  it('does not complete a provider merge until the enrolled local target is fast-forwarded', async () => {
+    const repo = await repoWithGithubOrigin('mirror-after-merge');
+    const writer = path.join(tmp, 'provider-writer');
+    await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'mirror-after-merge-origin.git'), writer]);
+    await ensureIdentity(writer);
+    fs.writeFileSync(path.join(writer, 'landed.txt'), 'landed by GitHub\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'provider merge']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'main']);
+    const landedSha = (await gitOrThrow(writer, ['rev-parse', 'HEAD'])).trim();
+
+    const fetcher = (async () => Response.json({
+      number: 91, html_url: 'https://github.test/acme/widgets/pull/91', state: 'closed', merged: true,
+      merged_at: '2026-08-04T00:00:00Z', merge_commit_sha: landedSha,
+      head: { ref: 'karmax/task_mirror', sha: landedSha }, base: { ref: 'main' },
+    })) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Provider mirror');
+    const task = core.store.createTask({ projectId: project.id, title: 'Mirror me', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const handle = {
+      id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_mirror', base: 'main',
+      repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', repo, root: repo,
+        branch: 'karmax/task_mirror', base: 'main', target: 'main', localPath: repo, sourceAuthority: 'origin' }],
+    } as any;
+    const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 91,
+      url: 'https://github.test/acme/widgets/pull/91', state: 'open', headSha: landedSha };
+
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
+      status: 'merged', sha: landedSha,
+    });
+    expect((await gitOrThrow(repo, ['rev-parse', 'main'])).trim()).toBe(landedSha);
+    expect(fs.readFileSync(path.join(repo, 'landed.txt'), 'utf8')).toBe('landed by GitHub\n');
+    expect(core.store.eventsSince(task.id, 0).map((event: any) => event.type)).toEqual(
+      expect.arrayContaining(['checkout.synced', 'merge.result']),
+    );
   });
 
   it('uses an eligible confirming human and refuses to move beyond the reviewed head', async () => {
@@ -461,11 +564,10 @@ describe('GitHub-authoritative merge activity', () => {
       url: 'https://github.test/acme/widgets/pull/21', state: 'open', headSha: 'reviewed-head' }];
 
     readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
-      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21',
-        output: { summary: 'three assertions failed' } },
+      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21' },
     ] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
-      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21.*three assertions failed/is),
+      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21/is),
     });
 
     readiness = { reviewDecision: 'CHANGES_REQUESTED' };
@@ -495,6 +597,254 @@ describe('GitHub-authoritative merge activity', () => {
     readiness = { mergeStateStatus: 'BLOCKED', statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'waiting', detail: expect.stringMatching(/merge must not be attempted/i) });
     expect(methods).toContain('PUT');
+  });
+
+  it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
+    const { githubWaitNeedsProposalRevision } = await import('../src/workflows/software-dev.js');
+
+    expect(githubWaitNeedsProposalRevision({
+      status: 'waiting',
+      detail: 'Pull Request has merge conflicts',
+    })).toBe(true);
+    expect(githubWaitNeedsProposalRevision({
+      status: 'waiting',
+      detail: 'GitHub says the branch is conflicting with the target branch.',
+    })).toBe(true);
+    expect(githubWaitNeedsProposalRevision({
+      status: 'waiting',
+      detail: 'Required status checks are pending.',
+    })).toBe(false);
+    expect(githubWaitNeedsProposalRevision({
+      status: 'queued',
+      detail: 'Pull Request has merge conflicts',
+    })).toBe(false);
+  });
+
+  it('returns an explicit merge-conflict refusal to Do for legacy pinned tasks and does not repeat impossible self-approval', async () => {
+    let reviewPosts = 0;
+    let mergeMessage = 'Pull Request has merge conflicts';
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return Response.json({
+        number: 23, node_id: 'PR_legacy_conflict', html_url: 'https://github.test/acme/widgets/pull/23', state: 'open',
+        merged: false, head: { ref: 'karmax/task_legacy_conflict', sha: 'reviewed-head' }, base: { ref: 'main' },
+      });
+      if (url.pathname.endsWith('/reviews')) {
+        reviewPosts++;
+        return Response.json({ message: 'Review Can not approve your own pull request' }, { status: 422 });
+      }
+      if (url.pathname === '/graphql') {
+        const body = JSON.parse(String(init.body ?? '{}'));
+        if (String(body.query).includes('PullRequestReadiness')) return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_legacy_conflict', url: 'https://github.test/acme/widgets/pull/23', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: 'reviewed-head', mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN',
+          viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+        } } } });
+        return Response.json({ errors: [{ message: mergeMessage }] });
+      }
+      if (method === 'PUT') return Response.json({ merged: false, message: mergeMessage }, { status: 409 });
+      return Response.json({ message: 'unexpected request' }, { status: 500 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Legacy GitHub conflict');
+    const task = core.store.createTask({ projectId: project.id, title: 'Unstick me', workflow: 'software-dev',
+      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+      payload: { userId: 'owner', satisfied: true, githubMergeAuthorized: true,
+        githubPrHeads: [{ slug: SLUG, number: 23, headSha: 'reviewed-head' }] } });
+    const ref = { repo: 'widgets', slug: SLUG, number: 23, nodeId: 'PR_legacy_conflict',
+      url: 'https://github.test/acme/widgets/pull/23', state: 'open', headSha: 'reviewed-head' } as TaskPullRequest;
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_legacy_conflict', base: 'main', repo: tmp, root: tmp } as any;
+
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
+      status: 'needs-revision',
+      detail: expect.stringMatching(/conflicts with its target.*Pull Request has merge conflicts/is),
+    });
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({ status: 'needs-revision' });
+    expect(reviewPosts).toBe(1);
+
+    mergeMessage = 'GitHub could not determine whether this pull request is mergeable';
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
+      status: 'retryable-error', detail: expect.stringMatching(/could not determine/i),
+    });
+    expect(reviewPosts).toBe(1);
+  });
+
+  it('v1.16 preserves intent across repairable failures and hands durable queueing to GitHub', async () => {
+    let liveHead = 'reviewed-head';
+    let readiness: any = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    let denyChecks = false;
+    let queueEnabled = true;
+    let refUpdateMessage: string | undefined;
+    const requests: Array<{ method: string; path: string; query?: string }> = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      requests.push({ method, path: url.pathname, query: body.query });
+      if (method === 'GET') return Response.json({
+        number: 31, node_id: 'PR_landing', html_url: 'https://github.test/acme/widgets/pull/31', state: 'open',
+        merged: false, head: { ref: 'karmax/task_landing', sha: liveHead }, base: { ref: 'main' },
+      });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+        if (denyChecks && String(body.query).includes('statusCheckRollup'))
+          return Response.json({ errors: [{ type: 'FORBIDDEN', message: 'Resource not accessible by integration' }] });
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_landing', url: 'https://github.test/acme/widgets/pull/31', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: liveHead, mergeable: 'MERGEABLE', viewerCanEnableAutoMerge: false,
+          viewerCanMergeAsAdmin: false, ...readiness,
+        } } } });
+      }
+      if (url.pathname.endsWith('/reviews')) return Response.json({ id: 1 });
+      if (method === 'PUT') return Response.json({ merged: false, message: 'merge queue required' }, { status: 409 });
+      if (url.pathname === '/graphql' && String(body.query).includes('enqueuePullRequest')) {
+        if (!queueEnabled) return Response.json({ errors: [{ message: 'This branch has no merge queue' }] });
+        return Response.json({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'MQ_31' } } } });
+      }
+      if (method === 'PATCH' && url.pathname.endsWith('/git/refs/heads/main')) {
+        if (refUpdateMessage) return Response.json({ message: refUpdateMessage }, { status: 422 });
+        return Response.json({ ref: 'refs/heads/main', object: { sha: body.sha } });
+      }
+      return Response.json({ message: 'unexpected request' }, { status: 500 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'reviewer-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'reviewer-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Intent-authorized landing');
+    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
+    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
+    const task = core.store.createTask({ projectId: project.id, title: 'Land me', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
+    } });
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_landing', base: 'main', repo: tmp, root: tmp } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 31, nodeId: 'PR_landing',
+      url: 'https://github.test/acme/widgets/pull/31', state: 'open', headSha: 'reviewed-head' }];
+
+    readiness = { mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
+      status: 'needs-revision', repair: { kind: 'conflict', preserveAuthorization: true },
+    });
+
+    readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
+      status: 'needs-revision', repair: { kind: 'ci', preserveAuthorization: true },
+    });
+
+    readiness = { mergeStateStatus: 'CLEAN', reviewDecision: 'CHANGES_REQUESTED' };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
+      status: 'needs-revision', repair: { kind: 'changes-requested', preserveAuthorization: false },
+    });
+
+    // A new full Review restores intent authorization after CHANGES_REQUESTED.
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 2, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
+    } });
+    readiness = { mergeStateStatus: 'BEHIND', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'submit' })).resolves.toMatchObject({
+      status: 'queued', providerQueue: { state: 'queued' },
+    });
+    expect(requests.some((request) => request.query?.includes('enqueuePullRequest'))).toBe(true);
+
+    const mutationsBeforeObserve = requests.filter((request) => request.method === 'PUT'
+      || request.query?.includes('enqueuePullRequest')).length;
+    readiness = { mergeStateStatus: 'CLEAN', mergeQueueEntry: { id: 'MQ_31' },
+      statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'observe' })).resolves.toMatchObject({
+      status: 'queued', providerQueue: { state: 'validating', entryIds: ['MQ_31'] },
+    });
+    expect(requests.filter((request) => request.method === 'PUT'
+      || request.query?.includes('enqueuePullRequest')).length).toBe(mutationsBeforeObserve);
+
+    readiness = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'observe' })).resolves.toMatchObject({
+      status: 'needs-revision',
+      repair: { kind: 'ci', preserveAuthorization: true },
+      detail: expect.stringMatching(/ejected.*merge-group checks/is),
+    });
+
+    // Without a native queue, land only the exact tested head. A target race is
+    // an automatic base repair—not a direct PR merge against an unbound base.
+    queueEnabled = false;
+    readiness = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'submit' })).resolves.toMatchObject({
+      status: 'merged', sha: 'reviewed-head',
+    });
+    expect(requests.some((request) => request.method === 'PATCH'
+      && request.path.endsWith('/git/refs/heads/main'))).toBe(true);
+    expect(requests.some((request) => request.method === 'PUT')).toBe(false);
+
+    refUpdateMessage = 'Update is not a fast forward';
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'submit' })).resolves.toMatchObject({
+      status: 'needs-revision', repair: { kind: 'base-moved', preserveAuthorization: true },
+    });
+
+    liveHead = 'repaired-head';
+    readiness = { mergeStateStatus: 'BLOCKED', reviewDecision: 'REVIEW_REQUIRED',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle, [{ ...refs[0]!, headSha: 'repaired-head' }], { mode: 'submit' }))
+      .resolves.toMatchObject({
+        status: 'needs-human',
+        detail: expect.stringMatching(/fresh human approval.*parked outside the provider queue/is),
+      });
+
+    // v1.17 separates read-only exact-candidate certification from the atomic
+    // landing mutation and never asks GitHub's provider queue to own ordering.
+    liveHead = 'reviewed-head';
+    readiness = { mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    refUpdateMessage = undefined;
+    const task17 = core.store.createTask({ projectId: project.id, title: 'Front-held landing', workflow: 'software-dev',
+      workflowVersion: '1.17.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task17.id, type: 'task.confirmation-voted', ts: 3, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 31, headSha: 'reviewed-head' }],
+    } });
+    const handle17 = { ...handle, id: task17.id };
+    const enqueueBefore = requests.filter((request) => request.query?.includes('enqueuePullRequest')).length;
+    const patchBefore = requests.filter((request) => request.method === 'PATCH').length;
+    readiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/still computing mergeability.*retains the front landing slot.*retry automatically/is),
+    });
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
+    expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'candidate-ready', prs: [expect.objectContaining({ headSha: 'reviewed-head' })],
+    });
+    denyChecks = true;
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'inspect-exact' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/read access to CI.*Checks and Commit statuses.*retry automatically/is),
+    });
+    denyChecks = false;
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
+    expect(requests.filter((request) => request.method === 'PATCH').length).toBe(patchBefore);
+    refUpdateMessage = 'Update is not a fast forward';
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'submit-exact' })).resolves.toMatchObject({
+      status: 'needs-revision', repair: { kind: 'base-moved', preserveAuthorization: true },
+    });
+    refUpdateMessage = undefined;
+    await expect(core.mergeGithubPrs(handle17, refs, { mode: 'submit-exact' })).resolves.toMatchObject({
+      status: 'merged', sha: 'reviewed-head',
+    });
+    expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
   });
 
   it('separates transient GitHub outages from authorization failures', async () => {
@@ -535,7 +885,7 @@ describe('GitHub-authoritative merge activity', () => {
       });
       if (method === 'PUT') return Response.json({ merged: false, message: 'Required checks are pending' }, { status: 409 });
       const body = JSON.parse(String(init.body));
-      graphqlInputs.push(body.variables.input);
+      if (body.variables?.input) graphqlInputs.push(body.variables.input);
       if (String(body.query).includes('enqueuePullRequest'))
         return Response.json({ errors: [{ message: 'This branch has no merge queue' }] });
       return Response.json({ data: { enablePullRequestAutoMerge: { pullRequest: {

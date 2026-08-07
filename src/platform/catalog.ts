@@ -33,6 +33,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   organizations: [
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
+    'GET /api/settings/installation (global operator-only Installation page probe)',
     // POST needs a human account: it calls bootstrapOrganizationOwner, and a scoped
     // agent token has no session.userId. Same for /invitations/accept below.
     'GET|POST /api/organizations (POST requires a human identity — an agent token cannot own an organization)',
@@ -57,7 +58,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/organizations/:organizationId/repositories',
     'POST /api/organizations/:organizationId/repositories/create (requires an authorized human GitHub identity)',
     'GET /api/organizations/:organizationId/git-connections',
-    'GET /api/organizations/:organizationId/github/app',
+    'GET|PUT /api/organizations/:organizationId/github/app',
     'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize|refresh (OAuth/install redirects require a human identity)',
   ],
   tasks: [
@@ -80,6 +81,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST|DELETE /api/tasks/:taskId/subscribers (task:subscribe)',
     'GET /api/search/fields (the searchable-field registry behind the query grammar)',
     'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
+    'POST /api/agent/resource-candidates (calling task inferred from its token)',
     'POST /api/agent/escalate (calling task inferred from its token; body {audience, message, urgency?: low|normal|high|critical})',
     'POST /api/agent/permission-requests (body {capabilities, audience, reason, urgency?}; exact task elevation routed for human approval, high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, and special audience selectors available to the calling task)',
@@ -98,6 +100,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
     'GET /api/tasks/:taskId/resources', 'POST /api/tasks/:taskId/resources/:resourceId/promote',
     'POST /api/tasks/:taskId/resources/:resourceId/discard',
+    'GET /api/tasks/:taskId/resources/inventory',
+    'POST /api/tasks/:taskId/resource-candidates/:candidateId/adopt|discard',
     'GET /api/tasks/:taskId/artifacts', 'POST /api/tasks/:taskId/artifacts/promote',
     'GET /api/artifacts/:artifactId',
     'GET|POST /api/tasks/:taskId/preview-leases', 'DELETE /api/preview-leases/:leaseId',
@@ -110,6 +114,11 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/settings/global/:workflow', 'GET|PUT /api/settings/project/:projectId/:workflow',
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
     'POST /api/skills', 'POST /api/safe-mode',
+  ],
+  installation: [
+    'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
+    'GET /api/email', 'POST /api/email/connect|test',
+    'GET|POST /api/remote-access',
   ],
   credentials: [
     'GET /api/user/github-accounts', 'POST /api/user/github-accounts/:accountId/active',
@@ -182,6 +191,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/cards/:id',
   ],
   administration: [
+    'GET /api/user/export (human identity only; all data directly linked to the signed-in user)',
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',

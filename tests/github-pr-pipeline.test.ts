@@ -10,6 +10,7 @@ import { WorkflowIdReusePolicy } from '@temporalio/client';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { worldRepos } from '../src/world/types.js';
+import { mergeQueueId } from '../src/coordinators/names.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -22,6 +23,42 @@ const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
 let githubReadiness: Record<string, unknown> = {};
 let mergeHttpStatus: number | undefined;
+let useMergeQueue = false;
+let mergeQueueAccepted = false;
+let mergeFailureMessage: string | undefined;
+let originDir: string;
+let blockFrontHeldRepair = false;
+let frontHeldRepairStarted = false;
+let releaseFrontHeldRepair: (() => void) | undefined;
+let frontHeldRepairGate: Promise<void> = Promise.resolve();
+const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
+let exactCandidateRevisions = 0;
+
+async function remoteForBranch(branch: string): Promise<string | undefined> {
+  if (!originDir || !fs.existsSync(originDir)) return undefined;
+  for (const entry of fs.readdirSync(originDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.endsWith('.git')) continue;
+    const remote = path.join(originDir, entry.name);
+    if ((await git(remote, ['rev-parse', '--verify', `refs/heads/${branch}^{commit}`])).code === 0) return remote;
+  }
+  return undefined;
+}
+
+async function refreshPrHead(pr: any): Promise<void> {
+  const remote = await remoteForBranch(pr.head.ref);
+  if (!remote) return;
+  const head = await git(remote, ['rev-parse', '--verify', `refs/heads/${pr.head.ref}^{commit}`]);
+  if (head.code === 0) pr.head.sha = head.stdout.trim();
+}
+
+async function landProviderTarget(pr: any, target: string): Promise<string> {
+  await refreshPrHead(pr);
+  const remote = await remoteForBranch(pr.head.ref);
+  if (!remote) throw new Error(`stub GitHub could not find remote branch ${pr.head.ref}`);
+  await gitOrThrow(remote, ['update-ref', `refs/heads/${target}`, pr.head.sha]);
+  pr.merge_commit_sha = pr.head.sha;
+  return pr.head.sha;
+}
 
 const fetcher = (async (url: string, init: RequestInit = {}) => {
   const u = new URL(String(url));
@@ -31,13 +68,16 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
   if (u.pathname === `/repos/${SLUG}/pulls` && method === 'GET') {
     const branch = u.searchParams.get('head')?.split(':')[1];
-    return json(200, prs.filter((pr) => pr.head.ref === branch));
+    const matches = prs.filter((pr) => pr.head.ref === branch);
+    await Promise.all(matches.map(refreshPrHead));
+    return json(200, matches);
   }
   if (u.pathname === `/repos/${SLUG}/pulls` && method === 'POST') {
     const pr = { number: prs.length + 1, html_url: `https://github.com/${SLUG}/pull/${prs.length + 1}`,
       node_id: `PR_${prs.length + 1}`, state: 'open', merged_at: null, title: body.title, body: body.body,
-      head: { ref: body.head, sha: 'reviewed-head' }, base: { ref: body.base } };
+      head: { ref: body.head, sha: '' }, base: { ref: body.base } };
     prs.push(pr);
+    await refreshPrHead(pr);
     const hook = afterPrOpened;
     afterPrOpened = undefined;
     await hook?.();
@@ -45,34 +85,57 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   }
   if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('PullRequestReadiness')) {
     const pr = prs.find((candidate) => candidate.number === Number(body.variables?.number)) ?? prs[0];
+    if (pr) await refreshPrHead(pr);
     return json(200, { data: { repository: { pullRequest: {
       id: pr?.node_id ?? 'PR_1', url: pr?.html_url ?? `https://github.com/${SLUG}/pull/1`,
       state: pr?.state === 'closed' ? 'CLOSED' : 'OPEN', isDraft: false, merged: Boolean(pr?.merged_at),
       headRefOid: pr?.head?.sha ?? 'reviewed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
       viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      ...(mergeQueueAccepted ? { mergeQueueEntry: { id: 'MQ_pipeline' } } : {}),
       ...githubReadiness,
     } } } });
   }
-  if (u.pathname === '/graphql' && method === 'POST')
-    return json(200, { data: {}, errors: [{ message: 'This test repository has no merge queue or auto-merge.' }] });
+  if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('enqueuePullRequest')) {
+    if (!useMergeQueue) return json(200, { errors: [{ message: 'This branch has no merge queue' }] });
+    mergeQueueAccepted = true;
+    return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: { id: 'MQ_pipeline' } } } });
+  }
+  if (u.pathname === '/graphql' && method === 'POST') {
+    return json(200, { errors: [{ message: mergeFailureMessage ?? 'GitHub did not accept the merge operation' }] });
+  }
+  const targetRef = u.pathname.match(new RegExp(`^/repos/${SLUG}/git/refs/heads/(.+)$`));
+  if (targetRef && method === 'PATCH') {
+    const pr = prs.find((candidate) => candidate.head.sha === body.sha);
+    if (!pr) return json(422, { message: 'Update is not a fast forward' });
+    pr.state = 'closed'; pr.merged_at = new Date().toISOString();
+    const landed = await landProviderTarget(pr, decodeURIComponent(targetRef[1]!));
+    return json(200, { ref: `refs/heads/${decodeURIComponent(targetRef[1]!)}`, object: { sha: landed } });
+  }
   const merge = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)/merge$`));
   if (merge && method === 'PUT') {
     const pr = prs.find((candidate) => candidate.number === Number(merge[1]));
     if (!pr) return json(404, {});
+    if (useMergeQueue) return json(409, { merged: false, message: 'merge queue required' });
     if (mergeHttpStatus) return json(mergeHttpStatus, {
       merged: false,
-      message: mergeHttpStatus >= 500 ? 'GitHub merge service unavailable' : 'GitHub refused the merge',
+      message: mergeFailureMessage ?? (mergeHttpStatus >= 500 ? 'GitHub merge service unavailable' : 'GitHub refused the merge'),
     });
     if (body.sha !== pr.head.sha) return json(409, { merged: false, message: 'Head branch was modified' });
     pr.state = 'closed'; pr.merged_at = new Date().toISOString();
-    return json(200, { merged: true, sha: 'github-merge-sha', message: 'merged' });
+    const landed = await landProviderTarget(pr, pr.base.ref);
+    return json(200, { merged: true, sha: landed, message: 'merged' });
   }
   const one = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)$`));
   if (one) {
     const pr = prs.find((candidate) => candidate.number === Number(one[1]));
     if (!pr) return json(404, {});
-    if (method === 'PATCH') Object.assign(pr, body);
+    if (method === 'PATCH') {
+      const { base, ...rest } = body;
+      Object.assign(pr, rest);
+      if (typeof base === 'string') pr.base = { ref: base };
+    }
+    await refreshPrHead(pr);
     return json(200, pr);
   }
   const comment = u.pathname.match(new RegExp(`^/repos/${SLUG}/issues/(\\d+)/comments$`));
@@ -87,13 +150,68 @@ const view = (h: any) => h.query('view') as Promise<any>;
 
 describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub)', () => {
   let h: Harness;
-  let originDir: string;
   beforeAll(async () => {
     process.env.GH_TOKEN = 'ghp_pipeline';
+    originDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pr-origin-'));
     const mock = new MockAdapter();
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        if (input.role === 'do' && blockFrontHeldRepair
+          && input.messages.at(-1)?.text.includes('retains the front landing slot')) {
+          frontHeldRepairStarted = true;
+          await frontHeldRepairGate;
+          githubReadiness = {};
+        }
+        if (input.role === 'confirm'
+          && /(?:AUTOMATED INTEGRATION-REPAIR|FINAL AUTOMATED INTEGRATION) review/
+            .test(input.messages.at(-1)?.text ?? '')) {
+          // The repaired proposal's external CI is green by the time the
+          // independent integration reviewer admits it again.
+          githubReadiness = {};
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-verdict-${input.messages.length}`,
+              role: 'user',
+              text: '@confirm confirm',
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
+        if (input.role === 'do'
+          && input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')) {
+          exactCandidateTurns.push({
+            role: input.role,
+            session: input.session,
+            messages: input.messages.map((message) => message.text),
+          });
+          githubReadiness = {};
+          const verdict = exactCandidateRevisions > 0
+            ? (exactCandidateRevisions--, '@confirm revise :: Add the missing exact-candidate repair.')
+            : '@confirm confirm';
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-verdict-${input.messages.length}`,
+              role: 'user',
+              text: verdict,
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
+        if (input.role === 'do'
+          && input.messages.at(-1)?.text.includes('Add the missing exact-candidate repair.')) {
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-repair-${input.messages.length}`,
+              role: 'user',
+              text: '@write front.md :: exact candidate repaired\n@openpr',
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
         // One test below needs a competent Merge agent that resolves a conflict
         // introduced after PR creation. Keep the ordinary mock behavior for every
         // other turn, including the existing "cannot resolve" pipeline coverage.
@@ -116,12 +234,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         status: () => ({ userAuthorized: true, oauthConfigured: true }),
         activeUserAccountId: (userId: string) => `${userId}-github`,
         repositoryPermission: async (_userId: string, slug: string) => ({ slug, permission: 'write', canMerge: true }),
-        repositoryCloneToken: async () => 'installation-token',
         userAccessToken: async (userId: string) => `${userId}-token`,
         brokerCredentials: async () => ({ env: {} }),
       } as any,
     });
-    originDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pr-origin-'));
   }, 120_000);
   afterAll(async () => {
     delete process.env.GH_TOKEN;
@@ -134,6 +250,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     afterPrOpened = undefined;
     githubReadiness = {};
     mergeHttpStatus = undefined;
+    useMergeQueue = false;
+    mergeQueueAccepted = false;
+    mergeFailureMessage = undefined;
+    blockFrontHeldRepair = false;
+    frontHeldRepairStarted = false;
+    releaseFrontHeldRepair = undefined;
+    frontHeldRepairGate = Promise.resolve();
+    exactCandidateTurns.length = 0;
+    exactCandidateRevisions = 0;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -259,16 +384,18 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     }, { timeout: 30_000 }).toBe('review/1');
     expect(prs[0].state).toBe('open');
     await handle.signal('confirm');
-    expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: prs[0].merge_commit_sha });
     expect(prs[0].state).toBe('closed');
     const final = await view(handle);
-    expect(final.pr).toMatchObject({ merged: true, state: 'closed', headSha: 'reviewed-head' });
+    expect(final.pr).toMatchObject({ merged: true, state: 'closed', headSha: prs[0].head.sha });
     expect(final.transcripts.some((transcript: any) => transcript.role === 'merge')).toBe(false);
     expect(final.messages.map((message: any) => message.text).join('\n')).toMatch(/Open PR was refused: the proposal has uncommitted changes/i);
-    // GitHub, not a local installation-token push, is authoritative: the local
-    // bare origin's target is intentionally untouched by this stub merge.
+    // GitHub is authoritative, and completion also mirrors its landed target
+    // into the enrolled local checkout.
     const origin = path.join(originDir, 'github-authoritative.git');
-    expect((await git(origin, ['show', 'main:proposal.md'])).code).not.toBe(0);
+    expect((await git(origin, ['show', 'main:proposal.md'])).stdout).toContain('reviewed proposal');
+    expect((await git(repo, ['rev-parse', 'main'])).stdout.trim())
+      .toBe((await git(origin, ['rev-parse', 'main'])).stdout.trim());
   }, 120_000);
 
   it('v1.14 returns terminal CI failures to Do with failed-check context, then reviews the repaired head again', async () => {
@@ -298,7 +425,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/ci-repair', output: { summary: 'expected green, received red' },
+        detailsUrl: 'https://github.test/checks/ci-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -306,11 +433,206 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       const context = current.messages.map((message: any) => message.text).join('\n');
-      return `${current.stage}/${/unit tests.*ci-repair.*expected green/is.test(context)}`;
+      // CheckRun output text requires an additional GitHub App permission and
+      // is deliberately not part of readiness. The actionable, permission-safe
+      // packet is the terminal classification plus check name and details URL.
+      return `${current.stage}/${/terminally failing CI.*unit tests.*ci-repair/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
     githubReadiness = {};
     await handle.signal('confirm');
-    expect(await handle.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: prs[0].merge_commit_sha });
+  }, 120_000);
+
+  it('v1.16 preserves intent authorization and automatically reviews a CI repair before landing', async () => {
+    const repo = await repoWithOrigin('github-intent-repair');
+    const project = h.store.createProject('Intent-authorized CI repair', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '53', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '88',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Repair without human churn', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Repair without human churn',
+        prompt: '@write intent.md :: repaired proposal\n@review Ready for intent review',
+        base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'integration tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: 'https://github.test/checks/intent-repair',
+      }] } },
+    };
+    await handle.signal('confirm');
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return JSON.stringify({
+        stage: current.stage,
+        status: current.status,
+        waitingFor: current.waitingFor,
+        landing: current.landing,
+        lastMessage: current.messages.at(-1)?.text,
+      });
+    }, { timeout: 30_000 }).toContain('"stage":"done"');
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: prs[0].merge_commit_sha });
+    const final = await view(handle);
+    expect(final.landing).toMatchObject({ authorization: 'authorized', validation: 'passed', provider: 'none' });
+    expect(final.transcripts.find((transcript: any) => transcript.role === 'confirm')?.messages
+      .some((message: any) => message.text.includes('AUTOMATED INTEGRATION-REPAIR review'))).toBe(true);
+    expect(final.messages.map((message: any) => message.text).join('\n')).toMatch(/intent authorization is preserved/i);
+  }, 120_000);
+
+  it('v1.16 releases the krmax admission queue after GitHub accepts durable queue ownership', async () => {
+    const repo = await repoWithOrigin('github-provider-queue');
+    const project = h.store.createProject('Provider-owned queue', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '54', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '89',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Queue without blocking', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    useMergeQueue = true;
+    const handle = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Queue without blocking',
+        prompt: '@write queued.md :: provider queue\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 50,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.waitingFor?.kind}/${current.landing?.provider}`
+        + `/${current.mergeQueue === undefined}/${current.state.mergeDomains === undefined}/${current.state.mergeDomain === undefined}`;
+    }, { timeout: 30_000 }).toMatch(/merge\/github\/(queued|validating)\/true\/true\/true/);
+    await handle.signal('cancel');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  it('v1.18 keeps a repair at the front and has the same Do session verify the exact head', async () => {
+    const repo = await repoWithOrigin('github-front-held-repair');
+    const project = h.store.createProject('Front-held exact landing', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '55', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '90',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Repair at the front', workflow: 'software-dev',
+      workflowVersion: '1.18.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    useMergeQueue = true; // The front-held protocol deliberately ignores provider queue admission.
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: 'https://github.test/checks/front-held',
+      }] } },
+    };
+    blockFrontHeldRepair = true;
+    exactCandidateRevisions = 1;
+    frontHeldRepairGate = new Promise<void>((resolve) => { releaseFrontHeldRepair = resolve; });
+    const handle = await h.client.workflow.start('softwareDev@1.18.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Repair at the front',
+        prompt: '@write front.md :: exact candidate\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10,
+      }],
+    });
+
+    try {
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+      await handle.signal('confirm');
+      await expect.poll(() => frontHeldRepairStarted, { timeout: 30_000 }).toBe(true);
+      const repairing = await view(handle);
+      expect(repairing.stage).toBe('do');
+      expect(repairing.state.mergeDomains?.length).toBeGreaterThan(0);
+      for (const domain of repairing.state.mergeDomains as string[]) {
+        const queue = await h.client.workflow.getHandle(mergeQueueId(domain)).query('queue') as any;
+        expect(queue.current).toBe(task.id);
+      }
+      expect(mergeQueueAccepted).toBe(false);
+
+      releaseFrontHeldRepair?.();
+      releaseFrontHeldRepair = undefined;
+      expect(await handle.result()).toMatchObject({ stage: 'done', sha: expect.any(String) });
+      const final = await view(handle);
+      expect(exactCandidateTurns).toHaveLength(2);
+      expect(exactCandidateTurns).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'do', session: expect.stringMatching(/^mock-/) }),
+      ]));
+      expect(new Set(exactCandidateTurns.map((turn) => turn.session)).size).toBe(1);
+      expect(final.transcripts.find((transcript: any) => transcript.role === 'do')?.messages
+        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION verification'))).toBe(true);
+      expect(final.transcripts.find((transcript: any) => transcript.role === 'confirm')?.messages
+        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION verification')) ?? false).toBe(false);
+      expect(final.landing).toMatchObject({ authorization: 'authorized', validation: 'passed', provider: 'none' });
+      expect(mergeQueueAccepted).toBe(false);
+    } finally {
+      releaseFrontHeldRepair?.();
+      blockFrontHeldRepair = false;
+    }
+  }, 120_000);
+
+  it('unsticks a v1.12 execution when GitHub reports a conflict only in the merge refusal', async () => {
+    const repo = await repoWithOrigin('github-legacy-conflict');
+    const project = h.store.createProject('Legacy GitHub conflict', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '45', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '80',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Unstick legacy conflict', workflow: 'software-dev',
+      workflowVersion: '1.12.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.12.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Unstick legacy conflict',
+        prompt: '@write legacy-conflict.md :: repaired proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
+    mergeHttpStatus = 409;
+    mergeFailureMessage = 'Pull Request has merge conflicts';
+    await handle.signal('confirm');
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      const context = current.messages.map((message: any) => message.text).join('\n');
+      return `${current.stage}/${/merge conflicts.*Finish the Do turn/is.test(context)}`;
+    }, { timeout: 30_000 }).toBe('review/true');
+
+    githubReadiness = {};
+    mergeHttpStatus = undefined;
+    mergeFailureMessage = undefined;
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done', sha: prs[0].merge_commit_sha });
   }, 120_000);
 
   it('v1.14 bounds transient GitHub errors and lets a Merge wait follow-up return to Do', async () => {
@@ -353,112 +675,11 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(await handle.result()).toMatchObject({ stage: 'done' });
   }, 120_000);
 
-  it('v1.15 reopens a cancelled Review PR before restoring the review gate', async () => {
-    const repo = await repoWithOrigin('github-review-restore');
-    const project = h.store.createProject('GitHub Review restore', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '45', accountLogin: 'acme', accountType: 'Organization' });
-    h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '80',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Restore Review', workflow: 'software-dev',
-      workflowVersion: '1.15.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
-    const handle = await h.client.workflow.start('softwareDev@1.15.0', {
-      taskQueue: TASK_QUEUE,
-      workflowId: task.id,
-      args: [{
-        taskId: task.id, projectId: project.id, title: 'Restore Review',
-        prompt: '@write restore.md :: preserved proposal\n@review Ready', base: 'main', target: 'main',
-        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
-      }],
-    });
-
-    await expect.poll(async () => `${(await view(handle)).stage}/${prs[0]?.state}`, { timeout: 30_000 })
-      .toBe('review/open');
-    await handle.signal('cancel');
-    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
-    expect(prs).toHaveLength(1);
-    expect(prs[0].state).toBe('closed');
-
-    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
-    const starting = await h.api.moveTaskStage(token, task.id, 'review');
-    expect(starting).toMatchObject({ stage: 'pr', state: { restoringTo: 'review' } });
-    const replacement = h.client.workflow.getHandle(task.id);
-    await expect.poll(async () => {
-      const current = await view(replacement);
-      return `${current.stage}/${current.waitingFor?.kind}/${current.prs?.[0]?.state}/${prs.length}`;
-    }, { timeout: 30_000 }).toBe('review/human/open/1');
-    expect((await view(replacement)).editableParams).not.toContain('target');
-
-    await replacement.signal('confirm');
-    expect(await replacement.result()).toMatchObject({ stage: 'done', sha: 'github-merge-sha' });
-  }, 120_000);
-
-  it('v1.15 reopens a cancelled Merge PR but sends a changed restored head through Review again', async () => {
-    const repo = await repoWithOrigin('github-merge-restore');
-    const project = h.store.createProject('GitHub Merge restore', { repos: [repo], remote: 'pr' });
-    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
-      installationId: '46', accountLogin: 'acme', accountType: 'Organization' });
-    h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '81',
-      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
-    const task = h.store.createTask({ projectId: project.id, title: 'Restore Merge', workflow: 'software-dev',
-      workflowVersion: '1.15.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
-      createdBy: { kind: 'user', userId: 'a' } });
-    const handle = await h.client.workflow.start('softwareDev@1.15.0', {
-      taskQueue: TASK_QUEUE,
-      workflowId: task.id,
-      args: [{
-        taskId: task.id, projectId: project.id, title: 'Restore Merge',
-        prompt: '@write restore-merge.md :: preserved proposal\n@review Ready', base: 'main', target: 'main',
-        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
-        githubPollMs: 10,
-      }],
-    });
-
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
-    githubReadiness = {
-      mergeStateStatus: 'UNSTABLE',
-      statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
-    };
-    mergeHttpStatus = 409;
-    await handle.signal('confirm');
-    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).waitingFor?.kind}`, { timeout: 30_000 })
-      .toBe('merge/github');
-    await handle.signal('cancel');
-    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
-    expect(prs[0].state).toBe('closed');
-
-    // An unchanged exact head may resume Merge after the PR is reopened; it
-    // must not manufacture a second Review for work that was already approved.
-    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
-    await h.api.moveTaskStage(token, task.id, 'merge');
-    const exactReplacement = h.client.workflow.getHandle(task.id);
-    await expect.poll(async () => {
-      const current = await view(exactReplacement);
-      return `${current.stage}/${current.waitingFor?.kind}/${current.prs?.[0]?.state}`;
-    }, { timeout: 30_000 }).toBe('merge/github/open');
-    await exactReplacement.signal('cancel');
-    expect(await exactReplacement.result()).toMatchObject({ stage: 'cancelled' });
-    expect(prs[0].state).toBe('closed');
-
-    // The remote proposal changed while stopped. Reopening is necessary, but
-    // the old exact-head approval must not carry onto this replacement head.
-    prs[0].head.sha = 'moved-head';
-    githubReadiness = {};
-    mergeHttpStatus = undefined;
-    await h.api.moveTaskStage(token, task.id, 'merge');
-    const replacement = h.client.workflow.getHandle(task.id);
-    await expect.poll(async () => {
-      const current = await view(replacement);
-      const transcript = current.messages.map((message: any) => message.text).join('\n');
-      return `${current.stage}/${current.waitingFor?.kind}/${current.prs?.[0]?.state}/${/head changed.*Review is required/is.test(transcript)}`;
-    }, { timeout: 30_000 }).toBe('review/human/open/true');
-
-    await replacement.signal('cancel');
-    expect(await replacement.result()).toMatchObject({ stage: 'cancelled' });
-  }, 120_000);
-
-  it('v1.16 does not let a held Review confirmation approve a head changed during the hold', async () => {
+  /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its
+   *  recorded workflow must remain replay-compatible, but a newly fixed activity
+   *  can let its empty PR stage be a no-op; the historical Merge stage then does
+   *  exactly what it always did: commit the dirty result and land it safely. */
+  it('v1.20 does not let a held Review confirmation approve a head changed during the hold', async () => {
     const repo = await repoWithOrigin('github-held-review-head');
     const project = h.store.createProject('GitHub held Review head', { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -466,9 +687,9 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '82',
       owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
     const task = h.store.createTask({ projectId: project.id, title: 'Hold Review', workflow: 'software-dev',
-      workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      workflowVersion: '1.20.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
       createdBy: { kind: 'user', userId: 'a' } });
-    const original = await h.client.workflow.start('softwareDev@1.16.0', {
+    const original = await h.client.workflow.start('softwareDev@1.20.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
       args: [{
@@ -485,7 +706,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await original.signal('cancel');
     expect(await original.result()).toMatchObject({ stage: 'cancelled' });
 
-    const held = await h.client.workflow.start('softwareDev@1.16.0', {
+    const held = await h.client.workflow.start('softwareDev@1.20.0', {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
       workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE,
@@ -508,7 +729,11 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => `${(await view(held)).stage}/${(await view(held)).waitingFor?.kind}`, { timeout: 30_000 })
       .toBe('review/human');
 
-    prs[0].head.sha = `${reviewedHead}-changed`;
+    fs.writeFileSync(path.join(reviewed.worldPath, 'held-review-moved.txt'), 'remote head moved\n');
+    await gitOrThrow(reviewed.worldPath, ['add', 'held-review-moved.txt']);
+    await gitOrThrow(reviewed.worldPath, ['commit', '-m', 'Move held Review head']);
+    await gitOrThrow(reviewed.worldPath, ['push', 'origin', reviewed.branch]);
+    expect(await gitOrThrow(reviewed.worldPath, ['rev-parse', 'HEAD'])).not.toBe(reviewedHead);
     await held.signal('confirm');
     await expect.poll(async () => {
       const current = await view(held);
@@ -521,10 +746,6 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(await held.result()).toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
-  /** Task 419 was already pinned to 1.10.0 when branch-before-PR shipped. Its
-   *  recorded workflow must remain replay-compatible, but a newly fixed activity
-   *  can let its empty PR stage be a no-op; the historical Merge stage then does
-   *  exactly what it always did: commit the dirty result and land it safely. */
   it('lets a pinned 1.10 workflow with uncommitted work continue past its empty PR stage', async () => {
     const repo = await repoWithOrigin('pinned-1-10');
     const taskId = newId('task');

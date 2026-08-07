@@ -31,6 +31,7 @@ import { WorldHandoffService } from '../../src/world/handoff.js';
 /** How long a teardown step may run before it is worth saying so out loud. Well
  *  clear of the ~1s a healthy teardown takes, so a normal run stays silent. */
 const SLOW_PHASE_MS = 20_000;
+const WORKER_DRAIN_ESCALATION_MS = 30_000;
 
 /** Run one teardown step, announcing it on stderr if it outlives
  *  {@link SLOW_PHASE_MS}. Purely diagnostic: the step is still awaited to
@@ -127,6 +128,7 @@ export async function bootHarness(
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
+  let serverStopped = false;
 
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds });
   const gateways: Array<() => Promise<void>> = [];
@@ -196,9 +198,45 @@ export async function bootHarness(
       // the information missing (it cost a bisect across three CI runs). Name
       // each step while it is still running, so a hang identifies itself.
       await stopPhase('gateways', async () => { for (const close of gateways) await close().catch(() => {}); });
-      await stopPhase('workerDrain', async () => { worker.shutdown(); await runPromise.catch(() => {}); });
+      // Every harness owns an isolated Temporal server, so no execution in its
+      // namespace should outlive the test. In particular, gateway tests can
+      // leave durable singleton coordinators or waiting tasks running. Asking
+      // the worker to drain first then waits forever for activities owned by
+      // executions that nobody will signal again (and CI eventually reports an
+      // afterAll timeout even though every assertion passed). Close the logical
+      // work before draining the process that serves it.
+      await stopPhase('workflowTerminate', async () => {
+        const terminations: Promise<unknown>[] = [];
+        for await (const execution of client.workflow.list({ query: "ExecutionStatus='Running'" })) {
+          terminations.push(client.workflow.getHandle(execution.workflowId, execution.runId)
+            .terminate('test harness shutdown').catch(() => undefined));
+        }
+        await Promise.all(terminations);
+      });
+      await stopPhase('workerDrain', async () => {
+        worker.shutdown();
+        const drained = await Promise.race([
+          runPromise.then(() => true, () => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), WORKER_DRAIN_ESCALATION_MS)),
+        ]);
+        if (!drained) {
+          // This harness owns an isolated Temporal process. A rare SDK drain can
+          // remain in STOPPING forever even after every execution was terminated
+          // (CI then reports an afterAll timeout although every assertion passed).
+          // Removing the worker's private server is the recoverable escalation:
+          // pollers unblock, native finalization still runs, and the process-wide
+          // Temporal Runtime remains usable by later harnesses. shutdownForceTime
+          // is not suitable here because it skips that finalization.
+          await server.stop().catch(() => undefined);
+          serverStopped = true;
+          await runPromise.catch(() => {});
+        }
+      });
       await stopPhase('clientClose', () => c.close());
-      await stopPhase('serverStop', () => server.stop());
+      await stopPhase('serverStop', async () => {
+        if (!serverStopped) await server.stop();
+        serverStopped = true;
+      });
       await stopPhase('rmTempDirs', async () => {
         fs.rmSync(worldsHome, { recursive: true, force: true });
         fs.rmSync(vaultHome, { recursive: true, force: true });
