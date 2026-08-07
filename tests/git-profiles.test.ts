@@ -8,8 +8,9 @@ import { finalizeMerge } from '../src/world/merge.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { GitProfiles, gitHandle, userGitScope } from '../src/autonomy/git-profiles.js';
+import { GitProfiles, gitHandle, inheritPersonalGithubProfile, userGitScope } from '../src/autonomy/git-profiles.js';
 import { remotePolicyOf } from '../src/domain/types.js';
+import { Store } from '../src/store/db.js';
 
 /** Git & GitHub configuration (PLAN-git-config.md): the GitProfile registry,
  *  worktree-scoped identity materialization, JIT credential env, remote policy. */
@@ -161,6 +162,41 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(organization.env(organization.get('main')!, {}).GH_TOKEN).toBe('rotated-token');
     expect(broker.hasHandle(gitHandle('main', 'token', 'org_acme'))).toBe(false);
     expect(() => organization.reuseUserProfile(user)).toThrow(/already configured/i);
+  });
+
+  it('inherits a GitHub profile when the user connects before their personal workspace exists', () => {
+    const db = new Store(':memory:');
+    const user = new GitProfiles(db, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    user.saveGithubIdentity({ id: '12345', login: 'jane-dev', name: 'Jane Developer' });
+    const personal = db.createOrganization({ name: "Jane's workspace", kind: 'personal', ownerUserId: 'user_jane' });
+
+    expect(inheritPersonalGithubProfile(db, broker, 'user_jane')).toMatchObject({
+      github: { id: '12345', login: 'jane-dev' },
+      source: { kind: 'user', userId: 'user_jane', profile: 'github' },
+    });
+    expect(new GitProfiles(db, broker, path.join(tmp, 'state'), personal.id).resolve(undefined)).toMatchObject({
+      userName: 'Jane Developer',
+      source: { kind: 'user', userId: 'user_jane', profile: 'github' },
+    });
+    db.close();
+  });
+
+  it('inherits after workspace creation but never replaces organization GitHub configuration', () => {
+    const db = new Store(':memory:');
+    const inherited = db.createOrganization({ name: "Jane's workspace", kind: 'personal', ownerUserId: 'user_jane' });
+    const configured = db.createOrganization({ name: "Pat's workspace", kind: 'personal', ownerUserId: 'user_pat' });
+    const jane = new GitProfiles(db, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    const pat = new GitProfiles(db, broker, path.join(tmp, 'state'), userGitScope('user_pat'));
+    jane.saveGithubIdentity({ id: '1', login: 'jane' });
+    pat.saveGithubIdentity({ id: '2', login: 'pat' });
+    db.upsertGitConnection({ organizationId: configured.id, provider: 'github', installationId: '99',
+      accountLogin: 'pat', accountType: 'User' });
+
+    expect(inheritPersonalGithubProfile(db, broker, 'user_jane')?.source?.userId).toBe('user_jane');
+    expect(new GitProfiles(db, broker, path.join(tmp, 'state'), inherited.id).defaultProfile()).toBe('github');
+    expect(inheritPersonalGithubProfile(db, broker, 'user_pat')).toBeUndefined();
+    expect(new GitProfiles(db, broker, path.join(tmp, 'state'), configured.id).list()).toEqual([]);
+    db.close();
   });
 
   it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', () => {

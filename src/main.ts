@@ -18,7 +18,7 @@ import { TokenAuthority } from './platform/tokens.js';
 import { CredentialBroker } from './autonomy/broker.js';
 import { Vault } from './autonomy/vault.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
-import { GitProfiles, userGitScope } from './autonomy/git-profiles.js';
+import { GitProfiles, inheritPersonalGithubProfile, userGitScope } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
 import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
@@ -184,6 +184,7 @@ async function main() {
       onAuthorization: async (authorization: GitHubAuthorization) => {
         const githubIdentity = await githubApp.adoptUserAuthorization(authorization.userId, authorization.accountId, authorization);
         new GitProfiles(store, broker, p.state, userGitScope(authorization.userId)).saveGithubIdentity(githubIdentity);
+        inheritPersonalGithubProfile(store, broker, authorization.userId);
       } } } : legacyGithubOauth ? { github: legacyGithubOauth } : {}),
   });
   const installationOwner = identity.listUsers()[0];

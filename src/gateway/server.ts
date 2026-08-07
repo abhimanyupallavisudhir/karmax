@@ -58,6 +58,7 @@ import { gatherCredentialSources } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -4331,6 +4332,7 @@ export class Gateway {
             for (const account of accounts) gp.saveGithubIdentity(account);
             const active = accounts.find((account) => account.active);
             if (active) gp.setActiveGithub(active.id);
+            inheritPersonalGithubProfile(store, this.deps.broker, session.userId);
             return this.json(res, 200, {
               accounts: accounts.map((account) => ({ ...account, profile: gp.githubProfile(account.id) ?? null })),
               githubApp: this.deps.githubApp.status(session.userId),
@@ -5594,6 +5596,7 @@ export class Gateway {
     const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
     new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(userId))
       .saveGithubIdentity(identity);
+    inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
@@ -5654,6 +5657,7 @@ export class Gateway {
       const organization = this.deps.store.createOrganization({
         name: label ? `${label}'s workspace` : 'Personal workspace', kind: 'personal', ownerUserId: userId });
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
+      inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);
