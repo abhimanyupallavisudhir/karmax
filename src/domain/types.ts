@@ -215,6 +215,9 @@ export interface WorldCheckpoint {
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
   resources?: Array<{ attachmentId: string; revisionId: string }>;
+  /** Metadata-only inventory of ignored paths omitted from the portable delta.
+   * Contents are never read or uploaded by this safety net. */
+  ignored?: IgnoredResourceInventory;
   /** Accepted provider-neutral runtime declarations pinned at checkpoint time.
    * Provider snapshots remain accelerators; generated endpoints are excluded. */
   environment?: ProjectEnvironmentSpec;
@@ -533,6 +536,32 @@ export interface ResourceRevision {
   createdAt: number;
 }
 
+/** A task-owned proposal to make newly-created non-Git state a project
+ * resource. The attachment is kept disabled until Review adopts it; snapshot
+ * bytes are already durable so provider loss cannot race the decision. */
+export interface ResourceCandidate {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  taskId: string;
+  worldId: string;
+  worldGeneration: number;
+  attachmentId: string;
+  sourceKind: 'path' | 'vault-item';
+  sourcePath?: string;
+  vaultItemId?: string;
+  vaultField?: string;
+  state: 'pending' | 'adopted' | 'discarding' | 'discarded';
+  createdAt: number;
+  resolvedAt?: number;
+  resolvedBy?: string;
+}
+
+export interface IgnoredResourceInventory {
+  entries: Array<{ checkout?: string; path: string; bytes: number; likelySecret: boolean }>;
+  truncated: boolean;
+}
+
 export type ResourceLeaseState = 'preparing' | 'active' | 'released' | 'failed';
 export interface ResourceLease {
   id: string;
@@ -662,7 +691,7 @@ export interface TaskPullRequest {
 }
 
 export interface GitHubMergeAuthorization {
-  status: 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
+  status: 'candidate-ready' | 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */
   actorUserId?: string;
@@ -676,14 +705,14 @@ export interface GitHubMergeAuthorization {
     kind: 'conflict' | 'base-moved' | 'ci' | 'changes-requested' | 'head-changed';
     preserveAuthorization: boolean;
   };
-  /** Provider-owned durable queue state. Once accepted, krmax's own merge
-   * coordinator is only an admission lock and must no longer be shown as the
-   * authoritative queue. */
+  /** Provider-owned durable queue state. Used by replay-pinned v1.16 landing;
+   * v1.17 keeps the karmax target lease through exact-candidate validation and
+   * automated repair instead. */
   providerQueue?: { state: 'queued' | 'validating'; entryIds?: string[] };
 }
 
 /** Human authorization is intent-scoped; integration validation is bound to a
- * disposable candidate and is invalidated whenever GitHub rebuilds or ejects it. */
+ * disposable exact candidate and is invalidated whenever its head changes. */
 export interface TaskLandingState {
   authorization: 'none' | 'authorized' | 'reapproval-required';
   validation: 'none' | 'pending' | 'passed' | 'failed';

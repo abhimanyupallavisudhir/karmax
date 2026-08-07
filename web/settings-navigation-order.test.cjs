@@ -1,5 +1,4 @@
-// Organization settings should keep Phone Access beside the people/security
-// controls, directly after People & authorization.
+// Installation controls do not belong in an organization's settings rail.
 // Run: node web/settings-navigation-order.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -19,7 +18,6 @@ const sections = [...nav.matchAll(/<a\b([^>]*)>([^<]+)<\/a>/g)]
     label: label.replace(/&amp;/g, '&'),
   }))
   .filter(({ id }) => id);
-const peopleIndex = sections.findIndex(({ id }) => id === 'settings-people');
 const phoneIndex = sections.findIndex(({ id }) => id === 'settings-access');
 
 let failed = 0;
@@ -30,10 +28,10 @@ function ok(condition, message) {
   }
 }
 
-ok(peopleIndex >= 0, 'settings navigation includes People & authorization');
-ok(phoneIndex >= 0, 'settings navigation includes Phone Access');
-ok(phoneIndex === peopleIndex + 1,
-  `Phone Access follows People & authorization (found: ${sections.map(({ label }) => label).join(' → ')})`);
+ok(sections.some(({ id }) => id === 'settings-people'), 'settings navigation keeps People & authorization');
+ok(phoneIndex < 0, 'settings navigation no longer includes installation Phone Access');
+ok(!view.includes('id="appearance-card"') && !view.includes('id="resilience-card"') && !view.includes('id="outbound-email-card"'),
+  'organization settings contains no installation-wide cards');
 
 console.log(`\n${3 - failed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

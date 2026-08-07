@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -36,7 +36,7 @@ import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
-import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
+import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -49,6 +49,9 @@ import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, des
 import { sameRepository } from '../world/repository-identity.js';
 import type { WorldAccessService } from '../world/access.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
+import { itemHandle } from '../autonomy/vault-items.js';
+import type { CredentialBroker } from '../autonomy/broker.js';
+import type { ProjectResourceService } from '../world/resources.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -231,6 +234,8 @@ export interface KarmaxApiDeps {
   /** World access for permission-checked collaboration tools. */
   worlds?: WorldRegistry;
   worldAccess?: WorldAccessService;
+  resources?: ProjectResourceService;
+  broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
@@ -412,6 +417,94 @@ export class KarmaxApi {
       await this.routeCollaborationEvent({ ...event, seq });
       return { branch: access.handle.branch, pushed: result.pushed };
     } finally { await access.release(); }
+  }
+
+  async proposeProjectResource(token: string, input: {
+    source: { kind: 'path'; path: string } | { kind: 'vault-item'; itemId: string; field?: string };
+    name: string;
+    driver?: 'volume@1' | 'object-tree@1' | 'secret@1' | 'service@1' | 'database@1';
+    target: ResourceTarget;
+    access?: ResourceAccess;
+    publish?: 'discard' | 'review';
+  }) {
+    const caller = this.require(token, 'propose_project_resource');
+    if (!caller.taskId || caller.taskId === '*') throw new CapabilityError('propose_project_resource requires a task-agent token');
+    if (!this.deps.resources) throw new Error('project resources are unavailable');
+    const task = this.deps.store.getTask(caller.taskId);
+    if (!task) throw new NotFoundError('calling task not found');
+    const resourceReviewMinor = task.workflow === 'software-dev' || task.workflow === 'goal' ? 19
+      : task.workflow === 'just-do' ? 5 : undefined;
+    const [taskMajor, taskMinor] = task.workflowVersion.split('.').map(Number);
+    const supportsResourceReview = resourceReviewMinor !== undefined && Number.isFinite(taskMajor)
+      && Number.isFinite(taskMinor) && (taskMajor! > 1 || (taskMajor === 1 && taskMinor! >= resourceReviewMinor));
+    if (!supportsResourceReview)
+      throw new ValidationError('this task workflow version does not support review-gated project resource adoption');
+    const project = this.deps.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new NotFoundError('calling task project is unavailable');
+    this.require(token, 'propose_project_resource', { taskId: task.id, projectId: task.projectId,
+      organizationId: project.organizationId });
+    const current = this.deps.store.currentWorld(task.id) as WorldHandle | undefined;
+    if (caller.worldGeneration == null || current?.generation == null || caller.worldGeneration !== current.generation)
+      throw new CapabilityError('project resource proposals require a token for the task’s current world generation');
+    if (input.source.kind === 'path') {
+      if (input.driver && !['volume@1', 'object-tree@1'].includes(input.driver))
+        throw new ValidationError('filesystem candidates require volume@1 or object-tree@1');
+      return this.deps.resources.proposePath(task.id, { path: input.source.path, name: input.name,
+        target: input.target, access: input.access, publish: input.publish,
+        driver: input.driver as 'volume@1' | 'object-tree@1' | undefined });
+    }
+    if (!this.deps.broker) throw new Error('credential broker is unavailable');
+    const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, project.organizationId);
+    const item = vault.get(input.source.itemId);
+    if (!item) throw new NotFoundError('vault item not found');
+    // The narrow vault:store capability lets an agent preserve credentials it
+    // created, not silently repurpose somebody else's credential as a project
+    // default. Existing-item attachment remains a human settings operation.
+    if (item.provenance.taskId !== task.id)
+      throw new CapabilityError('only a vault item created by this task can be proposed as a project resource');
+    const field = input.source.field ?? item.fields[0];
+    if (!field || !item.fields.includes(field as any)) throw new ValidationError('vault item field is not stored');
+    const driver = input.driver ?? 'secret@1';
+    if (!['secret@1', 'service@1', 'database@1'].includes(driver))
+      throw new ValidationError('vault-item candidates require secret@1, service@1, or database@1');
+    if ((driver === 'service@1' || driver === 'database@1') && input.access === 'write'
+      && !allows(caller.caps, 'project:resource:shared-write'))
+      throw new CapabilityError('a writable shared service or database requires project:resource:shared-write');
+    return this.deps.resources.proposeCredential(task.id, { itemId: item.id, field,
+      credentialHandle: itemHandle(item.id, field as any), name: input.name,
+      driver: driver as 'secret@1' | 'service@1' | 'database@1', target: input.target,
+      access: input.access, source: { vaultItemLabel: item.label, vaultItemType: item.type } });
+  }
+
+  async adoptProjectResource(token: string, taskId: string, candidateId: string) {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new NotFoundError('task not found');
+    const project = this.deps.store.getProject(task.projectId);
+    const caller = this.require(token, 'adopt_project_resource', { taskId, projectId: task.projectId,
+      organizationId: project?.organizationId });
+    if (caller.kind !== 'human') throw new CapabilityError('project resource adoption requires a human review token');
+    if (!this.deps.resources) throw new Error('project resources are unavailable');
+    const result = this.deps.resources.adoptCandidate(taskId, candidateId, caller.principal);
+    // The durable store transition is authoritative. The signal only wakes a
+    // Review workflow that is currently parked on this decision; if the workflow
+    // has already closed, the adopted resource must remain adopted.
+    try { await this.deps.client.workflow.getHandle(taskId).signal(SIG.resourceResolved); }
+    catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
+    return result;
+  }
+
+  async discardProjectResource(token: string, taskId: string, candidateId: string) {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new NotFoundError('task not found');
+    const project = this.deps.store.getProject(task.projectId);
+    const caller = this.require(token, 'discard_project_resource', { taskId, projectId: task.projectId,
+      organizationId: project?.organizationId });
+    if (caller.kind !== 'human') throw new CapabilityError('project resource discard requires a human review token');
+    if (!this.deps.resources) throw new Error('project resources are unavailable');
+    const result = await this.deps.resources.discardCandidate(taskId, candidateId, caller.principal);
+    try { await this.deps.client.workflow.getHandle(taskId).signal(SIG.resourceResolved); }
+    catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
+    return result;
   }
 
   async importTaskBranch(token: string, sourceTaskId: string) {
@@ -941,7 +1034,7 @@ export class KarmaxApi {
     if (resolved.separateAgents !== false) return;
     let spec = resolved['agent:do'] as AgentSpec | undefined;
     if (!spec?.provider) {
-      const profile = this.deps.store.getProfile(`${projectId}::do-default`) ?? this.deps.store.getProfile('do-default');
+      const profile = roleDefaultProfile(this.deps.store, 'do', projectId);
       const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
       const model = profile?.model ?? defaultModel(provider);
       const effort = profile?.effort ?? defaultEffort(provider);
@@ -1854,8 +1947,24 @@ export class KarmaxApi {
         : {}),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
     };
+    // A lifecycle replacement is a new Temporal history, not a new agent
+    // conversation. Resume the Do provider session when its credential home can
+    // be leased again; the copied transcript remains the provider-independent
+    // fallback when it cannot.
+    const session = source.session ?? (this.deps.store.kvGet(`session:${view.taskId}:do`) || undefined);
+    let sessionHome = source.sessionHome;
+    if (!sessionHome) {
+      try {
+        const meta = JSON.parse(this.deps.store.kvGet(`sessionmeta:${view.taskId}:do`) ?? '{}');
+        sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
+      } catch {
+        /* malformed legacy metadata: the transcript still preserves context */
+      }
+    }
     return {
       ...source,
+      ...(session ? { session } : {}),
+      ...(sessionHome ? { sessionHome } : {}),
       messages: source.messages.map((message) => ({ ...message })),
       transcripts: source.transcripts?.map((transcript) => ({
         ...transcript,
@@ -1868,8 +1977,9 @@ export class KarmaxApi {
       resumeStage,
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
-      // changed head before it can be re-admitted to the provider queue.
-      ...(resumeStage === 'do' && view.stage === 'merge' && view.landing?.authorization === 'authorized'
+      // changed head before it can be re-admitted to the landing queue.
+      ...(resumeStage === 'do' && (view.stage === 'merge' || view.stage === 'escalated')
+        && view.landing?.authorization === 'authorized'
         ? {
             repairValidationPending: true,
             landing: {
@@ -2766,6 +2876,34 @@ export class KarmaxApi {
       }
     }
 
+    // Retry is also the explicit migration boundary for Landing failures that
+    // are parked in a still-running historical execution. Retrying that same
+    // pin would reproduce either the separate Confirm credential selection or
+    // the unguarded task-branch push. Replace it with the current workflow while
+    // retaining the world, PRs, intent authorization, and Do conversation.
+    const retryMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
+    if (signal === SIG.retry
+      && scopedTask?.workflow === 'software-dev'
+      && retryMinor >= 16
+      && retryMinor < 18
+      && heldView?.stage === 'escalated'
+      && heldView.status === 'blocked'
+      && !heldView.pointOfNoReturnPassed
+      && heldView.landing?.authorization === 'authorized') {
+      const now = Date.now();
+      const message: Message = {
+        id: `landing-upgrade-${now}`,
+        role: 'user',
+        text: `Karmax upgraded this attempt to the current Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the already-authorized intent, inspect the current repaired proposal, make only necessary fixes, verify it, and call open_pr again. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
+        ts: now,
+      };
+      const nextView = this.withConversationMessage(heldView, 'do', message);
+      await this.stopTaskActivity(scopedTask, heldView, 'Retrying authorized Landing failure on same-Do protocol');
+      await this.startTransitionReplacement(scopedTask, nextView, 'do');
+      this.publishConversationMessage(taskId, 'do', message);
+      return message;
+    }
+
     // A cross-cutting human hold is not a second decision gate. Supplying agent
     // input releases it immediately. Replacing from the persisted checkpoint
     // also repairs already-parked v1.5/v1.6 executions whose hold condition only
@@ -2805,6 +2943,29 @@ export class KarmaxApi {
       await this.stopTaskActivity(scopedTask, heldView, 'Human confirmed the Review held for input');
       const minor = Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0);
       await this.startTransitionReplacement(scopedTask, heldView, minor >= 12 ? 'merge' : 'pr');
+      return;
+    }
+
+    // Executions on the pre-v1.18 Landing protocols already parked at their
+    // ordinary Review gate must not continue into a separate integration-agent
+    // path. The
+    // confirmation above has already been authorized and journalled, so replace
+    // the old execution at the exact Review -> Landing boundary. This preserves
+    // its PR/head checkpoint, consumes the one human decision exactly once, and
+    // lets the latest workflow reconstruct intent authorization before entering
+    // the front-held exact-candidate queue. Older versions did not journal durable
+    // intent authorization, so they retain their historical semantics.
+    const scopedMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
+    if (signal === SIG.confirm
+      && scopedTask?.workflow === 'software-dev'
+      && scopedMinor >= 16
+      && scopedMinor < 18
+      && heldView?.stage === 'review'
+      && heldView.status === 'waiting'
+      && heldView.waitingFor?.kind === 'human'
+      && !heldOrigin) {
+      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading to same-Do Landing verification');
+      await this.startTransitionReplacement(scopedTask, heldView, 'merge');
       return;
     }
 

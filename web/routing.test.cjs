@@ -66,6 +66,7 @@ eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
 eval(extractFn('encodeQuery'));
 eval(extractFn('globalRoute'));
+eval(extractFn('installationRoute'));
 eval(extractFn('profileRoute'));
 eval(extractFn('taskRecord'));
 eval(extractFn('taskUrl'));
@@ -87,6 +88,7 @@ eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under
 eq(globalRoute('dashboard'), '/acme/dashboard', 'dashboard route is org-prefixed');
 eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
 eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
+eq(installationRoute(), '/installation', 'installation route is global, not org-prefixed');
 eq(profileRoute(), '/profile', 'profile route is user-scoped, not org-prefixed');
 eq(globalRoute('organization', organizationById('org_globex')), '/globex/settings', 'globalRoute honours an explicit org');
 S.organizationId = 'org_globex';
@@ -100,6 +102,7 @@ eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox', sub: 
 eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', org: 'acme', tab: 'inbox', sub: 'review-requested' },
   'parse /<org>/inbox/<kind> as the inbox pinned to one kind of notification');
 eq(parseRoute('/profile'), { name: 'profile' }, 'parse the global user profile');
+eq(parseRoute('/installation'), { name: 'installation' }, 'parse the operator-owned installation page');
 eq(parseRoute('/globex/profile'), { name: 'profile', legacy: true },
   'an old org-prefixed profile URL canonicalises without selecting that organization');
 eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: null }, 'parse bare /<org> as org home');

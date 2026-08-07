@@ -9,6 +9,7 @@ import { newId } from '../src/util/id.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { worldRepos } from '../src/world/types.js';
+import { mergeQueueId } from '../src/coordinators/names.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -25,6 +26,12 @@ let useMergeQueue = false;
 let mergeQueueAccepted = false;
 let mergeFailureMessage: string | undefined;
 let originDir: string;
+let blockFrontHeldRepair = false;
+let frontHeldRepairStarted = false;
+let releaseFrontHeldRepair: (() => void) | undefined;
+let frontHeldRepairGate: Promise<void> = Promise.resolve();
+const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
+let exactCandidateRevisions = 0;
 
 async function remoteForBranch(branch: string): Promise<string | undefined> {
   if (!originDir || !fs.existsSync(originDir)) return undefined;
@@ -149,8 +156,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        if (input.role === 'do' && blockFrontHeldRepair
+          && input.messages.at(-1)?.text.includes('retains the front landing slot')) {
+          frontHeldRepairStarted = true;
+          await frontHeldRepairGate;
+          githubReadiness = {};
+        }
         if (input.role === 'confirm'
-          && input.messages.at(-1)?.text.includes('AUTOMATED INTEGRATION-REPAIR review')) {
+          && /(?:AUTOMATED INTEGRATION-REPAIR|FINAL AUTOMATED INTEGRATION) review/
+            .test(input.messages.at(-1)?.text ?? '')) {
           // The repaired proposal's external CI is green by the time the
           // independent integration reviewer admits it again.
           githubReadiness = {};
@@ -160,6 +174,39 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
               id: `integration-verdict-${input.messages.length}`,
               role: 'user',
               text: '@confirm confirm',
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
+        if (input.role === 'do'
+          && input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')) {
+          exactCandidateTurns.push({
+            role: input.role,
+            session: input.session,
+            messages: input.messages.map((message) => message.text),
+          });
+          githubReadiness = {};
+          const verdict = exactCandidateRevisions > 0
+            ? (exactCandidateRevisions--, '@confirm revise :: Add the missing exact-candidate repair.')
+            : '@confirm confirm';
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-verdict-${input.messages.length}`,
+              role: 'user',
+              text: verdict,
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
+        if (input.role === 'do'
+          && input.messages.at(-1)?.text.includes('Add the missing exact-candidate repair.')) {
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `integration-repair-${input.messages.length}`,
+              role: 'user',
+              text: '@write front.md :: exact candidate repaired\n@openpr',
               ts: input.messages.length,
             }],
           }, ctx);
@@ -205,6 +252,12 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     useMergeQueue = false;
     mergeQueueAccepted = false;
     mergeFailureMessage = undefined;
+    blockFrontHeldRepair = false;
+    frontHeldRepairStarted = false;
+    releaseFrontHeldRepair = undefined;
+    frontHeldRepairGate = Promise.resolve();
+    exactCandidateTurns.length = 0;
+    exactCandidateRevisions = 0;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -371,7 +424,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/ci-repair', output: { summary: 'expected green, received red' },
+        detailsUrl: 'https://github.test/checks/ci-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -379,7 +432,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       const context = current.messages.map((message: any) => message.text).join('\n');
-      return `${current.stage}/${/unit tests.*ci-repair.*expected green/is.test(context)}`;
+      // CheckRun output text requires an additional GitHub App permission and
+      // is deliberately not part of readiness. The actionable, permission-safe
+      // packet is the terminal classification plus check name and details URL.
+      return `${current.stage}/${/terminally failing CI.*unit tests.*ci-repair/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
     githubReadiness = {};
     await handle.signal('confirm');
@@ -414,7 +470,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/intent-repair', output: { summary: 'base interaction failed' },
+        detailsUrl: 'https://github.test/checks/intent-repair',
       }] } },
     };
     await handle.signal('confirm');
@@ -469,6 +525,73 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     }, { timeout: 30_000 }).toMatch(/merge\/github\/(queued|validating)\/true\/true\/true/);
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  it('v1.18 keeps a repair at the front and has the same Do session verify the exact head', async () => {
+    const repo = await repoWithOrigin('github-front-held-repair');
+    const project = h.store.createProject('Front-held exact landing', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '55', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '90',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Repair at the front', workflow: 'software-dev',
+      workflowVersion: '1.18.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    useMergeQueue = true; // The front-held protocol deliberately ignores provider queue admission.
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: 'https://github.test/checks/front-held',
+      }] } },
+    };
+    blockFrontHeldRepair = true;
+    exactCandidateRevisions = 1;
+    frontHeldRepairGate = new Promise<void>((resolve) => { releaseFrontHeldRepair = resolve; });
+    const handle = await h.client.workflow.start('softwareDev@1.18.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Repair at the front',
+        prompt: '@write front.md :: exact candidate\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10,
+      }],
+    });
+
+    try {
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+      await handle.signal('confirm');
+      await expect.poll(() => frontHeldRepairStarted, { timeout: 30_000 }).toBe(true);
+      const repairing = await view(handle);
+      expect(repairing.stage).toBe('do');
+      expect(repairing.state.mergeDomains?.length).toBeGreaterThan(0);
+      for (const domain of repairing.state.mergeDomains as string[]) {
+        const queue = await h.client.workflow.getHandle(mergeQueueId(domain)).query('queue') as any;
+        expect(queue.current).toBe(task.id);
+      }
+      expect(mergeQueueAccepted).toBe(false);
+
+      releaseFrontHeldRepair?.();
+      releaseFrontHeldRepair = undefined;
+      expect(await handle.result()).toMatchObject({ stage: 'done', sha: expect.any(String) });
+      const final = await view(handle);
+      expect(exactCandidateTurns).toHaveLength(2);
+      expect(exactCandidateTurns).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'do', session: expect.stringMatching(/^mock-/) }),
+      ]));
+      expect(new Set(exactCandidateTurns.map((turn) => turn.session)).size).toBe(1);
+      expect(final.transcripts.find((transcript: any) => transcript.role === 'do')?.messages
+        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION verification'))).toBe(true);
+      expect(final.transcripts.find((transcript: any) => transcript.role === 'confirm')?.messages
+        .some((message: any) => message.text.includes('FINAL AUTOMATED INTEGRATION verification')) ?? false).toBe(false);
+      expect(final.landing).toMatchObject({ authorization: 'authorized', validation: 'passed', provider: 'none' });
+      expect(mergeQueueAccepted).toBe(false);
+    } finally {
+      releaseFrontHeldRepair?.();
+      blockFrontHeldRepair = false;
+    }
   }, 120_000);
 
   it('unsticks a v1.12 execution when GitHub reports a conflict only in the merge refusal', async () => {

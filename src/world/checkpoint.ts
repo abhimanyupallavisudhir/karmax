@@ -80,6 +80,7 @@ export class WorldCheckpointService {
     const files: DeltaFile[] = [];
     const repos: WorldCheckpoint['repos'] = [];
     const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
+    const ignored = await this.resources?.ignoredInventory(handle.id).catch(() => undefined);
     const resourcePaths = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
       .map((projection) => projection.target).filter((value): value is string => Boolean(value));
     const ephemeralPaths = new Set(Array.isArray(handle.meta?.ephemeralPaths)
@@ -118,6 +119,7 @@ export class WorldCheckpointService {
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
       repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
       ...(resourceRefs.length ? { resources: resourceRefs } : {}),
+      ...(ignored?.entries.length || ignored?.truncated ? { ignored } : {}),
       ...snapshotProjectRuntime(this.store, projectId),
       createdAt: Date.now(),
     };

@@ -45,7 +45,7 @@ import {
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
-import { SIG_AGENT_TURN_STATE } from './names.js';
+import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -99,6 +99,7 @@ const boundedCoord = proxyActivities<coordinatorActivities>({
 export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
+export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
 export const confirmSignal = defineSignal('confirm');
 /** Explicit transition from Do/waiting-for-input into PR preparation. */
 export const openPrSignal = defineSignal('openPr');
@@ -211,9 +212,9 @@ const MAX_SHELL_NUDGES = 3;
 /** Transient GitHub/API failures are retried automatically, but unlike a real
  * pending check they are not allowed to disguise a permanent outage forever. */
 const MAX_GITHUB_ERROR_POLLS = 3;
-/** A hot target may eject the same PR repeatedly. Repairs are automatic and do
- * not occupy the provider queue, but after this many consecutive ejections a
- * person is asked for guidance instead of spending agent turns forever. */
+/** Landing repairs are automatic, but after this many consecutive failures a
+ * person is asked for guidance instead of spending agent turns—and, from v1.17,
+ * blocking the front landing slot—forever. */
 const MAX_AUTOMATED_LANDING_REPAIRS = 5;
 
 /**
@@ -335,13 +336,30 @@ export async function softwareDevV1_16(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.16.0');
 }
 
+/** The durable karmax queue owns final integration: every exact candidate is
+ * agent-checked at the front, and bounded automated repair retains that slot. */
+export async function softwareDevV1_17(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.17.0');
+}
+
+/** Final exact-candidate verification is another turn in the existing Do
+ * conversation; it never selects or displays a separate integration reviewer. */
+export async function softwareDevV1_18(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.18.0');
+}
+
+/** Review-gated adoption of task-created durable project resources. */
+export async function softwareDevV1_19(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.19.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -395,6 +413,7 @@ async function softwareDevImpl(
   behaviorVersion: BehaviorVersion,
 ): Promise<{ stage: Stage; sha?: string }> {
   const minor = behaviorMinor(behaviorVersion);
+  const resourceCandidateReview = minor >= 19;
   const liveAgentStates = behaviorVersion !== '1.0.0';
   const providerTerminalCompletion = minor >= 2;
   const modeSwitching = minor >= 3;
@@ -417,6 +436,15 @@ async function softwareDevImpl(
   const explicitPrCycle = minor >= 13;
   const classifiedGithubStates = minor >= 14;
   const intentAuthorizedLanding = minor >= 16;
+  // GitHub's merge queue ejects failed candidates, so it cannot preserve the
+  // invariant that automated integration repair stays at the front. v1.17 uses
+  // karmax's durable per-target lease as the authoritative landing queue, checks
+  // the exact CI-green head there, and advances the target atomically.
+  const frontHeldLanding = minor >= 17;
+  // The exact-candidate check belongs to the agent that authored and repaired
+  // the proposal. Re-enter its Do conversation so it retains both context and
+  // configured provider; no synthetic Confirm/integration-review role exists.
+  const doOwnsIntegrationReview = minor >= 18;
   // Waiting for a merge slot is unbounded in wall-clock time, so the wait loop's
   // cost per tick is load-bearing: before 1.9 it re-ran two activities AND
   // republished the entire TaskView (messages + every agent transcript) every
@@ -471,6 +499,8 @@ async function softwareDevImpl(
   let checkoutHeads: Record<string, string> = {};
   let cancelled = false;
   let retryRequested = false;
+  let resourceResolutionEpoch = 0;
+  let awaitingResourceDecision = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   let world: WorldHandleLike | undefined = recovery?.world;
@@ -497,13 +527,17 @@ async function softwareDevImpl(
     : { authorization: 'none', validation: 'none', provider: 'none' };
   let repairValidationPending = intentAuthorizedLanding && !!recovery?.repairValidationPending;
   let forceHumanRepairReview = false;
-  let providerQueueAccepted = intentAuthorizedLanding
+  let providerQueueAccepted = !frontHeldLanding && intentAuthorizedLanding
     && recoveryStage === 'merge'
     && (landing.provider === 'queued' || landing.provider === 'validating');
   // v1.16's in-process coordinator is only a short admission mutex. Once a PR
   // has been handed to GitHub's queue, publishing its domains would make the UI
   // falsely present it as occupying karmax's own durable merge queue.
   let internalMergeAdmissionActive = false;
+  // v1.17 deliberately carries these leases across proposalCycle loop-backs to
+  // Do. The merge coordinator renews a live task's lease every five minutes;
+  // human/exhausted paths and abort() release it explicitly.
+  let retainedMergeDomains: string[] = [];
   let branchPreparedForPr = explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
@@ -729,7 +763,7 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive) {
       return [
         ...(explicitPrCycle && stage === 'do' ? [openPr] : []),
-        ...(stage === 'review' ? [confirm] : []),
+        ...(stage === 'review' && !awaitingResourceDecision ? [confirm] : []),
         ...(pausedRole ? [followUp] : []),
         ...(stage === 'do' || stage === 'review' ? [setTarget] : []),
         cancel,
@@ -742,7 +776,7 @@ async function softwareDevImpl(
       case 'do':
         return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp, setTarget, cancel];
       case 'review':
-        return [confirm, followUp, setTarget, cancel];
+        return [...(awaitingResourceDecision ? [] : [confirm]), followUp, setTarget, cancel];
       case 'pr':
         return [cancel];
       case 'merge':
@@ -765,6 +799,15 @@ async function softwareDevImpl(
     if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
     if (confirmMsgs.length) t.push({ role: 'confirm', label: 'Confirm agent', messages: confirmMsgs });
     return t;
+  }
+
+  async function releaseRetainedLandingDomains(): Promise<void> {
+    const domains = retainedMergeDomains;
+    retainedMergeDomains = [];
+    for (const domain of domains)
+      await coordinator.releaseMerge(domain, taskId).catch(() => undefined);
+    internalMergeAdmissionActive = false;
+    mergeQueuePos = undefined;
   }
 
   function buildView(): TaskView {
@@ -893,7 +936,11 @@ async function softwareDevImpl(
     if (!msgs.some((candidate) => candidate.id === message.id))
       msgs.push({ ...message, ts: message.ts || msgs.length });
   });
+  setHandler(resourceResolvedSignal, () => {
+    resourceResolutionEpoch++;
+  });
   setHandler(confirmSignal, () => {
+    if (awaitingResourceDecision) return;
     confirmed = true;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
@@ -1675,18 +1722,52 @@ async function softwareDevImpl(
     return ct?.confirmDecision;
   }
 
-  /** Revalidate an automated integration repair without replaying human Review.
-   * Human authorization is about task intent; this fresh Confirm-agent turn is
-   * about the changed proposal head. It compares the last fully reviewed heads
-   * with the repaired heads and may approve, return actionable feedback to Do,
-   * or declare the repair ambiguous enough to require a person. */
+  /** Validate the exact integration candidate without replaying human Review.
+   * Human authorization is about task intent. v1.18 resumes the same Do agent
+   * and conversation to inspect the CI-green proposal head; older pins retain
+   * the historical Confirm-agent commands exactly for replay compatibility. */
   async function integrationReview(): Promise<'confirm' | 'revise' | 'human'> {
-    const configured = softwareDevConfirmLayers.filter((layer) => layer.kind === 'agent');
-    const layers: ConfirmLayer[] = configured.length ? configured : [{ kind: 'agent' }];
     const reviewed = Object.entries(landing.authorizedHeads ?? {})
       .map(([key, head]) => `- ${key}: ${head}`).join('\n') || '- no prior head was recorded';
     const repaired = Object.entries(prHeadMap(prs))
       .map(([key, head]) => `- ${key}: ${head}`).join('\n') || '- no changed PR head';
+
+    if (doOwnsIntegrationReview) {
+      const prompt = `This is the FINAL AUTOMATED INTEGRATION verification of the exact candidate at the front of the landing queue. A person already authorized the task's intent; do not ask them to re-review a mechanical base update merely because the commit SHA changed.
+
+Original task intent:
+-----
+${input.prompt}
+-----
+
+Heads that received the last full Review:
+${reviewed}
+
+Current exact candidate heads:
+${repaired}
+
+Inspect the complete current diff and specifically compare its delta from the reviewed heads. Confirm the candidate includes the current target, and run relevant tests. This is a verification turn: do not edit or commit files, and do not call open_pr. Call confirm_decision exactly once:
+- action:"confirm" only when this exact candidate remains within the authorized intent and is safe to land now;
+- action:"revise" with actionable text when you can repair it in your next Do turn;
+- action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.`;
+      msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: msgs.length });
+      const turn = await doTurn();
+      const decision = turn.confirmDecision;
+      if (decision?.action === 'confirm') return 'confirm';
+      if (decision?.action === 'revise') {
+        msgs.push({
+          id: `ir-${msgs.length}`,
+          role: 'user',
+          text: decision.text || 'Your exact-candidate verification found that the proposal still needs changes. Repair it, verify it, and call open_pr again.',
+          ts: msgs.length,
+        });
+        return 'revise';
+      }
+      return 'human';
+    }
+
+    const configured = softwareDevConfirmLayers.filter((layer) => layer.kind === 'agent');
+    const layers: ConfirmLayer[] = configured.length ? configured : [{ kind: 'agent' }];
     for (const layer of layers) {
       const guidance = layer.prompt?.trim()
         ? `\n\nAdditional configured review guidance:\n${layer.prompt.trim()}`
@@ -1694,7 +1775,9 @@ async function softwareDevImpl(
       const decision = await confirmTurn({
         ...layer,
         kind: 'agent',
-        prompt: `This is an AUTOMATED INTEGRATION-REPAIR review. A person already authorized the task's intent; do not ask them to re-review a mechanical base update merely because the commit SHA changed.
+        prompt: `${frontHeldLanding
+          ? 'This is the FINAL AUTOMATED INTEGRATION review of the exact candidate at the front of the landing queue.'
+          : 'This is an AUTOMATED INTEGRATION-REPAIR review.'} A person already authorized the task's intent; do not ask them to re-review a mechanical base update merely because the commit SHA changed.
 
 Original task intent:
 -----
@@ -1704,13 +1787,13 @@ Original task intent:
 Heads that received the last full Review:
 ${reviewed}
 
-Current repaired heads:
+Current exact candidate heads:
 ${repaired}
 
-Inspect the complete current diff and specifically compare the repair delta from the reviewed heads. Run relevant tests. Call confirm_decision exactly once:
-- action:"confirm" only when the repair remains within the authorized intent and is safe to re-admit for exact candidate CI;
+Inspect the complete current diff and specifically compare its delta from the reviewed heads. Confirm the candidate includes the current target, and run relevant tests. Call confirm_decision exactly once:
+- action:"confirm" only when this exact candidate remains within the authorized intent and is safe to land now;
 - action:"revise" with actionable text when the Do agent can repair it;
-- action:"reject" when the repair is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.${guidance}`,
+- action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.${guidance}`,
       });
       if (decision?.action === 'confirm') continue;
       if (decision?.action === 'revise') {
@@ -1924,9 +2007,17 @@ Inspect the complete current diff and specifically compare the repair delta from
   }
 
   let sha: string | undefined;
+  // A recovery checkpoint may enter directly at PR/Landing, skipping completed
+  // Do work exactly once. If that recovered candidate later needs a repair, the
+  // loop must stop honoring the original entry point and actually run Do.
+  // Otherwise every `continue proposalCycle` silently resubmits the unchanged
+  // stale head and exact-candidate verification repeats forever.
+  let recoveredLandingNeedsDo = false;
   proposalCycle: for (;;) {
   // ── Do ⇄ Waiting for input ⇒ PR ⇄ Review ──
-  if (!restoredReviewApproved && recoveryStage !== 'pr' && recoveryStage !== 'merge') {
+  if (!restoredReviewApproved
+    && (recoveredLandingNeedsDo || (recoveryStage !== 'pr' && recoveryStage !== 'merge'))) {
+  recoveredLandingNeedsDo = false;
   for (;;) {
     // Each iteration starts fresh in Do — clears any park state left by a prior
     // sub-task wait (status 'waiting'/waitingFor 'subtask').
@@ -2144,6 +2235,19 @@ Inspect the complete current diff and specifically compare the repair delta from
         const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
+      // At the front of the landing queue, returning to Do is an automated
+      // repair cycle, not a new proposal decision. The human already authorized
+      // the intent, and the repaired head still has to pass proposal validation,
+      // CI, and exact-candidate Do verification below. A successful Do turn must
+      // therefore resubmit the existing PR even if the model forgot the open_pr
+      // tool after saying it had finished; parking on the ordinary human Open PR
+      // gate here leaks the front queue lease and blocks every later merge.
+      const autoSubmitFrontHeldRepair = frontHeldLanding
+        && repairValidationPending
+        && turnFinished
+        && !turn.raise
+        && patched('software-dev-front-held-repair-auto-pr-v1');
+      if (autoSubmitFrontHeldRepair) prRequested = true;
       if (explicitPrCycle) {
         // Ending a Do turn is not a shipping decision. Unless the agent called
         // open_pr, park in Do for ordinary input; a follow-up resumes the same
@@ -2251,6 +2355,15 @@ Inspect the complete current diff and specifically compare the repair delta from
       // its branches missing their heads — and a branch with no head cannot be
       // approved, so that window is a Review whose Approve buttons quietly do nothing.
       if (multiPrEnabled) checkoutHeads = await core.checkoutHeads(world as any).catch(() => checkoutHeads);
+      if (frontHeldLanding && repairValidationPending) {
+        // The intent authorization survives mechanical repair. Skip the human
+        // Review route here; the exact CI-green head will receive the mandatory
+        // integration-agent review only after this task regains (or retains) the
+        // front landing slot.
+        if (multiPrEnabled && world)
+          checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
+        break;
+      }
       if (intentAuthorizedLanding && repairValidationPending) {
         stage = 'merge';
         status = 'waiting';
@@ -2308,6 +2421,38 @@ Inspect the complete current diff and specifically compare the repair delta from
       // that predate the gate are deliberately dropped; the confirmer is re-shown
       // the gate and can click again.
       if (clearsConfirmOnGate) confirmed = false;
+      const waitForResourceDecisions = async (): Promise<boolean> => {
+        let resolutionAtWait = resourceResolutionEpoch;
+        let pending = await core.pendingResourceCandidates(taskId);
+        if (!pending) return false;
+        const messagesAtWait = msgs.length;
+        while (pending && !cancelled && msgs.length === messagesAtWait) {
+          // A decision can land after the activity read the store but before its
+          // completion resumes us. Re-read instead of parking on a signal whose
+          // epoch already changed.
+          if (resourceResolutionEpoch !== resolutionAtWait) {
+            resolutionAtWait = resourceResolutionEpoch;
+            pending = await core.pendingResourceCandidates(taskId);
+            continue;
+          }
+          awaitingResourceDecision = true;
+          waitingFor = { kind: 'human', audience: ['@creator'],
+            detail: `${pending} staged project resource candidate${pending === 1 ? '' : 's'} must be Adopted or Discarded before this proposal can continue.` };
+          await publish();
+          await condition(() => cancelled || msgs.length > messagesAtWait
+            || resourceResolutionEpoch !== resolutionAtWait);
+          if (cancelled || msgs.length > messagesAtWait) break;
+          resolutionAtWait = resourceResolutionEpoch;
+          pending = await core.pendingResourceCandidates(taskId);
+        }
+        awaitingResourceDecision = false;
+        waitingFor = undefined;
+        return msgs.length > messagesAtWait;
+      };
+      if (resourceCandidateReview && await waitForResourceDecisions()) {
+        stage = 'do'; status = 'active'; continue proposalCycle;
+      }
+      if (cancelled) return await abort();
       // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
       // task plays its confirm layers in order (each a human click or a Confirm agent).
       if (input.parentTaskId) {
@@ -2495,16 +2640,24 @@ Inspect the complete current diff and specifically compare the repair delta from
     stage = 'merge';
     status = 'active';
     mergeGranted = false;
-    const observesProviderQueue = intentAuthorizedLanding && githubAuthoritativeMerge && providerQueueAccepted;
-    internalMergeAdmissionActive = intentAuthorizedLanding && githubAuthoritativeMerge && !observesProviderQueue;
+    const observesProviderQueue = !frontHeldLanding
+      && intentAuthorizedLanding && githubAuthoritativeMerge && providerQueueAccepted;
+    internalMergeAdmissionActive = frontHeldLanding
+      ? true
+      : intentAuthorizedLanding && githubAuthoritativeMerge && !observesProviderQueue;
     if (intentAuthorizedLanding) {
       landing = {
         ...landing,
         validation: 'pending',
-        provider: providerQueueAccepted ? 'validating' : 'admitting',
-        detail: providerQueueAccepted
+        provider: frontHeldLanding && retainedMergeDomains.length ? 'validating'
+          : providerQueueAccepted ? 'validating' : 'admitting',
+        detail: frontHeldLanding && retainedMergeDomains.length
+          ? 'This task holds the front landing slot while its exact candidate is repaired or validated.'
+          : providerQueueAccepted
           ? 'GitHub owns queue order and is validating the exact integration candidate.'
-          : 'Waiting for a short krmax admission turn before handing landing to GitHub.',
+          : frontHeldLanding
+            ? 'Waiting for the authoritative karmax landing slot for exact-candidate validation.'
+            : 'Waiting for a short krmax admission turn before handing landing to GitHub.',
       };
       if (providerQueueAccepted) mergeQueuePos = undefined;
     }
@@ -2518,7 +2671,8 @@ Inspect the complete current diff and specifically compare the repair delta from
     // sequentially (not all at once) also keeps the payload-less grant signal
     // unambiguous — we only ever wait on a single coordinator at a time.
     const domains = observesProviderQueue ? [] : mergeQueueDomains(world, target, input.projectId);
-    const held: string[] = [];
+    const held: string[] = frontHeldLanding ? [...retainedMergeDomains] : [];
+    let retainFront = false;
     let acquireCancelled = false;
     let result;
     let githubResult: GitHubMergeAuthorization | undefined;
@@ -2530,6 +2684,7 @@ Inspect the complete current diff and specifically compare the repair delta from
     // first, so this never double-releases.
     try {
       for (const domain of domains) {
+        if (held.includes(domain)) continue;
         mergeGranted = false;
         await coordinator.enqueueMerge(domain, taskId);
         // Wait for this domain's grant; allow cancel only before it.
@@ -2550,10 +2705,12 @@ Inspect the complete current diff and specifically compare the repair delta from
           break;
         }
         held.push(domain);
+        if (frontHeldLanding) retainedMergeDomains = [...held];
       }
       if (acquireCancelled) {
         for (const d of held) await coordinator.releaseMerge(d, taskId); // release every slot already held
         held.length = 0; // released here → the finally below is a no-op (command order preserved)
+        if (frontHeldLanding) retainedMergeDomains = [];
         return await abort();
       }
       mergeQueuePos = observesProviderQueue ? undefined : { position: 0, total: mergeQueuePos?.total ?? 1 };
@@ -2592,8 +2749,59 @@ Inspect the complete current diff and specifically compare the repair delta from
           // The proposal was already prepared and reviewed. Do not create a
           // second local merge and push it with the installation credential;
           // request the exact reviewed PR merge under a consenting human token.
-          githubResult = await core.mergeGithubPrs(world as any, prs,
-            intentAuthorizedLanding ? { mode: observesProviderQueue ? 'observe' : 'submit' } : undefined);
+          if (frontHeldLanding) {
+            githubResult = await core.mergeGithubPrs(world as any, prs, { mode: 'inspect-exact' });
+            prs = githubResult.prs;
+            pr = prs[0];
+            if (githubResult.status === 'candidate-ready') {
+              landing = {
+                ...landing,
+                validation: 'pending', provider: 'validating',
+                detail: doOwnsIntegrationReview
+                  ? 'CI passed on the exact candidate; the Do agent is verifying it at the front of the landing queue.'
+                  : 'CI passed on the exact candidate; the integration agent is reviewing it at the front of the landing queue.',
+              };
+              waitingFor = {
+                kind: doOwnsIntegrationReview ? 'agentSlot' : 'confirm',
+                detail: doOwnsIntegrationReview
+                  ? 'Do-agent exact-candidate verification'
+                  : 'Final exact-candidate integration review',
+              };
+              await publish();
+              const candidateReview = await integrationReview();
+              waitingFor = undefined;
+              if (cancelled) return await abort();
+              repairValidationPending = false;
+              if (candidateReview === 'confirm') {
+                landing = {
+                  ...landing, validation: 'passed', provider: 'validating',
+                  detail: doOwnsIntegrationReview
+                    ? 'The exact candidate passed CI and Do-agent verification; landing atomically.'
+                    : 'The exact candidate passed CI and integration-agent review; landing atomically.',
+                };
+                githubResult = await core.mergeGithubPrs(world as any, prs, { mode: 'submit-exact' });
+              } else if (candidateReview === 'revise') {
+                githubResult = {
+                  status: 'needs-revision', prs,
+                  detail: doOwnsIntegrationReview
+                    ? 'The Do agent found a fixable problem while verifying the exact landing candidate.'
+                    : 'The integration agent found a fixable problem in the exact landing candidate.',
+                  repair: { kind: 'ci', preserveAuthorization: true },
+                };
+              } else {
+                githubResult = {
+                  status: 'needs-revision', prs,
+                  detail: doOwnsIntegrationReview
+                    ? 'The Do agent found an ambiguous or substantive candidate change that needs human Review.'
+                    : 'The integration agent found an ambiguous or substantive candidate change that needs human Review.',
+                  repair: { kind: 'head-changed', preserveAuthorization: false },
+                };
+              }
+            }
+          } else {
+            githubResult = await core.mergeGithubPrs(world as any, prs,
+              intentAuthorizedLanding ? { mode: observesProviderQueue ? 'observe' : 'submit' } : undefined);
+          }
         } else {
           // …then the authoritative, deterministic local merge that guarantees
           // work lands for non-PR and replay-pinned historical workflows.
@@ -2610,6 +2818,12 @@ Inspect the complete current diff and specifically compare the repair delta from
           result = { merged: false, landedFiles: [], note: String(err) };
         }
       }
+      if (frontHeldLanding && githubResult) {
+        retainFront = githubResult.status === 'waiting'
+          || githubResult.status === 'retryable-error'
+          || (githubResult.status === 'needs-revision'
+            && githubResult.repair?.preserveAuthorization === true);
+      }
     } finally {
       // Swallow per-domain. From 1.9.0 `coordinator` retries a bounded 5 times
       // (~15 s), which a coordinator mid-continueAsNew or a worker restart can
@@ -2617,13 +2831,24 @@ Inspect the complete current diff and specifically compare the repair delta from
       // every remaining slot, the exact leak the try/finally exists to prevent —
       // and replace the in-flight merge error with a release error. Scheduling the
       // activity is what history records, so catching changes no replay.
-      for (const d of held) await coordinator.releaseMerge(d, taskId).catch(() => undefined);
-      held.length = 0;
+      if (frontHeldLanding && retainFront) {
+        retainedMergeDomains = [...held];
+        internalMergeAdmissionActive = true;
+      } else {
+        for (const d of held) await coordinator.releaseMerge(d, taskId).catch(() => undefined);
+        held.length = 0;
+        if (frontHeldLanding) {
+          retainedMergeDomains = [];
+          internalMergeAdmissionActive = false;
+        }
+      }
     }
 
-    // The krmax coordinator is an admission mutex for PR-policy landing, never
-    // the durable queue. Once the API turn ends, only provider state is shown.
-    if (intentAuthorizedLanding && githubAuthoritativeMerge) {
+    // v1.16 uses the karmax coordinator only as an admission mutex and hides it
+    // after the API turn. v1.17 instead keeps publishing the authoritative lease
+    // until the exact candidate lands or the task leaves for human attention.
+    if (intentAuthorizedLanding && githubAuthoritativeMerge
+      && (!frontHeldLanding || retainedMergeDomains.length === 0)) {
       mergeQueuePos = undefined;
       internalMergeAdmissionActive = false;
     }
@@ -2653,6 +2878,7 @@ Inspect the complete current diff and specifically compare the repair delta from
           const attempts = preservesIntent ? (landing.repairAttempts ?? 0) + 1 : 0;
           providerQueueAccepted = false;
           repairValidationPending = preservesIntent;
+          if (frontHeldLanding && !preservesIntent) forceHumanRepairReview = true;
           landing = {
             ...landing,
             authorization: preservesIntent ? 'authorized' : 'reapproval-required',
@@ -2662,6 +2888,7 @@ Inspect the complete current diff and specifically compare the repair delta from
             detail: decision.detail,
           };
           if (preservesIntent && attempts >= MAX_AUTOMATED_LANDING_REPAIRS) {
+            if (frontHeldLanding) await releaseRetainedLandingDomains();
             confirmed = false;
             status = 'waiting';
             const waitSeen = msgs.length;
@@ -2672,7 +2899,9 @@ Inspect the complete current diff and specifically compare the repair delta from
                 ...(decision.actorUserId ? [`user:${decision.actorUserId}`] : []),
                 '@creator',
               ])],
-              detail: `This pull request was ejected ${attempts} times while the target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
+              detail: frontHeldLanding
+                ? `This task exhausted ${attempts} front-held automated landing repairs. Its landing slot has been released so human input blocks nothing. Confirm to authorize another queued repair attempt, or send guidance to the Do agent.`
+                : `This pull request was ejected ${attempts} times while the target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
             };
             await publish();
             await condition(() => confirmed || cancelled || msgs.length > waitSeen);
@@ -2695,7 +2924,11 @@ Inspect the complete current diff and specifically compare the repair delta from
           role: 'user',
           text: intentAuthorizedLanding
             ? `${decision.detail ?? 'The pull request must be repaired before it can land'}\nInspect the live branch, repair it against the newest target, run the relevant tests, then call open_pr again. ${decision.repair?.preserveAuthorization === true
-              ? 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
+              ? frontHeldLanding
+                ? doOwnsIntegrationReview
+                  ? 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and return to this same Do conversation for verification before landing.'
+                  : 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and integration-agent review before landing.'
+                : 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
               : 'This change invalidated the prior authorization, so the updated proposal must pass human Review.'}`
             : explicitPrCycle
               ? `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`
@@ -2709,6 +2942,12 @@ Inspect the complete current diff and specifically compare the repair delta from
         stage = 'do';
         status = 'active';
         githubErrorPolls = 0;
+        // Patch at the repair decision's live edge. Historical recovered runs
+        // preserve their recorded first loop-back; the next live rejection can
+        // adopt the fix and enter Do without replacing the execution again.
+        if ((recoveryStage === 'pr' || recoveryStage === 'merge')
+          && patched('software-dev-recovered-landing-repair-do-v1'))
+          recoveredLandingNeedsDo = true;
         continue proposalCycle;
       }
       if (intentAuthorizedLanding && decision.status === 'queued') {
@@ -2743,6 +2982,8 @@ Inspect the complete current diff and specifically compare the repair delta from
       }
       if (decision.status === 'needs-authorizer'
         || decision.status === 'needs-human' || decision.status === 'retryable-error') {
+        if (frontHeldLanding && decision.status === 'retryable-error')
+          await releaseRetainedLandingDomains();
         // A controlled human layer. Authorization failures retry under the
         // confirming person's live token; PR-policy decisions (draft/closed/
         // required review) retry after the human changes GitHub. A follow-up has
@@ -2964,6 +3205,7 @@ Inspect the complete current diff and specifically compare the repair delta from
     terminalOrigin = stage;
     stage = 'cancelled';
     status = 'cancelled';
+    if (retainedMergeDomains.length) await releaseRetainedLandingDomains();
     await cancelChildren(liveAgentStates); // don't strand children when we go away
     // A cancelled task must not leave an open pull request proposing work that
     // will never land.
