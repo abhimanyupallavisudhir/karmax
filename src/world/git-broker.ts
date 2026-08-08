@@ -17,6 +17,18 @@ export interface GitBrokerPublishResult {
   errors?: Record<string, string>;
 }
 
+/** Recursive removal can transiently report ENOTEMPTY/EBUSY after a Git child
+ * exits on busy CI filesystems. Node only retries those errors when maxRetries
+ * is explicitly set. */
+function removeTemporaryDirectory(directory: string): void {
+  fs.rmSync(directory, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  });
+}
+
 export function describePublishFailures(result: GitBrokerPublishResult): string {
   if (!result.skipped.length) return '';
   return result.skipped
@@ -151,7 +163,7 @@ async function importBranchToLocal(world: World, repo: WorldRepo, localRepo: str
     return (await git(localRepo, ['rev-parse', staging])).stdout.trim();
   } finally {
     await git(localRepo, ['update-ref', '-d', staging]);
-    fs.rmSync(temp, { recursive: true, force: true });
+    removeTemporaryDirectory(temp);
   }
 }
 
@@ -196,7 +208,7 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
     } finally {
       await world.exec('git', ['update-ref', '-d', 'refs/karmax/handoff'], { cwd: repo.root }).catch(() => undefined);
       await world.exec('rm', ['-f', bundleName], { cwd: repo.root }).catch(() => undefined);
-      fs.rmSync(temp, { recursive: true, force: true });
+      removeTemporaryDirectory(temp);
     }
   }
   return { updated };
@@ -279,7 +291,7 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
     return head.stdout.trim();
   } finally {
     await world.exec('rm', ['-f', bundleName], { cwd: destinationRepo.root }).catch(() => undefined);
-    fs.rmSync(temp, { recursive: true, force: true });
+    removeTemporaryDirectory(temp);
   }
 }
 
@@ -452,7 +464,7 @@ async function landLocalBranch(localRepo: string, repo: WorldRepo, target: strin
   const tmp = path.join(scratchWorktreeHome(), `.karmax-land-${cryptoSafeName(worldId)}-${cryptoSafeName(repo.name)}`);
   if (fs.existsSync(tmp)) {
     await git(localRepo, ['worktree', 'remove', '--force', tmp]);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    removeTemporaryDirectory(tmp);
   }
   const added = await git(localRepo, ['worktree', 'add', '--force', tmp, repo.branch]);
   if (added.code !== 0) throw new Error(`could not check out the task branch for landing: ${added.stderr || added.stdout}`);
@@ -460,7 +472,7 @@ async function landLocalBranch(localRepo: string, repo: WorldRepo, target: strin
     return await finalizeMergeRepo({ ...repo, repo: localRepo, root: tmp }, target, worldId, identity);
   } finally {
     await git(localRepo, ['worktree', 'remove', '--force', tmp]);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    removeTemporaryDirectory(tmp);
   }
 }
 
@@ -474,6 +486,7 @@ async function withTransferredRepo<T>(
   if (!/^(?:ssh:\/\/|git@)/.test(source)) throw new Error('Git broker requires an SSH remote');
   const transferred = await readBranchBundle(world, repo);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
+  let operationFailed = false;
   try {
     const credential = await resolveCredential(auth, repo);
     const { env } = materializeGitCredential(temp, credential);
@@ -489,8 +502,17 @@ async function withTransferredRepo<T>(
       if (ancestor.code !== 0) throw new Error('world branch is not descended from its recorded base commit');
     }
     return await use(clone, env);
+  } catch (error) {
+    operationFailed = true;
+    throw error;
   } finally {
-    fs.rmSync(temp, { recursive: true, force: true });
+    try {
+      removeTemporaryDirectory(temp);
+    } catch (cleanupError) {
+      // Cleanup must not replace the useful Git rejection (for example a stale
+      // force-with-lease) with an incidental filesystem error.
+      if (!operationFailed) throw cleanupError;
+    }
   }
 }
 

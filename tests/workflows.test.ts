@@ -80,10 +80,12 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       workflowId: taskId,
       args: [baseInput(taskId, repo, {
         title: 'parallel join',
-        prompt: '@sleep 1200\n@write own.txt :: requester work',
+        prompt: '@sleep 3000\n@write own.txt :: requester work',
       })],
     });
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    // Temporal buffers a signal sent before its handler is installed. Sending
+    // the request immediately makes this a durable ordering test instead of a
+    // race to observe a short-lived `do` view on a busy CI runner.
     await handle.signal('collaborationRequested', 'collab-test');
 
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 })
