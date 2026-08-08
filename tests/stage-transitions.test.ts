@@ -9,6 +9,7 @@ const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!
 import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
+import { sameProposalIdentity } from '../src/workflows/software-dev.js';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -20,6 +21,7 @@ function fixture() {
   const terminated: string[] = [];
   const signalled: Array<{ id: string; signal: string; args: unknown[] }> = [];
   const hiddenTurnIds = ['hidden-account-turn'];
+  let liveViewOverride: TaskView | undefined;
   const client = {
     workflow: {
       getHandle(id: string) {
@@ -30,6 +32,11 @@ function fixture() {
             return { workflow: options.args[0] };
           },
           async query(name: string) {
+            if (name === 'view') {
+              const live = liveViewOverride ?? store.getTask(task.id)?.lastView;
+              if (!live) throw new Error('no live view');
+              return live;
+            }
             if (name === QRY_AGENT_QUEUE)
               return { queue: [{ taskId: task.id, turnId: 'hidden-agent-turn' }], current: [] };
             if (name === QRY_ACCOUNT_TASK_LEASES) return hiddenTurnIds;
@@ -68,10 +75,100 @@ function fixture() {
     updatedAt: 1,
   };
   store.saveView(task.id, view);
-  return { store, project, tokens, token, api, task, view, starts, terminated, signalled };
+  return {
+    store, project, tokens, token, api, task, view, starts, terminated, signalled,
+    setLiveView(view?: TaskView) { liveViewOverride = view; },
+  };
 }
 
 describe('task stage transitions', () => {
+  it('binds restored approval to every multi-repository PR identity and head', () => {
+    const reviewed = [
+      { slug: 'Acme/App', number: 7, headSha: 'aaa' },
+      { slug: 'acme/api', number: 9, headSha: 'bbb' },
+    ];
+    expect(sameProposalIdentity(reviewed, [...reviewed].reverse())).toBe(true);
+    expect(sameProposalIdentity(reviewed, [reviewed[0]!, { ...reviewed[1]!, headSha: 'changed' }])).toBe(false);
+    expect(sameProposalIdentity(reviewed, [reviewed[0]!])).toBe(false);
+    expect(sameProposalIdentity([{ slug: 'acme/app', number: 7 }], [{ slug: 'acme/app', number: 7 }])).toBe(false);
+  });
+
+  it('uses the authoritative live stage when the persisted projection lags', async () => {
+    const f = fixture();
+    f.setLiveView({
+      ...f.view,
+      stage: 'merge',
+      status: 'waiting',
+      waitingFor: { kind: 'github', detail: 'checks' },
+    });
+
+    await f.api.moveTaskStage(f.token, f.task.id, 'do');
+    expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'do' });
+    expect(f.terminated[0]).toContain('Task moved to do');
+  });
+
+  it('normalizes internal cancellation frames and manual completion to a safe Do recovery', async () => {
+    const f = fixture();
+    for (const origin of ['resolve', 'escalated'] as const) {
+      f.store.saveView(f.task.id, {
+        ...f.view,
+        stage: 'cancelled', status: 'cancelled',
+        state: { cancelled: true, cancelledFrom: origin },
+      });
+      const cancelled = await f.api.getTaskView(f.token, f.task.id);
+      expect(cancelled?.stageTransitions?.map((move) => move.target)).toContain('do');
+      await f.api.moveTaskStage(f.token, f.task.id, 'do');
+      expect(f.starts.at(-1)!.options.args[0].recovery.resumeStage).toBe('do');
+    }
+
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'done', status: 'done',
+      state: { manuallyDoneFrom: 'resolve' },
+    });
+    expect((await f.api.getTaskView(f.token, f.task.id))?.stageTransitions).toMatchObject([{ target: 'do' }]);
+  });
+
+  it('offers PR-to-Do but refuses lifecycle replacement during or after atomic landing', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, { ...f.view, stage: 'pr' });
+    expect((await f.api.getTaskView(f.token, f.task.id))?.stageTransitions?.map((move) => move.target))
+      .toContain('do');
+
+    for (const state of [
+      { lifecycleTransitionBlocked: true },
+      {},
+    ]) {
+      f.store.saveView(f.task.id, {
+        ...f.view,
+        stage: 'merge',
+        status: 'active',
+        state,
+        pointOfNoReturnPassed: !state.lifecycleTransitionBlocked,
+      });
+      expect((await f.api.getTaskView(f.token, f.task.id))?.stageTransitions).toEqual([]);
+    }
+  });
+
+  it('preserves the exact human route and question across a lifecycle replacement', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'review', status: 'active',
+    });
+    const held = await f.api.escalateToHuman(f.token, {
+      taskId: f.task.id,
+      audience: ['@creator'],
+      message: 'Approve the release window',
+    });
+    expect(held.waitingFor).toEqual({
+      kind: 'human', audience: ['@creator'], detail: 'Approve the release window',
+    });
+    expect(f.starts[0]!.options.args[0].recovery.humanWait).toEqual({
+      audience: ['@creator'], detail: 'Approve the release window',
+    });
+  });
+
   it('advertises human hold, destructive Draft, and reversible Done before Jayadratha', async () => {
     const f = fixture();
     const view = await f.api.getTaskView(f.token, f.task.id);
@@ -112,9 +209,16 @@ describe('task stage transitions', () => {
     expect(cancelled?.stageTransitions?.map((move) => move.target)).toEqual(['review', 'draft', 'done']);
 
     const restored = await f.api.moveTaskStage(f.token, f.task.id, 'review');
-    expect(restored).toMatchObject({ stage: 'review', status: 'active' });
+    expect(restored).toMatchObject({ stage: 'pr', status: 'active', state: { restoringTo: 'review' } });
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'review' });
 
+    // The replacement honestly advertises PR while it reconstructs the proposal;
+    // emulate its next published state before testing a Review-origin hold.
+    f.store.saveView(f.task.id, {
+      ...restored,
+      stage: 'review',
+      state: { ...restored.state, restoringTo: undefined },
+    });
     const held = await f.api.moveTaskStage(f.token, f.task.id, 'human');
     expect(held).toMatchObject({
       stage: 'review',
@@ -375,6 +479,31 @@ describe('task stage transitions', () => {
     });
     await confirm.api.signalTask(confirm.token, confirm.task.id, 'confirm');
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
+  });
+
+  it('consumes a current Review-hold confirmation once instead of restoring the hold again', async () => {
+    const f = fixture();
+    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'review', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Approve this exact proposal' },
+      state: {
+        ...f.view.state,
+        humanPauseOrigin: 'review',
+        transitionCheckpoint: {
+          messages: f.view.messages,
+          resumeStage: 'review',
+          pausedForHuman: true,
+          humanWait: { audience: ['@creator'], detail: 'Approve this exact proposal' },
+        },
+      },
+    });
+
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+    const recovery = f.starts.at(-1)!.options.args[0].recovery;
+    expect(recovery).toMatchObject({ resumeStage: 'review', reviewConfirmed: true });
+    expect(recovery.pausedForHuman).toBeUndefined();
   });
 
   it.each(['1.16.0', '1.17.0', '1.18.0', '1.19.0', '1.20.0'])('upgrades a %s task at its successful Review boundary into participant Landing', async (version) => {

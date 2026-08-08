@@ -21,6 +21,7 @@ import {
   softwareDevV1_19,
   softwareDevV1_20,
   softwareDevV1_21,
+  softwareDevV1_22,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -137,6 +138,11 @@ export async function goalV1_20(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** Per-participant multi-repository landing. */
 export async function goalV1_21(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_21({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Prerequisite-aware lifecycle restoration with exact human-hold routing. */
+export async function goalV1_22(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_22({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

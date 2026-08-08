@@ -36,6 +36,7 @@ describe('gateway request scope for bare-id routes', () => {
   let mine: string;
   let theirs: string;
   let token: string;
+  let liveView: any;
   /** What the stub GitHub webhook handler throws on the next delivery. */
   let webhookFailure: Error | undefined;
 
@@ -58,7 +59,7 @@ describe('gateway request scope for bare-id routes', () => {
         getHandle: () => ({
           terminate: async () => {},
           signal: async () => {},
-          query: async () => [],
+          query: async (name: string) => name === 'view' ? liveView : [],
         }),
         signalWithStart: async () => {},
         start: async () => ({}),
@@ -153,6 +154,7 @@ describe('gateway request scope for bare-id routes', () => {
       state: {},
       updatedAt: Date.now(),
     });
+    liveView = store.getTask(task.id)!.lastView;
     const agent = tokens.mint({
       taskId: task.id,
       profileId: 'do-default',

@@ -249,6 +249,15 @@ export interface KarmaxApiDeps {
  * so authz lives in exactly one place.
  */
 export class KarmaxApi {
+  /** A workflow id can have several unrelated runs after a lifecycle recovery.
+   * Temporal's id-only handle may resolve an earlier closed run; replacements
+   * persist their exact run id so every later query/signal targets the live run. */
+  private workflowHandle(taskId: string): any {
+    const runId = this.deps.store.getTask(taskId)?.params?._workflowRunId;
+    return this.deps.client.workflow.getHandle(taskId,
+      typeof runId === 'string' && runId ? runId : undefined);
+  }
+
   private armer?: TriggerArmer;
   private collaborationNotificationRetries = new Map<string, number>();
   constructor(private deps: KarmaxApiDeps) {
@@ -372,7 +381,7 @@ export class KarmaxApi {
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
     const message: Message = { id: `u${now}`, role: 'user', text, ts: now };
-    await this.deps.client.workflow.getHandle(taskId).signal(SIG.followUp, message, role);
+    await this.workflowHandle(taskId).signal(SIG.followUp, message, role);
     this.publishConversationMessage(taskId, role, message);
     return message;
   }
@@ -488,7 +497,7 @@ export class KarmaxApi {
     // The durable store transition is authoritative. The signal only wakes a
     // Review workflow that is currently parked on this decision; if the workflow
     // has already closed, the adopted resource must remain adopted.
-    try { await this.deps.client.workflow.getHandle(taskId).signal(SIG.resourceResolved); }
+    try { await this.workflowHandle(taskId).signal(SIG.resourceResolved); }
     catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
     return result;
   }
@@ -502,7 +511,7 @@ export class KarmaxApi {
     if (caller.kind !== 'human') throw new CapabilityError('project resource discard requires a human review token');
     if (!this.deps.resources) throw new Error('project resources are unavailable');
     const result = await this.deps.resources.discardCandidate(taskId, candidateId, caller.principal);
-    try { await this.deps.client.workflow.getHandle(taskId).signal(SIG.resourceResolved); }
+    try { await this.workflowHandle(taskId).signal(SIG.resourceResolved); }
     catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
     return result;
   }
@@ -1165,7 +1174,7 @@ export class KarmaxApi {
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization,
-      _discardProgress, ...overrides } = task.params as Record<string, unknown>;
+      _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
     // once prevents attempts queued days apart from inheriting different reviewers.
@@ -1272,17 +1281,24 @@ export class KarmaxApi {
     // number minted by this failed transition. Previously established permalinks
     // remain stable when already-numbered work is queued again.
     try {
-      await withTimeout(
+      const started = await withTimeout(
         this.deps.client.workflow.start(startType, {
           taskQueue: this.deps.taskQueue,
           workflowId: task.id,
           // Queueing is idempotent. In particular, never create a second run if
           // the first one finished before a lost start acknowledgement is retried.
-          workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
+          workflowIdReusePolicy: input.discardProgress
+            ? WorkflowIdReusePolicy.ALLOW_DUPLICATE
+            : WorkflowIdReusePolicy.REJECT_DUPLICATE,
           args: [input],
         }),
         START_TIMEOUT_MS,
       );
+      const runId = (started as any)?.firstExecutionRunId ?? (started as any)?.runId;
+      if (typeof runId === 'string' && runId) {
+        const current = this.deps.store.getTask(taskId)!;
+        this.deps.store.updateTaskParams(taskId, { ...current.params, _workflowRunId: runId });
+      }
     } catch (e) {
       // A start acknowledgement can be lost after Temporal durably accepted the
       // workflow. The retry then reports "already started"; that is proof of
@@ -1688,12 +1704,34 @@ export class KarmaxApi {
     // loop) makes a query hang without rejecting, which would otherwise freeze the
     // caller. Fall back fast to whatever snapshot we have.
     try {
-      const q = this.deps.client.workflow.getHandle(taskId).query('view') as Promise<TaskView>;
+      const q = this.workflowHandle(taskId).query('view') as Promise<TaskView>;
       q.catch(() => undefined); // swallow the late rejection if we time out first
       const view = await withTimeout(q, QUERY_TIMEOUT_MS);
       return enrich((view as TaskView) ?? snapshot());
     } catch {
       return enrich(snapshot());
+    }
+  }
+
+  /** Lifecycle mutations must not act on `lastView`: publishing that snapshot is
+   * an activity, so the deterministic workflow can already be in the next stage
+   * while the store still shows the previous one. A stale read here can hold,
+   * terminate, or restore the wrong stage. Terminal views have no live execution
+   * to query; every active/waiting mutation requires the authoritative query and
+   * fails closed when it cannot be obtained. */
+  private async transitionSourceView(task: TaskRecord): Promise<TaskView> {
+    const snapshot = task.lastView;
+    if (!snapshot) throw new Error('task has no lifecycle state yet');
+    if (['done', 'cancelled', 'failed'].includes(snapshot.status)) return snapshot;
+    try {
+      const query = this.workflowHandle(task.id).query('view') as Promise<TaskView>;
+      query.catch(() => undefined);
+      const view = await withTimeout(query, QUERY_TIMEOUT_MS);
+      if (!view || typeof view !== 'object' || !view.stage || !view.status)
+        throw new Error('the workflow returned no lifecycle view');
+      return view;
+    } catch (error) {
+      throw new Error(`Cannot move ${task.title}: the live workflow stage is unavailable (${unwrapCause(error)}). Try again once the worker is healthy.`);
     }
   }
 
@@ -1840,6 +1878,14 @@ export class KarmaxApi {
     return actions.filter((action) => allowed.has(action.name));
   }
 
+  /** Resolve/Escalated are stack frames around a failed public operation, not
+   * restartable pipeline positions. Historical views did not persist that
+   * operation, so Do is the conservative replacement destination: it preserves
+   * the branch and conversation without pretending to replay a lost closure. */
+  private safeRecoveryStage(stage: Stage): Stage {
+    return stage === 'resolve' || stage === 'escalated' ? 'do' : stage;
+  }
+
   /** The single transition policy shared by the selected task header, every
    * attempt row, and the mutation endpoint. */
   private availableStageTransitions(
@@ -1865,17 +1911,32 @@ export class KarmaxApi {
     }
     if (view.status === 'done') {
       if (manuallyDoneFrom) {
-        add({
-          target: manuallyDoneFrom,
-          label: manuallyDoneFrom === 'draft' ? 'Back to Draft' : `Restore ${stageName(manuallyDoneFrom)}`,
-          description: 'Undo the manual completion and restore its prior stage.',
-        });
+        const terminalSnapshot = manuallyDoneFrom === 'cancelled' || manuallyDoneFrom === 'failed';
+        if (resumable || terminalSnapshot || manuallyDoneFrom === 'draft' || manuallyDoneFrom === 'human') {
+          const restore = manuallyDoneFrom === 'draft' || manuallyDoneFrom === 'human' || terminalSnapshot
+            ? manuallyDoneFrom
+            : this.safeRecoveryStage(manuallyDoneFrom);
+          add({
+            target: restore,
+            label: restore === 'draft' ? 'Back to Draft' : `Restore ${stageName(restore)}`,
+            description: restore === manuallyDoneFrom
+              ? 'Undo the manual completion and restore its prior stage and prerequisites.'
+              : `The prior ${stageName(manuallyDoneFrom)} frame cannot be replayed safely; recover the preserved work in ${stageName(restore)}.`,
+          });
+        }
       }
       return result; // natural completion is immutable
     }
     if (view.status === 'cancelled') {
       if (resumable && cancelledFrom && cancelledFrom !== 'cancelled') {
-        add({ target: cancelledFrom, label: `Restore ${stageName(cancelledFrom)}`, description: 'Resume from the stage active when this attempt was cancelled.' });
+        const restore = this.safeRecoveryStage(cancelledFrom);
+        add({
+          target: restore,
+          label: `Restore ${stageName(restore)}`,
+          description: restore === cancelledFrom
+            ? 'Recreate the stage prerequisites, then resume where this attempt was cancelled.'
+            : `The cancelled ${stageName(cancelledFrom)} frame cannot be replayed safely; recover the preserved work in ${stageName(restore)}.`,
+        });
       }
       if (!jayadratha) add({ target: 'draft', label: 'Draft', description: 'Discard progress and make this attempt editable again.', danger: true });
       add({ target: 'done', label: 'Done', description: 'Mark this cancelled attempt done manually.' });
@@ -1890,6 +1951,15 @@ export class KarmaxApi {
       return result;
     }
 
+    // The workflow publishes this interlock immediately before invoking an
+    // activity that may atomically land a reviewed head. Its external outcome
+    // is unknowable until the activity returns, so no replacement is safe here.
+    if (view.state?.lifecycleTransitionBlocked) return result;
+
+    // Once any participant has landed, workflow reconciliation is the only safe
+    // continuation. A synthetic hold/Done/cancel could strand a partial saga.
+    if (view.pointOfNoReturnPassed) return result;
+
     if (origin) {
       add({ target: origin, label: `Resume ${stageName(origin)}`, description: 'Leave the human hold and resume the originating stage.' });
     // Resolve is an internal recovery frame rather than a resumable public
@@ -1899,13 +1969,15 @@ export class KarmaxApi {
     } else if (resumable && view.stage !== 'escalated' && view.stage !== 'resolve' && view.waitingFor?.kind !== 'human') {
       add({ target: 'human', label: 'Waiting for human input', description: 'Stop current activity and hold this attempt for a person.' });
     }
-    if (resumable && (view.stage === 'review' || view.stage === 'merge') && !origin)
+    if (resumable && (view.stage === 'pr' || view.stage === 'review' || view.stage === 'merge') && !origin)
       add({
         target: 'do',
         label: 'Do',
         description: view.stage === 'merge'
           ? 'Return the pending pull request to Do for repair; preserved intent authorization is revalidated automatically unless the repair changes scope.'
-          : 'Return the reviewed work to the Do agent.',
+          : view.stage === 'review'
+            ? 'Return the proposal to Do for repair; the current head approval lapses and the repaired proposal returns through Review.'
+            : 'Stop proposal publication and return the preserved branch to Do.',
       });
     if (!jayadratha && !view.pointOfNoReturnPassed)
       add({ target: 'draft', label: 'Draft', description: 'Discard all execution progress and make the attempt editable.', danger: true });
@@ -1913,12 +1985,24 @@ export class KarmaxApi {
     return result;
   }
 
-  private transitionCheckpoint(view: TaskView, resumeStage: Stage, pausedForHuman = false): TaskRecoveryCheckpoint {
+  private transitionCheckpoint(
+    view: TaskView,
+    resumeStage: Stage,
+    pausedForHuman = false,
+    humanWait?: { audience: string[]; detail: string },
+    reviewConfirmed = false,
+  ): TaskRecoveryCheckpoint {
     const saved = view.state?.transitionCheckpoint as TaskRecoveryCheckpoint | undefined;
+    const viewWorld = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
+    const recoverableWorld = view.status === 'cancelled'
+      && this.deps.store.worldState(view.taskId) === 'released'
+      ? undefined
+      : viewWorld;
     const source = saved ?? {
-      world: view.status === 'cancelled'
-        ? undefined
-        : (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined,
+      // v1.22 cancellation suspends rather than destroys its world. Historical
+      // cancelled views may have no handle, in which case Setup reconstructs as
+      // before; when the handle exists it is the authoritative preserved state.
+      world: recoverableWorld,
       messages: view.messages,
       transcripts: view.transcripts,
       reviewInfo: view.reviewInfo,
@@ -1933,6 +2017,20 @@ export class KarmaxApi {
         : {}),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
     };
+    const {
+      humanWait: savedHumanWait,
+      reviewConfirmed: _savedReviewConfirmed,
+      pausedForHuman: _savedPausedForHuman,
+      ...stableSource
+    } = source;
+    const held = humanWait ?? savedHumanWait ?? (view.waitingFor?.kind === 'human'
+      ? {
+          audience: view.waitingFor.audience?.length ? [...view.waitingFor.audience] : ['@creator'],
+          detail: view.waitingFor.detail ?? `Paused during ${resumeStage}`,
+        }
+      : { audience: ['@creator'], detail: `Paused during ${resumeStage}` });
+    const preservesHeldQuestion = pausedForHuman
+      || Boolean(view.state?.humanPauseOrigin && view.waitingFor?.kind === 'human');
     // A lifecycle replacement is a new Temporal history, not a new agent
     // conversation. Resume the Do provider session when its credential home can
     // be leased again; the copied transcript remains the provider-independent
@@ -1948,7 +2046,7 @@ export class KarmaxApi {
       }
     }
     return {
-      ...source,
+      ...stableSource,
       ...(session ? { session } : {}),
       ...(sessionHome ? { sessionHome } : {}),
       messages: source.messages.map((message) => ({ ...message })),
@@ -1977,6 +2075,8 @@ export class KarmaxApi {
           }
         : {}),
       ...(pausedForHuman ? { pausedForHuman: true } : {}),
+      ...(preservesHeldQuestion ? { humanWait: { audience: [...held.audience], detail: held.detail } } : {}),
+      ...(reviewConfirmed ? { reviewConfirmed: true } : {}),
     };
   }
 
@@ -2006,11 +2106,29 @@ export class KarmaxApi {
   /** Stop every execution-owned source of activity before replacing or
    * terminalizing a run. Coordinator cancellation is explicit because workflow
    * termination cannot run deterministic finally blocks. */
-  private async stopTaskActivity(task: TaskRecord, view: TaskView, reason: string): Promise<void> {
-    const handle = this.deps.client.workflow.getHandle(task.id);
-    await handle.terminate(reason).catch((error) => {
-      if (!(error instanceof WorkflowNotFoundError)) throw error;
-    });
+  private async stopTaskActivity(
+    task: TaskRecord,
+    view: TaskView,
+    reason: string,
+    disposition: 'replace' | 'cancel' | 'discard' = 'replace',
+  ): Promise<void> {
+    const handle = this.workflowHandle(task.id);
+    const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
+    let stoppedGracefully = false;
+    if (minor >= 22 && disposition !== 'discard' && typeof (handle as any).result === 'function') {
+      try {
+        await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
+        await withTimeout(Promise.resolve((handle as any).result()), 30_000);
+        stoppedGracefully = true;
+      } catch {
+        // A wedged/older execution still has the bounded termination fallback.
+      }
+    }
+    if (!stoppedGracefully) {
+      await handle.terminate(reason).catch((error: unknown) => {
+        if (!(error instanceof WorkflowNotFoundError)) throw error;
+      });
+    }
 
     // Do not trust only the projected turn: pre-1.7 account waits did not expose
     // their turnId, and a stale snapshot can lag a just-enqueued agent request.
@@ -2062,10 +2180,11 @@ export class KarmaxApi {
     resumeStage: Stage,
     pausedForHuman = false,
     humanWait?: { audience: string[]; detail: string },
+    reviewConfirmed = false,
   ): Promise<TaskView> {
     const { startType, input, version } = await this.buildStart(task, true);
-    input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman);
-    await withTimeout(this.deps.client.workflow.start(startType, {
+    input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman, humanWait, reviewConfirmed);
+    const started = await withTimeout(this.deps.client.workflow.start(startType, {
       taskQueue: this.deps.taskQueue,
       workflowId: task.id,
       workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE,
@@ -2073,25 +2192,34 @@ export class KarmaxApi {
     }), START_TIMEOUT_MS);
     this.deps.store.setTaskWorkflowVersion(task.id, version);
     this.deps.store.setTaskExecutionWorkflow(task.id, task.workflow);
-    this.deps.store.updateTaskParams(task.id, { ...task.params, archived: false, draft: false });
+    const runId = (started as any)?.firstExecutionRunId ?? (started as any)?.runId;
+    this.deps.store.updateTaskParams(task.id, {
+      ...task.params,
+      archived: false,
+      draft: false,
+      ...(typeof runId === 'string' && runId ? { _workflowRunId: runId } : {}),
+    });
     const {
       manuallyDoneFrom: _manuallyDoneFrom,
       manuallyDoneView: _manuallyDoneView,
       transitionCheckpoint: _transitionCheckpoint,
       humanPauseOrigin: _humanPauseOrigin,
       cancelledFrom: _cancelledFrom,
+      restoringTo: _restoringTo,
       ...priorState
     } = view.state;
+    const restoringProposal = !pausedForHuman && ['pr', 'review', 'merge'].includes(resumeStage);
+    const initialStage: Stage = restoringProposal ? 'pr' : resumeStage;
     const starting: TaskView = {
       ...view,
-      stage: resumeStage,
+      stage: initialStage,
       status: pausedForHuman ? 'waiting' : 'active',
-      actions: pausedForHuman ? this.lifecycleActions(view) : this.resumedActions(view.actions, resumeStage),
+      actions: pausedForHuman ? this.lifecycleActions(view) : this.resumedActions(view.actions, initialStage),
       waitingFor: pausedForHuman
         ? {
             kind: 'human',
-            audience: humanWait?.audience ?? ['@creator'],
-            detail: humanWait?.detail ?? `Paused during ${resumeStage}`,
+            audience: input.recovery.humanWait?.audience ?? ['@creator'],
+            detail: input.recovery.humanWait?.detail ?? `Paused during ${resumeStage}`,
           }
         : undefined,
       agentTurn: undefined,
@@ -2100,6 +2228,7 @@ export class KarmaxApi {
         ...priorState,
         cancelled: false,
         ...(pausedForHuman ? { humanPauseOrigin: resumeStage } : {}),
+        ...(restoringProposal ? { restoringTo: resumeStage } : {}),
         recoveryWorld: input.recovery.world,
       },
       updatedAt: Date.now(),
@@ -2117,7 +2246,7 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'signal_task', { projectId: task?.projectId, taskId });
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    const view = task.params.draft ? this.getDraftView(token, taskId) : task.lastView;
+    const view = task.params.draft ? this.getDraftView(token, taskId) : await this.transitionSourceView(task);
     if (!view) throw new Error('task has no lifecycle state yet');
     const move = this.availableStageTransitions(task, view).find((candidate) => candidate.target === target);
     if (!move) throw new Error(`cannot move this attempt from ${stageName(view.stage)} to ${stageName(target)}`);
@@ -2131,7 +2260,7 @@ export class KarmaxApi {
       const from = task.params.draft ? 'draft' : view.state?.humanPauseOrigin ? 'human' : view.stage;
       const checkpoint = task.params.draft ? undefined : this.transitionCheckpoint(view, view.stage);
       if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status))
-        await this.stopTaskActivity(task, view, 'Task marked done manually');
+        await this.stopTaskActivity(task, view, 'Task marked done manually', 'cancel');
       if (task.params.draft) this.deps.store.clearDraft(taskId);
       const done: TaskView = {
         ...view,
@@ -2175,14 +2304,16 @@ export class KarmaxApi {
 
     if (target === 'draft') {
       if (!['done', 'cancelled', 'failed'].includes(view.status))
-        await this.stopTaskActivity(task, view, 'Task moved back to Draft');
+        await this.stopTaskActivity(task, view, 'Task moved back to Draft', 'discard');
       const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
       if (world && this.deps.worlds) {
         const opened = await this.deps.worlds.open(world).catch(() => undefined);
         await opened?.destroy().catch(() => undefined);
       }
+      const draftParams = { ...task.params };
+      delete (draftParams as any)._workflowRunId;
       this.deps.store.updateTaskParams(taskId, {
-        ...task.params,
+        ...draftParams,
         draft: true,
         archived: false,
         _discardProgress: true,
@@ -2192,7 +2323,7 @@ export class KarmaxApi {
     }
 
     if (view.state?.humanPauseOrigin === target) {
-      await this.deps.client.workflow.getHandle(taskId).signal(SIG.retry);
+      await this.workflowHandle(taskId).signal(SIG.retry);
       return (await this.getTaskView(token, taskId, { live: true }))!;
     }
 
@@ -2220,8 +2351,7 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId });
     if (!task) throw new Error(`no task ${taskId}`);
-    const view = task.lastView;
-    if (!view) throw new Error('task has no lifecycle state yet');
+    const view = await this.transitionSourceView(task);
     if (!this.availableStageTransitions(task, view).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
@@ -2323,8 +2453,8 @@ export class KarmaxApi {
       // A scoped token is immutable. End the requesting turn and park the exact
       // workflow stage so an approval can wake this role in a fresh turn whose
       // normally minted token includes the durable extension.
-      const view = task.lastView;
-      if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
+      const view = await this.transitionSourceView(task);
+      if (!['done', 'cancelled', 'failed'].includes(view.status)) {
         await this.stopTaskActivity(task, view, `Waiting for permission approval ${request.id}`);
         await this.startTransitionReplacement(task, view, view.stage, true, {
           audience: request.audience,
@@ -2743,7 +2873,7 @@ export class KarmaxApi {
       target: view.targetBranch,
     };
 
-    await withTimeout(
+    const execution = await withTimeout(
       this.deps.client.workflow.start(startType, {
         taskQueue: this.deps.taskQueue,
         workflowId: taskId,
@@ -2754,6 +2884,11 @@ export class KarmaxApi {
     );
     this.deps.store.setTaskWorkflowVersion(taskId, version);
     this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
+    const runId = (execution as any)?.firstExecutionRunId ?? (execution as any)?.runId;
+    if (typeof runId === 'string' && runId) {
+      const current = this.deps.store.getTask(taskId)!;
+      this.deps.store.updateTaskParams(taskId, { ...current.params, _workflowRunId: runId });
+    }
     // A failed workflow recovery starts a new Temporal history, so replay cannot
     // reconstruct collaborationRequested signals from the old execution. Restore
     // the durable join set before the recovered Do turn can advance to Review.
@@ -2761,7 +2896,7 @@ export class KarmaxApi {
       requesterTaskId: taskId,
       status: 'pending',
     })) {
-      await this.deps.client.workflow.getHandle(taskId)
+      await this.workflowHandle(taskId)
         .signal(SIG.collaborationRequested, request.id)
         .catch(() => undefined);
     }
@@ -2927,7 +3062,16 @@ export class KarmaxApi {
     if (signal === SIG.confirm && scopedTask && heldView && heldOrigin === 'review') {
       await this.stopTaskActivity(scopedTask, heldView, 'Human confirmed the Review held for input');
       const minor = Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0);
-      await this.startTransitionReplacement(scopedTask, heldView, minor >= 12 ? 'merge' : 'pr');
+      // Current replacement workflows reopen/reconcile the proposal first and
+      // apply this one approval only if every PR identity and head still match.
+      await this.startTransitionReplacement(
+        scopedTask,
+        heldView,
+        minor >= 12 ? 'review' : 'pr',
+        false,
+        undefined,
+        true,
+      );
       return;
     }
 
@@ -2979,7 +3123,7 @@ export class KarmaxApi {
       return;
     }
 
-    const handle = this.deps.client.workflow.getHandle(taskId);
+    const handle = this.workflowHandle(taskId);
     let followUp: Message | undefined;
     try {
       if (signal === SIG.followUp) {
@@ -3154,7 +3298,7 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     try {
-      return (await this.deps.client.workflow.getHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
+      return (await this.workflowHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
     } catch {
       return false;
     }
@@ -3177,7 +3321,7 @@ export class KarmaxApi {
     if (confirmer && patch[confirmer.field.name] !== undefined)
       this.assertHumanRoutes(task!, confirmer.manifest, { [confirmer.field.name]: patch[confirmer.field.name] } as ValueMap);
     try {
-      const result = (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+      const result = (await this.workflowHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
       if (confirmer && result.applied.includes(confirmer.field.name))
         await this.shareConfirmerAcrossAttempts(task!, confirmer.field.name, patch[confirmer.field.name]);

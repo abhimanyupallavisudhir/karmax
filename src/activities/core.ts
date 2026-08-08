@@ -2302,6 +2302,48 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     },
 
+    /** Preserve a reversible task cancellation without retaining billable
+     * compute where the provider can park. Draft/reset remains the operation
+     * that deliberately discards this state. */
+    async suspendWorldForRecovery(handle: WorldHandle): Promise<void> {
+      const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
+      try {
+        if (deps.checkpoints) {
+          if (isRemote(current.kind) && worldRepos(current).length) {
+            const world = await openWorld(current, current.id);
+            const projectId = String(current.meta?.projectId ?? '');
+            if (store.listProjectRepositories(projectId).length) {
+              const pushed = await brokerPublishBranch(world, brokerAuthFor(current, current.id));
+              if (pushed.skipped.length)
+                throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+            }
+          }
+          await deps.checkpoints.checkpoint(current);
+        }
+        const provider = worlds.get(current.kind);
+        if (provider.parkable) {
+          await worlds.park(current);
+          if (await worlds.status(current) === 'parked') {
+            const parked = (store.currentWorld(current.id) ?? current) as WorldHandle;
+            const leaseId = typeof parked.meta?.worldLeaseId === 'string' ? parked.meta.worldLeaseId : undefined;
+            if (leaseId) {
+              deps.runners?.release(leaseId, parked.kind);
+              store.updateWorldMeta(parked, { worldLeaseId: null });
+            }
+            store.setWorldState((store.currentWorld(current.id) ?? parked) as WorldHandle, 'parked');
+          }
+        }
+        record(current.id, 'world.suspended', { provider: current.kind, parkable: !!provider.parkable });
+      } catch (error) {
+        // Cancellation itself remains reliable. The live world is intentionally
+        // left intact when persistence/parking fails, so a later restore has the
+        // best available chance of recovering it.
+        record(current.id, 'world.suspend_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return store.listResourceCandidates(taskId).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;
@@ -3487,9 +3529,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     /** Close the task's still-open PRs (cancellation). Best-effort: a task that
      *  is going away must not be held up by GitHub being unreachable. */
     async closePrs(handle: WorldHandle, prs: TaskPullRequest[], reason: string): Promise<void> {
+      // Opening a PR can authorize a local checkout by matching its configured
+      // GitHub origin against the organization repository catalog. Preserve the
+      // same checkout context here; resolving only by project attachment made
+      // cancellation unable to close exactly those otherwise-valid PRs.
+      const world = await openWorld(handle).catch(() => undefined);
+      const checkouts = world ? worldRepos(world.handle) : [];
       for (const ref of prs) {
         try {
-          const api = await prApiFor(handle, ref.slug);
+          const checkout = checkouts.find((candidate) => candidate.name === ref.repo);
+          const api = await prApiFor(handle, ref.slug, checkout);
           if ((await api.get(ref.slug, ref.number)).state === 'closed') continue;
           await api.comment(ref.slug, ref.number, reason);
           await api.update(ref.slug, ref.number, { state: 'closed' });

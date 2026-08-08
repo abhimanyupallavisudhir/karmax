@@ -820,6 +820,72 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:continued.txt'])).stdout).toContain('resumed');
   });
 
+  it('v1.22 rebuilds restored Review prerequisites and replays the configured layers', async () => {
+    const repo = await h.makeRepo('restored-review-layers');
+    const taskId = newId('task');
+    const existing = await h.worlds.create('worktree', { taskId, repo, base: 'main', target: 'main' });
+    await existing.writeFile('reviewed.txt', 'preserved reviewed work');
+    await git(existing.handle.workdir!, ['add', 'reviewed.txt']);
+    await git(existing.handle.workdir!, ['commit', '-m', 'preserved proposal']);
+
+    const handle = await h.client.workflow.start('softwareDev@1.22.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        ...input({
+          taskId,
+          repo,
+          title: 'Restored layered Review',
+          prompt: 'Review the preserved proposal.\n@confirm confirm',
+          recovery: {
+            world: existing.handle,
+            messages: [{ id: 'recover', role: 'user', text: 'Review the preserved proposal.\n@confirm confirm', ts: 0 }],
+            seen: 1,
+            target: 'main',
+            resumeStage: 'review',
+          },
+        }),
+        confirm: { layers: [{ kind: 'agent', provider: 'mock' }, { kind: 'human', audience: ['@creator'] }] },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 })
+      .toBe('confirm layer 2/2');
+    expect((await view(handle)).stage).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:reviewed.txt'])).stdout).toContain('preserved reviewed work');
+  });
+
+  it('v1.22 preserves the exact audience and question of a cross-cutting human hold', async () => {
+    const repo = await h.makeRepo('restored-human-route');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.22.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Targeted hold',
+        prompt: 'preserved work',
+        recovery: {
+          messages: [{ id: 'recover', role: 'user', text: 'preserved work', ts: 0 }],
+          seen: 1,
+          target: 'main',
+          resumeStage: 'do',
+          pausedForHuman: true,
+          humanWait: { audience: ['user:release-manager'], detail: 'Choose the deployment window' },
+        },
+      })],
+    });
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 15_000 })
+      .toBe('Choose the deployment window');
+    expect((await view(handle)).waitingFor?.audience).toEqual(['user:release-manager']);
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
   it('auto-resolves hard provider credit exhaustion without spawning a quota-bound Resolve agent', async () => {
     const repo = await h.makeRepo('app-usage-limit');
     const taskId = newId('task');

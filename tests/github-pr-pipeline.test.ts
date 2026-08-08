@@ -427,6 +427,60 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       .toBe((await git(origin, ['rev-parse', 'main'])).stdout.trim());
   }, 120_000);
 
+  it('v1.22 restores a cancelled Review by reopening the same exact PR before Review', async () => {
+    const repo = await repoWithOrigin('cancelled-review-restore');
+    const project = h.store.createProject('Cancelled Review restore', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'restore-installation', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'restore-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE,
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({
+      projectId: project.id,
+      title: 'Restore cancelled Review',
+      workflow: 'software-dev',
+      workflowVersion: '1.22.0',
+      params: { prompt: 'restore it', base: 'main', target: 'main', repos: [repo], remote: 'pr', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' },
+    });
+    const handle = await h.client.workflow.start('softwareDev@1.22.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id,
+        projectId: project.id,
+        title: task.title,
+        prompt: '@write restored.md :: exact proposal\n@run git add -A && git commit -q -m proposal\n@openpr',
+        base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).prs?.length ?? 0}`,
+      { timeout: 30_000 }).toBe('review/1');
+    const reviewed = { number: prs[0].number, head: prs[0].head.sha };
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+    expect(prs[0].state).toBe('closed');
+    expect(h.store.getTask(task.id)?.lastView?.state.recoveryWorld).toBeTruthy();
+
+    const token = h.tokens.mintPrincipal('user:a', ['*'], project.id).token;
+    expect(h.store.effectiveProjectConfig(project).remote).toBe('pr');
+    const restoring = await h.api.moveTaskStage(token, task.id, 'review');
+    expect(restoring).toMatchObject({ stage: 'pr', state: { restoringTo: 'review' } });
+    await expect.poll(() => {
+      const current = h.store.getTask(task.id)?.lastView;
+      return `${current?.stage}/${current?.prs?.length ?? 0}/${current?.prs?.[0]?.state}`;
+    }, { timeout: 30_000 }).toBe('review/1/open');
+    expect(prs).toHaveLength(1);
+    expect(prs[0]).toMatchObject({ number: reviewed.number, state: 'open' });
+    expect(prs[0].head.sha).toBe(reviewed.head);
+
+    await h.api.signalTask(token, task.id, 'confirm');
+    await expect.poll(() => h.store.getTask(task.id)?.lastView?.stage, { timeout: 30_000 }).toBe('done');
+  }, 120_000);
+
   it('v1.14 returns terminal CI failures to Do with failed-check context, then reviews the repaired head again', async () => {
     const repo = await repoWithOrigin('github-ci-repair');
     const project = h.store.createProject('GitHub CI repair', { repos: [repo], remote: 'pr' });
