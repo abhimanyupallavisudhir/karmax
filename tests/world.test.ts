@@ -67,6 +67,36 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
+  it('parks a remote world when its task escalates as blocked', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Blocked remote', {});
+    const task = store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id,
+      generation: 1, root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`,
+      base: 'main', meta: { projectId: project.id } }, project.id) as any;
+    let parked = false;
+    const worlds = new WorldRegistry();
+    worlds.register({
+      kind: 'e2b', capabilities: { remote: true }, parkable: true,
+      async status() { return parked ? 'parked' : 'ready'; },
+      async park() { parked = true; return handle; },
+    } as any);
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      await core.publishView(task.id, {
+        taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'escalated', status: 'blocked',
+        messages: [], actions: [], state: { recoveryWorld: handle }, world: handle,
+        pointOfNoReturnPassed: false, editableParams: [], updatedAt: 1,
+      } as any);
+      expect(parked).toBe(true);
+      expect(store.worldState(task.id)).toBe('parked');
+    } finally {
+      store.close();
+    }
+  });
+
   it('forks a PR-policy task from origin without moving a stale local base', async () => {
     const remote = path.join(home, 'origin.git');
     const writer = path.join(home, 'writer');

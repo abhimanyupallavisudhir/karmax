@@ -200,7 +200,8 @@ export class WorldLifecycleManager {
   }
 
   /**
-   * Destroy remote sandboxes this deployment owns whose task no longer exists.
+   * Destroy remote sandboxes this deployment owns whose task no longer exists,
+   * plus duplicate allocations that are not the task's registered world.
    *
    * This is the reaper the providers are written to depend on: Daytona creates
    * with `autoDeleteInterval: -1` (see `src/world/daytona.ts`), which turns the
@@ -209,26 +210,45 @@ export class WorldLifecycleManager {
    * so any sandbox whose task was deleted before `destroyWorld` ran billed
    * forever, with nothing on either side ever collecting it.
    *
-   * The rule is deliberately narrow: **reap only when the task row is gone.**
-   * A sandbox is created after its task row exists, so "no task" cannot be a
-   * not-yet-recorded new world — it can only be one whose task was deleted.
-   * Anything else (a terminated workflow whose world the store still calls
-   * `ready`, a parked world awaiting resume) is ambiguous from here and is left
-   * to `destroyWorld`, hibernation, and reconciliation, which have the context
-   * to decide. A reaper that guesses deletes someone's live work.
+   * A live task with no registered world is still provisioning, so every
+   * matching sandbox remains ambiguous and is preserved. Once a durable handle
+   * exists, however, the provider can compare its sealed id: exactly that object
+   * is live and any sibling carrying the same task label is a timed-out create
+   * duplicate. Providers without the comparison hook retain the conservative
+   * legacy behavior. A reaper must never guess at an opaque provider id.
    */
   private async reapOrphanSandboxes(): Promise<void> {
     for (const provider of this.worlds.enumerable()) {
-      const sandboxes = await provider.listSandboxes!().catch(() => [] as ProviderSandboxRef[]);
-      for (const sandbox of sandboxes) {
-        // No task id means karmax cannot attribute it — never destroy blind.
-        if (!sandbox.taskId || this.store.getTask(sandbox.taskId)) continue;
-        try {
-          await sandbox.destroy();
-          this.store.appendAudit({ principalId: 'system:lifecycle', action: 'world.orphanReaped',
-            detail: { provider: provider.kind, sandboxId: sandbox.sandboxId, taskId: sandbox.taskId } });
-        } catch {
-          // Transient control-plane failure — the next sweep tries again.
+      // Provider credentials are organization-scoped. Hosted deployments often
+      // have no ambient fallback key at all, so an unscoped list silently sees
+      // nothing. Query every enabled tenant connection; retain one unscoped pass
+      // only for legacy/custom providers that have no durable connection row.
+      const organizationIds = this.store.listOrganizations()
+        .filter((organization) => this.store.getWorldProviderConnection(organization.id, provider.kind)?.enabled)
+        .map((organization) => organization.id);
+      const scopes: Array<string | undefined> = organizationIds.length ? organizationIds : [undefined];
+      const seen = new Set<string>();
+      for (const organizationId of scopes) {
+        const sandboxes = await provider.listSandboxes!(organizationId).catch(() => [] as ProviderSandboxRef[]);
+        for (const sandbox of sandboxes) {
+          // The same provider account can be connected to multiple organizations.
+          // Never destroy/audit one object twice when their inventories overlap.
+          if (seen.has(sandbox.sandboxId)) continue;
+          seen.add(sandbox.sandboxId);
+          // No task id means karmax cannot attribute it — never destroy blind.
+          if (!sandbox.taskId) continue;
+          const task = this.store.getTask(sandbox.taskId);
+          const current = task ? this.store.currentWorld(sandbox.taskId) : undefined;
+          const duplicate = Boolean(task && current && sandbox.matches && !sandbox.matches(current));
+          if (task && !duplicate) continue;
+          try {
+            await sandbox.destroy();
+            this.store.appendAudit({ principalId: 'system:lifecycle', action: 'world.orphanReaped',
+              detail: { provider: provider.kind, sandboxId: sandbox.sandboxId, taskId: sandbox.taskId,
+                reason: duplicate ? 'duplicate' : 'task-deleted' } });
+          } catch {
+            // Transient control-plane failure — the next sweep tries again.
+          }
         }
       }
     }

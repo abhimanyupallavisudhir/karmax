@@ -125,8 +125,9 @@ describe('E2B cloud world provider', () => {
     expect(createdOptions).toMatchObject({
       template: 'karmax-template',
       timeoutMs: 123_000,
+      requestTimeoutMs: 120_000,
       lifecycle: { onTimeout: 'pause', autoResume: true },
-      metadata: { karmaxTaskId: 'task-cloud' },
+      metadata: { karmaxTaskId: 'task-cloud', karmaxGeneration: '1' },
       allowInternetAccess: true,
     });
     expect(createdOptions.network).toBeUndefined();
@@ -191,6 +192,60 @@ describe('E2B cloud world provider', () => {
     expect(await provider.status(world.handle)).toBe('ready');
     await world.destroy();
     expect(killed).toBe(1);
+  });
+
+  it('adopts an unregistered sandbox for the same task generation instead of creating another', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.sandboxId = 'already-created';
+    let creates = 0;
+    let connects = 0;
+    const metadata = { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'retry-create', karmaxGeneration: '3' };
+    const provider = new E2BWorldProvider({
+      async create() { creates++; return sandbox; },
+      async connect(id, options) {
+        expect(id).toBe('already-created');
+        expect(options.requestTimeoutMs).toBe(120_000);
+        connects++;
+        return sandbox;
+      },
+      async list(options) {
+        return options.metadata.karmaxGeneration === '3'
+          ? [{ sandboxId: sandbox.sandboxId, metadata }]
+          : [];
+      },
+    });
+
+    await provider.create({ taskId: 'retry-create', generation: 3, base: 'main' });
+
+    expect(creates).toBe(0);
+    expect(connects).toBe(1);
+  });
+
+  it('reconciles provider truth when the create response times out after allocation', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.sandboxId = 'late-create';
+    let allocated = false;
+    let creates = 0;
+    let connects = 0;
+    const metadata = { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'late', karmaxGeneration: '1' };
+    const provider = new E2BWorldProvider({
+      async create(options) {
+        expect(options.requestTimeoutMs).toBe(120_000);
+        creates++;
+        allocated = true;
+        throw Object.assign(new Error('The operation was aborted due to timeout'), { code: 'ETIMEDOUT' });
+      },
+      async connect(id) { expect(id).toBe('late-create'); connects++; return sandbox; },
+      async list(options) {
+        return allocated && options.metadata.karmaxGeneration === '1'
+          ? [{ sandboxId: sandbox.sandboxId, metadata }]
+          : [];
+      },
+    });
+
+    await expect(provider.create({ taskId: 'late', generation: 1, base: 'main' })).resolves.toBeDefined();
+    expect(creates).toBe(1);
+    expect(connects).toBe(1);
   });
 
   it('rejects local and HTTPS repositories before a cloud checkout is exposed', async () => {

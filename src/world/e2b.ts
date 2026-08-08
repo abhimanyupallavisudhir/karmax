@@ -28,6 +28,10 @@ const HOME = '/home/user';
 const ROOT = '/home/user/karmax';
 const DEFAULT_IDLE_MS = 10 * 60_000;
 const DEFAULT_TEMPLATE = 'codex';
+// `createWorld` has a five-minute Temporal boundary that also includes Git
+// provisioning. Give E2B twice its SDK default without consuming the entire
+// activity budget; an indeterminate timeout is reconciled by metadata below.
+const DEFAULT_REQUEST_TIMEOUT_MS = 2 * 60_000;
 
 /** Minimal SDK surface kept structural so the provider can be unit-tested with
  * no E2B account and upgraded independently from Temporal workflow contracts. */
@@ -62,17 +66,17 @@ export interface E2BSandboxLike {
 }
 
 export interface E2BFactory {
-  create(options: { template?: string; desktop?: boolean; apiKey?: string; timeoutMs: number; lifecycle: { onTimeout: 'pause'; autoResume: true };
+  create(options: { template?: string; desktop?: boolean; apiKey?: string; timeoutMs: number; requestTimeoutMs: number; lifecycle: { onTimeout: 'pause'; autoResume: true };
     metadata: Record<string, string>; allowInternetAccess?: boolean;
     network?: { allowOut?: string[]; denyOut?: string[]; allowPublicTraffic: false } }): Promise<E2BSandboxLike>;
-  connect(id: string, options: { timeoutMs: number; apiKey?: string; desktop?: boolean }): Promise<E2BSandboxLike>;
+  connect(id: string, options: { timeoutMs: number; requestTimeoutMs?: number; apiKey?: string; desktop?: boolean }): Promise<E2BSandboxLike>;
   /** Control-plane state lookup that must not resume a paused sandbox; absent
    * (or undefined result) means the provider cannot answer cheaply. */
   info?(id: string, options: { apiKey?: string }): Promise<{ state?: string } | undefined>;
   /** Control-plane enumeration of sandboxes carrying this deployment's
    * metadata, for orphan reaping. Never connects (which would resume a paused
    * sandbox and bill it). */
-  list?(options: { apiKey?: string; metadata: Record<string, string> }): Promise<Array<{
+  list?(options: { apiKey?: string; requestTimeoutMs?: number; metadata: Record<string, string> }): Promise<Array<{
     sandboxId: string; metadata?: Record<string, string> }>>;
   /** Control-plane teardown by id, so an orphan can be killed without a
    * handle — and, again, without resuming it first. */
@@ -113,26 +117,51 @@ export class E2BWorldProvider implements WorldProvider {
       ? spec.environment?.template ?? spec.environment?.snapshot ?? connection?.config.desktopTemplate ?? this.desktopTemplate
       : spec.environment?.template ?? spec.environment?.snapshot ?? spec.environment?.image ?? connection?.config.template ?? this.template;
     const taskNetwork = e2bNetwork(spec);
-    const sandbox = await this.factory.create({
+    const requestTimeoutMs = envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+    const generation = String(spec.generation ?? 1);
+    const metadata = { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel(), karmaxGeneration: generation };
+    const connectionOptions = {
+      timeoutMs: this.idleMs,
+      requestTimeoutMs,
+      ...(flavor === 'desktop' ? { desktop: true } : {}),
+      ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}),
+    };
+    let sandbox = await this.findProvisioningSandbox(metadata, connectionOptions);
+    let adopted = Boolean(sandbox);
+    if (!sandbox) sandbox = await this.factory.create({
       ...(selectedTemplate ? { template: selectedTemplate } : {}),
       ...(flavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}),
       timeoutMs: this.idleMs,
+      requestTimeoutMs,
       lifecycle: { onTimeout: 'pause', autoResume: true },
       // `karmaxHome` scopes orphan reaping to sandboxes THIS deployment
       // created: several karmax instances (dev, prod, a colleague's) can share
       // one E2B account, and reaping by task id alone would kill theirs.
-      metadata: { karmaxTaskId: spec.taskId, karmaxHome: serviceHomeLabel() },
+      metadata,
       // Git provisioning is trusted host work and may require protocols (most
       // notably GitHub SSH) that E2B's domain allowlist proxy resets even when
       // the host is explicitly allowed. No task code runs in this phase. The
       // final task policy is installed atomically below before the World escapes.
       allowInternetAccess: true,
+    }).catch(async (error) => {
+      // E2B may finish allocating after its HTTP response exceeds the client
+      // deadline. Reconcile provider truth before allowing Temporal to retry;
+      // otherwise every retry can allocate another paid sandbox for one task.
+      const recovered = await this.findProvisioningSandbox(metadata, connectionOptions).catch(() => undefined);
+      if (recovered) {
+        adopted = true;
+        return recovered;
+      }
+      throw error;
     });
     this.sandboxes.set(sandbox.sandboxId, sandbox);
     this.states.set(sandbox.sandboxId, 'ready');
     try {
       const provisioner = provisionTarget(sandbox);
+      // A recovered sandbox never escaped this create activity, so anything in
+      // its workspace is an incomplete provisioning attempt, not user work.
+      if (adopted) await provisionRun(provisioner, `rm -rf ${ROOT} && mkdir -p ${ROOT}`);
       await provisionGitCredentials(provisioner, spec, HOME);
       const { repos, root, warnings, workdir, ephemeralPaths } = await provisionGitRepos(provisioner, spec, {
         root: ROOT, home: HOME,
@@ -192,6 +221,7 @@ export class E2BWorldProvider implements WorldProvider {
     if (!sandbox || this.states.get(sandboxId) === 'parked') {
       const connection = this.connection(reference.organizationId);
       sandbox = await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
+        requestTimeoutMs: envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
         ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
         ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
       this.sandboxes.set(sandboxId, sandbox);
@@ -206,6 +236,7 @@ export class E2BWorldProvider implements WorldProvider {
     if (this.states.get(sandboxId) === 'parked') return handle;
     const connection = this.connection(reference.organizationId);
     const sandbox = this.sandboxes.get(sandboxId) ?? await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
+      requestTimeoutMs: envPositiveInt('KARMAX_E2B_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
       ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
     await sandbox.pause();
@@ -249,6 +280,10 @@ export class E2BWorldProvider implements WorldProvider {
     return listed.map((sandbox) => ({
       sandboxId: sandbox.sandboxId,
       ...(sandbox.metadata?.karmaxTaskId ? { taskId: sandbox.metadata.karmaxTaskId } : {}),
+      matches: (handle) => {
+        try { return handle.kind === this.kind && this.sandboxIdOf(handle as WorldHandle) === sandbox.sandboxId; }
+        catch { return false; }
+      },
       destroy: async () => {
         if (this.factory.kill) await this.factory.kill(sandbox.sandboxId, apiKey);
         else await (await this.factory.connect(sandbox.sandboxId, { timeoutMs: this.idleMs, ...apiKey })).kill();
@@ -320,6 +355,38 @@ export class E2BWorldProvider implements WorldProvider {
   }
 
   private sandboxIdOf(handle: WorldHandle): string { return this.refOf(handle).sandboxId; }
+
+  /** Adopt an unregistered sandbox created by an earlier indeterminate request.
+   * The generation makes this safe across discard/recreate cycles. A one-time
+   * legacy lookup recovers sandboxes created immediately before this metadata
+   * key shipped (including in-flight activities during a worker roll). */
+  private async findProvisioningSandbox(
+    metadata: Record<string, string>,
+    options: { timeoutMs: number; requestTimeoutMs: number; apiKey?: string; desktop?: boolean },
+  ): Promise<E2BSandboxLike | undefined> {
+    if (!this.factory.list) return undefined;
+    const api = {
+      ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+      requestTimeoutMs: options.requestTimeoutMs,
+    };
+    let matches = await this.factory.list({ ...api, metadata });
+    if (!matches.length) {
+      const { karmaxGeneration: _generation, ...legacy } = metadata;
+      const candidates = await this.factory.list({ ...api, metadata: legacy });
+      matches = candidates.filter((candidate) => !candidate.metadata?.karmaxGeneration
+        || candidate.metadata.karmaxGeneration === metadata.karmaxGeneration);
+    }
+    if (!matches.length) return undefined;
+    if (matches.length > 1) {
+      // No candidate has been registered yet, so none contains user work. Clear
+      // ambiguous duplicates instead of choosing one arbitrarily and leaking the
+      // rest; the caller will make one clean replacement on its next retry.
+      if (this.factory.kill) await Promise.all(matches.map((candidate) =>
+        this.factory.kill!(candidate.sandboxId, options.apiKey ? { apiKey: options.apiKey } : {}).catch(() => undefined)));
+      throw new Error(`multiple E2B sandboxes exist for task generation ${metadata.karmaxTaskId}/${metadata.karmaxGeneration}`);
+    }
+    return this.factory.connect(matches[0]!.sandboxId, options);
+  }
 
   private connection(organizationId: string | undefined): ResolvedWorldProviderConnection | undefined {
     if (this.resolveConnection) return this.resolveConnection(organizationId, this.kind);

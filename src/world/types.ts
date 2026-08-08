@@ -121,6 +121,10 @@ export interface WorldGitIdentity {
 
 export interface WorldSpec {
   taskId: string;
+  /** Durable generation Karmax is provisioning. Remote providers use this as
+   * an idempotency key when a create request times out after the provider has
+   * already allocated the sandbox. */
+  generation?: number;
   /** Tenant used to resolve the provider connection inside the trusted activity.
    * It is non-secret and is sealed into remote handles for later resume. */
   organizationId?: string;
@@ -346,6 +350,9 @@ export interface ProviderSandboxRef {
   sandboxId: string;
   /** The karmax task this sandbox was created for (`karmaxTaskId` metadata). */
   taskId?: string;
+  /** Whether this provider object is the sandbox sealed into a durable world
+   * handle. Provider modules can answer without exposing the sealed id. */
+  matches?(handle: WorldHandleRef): boolean;
   destroy(): Promise<void>;
 }
 

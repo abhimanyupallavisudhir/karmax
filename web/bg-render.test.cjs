@@ -27,6 +27,7 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
 // ── interactionInFlight ──────────────────────────────────────────────────────
 let ACTIVE = null;
 let SELECTION = { isCollapsed: true, rangeCount: 0, anchorNode: null };
+let mainPointerDown = false;
 global.document = { get activeElement() { return ACTIVE; } };
 global.window = { getSelection: () => SELECTION };
 eval(extractFn('interactionInFlight'));
@@ -34,6 +35,10 @@ eval(extractFn('interactionInFlight'));
 const root = { contains: (el) => el === IN || (el && el._in) };
 const IN = { tagName: 'SELECT' };          // a <select> that lives inside #main
 const OUT = { tagName: 'SELECT' };         // a <select> elsewhere (topbar)
+
+mainPointerDown = true;
+ok(interactionInFlight(root) === true, 'a pointer-down in the main view defers replacement');
+mainPointerDown = false;
 
 ACTIVE = IN; SELECTION = { isCollapsed: true, rangeCount: 0 };
 ok(interactionInFlight(root) === true, 'focused <select> inside root defers the repaint');

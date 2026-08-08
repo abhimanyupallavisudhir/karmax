@@ -202,6 +202,10 @@ export class DaytonaWorldProvider implements WorldProvider {
     return sandboxes.map((sandbox) => ({
       sandboxId: sandbox.id,
       ...(sandbox.labels?.karmaxTaskId ? { taskId: sandbox.labels.karmaxTaskId } : {}),
+      matches: (handle) => {
+        try { return handle.kind === this.kind && this.sandboxId(handle as WorldHandle) === sandbox.id; }
+        catch { return false; }
+      },
       destroy: async () => {
         await sandbox.delete(60);
         this.sandboxes.delete(sandbox.id);

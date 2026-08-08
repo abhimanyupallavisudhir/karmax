@@ -114,6 +114,10 @@ export function isTransportError(error: unknown): boolean {
       // the HTTP-status matcher recognized the outage.
       /\breconnecting(?:\.{3}|\s)*\s*\d+\s*\/\s*\d+\b/.test(lc) ||
       /timeout waiting for (?:a |the )?child process to exit/.test(lc) ||
+      // ConnectRPC's terse transport failure from E2B PTY/control streams. A
+      // bare `terminated` without this protocol status is deliberately not
+      // enough: an ordinary agent process can terminate for a code/config bug.
+      /^\s*\d+\s*:\s*\[(?:unknown|unavailable|internal)\]\s*terminated\s*$/.test(lc) ||
       // Short-lived host process-table / descriptor pressure. Disk-full and
       // permission errors are intentionally absent: those need intervention.
       /\b(?:eagain|emfile|enfile)\b/.test(lc) ||
