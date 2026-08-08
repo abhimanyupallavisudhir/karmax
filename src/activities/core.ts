@@ -993,9 +993,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) });
       }
       let world: World;
+      const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
       try {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
+          generation,
           organizationId: project?.organizationId,
           repo: worldSources.length === 1 ? worldSources[0] : undefined,
           repos: worldSources.length > 1 ? worldSources : undefined,
@@ -1031,7 +1033,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       try {
         if (projectId && deps.resources) {
-          const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
           world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
         }
         if (projectId) {
@@ -3588,7 +3589,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         agentTurn: view.agentTurn?.state ?? null,
         agentRole: view.agentTurn?.role ?? null,
       });
-      // A waiting task owns durable state, not continuously-metered compute.
+      // A waiting or blocked task owns durable state, not continuously-metered compute.
       // Parking is an implementation detail inside this existing activity (no new
       // workflow command, so old Temporal histories remain replay-compatible).
       // Every later operation goes through worlds.open(), which transparently
@@ -3599,7 +3600,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // every waiting publish creates avoidable activity contention precisely
       // while parent/child cancellation signals need to settle promptly.
       const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
-      if (view.status === 'waiting' && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
+      if ((view.status === 'waiting' || view.status === 'blocked')
+        && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
         try {
           const before = await worlds.status(waitingWorld);
           if (before === 'ready') {

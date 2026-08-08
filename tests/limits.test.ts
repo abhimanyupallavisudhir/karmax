@@ -177,6 +177,11 @@ describe('isTransportError', () => {
   it('leaves quota signals to the limit classifier (429 is not transport)', () => {
     expect(isTransportError('Anthropic API 429: too many requests')).toBe(false);
   });
+
+  it('recognizes E2B ConnectRPC stream termination as transport failure', () => {
+    expect(isTransportError('2: [unknown] terminated')).toBe(true);
+    expect(isTransportError('process terminated')).toBe(false);
+  });
 });
 
 describe('isResourceKill (OOM / signal-9 predicate — karmax#4)', () => {
