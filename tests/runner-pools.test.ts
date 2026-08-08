@@ -224,6 +224,35 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.auditSince(0).some((e: { action: string }) => e.action === 'world.orphanReaped')).toBe(true);
   });
 
+  it('reaps duplicate provider allocations after one sandbox is durably registered', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Duplicate recovery', {});
+    const task = store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/w', workspaceRoot: '/w', branch: `karmax/${task.id}`, base: 'main', sealedProviderRef: 'sealed-current',
+      meta: {} }, project.id);
+    const destroyed: string[] = [];
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true,
+      async listSandboxes() {
+        return [
+          { sandboxId: 'current', taskId: task.id,
+            matches: (candidate: any) => candidate.sealedProviderRef === handle.sealedProviderRef,
+            destroy: async () => { destroyed.push('current'); } },
+          { sandboxId: 'duplicate', taskId: task.id, matches: () => false,
+            destroy: async () => { destroyed.push('duplicate'); } },
+        ];
+      } } as any);
+
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    await lifecycle.sweep(Date.now());
+
+    expect(destroyed).toEqual(['duplicate']);
+    expect(store.auditSince(0).find((event: any) => event.detail?.sandboxId === 'duplicate')?.detail)
+      .toMatchObject({ reason: 'duplicate' });
+  });
+
   it('keeps sweeping after one provider control plane fails', async () => {
     const store = new Store(':memory:');
     const destroyed: string[] = [];

@@ -350,6 +350,9 @@ export interface ProviderSandboxRef {
   sandboxId: string;
   /** The karmax task this sandbox was created for (`karmaxTaskId` metadata). */
   taskId?: string;
+  /** Whether this provider object is the sandbox sealed into a durable world
+   * handle. Provider modules can answer without exposing the sealed id. */
+  matches?(handle: WorldHandleRef): boolean;
   destroy(): Promise<void>;
 }
 

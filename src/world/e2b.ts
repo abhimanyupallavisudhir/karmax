@@ -280,6 +280,10 @@ export class E2BWorldProvider implements WorldProvider {
     return listed.map((sandbox) => ({
       sandboxId: sandbox.sandboxId,
       ...(sandbox.metadata?.karmaxTaskId ? { taskId: sandbox.metadata.karmaxTaskId } : {}),
+      matches: (handle) => {
+        try { return handle.kind === this.kind && this.sandboxIdOf(handle as WorldHandle) === sandbox.sandboxId; }
+        catch { return false; }
+      },
       destroy: async () => {
         if (this.factory.kill) await this.factory.kill(sandbox.sandboxId, apiKey);
         else await (await this.factory.connect(sandbox.sandboxId, { timeoutMs: this.idleMs, ...apiKey })).kill();
