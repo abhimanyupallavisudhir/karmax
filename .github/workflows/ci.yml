@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # When an eligible organization-owned deployment enables GitHub's native
+  # queue, required checks must report on the speculative landing candidate.
+  # Personal/private deployments simply never emit this event.
+  merge_group:
 
 # A newer push to the same branch makes the in-flight run redundant. master is
 # excluded so every landed commit keeps a result of its own.

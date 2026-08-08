@@ -22,7 +22,8 @@ import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './cust
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity, toolActivityDetail } from './activity.js';
 import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-homes.js';
-import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess,
+  syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 
 /**
@@ -759,8 +760,13 @@ export class ClaudeAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       injector.close(); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
-      if (remoteHome && input.resolvedAuth?.configHome)
-        await syncRemoteAgentHome(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);
+      if (remoteHome && input.resolvedAuth?.configHome) {
+        const failure = await syncRemoteAgentHomeBestEffort(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);
+        if (failure) ctx.emitActivity({
+          id: 'claude-remote-state-sync', kind: 'error', phase: 'failed',
+          title: 'Could not preserve remote Claude state', detail: failure.message.slice(0, 1000),
+        });
+      }
     }
     if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
     if (!successfulResult) {

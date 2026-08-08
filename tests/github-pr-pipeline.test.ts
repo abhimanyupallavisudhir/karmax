@@ -10,6 +10,7 @@ import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { worldRepos } from '../src/world/types.js';
 import { mergeQueueId } from '../src/coordinators/names.js';
+import { mergeQueueDomains } from '../src/domain/types.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -21,9 +22,13 @@ const prs: any[] = [];
 const comments: { number: number; body: string }[] = [];
 let afterPrOpened: (() => Promise<void>) | undefined;
 let githubReadiness: Record<string, unknown> = {};
+const githubReadinessBySlug = new Map<string, Record<string, unknown>>();
 let mergeHttpStatus: number | undefined;
 let useMergeQueue = false;
 let mergeQueueAccepted = false;
+const nativeQueueSlugs = new Set<string>();
+const remoteBySlug = new Map<string, string>();
+const providerWithdrawals: string[] = [];
 let mergeFailureMessage: string | undefined;
 let originDir: string;
 let blockFrontHeldRepair = false;
@@ -33,7 +38,8 @@ let frontHeldRepairGate: Promise<void> = Promise.resolve();
 const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
 let exactCandidateRevisions = 0;
 
-async function remoteForBranch(branch: string): Promise<string | undefined> {
+async function remoteForBranch(branch: string, slug?: string): Promise<string | undefined> {
+  if (slug && remoteBySlug.has(slug)) return remoteBySlug.get(slug);
   if (!originDir || !fs.existsSync(originDir)) return undefined;
   for (const entry of fs.readdirSync(originDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.endsWith('.git')) continue;
@@ -44,7 +50,7 @@ async function remoteForBranch(branch: string): Promise<string | undefined> {
 }
 
 async function refreshPrHead(pr: any): Promise<void> {
-  const remote = await remoteForBranch(pr.head.ref);
+  const remote = await remoteForBranch(pr.head.ref, pr.repo);
   if (!remote) return;
   const head = await git(remote, ['rev-parse', '--verify', `refs/heads/${pr.head.ref}^{commit}`]);
   if (head.code === 0) pr.head.sha = head.stdout.trim();
@@ -52,7 +58,7 @@ async function refreshPrHead(pr: any): Promise<void> {
 
 async function landProviderTarget(pr: any, target: string): Promise<string> {
   await refreshPrHead(pr);
-  const remote = await remoteForBranch(pr.head.ref);
+  const remote = await remoteForBranch(pr.head.ref, pr.repo);
   if (!remote) throw new Error(`stub GitHub could not find remote branch ${pr.head.ref}`);
   await gitOrThrow(remote, ['update-ref', `refs/heads/${target}`, pr.head.sha]);
   pr.merge_commit_sha = pr.head.sha;
@@ -65,14 +71,15 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   const body = init.body ? JSON.parse(String(init.body)) : {};
   const json = (status: number, value: unknown) =>
     new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
-  if (u.pathname === `/repos/${SLUG}/pulls` && method === 'GET') {
+  const list = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
+  if (list && method === 'GET') {
     const branch = u.searchParams.get('head')?.split(':')[1];
-    const matches = prs.filter((pr) => pr.head.ref === branch);
+    const matches = prs.filter((pr) => pr.repo === list[1] && pr.head.ref === branch);
     await Promise.all(matches.map(refreshPrHead));
     return json(200, matches);
   }
-  if (u.pathname === `/repos/${SLUG}/pulls` && method === 'POST') {
-    const pr = { number: prs.length + 1, html_url: `https://github.com/${SLUG}/pull/${prs.length + 1}`,
+  if (list && method === 'POST') {
+    const pr = { repo: list[1], number: prs.length + 1, html_url: `https://github.com/${list[1]}/pull/${prs.length + 1}`,
       node_id: `PR_${prs.length + 1}`, state: 'open', merged_at: null, title: body.title, body: body.body,
       head: { ref: body.head, sha: '' }, base: { ref: body.base } };
     prs.push(pr);
@@ -83,7 +90,9 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     return json(201, pr);
   }
   if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('PullRequestReadiness')) {
-    const pr = prs.find((candidate) => candidate.number === Number(body.variables?.number)) ?? prs[0];
+    const querySlug = `${body.variables?.owner}/${body.variables?.name}`;
+    const pr = prs.find((candidate) => candidate.repo === querySlug
+      && candidate.number === Number(body.variables?.number)) ?? prs[0];
     if (pr) await refreshPrHead(pr);
     return json(200, { data: { repository: { pullRequest: {
       id: pr?.node_id ?? 'PR_1', url: pr?.html_url ?? `https://github.com/${SLUG}/pull/1`,
@@ -91,29 +100,44 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
       headRefOid: pr?.head?.sha ?? 'reviewed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
       viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
-      ...(mergeQueueAccepted ? { mergeQueueEntry: { id: 'MQ_pipeline' } } : {}),
+      ...(pr?.queueAccepted ? { mergeQueueEntry: { id: `MQ_${pr?.number ?? 'pipeline'}` } } : {}),
       ...githubReadiness,
+      ...(pr?.repo ? githubReadinessBySlug.get(pr.repo) : undefined),
     } } } });
   }
   if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('enqueuePullRequest')) {
-    if (!useMergeQueue) return json(200, { errors: [{ message: 'This branch has no merge queue' }] });
+    const pr = prs.find((candidate) => candidate.node_id === body.variables?.input?.pullRequestId);
+    if (!useMergeQueue && !nativeQueueSlugs.has(pr?.repo))
+      return json(200, { errors: [{ message: 'This branch has no merge queue' }] });
     mergeQueueAccepted = true;
-    return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: { id: 'MQ_pipeline' } } } });
+    if (pr) pr.queueAccepted = true;
+    return json(200, { data: { enqueuePullRequest: { mergeQueueEntry: { id: `MQ_${pr?.number ?? 'pipeline'}` } } } });
+  }
+  if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('dequeuePullRequest')) {
+    const pr = prs.find((candidate) => candidate.node_id === body.variables?.input?.pullRequestId);
+    if (pr) pr.queueAccepted = false;
+    providerWithdrawals.push(`dequeue:${body.variables?.input?.pullRequestId}`);
+    return json(200, { data: { dequeuePullRequest: { mergeQueueEntry: null } } });
+  }
+  if (u.pathname === '/graphql' && method === 'POST' && String(body.query).includes('disablePullRequestAutoMerge')) {
+    providerWithdrawals.push(`disable:${body.variables?.input?.pullRequestId}`);
+    return json(200, { data: { disablePullRequestAutoMerge: { pullRequest: { id: body.variables?.input?.pullRequestId,
+      autoMergeRequest: null } } } });
   }
   if (u.pathname === '/graphql' && method === 'POST') {
     return json(200, { errors: [{ message: mergeFailureMessage ?? 'GitHub did not accept the merge operation' }] });
   }
-  const targetRef = u.pathname.match(new RegExp(`^/repos/${SLUG}/git/refs/heads/(.+)$`));
+  const targetRef = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/git\/refs\/heads\/(.+)$/);
   if (targetRef && method === 'PATCH') {
-    const pr = prs.find((candidate) => candidate.head.sha === body.sha);
+    const pr = prs.find((candidate) => candidate.repo === targetRef[1] && candidate.head.sha === body.sha);
     if (!pr) return json(422, { message: 'Update is not a fast forward' });
     pr.state = 'closed'; pr.merged_at = new Date().toISOString();
-    const landed = await landProviderTarget(pr, decodeURIComponent(targetRef[1]!));
-    return json(200, { ref: `refs/heads/${decodeURIComponent(targetRef[1]!)}`, object: { sha: landed } });
+    const landed = await landProviderTarget(pr, decodeURIComponent(targetRef[2]!));
+    return json(200, { ref: `refs/heads/${decodeURIComponent(targetRef[2]!)}`, object: { sha: landed } });
   }
-  const merge = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)/merge$`));
+  const merge = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/merge$/);
   if (merge && method === 'PUT') {
-    const pr = prs.find((candidate) => candidate.number === Number(merge[1]));
+    const pr = prs.find((candidate) => candidate.repo === merge[1] && candidate.number === Number(merge[2]));
     if (!pr) return json(404, {});
     if (useMergeQueue) return json(409, { merged: false, message: 'merge queue required' });
     if (mergeHttpStatus) return json(mergeHttpStatus, {
@@ -125,9 +149,9 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     const landed = await landProviderTarget(pr, pr.base.ref);
     return json(200, { merged: true, sha: landed, message: 'merged' });
   }
-  const one = u.pathname.match(new RegExp(`^/repos/${SLUG}/pulls/(\\d+)$`));
+  const one = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/);
   if (one) {
-    const pr = prs.find((candidate) => candidate.number === Number(one[1]));
+    const pr = prs.find((candidate) => candidate.repo === one[1] && candidate.number === Number(one[2]));
     if (!pr) return json(404, {});
     if (method === 'PATCH') {
       const { base, ...rest } = body;
@@ -137,9 +161,9 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     await refreshPrHead(pr);
     return json(200, pr);
   }
-  const comment = u.pathname.match(new RegExp(`^/repos/${SLUG}/issues/(\\d+)/comments$`));
+  const comment = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/);
   if (comment && method === 'POST') {
-    comments.push({ number: Number(comment[1]), body: body.body });
+    comments.push({ number: Number(comment[2]), body: body.body });
     return json(201, {});
   }
   return json(404, { message: `unrouted ${method} ${u.pathname}` });
@@ -248,9 +272,13 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     comments.length = 0;
     afterPrOpened = undefined;
     githubReadiness = {};
+    githubReadinessBySlug.clear();
     mergeHttpStatus = undefined;
     useMergeQueue = false;
     mergeQueueAccepted = false;
+    nativeQueueSlugs.clear();
+    remoteBySlug.clear();
+    providerWithdrawals.length = 0;
     mergeFailureMessage = undefined;
     blockFrontHeldRepair = false;
     frontHeldRepairStarted = false;
@@ -262,13 +290,15 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
    *  local bare repo (so the push is real). */
-  async function repoWithOrigin(name: string): Promise<string> {
+  async function repoWithOrigin(name: string, slug = SLUG): Promise<string> {
     const repo = await h.makeRepo(name);
     const origin = path.join(originDir, `${name}.git`);
     await gitOrThrow(originDir, ['init', '-q', '--bare', '-b', 'main', origin]);
-    await git(repo, ['remote', 'add', 'origin', REMOTE]);
-    await git(repo, ['config', `url.${origin}.insteadOf`, REMOTE]);
+    const remoteUrl = `git@github.com:${slug}.git`;
+    await git(repo, ['remote', 'add', 'origin', remoteUrl]);
+    await git(repo, ['config', `url.${origin}.insteadOf`, remoteUrl]);
     await git(repo, ['push', '-q', 'origin', 'main']);
+    remoteBySlug.set(slug, origin);
     return repo;
   }
 
@@ -592,6 +622,185 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       releaseFrontHeldRepair?.();
       blockFrontHeldRepair = false;
     }
+  }, 120_000);
+
+  it('v1.20 releases fallback admission before a CI repair and rejoins only after open_pr', async () => {
+    const repo = await repoWithOrigin('github-fair-ejection');
+    const project = h.store.createProject('Fair landing ejection', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '56', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '91',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Release failed admission', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.20.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Release failed admission',
+        prompt: '@write fair.md :: candidate\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', landingAuthority: 'auto' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: 'https://github.test/checks/fair',
+      }] } },
+    };
+    await handle.signal('confirm');
+
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.messages.at(-1)?.text ?? ''}`;
+    }, { timeout: 30_000 }).toMatch(/do\/.*released every Karmax admission slot/is);
+    const repairing = await view(handle);
+    expect(repairing.mergeQueue).toBeUndefined();
+    expect(repairing.state.mergeDomains).toBeUndefined();
+    expect(repairing.landing).toMatchObject({ provider: 'ejected', validation: 'failed' });
+    expect(exactCandidateTurns).toEqual([]);
+    expect(mergeQueueAccepted).toBe(false);
+    for (const domain of mergeQueueDomains(repairing.world, 'main', project.id)) {
+      const queue = await h.client.workflow.getHandle(mergeQueueId(domain)).query('queue') as any;
+      expect(queue.current).not.toBe(task.id);
+      expect(queue.queue).not.toContain(task.id);
+    }
+
+    await handle.signal('cancel');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  it('v1.21 gives each repository its own landing owner and leases only the fallback target', async () => {
+    const slugA = 'acme/pipeline-a';
+    const slugB = 'acme/pipeline-b';
+    const repoA = await repoWithOrigin('participant-a', slugA);
+    const repoB = await repoWithOrigin('participant-b', slugB);
+    const project = h.store.createProject('Participant landing', { repos: [repoA, repoB], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'participant-installation', accountLogin: 'acme', accountType: 'Organization' });
+    for (const [providerId, name, slug] of [['participant-a', 'pipeline-a', slugA], ['participant-b', 'pipeline-b', slugB]] as const) {
+      const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+        providerId, owner: 'acme', name, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main', private: true,
+        gitConnectionId: connection.id });
+      h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    }
+    nativeQueueSlugs.add(slugA);
+    githubReadinessBySlug.set(slugB, {
+      mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
+    });
+    const task = h.store.createTask({ projectId: project.id, title: 'Land two participants', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const nameA = path.basename(repoA);
+    const nameB = path.basename(repoB);
+    const handle = await h.client.workflow.start('softwareDev@1.21.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Land two participants',
+        prompt: `@write ${nameA}/a.md :: A\n@write ${nameB}/b.md :: B\n`
+          + `@run git -C ${nameA} add -A && git -C ${nameA} commit -q -m A\n`
+          + `@run git -C ${nameB} add -A && git -C ${nameB} commit -q -m B\n@openpr`,
+        base: 'main', target: 'main',
+        project: { repos: [repoA, repoB], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', landingAuthority: 'auto' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    await expect.poll(async () => {
+      const current = await view(handle);
+      const participants = Object.values(current.landing?.participants ?? {}) as any[];
+      return participants.map((candidate) => `${candidate.slug}:${candidate.owner}:${candidate.state}`).sort().join('|');
+    }, { timeout: 30_000 }).toBe(`${slugA}:provider:queued|${slugB}:karmax:waiting`);
+    const waiting = await view(handle);
+    expect(waiting.state.mergeDomains).toEqual([`github:${slugB}:main`]);
+
+    githubReadinessBySlug.set(slugB, {
+      mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
+    });
+    await handle.signal('providerChanged');
+    await expect.poll(async () => prs.find((candidate) => candidate.repo === slugB)?.merged_at,
+      { timeout: 30_000 }).toBeTruthy();
+
+    const queuedA = prs.find((candidate) => candidate.repo === slugA)!;
+    queuedA.state = 'closed';
+    queuedA.merged_at = new Date().toISOString();
+    queuedA.queueAccepted = false;
+    await landProviderTarget(queuedA, 'main');
+    await handle.signal('providerChanged');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
+    const final = await view(handle);
+    expect(Object.values(final.landing.participants)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slug: slugA, owner: 'merged', state: 'merged' }),
+      expect.objectContaining({ slug: slugB, owner: 'merged', state: 'merged' }),
+    ]));
+    expect(final.state.mergeDomains).toBeUndefined();
+  }, 120_000);
+
+  it('v1.21 withdraws queued provider siblings before returning a failed participant to Do', async () => {
+    const slugA = 'acme/withdraw-a';
+    const slugB = 'acme/withdraw-b';
+    const repoA = await repoWithOrigin('withdraw-a', slugA);
+    const repoB = await repoWithOrigin('withdraw-b', slugB);
+    const project = h.store.createProject('Withdraw siblings', { repos: [repoA, repoB], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'withdraw-installation', accountLogin: 'acme', accountType: 'Organization' });
+    for (const [providerId, name, slug] of [['withdraw-a', 'withdraw-a', slugA], ['withdraw-b', 'withdraw-b', slugB]] as const) {
+      const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId,
+        owner: 'acme', name, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main', private: true,
+        gitConnectionId: connection.id });
+      h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    }
+    nativeQueueSlugs.add(slugA);
+    githubReadinessBySlug.set(slugB, {
+      mergeStateStatus: 'CLEAN', statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
+    });
+    const task = h.store.createTask({ projectId: project.id, title: 'Withdraw siblings', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const nameA = path.basename(repoA);
+    const nameB = path.basename(repoB);
+    const handle = await h.client.workflow.start('softwareDev@1.21.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: 'Withdraw siblings',
+        prompt: `@write ${nameA}/a.md :: A\n@write ${nameB}/b.md :: B\n`
+          + `@run git -C ${nameA} add -A && git -C ${nameA} commit -q -m A\n`
+          + `@run git -C ${nameB} add -A && git -C ${nameB} commit -q -m B\n@openpr`,
+        base: 'main', target: 'main', githubPollMs: 10,
+        project: { repos: [repoA, repoB], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', landingAuthority: 'auto' },
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    await expect.poll(async () => Object.values((await view(handle)).landing?.participants ?? {})
+      .map((candidate: any) => `${candidate.slug}:${candidate.owner}`).sort().join('|'),
+    { timeout: 30_000 }).toBe(`${slugA}:provider|${slugB}:karmax`);
+
+    githubReadinessBySlug.set(slugB, {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'StatusContext', context: 'integration', state: 'FAILURE', description: 'cross-repo contract failed',
+      }] } },
+    });
+    await handle.signal('providerChanged');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('do');
+    expect(providerWithdrawals).toEqual(expect.arrayContaining(['dequeue:PR_1', 'disable:PR_1']));
+    const repairing = await view(handle);
+    expect(repairing.state.mergeDomains).toBeUndefined();
+    expect(repairing.landing.participants['acme/withdraw-a#1']).toMatchObject({ owner: 'unowned', state: 'ready' });
+    expect(repairing.messages.map((message: any) => message.text).join('\n')).toMatch(/cross-repo contract failed/i);
+    await handle.signal('cancel');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
   it('unsticks a v1.12 execution when GitHub reports a conflict only in the merge refusal', async () => {

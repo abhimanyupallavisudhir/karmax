@@ -58,8 +58,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -142,7 +142,7 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   // resumes the interrupted session. isResourceKill is the shared predicate
   // (src/agent/limits.ts) the software-dev auto-resolve task reuses.
   if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
-  if (isTransportError(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
+  if (isTransportError(err)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
 }
 
@@ -888,20 +888,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
       }
-      // The project wiki is a platform-owned companion repository. Add it at
-      // provisioning time (rather than to deterministic workflow input), so
-      // old workflow histories remain replay-compatible.
+      const developmentSources = (args.repos?.length ? args.repos : args.repo ? [args.repo] : [])
+        .map((source) => source.trim()).filter(Boolean);
+      // The project wiki is a platform-owned companion repository for source
+      // work. A zero-repo task reads and mutates project state through the
+      // platform API, so attaching the wiki there would secretly reintroduce a
+      // branch, worktree, Git credential, and merge into an otherwise non-Git run.
       const wikiRoot = project
         ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
         : undefined;
       if (project && !store.projectWiki(project.id)) store.setProjectWikiRepository(project.id);
       const wikiRepository = project ? store.projectWiki(project.id)?.repository : undefined;
-      if (remote && project && (!wikiRepository || !wikiRepository.private))
+      if (remote && developmentSources.length > 0 && project && (!wikiRepository || !wikiRepository.private))
         throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
-      const developmentSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
       const requestedSources = [
         ...developmentSources,
-        ...(wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
+        ...(developmentSources.length > 0 && wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
       ];
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       const githubIsAuthority = remotePolicyOf(executionConfig) === 'pr';
@@ -1016,6 +1018,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
       } catch (error) {
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        if (remote && isTransportError(error)) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw ApplicationFailure.create({
+            message,
+            type: 'world-infra',
+            nonRetryable: false,
+            cause: error instanceof Error ? error : undefined,
+          });
+        }
         throw error;
       }
       try {
@@ -1210,7 +1221,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         profile = { ...profile, modelProvider: leasedCredentialProvider };
       }
       const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
-      const world = await openWorld(args.worldHandle, args.taskId);
+      let world: World;
+      try {
+        world = await openWorld(args.worldHandle, args.taskId);
+      } catch (error) {
+        // Reconnecting/resuming a cloud sandbox is part of the turn's transport
+        // boundary. A control-plane outage here is no more agent-actionable than
+        // a PTY or filesystem request failing after the adapter starts.
+        throw classifyTurnError(error, profile.provider);
+      }
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
@@ -2007,7 +2026,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
-      const roots = repos.length ? repos : [{ name: '', root: handle.root }];
+      if (!repos.length) {
+        const changedFiles = (await world.listFiles()).map((file) => `${file} (new)`);
+        const summary = changedFiles.length ? `${changedFiles.length} file(s) in the task workspace.` : 'No file changes detected.';
+        record(handle.id, 'review.built', { files: changedFiles.length });
+        return { summary, changedFiles };
+      }
+      const roots = repos;
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
@@ -2299,6 +2324,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw new Error('remote policy "pr" is on, but no repository in this world has a GitHub origin remote'
           + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin');
       }
+      const task = store.getTask(handle.id);
+      const workflowMinor = Number(String(task?.workflowVersion ?? '').split('.')[1] ?? 0);
+      if (workflowMinor >= 21) {
+        const githubCheckoutNames = new Set(targets.map(({ repo }) => repo.name));
+        const changedWithoutPr: string[] = [];
+        for (const repo of repos.filter((candidate) => !githubCheckoutNames.has(candidate.name))) {
+          const base = worldRepoTarget(repo, target);
+          const ahead = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+          if (ahead.code !== 0) {
+            throw new Error(`could not verify non-GitHub checkout "${repo.name}" before opening the multi-repository proposal:`
+              + ` ${ahead.stderr || ahead.stdout || 'git rev-list failed'}`);
+          }
+          if (Number(ahead.stdout.trim()) > 0) changedWithoutPr.push(repo.name);
+        }
+        // A project-wide PR policy cannot silently declare success after only
+        // its GitHub participants land.  Hybrid provider/local sagas need an
+        // explicit landing contract; until one exists, reject before any branch
+        // is pushed or PR opened so no partial publication can occur.
+        if (changedWithoutPr.length) {
+          throw new Error(`remote policy "pr" cannot publish this multi-repository proposal because changed checkout(s) `
+            + `${changedWithoutPr.map((name) => `"${name}"`).join(', ')} have no GitHub PR target. `
+            + 'Configure GitHub origins for every changed checkout, or use a non-PR workflow for an explicitly local landing.');
+        }
+      }
       const changed: Array<(typeof targets)[number] & { base: string }> = [];
       for (const { repo, slug, api } of targets) {
         // A checkout whose base is a SIBLING's branch is a stacked pull request:
@@ -2368,7 +2417,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * person's merge rights.
      */
     async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: {
-      mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact';
+      mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact' | 'preflight' | 'claim-provider' | 'submit-fallback';
+      authority?: LandingAuthority;
     }): Promise<GitHubMergeAuthorization> {
       // A PR-policy task may legitimately make no changes. There is nothing
       // external to authorize in that case, so do not manufacture a human gate.
@@ -2379,7 +2429,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const workflowMinor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
       const intentAuthorizedLanding = workflowMinor >= 16;
+      const fairLanding = workflowMinor >= 20;
+      const landingAuthority = options?.authority
+        ?? landingAuthorityOf(store.effectiveProjectConfig(task.projectId));
       const observeOnly = intentAuthorizedLanding && options?.mode === 'observe';
+      const participantPreflight = workflowMinor >= 21 && options?.mode === 'preflight';
+      const claimProviderOnly = workflowMinor >= 21 && options?.mode === 'claim-provider';
       const inspectExact = workflowMinor >= 17 && options?.mode === 'inspect-exact';
       const submitExact = workflowMinor >= 17 && options?.mode === 'submit-exact';
       const frontHeldExact = inspectExact || submitExact;
@@ -2430,6 +2485,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       for (const userId of candidates) {
         const accountId = accountFor(userId);
         if (!accountId) continue;
+        // A configured external authority lands under its own repository
+        // integration. Karmax only needs an account able to read the PR it
+        // already opened; requiring that person to have merge rights would
+        // defeat external ownership before observation even began.
+        if (fairLanding && landingAuthority === 'external') {
+          actorUserId = userId;
+          break;
+        }
         let eligible = true;
         const permissions = new Map<string, GitHubRepositoryPermission>();
         for (const ref of prs.filter((candidate) => !candidate.merged)) {
@@ -2484,8 +2547,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : { api };
       };
       const settled: TaskPullRequest[] = [];
+      const participants: GithubLandingParticipant[] = [];
       let lastSha: string | undefined;
       let queued = false;
+      let queuedOwner: GitHubMergeAuthorization['landingOwner'];
       let pendingDetail: string | undefined;
       const errorDecision = (error: unknown, current: TaskPullRequest[]): GitHubMergeAuthorization => {
         const detail = error instanceof Error ? error.message : String(error);
@@ -2508,42 +2573,43 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: `GitHub could not be inspected or updated: ${detail}`,
         };
       };
-      const localSyncDecision = (
-        result: LocalTargetSyncResult,
-        current: TaskPullRequest[],
-      ): GitHubMergeAuthorization | undefined => {
-        if (result.coherent) return undefined;
-        return {
-          status: result.retryable ? 'retryable-error' : 'needs-human',
-          prs: current,
-          actorUserId,
-          detail: result.detail
-            ?? `GitHub landed the pull request, but the local ${result.target} checkout is not coherent with it.`,
-        };
-      };
       const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness) => {
         const failures = (readiness.failedChecks ?? []).slice(0, 12).map((check) => {
-          const detail = check.detail?.replace(/\s+/g, ' ').trim();
-          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${detail ? ` — ${detail.slice(0, 500)}` : ''}`;
+          const detail = check.detail?.trim();
+          return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${detail ? `\n${detail.slice(0, 12_000)}` : ''}`;
         });
         return [
           `Pull request ${ref.slug}#${ref.number} has terminally failing CI (${readiness.checks}).`,
           ...(failures.length ? failures : ['GitHub did not expose an individual failed-check summary; inspect the PR checks page.']),
-        ].join('\n');
+        ].join('\n').slice(0, 64_000);
       };
-      for (const ref of prs) {
+      for (let ref of prs) {
         let live;
         try {
           live = await api.get(ref.slug, ref.number);
         } catch (error) {
           return errorDecision(error, [...settled, ref, ...prs.slice(settled.length + 1)]);
         }
-        const next = {
+        let next: TaskPullRequest = {
           ...ref, state: live.state, merged: live.merged,
           ...(live.headSha ? { headSha: live.headSha } : {}),
           ...(live.nodeId ? { nodeId: live.nodeId } : {}),
         };
-        const current = [...settled, next, ...prs.slice(settled.length + 1)];
+        let current = [...settled, next, ...prs.slice(settled.length + 1)];
+        const participant = (
+          owner: GithubLandingParticipant['owner'],
+          state: GithubLandingParticipant['state'],
+        ): GithubLandingParticipant | undefined => live.base ? {
+          key: `${ref.slug.toLowerCase()}#${ref.number}`,
+          repo: ref.repo,
+          slug: ref.slug,
+          number: ref.number,
+          ...(live.headSha ? { headSha: live.headSha } : ref.headSha ? { headSha: ref.headSha } : {}),
+          target: live.base,
+          domain: `github:${ref.slug.toLowerCase()}:${live.base}`,
+          owner,
+          state,
+        } : undefined;
         if (live.merged) {
           if (!live.base) {
             return {
@@ -2552,9 +2618,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           const localSync = await syncGithubTargetToLocal(handle, ref, live.base, live.mergeCommitSha);
-          const blocked = localSyncDecision(localSync, current);
-          if (blocked) return blocked;
           lastSha = live.mergeCommitSha ?? localSync.sha ?? lastSha;
+          const landedParticipant = participant('merged', 'merged');
+          if (landedParticipant) participants.push(landedParticipant);
           settled.push(next);
           continue;
         }
@@ -2563,6 +2629,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             status: 'needs-human', prs: current, actorUserId,
             detail: `Pull request ${ref.slug}#${ref.number} was closed without merging. Reopen it on GitHub and retry, send the task back to Do, or cancel it.`,
           };
+        }
+        if (fairLanding && ref.headSha && live.headSha && ref.headSha !== live.headSha) {
+          const requested = events.findLast((event) => event.type === 'github.pr.branch-update-requested'
+            && event.payload?.slug === ref.slug && Number(event.payload?.number) === ref.number
+            && event.payload?.expectedHeadSha === ref.headSha);
+          if (requested) {
+            record(handle.id, 'github.pr.branch-updated', {
+              ...ref, actorUserId, previousHeadSha: ref.headSha, headSha: live.headSha,
+            });
+            ref = { ...next, headSha: live.headSha };
+            next = ref;
+            current = [...settled, next, ...prs.slice(settled.length + 1)];
+          }
         }
         if (!ref.headSha || !live.headSha || ref.headSha !== live.headSha) {
           record(handle.id, 'github.merge.review-stale', { ...ref, reviewedHead: ref.headSha, liveHead: live.headSha });
@@ -2603,7 +2682,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               prs: current,
               actorUserId,
               detail: intentAuthorizedLanding
-                ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or merge group. GitHub has ejected this entry; resolve it against the newest target and reopen it for automated integration review.`
+                ? fairLanding
+                  ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or landing candidate. It has no Karmax admission slot; resolve it against the newest target, verify it, and request landing again.`
+                  : `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or merge group. GitHub has ejected this entry; resolve it against the newest target and reopen it for automated integration review.`
                 : `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
               ...(intentAuthorizedLanding ? { repair: { kind: 'conflict' as const, preserveAuthorization: true } } : {}),
             };
@@ -2636,6 +2717,56 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
         }
+        // Native queue CI runs on a speculative merge-group commit, so the PR
+        // head can remain completely green after GitHub ejects it. Correlate
+        // the durable timeline removal with *our latest enqueue event*; older
+        // removals must not poison a repaired PR that has since rejoined.
+        if (fairLanding && observeOnly && !readiness?.mergeQueueEntryId
+          && readiness?.removedFromMergeQueue) {
+          const latestEnqueue = events.findLast((event) => event.type === 'github.pr.queued'
+            && event.payload?.slug === ref.slug && Number(event.payload?.number) === ref.number
+            && (!event.payload?.headSha || event.payload.headSha === ref.headSha));
+          const removedAt = Date.parse(readiness.removedFromMergeQueue.createdAt);
+          if (latestEnqueue && Number.isFinite(removedAt) && removedAt >= latestEnqueue.ts - 2_000) {
+            const removal = readiness.removedFromMergeQueue;
+            const failedChecks = removal.beforeCommitSha
+              ? await inspectionApi.failedChecksForRef(ref.slug, removal.beforeCommitSha).catch(() => [])
+              : [];
+            const reason = removal.reason?.trim() || 'GitHub did not expose a removal reason.';
+            const renderedChecks = failedChecks.slice(0, 12).map((check) => {
+              const detail = check.detail?.trim();
+              return `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}${detail ? `\n${detail.slice(0, 12_000)}` : ''}`;
+            });
+            record(handle.id, 'github.pr.queue-ejected', {
+              ...ref, actorUserId, reason, removedAt: removal.createdAt,
+              ...(removal.beforeCommitSha ? { mergeGroupSha: removal.beforeCommitSha } : {}),
+              failedChecks: failedChecks.map((check) => ({ name: check.name, state: check.state, url: check.url })),
+            });
+            const detail = [
+              `GitHub removed pull request ${ref.slug}#${ref.number} from its merge queue: ${reason}`,
+              ...(removal.beforeCommitSha
+                ? [`Speculative merge-group commit: ${removal.beforeCommitSha}`]
+                : []),
+              ...(renderedChecks.length
+                ? ['Failed merge-group checks:', ...renderedChecks]
+                : ['GitHub exposed no failed check output for the speculative commit; the queue removal reason above is the complete available diagnostic.']),
+            ].join('\n').slice(0, 64_000);
+            // A deliberate human dequeue is an external decision: never undo
+            // it by entering fallback or re-enqueueing. Automated ejections go
+            // to Do without a held admission slot, carrying the exact failure.
+            if (/\buser\b|manual|request(?:ed|ing)? (?:a )?remov|dequeue/i.test(reason)) {
+              return {
+                status: 'needs-human', prs: current, actorUserId, detail,
+                eligibleUserIds: [actorUserId],
+              };
+            }
+            const conflict = /conflict/i.test(reason);
+            return {
+              status: 'needs-revision', prs: current, actorUserId, detail,
+              repair: { kind: conflict ? 'conflict' : 'ci', preserveAuthorization: true },
+            };
+          }
+        }
         if (frontHeldExact && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
           return {
             status: 'needs-human', prs: current, actorUserId,
@@ -2658,14 +2789,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 : ''}`,
           };
         }
-        if (!frontHeldExact && intentAuthorizedLanding && (readiness?.mergeQueueEntryId || readiness?.autoMerge)) {
+        if (!frontHeldExact && intentAuthorizedLanding && (readiness?.mergeQueueEntryId
+          || (readiness?.autoMerge && (!fairLanding || readiness.mergeStateStatus !== 'BEHIND')))) {
           const entryIds = readiness.mergeQueueEntryId ? [readiness.mergeQueueEntryId] : [];
+          if (fairLanding) {
+            queued = true;
+            queuedOwner = readiness.mergeQueueEntryId ? 'provider'
+              : landingAuthority === 'external' ? 'external' : 'provider';
+            pendingDetail = readiness.mergeQueueEntryId
+              ? 'GitHub is validating the pull requests in its merge queue.'
+              : 'GitHub auto-merge is waiting for repository requirements.';
+            const activeParticipant = participant(queuedOwner, 'queued');
+            if (activeParticipant) participants.push(activeParticipant);
+            settled.push(next);
+            continue;
+          }
           return {
             status: 'queued', prs: current, actorUserId,
             detail: readiness.mergeQueueEntryId
               ? 'GitHub is validating this pull request in its merge queue.'
               : 'GitHub auto-merge is waiting for repository requirements.',
             providerQueue: { state: 'validating', ...(entryIds.length ? { entryIds } : {}) },
+            landingOwner: readiness.mergeQueueEntryId ? 'provider' : landingAuthority === 'external' ? 'external' : 'provider',
           };
         }
         const reviewEvents = store.eventsSince(handle.id, 0);
@@ -2729,6 +2874,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
         }
+        // v1.21 separates read-only participant classification from every
+        // landing mutation.  The workflow first preflights ALL PRs; only after
+        // that barrier succeeds may it ask provider queues to claim unowned
+        // participants or acquire the exact fallback domains.
+        if (participantPreflight) {
+          if (!readiness) {
+            if (readinessError) return { ...errorDecision(readinessError, current), participants };
+            return {
+              status: 'retryable-error', prs: current, actorUserId, participants,
+              detail: `GitHub did not expose policy and check state for ${ref.slug}#${ref.number}; the multi-repository preflight will not mutate any participant without it.`,
+            };
+          }
+          if (!live.base) return {
+            status: 'retryable-error', prs: current, actorUserId, participants,
+            detail: `GitHub did not report the target branch for pull request ${ref.slug}#${ref.number}; multi-repository landing cannot identify its scheduler domain.`,
+          };
+          const planned = participant(
+            landingAuthority === 'external' ? 'external'
+              : landingAuthority === 'karmax' ? 'karmax' : 'unowned',
+            landingAuthority === 'external' ? 'queued' : 'ready',
+          );
+          if (planned) participants.push(planned);
+          settled.push(next);
+          continue;
+        }
         if (frontHeldExact) {
           if (!readiness) {
             if (readinessError) return errorDecision(readinessError, current);
@@ -2790,10 +2960,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           catch (error) { return errorDecision(error, current); }
           if (advanced.updated) {
             const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
-            const landedPrs = [...settled, landed, ...prs.slice(settled.length + 1)];
             const localSync = await syncGithubTargetToLocal(handle, ref, live.base, ref.headSha);
-            const blocked = localSyncDecision(localSync, landedPrs);
-            if (blocked) return blocked;
             lastSha = ref.headSha;
             settled.push(landed);
             record(handle.id, 'github.pr.merged', {
@@ -2814,11 +2981,192 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             eligibleUserIds: [actorUserId],
           };
         }
-        if (observeOnly) {
+        if (observeOnly && !fairLanding) {
           return {
             status: 'needs-revision', prs: current, actorUserId,
             detail: `GitHub ejected pull request ${ref.slug}#${ref.number} from its merge queue without merging it. Inspect the merge-group checks and the newest target, repair the branch if needed, and revalidate before requeueing.`,
             repair: { kind: 'ci', preserveAuthorization: true },
+          };
+        }
+        if (fairLanding && observeOnly && landingAuthority !== 'external') {
+          // The provider previously owned this PR but no queue/auto-merge entry
+          // is visible now. Observation must not mutate a stale branch without
+          // admission. Hand control back to the workflow; its next iteration
+          // acquires fair fallback admission before update/requeue/direct merge.
+          return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: `The provider no longer reports an active landing entry for ${ref.slug}#${ref.number}; requesting fair fallback admission before any mutation.`,
+            landingOwner: 'karmax',
+          };
+        }
+        if (fairLanding) {
+          // An explicitly configured third-party authority is triggered by the
+          // repository/PR itself. Karmax observes terminal checks, conflicts and
+          // merge completion above, but never creates a competing order or
+          // mutates the branch merely because it is behind.
+          if (landingAuthority === 'external') {
+            queued = true;
+            queuedOwner = 'external';
+            pendingDetail = 'The configured external landing authority owns landing; Karmax is observing the PRs and will act only on a terminal failure or merge.';
+            const externalParticipant = participant('external', 'queued');
+            if (externalParticipant) participants.push(externalParticipant);
+            settled.push(next);
+            continue;
+          }
+
+          // Prefer a real provider queue. It can accept an out-of-date PR and
+          // construct speculative candidates without rewriting the PR branch.
+          if (landingAuthority !== 'karmax' && live.nodeId) {
+            let queueResult;
+            let queueError: unknown;
+            try { queueResult = await api.enqueue(live.nodeId, ref.headSha); }
+            catch (error) { queueError = error; }
+            if (queueResult?.queued) {
+              queued = true;
+              queuedOwner = 'provider';
+              pendingDetail = 'GitHub accepted the pull requests into its merge queue and now owns landing order.';
+              const providerParticipant = participant('provider', 'queued');
+              if (providerParticipant) participants.push(providerParticipant);
+              settled.push(next);
+              record(handle.id, 'github.pr.queued', { ...ref, actorUserId });
+              continue;
+            }
+            // GraphQL mutation errors are commonly the capability probe saying
+            // this branch has no native queue. Authentication/transport errors
+            // still surface; a returned mutation message falls through safely.
+            if (queueError) return errorDecision(queueError, current);
+          }
+
+          if (claimProviderOnly) {
+            // Auto-merge is also provider ownership, but enabling it for an
+            // already-behind branch does not make the provider update that
+            // branch.  Such a participant belongs to guarded fallback instead.
+            if (landingAuthority !== 'karmax' && live.nodeId
+              && readiness?.mergeStateStatus !== 'BEHIND') {
+              const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
+              let autoMerge;
+              try { autoMerge = await api.enableAutoMerge(live.nodeId, ref.headSha, mergeMethod); }
+              catch { /* Capability probe: absence means fallback owns it. */ }
+              if (autoMerge?.enabled) {
+                const providerParticipant = participant('provider', 'queued');
+                if (providerParticipant) participants.push(providerParticipant);
+                settled.push(next);
+                record(handle.id, 'github.pr.auto-merge-enabled', { ...ref, actorUserId, mergeMethod });
+                continue;
+              }
+            }
+            const fallbackParticipant = participant('karmax', 'ready');
+            if (fallbackParticipant) participants.push(fallbackParticipant);
+            settled.push(next);
+            continue;
+          }
+
+          // Behind is scheduling state, not agent work. Only the proposal that
+          // owns fallback admission is updated, using GitHub's expected-head
+          // guarded mechanical operation. A conflict is the only branch-update
+          // outcome that returns to Do.
+          if (readiness?.mergeStateStatus === 'BEHIND') {
+            record(handle.id, 'github.pr.branch-update-requested', {
+              ...ref, actorUserId, expectedHeadSha: ref.headSha,
+            });
+            let update;
+            try { update = await api.updateBranch(ref.slug, ref.number, ref.headSha); }
+            catch (error) { return errorDecision(error, current); }
+            if (!update.requested) {
+              return {
+                status: 'needs-revision', prs: current, actorUserId,
+                detail: `GitHub could not mechanically update ${ref.slug}#${ref.number} from its target: ${update.message}. Resolve the actual conflict in Do; this task has already released fallback admission.`,
+                repair: { kind: 'conflict', preserveAuthorization: true },
+              };
+            }
+            const refreshed = update.headSha ? { ...next, headSha: update.headSha } : next;
+            if (update.headSha) record(handle.id, 'github.pr.branch-updated', {
+              ...ref, actorUserId, previousHeadSha: ref.headSha, headSha: update.headSha,
+            });
+            return {
+              status: 'waiting',
+              prs: [...settled, refreshed, ...prs.slice(settled.length + 1)],
+              actorUserId,
+              detail: update.headSha
+                ? `GitHub mechanically updated ${ref.slug}#${ref.number} to ${update.headSha.slice(0, 8)}; fallback admission is waiting for repository checks.`
+                : `GitHub accepted the mechanical update for ${ref.slug}#${ref.number}; fallback admission is waiting for the new head and its checks.`,
+              landingOwner: 'karmax',
+            };
+          }
+
+          // Auto-merge is provider-owned completion. It is safe to release
+          // Karmax admission while current; if strict freshness later reports
+          // BEHIND, reconciliation enters fallback admission and updates only
+          // that one candidate instead of waking every stale task.
+          if (landingAuthority !== 'karmax' && live.nodeId) {
+            const mergeMethod = actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge';
+            let autoMerge;
+            try { autoMerge = await api.enableAutoMerge(live.nodeId, ref.headSha, mergeMethod); }
+            catch { /* Not available or immediately mergeable: fall through. */ }
+            if (autoMerge?.enabled) {
+              queued = true;
+              queuedOwner = 'provider';
+              pendingDetail = 'GitHub auto-merge owns completion while repository requirements are pending.';
+              settled.push(next);
+              record(handle.id, 'github.pr.auto-merge-enabled', { ...ref, actorUserId, mergeMethod });
+              continue;
+            }
+          }
+
+          if (readiness && ['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')) {
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: 'Fallback admission is waiting for required checks on the current pull-request head.',
+              landingOwner: 'karmax',
+            };
+          }
+          if (!readiness || readiness.mergeable === 'UNKNOWN' || readiness.mergeStateStatus === 'UNKNOWN') {
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: `GitHub is still computing landing readiness for ${ref.slug}#${ref.number}.`,
+              landingOwner: 'karmax',
+            };
+          }
+          if (!['CLEAN', 'UNSTABLE'].includes(readiness.mergeStateStatus)) {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `GitHub policy is blocking ${ref.slug}#${ref.number} (${readiness.mergeStateStatus}). Resolve that repository or PR policy before requesting landing again.`,
+              eligibleUserIds: [actorUserId],
+            };
+          }
+
+          let merged;
+          try {
+            merged = await api.merge(ref.slug, ref.number, ref.headSha,
+              actorPermissions.get(ref.slug)?.mergeMethod ?? 'merge');
+          } catch (error) { return errorDecision(error, current); }
+          if (merged.merged) {
+            if (!live.base) return {
+              status: 'retryable-error', prs: current, actorUserId,
+              detail: `GitHub merged ${ref.slug}#${ref.number} but did not report its target branch; local coherence cannot be established yet.`,
+            };
+            const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
+            const localSync = await syncGithubTargetToLocal(handle, ref, live.base, merged.sha);
+            settled.push(landed);
+            lastSha = merged.sha ?? localSync.sha ?? lastSha;
+            record(handle.id, 'github.pr.merged', { ...ref, sha: merged.sha, actorUserId, strategy: 'provider-policy' });
+            continue;
+          }
+          const refusal = merged.message ?? 'GitHub refused the merge';
+          if (/conflict|not mergeable/i.test(refusal)) return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: `GitHub reports an actual conflict for ${ref.slug}#${ref.number}: ${refusal}`,
+            repair: { kind: 'conflict', preserveAuthorization: true },
+          };
+          if (/checks?|pending|expected|behind|update.*branch/i.test(refusal)) return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: `Fallback admission is waiting for GitHub policy: ${refusal}`,
+            landingOwner: 'karmax',
+          };
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `GitHub refused to land ${ref.slug}#${ref.number}: ${refusal}`,
+            eligibleUserIds: [actorUserId],
           };
         }
         if (intentAuthorizedLanding) {
@@ -2885,10 +3233,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           catch (error) { return errorDecision(error, current); }
           if (advanced.updated) {
             const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
-            const landedPrs = [...settled, landed, ...prs.slice(settled.length + 1)];
             const localSync = await syncGithubTargetToLocal(handle, ref, live.base, ref.headSha);
-            const blocked = localSyncDecision(localSync, landedPrs);
-            if (blocked) return blocked;
             lastSha = ref.headSha;
             settled.push(landed);
             record(handle.id, 'github.pr.merged', {
@@ -2924,10 +3269,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           const landed: TaskPullRequest = { ...next, state: 'closed', merged: true };
-          const landedPrs = [...settled, landed, ...prs.slice(settled.length + 1)];
           const localSync = await syncGithubTargetToLocal(handle, ref, live.base, merged.sha);
-          const blocked = localSyncDecision(localSync, landedPrs);
-          if (blocked) return blocked;
           lastSha = merged.sha ?? localSync.sha ?? lastSha;
           settled.push(landed);
           record(handle.id, 'github.pr.merged', { ...ref, sha: merged.sha, actorUserId });
@@ -3007,18 +3349,95 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: merged.message,
         };
       }
+      if (participantPreflight) return {
+        status: 'planned', prs: settled, actorUserId, participants,
+        detail: 'Every pull request passed the read-only multi-repository landing preflight.',
+      };
+      if (claimProviderOnly) {
+        const fallback = participants.some((candidate) => candidate.owner === 'karmax');
+        const external = participants.length > 0 && participants.every((candidate) => candidate.owner === 'external');
+        return {
+          status: fallback ? 'waiting' : 'queued',
+          prs: settled,
+          actorUserId,
+          participants,
+          landingOwner: fallback ? 'karmax' : external ? 'external' : 'provider',
+          detail: fallback
+            ? 'No repository landing scheduler accepted this participant; it requires guarded Karmax fallback admission.'
+            : pendingDetail ?? 'The repository landing authority accepted this participant.',
+          ...(!fallback ? { providerQueue: { state: 'queued' as const } } : {}),
+        };
+      }
       if (inspectExact && settled.length === prs.length)
         return {
-          status: 'candidate-ready', prs: settled, actorUserId,
+          status: 'candidate-ready', prs: settled, actorUserId, participants,
           detail: 'The exact pull-request head is current, CI-complete, and ready for integration review.',
         };
       if (settled.every((ref) => ref.merged))
-        return { status: 'merged', prs: settled, actorUserId, ...(lastSha ? { sha: lastSha } : {}) };
+        return { status: 'merged', prs: settled, actorUserId, participants, ...(lastSha ? { sha: lastSha } : {}) };
       return {
-        status: queued ? 'queued' : 'waiting', prs: settled, actorUserId,
+        status: queued ? 'queued' : 'waiting', prs: settled, actorUserId, participants,
         detail: queued ? pendingDetail : 'Waiting for GitHub merge policy.',
         ...(intentAuthorizedLanding && queued ? { providerQueue: { state: 'queued' as const } } : {}),
+        ...(queuedOwner ? { landingOwner: queuedOwner } : {}),
       };
+    },
+
+    /** Stop still-pending provider participants after a sibling fails.  This is
+     * best-effort saga cleanup: a participant that already crossed GitHub's
+     * atomic merge point remains merged and is reconciled on the next preflight. */
+    async withdrawGithubPrs(
+      handle: WorldHandle,
+      prs: TaskPullRequest[],
+      actorUserId?: string,
+    ): Promise<{ withdrawn: string[]; failed: Record<string, string>; reconciled: TaskPullRequest[] }> {
+      const task = store.getTask(handle.id);
+      const actor = actorUserId ?? store.taskCreatorUserId(handle.id);
+      if (!task || !actor || !deps.githubApp) return {
+        withdrawn: [], failed: Object.fromEntries(prs.map((ref) => [`${ref.slug}#${ref.number}`, 'no GitHub actor is available'])),
+        reconciled: prs,
+      };
+      const accountId = actor === store.taskCreatorUserId(handle.id)
+        ? (typeof task.params?._githubAccountId === 'string'
+            ? task.params._githubAccountId
+            : deps.githubApp.activeUserAccountId(actor))
+        : deps.githubApp.activeUserAccountId(actor);
+      const api = prApiForUser(actor, accountId);
+      const withdrawn: string[] = [];
+      const failed: Record<string, string> = {};
+      const reconciled: TaskPullRequest[] = [];
+      for (const ref of prs.filter((candidate) => !candidate.merged && candidate.nodeId)) {
+        const key = `${ref.slug.toLowerCase()}#${ref.number}`;
+        try {
+          const live = await api.get(ref.slug, ref.number);
+          if (live.merged) {
+            const landed = { ...ref, state: 'closed' as const, merged: true,
+              ...(live.headSha ? { headSha: live.headSha } : {}) };
+            reconciled.push(landed);
+            if (live.base) await syncGithubTargetToLocal(handle, ref, live.base, live.mergeCommitSha).catch(() => undefined);
+            record(handle.id, 'github.pr.merged', { ...ref, sha: live.mergeCommitSha, actorUserId: actor, strategy: 'provider-raced-cleanup' });
+            continue;
+          }
+        } catch { /* Continue with best-effort withdrawal under the known node id. */ }
+        const outcomes = await Promise.allSettled([
+          api.dequeue(ref.nodeId!),
+          api.disableAutoMerge(ref.nodeId!),
+        ]);
+        const accepted = outcomes.some((outcome) => outcome.status === 'fulfilled' && outcome.value.withdrawn);
+        if (accepted) {
+          withdrawn.push(key);
+          reconciled.push(ref);
+          record(handle.id, 'github.pr.landing-withdrawn', { ...ref, actorUserId: actor, reason: 'sibling-failed' });
+        } else {
+          reconciled.push(ref);
+          const details = outcomes.map((outcome) => outcome.status === 'fulfilled'
+            ? outcome.value.message
+            : outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+          failed[key] = details.join('; ').slice(0, 2_000);
+          record(handle.id, 'github.pr.landing-withdraw-failed', { ...ref, actorUserId: actor, detail: failed[key] });
+        }
+      }
+      return { withdrawn, failed, reconciled };
     },
 
     /**

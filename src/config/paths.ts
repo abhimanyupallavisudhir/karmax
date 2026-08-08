@@ -14,7 +14,7 @@ export function karmaxHome(): string {
 export interface KarmaxPaths {
   home: string;
   workflows: string; // ~/.karmax/workflows/<name>/  (git repos)
-  worlds: string; // worktrees / scratch repos
+  worlds: string; // task worktrees / plain repository-less workspaces
   localCheckouts: string; // durable human checkouts materialized from cloud task branches
   configHomes: string; // per-(account×profile) CODEX_HOME/CLAUDE_CONFIG_DIR
   content: string; // prompts/skills/memory content store

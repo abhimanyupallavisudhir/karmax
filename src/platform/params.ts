@@ -202,7 +202,7 @@ export function assembleTaskInput(
 }
 
 function toList(v: unknown): string[] {
-  if (Array.isArray(v)) return v.map(String).filter(Boolean);
+  if (Array.isArray(v)) return v.map(String).map((s) => s.trim()).filter(Boolean);
   if (typeof v === 'string') return v.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   return [];
 }
@@ -212,8 +212,8 @@ function toList(v: unknown): string[] {
  * when set, else the project config's repos. Mirrors how `assembleTaskInput` fills
  * `input.project.repos` (which flows into `createWorld`), so callers can guard on
  * exactly what the world provider will see rather than on `project.config` alone
- * (those two can diverge — an empty overlay used to slip past the guard and drop a
- * repo-oriented task into a silent scratch sandbox).
+ * Those two can diverge, and hosted repository validation must inspect the same
+ * normalized selection that provisioning receives.
  */
 export function effectiveRepos(resolved: ValueMap, config: ProjectConfig): string[] {
   const raw = resolved.repos !== undefined ? toList(resolved.repos) : config.repos ?? [];

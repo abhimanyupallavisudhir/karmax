@@ -29,7 +29,6 @@ vm.runInContext(
   [
     extractFunction('patchTaskListFromEvent'),
     extractFunction('pendingCancellationView'),
-    extractFunction('waitingProviderLabel'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
     extractFunction('stageLabel'),
@@ -51,44 +50,58 @@ const conversationPresence = context.conversationPresence as (
 const patchTaskListFromEvent = context.patchTaskListFromEvent as (event: Record<string, any>) => boolean;
 
 describe('waiting labels in task summaries', () => {
-  it('shows the wait reason instead of the pipeline stage', () => {
+  it('keeps the pipeline stage stable while a task waits', () => {
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
       state: {},
       waitingFor: { kind: 'account', provider: 'claude' },
-    })).toBe('Waiting for a Claude login to become available');
+    })).toBe('do');
+    expect(stageLabel({
+      stage: 'merge',
+      status: 'waiting',
+      state: { mergeGranted: false },
+      waitingFor: { kind: 'github', detail: 'Waiting for CI while retaining the front landing spot.' },
+    })).toBe('landing');
   });
 
-  it('normalizes both complete wait details and noun-phrase details', () => {
+  it('projects verbose workflow details to short wait labels', () => {
     expect(waitingText({
       kind: 'agentSlot',
-    })).toBe('Starting agent');
+    })).toBe('Waiting for agent');
     expect(waitingText({
       kind: 'agentSlot',
       detail: 'Starting agent',
-    })).toBe('Starting agent');
+    })).toBe('Waiting for agent');
     expect(waitingText({
       kind: 'agentSlot',
       detail: 'Waiting for host capacity to run the agent',
-    })).toBe('Waiting for host capacity to run the agent');
+    })).toBe('Waiting for agent');
     expect(waitingText({
       kind: 'shell',
       detail: '2 background jobs still running',
-    })).toBe('Waiting for 2 background jobs still running');
+    })).toBe('Waiting for command');
     expect(waitingText({
       kind: 'mergeSlot',
       detail: 'Waiting to merge into main',
-    })).toBe('Waiting to merge into main');
+    })).toBe('Waiting to merge');
+    expect(waitingText({
+      kind: 'github',
+      detail: 'Waiting for CI on the exact pull-request head while this task retains the front landing slot.',
+    })).toBe('Waiting for CI');
+    expect(waitingText({
+      kind: 'human',
+      detail: 'A long internal explanation of the decision needed',
+    })).toBe('Waiting for input');
   });
 
   it('keeps ordinary and legacy merge-stage labels intact', () => {
     expect(stageLabel({ stage: 'do', state: {} })).toBe('do');
-    expect(stageLabel({ stage: 'merge', state: { mergeGranted: false } })).toBe('merge queued');
+    expect(stageLabel({ stage: 'merge', state: { mergeGranted: false } })).toBe('landing');
     expect(stageLabel({ stage: 'setup', state: { draft: true } })).toBe('draft');
   });
 
-  it('uses the shared wait label in repeatable-run summaries', () => {
+  it('keeps repeatable-run summaries on their stable stage', () => {
     const run = {
       id: 'run-1',
       title: 'Scheduled task',
@@ -100,8 +113,8 @@ describe('waiting labels in task summaries', () => {
         waitingFor: { kind: 'parent' },
       },
     };
-    expect(runSubRow(run)).toContain('Waiting for the parent task to respond');
-    expect(runPageRow(run)).toContain('Waiting for the parent task to respond');
+    expect(runSubRow(run)).toContain('<span class="chip waiting">do</span>');
+    expect(runPageRow(run)).toContain('<span class="chip waiting">do</span>');
   });
 
   it('uses the truthful startup state in agent conversations', () => {
@@ -115,7 +128,7 @@ describe('waiting labels in task summaries', () => {
         waitingFor: { detail: 'Waiting for host capacity to start agent' },
       },
       { role: 'do' },
-    ).label).toBe('Waiting for host capacity to start agent');
+    ).label).toBe('Waiting for progress');
   });
 
   it('keeps authoritative wait details in compact live task updates', () => {
@@ -143,6 +156,6 @@ describe('waiting labels in task summaries', () => {
       detail: 'Starting agent',
       provider: 'codex',
     });
-    expect(stageLabel(view)).toBe('Starting agent');
+    expect(stageLabel(view)).toBe('do');
   });
 });

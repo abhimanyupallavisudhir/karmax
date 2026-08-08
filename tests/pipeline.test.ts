@@ -30,6 +30,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   let cancellationCleanupFinishedAt = 0;
   let releaseResourceCandidateTurn: (() => void) | undefined;
+  let resourceCandidateTurnReleased = false;
   beforeAll(async () => {
     const mock = new MockAdapter();
     const restartSession = 'restart-regression-session';
@@ -40,7 +41,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       provider: 'mock',
       async runTurn(input, ctx) {
         const latestUser = input.messages.filter((message) => message.role === 'user').at(-1);
-        if (latestUser?.text.includes('@resource-candidate-regression')) {
+        if (!resourceCandidateTurnReleased
+          && latestUser?.text.includes('@resource-candidate-regression')) {
           await new Promise<void>((resolve, reject) => {
             const onAbort = () => {
               releaseResourceCandidateTurn = undefined;
@@ -87,6 +89,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     h = await bootHarness('mock', adapter);
   }, 60_000);
   afterAll(async () => {
+    releaseResourceCandidateTurn?.();
+    releaseResourceCandidateTurn = undefined;
     await h?.stop();
   });
 
@@ -128,6 +132,40 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it.each(['1.15.0', '1.20.0'])('v%s runs repository-less work through Do and Review without Git or Merge', async (version) => {
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start(`softwareDev@${version}`, {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        taskId,
+        projectId: 'p1',
+        title: 'State-only task',
+        prompt: '@run test ! -e .git\n@review State action completed',
+        base: 'main',
+        target: 'main',
+        project: { repos: [], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.branch).toBeUndefined();
+    expect(review.base).toBeUndefined();
+    expect(review.targetBranch).toBeUndefined();
+    expect(review.state.mergeDomain).toBeUndefined();
+    expect(review.actions.map((action: any) => action.label)).toContain('Confirm');
+    expect(review.actions.map((action: any) => action.label)).not.toContain('Confirm PR');
+    expect(review.messages.map((message: any) => message.text).join('\n')).toContain('ran: test ! -e .git (exit 0)');
+
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result).toEqual({ stage: 'done' });
+    const final = await view(handle);
+    expect(final.reviewInfo.summary).toMatch(/no repository merge required/i);
+    expect(h.store.eventsSince(taskId, 0).some((event) => event.type === 'merge.completed')).toBe(false);
+  }, 120_000);
+
   it('v1.19 blocks Review on staged resources and wakes on an actual decision', async () => {
     const repo = await h.makeRepo('resource-candidate-review');
     const project = h.store.createProject('Resource candidate review', { repos: [repo] });
@@ -137,7 +175,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
       args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,
-        prompt: '@resource-candidate-regression\n@run printf \'model.bin\\n\' > .gitignore\n@write model.js :: export const installed = true;\n@review Installed model' })],
+        prompt: '@resource-candidate-regression\n@write .gitignore ::model.bin\n'
+          + '@write model.js :: export const installed = true;\n'
+          + '@run git add .gitignore model.js && git commit -q -m "install model"\n@review Installed model' })],
     });
 
     await expect.poll(() => h.store.currentWorld(task.id), { timeout: 30_000 }).toBeTruthy();
@@ -146,6 +186,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const proposed = await h.resources.proposePath(task.id, { path: 'model.bin', name: 'Installed model',
       target: { kind: 'path', path: 'data/model.bin' }, access: 'read' });
     await expect.poll(() => Boolean(releaseResourceCandidateTurn), { timeout: 30_000 }).toBe(true);
+    resourceCandidateTurnReleased = true;
     releaseResourceCandidateTurn!();
     releaseResourceCandidateTurn = undefined;
 
@@ -434,13 +475,20 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       text: '@write hello.txt :: hi there\n@review done now',
       ts: 0,
     });
+    // Do not let the poll below observe the Review state from before the signal was
+    // handled. Wait for proof that the follow-up turn actually ran first.
+    await expect
+      .poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('wrote hello.txt')), {
+        timeout: 30_000,
+      })
+      .toBe(true);
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
     const onMain = await git(repo, ['show', 'main:hello.txt']);
     expect(onMain.stdout).toContain('hi there');
-  });
+  }, 60_000);
 
   it('injects a follow-up sent WHILE a turn is running INTO that live turn (SPEC §5.6)', async () => {
     // A follow-up that arrives mid-turn is polled from the workflow (pendingMessages
@@ -483,7 +531,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:mid.txt']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('delivered after all');
-  });
+  }, 60_000);
 
   it('confirm=auto: lands the work without any human confirmation', async () => {
     const repo = await h.makeRepo('auto');

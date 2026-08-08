@@ -458,6 +458,12 @@ export interface ProjectConfig {
    * happens only when a task explicitly asks its agent to push.
    */
   remote?: RemotePolicy;
+  /** Who is expected to order pull-request landing. `auto` prefers a provider
+   * queue/auto-merge and falls back to Karmax admission only when strict
+   * freshness needs serialization. `external` is for a repository-triggered
+   * third-party queue Karmax can observe but must never shadow. `karmax` forces
+   * the fair fallback admission queue. */
+  landingAuthority?: LandingAuthority;
   /** Allow one task to partition its change across several branches, each landing
    *  as its own pull request (SPEC §11.1, the agent's `create_branch`). Its only
    *  structural effect is that the world nests its checkouts at Setup, so a
@@ -645,10 +651,15 @@ export interface OrganizationExecutionPolicy {
 // ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
 
 export type RemotePolicy = 'none' | 'push' | 'pr';
+export type LandingAuthority = 'auto' | 'external' | 'karmax';
 
 /** The effective remote policy, honoring the deprecated `openGithubPr` flag. */
 export function remotePolicyOf(project: ProjectConfig | undefined): RemotePolicy {
   return project?.remote ?? (project?.openGithubPr ? 'pr' : 'none');
+}
+
+export function landingAuthorityOf(project: ProjectConfig | undefined): LandingAuthority {
+  return project?.landingAuthority ?? 'auto';
 }
 
 /** A GitHub pull request karmax opened for one repo of a task's world. The
@@ -690,8 +701,26 @@ export interface TaskPullRequest {
   nodeId?: string;
 }
 
+export type GithubLandingOwner = 'provider' | 'external' | 'karmax' | 'unowned' | 'merged';
+
+/** One independently scheduled participant in a multi-PR landing saga.  The
+ * domain is the canonical remote `(provider repository, target)` identity, not
+ * a checkout path: several projects/clones of the same repository must contend
+ * for the same fallback admission slot. */
+export interface GithubLandingParticipant {
+  key: string;
+  repo: string;
+  slug: string;
+  number: number;
+  headSha?: string;
+  target: string;
+  domain: string;
+  owner: GithubLandingOwner;
+  state: 'ready' | 'queued' | 'waiting' | 'merged';
+}
+
 export interface GitHubMergeAuthorization {
-  status: 'candidate-ready' | 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
+  status: 'planned' | 'candidate-ready' | 'merged' | 'queued' | 'waiting' | 'retryable-error' | 'needs-human' | 'needs-authorizer' | 'stale-review' | 'needs-revision';
   prs: TaskPullRequest[];
   /** GitHub user whose token performed or queued the merge. */
   actorUserId?: string;
@@ -709,6 +738,13 @@ export interface GitHubMergeAuthorization {
    * v1.17 keeps the karmax target lease through exact-candidate validation and
    * automated repair instead. */
   providerQueue?: { state: 'queued' | 'validating'; entryIds?: string[] };
+  /** Which scheduler owns the current wait. Provider/external ownership means
+   * no Karmax target lease; fallback ownership keeps only the live mechanical
+   * update/check/merge admission turn. */
+  landingOwner?: 'provider' | 'external' | 'karmax';
+  /** Per-PR ownership is authoritative for current multi-repository workflows;
+   * `landingOwner` remains as the single-PR/replay compatibility summary. */
+  participants?: GithubLandingParticipant[];
 }
 
 /** Human authorization is intent-scoped; integration validation is bound to a
@@ -717,6 +753,9 @@ export interface TaskLandingState {
   authorization: 'none' | 'authorized' | 'reapproval-required';
   validation: 'none' | 'pending' | 'passed' | 'failed';
   provider: 'none' | 'admitting' | 'queued' | 'validating' | 'ejected';
+  authority?: 'provider' | 'external' | 'karmax';
+  /** PR identity -> independently scheduled landing participant. */
+  participants?: Record<string, GithubLandingParticipant>;
   /** PR identity -> head that received the most recent full Review. */
   authorizedHeads?: Record<string, string>;
   repairAttempts?: number;

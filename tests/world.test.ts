@@ -10,6 +10,7 @@ import { WorldRegistry } from '../src/world/registry.js';
 import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { ApplicationFailure } from '@temporalio/common';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -40,6 +41,30 @@ describe('WorktreeProvider (real git)', () => {
     expect(fs.existsSync(world.handle.root)).toBe(false);
     // branch is preserved after destroy
     expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
+  });
+
+  it('tags remote sandbox transport failures for outage-tolerant workflow backoff', async () => {
+    const store = new Store(':memory:');
+    const worlds = new WorldRegistry();
+    worlds.register({
+      kind: 'fake-remote',
+      capabilities: { remote: true },
+      async create() {
+        throw Object.assign(new Error('E2B sandbox creation failed'), { code: 'ETIMEDOUT' });
+      },
+      async open() { throw new Error('unused'); },
+      async destroy() {},
+    } as any);
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const failure = await core.createWorld({ taskId: 'transport-timeout', base: 'main',
+        target: 'main', kind: 'fake-remote' as any }).catch((error) => error);
+      expect(failure).toBeInstanceOf(ApplicationFailure);
+      expect(failure).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    } finally {
+      store.close();
+    }
   });
 
   it('forks a PR-policy task from origin without moving a stale local base', async () => {
@@ -132,7 +157,7 @@ describe('WorktreeProvider (real git)', () => {
     }
   });
 
-  it('keeps a scratch workspace when the project wiki is the only configured repository', async () => {
+  it('keeps repository-less project work outside Git even when the project has a wiki', async () => {
     const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
     const store = new Store(':memory:');
     const project = store.createProject('Wiki scratch', { repos: [], defaultBase: 'main', defaultTarget: 'main' });
@@ -144,11 +169,11 @@ describe('WorktreeProvider (real git)', () => {
       profiles: new ProfileResolver(store, 'mock'), contentDir });
     try {
       const handle = await core.createWorld({ taskId: task.id, base: 'main', target: 'main', kind: 'worktree' });
-      expect(handle.repos).toHaveLength(2);
-      expect(handle.repos!.some((candidate) => candidate.role === 'project-wiki')).toBe(true);
-      expect(handle.repos!.find((candidate) => candidate.root === handle.workdir)?.name).toBe('scratch');
+      expect(handle.repos).toEqual([]);
+      expect(handle.repo).toBeUndefined();
+      expect(fs.existsSync(path.join(handle.root, '.git'))).toBe(false);
       const opened = await worlds.open(handle);
-      expect((await opened.exec('pwd', [])).stdout.trim()).toBe(handle.workdir);
+      expect((await opened.exec('pwd', [])).stdout.trim()).toBe(handle.root);
       await opened.destroy();
     } finally {
       fs.rmSync(contentDir, { recursive: true, force: true });
@@ -207,11 +232,13 @@ describe('WorktreeProvider (real git)', () => {
     await world.destroy();
   });
 
-  it('creates a scratch repo when no repo is given', async () => {
+  it('creates a plain workspace when no repo is given', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'scratch1', base: 'main' });
     expect(fs.existsSync(world.handle.root)).toBe(true);
-    expect(world.handle.repo).toBeTruthy();
+    expect(world.handle.repo).toBeUndefined();
+    expect(world.handle.repos).toEqual([]);
+    expect(fs.existsSync(path.join(world.handle.root, '.git'))).toBe(false);
     await world.writeFile('hello.txt', 'hi');
     expect(await world.readFile('hello.txt')).toBe('hi');
     const files = await world.listFiles();

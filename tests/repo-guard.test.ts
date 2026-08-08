@@ -6,18 +6,8 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { RESOLVE_AGENT_ENABLED } from '../src/config/features.js';
 
-/**
- * The empty-repo guard. A repo-oriented workflow (its manifest declares a `repos`
- * param) run against a project with no repository configured used to silently get
- * a throwaway README-only scratch world from the worktree provider — the agent
- * worked in an empty sandbox instead of the user's code, with no signal. The API
- * now refuses the *run* early with an actionable message.
- *
- * No Temporal here on purpose: the guard fires before `client.workflow.start`, so
- * a stub client that records starts is enough to prove both "never started" (on
- * refusal) and "started" (once a repo is configured).
- */
-describe('repo-required guard (empty-repo footgun)', () => {
+/** Repository selection validation before a workflow is started. */
+describe('repository selection validation', () => {
   let store: Store;
   let api: KarmaxApi;
   let token: string;
@@ -50,20 +40,19 @@ describe('repo-required guard (empty-repo footgun)', () => {
     }).token;
   });
 
-  it('refuses to run a repo-oriented workflow when no repo is configured', async () => {
+  it('allows software-development work when no repo is configured', async () => {
     const p = store.createProject('NoRepo', {}); // repos unset
-    await expect(
-      api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'do a thing' }),
-    ).rejects.toThrow('Please add a git repo in project settings.');
-    expect(started).toHaveLength(0); // the workflow was never started
+    const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'do a thing' });
+    expect(task.workflow).toBe('software-dev');
+    expect(started).toHaveLength(1);
+    expect((started[0]![1] as any).args[0].project.repos ?? []).toEqual([]);
   });
 
-  it('treats blank/whitespace repo entries as unconfigured', async () => {
+  it('normalizes blank repository entries to the zero-repo case', async () => {
     const p = store.createProject('Blank', { repos: ['', '   '] });
-    await expect(
-      api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }),
-    ).rejects.toThrow(/git repo/i);
-    expect(started).toHaveLength(0);
+    await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+    expect(started).toHaveLength(1);
+    expect((started[0]![1] as any).args[0].project.repos).toEqual([]);
   });
 
   it('allows the run once a repository is configured', async () => {
@@ -72,6 +61,15 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(task.workflow).toBe('software-dev');
     expect(started).toHaveLength(1); // guard passed → workflow started
     expect((started[0]![1] as any).args[0].resolveAgentEnabled).toBe(false);
+  });
+
+  it('allows a hosted zero-repo task without requiring a GitHub connection', async () => {
+    const p = store.createProject('Hosted state', { worldProvider: 'e2b', repos: [] });
+    api = new KarmaxApi({ store, client: { workflow: { start: async (...a: unknown[]) => { started.push(a); return {}; } } } as any,
+      taskQueue: 'tq', tokens, hosted: true });
+    const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'update state' });
+    expect(task.workflow).toBe('software-dev');
+    expect(started).toHaveLength(1);
   });
 
   it('requires a first-class organization repository in hosted mode', async () => {
@@ -122,7 +120,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(view?.agents).toEqual(expected);
   });
 
-  it('lets a draft be saved without a repo, but blocks queueing it', async () => {
+  it('lets a draft be saved and queued without a repo', async () => {
     const p = store.createProject('Draft', {});
     const draft = await api.createTask(token, {
       projectId: p.id,
@@ -131,8 +129,8 @@ describe('repo-required guard (empty-repo footgun)', () => {
       draft: true,
     });
     expect(started).toHaveLength(0); // a draft starts nothing
-    await expect(api.queueTask(token, draft.id)).rejects.toThrow(/git repo/i);
-    expect(started).toHaveLength(0); // still not started after the refused queue
+    await api.queueTask(token, draft.id);
+    expect(started).toHaveLength(1);
   });
 
   it('does not retain a number when the durable engine refuses the queue', async () => {
@@ -180,11 +178,8 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(store.getTask(draft.id)).toMatchObject({ num: 1, params: { draft: false } });
   });
 
-  // The scratch-sandbox incident: the guard and the world builder read different
-  // sources. A project-settings overlay with an empty `repos` list shadowed the
-  // configured repo, so the effective repo list resolved to nothing and the task
-  // got a silent scratch world — while the config-only guard happily passed. The
-  // guard now reads the SAME effective repos the world is built from.
+  // Repository selection validation and the world builder must read the same
+  // effective list, including settings overlays.
   const startedInput = () => (started[0]![1] as any).args[0];
 
   it('an empty project-settings repos list does not shadow the configured repo', async () => {
@@ -205,12 +200,11 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(startedInput().project.repos).toEqual(['/from/settings']);
   });
 
-  it('still refuses when the effective repos resolve empty everywhere', async () => {
+  it('treats an explicitly empty effective repository list as repository-less work', async () => {
     const p = store.createProject('AllEmpty', { repos: ['/cfg'] });
     store.setSettings(p.id, 'software-dev', { repos: ['   '] }); // whitespace-only overlay wins, resolves empty
-    await expect(
-      api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }),
-    ).rejects.toThrow(/git repo/i);
-    expect(started).toHaveLength(0);
+    await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+    expect(started).toHaveLength(1);
+    expect(startedInput().project.repos).toEqual([]);
   });
 });

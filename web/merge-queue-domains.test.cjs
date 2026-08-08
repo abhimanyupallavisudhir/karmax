@@ -91,14 +91,32 @@ ok(pinned.includes('class="queue-item current"'), 'the leased task is marked as 
 // longer presented as reorderable in karmax's admission queue.
 global.S.tasks = [
   { id: 'provider', num: 3, title: 'Provider owned', lastView: view({
-    state: {}, landing: { provider: 'validating', detail: 'running merge-group CI' },
+    state: {}, landing: { provider: 'validating', authority: 'provider', detail: 'running merge-group CI' },
   }) },
 ];
 const provider = mergeQueuePanel();
-ok(provider.includes('GitHub landing queue'), 'provider-owned entries get their own clearly labelled queue');
-ok(provider.includes('GitHub validating'), 'the provider validation state is visible');
+ok(provider.includes('Provider landing'), 'provider-owned entries get their own clearly labelled queue');
+ok(provider.includes('provider validating'), 'the provider validation state is visible');
 ok(!provider.includes('draggable="true"'), 'provider-owned order cannot be changed through the karmax coordinator');
 ok(!provider.includes('data-domain=""'), 'provider-owned entries are not placed in the unnamed internal queue');
+
+// One multi-repository task may simultaneously have a provider participant and
+// one canonical fallback domain. It must appear in both read-only provider
+// observation and the one reorderable Karmax domain—never under every checkout.
+global.S.tasks = [
+  { id: 'mixed', num: 4, title: 'Mixed owners', lastView: view({
+    state: { mergeDomains: ['github:acme/b:main'], mergeGranted: true },
+    landing: { provider: 'validating', participants: {
+      'acme/a#1': { key: 'acme/a#1', slug: 'acme/a', target: 'main', owner: 'provider', state: 'queued' },
+      'acme/b#2': { key: 'acme/b#2', slug: 'acme/b', target: 'main', owner: 'karmax', state: 'waiting' },
+    } },
+  }) },
+];
+const mixed = mergeQueuePanel();
+ok((mixed.match(/Mixed owners/g) || []).length === 2, 'mixed ownership renders one provider row and one fallback row');
+ok(mixed.includes('acme/a'), 'the provider row names its exact repository participant');
+ok(mixed.includes('data-domain="github:acme/b:main"'), 'only the fallback participant appears in the Karmax domain');
+ok(mixed.includes('provider queued'), 'the provider participant remains read-only and visibly owned');
 
 // An empty queue still reads as empty, not as a stray group.
 global.S.tasks = [];

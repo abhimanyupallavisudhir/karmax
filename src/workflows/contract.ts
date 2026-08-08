@@ -29,7 +29,9 @@ export type {
   RaiseType,
   SubTaskAction,
   RemotePolicy,
+  LandingAuthority,
   TaskPullRequest,
+  GithubLandingParticipant,
   GitHubMergeAuthorization,
   TaskLandingState,
   TaskCheckout,
@@ -37,7 +39,7 @@ export type {
 } from '../domain/types.js';
 
 // Pure, deterministic helpers (no Node imports) — safe inside the workflow sandbox.
-export { mergeQueueDomains, remotePolicyOf, samePosition, MERGE_POLL } from '../domain/types.js';
+export { mergeQueueDomains, remotePolicyOf, landingAuthorityOf, samePosition, MERGE_POLL } from '../domain/types.js';
 // Multi-PR Review bookkeeping (SPEC §11.1) and the world's checkout list. Both
 // are pure data transforms over the handle, so they are sandbox-safe too.
 export { reviewCheckouts, allCheckoutsApproved, approveAll } from '../domain/checkouts.js';

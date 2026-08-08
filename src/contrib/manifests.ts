@@ -68,6 +68,16 @@ const remoteField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
+const landingAuthorityField = (): FieldSpec => ({
+  name: 'landingAuthority',
+  type: 'select',
+  label: 'Pull-request landing authority',
+  help: 'auto — prefer the provider queue/auto-merge and use Karmax admission only when strict freshness needs it; external — a repository-triggered third-party system owns landing and Karmax only observes; karmax — always use Karmax fair fallback admission.',
+  options: ['auto', 'external', 'karmax'],
+  default: 'auto',
+  scopes: ['project', 'global'],
+  bind: 'project',
+});
 // Multi-PR (SPEC §11.1, PLAN-multi-pr.md). Off, a task is one branch per repo,
 // exactly as before. On, the Do agent may partition its change across several
 // branches with `create_branch`, each landing as its own pull request — so the
@@ -358,8 +368,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.19.0',
-    description: 'Branch/world → do/wait → explicit PR → intent review → front-held exact-candidate CI and verification by the same Do conversation → atomic landing, with bounded in-place repair and reviewed adoption of task-created resources.',
+    version: '1.21.0',
+    description: 'World → do/wait → review → optional per-PR provider/external landing or canonical Karmax fallback admission; repository-less work skips Git, multi-repository participants preflight together, and failed work releases admission before repair.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -404,6 +414,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       multiPrField(),
       copyGlobsField(),
       remoteField(),
+      landingAuthorityField(),
       ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
       confirmerField(),
     ],
@@ -463,8 +474,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.19.0',
-    description: 'Software Dev in autonomous completion mode with front-held exact-candidate validation by the same Do conversation, bounded in-place repair, and reviewed adoption of task-created resources.',
+    version: '1.21.0',
+    description: 'Software Dev in autonomous completion mode with repository-less work, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
@@ -473,7 +484,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), confirmerField()],
   },
   {
     name: 'merge-only',
@@ -593,6 +604,7 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'github.pr.closed', description: "A task's pull request was closed without merging.", fields: GITHUB_PR_ACTION_FIELDS },
   { type: 'github.pr.synchronize', description: "New commits were pushed to a task's pull request.", fields: GITHUB_PR_ACTION_FIELDS },
   { type: 'github.pr.review', description: "A review was submitted on a task's pull request.", fields: { ...GITHUB_PR_FIELDS, review: 'approved | changes_requested | commented | dismissed', reviewer: 'GitHub login' } },
+  { type: 'github.check.completed', description: "A check completed on a task's pull-request branch.", fields: { name: 'check name', conclusion: 'success | failure | cancelled | …', status: 'completed', branch: 'task branch', url: 'details URL', repo: 'owner/name on GitHub' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
   { type: 'world.created', description: "A task's local or cloud world was provisioned.", fields: {} },

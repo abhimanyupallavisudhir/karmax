@@ -101,8 +101,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   if (sources.some((source) => !isSshRemote(source))) throw new Error(options.sshUrlError);
   const root = options.root;
   if (!sources.length) {
-    await runOrThrow(target, `mkdir -p ${quote(root)} && git -C ${quote(root)} init -q -b ${quote(spec.base || 'main')}`);
-    await configureRepo(target, root, spec, branch, false);
+    await runOrThrow(target, `mkdir -p ${quote(root)}`);
     return { root, repos: [], warnings, ephemeralPaths, ...(spec.scratch ? { workdir: root } : {}) };
   }
   const multi = sources.length > 1 || spec.scratch;
@@ -112,8 +111,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   if (multi) await runOrThrow(target, `mkdir -p ${quote(root)}`);
   const workdir = spec.scratch ? path.posix.join(root, scratchName!) : undefined;
   if (workdir) {
-    await runOrThrow(target, `mkdir -p ${quote(workdir)} && git -C ${quote(workdir)} init -q -b ${quote(spec.base || 'main')}`);
-    await configureRepo(target, workdir, spec, branch, false);
+    await runOrThrow(target, `mkdir -p ${quote(workdir)}`);
   }
   const uniqueKeys = [...new Set([spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
     .filter((value): value is string => Boolean(value)))];

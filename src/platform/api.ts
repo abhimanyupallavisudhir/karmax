@@ -646,36 +646,23 @@ export class KarmaxApi {
     }
   }
 
-  /**
-   * A repo-oriented workflow — one whose manifest declares a `repos` param — run
-   * against a project with no repository configured would silently get a
-   * throwaway scratch repo from the world provider (worktree.ts): the agent ends
-   * up in an empty README-only sandbox instead of the user's code, with no signal
-   * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
-   * rather than let a whole attempt burn against the wrong world.
-   */
-  private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
+  /** Validate configured repository selections without making repositories a
+   * prerequisite. An empty effective list is the supported zero-repo form of a
+   * workflow; hosted repository enrollment applies only when a repo was chosen. */
+  private assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
-    if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
+    if (!needsRepo) return;
+    const repositories = effectiveRepos(resolved, project.config);
+    if (!repositories.length) return;
     if (this.deps.hosted) {
       const linked = this.deps.store.listProjectRepositories(project.id);
       if (!linked.length) {
         throw new Error('Please connect GitHub in organization settings, then add a git repo in project settings.');
       }
       const enrolled = linked.map((candidate) => candidate.repository.sshUrl);
-      const outside = effectiveRepos(resolved, project.config)
+      const outside = repositories
         .filter((repository) => !enrolled.some((candidate) => sameRepository(candidate, repository)));
       if (outside.length) throw new Error('Please choose a GitHub repo attached to this project in project settings.');
-    }
-    // Guard on the EFFECTIVE repo list the world will be built from (the resolved
-    // settings overlay, falling back to project config) — the same value that
-    // reaches createWorld — not project.config alone. Those two can diverge (an
-    // empty settings-overlay repos list resolving to nothing while config still
-    // holds a repo), and checking config-only let that case slip through into a
-    // silent scratch sandbox — the very footgun this guard exists to prevent.
-    const configured = effectiveRepos(resolved, project.config).length > 0;
-    if (!configured) {
-      throw new Error('Please add a git repo in project settings.');
     }
   }
 
@@ -763,10 +750,9 @@ export class KarmaxApi {
     // against that task's project before anything is created.
     this.authorizeResumeSources(token, taskOverrides);
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
-    // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
-    // (drafts may still be saved without one, then checked again at queueTask).
-    // Checked after resolution so the guard sees the same repos the world will.
-    if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
+    // Validate any repository selection after resolution so this sees the exact
+    // effective list the world will. An empty list is a supported zero-repo run.
+    if (!args.draft) this.assertRepositoriesValid(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     const callerRef = principalRefOf(caller.principal, caller.kind);
@@ -1188,7 +1174,7 @@ export class KarmaxApi {
     if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
     this.assertHumanRoutes(task, manifest, resolved);
     // Same guard as createTask, on the resolved effective repos, before we clear the draft.
-    this.assertRepoConfigured(manifest, project, resolved);
+    this.assertRepositoriesValid(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
@@ -2876,16 +2862,15 @@ export class KarmaxApi {
       }
     }
 
-    // Retry is also the explicit migration boundary for Landing failures that
-    // are parked in a still-running historical execution. Retrying that same
-    // pin would reproduce either the separate Confirm credential selection or
-    // the unguarded task-branch push. Replace it with the current workflow while
-    // retaining the world, PRs, intent authorization, and Do conversation.
+    // Retry is also the explicit migration boundary for Landing failures parked
+    // in a historical pre-1.21 execution. Retrying that pin would reproduce its
+    // task-scalar landing model. Replace it with current participant admission
+    // while retaining the world, PRs, task intent, and Do conversation.
     const retryMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
     if (signal === SIG.retry
       && scopedTask?.workflow === 'software-dev'
       && retryMinor >= 16
-      && retryMinor < 18
+      && retryMinor < 21
       && heldView?.stage === 'escalated'
       && heldView.status === 'blocked'
       && !heldView.pointOfNoReturnPassed
@@ -2894,7 +2879,7 @@ export class KarmaxApi {
       const message: Message = {
         id: `landing-upgrade-${now}`,
         role: 'user',
-        text: `Karmax upgraded this attempt to the current Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the already-authorized intent, inspect the current repaired proposal, make only necessary fixes, verify it, and call open_pr again. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
+        text: `Karmax upgraded this attempt to the current fair Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the task context, inspect the current proposal, make only necessary fixes, verify it, and call open_pr again. The repaired proposal owns no landing slot and will request landing again at the back; live repository policy decides whether fresh approval is required. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
         ts: now,
       };
       const nextView = this.withConversationMessage(heldView, 'do', message);
@@ -2946,25 +2931,50 @@ export class KarmaxApi {
       return;
     }
 
-    // Executions on the pre-v1.18 Landing protocols already parked at their
+    // A pre-v1.21 execution may already be parked at an exceptional Landing
+    // confirmation (provider permission, policy intervention, or the bounded
+    // repair retry gate). Confirm is a safe replacement boundary here too: the
+    // vote has been journalled above, and the checkpoint carries the exact PRs,
+    // intent authorization, worktree, and Do session into participant Landing.
+    // When the old wait exhausted its repair budget, this click explicitly
+    // authorizes another batch, so consume that decision by resetting the count.
+    const landingConfirmMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
+    if (signal === SIG.confirm
+      && scopedTask?.workflow === 'software-dev'
+      && landingConfirmMinor >= 16
+      && landingConfirmMinor < 21
+      && heldView?.stage === 'merge'
+      && heldView.status === 'waiting'
+      && heldView.waitingFor?.kind === 'human'
+      && heldView.landing?.authorization === 'authorized'
+      && !heldOrigin) {
+      const migratingView = (heldView.landing.repairAttempts ?? 0) >= 5
+        ? { ...heldView, landing: { ...heldView.landing, repairAttempts: 0 } }
+        : heldView;
+      await this.stopTaskActivity(scopedTask, heldView, 'Landing confirmed; upgrading to per-participant provider/fallback Landing');
+      await this.startTransitionReplacement(scopedTask, migratingView, 'merge');
+      return;
+    }
+
+    // Executions on pre-v1.21 Landing protocols already parked at their
     // ordinary Review gate must not continue into a separate integration-agent
     // path. The
     // confirmation above has already been authorized and journalled, so replace
     // the old execution at the exact Review -> Landing boundary. This preserves
     // its PR/head checkpoint, consumes the one human decision exactly once, and
-    // lets the latest workflow reconstruct intent authorization before entering
-    // the front-held exact-candidate queue. Older versions did not journal durable
+    // lets the latest workflow reconstruct intent authorization before requesting
+    // provider-owned or fair fallback landing. Older versions did not journal durable
     // intent authorization, so they retain their historical semantics.
     const scopedMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
     if (signal === SIG.confirm
       && scopedTask?.workflow === 'software-dev'
       && scopedMinor >= 16
-      && scopedMinor < 18
+      && scopedMinor < 21
       && heldView?.stage === 'review'
       && heldView.status === 'waiting'
       && heldView.waitingFor?.kind === 'human'
       && !heldOrigin) {
-      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading to same-Do Landing verification');
+      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading to per-participant provider/fallback Landing');
       await this.startTransitionReplacement(scopedTask, heldView, 'merge');
       return;
     }
