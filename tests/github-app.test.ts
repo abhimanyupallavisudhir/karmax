@@ -105,7 +105,7 @@ describe('GitHub App integration', () => {
       ], default_permissions: { email_addresses: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
-    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review']);
+    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group']);
     expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'read');
     expect(manifest.manifest).toHaveProperty('default_permissions.statuses', 'read');
     expect(manifest.manifest).not.toHaveProperty('default_permissions.administration');
@@ -407,6 +407,12 @@ describe('GitHub App integration', () => {
     const merged = await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`));
     expect(merged.events).toHaveLength(1);
     expect(merged.events![0]).toMatchObject({ taskId: task.id, type: 'github.pr.merged' });
+    const check = await deliver('check_run', 'check-1', {
+      installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
+      check_run: { name: 'CI', status: 'completed', conclusion: 'failure',
+        check_suite: { head_branch: `karmax/${task.id}` } },
+    });
+    expect(check.events).toEqual([expect.objectContaining({ taskId: task.id, type: 'github.check.completed' })]);
     // A branch no karmax task owns is accepted and produces nothing to dispatch.
     expect(await deliver('pull_request', 'pr-2', pull('feature/manual'))).toEqual({ accepted: true });
     // Neither does a branch naming a task in an organization that did not install

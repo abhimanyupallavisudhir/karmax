@@ -2862,16 +2862,15 @@ export class KarmaxApi {
       }
     }
 
-    // Retry is also the explicit migration boundary for Landing failures that
-    // are parked in a still-running historical execution. Retrying that same
-    // pin would reproduce either the separate Confirm credential selection or
-    // the unguarded task-branch push. Replace it with the current workflow while
-    // retaining the world, PRs, intent authorization, and Do conversation.
+    // Retry is also the explicit migration boundary for Landing failures parked
+    // in a historical pre-1.21 execution. Retrying that pin would reproduce its
+    // task-scalar landing model. Replace it with current participant admission
+    // while retaining the world, PRs, task intent, and Do conversation.
     const retryMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
     if (signal === SIG.retry
       && scopedTask?.workflow === 'software-dev'
       && retryMinor >= 16
-      && retryMinor < 18
+      && retryMinor < 21
       && heldView?.stage === 'escalated'
       && heldView.status === 'blocked'
       && !heldView.pointOfNoReturnPassed
@@ -2880,7 +2879,7 @@ export class KarmaxApi {
       const message: Message = {
         id: `landing-upgrade-${now}`,
         role: 'user',
-        text: `Karmax upgraded this attempt to the current Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the already-authorized intent, inspect the current repaired proposal, make only necessary fixes, verify it, and call open_pr again. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
+        text: `Karmax upgraded this attempt to the current fair Landing protocol after its prior automated landing step failed. Continue from the existing worktree and this same Do conversation. Preserve the task context, inspect the current proposal, make only necessary fixes, verify it, and call open_pr again. The repaired proposal owns no landing slot and will request landing again at the back; live repository policy decides whether fresh approval is required. Previous failure: ${heldView.error ?? 'unknown landing failure'}`,
         ts: now,
       };
       const nextView = this.withConversationMessage(heldView, 'do', message);
@@ -2932,25 +2931,50 @@ export class KarmaxApi {
       return;
     }
 
-    // Executions on the pre-v1.18 Landing protocols already parked at their
+    // A pre-v1.21 execution may already be parked at an exceptional Landing
+    // confirmation (provider permission, policy intervention, or the bounded
+    // repair retry gate). Confirm is a safe replacement boundary here too: the
+    // vote has been journalled above, and the checkpoint carries the exact PRs,
+    // intent authorization, worktree, and Do session into participant Landing.
+    // When the old wait exhausted its repair budget, this click explicitly
+    // authorizes another batch, so consume that decision by resetting the count.
+    const landingConfirmMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
+    if (signal === SIG.confirm
+      && scopedTask?.workflow === 'software-dev'
+      && landingConfirmMinor >= 16
+      && landingConfirmMinor < 21
+      && heldView?.stage === 'merge'
+      && heldView.status === 'waiting'
+      && heldView.waitingFor?.kind === 'human'
+      && heldView.landing?.authorization === 'authorized'
+      && !heldOrigin) {
+      const migratingView = (heldView.landing.repairAttempts ?? 0) >= 5
+        ? { ...heldView, landing: { ...heldView.landing, repairAttempts: 0 } }
+        : heldView;
+      await this.stopTaskActivity(scopedTask, heldView, 'Landing confirmed; upgrading to per-participant provider/fallback Landing');
+      await this.startTransitionReplacement(scopedTask, migratingView, 'merge');
+      return;
+    }
+
+    // Executions on pre-v1.21 Landing protocols already parked at their
     // ordinary Review gate must not continue into a separate integration-agent
     // path. The
     // confirmation above has already been authorized and journalled, so replace
     // the old execution at the exact Review -> Landing boundary. This preserves
     // its PR/head checkpoint, consumes the one human decision exactly once, and
-    // lets the latest workflow reconstruct intent authorization before entering
-    // the front-held exact-candidate queue. Older versions did not journal durable
+    // lets the latest workflow reconstruct intent authorization before requesting
+    // provider-owned or fair fallback landing. Older versions did not journal durable
     // intent authorization, so they retain their historical semantics.
     const scopedMinor = Number(String(scopedTask?.workflowVersion ?? '').split('.')[1] ?? 0);
     if (signal === SIG.confirm
       && scopedTask?.workflow === 'software-dev'
       && scopedMinor >= 16
-      && scopedMinor < 18
+      && scopedMinor < 21
       && heldView?.stage === 'review'
       && heldView.status === 'waiting'
       && heldView.waitingFor?.kind === 'human'
       && !heldOrigin) {
-      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading to same-Do Landing verification');
+      await this.stopTaskActivity(scopedTask, heldView, 'Review confirmed; upgrading to per-participant provider/fallback Landing');
       await this.startTransitionReplacement(scopedTask, heldView, 'merge');
       return;
     }

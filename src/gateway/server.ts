@@ -21,6 +21,7 @@ import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, r
 import { defaultBranch } from '../world/git.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
+import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
@@ -920,8 +921,13 @@ export class Gateway {
         // The service already resolved each event to a task of the installing
         // organization, so dispatch is unconditional here.
         const { events, ...body } = result;
-        for (const event of events ?? [])
+        for (const event of events ?? []) {
           this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
+          const task = this.deps.store.getTask(event.taskId);
+          if (task && ['software-dev', 'goal'].includes(task.workflow)
+            && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
+            await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
+        }
         return this.json(res, 200, { ...body, ...(events?.length ? { dispatched: events.length } : {}) });
       } catch (error) {
         // Only a genuine signature failure is a 401. Answering 401 for ANY

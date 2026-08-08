@@ -61,6 +61,14 @@ ok(
 ok(S.tasks[0].lastView.status === 'active', 'the list status is updated locally');
 ok(S.tasks[0].lastView.waitingFor === undefined, 'the stale wait reason is removed');
 ok(S.tasks[0].lastView.agentTurn.state === 'running', 'the live agent state is projected locally');
+ok(
+  !patchTaskListFromEvent({
+    taskId: '308',
+    type: 'view.updated',
+    payload: { stage: 'do', status: 'active', waitingFor: null, agentTurn: 'running', agentRole: 'do' },
+  }),
+  'an identical compact view does not repaint the task list',
+);
 
 const ws = extractFn('connectWs');
 ok(!ws.includes("['view.updated', 'task.responsibility-changed'"), 'view updates do not reload collaboration endpoints');
@@ -73,6 +81,12 @@ ok(open.indexOf('renderTaskPage();') < open.indexOf('await details'), 'the compa
 const refresh = extractFn('refreshTasks');
 ok(refresh.includes('if (taskRefreshPromise)') && refresh.includes('taskRefreshQueued = true'),
   'full task refreshes are single-flight and queue a post-mutation follow-up pass');
+
+const interaction = extractFn('interactionInFlight');
+ok(interaction.includes('if (mainPointerDown) return true'),
+  'background repaint cannot replace a task row during its pointer click');
+ok(src.includes("document.addEventListener('pointerup', releaseMainPointer, true)"),
+  'a completed click releases and flushes the deferred repaint');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

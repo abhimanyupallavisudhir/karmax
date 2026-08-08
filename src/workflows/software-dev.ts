@@ -39,11 +39,12 @@ import {
   ParentResponse,
   SubTaskResponse,
   TaskPullRequest,
+  GithubLandingParticipant,
   GitHubMergeAuthorization,
   TaskLandingState,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
-  samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
+  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 
@@ -100,6 +101,7 @@ export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
+export const providerChangedSignal = defineSignal(SIG.providerChanged);
 export const confirmSignal = defineSignal('confirm');
 /** Explicit transition from Do/waiting-for-input into PR preparation. */
 export const openPrSignal = defineSignal('openPr');
@@ -353,10 +355,16 @@ export async function softwareDevV1_19(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.19.0');
 }
 
-/** Repository-less projects use the ordinary Do and Review lifecycle without
- * inventing a Git branch, pull request, merge queue lease, or merge activity. */
+/** Repository-less completion, or one provider/fallback landing authority with
+ * mechanical stale-branch updates and fair ejection before repair. */
 export async function softwareDevV1_20(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.20.0');
+}
+
+/** Per-PR landing ownership, all-participant preflight, and canonical remote
+ * fallback domains for multi-repository proposals. */
+export async function softwareDevV1_21(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.21.0');
 }
 
 /** Replay-compatible entry for executions already recorded as
@@ -365,7 +373,7 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -388,6 +396,23 @@ export function githubWaitNeedsProposalRevision(
   return decision.status === 'waiting'
     && /(?:merge conflicts?|conflict(?:ing|s)? with (?:the )?(?:base|target)|not mergeable|base branch was modified|update (?:the )?branch)/i
       .test(decision.detail ?? '');
+}
+
+/**
+ * Open PR may reuse the proposal produced by the completed Do turn only when no
+ * newer conversation input is waiting. Otherwise the synthetic completed turn
+ * leaves `seen` behind `messages.length`; the unread-message guard loops back to
+ * Do, sees the same Open-PR latch, synthesizes again, and publishes forever.
+ * `fixActive=false` is the replay path for histories recorded before the patch.
+ */
+export function mayReuseCompletedProposalForOpenPr(
+  explicitPrCycle: boolean,
+  prRequested: boolean,
+  messagesLength: number,
+  seen: number,
+  fixActive = true,
+): boolean {
+  return explicitPrCycle && prRequested && (!fixActive || messagesLength === seen);
 }
 
 /**
@@ -447,11 +472,16 @@ async function softwareDevImpl(
   const explicitPrCycle = !repositoryless && minor >= 13;
   const classifiedGithubStates = minor >= 14;
   const intentAuthorizedLanding = !repositoryless && minor >= 16;
-  // GitHub's merge queue ejects failed candidates, so it cannot preserve the
-  // invariant that automated integration repair stays at the front. v1.17 uses
-  // karmax's durable per-target lease as the authoritative landing queue, checks
-  // the exact CI-green head there, and advances the target atomically.
-  const frontHeldLanding = minor >= 17;
+  // v1.17-v1.19 made Karmax's front-held queue authoritative. v1.20 replaces
+  // that model with provider ownership and a fair fallback admission turn;
+  // historical executions keep the commands and leases they recorded.
+  const frontHeldLanding = !repositoryless && minor >= 17 && minor < 20;
+  const fairLanding = !repositoryless && minor >= 20;
+  // v1.21 models each PR/target as an independent landing participant.  A
+  // task-wide scalar owner cannot represent a native queue in one repository
+  // and guarded fallback in another.
+  const participantLanding = !repositoryless && minor >= 21;
+  const configuredLandingAuthority = landingAuthorityOf(input.project);
   // The exact-candidate check belongs to the agent that authored and repaired
   // the proposal. Re-enter its Do conversation so it retains both context and
   // configured provider; no synthetic Confirm/integration-review role exists.
@@ -511,6 +541,7 @@ async function softwareDevImpl(
   let cancelled = false;
   let retryRequested = false;
   let resourceResolutionEpoch = 0;
+  let providerChangeEpoch = 0;
   let awaitingResourceDecision = false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
@@ -533,21 +564,35 @@ async function softwareDevImpl(
     items.filter((candidate) => candidate.headSha)
       .map((candidate) => [`${candidate.slug}#${candidate.number}`, candidate.headSha!]),
   );
+  const prKey = (candidate: Pick<TaskPullRequest, 'slug' | 'number'>) =>
+    `${candidate.slug.toLowerCase()}#${candidate.number}`;
+  const mergePrSnapshots = (all: TaskPullRequest[], updates: TaskPullRequest[]) => {
+    const byKey = new Map(updates.map((candidate) => [prKey(candidate), candidate]));
+    return all.map((candidate) => byKey.get(prKey(candidate)) ?? candidate);
+  };
+  const participantRecord = (items: GithubLandingParticipant[]) => Object.fromEntries(
+    items.map((candidate) => [candidate.key, candidate]),
+  );
   let landing: TaskLandingState = recovery?.landing
-    ? { ...recovery.landing, authorizedHeads: { ...(recovery.landing.authorizedHeads ?? {}) } }
+    ? { ...recovery.landing, authorizedHeads: { ...(recovery.landing.authorizedHeads ?? {}) },
+        ...(recovery.landing.participants
+          ? { participants: Object.fromEntries(Object.entries(recovery.landing.participants)
+            .map(([key, value]) => [key, { ...value }])) }
+          : {}) }
     : { authorization: 'none', validation: 'none', provider: 'none' };
   let repairValidationPending = intentAuthorizedLanding && !!recovery?.repairValidationPending;
   let forceHumanRepairReview = false;
   let providerQueueAccepted = !frontHeldLanding && intentAuthorizedLanding
     && recoveryStage === 'merge'
-    && (landing.provider === 'queued' || landing.provider === 'validating');
+    && (landing.provider === 'queued' || landing.provider === 'validating')
+    && (!fairLanding || landing.authority === 'provider' || landing.authority === 'external');
   // v1.16's in-process coordinator is only a short admission mutex. Once a PR
   // has been handed to GitHub's queue, publishing its domains would make the UI
   // falsely present it as occupying karmax's own durable merge queue.
   let internalMergeAdmissionActive = false;
-  // v1.17 deliberately carries these leases across proposalCycle loop-backs to
-  // Do. The merge coordinator renews a live task's lease every five minutes;
-  // human/exhausted paths and abort() release it explicitly.
+  // v1.17-v1.19 carry these leases across Do repair. v1.20 may retain the same
+  // storage only across one live fallback update/check/merge attempt; every Do
+  // or human transition releases it before leaving Landing.
   let retainedMergeDomains: string[] = [];
   let branchPreparedForPr = explicitPrCycle && (recoveryStage === 'review' || recoveryStage === 'merge');
   let mergeQueuePos: { position: number; total: number } | undefined;
@@ -830,6 +875,9 @@ async function softwareDevImpl(
       !cancelled &&
       !pointOfNoReturnPassed &&
       (stage === 'setup' || stage === 'do' || stage === 'review');
+    const visibleMergeDomains = participantLanding && githubAuthoritativeMerge
+      ? retainedMergeDomains
+      : world ? mergeQueueDomains(world, target, input.projectId) : [];
     return {
       taskId,
       title: input.title,
@@ -852,11 +900,11 @@ async function softwareDevImpl(
         targetLocked,
         mergeDomain: world && !repositoryless
           && (!intentAuthorizedLanding || !githubAuthoritativeMerge || internalMergeAdmissionActive)
-          ? mergeQueueDomains(world, target, input.projectId)[0]
+          ? visibleMergeDomains[0]
           : undefined,
         ...(publishesAllMergeDomains && world && !repositoryless
           && (!intentAuthorizedLanding || !githubAuthoritativeMerge || internalMergeAdmissionActive)
-          ? { mergeDomains: mergeQueueDomains(world, target, input.projectId) }
+          ? { mergeDomains: visibleMergeDomains }
           : {}),
         // A failed Temporal execution is terminal. Persist the full handle needed
         // for a replacement run to OPEN this world; reconstructing it through
@@ -950,6 +998,9 @@ async function softwareDevImpl(
   });
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
+  });
+  if (fairLanding) setHandler(providerChangedSignal, () => {
+    providerChangeEpoch++;
   });
   setHandler(confirmSignal, () => {
     if (awaitingResourceDecision) return;
@@ -2046,7 +2097,14 @@ Inspect the complete current diff and specifically compare its delta from the re
     // A human/parent may request Open PR while the task is already parked. That
     // transition uses the proposal the Do agent just produced; it must not spend
     // another model turn before publishing it.
-    const turn: Awaited<ReturnType<typeof doTurn>> = explicitPrCycle && prRequested
+    const preventsUnreadOpenPrSpin = patched('software-dev-open-pr-unread-message-spin-v1');
+    const turn: Awaited<ReturnType<typeof doTurn>> = mayReuseCompletedProposalForOpenPr(
+      explicitPrCycle,
+      prRequested,
+      msgs.length,
+      seen,
+      preventsUnreadOpenPrSpin,
+    )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
       : await doTurn();
     // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
@@ -2673,40 +2731,118 @@ Inspect the complete current diff and specifically compare its delta from the re
     mergeGranted = false;
     const observesProviderQueue = !frontHeldLanding
       && intentAuthorizedLanding && githubAuthoritativeMerge && providerQueueAccepted;
-    internalMergeAdmissionActive = frontHeldLanding
+    internalMergeAdmissionActive = participantLanding
+      ? retainedMergeDomains.length > 0
+      : frontHeldLanding
       ? true
       : intentAuthorizedLanding && githubAuthoritativeMerge && !observesProviderQueue;
     if (intentAuthorizedLanding) {
       landing = {
         ...landing,
         validation: 'pending',
-        provider: frontHeldLanding && retainedMergeDomains.length ? 'validating'
+        provider: (frontHeldLanding || fairLanding) && retainedMergeDomains.length ? 'validating'
           : providerQueueAccepted ? 'validating' : 'admitting',
+        authority: providerQueueAccepted
+          ? (landing.authority === 'external' ? 'external' : 'provider')
+          : fairLanding ? 'karmax' : landing.authority,
         detail: frontHeldLanding && retainedMergeDomains.length
-          ? 'This task holds the front landing slot while its exact candidate is repaired or validated.'
+          ? 'This historical task holds the front landing slot while its exact candidate is repaired or validated.'
+          : fairLanding && retainedMergeDomains.length
+            ? 'This task holds fallback admission only while its mechanical update, checks, and merge request are active.'
           : providerQueueAccepted
-          ? 'GitHub owns queue order and is validating the exact integration candidate.'
+          ? 'The configured provider owns landing order and is validating the integration candidate.'
           : frontHeldLanding
             ? 'Waiting for the authoritative karmax landing slot for exact-candidate validation.'
-            : 'Waiting for a short krmax admission turn before handing landing to GitHub.',
+            : fairLanding
+              ? 'Waiting for fair fallback admission unless the provider accepts landing ownership.'
+              : 'Waiting for a short krmax admission turn before handing landing to GitHub.',
       };
       if (providerQueueAccepted) mergeQueuePos = undefined;
     }
     await publish();
     if (cancelled) return await abort();
 
-    // Acquire the merge slot for EVERY repo this task touches, one at a time in a
+    let githubResult: GitHubMergeAuthorization | undefined;
+    let plannedParticipants: GithubLandingParticipant[] = [];
+    let fallbackPrs: TaskPullRequest[] = [];
+    if (participantLanding && githubAuthoritativeMerge) {
+      const preflight = await core.mergeGithubPrs(world as any, prs, {
+        mode: 'preflight', authority: configuredLandingAuthority,
+      });
+      prs = mergePrSnapshots(prs, preflight.prs);
+      pr = prs[0];
+      if (preflight.status !== 'planned') {
+        githubResult = { ...preflight, prs };
+      } else {
+        const byParticipant = new Map((preflight.participants ?? []).map((candidate) => [candidate.key, candidate]));
+        // Provider claiming happens only after every participant passed the
+        // read-only barrier.  A later PR cannot therefore reveal an already
+        // known CI failure after an earlier PR has been enqueued in this pass.
+        for (const candidate of [...byParticipant.values()].filter((item) => item.owner === 'unowned')) {
+          const ref = prs.find((item) => prKey(item) === candidate.key);
+          if (!ref) continue;
+          const claim = await core.mergeGithubPrs(world as any, [ref], {
+            mode: 'claim-provider', authority: configuredLandingAuthority,
+          });
+          prs = mergePrSnapshots(prs, claim.prs);
+          pr = prs[0];
+          if (!['queued', 'waiting'].includes(claim.status)) {
+            githubResult = {
+              ...claim,
+              prs,
+              participants: [...byParticipant.values()],
+            };
+            break;
+          }
+          for (const claimed of claim.participants ?? []) byParticipant.set(claimed.key, claimed);
+        }
+        plannedParticipants = [...byParticipant.values()];
+        const activeAuthorities = [...new Set(plannedParticipants
+          .map((candidate) => candidate.owner)
+          .filter((owner): owner is 'provider' | 'external' | 'karmax' =>
+            owner === 'provider' || owner === 'external' || owner === 'karmax'))];
+        landing = {
+          ...landing,
+          participants: participantRecord(plannedParticipants),
+          authority: activeAuthorities.length === 1 ? activeAuthorities[0] : undefined,
+        };
+        if (!githubResult) {
+          fallbackPrs = prs.filter((candidate) => byParticipant.get(prKey(candidate))?.owner === 'karmax');
+          if (plannedParticipants.length > 0 && plannedParticipants.every((candidate) => candidate.owner === 'merged')) {
+            githubResult = {
+              status: 'merged', prs, participants: plannedParticipants,
+              detail: 'Every multi-repository landing participant has merged.',
+            };
+          } else if (!fallbackPrs.length) {
+            githubResult = {
+              status: 'queued', prs, participants: plannedParticipants,
+              detail: 'Repository landing authorities own every outstanding pull request.',
+              providerQueue: { state: 'queued' },
+            };
+          }
+        }
+      }
+    }
+
+    // Historical/local workflows acquire every world domain. Current GitHub
+    // workflows acquire only the canonical remote domains whose participants
+    // actually need fallback; provider/external participants own no shadow
+    // Karmax slot.
+    // Acquire the selected slots one at a time in a
     // fixed global order (sorted). Ordered acquisition is what makes concurrent
     // multi-repo merges deadlock-free (SPEC §6.1): all tasks request shared repos
     // in the same sequence, so the wait-for graph can't form a cycle. Acquiring
     // sequentially (not all at once) also keeps the payload-less grant signal
     // unambiguous — we only ever wait on a single coordinator at a time.
-    const domains = observesProviderQueue ? [] : mergeQueueDomains(world, target, input.projectId);
-    const held: string[] = frontHeldLanding ? [...retainedMergeDomains] : [];
+    const domains = participantLanding && githubAuthoritativeMerge
+      ? [...new Set(plannedParticipants.filter((candidate) => candidate.owner === 'karmax')
+        .map((candidate) => candidate.domain))].sort()
+      : observesProviderQueue ? [] : mergeQueueDomains(world, target, input.projectId);
+    if (participantLanding) internalMergeAdmissionActive = domains.length > 0;
+    const held: string[] = (frontHeldLanding || fairLanding) ? [...retainedMergeDomains] : [];
     let retainFront = false;
     let acquireCancelled = false;
     let result;
-    let githubResult: GitHubMergeAuthorization | undefined;
     // Every acquired domain MUST be released — including when enqueueMerge / the
     // position publish / the merge agent throws while acquiring or holding a LATER
     // domain. Without this, domains 0..n-1 stayed leased until the coordinator's
@@ -2736,15 +2872,17 @@ Inspect the complete current diff and specifically compare its delta from the re
           break;
         }
         held.push(domain);
-        if (frontHeldLanding) retainedMergeDomains = [...held];
+        if (frontHeldLanding || fairLanding) retainedMergeDomains = [...held];
       }
       if (acquireCancelled) {
         for (const d of held) await coordinator.releaseMerge(d, taskId); // release every slot already held
         held.length = 0; // released here → the finally below is a no-op (command order preserved)
-        if (frontHeldLanding) retainedMergeDomains = [];
+        if (frontHeldLanding || fairLanding) retainedMergeDomains = [];
         return await abort();
       }
-      mergeQueuePos = observesProviderQueue ? undefined : { position: 0, total: mergeQueuePos?.total ?? 1 };
+      mergeQueuePos = observesProviderQueue || (participantLanding && domains.length === 0)
+        ? undefined
+        : { position: 0, total: mergeQueuePos?.total ?? 1 };
       await publish();
 
       try {
@@ -2780,7 +2918,41 @@ Inspect the complete current diff and specifically compare its delta from the re
           // The proposal was already prepared and reviewed. Do not create a
           // second local merge and push it with the installation credential;
           // request the exact reviewed PR merge under a consenting human token.
-          if (frontHeldLanding) {
+          if (participantLanding) {
+            if (!githubResult && fallbackPrs.length) {
+              const fallbackResult = await core.mergeGithubPrs(world as any, fallbackPrs, {
+                mode: 'submit-fallback', authority: 'karmax',
+              });
+              prs = mergePrSnapshots(prs, fallbackResult.prs);
+              pr = prs[0];
+              const byParticipant = new Map(plannedParticipants.map((candidate) => [candidate.key, candidate]));
+              for (const updated of fallbackResult.prs) {
+                const key = prKey(updated);
+                const prior = byParticipant.get(key);
+                if (!prior) continue;
+                byParticipant.set(key, {
+                  ...prior,
+                  ...(updated.headSha ? { headSha: updated.headSha } : {}),
+                  owner: updated.merged ? 'merged' : 'karmax',
+                  state: updated.merged ? 'merged'
+                    : fallbackResult.status === 'waiting' ? 'waiting' : prior.state,
+                });
+              }
+              plannedParticipants = [...byParticipant.values()];
+              landing = { ...landing, participants: participantRecord(plannedParticipants) };
+              if (fallbackResult.status === 'merged') {
+                githubResult = prs.every((candidate) => candidate.merged)
+                  ? { ...fallbackResult, prs, participants: plannedParticipants }
+                  : {
+                      status: 'queued', prs, participants: plannedParticipants,
+                      detail: 'Fallback participants landed; repository authorities still own the remaining pull requests.',
+                      providerQueue: { state: 'queued' },
+                    };
+              } else {
+                githubResult = { ...fallbackResult, prs, participants: plannedParticipants };
+              }
+            }
+          } else if (frontHeldLanding) {
             githubResult = await core.mergeGithubPrs(world as any, prs, { mode: 'inspect-exact' });
             prs = githubResult.prs;
             pr = prs[0];
@@ -2831,7 +3003,10 @@ Inspect the complete current diff and specifically compare its delta from the re
             }
           } else {
             githubResult = await core.mergeGithubPrs(world as any, prs,
-              intentAuthorizedLanding ? { mode: observesProviderQueue ? 'observe' : 'submit' } : undefined);
+              intentAuthorizedLanding ? {
+                mode: observesProviderQueue ? 'observe' : 'submit',
+                ...(fairLanding ? { authority: configuredLandingAuthority } : {}),
+              } : undefined);
           }
         } else {
           // …then the authoritative, deterministic local merge that guarantees
@@ -2855,6 +3030,10 @@ Inspect the complete current diff and specifically compare its delta from the re
           || (githubResult.status === 'needs-revision'
             && githubResult.repair?.preserveAuthorization === true);
       }
+      if (fairLanding && githubResult) {
+        retainFront = githubResult.landingOwner === 'karmax'
+          && (githubResult.status === 'waiting' || githubResult.status === 'queued');
+      }
     } finally {
       // Swallow per-domain. From 1.9.0 `coordinator` retries a bounded 5 times
       // (~15 s), which a coordinator mid-continueAsNew or a worker restart can
@@ -2862,13 +3041,13 @@ Inspect the complete current diff and specifically compare its delta from the re
       // every remaining slot, the exact leak the try/finally exists to prevent —
       // and replace the in-flight merge error with a release error. Scheduling the
       // activity is what history records, so catching changes no replay.
-      if (frontHeldLanding && retainFront) {
+      if ((frontHeldLanding || fairLanding) && retainFront) {
         retainedMergeDomains = [...held];
         internalMergeAdmissionActive = true;
       } else {
         for (const d of held) await coordinator.releaseMerge(d, taskId).catch(() => undefined);
         held.length = 0;
-        if (frontHeldLanding) {
+        if (frontHeldLanding || fairLanding) {
           retainedMergeDomains = [];
           internalMergeAdmissionActive = false;
         }
@@ -2879,9 +3058,35 @@ Inspect the complete current diff and specifically compare its delta from the re
     // after the API turn. v1.17 instead keeps publishing the authoritative lease
     // until the exact candidate lands or the task leaves for human attention.
     if (intentAuthorizedLanding && githubAuthoritativeMerge
-      && (!frontHeldLanding || retainedMergeDomains.length === 0)) {
+      && (!(frontHeldLanding || fairLanding) || retainedMergeDomains.length === 0)) {
       mergeQueuePos = undefined;
       internalMergeAdmissionActive = false;
+    }
+
+    if (participantLanding && githubResult
+      && !['planned', 'queued', 'waiting', 'candidate-ready', 'merged'].includes(githubResult.status)) {
+      const providerKeys = new Set(Object.values(landing.participants ?? {})
+        .filter((candidate) => candidate.owner === 'provider')
+        .map((candidate) => candidate.key));
+      const providerPrs = prs.filter((candidate) => providerKeys.has(prKey(candidate)) && !candidate.merged);
+      if (providerPrs.length) {
+        const withdrawal = await core.withdrawGithubPrs(world as any, providerPrs, githubResult.actorUserId);
+        prs = mergePrSnapshots(prs, withdrawal.reconciled);
+        pr = prs[0];
+        const nextParticipants = { ...(landing.participants ?? {}) };
+        for (const candidate of providerPrs) {
+          const key = prKey(candidate);
+          const prior = nextParticipants[key];
+          const live = prs.find((item) => prKey(item) === key);
+          if (!prior) continue;
+          nextParticipants[key] = live?.merged
+            ? { ...prior, owner: 'merged', state: 'merged' }
+            : withdrawal.withdrawn.includes(key)
+              ? { ...prior, owner: 'unowned', state: 'ready' }
+              : prior;
+        }
+        landing = { ...landing, participants: nextParticipants };
+      }
     }
 
     if (githubAuthoritativeMerge) {
@@ -2959,7 +3164,9 @@ Inspect the complete current diff and specifically compare its delta from the re
                 ? doOwnsIntegrationReview
                   ? 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and return to this same Do conversation for verification before landing.'
                   : 'The existing human intent authorization is preserved, and this task retains the front landing slot. The repaired exact candidate will run CI and integration-agent review before landing.'
-                : 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
+                : fairLanding
+                  ? 'The existing task intent is preserved, but this failure released every Karmax admission slot. After repair, repository policy decides whether fresh review is required, and the proposal requests landing again at the back.'
+                  : 'The existing human intent authorization is preserved; an automated integration reviewer will validate the repair before it is requeued.'
               : 'This change invalidated the prior authorization, so the updated proposal must pass human Review.'}`
             : explicitPrCycle
               ? `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`
@@ -2982,18 +3189,20 @@ Inspect the complete current diff and specifically compare its delta from the re
         continue proposalCycle;
       }
       if (intentAuthorizedLanding && decision.status === 'queued') {
-        providerQueueAccepted = true;
+        providerQueueAccepted = !fairLanding || decision.landingOwner !== 'karmax';
         githubErrorPolls = 0;
         landing = {
           ...landing,
           validation: 'pending',
           provider: decision.providerQueue?.state ?? 'queued',
-          detail: decision.detail ?? 'GitHub owns queue order and is validating the integration candidate.',
+          authority: fairLanding ? (decision.landingOwner ?? 'provider') : landing.authority,
+          detail: decision.detail ?? 'The landing authority is validating the integration candidate.',
         };
         status = 'waiting';
         waitingFor = { kind: 'github', detail: landing.detail };
         await publish();
-        await condition(() => cancelled, input.githubPollMs ?? MERGE_POLL);
+        const providerSeen = providerChangeEpoch;
+        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3006,7 +3215,8 @@ Inspect the complete current diff and specifically compare its delta from the re
           detail: `${decision.detail ?? 'GitHub is temporarily unavailable'} Retrying automatically (${githubErrorPolls}/${MAX_GITHUB_ERROR_POLLS}).`,
         };
         await publish();
-        await condition(() => cancelled, input.githubPollMs ?? MERGE_POLL);
+        const providerSeen = providerChangeEpoch;
+        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
         waitingFor = undefined;
         if (cancelled) return await abort();
         continue;
@@ -3069,12 +3279,20 @@ Inspect the complete current diff and specifically compare its delta from the re
         continue;
       }
       githubErrorPolls = 0;
+      if (fairLanding && decision.landingOwner === 'karmax') providerQueueAccepted = false;
       if (intentAuthorizedLanding)
-        landing = { ...landing, validation: 'pending', provider: 'admitting', detail: decision.detail };
+        landing = {
+          ...landing, validation: 'pending',
+          provider: decision.landingOwner === 'karmax' ? 'validating' : 'admitting',
+          ...(fairLanding && decision.landingOwner ? { authority: decision.landingOwner } : {}),
+          detail: decision.detail,
+        };
       status = 'waiting';
       waitingFor = { kind: 'github', detail: decision.detail ?? 'Waiting for GitHub checks or merge queue.' };
       await publish();
-      await condition(() => cancelled, classifiedGithubStates ? (input.githubPollMs ?? MERGE_POLL) : '30s');
+      const providerSeen = providerChangeEpoch;
+      await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen),
+        classifiedGithubStates ? (input.githubPollMs ?? MERGE_POLL) : '30s');
       waitingFor = undefined;
       if (cancelled) return await abort();
       continue;

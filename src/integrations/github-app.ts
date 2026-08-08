@@ -273,9 +273,9 @@ export class GitHubAppService {
     // subscribe to installation_repositories explicitly.
     if (publicWebhookOrigin(parsed)) {
       manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
-      // Pull-request lifecycle is the one non-installation feed karmax subscribes
-      // to: it is what turns a PR karmax opened into task events (SPEC §5.4).
-      manifest.default_events = ['pull_request', 'pull_request_review'];
+      // PR/check/merge-group lifecycle turns provider progress for a Karmax task
+      // into durable events and wakes its reconciliation loop (SPEC §5.4).
+      manifest.default_events = ['pull_request', 'pull_request_review', 'check_run', 'merge_group'];
     }
     return {
       action: 'https://github.com/settings/apps/new',
@@ -566,7 +566,7 @@ export class GitHubAppService {
       const repositories = await this.reconcile(saved);
       return { accepted: true, reconciled: repositories.length };
     }
-    if (event === 'pull_request' || event === 'pull_request_review') {
+    if (event === 'pull_request' || event === 'pull_request_review' || event === 'check_run') {
       // The PR lifecycle karmax itself started: correlated back to its task so
       // the timeline shows it and `event` triggers can fire on it. Correlation is
       // by branch name, which anyone can pick — so the task must also belong to

@@ -235,6 +235,9 @@ describe('GitHub PR client', () => {
         path: 'src/math.test.ts', start_line: 42, annotation_level: 'failure',
         title: 'AssertionError', message: 'expected 2, received 3',
       }]);
+      if (new URL(String(input)).pathname.endsWith('/check-runs/101')) return Response.json({ output: {
+        title: 'Vitest failed', summary: 'One test failed', text: 'Complete captured check output',
+      } });
       return Response.json({ data: { repository: { pullRequest: {
       id: 'PR_failed', url: 'https://github.test/acme/widgets/pull/9', state: 'OPEN', isDraft: false,
       merged: false, headRefOid: 'failed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
@@ -253,10 +256,51 @@ describe('GitHub PR client', () => {
     await expect(api.readiness(SLUG, 9)).resolves.toMatchObject({
       checks: 'FAILURE',
       failedChecks: [
-        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/src\/math\.test\.ts:42.*AssertionError/is) },
+        { name: 'unit tests', state: 'FAILURE', url: 'https://github.test/checks/1', detail: expect.stringMatching(/Complete captured check output.*src\/math\.test\.ts:42.*AssertionError/is) },
         { name: 'lint', state: 'ERROR', url: 'https://ci.test/lint', detail: 'runner crashed' },
       ],
     });
+  });
+
+  it('reports native queue removal and reads failures from the speculative merge-group commit', async () => {
+    const fetcher = (async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith('/commits/merge-group-sha/check-runs')) return Response.json({ check_runs: [{
+        id: 202, name: 'merge train', status: 'completed', conclusion: 'failure',
+        details_url: 'https://github.test/checks/202',
+      }] });
+      if (path.endsWith('/commits/merge-group-sha/status')) return Response.json({ statuses: [{
+        context: 'external CI', state: 'error', target_url: 'https://ci.test/group', description: 'runner lost',
+      }] });
+      if (path.endsWith('/check-runs/202/annotations')) return Response.json([{
+        path: 'src/queue.test.ts', start_line: 19, title: 'AssertionError', message: 'combined code failed',
+      }]);
+      if (path.endsWith('/check-runs/202')) return Response.json({ output: {
+        title: 'Merge-group CI failed', summary: 'The speculative prefix is incompatible', text: 'full queue output',
+      } });
+      return Response.json({ data: { repository: { pullRequest: {
+        id: 'PR_queue', url: 'https://github.test/acme/widgets/pull/12', state: 'OPEN', isDraft: false,
+        merged: false, headRefOid: 'green-pr-head', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+        statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
+        timelineItems: { nodes: [{ createdAt: '2026-08-06T12:00:00Z',
+          reason: 'Required status check failed', beforeCommit: { oid: 'merge-group-sha' } }] },
+        viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+      } } } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('app-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.readiness(SLUG, 12)).resolves.toMatchObject({
+      checks: 'SUCCESS',
+      removedFromMergeQueue: {
+        createdAt: '2026-08-06T12:00:00Z', reason: 'Required status check failed',
+        beforeCommitSha: 'merge-group-sha',
+      },
+    });
+    await expect(api.failedChecksForRef(SLUG, 'merge-group-sha')).resolves.toEqual([
+      expect.objectContaining({ name: 'merge train', state: 'FAILURE',
+        detail: expect.stringMatching(/full queue output.*src\/queue\.test\.ts:19.*combined code failed/is) }),
+      { name: 'external CI', state: 'ERROR', url: 'https://ci.test/group', detail: 'runner lost' },
+    ]);
   });
 
   it('falls back to aggregate check state when the App cannot enumerate CheckRuns', async () => {
@@ -329,6 +373,27 @@ describe('GitHub PR client', () => {
     } });
   });
 
+  it('mechanically updates a behind branch with an expected-head guard', async () => {
+    let head = 'old-head';
+    let body: any;
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/update-branch')) {
+        body = JSON.parse(String(init.body));
+        head = 'updated-head';
+        return Response.json({ message: 'Updating pull request branch.' }, { status: 202 });
+      }
+      return Response.json({ number: 7, html_url: 'https://github.test/acme/widgets/pull/7', state: 'open',
+        merged: false, head: { ref: 'karmax/task_update', sha: head }, base: { ref: 'main' } });
+    }) as typeof fetch;
+    const api = new GithubPrApi('user-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    await expect(api.updateBranch(SLUG, 7, 'old-head')).resolves.toEqual({
+      requested: true, headSha: 'updated-head', message: 'Updating pull request branch.',
+    });
+    expect(body).toEqual({ expected_head_sha: 'old-head' });
+  });
+
   it('refreshes a GitHub App user token once when GitHub rejects it', async () => {
     const forced: boolean[] = [];
     const fetcher = (async (_url: string, init: RequestInit = {}) => {
@@ -385,7 +450,7 @@ describe('GitHub-authoritative merge activity', () => {
       .resolves.toEqual({ status: 'merged', prs: [] });
   });
 
-  it('does not complete a provider merge until the enrolled local target is fast-forwarded', async () => {
+  it('fast-forwards a clean enrolled local target after a provider merge', async () => {
     const repo = await repoWithGithubOrigin('mirror-after-merge');
     const writer = path.join(tmp, 'provider-writer');
     await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'mirror-after-merge-origin.git'), writer]);
@@ -427,6 +492,51 @@ describe('GitHub-authoritative merge activity', () => {
     expect(core.store.eventsSince(task.id, 0).map((event: any) => event.type)).toEqual(
       expect.arrayContaining(['checkout.synced', 'merge.result']),
     );
+  });
+
+  it('completes an authoritative provider merge while preserving a dirty local target checkout', async () => {
+    const repo = await repoWithGithubOrigin('dirty-mirror-after-merge');
+    const writer = path.join(tmp, 'dirty-provider-writer');
+    await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'dirty-mirror-after-merge-origin.git'), writer]);
+    await ensureIdentity(writer);
+    fs.writeFileSync(path.join(writer, 'landed.txt'), 'landed by GitHub\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'provider merge']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'main']);
+    const landedSha = (await gitOrThrow(writer, ['rev-parse', 'HEAD'])).trim();
+    const localBefore = (await gitOrThrow(repo, ['rev-parse', 'main'])).trim();
+    fs.writeFileSync(path.join(repo, 'operator-work.txt'), 'preserve me\n');
+
+    const fetcher = (async () => Response.json({
+      number: 92, html_url: 'https://github.test/acme/widgets/pull/92', state: 'closed', merged: true,
+      merged_at: '2026-08-07T00:00:00Z', merge_commit_sha: landedSha,
+      head: { ref: 'karmax/task_dirty_mirror', sha: landedSha }, base: { ref: 'main' },
+    })) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Dirty provider mirror');
+    const task = core.store.createTask({ projectId: project.id, title: 'Preserve local work', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const handle = {
+      id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_dirty_mirror', base: 'main',
+      repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', repo, root: repo,
+        branch: 'karmax/task_dirty_mirror', base: 'main', target: 'main', localPath: repo, sourceAuthority: 'origin' }],
+    } as any;
+    const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 92,
+      url: 'https://github.test/acme/widgets/pull/92', state: 'open', headSha: landedSha };
+
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({
+      status: 'merged', sha: landedSha,
+      prs: [expect.objectContaining({ number: 92, merged: true, state: 'closed' })],
+    });
+    expect((await gitOrThrow(repo, ['rev-parse', 'main'])).trim()).toBe(localBefore);
+    expect(fs.readFileSync(path.join(repo, 'operator-work.txt'), 'utf8')).toBe('preserve me\n');
+    expect(core.store.eventsSince(task.id, 0).map((event: any) => event.type)).toContain('checkout.sync-blocked');
   });
 
   it('uses an eligible confirming human and refuses to move beyond the reviewed head', async () => {
@@ -845,6 +955,279 @@ describe('GitHub-authoritative merge activity', () => {
       status: 'merged', sha: 'reviewed-head',
     });
     expect(requests.filter((request) => request.query?.includes('enqueuePullRequest')).length).toBe(enqueueBefore);
+  });
+
+  it('v1.20 treats behind as mechanical fallback admission and failures as ejection', async () => {
+    let liveHead = 'reviewed-head';
+    let readiness: any = { mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    const mutations: string[] = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      if (method === 'GET' && url.pathname.endsWith('/pulls/40')) return Response.json({
+        number: 40, node_id: 'PR_fair', html_url: 'https://github.test/acme/widgets/pull/40', state: 'open',
+        merged: false, head: { ref: 'karmax/task_fair', sha: liveHead }, base: { ref: 'main' },
+      });
+      if (method === 'GET' && url.pathname.endsWith('/commits/merge-group-failure/check-runs'))
+        return Response.json({ check_runs: [{ id: 501, name: 'speculative CI', conclusion: 'failure',
+          details_url: 'https://github.test/checks/501' }] });
+      if (method === 'GET' && url.pathname.endsWith('/commits/merge-group-failure/status'))
+        return Response.json({ statuses: [] });
+      if (method === 'GET' && url.pathname.endsWith('/check-runs/501/annotations'))
+        return Response.json([{ path: 'src/prefix.ts', start_line: 7, message: 'prefix assertion failed' }]);
+      if (method === 'GET' && url.pathname.endsWith('/check-runs/501'))
+        return Response.json({ output: { title: 'Queue build failed', summary: 'A + B is incompatible' } });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_fair', url: 'https://github.test/acme/widgets/pull/40', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: liveHead, viewerCanEnableAutoMerge: false,
+          viewerCanMergeAsAdmin: false, ...readiness,
+        } } } });
+      if (url.pathname === '/graphql' && String(body.query).includes('enqueuePullRequest')) {
+        mutations.push('enqueue');
+        return Response.json({ errors: [{ message: 'This branch has no merge queue' }] });
+      }
+      if (url.pathname.endsWith('/update-branch')) {
+        mutations.push('update');
+        expect(body).toEqual({ expected_head_sha: 'reviewed-head' });
+        liveHead = 'mechanically-updated-head';
+        return Response.json({ message: 'Updating pull request branch.' }, { status: 202 });
+      }
+      if (url.pathname.endsWith('/reviews')) return Response.json({ id: 1 });
+      return Response.json({ errors: [{ message: 'Auto-merge unavailable' }] });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'reviewer-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'reviewer-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Fair landing', { landingAuthority: 'auto' });
+    core.store.setOrganizationMembership(project.organizationId!, 'reviewer', 'member');
+    core.store.setProjectMembership(project.id, { kind: 'user', userId: 'reviewer' }, 'reviewer');
+    const task = core.store.createTask({ projectId: project.id, title: 'Land fairly', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'reviewer', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 40, headSha: 'reviewed-head' }],
+    } });
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_fair', base: 'main', repo: tmp, root: tmp } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 40, nodeId: 'PR_fair',
+      url: 'https://github.test/acme/widgets/pull/40', state: 'open', headSha: 'reviewed-head' }];
+
+    const updated = await core.mergeGithubPrs(handle, refs, { mode: 'submit', authority: 'auto' });
+    expect(updated).toMatchObject({
+      status: 'waiting', landingOwner: 'karmax',
+      prs: [expect.objectContaining({ headSha: 'mechanically-updated-head' })],
+      detail: expect.stringMatching(/mechanically updated.*fallback admission/is),
+    });
+    expect(mutations).toEqual(['enqueue', 'update']);
+
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } } };
+    const beforeHandoff = [...mutations];
+    await expect(core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' }))
+      .resolves.toMatchObject({
+        status: 'waiting', landingOwner: 'karmax',
+        detail: expect.stringMatching(/no longer reports an active landing entry.*fallback admission/is),
+      });
+    expect(mutations).toEqual(beforeHandoff);
+
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'StatusContext', context: 'test', state: 'FAILURE', description: 'assertion failed',
+      }] } } };
+    const failed = await core.mergeGithubPrs(handle, updated.prs, { mode: 'submit', authority: 'auto' });
+    expect(failed).toMatchObject({
+      status: 'needs-revision', repair: { kind: 'ci', preserveAuthorization: true },
+    });
+    expect(failed).not.toHaveProperty('landingOwner');
+
+    const enqueuedAt = Date.now();
+    core.store.appendEvent({ taskId: task.id, type: 'github.pr.queued', ts: enqueuedAt, payload: {
+      slug: SLUG, number: 40, headSha: 'mechanically-updated-head',
+    } });
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
+      timelineItems: { nodes: [{ createdAt: new Date(enqueuedAt + 1_000).toISOString(),
+        reason: 'Required status check failed', beforeCommit: { oid: 'merge-group-failure' } }] } };
+    const ejected = await core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' });
+    expect(ejected).toMatchObject({
+      status: 'needs-revision', repair: { kind: 'ci', preserveAuthorization: true },
+      detail: expect.stringMatching(/Required status check failed.*merge-group-failure.*speculative CI.*A \+ B is incompatible.*src\/prefix\.ts:7/is),
+    });
+    expect(ejected).not.toHaveProperty('landingOwner');
+  });
+
+  it('v1.20 observes an explicitly external landing authority without shadow mutations', async () => {
+    const mutations: string[] = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      if (url.pathname.endsWith('/update-branch') || url.pathname.endsWith('/merge')
+        || String(body.query).includes('enqueuePullRequest') || String(body.query).includes('enablePullRequestAutoMerge'))
+        mutations.push(`${method} ${url.pathname}`);
+      if (method === 'GET') return Response.json({ number: 41, node_id: 'PR_external',
+        html_url: 'https://github.test/acme/widgets/pull/41', state: 'open', merged: false,
+        head: { ref: 'karmax/task_external', sha: 'external-head' }, base: { ref: 'main' } });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_external', url: 'https://github.test/acme/widgets/pull/41', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: 'external-head', mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND',
+          statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
+          viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+        } } } });
+      if (url.pathname.endsWith('/reviews')) return Response.json({ id: 1 });
+      return Response.json({ message: 'unexpected mutation' }, { status: 500 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('External landing', { landingAuthority: 'external' });
+    const task = core.store.createTask({ projectId: project.id, title: 'Observe me', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const ref = { repo: 'widgets', slug: SLUG, number: 41, nodeId: 'PR_external',
+      url: 'https://github.test/acme/widgets/pull/41', state: 'open', headSha: 'external-head' } as TaskPullRequest;
+
+    await expect(core.mergeGithubPrs({ id: task.id } as any, [ref], { mode: 'submit', authority: 'external' }))
+      .resolves.toMatchObject({ status: 'queued', landingOwner: 'external' });
+    expect(mutations).toEqual([]);
+  });
+
+  it('v1.21 preflights every PR before claiming any provider and assigns canonical owners per target', async () => {
+    const mutations: string[] = [];
+    let secondFails = true;
+    const headFor = (number: number) => number === 51 ? 'head-a' : 'head-b';
+    const slugFor = (number: number) => number === 51 ? 'acme/service-a' : 'acme/service-b';
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      const pull = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/);
+      if (method === 'GET' && pull) {
+        const number = Number(pull[2]);
+        return Response.json({ number, node_id: `PR_${number}`, html_url: `https://github.test/${pull[1]}/pull/${number}`,
+          state: 'open', merged: false, head: { ref: `karmax/task-${number}`, sha: headFor(number) }, base: { ref: 'main' } });
+      }
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness')) {
+        const number = Number(body.variables?.number);
+        const failing = secondFails && number === 52;
+        return Response.json({ data: { repository: { pullRequest: {
+          id: `PR_${number}`, url: `https://github.test/${slugFor(number)}/pull/${number}`, state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: headFor(number), mergeable: 'MERGEABLE', mergeStateStatus: failing ? 'UNSTABLE' : 'CLEAN',
+          statusCheckRollup: { state: failing ? 'FAILURE' : 'SUCCESS', contexts: { nodes: [] } },
+          viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+        } } } });
+      }
+      if (url.pathname === '/graphql' && String(body.query).includes('enqueuePullRequest')) {
+        const id = body.variables?.input?.pullRequestId;
+        mutations.push(`enqueue:${id}`);
+        return id === 'PR_51'
+          ? Response.json({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'MQ_51' } } } })
+          : Response.json({ data: { enqueuePullRequest: { mergeQueueEntry: null } } });
+      }
+      if (url.pathname === '/graphql' && String(body.query).includes('enablePullRequestAutoMerge')) {
+        mutations.push(`auto:${body.variables?.input?.pullRequestId}`);
+        return Response.json({ errors: [{ message: 'Auto-merge unavailable' }] });
+      }
+      if (url.pathname === '/graphql' && String(body.query).includes('dequeuePullRequest')) {
+        mutations.push(`dequeue:${body.variables?.input?.pullRequestId}`);
+        return Response.json({ data: { dequeuePullRequest: { mergeQueueEntry: null } } });
+      }
+      if (url.pathname === '/graphql' && String(body.query).includes('disablePullRequestAutoMerge')) {
+        mutations.push(`disable:${body.variables?.input?.pullRequestId}`);
+        return Response.json({ errors: [{ message: 'Auto-merge was not enabled' }] });
+      }
+      if (url.pathname.endsWith('/reviews')) return Response.json({ id: 1 });
+      return Response.json({ message: `unexpected ${method} ${url.pathname}` }, { status: 500 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async (_user: string, slug: string) => ({ slug, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Participant landing', { landingAuthority: 'auto' });
+    const task = core.store.createTask({ projectId: project.id, title: 'Land both', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const refs: TaskPullRequest[] = [51, 52].map((number) => ({ repo: `service-${number}`, slug: slugFor(number), number,
+      nodeId: `PR_${number}`, url: `https://github.test/${slugFor(number)}/pull/${number}`,
+      state: 'open', headSha: headFor(number) }));
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'owner', satisfied: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: refs.map(({ slug, number, headSha }) => ({ slug, number, headSha })),
+    } });
+
+    const failed = await core.mergeGithubPrs({ id: task.id } as any, refs, { mode: 'preflight', authority: 'auto' });
+    expect(failed).toMatchObject({ status: 'needs-revision', repair: { kind: 'ci' } });
+    expect(mutations).toEqual([]);
+
+    secondFails = false;
+    const planned = await core.mergeGithubPrs({ id: task.id } as any, refs, { mode: 'preflight', authority: 'auto' });
+    expect(planned).toMatchObject({
+      status: 'planned',
+      participants: [
+        { key: 'acme/service-a#51', owner: 'unowned', domain: 'github:acme/service-a:main' },
+        { key: 'acme/service-b#52', owner: 'unowned', domain: 'github:acme/service-b:main' },
+      ],
+    });
+    const claimedA = await core.mergeGithubPrs({ id: task.id } as any, [refs[0]!], { mode: 'claim-provider', authority: 'auto' });
+    const claimedB = await core.mergeGithubPrs({ id: task.id } as any, [refs[1]!], { mode: 'claim-provider', authority: 'auto' });
+    expect(claimedA).toMatchObject({ status: 'queued', landingOwner: 'provider', participants: [{ owner: 'provider' }] });
+    expect(claimedB).toMatchObject({ status: 'waiting', landingOwner: 'karmax',
+      participants: [{ owner: 'karmax', domain: 'github:acme/service-b:main' }] });
+    expect(mutations).toEqual(['enqueue:PR_51', 'enqueue:PR_52', 'auto:PR_52']);
+
+    const withdrawn = await core.withdrawGithubPrs({ id: task.id } as any, [refs[0]!], 'owner');
+    expect(withdrawn).toMatchObject({ withdrawn: ['acme/service-a#51'], failed: {}, reconciled: [refs[0]] });
+    expect(mutations.slice(-2)).toEqual(['dequeue:PR_51', 'disable:PR_51']);
+  });
+
+  it('v1.21 fails closed before publication when a changed PR-policy checkout has no GitHub target', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh, {
+      activeUserAccountId: () => 'owner-account',
+      status: () => ({ userAuthorized: true, oauthConfigured: true }),
+      userAccessToken: async () => 'owner-token',
+    });
+    const githubRepo = await repoWithGithubOrigin('hybrid-github', 'acme/hybrid');
+    const localRepo = path.join(tmp, 'hybrid-local');
+    fs.mkdirSync(localRepo, { recursive: true });
+    await gitOrThrow(localRepo, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(localRepo);
+    fs.writeFileSync(path.join(localRepo, 'base.txt'), 'base\n');
+    await git(localRepo, ['add', '-A']);
+    await git(localRepo, ['commit', '-q', '-m', 'init']);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Hybrid fail closed', { repos: [githubRepo, localRepo], remote: 'pr' });
+    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'hybrid-installation', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'hybrid-repo', owner: 'acme', name: 'hybrid', sshUrl: 'git@github.com:acme/hybrid.git',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = core.store.createTask({ projectId: project.id, title: 'Hybrid', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repos: [githubRepo, localRepo],
+      base: 'main', target: 'main', kind: 'worktree' });
+    for (const repo of handle.repos!.filter((candidate: any) => candidate.role !== 'project-wiki')) {
+      fs.writeFileSync(path.join(repo.root, 'change.txt'), `${repo.name}\n`);
+      await git(repo.root, ['add', '-A']);
+      await git(repo.root, ['commit', '-q', '-m', 'change']);
+    }
+
+    await expect(core.openPr(handle, 'main', { title: 'Hybrid' })).rejects.toThrow(/changed checkout.*no GitHub PR target/i);
+    expect(gh.prs).toHaveLength(0);
+    await core.destroyWorld(handle);
   });
 
   it('separates transient GitHub outages from authorization failures', async () => {
@@ -1288,6 +1671,21 @@ describe('PR webhooks → karmax events', () => {
     expect(pullRequestWebhookEvent('push', delivery('opened'))).toBeUndefined();
   });
 
+  it('correlates a completed check run to the task branch for prompt reconciliation', () => {
+    const event = pullRequestWebhookEvent('check_run', {
+      action: 'completed', repository: { full_name: SLUG }, check_run: {
+        name: 'CI', status: 'completed', conclusion: 'failure', details_url: 'https://ci.test/run/1',
+        check_suite: { head_branch: 'karmax/task_abc' },
+      },
+    });
+    expect(event).toMatchObject({ taskId: 'task_abc', type: 'github.check.completed', payload: {
+      name: 'CI', conclusion: 'failure', branch: 'karmax/task_abc', repo: SLUG,
+    } });
+    expect(pullRequestWebhookEvent('check_run', {
+      action: 'created', check_run: { check_suite: { head_branch: 'karmax/task_abc' } },
+    })).toBeUndefined();
+  });
+
   it('an event trigger matches the merged event', async () => {
     const { eventMatchesEventTrigger } = await import('../src/domain/triggers.js');
     const event = pullRequestWebhookEvent('pull_request',
@@ -1309,6 +1707,12 @@ describe('PR webhooks → karmax events', () => {
       pullRequestWebhookEvent('pull_request', delivery('closed', { state: 'closed', merged: true }))!,
       pullRequestWebhookEvent('pull_request_review',
         { ...delivery('submitted'), review: { state: 'approved', user: { login: 'ada' } } })!,
+      pullRequestWebhookEvent('check_run', {
+        action: 'completed', repository: { full_name: SLUG }, check_run: {
+          name: 'CI', status: 'completed', conclusion: 'success', details_url: 'https://ci.test/run/1',
+          check_suite: { head_branch: 'karmax/task_abc' },
+        },
+      })!,
     ];
     for (const event of emitted) {
       const declared = byType.get(event.type);

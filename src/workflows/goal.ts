@@ -20,6 +20,7 @@ import {
   softwareDevV1_18,
   softwareDevV1_19,
   softwareDevV1_20,
+  softwareDevV1_21,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -128,9 +129,14 @@ export async function goalV1_19(input: TaskInput): Promise<{ stage: Stage; sha?:
   return softwareDevV1_19({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
-/** Repository-less completion without Git or merge machinery. */
+/** Repository-less completion or provider-owned landing with fair fallback. */
 export async function goalV1_20(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_20({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Per-participant multi-repository landing. */
+export async function goalV1_21(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_21({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

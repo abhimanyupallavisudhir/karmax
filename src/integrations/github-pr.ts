@@ -40,6 +40,12 @@ export interface GithubRefUpdateResult {
   message: string;
 }
 
+export interface GithubBranchUpdateResult {
+  requested: boolean;
+  headSha?: string;
+  message: string;
+}
+
 export type GithubMergeMethod = 'merge' | 'squash' | 'rebase';
 export type GithubPullRequestMergeable = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
 export type GithubPullRequestMergeState =
@@ -77,6 +83,14 @@ export interface GithubPullRequestReadiness {
   checksUnavailable?: true;
   failedChecks?: GithubFailedCheck[];
   mergeQueueEntryId?: string;
+  /** Most recent durable GitHub timeline record for removal from a native
+   * merge queue. `beforeCommitSha` is the speculative merge-group commit whose
+   * checks/policy produced that decision, not necessarily the PR head. */
+  removedFromMergeQueue?: {
+    createdAt: string;
+    reason?: string;
+    beforeCommitSha?: string;
+  };
   autoMerge?: { enabledAt: string; mergeMethod: GithubMergeMethod };
   viewerCanEnableAutoMerge: boolean;
   viewerCanMergeAsAdmin: boolean;
@@ -244,6 +258,31 @@ export class GithubPrApi {
     };
   }
 
+  /** Best-effort saga cleanup when a sibling PR fails after this participant
+   * was already handed to GitHub.  A race may have merged it already; callers
+   * therefore treat a refusal as an observed partial landing, never as rollback. */
+  async dequeue(nodeId: string): Promise<{ withdrawn: boolean; message: string }> {
+    const value = await this.graphql<any>(
+      'mutation($input:DequeuePullRequestInput!){ dequeuePullRequest(input:$input){ mergeQueueEntry{ id } } }',
+      { input: { pullRequestId: nodeId } },
+    );
+    const message = value?.errors?.[0]?.message
+      ? String(value.errors[0].message)
+      : 'Pull request removed from the merge queue';
+    return { withdrawn: !value?.errors?.length, message };
+  }
+
+  async disableAutoMerge(nodeId: string): Promise<{ withdrawn: boolean; message: string }> {
+    const value = await this.graphql<any>(
+      'mutation($input:DisablePullRequestAutoMergeInput!){ disablePullRequestAutoMerge(input:$input){ pullRequest{ id autoMergeRequest{ enabledAt } } } }',
+      { input: { pullRequestId: nodeId } },
+    );
+    const message = value?.errors?.[0]?.message
+      ? String(value.errors[0].message)
+      : 'Pull request auto-merge disabled';
+    return { withdrawn: !value?.errors?.length, message };
+  }
+
   /** Atomically advance a target ref to the exact candidate that CI inspected.
    * `force:false` is the compare-and-swap property we need: if the target moved
    * beyond a commit contained in `headSha`, GitHub rejects the non-fast-forward
@@ -282,6 +321,13 @@ export class GithubPrApi {
             }` : ''}
           }`}
           mergeQueueEntry { id }
+          timelineItems(last: 10, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+            nodes {
+              ... on RemovedFromMergeQueueEvent {
+                createdAt reason beforeCommit { oid }
+              }
+            }
+          }
           autoMergeRequest { enabledAt mergeMethod }
           viewerCanEnableAutoMerge viewerCanMergeAsAdmin
         }
@@ -343,28 +389,8 @@ export class GithubPrApi {
       }
       return [];
     }) as Array<GithubFailedCheck & { databaseId?: number }>;
-    // Optional CheckRun summary/text fields require GitHub App Checks permission;
-    // asking for them makes the entire readiness query fail for an otherwise
-    // authorized user token. Fetch annotations separately as best-effort
-    // enrichment: third-party contexts and restricted Apps retain the check name,
-    // state and details URL even when that REST call is forbidden.
-    for (const check of failedCheckCandidates) {
-      if (!check.databaseId) continue;
-      const annotations = await this.request<any[]>(
-        `/repos/${slug}/check-runs/${check.databaseId}/annotations?per_page=10`,
-      ).catch(() => undefined);
-      if (!Array.isArray(annotations) || !annotations.length) continue;
-      const rendered = annotations.slice(0, 10).map((annotation) => {
-        const location = annotation.path
-          ? `${annotation.path}${annotation.start_line ? `:${annotation.start_line}` : ''}`
-          : undefined;
-        const message = [annotation.title, annotation.message, annotation.raw_details]
-          .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join(' — ');
-        return `${location ? `${location}: ` : ''}${message || annotation.annotation_level || 'check annotation'}`;
-      }).join('\n');
-      check.detail = [check.detail, rendered].filter(Boolean).join('\n').slice(0, 2400);
-    }
-    const failedChecks: GithubFailedCheck[] = failedCheckCandidates.map(({ databaseId: _databaseId, ...check }) => check);
+    const failedChecks = await this.enrichFailedChecks(slug, failedCheckCandidates);
+    const removed = (raw.timelineItems?.nodes ?? []).filter(Boolean).at(-1);
     return {
       nodeId: String(raw.id),
       url: String(raw.url),
@@ -379,11 +405,79 @@ export class GithubPrApi {
       ...(checksUnavailable ? { checksUnavailable: true as const } : {}),
       ...(failedChecks.length ? { failedChecks } : {}),
       ...(raw.mergeQueueEntry?.id ? { mergeQueueEntryId: String(raw.mergeQueueEntry.id) } : {}),
+      ...(removed?.createdAt ? { removedFromMergeQueue: {
+        createdAt: String(removed.createdAt),
+        ...(removed.reason ? { reason: String(removed.reason) } : {}),
+        ...(removed.beforeCommit?.oid ? { beforeCommitSha: String(removed.beforeCommit.oid) } : {}),
+      } } : {}),
       ...(raw.autoMergeRequest ? { autoMerge: { enabledAt: String(raw.autoMergeRequest.enabledAt),
         mergeMethod: String(raw.autoMergeRequest.mergeMethod).toLowerCase() as GithubMergeMethod } } : {}),
       viewerCanEnableAutoMerge: Boolean(raw.viewerCanEnableAutoMerge),
       viewerCanMergeAsAdmin: Boolean(raw.viewerCanMergeAsAdmin),
     };
+  }
+
+  /** Failed checks for an arbitrary commit, including a temporary merge-group
+   * commit that is no longer reachable through the PR head after queue
+   * ejection. Both Checks and legacy commit-status providers are represented. */
+  async failedChecksForRef(slug: string, ref: string): Promise<GithubFailedCheck[]> {
+    const encoded = encodeURIComponent(ref);
+    const [runs, combined] = await Promise.all([
+      this.request<any>(`/repos/${slug}/commits/${encoded}/check-runs?per_page=100&filter=latest`)
+        .catch(() => undefined),
+      this.request<any>(`/repos/${slug}/commits/${encoded}/status?per_page=100`)
+        .catch(() => undefined),
+    ]);
+    const candidates: Array<GithubFailedCheck & { databaseId?: number }> = [];
+    for (const run of runs?.check_runs ?? []) {
+      const state = String(run?.conclusion ?? run?.status ?? 'UNKNOWN').toUpperCase();
+      if (!['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) continue;
+      candidates.push({
+        name: String(run?.name ?? 'GitHub check'), state,
+        ...(run?.id ? { databaseId: Number(run.id) } : {}),
+        ...(run?.details_url ? { url: String(run.details_url) } : {}),
+      });
+    }
+    for (const status of combined?.statuses ?? []) {
+      const state = String(status?.state ?? 'UNKNOWN').toUpperCase();
+      if (!['ERROR', 'FAILURE'].includes(state)) continue;
+      candidates.push({
+        name: String(status?.context ?? 'GitHub status'), state,
+        ...(status?.target_url ? { url: String(status.target_url) } : {}),
+        ...(status?.description ? { detail: String(status.description).slice(0, 1200) } : {}),
+      });
+    }
+    return this.enrichFailedChecks(slug, candidates);
+  }
+
+  /** CheckRun summary/text fields are permission-sensitive in GraphQL. Fetch
+   * them and the concrete file annotations separately so a Do agent receives
+   * the complete provider diagnostic whenever GitHub makes it available. */
+  private async enrichFailedChecks(slug: string,
+    candidates: Array<GithubFailedCheck & { databaseId?: number }>): Promise<GithubFailedCheck[]> {
+    for (const check of candidates) {
+      if (!check.databaseId) continue;
+      const run = await this.request<any>(`/repos/${slug}/check-runs/${check.databaseId}`)
+        .catch(() => undefined);
+      const output = run?.output
+        ? [run.output.title, run.output.summary, run.output.text]
+          .map((value) => typeof value === 'string' ? value.trim() : '')
+          .filter(Boolean).join('\n')
+        : '';
+      const annotations = await this.request<any[]>(
+        `/repos/${slug}/check-runs/${check.databaseId}/annotations?per_page=100`,
+      ).catch(() => undefined);
+      const rendered = (Array.isArray(annotations) ? annotations : []).map((annotation) => {
+        const location = annotation.path
+          ? `${annotation.path}${annotation.start_line ? `:${annotation.start_line}` : ''}`
+          : undefined;
+        const message = [annotation.title, annotation.message, annotation.raw_details]
+          .map((value) => typeof value === 'string' ? value.trim() : '').filter(Boolean).join(' — ');
+        return `${location ? `${location}: ` : ''}${message || annotation.annotation_level || 'check annotation'}`;
+      }).join('\n');
+      check.detail = [check.detail, output, rendered].filter(Boolean).join('\n').slice(0, 24_000);
+    }
+    return candidates.map(({ databaseId: _databaseId, ...check }) => check);
   }
 
   /** Enable GitHub auto-merge only while the PR still points at `headSha`. */
@@ -405,6 +499,30 @@ export class GithubPrApi {
         ? String(value.errors[0].message)
         : request ? 'Pull request auto-merge enabled' : 'GitHub did not enable pull request auto-merge',
     };
+  }
+
+  /** Ask GitHub to merge the current base into a merely-behind PR branch. This
+   * is mechanical and expected-head guarded: a real conflict is returned to the
+   * caller, while a racing writer gets a 422 rather than being overwritten. */
+  async updateBranch(slug: string, number: number, expectedHeadSha: string): Promise<GithubBranchUpdateResult> {
+    const value = await this.request<any>(`/repos/${slug}/pulls/${number}/update-branch`, {
+      method: 'PUT', body: JSON.stringify({ expected_head_sha: expectedHeadSha }),
+    }, [422]);
+    const message = String(value?.message ?? 'GitHub accepted the pull-request branch update');
+    if (/conflict|expected head|head sha|not mergeable|cannot be updated/i.test(message))
+      return { requested: false, message };
+
+    // The endpoint is asynchronous. Usually the ref moves immediately; waiting
+    // briefly here lets the activity return the new reviewed identity instead of
+    // misclassifying GitHub's own update as an external branch replacement on
+    // the next reconciliation pass.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const current = await this.get(slug, number);
+      if (current.headSha && current.headSha !== expectedHeadSha)
+        return { requested: true, headSha: current.headSha, message };
+      if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return { requested: true, message };
   }
 
   private async graphql<T = any>(query: string, variables: Record<string, unknown>): Promise<T> {
@@ -447,6 +565,19 @@ export interface GithubPrWebhookEvent {
  * events: those are the ones that belong to a task's timeline.
  */
 export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWebhookEvent | undefined {
+  if (event === 'check_run') {
+    const taskId = taskIdOfBranch(payload?.check_run?.check_suite?.head_branch);
+    if (!taskId || payload?.action !== 'completed') return undefined;
+    const run = payload.check_run;
+    return { taskId, type: 'github.check.completed', payload: {
+      name: String(run.name ?? 'GitHub check'),
+      conclusion: String(run.conclusion ?? ''),
+      status: String(run.status ?? ''),
+      branch: String(run.check_suite.head_branch),
+      ...(run.details_url ? { url: String(run.details_url) } : {}),
+      ...(payload?.repository?.full_name ? { repo: String(payload.repository.full_name) } : {}),
+    } };
+  }
   const pr = payload?.pull_request;
   const taskId = taskIdOfBranch(pr?.head?.ref);
   if (!taskId) return undefined;

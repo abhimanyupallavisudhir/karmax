@@ -222,3 +222,16 @@ describe('sub-task children inherit their parent version', () => {
     expect(BUNDLED_QUALIFIED.has(`softwareDev@${version}`)).toBe(true);
   });
 });
+
+describe('Open PR wake-up routing', () => {
+  it('runs the Do agent before reusing a proposal when conversation input is unread', async () => {
+    const { mayReuseCompletedProposalForOpenPr } = await import('../src/workflows/software-dev.js');
+
+    expect(mayReuseCompletedProposalForOpenPr(true, true, 18, 18)).toBe(true);
+    expect(mayReuseCompletedProposalForOpenPr(true, true, 19, 18)).toBe(false);
+    expect(mayReuseCompletedProposalForOpenPr(true, false, 18, 18)).toBe(false);
+    // Old histories keep the command sequence they already recorded until the
+    // Temporal patch marker reaches their live edge.
+    expect(mayReuseCompletedProposalForOpenPr(true, true, 19, 18, false)).toBe(true);
+  });
+});

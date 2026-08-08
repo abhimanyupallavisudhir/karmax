@@ -37,7 +37,6 @@ function extractConst(name) {
 {
   const ctx = {};
   const code = [
-    extractFn('waitingProviderLabel'),
     extractFn('waitingLabel'),
     extractFn('waitingText'),
     extractFn('conversationPresence'),
@@ -49,20 +48,27 @@ function extractConst(name) {
   new Function('ctx', code)(ctx);
 
   // Every coordinator wait a user can actually sit behind.
-  for (const kind of ['mergeSlot', 'agentSlot', 'account', 'subtask', 'collaboration', 'confirm', 'human']) {
+  const concise = {
+    mergeSlot: 'Waiting to merge',
+    agentSlot: 'Waiting for agent',
+    account: 'Waiting for account',
+    subtask: 'Waiting for sub-tasks',
+    collaboration: 'Waiting for collaborator',
+    confirm: 'Waiting for review',
+    human: 'Waiting for input',
+  };
+  for (const kind of Object.keys(concise)) {
     const view = { waitingFor: { kind }, agentTurn: undefined, status: 'active', stage: 'do', roles: ['do'] };
     const label = ctx.conversationPresence(view, { role: 'do' }).label;
-    // The bug rendered exactly `Waiting for <kind>`; the humanized labels never do.
-    assert.notStrictEqual(label, `Waiting for ${kind}`,
-      `check-in pane leaked the raw discriminant for ${kind}`);
+    assert.strictEqual(label, concise[kind]);
     assert.ok(!/[a-z][A-Z]/.test(label),
       `check-in pane leaked a camelCase enum: ${label}`);
     assert.ok(/^(Waiting|Starting)/.test(label), `unexpected presence label for ${kind}: ${label}`);
   }
-  // A detail string still wins where the workflow supplied one.
+  // Detailed workflow diagnostics do not spill into compact status labels.
   const detailed = ctx.conversationPresence(
     { waitingFor: { kind: 'human', detail: 'your approval' }, status: 'active', roles: ['do'] }, { role: 'do' });
-  assert.ok(detailed.label.includes('your approval'), detailed.label);
+  assert.strictEqual(detailed.label, 'Waiting for input');
   console.log('ok  waiting labels are human-readable in the check-in pane');
 }
 

@@ -16,11 +16,11 @@ export interface LocalTargetSyncResult {
  * Reconcile one already-fetched remote target into its canonical local branch.
  *
  * PR policy makes origin the protected-history authority, but a configured host
- * checkout is still the code Karmax may be running. It must therefore be a clean
- * mirror before a GitHub merge is considered locally complete. We only perform
- * a fast-forward: local-only commits or a dirty checked-out target are preserved
- * and surfaced as an invariant violation instead of being reset, overwritten, or
- * silently left behind.
+ * checkout may still be the code Karmax is running. Keep that mirror current when
+ * it is safe to do so, without ever overwriting local work. GitHub landing is an
+ * irreversible, authoritative event: a dirty/diverged checkout is recorded for
+ * deferred operator reconciliation, but cannot make the already-merged task fail
+ * or remain in Landing.
  */
 export async function syncLocalTarget(
   repository: string,

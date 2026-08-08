@@ -77,6 +77,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     h = await bootHarness('mock', adapter);
   }, 60_000);
   afterAll(async () => {
+    releaseResourceCandidateTurn?.();
+    releaseResourceCandidateTurn = undefined;
     await h?.stop();
   });
 
@@ -161,7 +163,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       taskQueue: TASK_QUEUE,
       workflowId: task.id,
       args: [input({ taskId: task.id, projectId: project.id, repo, title: task.title,
-        prompt: '@resource-candidate-regression\n@write model.js :: export const installed = true;\n@review Installed model' })],
+        prompt: '@resource-candidate-regression\n@write .gitignore ::model.bin\n'
+          + '@write model.js :: export const installed = true;\n'
+          + '@run git add .gitignore model.js && git commit -q -m "install model"\n@review Installed model' })],
     });
 
     await expect.poll(() => h.store.currentWorld(task.id), { timeout: 30_000 }).toBeTruthy();
