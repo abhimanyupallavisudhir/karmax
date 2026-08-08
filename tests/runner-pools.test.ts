@@ -267,6 +267,29 @@ describe('runner capacity and world lifecycle', () => {
     expect(destroyed).toEqual(['sb-2']);
   });
 
+  it('enumerates every organization-scoped provider connection during orphan cleanup', async () => {
+    const store = new Store(':memory:');
+    const first = store.createOrganization({ name: 'First tenant', ownerUserId: 'owner-1' });
+    const second = store.createOrganization({ name: 'Second tenant', ownerUserId: 'owner-2' });
+    for (const organization of [first, second]) store.upsertWorldProviderConnection({
+      organizationId: organization.id, provider: 'e2b', credentialHandle: `key:${organization.id}`, enabled: true,
+    });
+    const scopes: Array<string | undefined> = [];
+    const destroyed: string[] = [];
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true,
+      async listSandboxes(organizationId?: string) {
+        scopes.push(organizationId);
+        return [{ sandboxId: `gone:${organizationId}`, taskId: `deleted:${organizationId}`,
+          destroy: async () => { destroyed.push(`gone:${organizationId}`); } }];
+      } } as any);
+
+    await new WorldLifecycleManager(store, worlds, {} as any, 1_000).sweep(Date.now());
+
+    expect(scopes).toEqual(expect.arrayContaining([first.id, second.id]));
+    expect(destroyed).toEqual(expect.arrayContaining([`gone:${first.id}`, `gone:${second.id}`]));
+  });
+
   it('releases runner capacity held by an execution lost during failover', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });
