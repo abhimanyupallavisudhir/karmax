@@ -40,9 +40,21 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        const latestUser = input.messages.filter((message) => message.role === 'user').at(-1);
         if (!resourceCandidateTurnReleased
-          && input.messages.some((m) => m.text.includes('@resource-candidate-regression'))) {
-          await new Promise<void>((resolve) => { releaseResourceCandidateTurn = resolve; });
+          && latestUser?.text.includes('@resource-candidate-regression')) {
+          await new Promise<void>((resolve, reject) => {
+            const onAbort = () => {
+              releaseResourceCandidateTurn = undefined;
+              reject(new Error('aborted'));
+            };
+            releaseResourceCandidateTurn = () => {
+              ctx.signal?.removeEventListener('abort', onAbort);
+              resolve();
+            };
+            if (ctx.signal?.aborted) onAbort();
+            else ctx.signal?.addEventListener('abort', onAbort, { once: true });
+          });
           return mock.runTurn(input, ctx);
         }
         if (input.messages.some((m) => m.text.includes('@cancel-cleanup-regression'))) {

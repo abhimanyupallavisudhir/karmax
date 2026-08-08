@@ -141,7 +141,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/organizations/:organizationId/git-connections/:connectionId',
   ],
   vault: [
-    'GET|POST /api/vault/items (typed credential items; secret fields are write-only)', 'DELETE /api/vault/items/:id',
+    'GET|POST /api/vault/items (typed credential items; list/save responses never contain secrets)', 'POST /api/vault/items/:id/reveal (human vault administrator only; audited)', 'DELETE /api/vault/items/:id',
     'POST /api/vault/import/bitwarden (one-time plaintext Bitwarden JSON export; idempotent by Bitwarden item id; encrypted immediately and the request body is not retained as a file)',
     'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
     'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; body {itemId?|domain?, field?})',

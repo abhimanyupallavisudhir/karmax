@@ -948,6 +948,34 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(items)).not.toContain('hunter2');
     expect(items.map((i: any) => i.id)).toContain(created.id);
 
+    // A vault administrator may explicitly inspect a stored field without
+    // weakening the independent "agent sees" policy. The inspection is still
+    // a plaintext reveal, so it is audited.
+    const inspectedResponse = await fetch(`${base}/api/vault/items/${created.id}/reveal`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ field: 'password' }),
+    });
+    expect(inspectedResponse.headers.get('cache-control')).toBe('private, no-store');
+    const inspected: any = await inspectedResponse.json();
+    expect(inspected).toMatchObject({ itemId: created.id, field: 'password', value: 'hunter2' });
+    expect(h.store.auditSince().some((entry: any) => entry.action === 'vault.revealed'
+      && entry.detail.itemId === created.id && entry.detail.field === 'password')).toBe(true);
+
+    // This administrative endpoint must never become a shortcut around the
+    // item grant/policy checks for a task-agent, even if its role happens to
+    // carry credential:write.
+    const taskAgent = h.tokens.mint({
+      taskId: 'task_admin_reveal', profileId: 'do', principal: 'user:test', organizationId: 'org_personal',
+      ceiling: ['credential:write'], grantorCaps: ['credential:write'],
+    });
+    const agentInspection = await fetch(`${base}/api/vault/items/${created.id}/reveal`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${taskAgent.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ field: 'password' }),
+    });
+    expect(agentInspection.status).toBe(403);
+    const agentInspectionBody: any = await agentInspection.json();
+    expect(agentInspectionBody.error).toMatch(/human vault administrator/);
+
     // reveal policy 'ask' gates even an all-capability caller
     const asked: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();
     expect(asked.status).toBe('needs_approval');

@@ -27,7 +27,9 @@ import { paths } from '../config/paths.js';
 export type VaultItemType = 'login' | 'api-key' | 'ssh-key' | 'env' | 'passkey' | 'note';
 export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'env' | 'passkey' | 'note';
 
-/** The secret fields each item type may carry (write-only through the API). */
+/** The secret fields each item type may carry. Item CRUD never returns their
+ * values; the gateway's separate human-administrator inspection route resolves
+ * one field explicitly and records the reveal in the audit log. */
 export const ITEM_FIELDS: Record<VaultItemType, VaultFieldName[]> = {
   login: ['password', 'totp'],
   'api-key': ['secret'],

@@ -52,6 +52,9 @@ ok(!passwords.includes('class="vault-items-list"'), 'settings no longer renders 
 ok(vaultCards.includes('class="modal-card vault-manager-modal"'), 'settings button opens a full vault manager');
 ok(vaultCards.includes('class="vault-search"'), 'settings manager offers credential search');
 ok(vaultCards.includes('data-vi-rotate'), 'settings manager retains secret rotation');
+ok(vaultCards.includes('data-vi-reveal'), 'settings manager lets a vault administrator inspect a credential');
+ok(vaultCards.includes('/reveal'), 'settings manager uses the audited administrative reveal endpoint');
+ok(vaultCards.includes('Every reveal is recorded in the audit log'), 'settings manager explains that plaintext inspection is audited');
 ok(vaultCards.includes('data-vi-del'), 'settings manager retains deletion');
 ok(vaultCards.includes('class="vi-pol-use"'), 'settings manager retains global policy actions');
 
