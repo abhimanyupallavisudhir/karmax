@@ -64,4 +64,32 @@ describe('agent turn admission', () => {
     expect(error.message).toContain('agent-slot admission failed');
     await world.destroy();
   });
+
+  it('classifies a remote sandbox reconnect timeout as retryable infrastructure', async () => {
+    const store = new Store(':memory:');
+    const worlds = new WorldRegistry();
+    worlds.register({
+      kind: 'fake-remote', capabilities: { remote: true },
+      async create() { throw new Error('unused'); },
+      async open() {
+        throw Object.assign(new Error('E2B reconnect failed'), { code: 'ETIMEDOUT' });
+      },
+      async destroy() {},
+    } as any);
+    const core = makeCoreActivities({
+      store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock'),
+    });
+
+    const error = await core.runAgentTurn({
+      taskId: 'reconnect-task', role: 'do',
+      worldHandle: { kind: 'fake-remote', id: 'reconnect-task', root: '/workspace',
+        branch: 'karmax/reconnect-task', base: 'main' },
+      messages: [{ id: 'm0', role: 'user', text: 'continue', ts: 0 }],
+      task: { projectId: 'project', title: 'Reconnect', prompt: 'continue', project: {},
+        workflow: 'software-dev' },
+    } as any).then(() => undefined, (caught) => caught);
+
+    expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false });
+    store.close();
+  });
 });
