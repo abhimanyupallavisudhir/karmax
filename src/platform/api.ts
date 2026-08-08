@@ -993,6 +993,13 @@ export class KarmaxApi {
       ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
+    // `none` means a completed merge may remain only in its local world. That is
+    // a valid self-hosted choice, but never a valid outcome for a disposable
+    // hosted GitHub world. Coerce legacy settings rows here so every newly
+    // started task in an existing hosted project gets the new PR contract. An
+    // already-running Temporal execution keeps its recorded input unchanged.
+    if (this.deps.hosted && (resolved.remote === undefined || resolved.remote === 'none'))
+      resolved.remote = 'pr';
     this.materializeUnifiedAgents(resolved, project.id);
 
     // Auto-detect the repo's default branch when base/target weren't set anywhere,
@@ -3949,7 +3956,21 @@ export class KarmaxApi {
     const settingsOnly = MANIFESTS
       .filter((m) => m.kind === 'coordinator' && m.params.length)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
-    return [...taskSchemas, ...settingsOnly];
+    const schemas = [...taskSchemas, ...settingsOnly];
+    if (!this.deps.hosted) return schemas;
+    return schemas.map((schema) => ({
+      ...schema,
+      params: Array.isArray(schema.params) ? schema.params.map((raw) => {
+        const field = raw as FieldSpec;
+        if (field.name !== 'remote' || field.type !== 'select') return field;
+        return {
+          ...field,
+          options: ['pr', 'push'],
+          default: 'pr',
+          help: 'How completed hosted repository work lands: pr — open the exact GitHub proposal before Review and land it under a confirming human’s GitHub authorization; push — advanced direct push without a pull request.',
+        } satisfies FieldSpec;
+      }) : schema.params,
+    }));
   }
 
   /**

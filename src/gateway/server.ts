@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
-import { KarmaxApi, CapabilityError } from '../platform/api.js';
+import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
@@ -1684,7 +1684,8 @@ export class Gateway {
           const b = await this.body(req);
           let project;
           try {
-            project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
+            project = store.createProject(String(b.name ?? 'New project'),
+              normalizeConfig(b.config, false, this.deps.hosted === true), organizationId);
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
           await this.ensureProjectWiki(project, session.userId);
@@ -1938,7 +1939,8 @@ export class Gateway {
         const b = await this.body(req);
         let project;
         try {
-          project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+          project = store.createProject(b.name ?? 'New project',
+            normalizeConfig(b.config, true, false));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         await this.ensureProjectWiki(project, session.userId);
         await this.spawnProjectPrepTask(token, project.id);
@@ -1951,7 +1953,7 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
-            const config = normalizeConfig(b.config);
+            const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = store.getProject(id);
             if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&
                 !this.deps.providerConnections?.available(project.organizationId, config.worldProvider)) {
@@ -4760,8 +4762,17 @@ export class Gateway {
         const gs = (s: string, w: string) => store.getSettings(s, w);
         const project = store.getProject(projectId);
         const organizationId = url.searchParams.get('organizationId') ?? project?.organizationId;
-        const globalVals = { ...globalSettingsFor(gs, wf, organizationId ?? undefined) };
-        const projectVals = project ? { ...projectSettingsFor(gs, project, wf) } : {};
+        let globalVals = { ...globalSettingsFor(gs, wf, organizationId ?? undefined) };
+        let projectVals = project ? { ...projectSettingsFor(gs, project, wf) } : {};
+        if (this.deps.hosted) {
+          // Old hosted rows may have inherited or explicitly stored the former
+          // local-only default. Show the effective hosted contract in every
+          // settings form; newly started tasks are independently normalized in
+          // KarmaxApi so an old client cannot bypass this presentation layer.
+          if (globalVals.remote === undefined || globalVals.remote === 'none')
+            globalVals = { ...globalVals, remote: 'pr' };
+          if (projectVals.remote === 'none') projectVals = { ...projectVals, remote: 'pr' };
+        }
         // "Agent environment" (worldProvider) is stored in the execution policy, not
         // the settings rows — surface the real organization default + project override
         // so the Task Defaults form shows and inherits the true selection (§11).
@@ -4805,7 +4816,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
-          const values = b.values ?? {};
+          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
           store.setSettings(`organization:${organizationId}`, wf!, values);
           // The organization "Agent environment" default lives in the execution
           // policy (so runner-pool compatibility and effectiveProjectConfig agree);
@@ -4822,7 +4833,8 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, quickGlobalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
-          store.setSettings(`quick:organization:${organizationId}`, wf!, b.values ?? {});
+          store.setSettings(`quick:organization:${organizationId}`, wf!,
+            hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -4838,8 +4850,9 @@ export class Gateway {
           if (wf === 'appearance' && !isBrandIcon(b.values?.icon)) {
             return this.json(res, 400, { error: 'Unknown brand icon' });
           }
-          store.setSettings('global', wf, b.values ?? {});
-          if (wf === 'agent-queue') await api.setAgentCapacity(token, Number(b.values?.capacity));
+          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
+          store.setSettings('global', wf, values);
+          if (wf === 'agent-queue') await api.setAgentCapacity(token, Number(values.capacity));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -4854,7 +4867,7 @@ export class Gateway {
         }
         if (method === 'PUT') {
           const b = await this.body(req);
-          const values = b.values ?? {};
+          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
           store.setSettings(projectId, wf, values);
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
@@ -4876,7 +4889,8 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, quickGlobalSettingsFor((s, w) => store.getSettings(s, w), wf));
         if (method === 'PUT') {
           const b = await this.body(req);
-          store.setSettings(quickScopeKey('global'), wf, b.values ?? {});
+          store.setSettings(quickScopeKey('global'), wf,
+            hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -4893,7 +4907,8 @@ export class Gateway {
           const b = await this.body(req);
           // Quick-task defaults are UI-only overlays (never mirrored into ProjectConfig,
           // which drives full-form/general resolution), so just persist the row.
-          store.setSettings(quickScopeKey(projectId), wf, b.values ?? {});
+          store.setSettings(quickScopeKey(projectId), wf,
+            hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -6060,8 +6075,15 @@ function escapeHtml(value: string): string {
 }
 
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */
-function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = false): ProjectConfig {
-  if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
+function normalizeConfig(
+  config: ProjectConfig = {},
+  defaultHostedProvider = false,
+  hosted = process.env.KARMAX_DEPLOYMENT === 'hosted',
+): ProjectConfig {
+  if (hosted) {
+    if (config.remote === 'none')
+      throw new ValidationError('Hosted GitHub projects cannot use remote policy "none"; use "pr" or the advanced direct-push policy.');
+    if (config.remote === undefined) config = { ...config, remote: 'pr' };
     const worldProvider = config.worldProvider ?? (defaultHostedProvider
       ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
       : undefined);
@@ -6073,6 +6095,12 @@ function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = fal
     return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
   }
   return config;
+}
+
+function hostedSettingsValues(values: Record<string, unknown>, hosted: boolean): Record<string, unknown> {
+  if (hosted && values.remote === 'none')
+    throw new ValidationError('Hosted GitHub projects cannot use remote policy "none"; use "pr" or the advanced direct-push policy.');
+  return values;
 }
 
 const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;

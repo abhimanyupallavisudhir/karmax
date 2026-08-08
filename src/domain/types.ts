@@ -452,10 +452,11 @@ export interface ProjectConfig {
   openGithubPr?: boolean;
   /**
    * Remote policy (PLAN-git-config.md §5): what leaves the machine, and when.
-   * 'none' (default) — merges are local. 'push' — the target branch is pushed
-   * after a merge lands. 'pr' — the task branch is pushed and a GitHub PR opened
-   * at the PR stage, and the target pushed after merge. Anything beyond this
-   * happens only when a task explicitly asks its agent to push.
+   * 'none' (self-hosted/local default) — merges are local. 'push' — the target
+   * branch is pushed after a merge lands. 'pr' — the task branch is pushed and a
+   * GitHub PR opened at the PR stage, and the target pushed after merge. Hosted
+   * GitHub projects default to 'pr' and do not accept 'none'. Anything beyond
+   * this happens only when a task explicitly asks its agent to push.
    */
   remote?: RemotePolicy;
   /** Who is expected to order pull-request landing. `auto` prefers a provider

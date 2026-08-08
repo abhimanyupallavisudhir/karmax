@@ -11,6 +11,35 @@ describe('Store', () => {
     store = new Store(':memory:');
   });
 
+  it('defaults and migrates hosted projects to PR delivery while rejecting new local-only writes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-hosted-remote-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const previous = process.env.KARMAX_DEPLOYMENT;
+    try {
+      delete process.env.KARMAX_DEPLOYMENT;
+      const legacy = new Store(dbPath);
+      const oldDefault = legacy.createProject('Old default');
+      const oldNone = legacy.createProject('Old explicit none', { remote: 'none' });
+      legacy.setSettings(oldNone.id, '__common__', { remote: 'none', target: 'main' });
+      legacy.close();
+
+      process.env.KARMAX_DEPLOYMENT = 'hosted';
+      const hosted = new Store(dbPath);
+      expect(hosted.getProject(oldDefault.id)?.config.remote).toBe('pr');
+      expect(hosted.getProject(oldNone.id)?.config.remote).toBe('pr');
+      expect(hosted.getSettings(oldNone.id, '__common__')).toMatchObject({ remote: 'pr', target: 'main' });
+      expect(hosted.createProject('New hosted').config.remote).toBe('pr');
+      expect(() => hosted.createProject('No local-only', { remote: 'none' })).toThrow(/hosted GitHub projects require/i);
+      expect(() => hosted.updateProjectConfig(oldNone.id, { remote: 'none' })).toThrow(/hosted GitHub projects require/i);
+      expect(() => hosted.setSettings(oldNone.id, '__common__', { remote: 'none' })).toThrow(/hosted GitHub projects require/i);
+      hosted.close();
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_DEPLOYMENT;
+      else process.env.KARMAX_DEPLOYMENT = previous;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('removes legacy E2B lease estimates while preserving reconciled executions', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-e2b-usage-mig-'));
     const dbPath = path.join(dir, 'karmax.db');

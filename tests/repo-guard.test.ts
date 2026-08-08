@@ -65,11 +65,21 @@ describe('repository selection validation', () => {
 
   it('allows a hosted zero-repo task without requiring a GitHub connection', async () => {
     const p = store.createProject('Hosted state', { worldProvider: 'e2b', repos: [] });
+    // Model an existing hosted installation whose settings predate the hosted
+    // PR default. KarmaxApi must normalize new workflow inputs even before the
+    // Store's boot migration gets another chance to rewrite the row.
+    store.setSettings(p.id, '__common__', { remote: 'none' });
     api = new KarmaxApi({ store, client: { workflow: { start: async (...a: unknown[]) => { started.push(a); return {}; } } } as any,
       taskQueue: 'tq', tokens, hosted: true });
     const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'update state' });
     expect(task.workflow).toBe('software-dev');
     expect(started).toHaveLength(1);
+    expect((started[0]![1] as any).args[0].project.remote).toBe('pr');
+
+    const remote = (api.workflowSchemas().find((schema) => schema.name === 'software-dev')!.params as any[])
+      .find((field) => field.name === 'remote');
+    expect(remote).toMatchObject({ default: 'pr', options: ['pr', 'push'] });
+    expect(remote.help).not.toMatch(/none/i);
   });
 
   it('requires a first-class organization repository in hosted mode', async () => {

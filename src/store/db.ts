@@ -158,6 +158,7 @@ export class Store {
       let config: Record<string, any>;
       try { config = JSON.parse(row.config) as Record<string, any>; } catch { continue; }
       if (!config || typeof config !== 'object') continue;
+      let configChanged = false;
       const resources = config.resources;
       const network = config.network;
       const environment = config.environment;
@@ -174,7 +175,30 @@ export class Store {
         && legacyResources && legacyNetwork && legacyEnvironment) {
         for (const key of ['runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'])
           delete config[key];
+        configChanged = true;
+      }
+      // A hosted world's local merge is not a durable delivery destination.
+      // Migrate both an absent old default and an explicit old `none` choice.
+      // Workflow inputs already recorded in Temporal are unaffected; only new
+      // starts read this project/settings state.
+      if (process.env.KARMAX_DEPLOYMENT === 'hosted'
+        && (config.remote === undefined || config.remote === 'none')) {
+        config.remote = 'pr';
+        configChanged = true;
+      }
+      if (configChanged)
         this.db.prepare('UPDATE projects SET config=? WHERE id=?').run(JSON.stringify(config), row.id);
+    }
+
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
+      const settings: Array<{ scopeKey: string; workflow: string; json: string }> =
+        this.db.prepare('SELECT scopeKey, workflow, json FROM settings').all() as any;
+      const update = this.db.prepare('UPDATE settings SET json=? WHERE scopeKey=? AND workflow=?');
+      for (const row of settings) {
+        let values: Record<string, unknown>;
+        try { values = JSON.parse(row.json) as Record<string, unknown>; } catch { continue; }
+        if (!values || typeof values !== 'object' || values.remote !== 'none') continue;
+        update.run(JSON.stringify({ ...values, remote: 'pr' }), row.scopeKey, row.workflow);
       }
     }
 
@@ -767,6 +791,7 @@ export class Store {
   createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Project {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     assertRoutableName('project', name);
+    config = writableProjectConfig(config);
     validateProjectExecutionConfig(config);
     const ord = (this.db
       .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
@@ -873,7 +898,7 @@ export class Store {
     const organization = this.getOrganizationExecutionPolicy(value.organizationId ?? 'org_personal');
     const providerChanged = Boolean(value.config.worldProvider
       && value.config.worldProvider !== organization.worldProvider);
-    return {
+    const config = {
       ...organization,
       ...value.config,
       // A pool belongs to one provider. Selecting a different provider at the
@@ -884,6 +909,14 @@ export class Store {
       network: value.config.network ? { ...value.config.network } : organization.network,
       environment: { ...organization.environment, ...value.config.environment },
     };
+    // Hosted task worlds are disposable and GitHub is their durable development
+    // authority. Historical projects/settings may still contain the old `none`
+    // default, so resolve those as PR delivery without rewriting an in-flight
+    // workflow's already-recorded input. Self-hosted projects retain local-only
+    // delivery and its `none` default.
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && (config.remote === undefined || config.remote === 'none'))
+      config.remote = 'pr';
+    return config;
   }
 
   setProjectExecutionPolicy(id: string, override: Partial<Record<keyof OrganizationExecutionPolicy, unknown>>): Project {
@@ -911,7 +944,7 @@ export class Store {
   updateProjectConfig(id: string, config: ProjectConfig): Project {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`no project ${id}`);
-    const merged = { ...existing.config, ...config };
+    const merged = writableProjectConfig({ ...existing.config, ...config });
     validateProjectExecutionConfig(merged);
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(merged.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
@@ -3499,6 +3532,8 @@ export class Store {
   }
 
   setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && values.remote === 'none')
+      throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
     this.db
       .prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO UPDATE SET json = excluded.json')
       .run(scopeKey, workflow, JSON.stringify(values));
@@ -4846,6 +4881,18 @@ function providerDisplayName(provider: string): string {
   if (provider === 'e2b') return 'E2B';
   if (provider === 'daytona') return 'Daytona';
   return provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
+/** New hosted configuration can never select the local-only `none` policy.
+ * Keep this at the Store boundary as well as the HTTP boundary: agents and
+ * future service callers write through the Store without necessarily using the
+ * browser route. Legacy rows are tolerated by `effectiveProjectConfig` above
+ * and resolve to `pr`; only a new write is rejected. */
+function writableProjectConfig(config: ProjectConfig): ProjectConfig {
+  if (process.env.KARMAX_DEPLOYMENT !== 'hosted') return config;
+  if (config.remote === 'none')
+    throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
+  return config.remote === undefined ? { ...config, remote: 'pr' } : config;
 }
 
 function rowToProject(r: any): Project {
