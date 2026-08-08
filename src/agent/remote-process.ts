@@ -108,6 +108,19 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
   }
 }
 
+/** Remote auth/session export is a durability enhancement, not the provider
+ * turn's terminal result. Return a diagnostic instead of throwing so a control-
+ * plane timeout during cleanup cannot replace a verified successful turn. */
+export async function syncRemoteAgentHomeBestEffort(world: World, provider: Provider,
+  remoteHome: RemoteAgentHome, localHome: string): Promise<Error | undefined> {
+  try {
+    await syncRemoteAgentHome(world, provider, remoteHome, localHome);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
 /** Minimal environment passed across the trust boundary. Authentication lives in
  * the seeded home; only explicit turn-scoped values and provider tuning cross.
  * `forward` is the caller-vouched allowlist of project secret/service names. */

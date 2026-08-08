@@ -246,6 +246,17 @@ describe('E2B cloud world provider', () => {
     }
   });
 
+  it('preserves structured E2B command transport errors for activity classification', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'command-timeout', base: 'main' });
+    sandbox.commands.run = async () => {
+      throw Object.assign(new Error('E2B command request failed'), { code: 'ETIMEDOUT' });
+    };
+
+    await expect(world.exec('pwd', [])).rejects.toMatchObject({ code: 'ETIMEDOUT' });
+  });
+
   it('fails rather than silently reviewing the wrong branch', async () => {
     const sandbox = fakeSandbox(() => undefined);
     sandbox.commands.run = async (command) => ({
