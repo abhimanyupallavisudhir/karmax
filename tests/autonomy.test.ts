@@ -163,6 +163,21 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     }
   });
 
+  it('keeps the running Node executable available to provider package entrypoints', () => {
+    const previous = process.env.PATH;
+    process.env.PATH = ['/usr/bin', '/bin'].join(path.delimiter);
+    try {
+      const env = scrubbedEnv({ provider: 'codex', configHome: '/tmp/isolated-codex-home' });
+      expect(env.PATH?.split(path.delimiter).slice(0, 2)).toEqual([
+        path.join(os.homedir(), '.local', 'bin'),
+        path.dirname(process.execPath),
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+    }
+  });
+
   it('uses Codex device authorization on a hosted deployment', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-hosted-'));
     const home = new ConfigHomeManager(dir).ensure('codex', 'work');

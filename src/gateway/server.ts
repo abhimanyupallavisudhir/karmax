@@ -5105,7 +5105,14 @@ export class Gateway {
       claude: claude.length ? claude : [
         { id: 'default' }, { id: 'opus[1m]' }, { id: 'claude-fable-5[1m]' }, { id: 'sonnet' }, { id: 'haiku' },
       ],
-      codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
+      codex: codex.length ? codex : [
+        { id: 'gpt-5.6-sol', isDefault: true },
+        { id: 'gpt-5.6-terra' },
+        { id: 'gpt-5.6-luna' },
+        { id: 'gpt-5.5' },
+        { id: 'gpt-5.4' },
+        { id: 'gpt-5.4-mini' },
+      ],
       opencode: opencode.length ? opencode : [
         { id: 'kimi/kimi-for-coding' },
         { id: 'kimi/k3', effort: ['low', 'high', 'max'] },

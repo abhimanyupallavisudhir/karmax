@@ -385,12 +385,15 @@ export function hasClaudeNativeCredential(home: string): boolean {
 /** Build a clean, isolated environment for an agent spawn (SPEC §7.3 gotcha). */
 export function scrubbedEnv(opts: { provider: Provider; configHome?: string; extra?: Record<string, string> }): Record<string, string> {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-  // Native user installs (notably Claude Code's installer) live here. Service
-  // managers often start karmax with only system + Node paths, which otherwise
-  // makes a working CLI invisible to login, model, and usage subprocesses.
+  // Provider package entrypoints use `#!/usr/bin/env node`, so they need the
+  // running app's Node directory even when a service manager supplied only a
+  // system PATH. Native user installs (notably Claude Code's installer) also
+  // live in ~/.local/bin. Keep both available to login, model-discovery, usage,
+  // and agent subprocesses without depending on the shell that launched Krmax.
+  const nodeBin = path.dirname(process.execPath);
   const userBin = path.join(os.homedir(), '.local', 'bin');
   const pathEntries = (env.PATH ?? '').split(path.delimiter).filter(Boolean);
-  env.PATH = [userBin, ...pathEntries.filter((entry) => entry !== userBin)].join(path.delimiter);
+  env.PATH = [userBin, nodeBin, ...pathEntries.filter((entry) => entry !== nodeBin && entry !== userBin)].join(path.delimiter);
   // Never let one profile's keys leak into another's process.
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;

@@ -50,7 +50,19 @@ const conversationPresence = context.conversationPresence as (
 const patchTaskListFromEvent = context.patchTaskListFromEvent as (event: Record<string, any>) => boolean;
 
 describe('waiting labels in task summaries', () => {
-  it('keeps the pipeline stage stable while a task waits', () => {
+  it('shows the public input stage while retaining other pipeline stages', () => {
+    expect(stageLabel({
+      stage: 'do',
+      status: 'waiting',
+      state: { humanPauseOrigin: 'do' },
+      waitingFor: { kind: 'human', detail: 'The agent finished its turn.' },
+    })).toBe('Waiting for input');
+    expect(stageLabel({
+      stage: 'review',
+      status: 'waiting',
+      state: {},
+      waitingFor: { kind: 'human', detail: 'Review this proposal.' },
+    })).toBe('Waiting for input');
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
@@ -97,6 +109,7 @@ describe('waiting labels in task summaries', () => {
 
   it('keeps ordinary and legacy merge-stage labels intact', () => {
     expect(stageLabel({ stage: 'do', state: {} })).toBe('do');
+    expect(stageLabel({ stage: 'do', status: 'active', waitingFor: { kind: 'human' }, state: {} })).toBe('do');
     expect(stageLabel({ stage: 'merge', state: { mergeGranted: false } })).toBe('landing');
     expect(stageLabel({ stage: 'setup', state: { draft: true } })).toBe('draft');
   });

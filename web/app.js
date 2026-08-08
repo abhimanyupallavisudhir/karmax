@@ -555,7 +555,7 @@ const NODES = [
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'];
 const MODELS = {
   claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
-  codex: ['gpt-5.5', 'gpt-5.4-mini'],
+  codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
   grok: ['grok-build', 'grok-code-fast-1'],
@@ -3397,6 +3397,10 @@ function pullRequestLinks(v) {
 // the task ever leaving Landing. The short wait reason is rendered separately.
 function stageLabel(v) {
   if (v.state?.draft) return 'draft';
+  // Waiting for input is a public software-dev stage (Do ⇄ Waiting for
+  // input), even though the workflow retains its replay-safe Do/Review/Landing
+  // checkpoint internally so a follow-up knows where to resume.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return 'Waiting for input';
   const stage = v.stage || 'setup';
   if (stage === 'merge') return 'landing';
   return stage;
