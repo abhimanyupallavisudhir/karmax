@@ -582,6 +582,33 @@ describe('Store', () => {
     expect(store.getTask(t.id)!.params.archived).toBe(false); // respected — no re-archive on same terminal status
   });
 
+  it('archives a logical task consistently when its principal is a draft attempt', () => {
+    const p = store.createProject('Acme');
+    const original = store.createTask({
+      projectId: p.id, title: 'X', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' },
+    });
+    store.saveView(original.id, {
+      taskId: original.id, title: 'X', workflow: 'software-dev', stage: 'cancelled', status: 'cancelled',
+      messages: [], actions: [], state: {}, updatedAt: 1,
+    });
+    const draft = store.createTask({
+      projectId: p.id, title: 'X', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'try again', draft: true }, intentId: original.intentId,
+    });
+    store.electPrincipal(original.intentId!);
+    expect(store.attemptGroup(original.id)?.principalAttemptId).toBe(draft.id);
+
+    // The archive action may originate from any selected attempt. The projected
+    // principal must still move to Archived, and every sibling must agree so a
+    // later principal election cannot resurrect the task on the active list.
+    store.setTaskArchived(original.id, true);
+    expect(store.listTasks(p.id)[0]?.params).toMatchObject({ draft: true, archived: true });
+    expect(store.attemptsOf(original.id).every((attempt) => attempt.params.archived === true)).toBe(true);
+
+    store.setTaskArchived(draft.id, false);
+    expect(store.attemptsOf(original.id).every((attempt) => attempt.params.archived === false)).toBe(true);
+  });
+
   it('appends and reads events incrementally', () => {
     const p = store.createProject('Acme');
     const t = store.createTask({

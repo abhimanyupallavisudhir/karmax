@@ -3285,8 +3285,9 @@ function runSubRow(r) {
 
 function taskRow(t, { showTags = true } = {}) {
   const isDraft = t.params?.draft;
-  if (t.params?.repeatable) return seriesRow(t);
-  if (t.params?.triggerState === 'armed') {
+  const archived = t.params?.archived;
+  if (t.params?.repeatable && !archived) return seriesRow(t);
+  if (t.params?.triggerState === 'armed' && !archived) {
     return `
     <div class="task-row" data-armed="${t.id}">
       <span class="status-dot waiting" title="waiting for trigger"></span>
@@ -3300,7 +3301,11 @@ function taskRow(t, { showTags = true } = {}) {
       </div>
     </div>`;
   }
-  if (isDraft) {
+  // An archived row represents the whole logical task even when its current
+  // principal is a draft, armed task, or series. Open the task page in that case
+  // so its history remains visible and the task can be unarchived; active special
+  // rows retain their direct editing controls.
+  if (isDraft && !archived) {
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0">
       <span class="status-dot cancelled" title="draft"></span>
@@ -3317,7 +3322,6 @@ function taskRow(t, { showTags = true } = {}) {
   const v = t.lastView || {};
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
-  const archived = t.params?.archived;
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
