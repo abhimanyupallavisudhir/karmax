@@ -10,7 +10,7 @@ export const PLATFORM_API_CATALOG = {
   note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
   resources: ['GET /api/resource-drivers'],
   projects: [
-    'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
+    'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId (PATCH body {name} or {config})',
     // The org-scoped spelling is the ONLY project-create that works on a hosted
     // deployment: bare `POST /api/projects` rejects there with "hosted projects must
     // be created inside an organization". Leaving it undocumented meant an agent on
@@ -37,7 +37,7 @@ export const PLATFORM_API_CATALOG = {
     // POST needs a human account: it calls bootstrapOrganizationOwner, and a scoped
     // agent token has no session.userId. Same for /invitations/accept below.
     'GET|POST /api/organizations (POST requires a human identity — an agent token cannot own an organization)',
-    'GET|DELETE /api/organizations/:organizationId (DELETE body {confirmSlug})',
+    'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',

@@ -1288,6 +1288,8 @@ export class Gateway {
           organization: requestedScope.organizationId
             ? allowed('organization:edit', { organizationId: requestedScope.organizationId }) : false,
           project: requestedScope.projectId
+            ? allowed('project:edit', { projectId: requestedScope.projectId }) : false,
+          projectDelete: requestedScope.projectId
             ? allowed('project:delete', { projectId: requestedScope.projectId }) : false,
         });
       }
@@ -1348,6 +1350,12 @@ export class Gateway {
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      if (organizationMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        if (typeof b.name !== 'string') return this.json(res, 400, { error: 'organization name is required' });
+        try { return this.json(res, 200, store.renameOrganization(organizationMatch[1]!, b.name)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
       if (organizationExecution) {
         const organizationId = organizationExecution[1]!;
@@ -1953,6 +1961,12 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
+            if (Object.prototype.hasOwnProperty.call(b, 'name')) {
+              if (typeof b.name !== 'string') throw new Error('project name is required');
+              if (Object.prototype.hasOwnProperty.call(b, 'config'))
+                throw new Error('update the project name and configuration separately');
+              return this.json(res, 200, store.renameProject(id, b.name));
+            }
             const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = store.getProject(id);
             if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&

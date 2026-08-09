@@ -285,6 +285,23 @@ describe('Store', () => {
     expect(store.createOrganization({ name: 'Acme' }).slug).toBe('acme');
   });
 
+  it('renames projects and organizations without changing their identity', () => {
+    const organization = store.createOrganization({ name: 'Acme' });
+    const project = store.createProject('Website', {}, organization.id);
+
+    expect(store.renameProject(project.id, '  Storefront  ')).toMatchObject({
+      id: project.id, organizationId: organization.id, name: 'Storefront',
+    });
+    expect(store.renameOrganization(organization.id, '  Acme Labs  ')).toMatchObject({
+      id: organization.id, name: 'Acme Labs', slug: organization.slug,
+    });
+    expect(store.getProject(project.id)?.name).toBe('Storefront');
+    expect(store.getOrganization(organization.id)?.name).toBe('Acme Labs');
+    expect(() => store.renameProject(project.id, 'settings')).toThrow(/reserved/i);
+    expect(() => store.renameProject(project.id, '   ')).toThrow(/required/i);
+    expect(() => store.renameOrganization(organization.id, '')).toThrow(/required/i);
+  });
+
   it('creates and lists tasks in order', () => {
     const p = store.createProject('Acme');
     const t1 = store.createTask({
