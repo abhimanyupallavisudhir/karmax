@@ -9,11 +9,16 @@ export interface CallerIdentity {
 }
 
 export class IdentityRequirementError extends Error {
-  status = 403;
+  status: number;
   constructor(public requirement: Exclude<IdentityRequirement, 'capability'>) {
     super(requirement === 'interactive-human'
       ? 'an interactive human session is required'
       : 'a verified human subject is required');
+    // A valid bearer without a delegated subject is authenticated but forbidden.
+    // A route requiring live browser presence retains the established HTTP
+    // authentication challenge semantics: agent credentials are not an
+    // interactive session, regardless of their capabilities or delegation.
+    this.status = requirement === 'interactive-human' ? 401 : 403;
   }
 }
 
@@ -50,8 +55,8 @@ export function requireHumanSubject(identity: CallerIdentity): VerifiedHumanSubj
 }
 
 export function requireInteractiveHuman(identity: CallerIdentity): VerifiedHumanSubject {
-  const subject = requireHumanSubject(identity);
-  if (identity.actor.kind !== 'interactive-human' || subject.presence !== 'interactive')
+  const subject = identity.humanSubject;
+  if (identity.actor.kind !== 'interactive-human' || !subject || subject.presence !== 'interactive')
     throw new IdentityRequirementError('interactive-human');
   return subject;
 }

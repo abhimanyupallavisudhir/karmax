@@ -43,7 +43,9 @@ describe('delegated human identity authority', () => {
       externalIdentities: { githubAccountId: '42' },
     });
     expect(requireHumanSubject(identity).userId).toBe('alice');
-    expect(() => requireInteractiveHuman(identity)).toThrow(/interactive human session/i);
+    expect(() => requireInteractiveHuman(identity)).toThrow(expect.objectContaining({
+      message: expect.stringMatching(/interactive human session/i), status: 401,
+    }));
     expect(actorPrincipal(identity.actor)).toBe('task-agent:t1:do');
     expect(identityAuditDetail(identity)).toMatchObject({ humanSubject: { userId: 'alice' } });
   });

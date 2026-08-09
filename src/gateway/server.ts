@@ -1982,6 +1982,12 @@ export class Gateway {
           project = store.createProject(b.name ?? 'New project',
             normalizeConfig(b.config, true, false));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        // The legacy unhosted collection route creates inside the personal
+        // organization. Keep its creator discoverable through the same durable
+        // membership authorization used by the production project listing.
+        if (callerIdentity.humanSubject)
+          store.setProjectMembership(project.id,
+            { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner');
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
@@ -3933,7 +3939,11 @@ export class Gateway {
         // must never use this route as a shortcut around its item grant/policy.
         const viReveal = p.match(/^\/api\/vault\/items\/([^/]+)\/reveal$/);
         if (viReveal && method === 'POST') {
-          requireInteractiveHuman(callerIdentity);
+          try {
+            requireInteractiveHuman(callerIdentity);
+          } catch {
+            return this.json(res, 403, { error: 'a human vault administrator is required' });
+          }
           const item = vault.get(viReveal[1]!);
           if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
           const b = await this.body(req);

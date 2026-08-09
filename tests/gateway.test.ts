@@ -227,7 +227,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(await noSubjectResponse.json()).toMatchObject({ error: expect.stringMatching(/verified human subject/i) });
 
     const interactiveOnly = await fetch(`${base}/api/user/export`, { headers: delegatedAuth });
-    expect(interactiveOnly.status).toBe(403);
+    expect(interactiveOnly.status).toBe(401);
     expect(await interactiveOnly.json()).toMatchObject({ error: expect.stringMatching(/interactive human/i) });
 
     const audit = h.store.auditSince(0, 2000).find((event) =>
