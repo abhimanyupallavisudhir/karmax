@@ -2100,7 +2100,7 @@ export class KarmaxApi {
     if (!transcript) {
       transcript = {
         role,
-        label: role === 'do' ? 'Do agent' : role === 'merge' ? 'Merge agent' : role === 'resolve' ? 'Resolve agent' : 'Confirm agent',
+        label: role === 'do' ? 'Agent' : role === 'merge' ? 'Merge agent' : role === 'resolve' ? 'Resolve agent' : 'Confirm agent',
         messages: [],
       };
       transcripts.push(transcript);
@@ -2603,7 +2603,7 @@ export class KarmaxApi {
     const view = await this.getTaskView(token, taskId);
     const transcripts = view?.transcripts?.length
       ? view.transcripts
-      : [{ role: 'do', label: 'Do', messages: view?.messages ?? [] }];
+      : [{ role: 'do', label: 'Agent', messages: view?.messages ?? [] }];
     return transcripts.map((t) => {
       const session = this.deps.store.kvGet(`session:${taskId}:${t.role}`) || undefined;
       let provider: string | undefined;

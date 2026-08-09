@@ -147,7 +147,6 @@ a { color: var(--accent); text-decoration: none; }
   background: var(--surface-2);
 }
 .topbar .agent-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--merged); }
-.topbar .agent-chip.mock .dot { background: var(--working); }
 .icon-btn {
   width: 34px; height: 34px; border-radius: 8px; border: 1px solid transparent;
   background: transparent; color: var(--ink-2); cursor: pointer;
@@ -1354,15 +1353,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .af-resume-clear:hover { color: var(--danger); }
 
-.agent-group { margin-bottom: 14px; }
-.agent-separate-toggle {
-  display: flex; align-items: center; gap: 6px; width: max-content; margin: 0 0 8px;
-  color: var(--ink-3); font-size: 11px; cursor: pointer;
-}
-.agent-separate-toggle input { width: auto; margin: 0; }
-.agent-group [hidden] { display: none !important; }
-.profiles-group [hidden] { display: none !important; }
-.profiles-group .agent-separate-toggle { margin: 2px 0 10px; }
 .parameter-fields .agent-field {
   padding: 10px; border: 1px solid var(--line); border-radius: 10px;
   background: var(--surface-2);

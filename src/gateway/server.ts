@@ -3541,6 +3541,7 @@ export class Gateway {
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
         const { roleDef } = await import('../contrib/manifests.js');
         const withRole = (pr: any) => {
+          const definition = roleDef(pr.role);
           const {
             modelProvider: _legacyModelProvider,
             allowedAccounts: _legacyAllowedAccounts,
@@ -3556,9 +3557,18 @@ export class Gateway {
               capabilities: _legacyInheritedCapabilities,
               ...visibleInherited
             } = visibleProfile.inherited;
-            visibleProfile.inherited = visibleInherited;
+            visibleProfile.inherited = {
+              ...visibleInherited,
+              ...(definition ? { name: definition.label } : {}),
+            };
           }
-          return { ...visibleProfile, roleWorkflows: roleDef(pr.role)?.workflows ?? [] };
+          return {
+            ...visibleProfile,
+            // Role labels are manifest vocabulary, not user data. This also
+            // upgrades stored "Do agent" rows without rewriting the database.
+            ...(definition ? { name: definition.label } : {}),
+            roleWorkflows: definition?.workflows ?? [],
+          };
         };
         const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
@@ -3596,7 +3606,8 @@ export class Gateway {
           return this.json(res, 400, { error: `unknown agent provider "${String(b.provider)}"` });
         }
         const { roleDef } = await import('../contrib/manifests.js');
-        if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
+        const definition = roleDef(String(b.role));
+        if (!definition) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const queryProjectId = url.searchParams.get('projectId') ?? undefined;
         const queryOrganizationId = url.searchParams.get('organizationId') ?? undefined;
         if (b.projectId && String(b.projectId) !== queryProjectId)
@@ -3619,7 +3630,7 @@ export class Gateway {
           capabilities: _legacyCapabilities,
           ...rest
         } = b;
-        store.upsertProfile({ provider: 'claude', ...rest, id });
+        store.upsertProfile({ provider: 'claude', ...rest, name: definition.label, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
       // Reset one scoped override back to the next inherited layer.

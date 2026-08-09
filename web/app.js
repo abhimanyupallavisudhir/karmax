@@ -526,7 +526,7 @@ function principalLabel(principal) {
   if (!principal) return 'Unassigned';
   if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
   if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
-  return `Task agent · ${principal.role}`;
+  return principal.role === 'do' ? 'Task agent · Agent' : `Task agent · ${principal.role}`;
 }
 
 // The workflows a human may pick when creating a task. INTENDED: `just-do` and
@@ -552,15 +552,17 @@ const NODES = [
 ];
 
 // Provider → model choices for the agent field (free-text also allowed).
-const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'];
+// `mock` is a hermetic test adapter, not a user-selectable agent.
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
   claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
   grok: ['grok-build', 'grok-code-fast-1'],
-  mock: ['mock'],
 };
+const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
+const agentProviderLabel = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : '';
 function modelOptions(provider) {
   const live = S.modelCatalog?.[provider];
   // Keep the provider metadata intact: Claude's stable selectable id can be an
@@ -698,35 +700,7 @@ function renderField(f, own, inherited, withChips, alt) {
   return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
-const agentGroupFields = (fields) => ['do', 'merge', ...(fields.some((f) => f.type === 'agent' && f.role === 'resolve') ? ['resolve'] : [])]
-  .map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
-const inferredSeparateAgents = (values = {}, roles = ['do', 'merge']) => values.separateAgents === true ||
-  (values.separateAgents === undefined && roles.some((role) => values[`agent:${role}`] !== undefined));
-
-// Software-dev's operational roles usually share one identity. Keep the
-// manifest's role fields (the workflow still consumes those)
-// while presenting a compact virtual `agent:unified` field by default.
-function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
-  const [doField, mergeField, ...optionalFields] = agentGroupFields(fields);
-  if (!doField || !mergeField) return null;
-  const roleFields = [doField, mergeField, ...optionalFields].filter(Boolean);
-  const separate = inferredSeparateAgents(own, roleFields.map((f) => f.role));
-  const unifiedField = { ...doField, name: 'agent:unified', role: 'unified', label: 'Agent' };
-  const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
-  const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
-  return `<div class="agent-group" data-agent-group>
-    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate ${roleFields.map((f) => f.label.replace(/ agent$/, '')).join(', ').replace(/, ([^,]+)$/, ' and $1')} agent configurations</label>
-    <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
-    <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
-      ${roleFields.map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
-    </div>
-  </div>`;
-}
-
 function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
-  const group = renderAgentGroup(fields, own, inherited, altFor);
-  const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
-  let groupDrawn = false;
   // Base, target, and the Agent environment share one row (rendered at the first
   // of them present, in this order); the rest are skipped where they'd fall.
   const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
@@ -734,10 +708,6 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
-    if (grouped.has(f.name)) {
-      if (!groupDrawn) { html.push(group); groupDrawn = true; }
-      continue;
-    }
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
@@ -753,20 +723,23 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
 function renderAgentField(f, spec, inherited) {
   const inh = inherited || {};
   const e = spec || inh; // prefill with the effective spec
-  const provider = e.provider || 'claude';
+  const providerVisible = !e.provider || AGENT_PROVIDERS.includes(e.provider);
+  const provider = agentProviderChoice(e.provider);
+  const model = providerVisible ? e.model : '';
+  const effort = providerVisible ? e.effort : '';
   const role = f.role || f.name;
   const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div class="agent-controls">
       <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
-        <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
+        <input class="af-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
         <div class="combo-menu" hidden></div>
       </div>
-      ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
+      ${effortSelectHtml('af-effort', provider, model, effort || '')}
     </div>
-    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> ${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</label>
+    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
@@ -779,7 +752,8 @@ function renderAgentField(f, spec, inherited) {
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
 function resumeChosenInner(rf, task) {
   const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
-  const label = `⑂ forking ${rf.role || 'do'} agent of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
+  const source = !rf.role || rf.role === 'do' ? 'agent' : `${rf.role} agent`;
+  const label = `⑂ forking ${source} of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
   return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
 }
 
@@ -895,19 +869,7 @@ function readConfirmerLayers(box) {
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
   const out = {};
-  const group = root.querySelector('[data-agent-group]');
-  const groupedRoles = group ? new Set(agentGroupFields(fields).map((f) => f.role)) : new Set();
-  if (group) {
-    const separate = group.querySelector('.agent-separate').checked;
-    out.separateAgents = separate;
-    const panels = separate ? [group.querySelector('.agent-separated-panel')] : [group.querySelector('.agent-unified-panel')];
-    const selectedFields = separate
-      ? fields.filter((f) => f.type === 'agent' && groupedRoles.has(f.role))
-      : [{ ...fields.find((f) => f.type === 'agent' && f.role === 'do'), name: 'agent:unified', role: 'unified' }];
-    Object.assign(out, collectForm(panels[0], selectedFields));
-  }
   for (const f of fields) {
-    if (f.type === 'agent' && groupedRoles.has(f.role)) continue;
     if (f.type === 'agent') {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
@@ -1245,31 +1207,6 @@ function wireAgentBox(box) {
   syncForkState();
 }
 function wireAgentFields(root) {
-  root.querySelectorAll('[data-agent-group]').forEach((group) => {
-    const toggle = group.querySelector('.agent-separate');
-    toggle?.addEventListener('change', () => {
-      group.querySelector('.agent-unified-panel').hidden = toggle.checked;
-      group.querySelector('.agent-separated-panel').hidden = !toggle.checked;
-      group.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    const unifiedBox = group.querySelector('.agent-unified-panel .agent-field');
-    const reset = group.querySelector('.agent-unified-panel .field-reset');
-    if (unifiedBox && reset) {
-      const sync = () => {
-        const inh = JSON.parse(unifiedBox.getAttribute('data-inherit') || 'null');
-        const cur = { provider: unifiedBox.querySelector('.af-provider').value };
-        const model = unifiedBox.querySelector('.af-model').value.trim();
-        const effort = unifiedBox.querySelector('.af-effort').value;
-        if (model) cur.model = model;
-        if (effort) cur.effort = effort;
-        reset.hidden = sameJson(normSpec(cur), normSpec(inh));
-      };
-      unifiedBox.addEventListener('input', sync);
-      unifiedBox.addEventListener('change', sync);
-      reset.addEventListener('click', () => { resetAgentField(unifiedBox); sync(); });
-      sync();
-    }
-  });
   root.querySelectorAll('.agent-field').forEach(wireAgentBox);
   root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
 }
@@ -6285,7 +6222,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
-    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
+    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
   const agentForks = agentForksSection(v);
@@ -6308,8 +6245,10 @@ function overviewTab(v) {
 // Falls back to `messages` (Do) for workflows that predate per-role transcripts.
 function taskTranscripts(v) {
   return (v.transcripts && v.transcripts.length)
-    ? v.transcripts.filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
-    : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
+    ? v.transcripts
+        .filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
+        .map((t) => t.role === 'do' ? { ...t, label: 'Agent' } : t)
+    : [{ role: 'do', label: 'Agent', messages: v.messages || [] }];
 }
 // The conversation owning the active stage — it gets the live bubble and is the
 // default pane (in Review that's the agent whose work is being reviewed).
@@ -11209,30 +11148,33 @@ async function wireOutboundEmailCard() {
 function profileRow(p, scope) {
   const inherited = p.scope === 'inherited';
   const ownScope = scope === 'project' ? 'project' : 'organization';
+  const providerVisible = AGENT_PROVIDERS.includes(p.provider);
+  const provider = agentProviderChoice(p.provider);
+  const model = providerVisible ? p.model : '';
+  const effort = providerVisible ? p.effort : '';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
-    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
+    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} ${usedBy}
       ${inherited ? `<span class="chip" title="Using the next default up; edit to create a ${ownScope} override">inherited</span>` : `<span class="chip">${ownScope} override</span>`}</div>
     <div class="agent-profile-controls">
-      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
-        <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
+        <input class="pf-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
         <div class="combo-menu" hidden></div>
       </div>
-      ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
+      ${effortSelectHtml('pf-effort', provider, model, effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
     <div style="display:flex;gap:8px">
-      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
+      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save agent</button>
       ${p.scope === ownScope ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
     </div>
   </div>`;
 }
 
-// Render + wire the agents editor for a scope (organization or project). Software
-// Dev has only a Do agent; the remaining Merge profile belongs to merge-only and
-// is therefore shown honestly as its own role instead of being coupled to Do.
+// Render + wire the shared operational Agent editor for an organization or
+// project. All coding workflows, including Merge-only, resolve this one profile.
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
@@ -11329,7 +11271,7 @@ async function hydrateAccounts(organizationId = S.organizationId) {
 
 function profilesCard(scope) {
   return `<div class="card agent-profile-settings" id="profiles-card-${scope}">
-    <div class="section-h">Agents</div>
+    <div class="section-h">Agent</div>
     <p style="color:var(--ink-2);margin-top:0">Who does the work: model, turn cap, and account pool.${scope === 'project' ? ' Overrides the organization defaults for this project.' : ''}</p>
     <div id="profiles-list-${scope}">Loading…</div>
     <div class="settings-divider"></div>

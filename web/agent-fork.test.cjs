@@ -20,6 +20,7 @@ global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;
 global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
 global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
+global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
 global.S = { tasks: [] };
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('renderAgentField'));

@@ -91,5 +91,6 @@ export { mergeOnlyV1_3 as 'mergeOnly@1.3.0' } from './merge-only.js';
 export { mergeOnlyV1_4 as 'mergeOnly@1.4.0' } from './merge-only.js';
 export { mergeOnlyV1_5 as 'mergeOnly@1.5.0' } from './merge-only.js';
 export { mergeOnlyV1_6 as 'mergeOnly@1.6.0' } from './merge-only.js';
+export { mergeOnlyV1_7 as 'mergeOnly@1.7.0' } from './merge-only.js';
 export { versionedProbeV1 as 'versionedProbe@1.0.0' } from './versioned-probe.js';
 export { versionedProbeV2 as 'versionedProbe@2.0.0' } from './versioned-probe.js';

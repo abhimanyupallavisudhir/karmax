@@ -178,7 +178,9 @@ export interface WorkflowRole {
 // `{{toolsPreamble}}` and the other `{{...}}` are filled by assemblePrompt.
 const DO_ROLE: WorkflowRole = {
   name: 'do',
-  label: 'Do agent',
+  // `do` is the replay-stable internal role name. It is the one operational
+  // Agent setting shared by Software Dev, Goal, Just Do, and Merge-only.
+  label: 'Agent',
   // Task authorization is the deliberate delegation boundary. A Do agent may
   // use everything the granting human selected (including organization/global
   // operation); attenuation still removes everything that human did not hold.
@@ -207,7 +209,10 @@ Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
 
 {{instructions}}`,
 };
-const MERGE_ROLE: WorkflowRole = {
+// Retained privately for version-pinned executions that recorded a separate
+// Merge turn. Current manifests do not declare this role, so it does not seed a
+// profile or appear in task/project/organization settings.
+const LEGACY_MERGE_ROLE: WorkflowRole = {
   name: 'merge',
   label: 'Merge agent',
   // Merge remains a developer working in the task branch. The protected merge
@@ -406,7 +411,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       // `always`: the Do agent's model + effort can be retuned
       // in-flight up to the point of no return (SPEC §5.5); software-dev's update
       // validator still gates the IDENTITY swap (provider/session) per role.
-      agentField('do', 'Do agent', 'always'),
+      agentField('do', 'Agent', 'always'),
       baseField(),
       targetField(),
       agentEnvironmentField(),
@@ -447,7 +452,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), agentEnvironmentField(), reposField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), agentEnvironmentField(), reposField(), confirmerField()],
   },
   {
     name: 'script-exec',
@@ -484,18 +489,20 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), confirmerField()],
   },
   {
     name: 'merge-only',
-    version: '1.6.0',
+    version: '1.7.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],
     events: [{ type: 'merge-only.merged', description: 'Reviewed branch merged.', fields: { sha: 'string' } }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
-    roles: [MERGE_ROLE, CONFIRM_ROLE],
+    // Merge-only uses the same operational Agent profile as every other coding
+    // workflow. The internal `do` name is retained for wire compatibility.
+    roles: [DO_ROLE, CONFIRM_ROLE],
     // Review an existing branch, then merge it (no Do).
     stages: [
       { key: 'setup', label: 'Setup' },
@@ -508,7 +515,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       targetField(),
       agentEnvironmentField(),
       reposField(),
-      agentField('merge', 'Merge agent'),
+      agentField('do', 'Agent'),
       confirmerField(),
     ],
   },
@@ -655,7 +662,10 @@ export function roleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS)
 /** Prompt lookup for workflow execution. The disabled Resolve prompt remains
  * available only so historical version-pinned executions can replay. */
 export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS): RoleWithSource | undefined {
-  return roleDef(name, manifests) ?? (name === 'resolve' ? { ...LEGACY_RESOLVE_ROLE, workflows: [] } : undefined);
+  return roleDef(name, manifests)
+    ?? (name === 'merge' ? { ...LEGACY_MERGE_ROLE, workflows: [] }
+      : name === 'resolve' ? { ...LEGACY_RESOLVE_ROLE, workflows: [] }
+      : undefined);
 }
 
 /**
