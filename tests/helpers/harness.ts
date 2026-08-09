@@ -27,6 +27,7 @@ import { LoginManager } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/resources.js';
 import { WorldHandoffService } from '../../src/world/handoff.js';
+import { AuthorizationService } from '../../src/platform/authorization.js';
 
 /** How long a teardown step may run before it is worth saying so out loud. Well
  *  clear of the ~1s a healthy teardown takes, so a normal run stays silent. */
@@ -60,7 +61,9 @@ export interface Harness {
   restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
-  startGateway(opts?: { password?: string }): Promise<{ url: string; internalUrl: string; close: () => Promise<void> }>;
+  startGateway(opts?: { password?: string;
+    githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
+      url: string; internalUrl: string; close: () => Promise<void> }>;
 }
 
 /** Boots a full karmax backend (Temporal + worker + deps) for integration tests. */
@@ -105,6 +108,7 @@ export async function bootHarness(
     { client, taskQueue: TASK_QUEUE });
 
   const tokens = new TokenAuthority(store);
+  const authorization = new AuthorizationService(store);
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
@@ -177,10 +181,12 @@ export async function bootHarness(
         staticDir: fileURLToPath(new URL('../../web', import.meta.url)),
         agentInfo: { provider: 'mock', reason: 'test' },
         broker,
+        authorization,
         payments,
         paymentRegistry,
         configHomes,
         login,
+        githubApp: opts?.githubApp ?? overrides.githubApp,
         password: opts?.password,
         worlds,
         objects,

@@ -389,7 +389,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
       + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
       + '`tags` accepts names or `a/b` paths and creates missing ones. '
-      + '`wiki_context` inlines wiki pages as `@proj:…`/`@org:…` tokens; omit to inherit the default-labelled pages, pass [] for none.',
+      + '`wiki_context` inlines wiki pages as `[[proj:…]]`/`[[org:…]]` references; omit to inherit the default-labelled pages, pass [] for none.',
     parameters: {
       type: 'object',
       properties: {

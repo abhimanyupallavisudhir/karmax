@@ -13,9 +13,9 @@ const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude',
 describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', () => {
   it('aggregates declared roles across the bundled workflows, tracking who uses each', () => {
     const roles = Object.fromEntries(allRoles().map((r) => [r.name, r]));
-    expect(Object.keys(roles).sort()).toEqual(['confirm', 'do', 'merge']);
-    expect(roles.do!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal']));
-    expect(roles.merge!.workflows).toEqual(['merge-only']);
+    expect(Object.keys(roles).sort()).toEqual(['confirm', 'do']);
+    expect(roles.do!.label).toBe('Agent');
+    expect(roles.do!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal', 'merge-only']));
     // every workflow with a Review gate declares the confirm role (agent confirm layers)
     expect(roles.confirm!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal', 'merge-only']));
     expect(roles.confirm!.capabilities).toContain('confirm-decision');
@@ -23,8 +23,9 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
 
   it('exposes each role its declared prompt template + capability ceiling', () => {
     expect(roleDef('do')!.promptTemplate).toContain('# Task');
-    expect(roleDef('merge')!.promptTemplate).toContain('You are merging');
-    expect(roleDef('merge')!.capabilities).toContain('merge-into:*');
+    expect(roleDef('merge')).toBeUndefined();
+    // Historical workflow pins can still replay the retired Merge role.
+    expect(roleCeiling('merge')).toContain('merge-into:*');
     expect(roleDef('nonexistent')).toBeUndefined();
   });
 
@@ -44,10 +45,8 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
 
   it('seeds one default profile per declared role, with no copy of the role ceiling', () => {
     const profiles = makeDefaultProfiles('claude');
-    expect(profiles.map((p) => p.id).sort()).toEqual(['confirm-default', 'do-default', 'merge-default']);
-    const merge = profiles.find((p) => p.id === 'merge-default')!;
-    expect(merge.role).toBe('merge');
-    expect(merge.model).toBeTruthy(); // provider/model resolved at seed time
+    expect(profiles.map((p) => p.id).sort()).toEqual(['confirm-default', 'do-default']);
+    expect(profiles.find((p) => p.id === 'do-default')!.model).toBeTruthy(); // provider/model resolved at seed time
     // The ceiling is the role contract, resolved from the manifest at turn time —
     // seeding a copy is what let it go stale (and what the dead settings field edited).
     expect(profiles.every((p) => p.capabilities === undefined)).toBe(true);
@@ -56,7 +55,6 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
   it('resolves the capability ceiling from the manifest, never from a stored profile', () => {
     // The ceiling a turn is minted against is looked up by ROLE NAME, so a stale or
     // hand-edited copy on the persisted profile is structurally unreachable.
-    expect(roleCeiling('merge')).toEqual(roleDef('merge')!.capabilities);
     expect(roleCeiling('merge')).toContain('merge-into:*');
     // Merge runs in the same task branch as Do. Routine developer operations
     // must not become permission prompts merely because the workflow advanced.

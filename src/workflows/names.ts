@@ -99,6 +99,7 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.mergeOnly, '1.4.0'),
   qualifiedType(WF.mergeOnly, '1.5.0'),
   qualifiedType(WF.mergeOnly, '1.6.0'),
+  qualifiedType(WF.mergeOnly, '1.7.0'),
 ]);
 
 /**

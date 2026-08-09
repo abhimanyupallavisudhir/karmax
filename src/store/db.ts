@@ -517,6 +517,12 @@ export class Store {
         tokenHash TEXT PRIMARY KEY, tokenId TEXT NOT NULL UNIQUE, json TEXT NOT NULL,
         expiresAt INTEGER NOT NULL, revokedAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS human_delegations (
+        id TEXT PRIMARY KEY,
+        json TEXT NOT NULL,
+        expiresAt INTEGER NOT NULL,
+        revokedAt INTEGER
+      );
       CREATE TABLE IF NOT EXISTS task_intents (
         id TEXT PRIMARY KEY, principalAttemptId TEXT NOT NULL,
         committedAttemptId TEXT, confirmer TEXT, createdAt INTEGER NOT NULL
@@ -627,6 +633,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_repositories_org ON repositories(organizationId, owner, name);
       CREATE INDEX IF NOT EXISTS idx_github_install_states_expiry ON github_install_states(expiresAt, usedAt);
       CREATE INDEX IF NOT EXISTS idx_scoped_tokens_expiry ON scoped_tokens(expiresAt);
+      CREATE INDEX IF NOT EXISTS idx_human_delegations_expiry ON human_delegations(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_world_instances_current ON world_instances(worldId, generation DESC);
       CREATE INDEX IF NOT EXISTS idx_checkpoints_world ON world_checkpoints(worldId, createdAt DESC);
       CREATE INDEX IF NOT EXISTS idx_resource_attachments_project ON resource_attachments(projectId, createdAt);
@@ -841,6 +848,16 @@ export class Store {
     );
   }
 
+  renameProject(id: string, name: string): Project {
+    const existing = this.getProject(id);
+    if (!existing) throw new Error(`no project ${id}`);
+    const nextName = name.trim();
+    if (!nextName) throw new Error('project name is required');
+    assertRoutableName('project', nextName);
+    this.db.prepare('UPDATE projects SET name = ? WHERE id = ?').run(nextName, id);
+    return { ...existing, name: nextName };
+  }
+
   /** Move a project so it sits immediately before `beforeProjectId` in the sidebar,
    * or last when that is omitted/unknown. Only the moved project's own organization
    * is touched, and its rows are re-densified to 0…n-1 so repeated drags stay stable.
@@ -995,6 +1012,7 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.revokeScopedTokens({ projectId: id });
+      this.revokeHumanDelegations({ projectId: id });
       deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
       deleteRows(this.db, 'execution_frames', 'executionId', executionIds);
       deleteRows(this.db, 'team_memberships', 'teamId', teamIds);
@@ -1058,6 +1076,15 @@ export class Store {
   getOrganization(id: string): Organization | undefined {
     const r = this.db.prepare('SELECT * FROM organizations WHERE id = ?').get(id) as any;
     return r ? rowToOrganization(r) : undefined;
+  }
+
+  renameOrganization(id: string, name: string): Organization {
+    const existing = this.getOrganization(id);
+    if (!existing) throw new Error(`no organization ${id}`);
+    const nextName = name.trim();
+    if (!nextName) throw new Error('organization name is required');
+    this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(nextName, id);
+    return { ...existing, name: nextName };
   }
 
   listOrganizations(userId?: string): Organization[] {
@@ -1353,6 +1380,7 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.revokeScopedTokens({ organizationId });
+      this.revokeHumanDelegations({ organizationId });
       for (const projectId of projectIds) this.revokeScopedTokens({ projectId });
       deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
       deleteRows(this.db, 'execution_frames', 'executionId', executionIds);
@@ -1530,6 +1558,7 @@ export class Store {
       for (const row of this.db.prepare('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL').all() as any[]) {
         try { if (JSON.parse(row.json).principal === `user:${userId}`) this.revokeScopedToken({ tokenHash: row.tokenHash }); } catch {}
       }
+      this.revokeHumanDelegations({ humanUserId: userId });
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -2522,6 +2551,7 @@ export class Store {
       .map((row) => String(row.id));
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.revokeHumanDelegationsForTask(taskId);
       deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
       this.db.prepare('DELETE FROM inbox WHERE taskId = ?').run(taskId);
       this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
@@ -4608,6 +4638,50 @@ export class Store {
     return r ? JSON.parse(r.json) : undefined;
   }
 
+  getScopedTokenById(tokenId: string): Record<string, unknown> | undefined {
+    const r = this.db.prepare('SELECT json FROM scoped_tokens WHERE tokenId=? AND revokedAt IS NULL AND expiresAt>?')
+      .get(tokenId, Date.now()) as any;
+    return r ? JSON.parse(r.json) : undefined;
+  }
+
+  putHumanDelegation(id: string, record: Record<string, unknown>, expiresAt: number): void {
+    this.db.prepare(`INSERT INTO human_delegations (id, json, expiresAt, revokedAt)
+      VALUES (?, ?, ?, NULL) ON CONFLICT(id) DO UPDATE SET
+      json=excluded.json, expiresAt=excluded.expiresAt, revokedAt=NULL`)
+      .run(id, JSON.stringify(record), expiresAt);
+  }
+
+  getHumanDelegation(id: string): Record<string, unknown> | undefined {
+    const r = this.db.prepare('SELECT json FROM human_delegations WHERE id=? AND revokedAt IS NULL AND expiresAt>?')
+      .get(id, Date.now()) as any;
+    return r ? JSON.parse(r.json) : undefined;
+  }
+
+  revokeHumanDelegation(id: string): void {
+    this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=?').run(Date.now(), id);
+  }
+
+  revokeHumanDelegationsForTask(taskId: string): number {
+    return this.revokeHumanDelegations({ taskId });
+  }
+
+  revokeHumanDelegations(scope: { taskId?: string; projectId?: string; organizationId?: string; humanUserId?: string }): number {
+    const update = this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL');
+    let revoked = 0;
+    for (const row of this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all() as any[]) {
+      try {
+        const record = JSON.parse(row.json) as Record<string, unknown>;
+        if ((scope.taskId && record.taskId === scope.taskId)
+          || (scope.projectId && (record.projectId === scope.projectId
+            || Array.isArray(record.projectIds) && record.projectIds.includes(scope.projectId)))
+          || (scope.organizationId && record.organizationId === scope.organizationId)
+          || (scope.humanUserId && record.humanUserId === scope.humanUserId))
+          revoked += Number(update.run(Date.now(), row.id).changes);
+      } catch { /* malformed historical state is unusable, but must not block cleanup */ }
+    }
+    return revoked;
+  }
+
   revokeScopedToken(input: { tokenHash?: string; tokenId?: string }): void {
     if (input.tokenHash) this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE tokenHash=?').run(Date.now(), input.tokenHash);
     else if (input.tokenId) this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE tokenId=?').run(Date.now(), input.tokenId);
@@ -4633,6 +4707,10 @@ export class Store {
 
   purgeScopedTokens(now = Date.now()): number {
     return Number(this.db.prepare('DELETE FROM scoped_tokens WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now).changes);
+  }
+
+  purgeHumanDelegations(now = Date.now()): number {
+    return Number(this.db.prepare('DELETE FROM human_delegations WHERE expiresAt<=? OR revokedAt IS NOT NULL').run(now).changes);
   }
 
   /** How long a GitHub delivery id stays in the dedupe table. GitHub retries a
@@ -4661,9 +4739,10 @@ export class Store {
    * SEAM: the app boot (`src/main.ts`) is what must schedule this — e.g.
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
-  retentionSweep(now = Date.now()): { scopedTokens: number; githubDeliveries: number } {
+  retentionSweep(now = Date.now()): { scopedTokens: number; humanDelegations: number; githubDeliveries: number } {
     return {
       scopedTokens: this.purgeScopedTokens(now),
+      humanDelegations: this.purgeHumanDelegations(now),
       githubDeliveries: this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now),
     };
   }

@@ -35,6 +35,7 @@ describe('gateway request scope for bare-id routes', () => {
   let close: () => Promise<void>;
   let mine: string;
   let theirs: string;
+  let acmeId: string;
   let token: string;
   let liveView: any;
   /** What the stub GitHub webhook handler throws on the next delivery. */
@@ -48,6 +49,7 @@ describe('gateway request scope for bare-id routes', () => {
     tokens = new TokenAuthority();
     const acme = store.createOrganization({ name: 'Acme', ownerUserId: 'a' });
     const other = store.createOrganization({ name: 'Other', ownerUserId: 'b' });
+    acmeId = acme.id;
     mine = store.createProject('Mine', {}, acme.id).id;
     theirs = store.createProject('Theirs', {}, other.id).id;
     // Permission approval now parks by starting a replacement at the exact
@@ -128,10 +130,44 @@ describe('gateway request scope for bare-id routes', () => {
       headers: { authorization: `Bearer ${maintainer}` },
     });
     expect(allowed.status).toBe(200);
-    expect(await allowed.json()).toMatchObject({ project: true });
+    expect(await allowed.json()).toMatchObject({ project: false, projectDelete: true });
+
+    const editor = tokens.mintPrincipal('user:a', ['project:read', 'project:edit'], mine, 60_000).token;
+    const editable = await fetch(`${base}/api/settings/access?projectId=${mine}`, {
+      headers: { authorization: `Bearer ${editor}` },
+    });
+    expect(editable.status).toBe(200);
+    expect(await editable.json()).toMatchObject({ project: true, projectDelete: false });
 
     const foreign = await fetch(`${base}/api/settings/access?projectId=${theirs}`, { headers: auth() });
     expect(foreign.status).toBe(403);
+  });
+
+  it('renames only with edit authority in the matching project or organization', async () => {
+    const projectEditor = tokens.mintPrincipal('user:a', ['project:read', 'project:edit'], mine, 60_000, acmeId).token;
+    const renamedProject = await fetch(`${base}/api/projects/${mine}`, {
+      method: 'PATCH', headers: { authorization: `Bearer ${projectEditor}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Customer portal' }),
+    });
+    expect(renamedProject.status).toBe(200);
+    expect(await renamedProject.json()).toMatchObject({ id: mine, name: 'Customer portal' });
+
+    const denied = await fetch(`${base}/api/projects/${theirs}`, {
+      method: 'PATCH', headers: { authorization: `Bearer ${projectEditor}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Not mine' }),
+    });
+    expect(denied.status).toBe(403);
+
+    const organizationEditor = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'],
+      undefined, 60_000, acmeId).token;
+    const slug = store.getOrganization(acmeId)!.slug;
+    const renamedOrganization = await fetch(`${base}/api/organizations/${acmeId}`, {
+      method: 'PATCH', headers: { authorization: `Bearer ${organizationEditor}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Acme Labs' }),
+    });
+    expect(renamedOrganization.status).toBe(200);
+    expect(await renamedOrganization.json()).toMatchObject({ id: acmeId, name: 'Acme Labs', slug });
+    expect(store.getOrganization(acmeId)?.slug).toBe(slug);
   });
 
   it('serves routed permission requests in Approval Requests and enforces the approver capability', async () => {

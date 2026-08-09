@@ -53,6 +53,15 @@ ok(
   'quick-add placeholder explains its keyboard and paste shortcuts',
 );
 
+// The Activity feed is an internal debugging page. Its direct route remains
+// usable, but users must not discover it through the tab bar, command palette,
+// keyboard help, or a g+a shortcut.
+ok(
+  src.includes("const tabs = ['tasks', 'queue', 'wiki', 'settings'];"),
+  'project navigation omits the debugging-only Activity tab',
+);
+ok(!src.includes("id: 'nav.activity'"), 'Activity has no user-facing navigation command');
+
 // ── parseKeybinding ──
 ok(JSON.stringify(parseKeybinding('n')) === JSON.stringify([{ key: 'n' }]), 'single key');
 ok(JSON.stringify(parseKeybinding('g t')) === JSON.stringify([{ key: 'g' }, { key: 't' }]), 'two-step chord');

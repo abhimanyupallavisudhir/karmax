@@ -127,6 +127,9 @@ function slugify(s) {
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+function firstProjectForOrganization(organizationId) {
+  return (S.projects || []).find((p) => p.organizationId === organizationId);
+}
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -134,8 +137,7 @@ function projectById(pid) { return (S.projects || []).find((p) => p.id === pid);
 function projectBySlug(slug, organizationId) {
   const s = slugify(slug);
   const pool = (S.projects || []).filter((p) => !organizationId || p.organizationId === organizationId);
-  return pool.find((p) => slugify(p.name) === s) || pool.find((p) => p.id === slug)
-    || (S.projects || []).find((p) => p.id === slug);
+  return pool.find((p) => slugify(p.name) === s) || pool.find((p) => p.id === slug);
 }
 
 // Organizations own the top path segment. They carry a persisted slug; fall back
@@ -163,6 +165,16 @@ function currentOrg() {
   return organizationById(S.organizationId)
     || organizationById(projectById(S.projectId)?.organizationId)
     || (S.organizations || [])[0];
+}
+
+// The shell outlives every in-app navigation, so changing route state does not
+// recreate its organization picker. Keep that persistent control aligned with
+// the organization whose data the route selected (including the initial deep
+// link and Back/Forward navigation).
+function syncOrganizationSwitcher() {
+  const switcher = $('#org-switcher');
+  const organization = currentOrg();
+  if (switcher && organization && switcher.value !== organization.id) switcher.value = organization.id;
 }
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
@@ -240,6 +252,16 @@ function globalRoute(tab, org = currentOrg()) {
   return `${orgBase(org)}/${seg}`;
 }
 
+// Destination for an explicit organization-picker selection. Build it from the
+// selected organization rather than mutating S first; applyRoute then performs
+// the context switch from the URL as the single source of truth.
+function organizationLandingRoute(organizationId) {
+  const organization = organizationById(organizationId);
+  if (!organization) return null;
+  const project = firstProjectForOrganization(organization.id);
+  return project ? projectRoute(project.id) : globalRoute('organization', organization);
+}
+
 function installationRoute() { return '/installation'; }
 
 // The profile belongs to the signed-in user, not to the selected organization.
@@ -315,9 +337,14 @@ async function applyRoute() {
     // Select the organization named in the URL (if any) before painting.
     if (r.org) {
       const org = organizationBySlug(r.org);
-      if (org && org.id !== S.organizationId) {
+      if (!org) { toast('Organization not found', true); return go('/', { replace: true }); }
+      const organizationChanged = org.id !== S.organizationId;
+      if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+      }
+      syncOrganizationSwitcher();
+      if (organizationChanged) {
         await loadCollaboration().catch(() => {});
         if (!routeIsCurrent()) return;
       }
@@ -353,11 +380,14 @@ async function applyRoute() {
     return;
   }
   // project / task routes → resolve the org + project (by name-slug) + optional open task
+  const previousOrganizationId = S.organizationId;
+  let routeOrganization = null;
   if (r.org) {
-    const org = organizationBySlug(r.org);
-    if (org) S.organizationId = org.id;
+    routeOrganization = organizationBySlug(r.org);
+    if (!routeOrganization) { toast('Organization not found', true); return go('/', { replace: true }); }
+    S.organizationId = routeOrganization.id;
   }
-  const proj = projectBySlug(r.slug, S.organizationId) || projectBySlug(r.slug);
+  const proj = projectBySlug(r.slug, routeOrganization?.id);
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
@@ -368,6 +398,11 @@ async function applyRoute() {
   }
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
+  syncOrganizationSwitcher();
+  if (S.organizationId !== previousOrganizationId) {
+    await loadCollaboration().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   await loadOrganizationRuntimeCatalog();
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
@@ -526,7 +561,7 @@ function principalLabel(principal) {
   if (!principal) return 'Unassigned';
   if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
   if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
-  return `Task agent · ${principal.role}`;
+  return principal.role === 'do' ? 'Task agent · Agent' : `Task agent · ${principal.role}`;
 }
 
 // The workflows a human may pick when creating a task. INTENDED: `just-do` and
@@ -552,15 +587,17 @@ const NODES = [
 ];
 
 // Provider → model choices for the agent field (free-text also allowed).
-const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'];
+// `mock` is a hermetic test adapter, not a user-selectable agent.
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
   claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
   grok: ['grok-build', 'grok-code-fast-1'],
-  mock: ['mock'],
 };
+const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
+const agentProviderLabel = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : '';
 function modelOptions(provider) {
   const live = S.modelCatalog?.[provider];
   // Keep the provider metadata intact: Claude's stable selectable id can be an
@@ -667,18 +704,18 @@ function renderField(f, own, inherited, withChips, alt) {
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
-    // The prompt field (withChips) also carries the @-mention affordance, so its
+    // The prompt field (withChips) also carries the wiki-reference affordance, so its
     // placeholder advertises both image paste and wiki tagging.
-    const placeholder = withChips ? 'Describe the task (paste an image to attach, type @ to add context from the wiki)' : (f.placeholder || '');
+    const placeholder = withChips ? 'Describe the task (paste an image to attach, type [[ to add context from the wiki)' : (f.placeholder || '');
     const ta = `<textarea ${attrs} rows="4" placeholder="${esc(placeholder)}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
     // growing it as needed — rather than in a separate "Images" section.
     if (withChips)
       // The prompt box's clean bottom row: a borderless "wiki context" field,
-      // seeded elsewhere with the default @proj:tag:default / @org:tag:default so
+      // seeded elsewhere with the default [[proj:tag:default]] / [[org:tag:default]] so
       // the user sees (and can backspace away) what's inlined by default.
       return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div>
-        <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels (@…:tag:…), or folders (@…/*) inlined into this task's context. Type @ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type @ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
+        <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels ([[…:tag:…]]), or folders ([[…/*]]) inlined into this task's context. Type [[ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
   if (f.type === 'boolean')
@@ -698,35 +735,7 @@ function renderField(f, own, inherited, withChips, alt) {
   return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
-const agentGroupFields = (fields) => ['do', 'merge', ...(fields.some((f) => f.type === 'agent' && f.role === 'resolve') ? ['resolve'] : [])]
-  .map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
-const inferredSeparateAgents = (values = {}, roles = ['do', 'merge']) => values.separateAgents === true ||
-  (values.separateAgents === undefined && roles.some((role) => values[`agent:${role}`] !== undefined));
-
-// Software-dev's operational roles usually share one identity. Keep the
-// manifest's role fields (the workflow still consumes those)
-// while presenting a compact virtual `agent:unified` field by default.
-function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
-  const [doField, mergeField, ...optionalFields] = agentGroupFields(fields);
-  if (!doField || !mergeField) return null;
-  const roleFields = [doField, mergeField, ...optionalFields].filter(Boolean);
-  const separate = inferredSeparateAgents(own, roleFields.map((f) => f.role));
-  const unifiedField = { ...doField, name: 'agent:unified', role: 'unified', label: 'Agent' };
-  const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
-  const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
-  return `<div class="agent-group" data-agent-group>
-    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate ${roleFields.map((f) => f.label.replace(/ agent$/, '')).join(', ').replace(/, ([^,]+)$/, ' and $1')} agent configurations</label>
-    <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
-    <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
-      ${roleFields.map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
-    </div>
-  </div>`;
-}
-
 function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
-  const group = renderAgentGroup(fields, own, inherited, altFor);
-  const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
-  let groupDrawn = false;
   // Base, target, and the Agent environment share one row (rendered at the first
   // of them present, in this order); the rest are skipped where they'd fall.
   const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
@@ -734,10 +743,6 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
-    if (grouped.has(f.name)) {
-      if (!groupDrawn) { html.push(group); groupDrawn = true; }
-      continue;
-    }
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
@@ -753,20 +758,23 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
 function renderAgentField(f, spec, inherited) {
   const inh = inherited || {};
   const e = spec || inh; // prefill with the effective spec
-  const provider = e.provider || 'claude';
+  const providerVisible = !e.provider || AGENT_PROVIDERS.includes(e.provider);
+  const provider = agentProviderChoice(e.provider);
+  const model = providerVisible ? e.model : '';
+  const effort = providerVisible ? e.effort : '';
   const role = f.role || f.name;
   const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div class="agent-controls">
       <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
-        <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
+        <input class="af-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
         <div class="combo-menu" hidden></div>
       </div>
-      ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
+      ${effortSelectHtml('af-effort', provider, model, effort || '')}
     </div>
-    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> ${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</label>
+    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
@@ -779,7 +787,8 @@ function renderAgentField(f, spec, inherited) {
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
 function resumeChosenInner(rf, task) {
   const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
-  const label = `⑂ forking ${rf.role || 'do'} agent of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
+  const source = !rf.role || rf.role === 'do' ? 'agent' : `${rf.role} agent`;
+  const label = `⑂ forking ${source} of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
   return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
 }
 
@@ -838,7 +847,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type @ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type [[ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -895,19 +904,7 @@ function readConfirmerLayers(box) {
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
   const out = {};
-  const group = root.querySelector('[data-agent-group]');
-  const groupedRoles = group ? new Set(agentGroupFields(fields).map((f) => f.role)) : new Set();
-  if (group) {
-    const separate = group.querySelector('.agent-separate').checked;
-    out.separateAgents = separate;
-    const panels = separate ? [group.querySelector('.agent-separated-panel')] : [group.querySelector('.agent-unified-panel')];
-    const selectedFields = separate
-      ? fields.filter((f) => f.type === 'agent' && groupedRoles.has(f.role))
-      : [{ ...fields.find((f) => f.type === 'agent' && f.role === 'do'), name: 'agent:unified', role: 'unified' }];
-    Object.assign(out, collectForm(panels[0], selectedFields));
-  }
   for (const f of fields) {
-    if (f.type === 'agent' && groupedRoles.has(f.role)) continue;
     if (f.type === 'agent') {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
@@ -1245,31 +1242,6 @@ function wireAgentBox(box) {
   syncForkState();
 }
 function wireAgentFields(root) {
-  root.querySelectorAll('[data-agent-group]').forEach((group) => {
-    const toggle = group.querySelector('.agent-separate');
-    toggle?.addEventListener('change', () => {
-      group.querySelector('.agent-unified-panel').hidden = toggle.checked;
-      group.querySelector('.agent-separated-panel').hidden = !toggle.checked;
-      group.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    const unifiedBox = group.querySelector('.agent-unified-panel .agent-field');
-    const reset = group.querySelector('.agent-unified-panel .field-reset');
-    if (unifiedBox && reset) {
-      const sync = () => {
-        const inh = JSON.parse(unifiedBox.getAttribute('data-inherit') || 'null');
-        const cur = { provider: unifiedBox.querySelector('.af-provider').value };
-        const model = unifiedBox.querySelector('.af-model').value.trim();
-        const effort = unifiedBox.querySelector('.af-effort').value;
-        if (model) cur.model = model;
-        if (effort) cur.effort = effort;
-        reset.hidden = sameJson(normSpec(cur), normSpec(inh));
-      };
-      unifiedBox.addEventListener('input', sync);
-      unifiedBox.addEventListener('change', sync);
-      reset.addEventListener('click', () => { resetAgentField(unifiedBox); sync(); });
-      sync();
-    }
-  });
   root.querySelectorAll('.agent-field').forEach(wireAgentBox);
   root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
 }
@@ -1282,9 +1254,9 @@ function cfSync(box) {
   if (empty) empty.style.display = rows.length ? 'none' : '';
 }
 
-// Review-request prompts accept the same project/org wiki mentions as the task
+// Review-request prompts accept the same project/org wiki references as the task
 // prompt and follow-up composer. The resolver scans the rendered request when the
-// Confirm turn starts; wireWikiMention supplies the shared search/picker UI.
+// Confirm turn starts; wireWikiMention supplies search, decoration, and links.
 function wireConfirmerWikiPrompts(root) {
   // Kept guarded for hosts upgrading from a build before wiki mentions existed;
   // current builds always provide the shared picker.
@@ -2687,13 +2659,10 @@ function renderShell() {
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
-  $('#org-switcher')?.addEventListener('change', async (e) => {
+  $('#org-switcher')?.addEventListener('change', (e) => {
     if (e.target.value === '__new') return createOrganization();
-    S.organizationId = e.target.value;
-    const project = S.projects.find((p) => p.organizationId === S.organizationId);
-    S.projectId = project?.id || null;
-    await loadCollaboration().catch(() => {});
-    return go(project ? projectRoute(project.id) : globalRoute('organization'));
+    const route = organizationLandingRoute(e.target.value);
+    return route ? go(route) : syncOrganizationSwitcher();
   });
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
@@ -2926,8 +2895,10 @@ function renderMain() {
   // clears S.wikiEditing first.
   if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
-  const tabs = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', wiki: 'Wiki', settings: 'Project settings' };
+  // Activity remains available by direct URL for debugging, but is deliberately
+  // absent from user-facing navigation.
+  const tabs = ['tasks', 'queue', 'wiki', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: 'Project settings' };
   const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -4513,7 +4484,7 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-body')
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
     .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
-  // Typing "@" in the prompt tags wiki pages/labels/folders into the task's context.
+  // Typing "[[" in the prompt references wiki pages/labels/folders in the task context.
   const promptTa = $('#tf-body')?.querySelector('textarea[data-field="prompt"]');
   if (promptTa) wireWikiMention(promptTa, projectId);
   // The prompt's "wiki context" bottom row: seed with the task's tokens, or the
@@ -4521,7 +4492,12 @@ async function openTaskForm(workflow, draft, seedText) {
   const contextTa = $('#tf-context');
   if (contextTa) {
     const wc = draft?.params?.wikiContext;
-    contextTa.value = Array.isArray(wc) ? wc.join(' ') : '@proj:tag:default @org:tag:default';
+    contextTa.value = Array.isArray(wc)
+      ? wc.map((token) => {
+        const value = String(token);
+        return /^@(proj|org):\S+$/i.test(value) ? `[[${value.slice(1)}]]` : value;
+      }).join(' ')
+      : '[[proj:tag:default]] [[org:tag:default]]';
     const growContext = () => { contextTa.style.height = 'auto'; contextTa.style.height = `${contextTa.scrollHeight}px`; };
     growContext();
     contextTa.addEventListener('input', growContext);
@@ -4601,11 +4577,11 @@ async function openTaskForm(workflow, draft, seedText) {
     const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
-    // The "wiki context" row (@proj:…/@org:… tokens). Always sent — even empty,
+    // The wiki-context row. Always sent — even empty,
     // which is a deliberate opt-out of the default `default`-labelled pages — so
     // the replace:true auto-save preserves the user's choice.
     const ctx = $('#tf-context');
-    if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
+    if (ctx) body.wikiContext = wikiRefMatches(ctx.value).map((ref) => ref.raw);
     return {
       body, notes: $('#tf-notes')?.value ?? '',
       authorization: readAuthorizationEditor($('#tf-authorization')),
@@ -6285,7 +6261,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
-    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
+    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
   const agentForks = agentForksSection(v);
@@ -6308,8 +6284,10 @@ function overviewTab(v) {
 // Falls back to `messages` (Do) for workflows that predate per-role transcripts.
 function taskTranscripts(v) {
   return (v.transcripts && v.transcripts.length)
-    ? v.transcripts.filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
-    : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
+    ? v.transcripts
+        .filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
+        .map((t) => t.role === 'do' ? { ...t, label: 'Agent' } : t)
+    : [{ role: 'do', label: 'Agent', messages: v.messages || [] }];
 }
 // The conversation owning the active stage — it gets the live bubble and is the
 // default pane (in Review that's the agent whose work is being reviewed).
@@ -6417,7 +6395,7 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type @ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type [[ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           <div class="img-chips followup-chips" style="display:none"></div>
         </div>
         <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
@@ -7475,8 +7453,8 @@ function wireFollowups(v) {
     const chips = box.querySelector('.followup-chips');
     const paint = () => renderImageChips(chips, store);
     wireImagePaste(ta, () => store, paint);
-    // Typing "@" tags wiki pages/labels/folders into the follow-up, same as the
-    // task prompt — the backend scans follow-up messages for `@proj:…`/`@org:…`.
+    // Wiki references in follow-ups use the same picker and backend scanner as
+    // the task prompt.
     wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
     paint();
     const send = async () => {
@@ -8554,12 +8532,164 @@ function buildWikiContent(fields, body) {
   return lines.length ? `---\n${lines.join('\n')}\n---\n\n${text}` : text;
 }
 
-// ── @-mention: tag wiki context into a task prompt ───────────────────────────
-// Typing "@" in a prompt opens a dropdown that searches BOTH the project and
-// the organization wiki. Picking a result inserts a `@proj:…` / `@org:…` token
-// that inlines that page — or a whole label (`@proj:tag:…`) or folder
-// (`@proj:…/*`) — into the task's context at run time. Enter picks the top
+// ── Wiki references in prompt editors ──────────────────────────────────────
+// Typing "[[" opens a dropdown that searches BOTH wiki scopes. Picking a
+// result inserts `[[proj:…]]` / `[[org:…]]`; completed references are decorated
+// and Ctrl/Cmd-clickable. Enter picks the top
 // (or highlighted) result; ↑/↓ navigate; Esc dismisses; a click picks directly.
+
+// Return the source ranges occupied by Markdown code. This mirrors the backend
+// scanner: references shown as examples in inline code, backtick/tilde fences,
+// longer-backtick spans, or unclosed fences are never activated or decorated.
+function wikiMarkdownCodeRanges(value) {
+  const text = String(value ?? '');
+  const fenced = [];
+  const indented = [];
+  let open = null, offset = 0;
+  while (offset < text.length) {
+    const newline = text.indexOf('\n', offset);
+    const end = newline < 0 ? text.length : newline + 1;
+    const line = text.slice(offset, newline < 0 ? text.length : newline).replace(/\r$/, '');
+    if (open) {
+      const close = /^ {0,3}(`{3,}|~{3,})[\t ]*$/.exec(line);
+      if (close && close[1][0] === open.char && close[1].length >= open.length) {
+        fenced.push([open.start, end]);
+        open = null;
+      }
+    } else {
+      const begin = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (begin && (begin[1][0] !== '`' || !begin[2].includes('`')))
+        open = { char: begin[1][0], length: begin[1].length, start: offset };
+      else if (/^(?: {4}|\t)/.test(line)) indented.push([offset, end]);
+    }
+    offset = end;
+  }
+  if (open) fenced.push([open.start, text.length]);
+  const ranges = [...fenced, ...indented];
+  const blockAt = (at) => ranges.find(([start, end]) => at >= start && at < end);
+  for (let i = 0; i < text.length;) {
+    const block = blockAt(i);
+    if (block) { i = block[1]; continue; }
+    if (text[i] !== '`') { i++; continue; }
+    let length = 1;
+    while (text[i + length] === '`') length++;
+    const boundary = ranges.filter(([start]) => start > i).reduce((min, [start]) => Math.min(min, start), text.length);
+    let close = i + length;
+    while (close < boundary) {
+      close = text.indexOf('`'.repeat(length), close);
+      if (close < 0 || close >= boundary) { close = -1; break; }
+      const exact = text[close - 1] !== '`' && text[close + length] !== '`';
+      if (exact) break;
+      close += length;
+    }
+    if (close >= 0 && close < text.length) {
+      ranges.push([i, close + length]);
+      i = close + length;
+    } else i += length;
+  }
+  return ranges.sort((a, b) => a[0] - b[0]);
+}
+
+function wikiRefMatches(value) {
+  const text = String(value ?? '');
+  const code = wikiMarkdownCodeRanges(text);
+  const out = [];
+  const re = /\[\[(proj|org):([^\s\[\]]+)\]\]/gi;
+  let match;
+  while ((match = re.exec(text))) {
+    const start = match.index, end = start + match[0].length;
+    let slashes = 0;
+    for (let i = start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
+    if (slashes % 2 || code.some(([a, b]) => start < b && end > a)) continue;
+    const rest = match[2];
+    const kind = /^tag:/i.test(rest) ? 'label' : rest.endsWith('/*') ? 'folder' : 'page';
+    const valuePart = kind === 'label' ? rest.slice(4).replace(/\/+$/, '')
+      : kind === 'folder' ? rest.slice(0, -2) : rest;
+    if (valuePart) out.push({
+      scope: match[1].toLowerCase() === 'proj' ? 'project' : 'organization',
+      kind, value: valuePart, start, end, raw: match[0],
+    });
+  }
+  return out;
+}
+
+function wikiRefHref(ref, projectId) {
+  const project = projectById(projectId);
+  const base = ref.scope === 'project'
+    ? projectRoute(projectId, 'wiki')
+    : globalRoute('orgwiki', organizationById(project?.organizationId) || currentOrg());
+  return `${base}${ref.kind === 'page' ? `#${encodeURIComponent(ref.value)}` : ''}`;
+}
+
+// A transparent textarea remains the real editable/accessibility surface; its
+// mirrored backdrop paints just the recognized ranges. Because both decoration
+// and click handling consume wikiRefMatches, code examples can never become
+// links by disagreeing with the parser.
+function wireWikiRefDecoration(ta, projectId, signal) {
+  if (ta.dataset.wrDecorated) return;
+  ta.dataset.wrDecorated = '1';
+  const shell = document.createElement('div');
+  shell.className = 'wiki-ref-editor';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'wiki-ref-backdrop';
+  backdrop.setAttribute('aria-hidden', 'true');
+  ta.parentNode.insertBefore(shell, ta);
+  shell.append(backdrop, ta);
+  ta.classList.add('wiki-ref-input');
+  ta.title = 'Wiki references are highlighted. Ctrl/Cmd-click one to open it.';
+
+  const metrics = ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight',
+    'textAlign', 'textIndent', 'textTransform', 'wordSpacing', 'tabSize', 'paddingTop', 'paddingRight',
+    'paddingBottom', 'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth',
+    'borderLeftWidth', 'boxSizing'];
+  const syncMetrics = () => {
+    const style = getComputedStyle(ta);
+    for (const prop of metrics) backdrop.style[prop] = style[prop];
+    // A native textarea's scrollbar consumes layout width/height. Give the
+    // mirror equivalent trailing padding so wrapping stays pixel-aligned.
+    const borderX = parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth);
+    const borderY = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+    const scrollbarX = Math.max(0, ta.offsetWidth - ta.clientWidth - borderX);
+    const scrollbarY = Math.max(0, ta.offsetHeight - ta.clientHeight - borderY);
+    backdrop.style.paddingRight = `${parseFloat(style.paddingRight) + scrollbarX}px`;
+    backdrop.style.paddingBottom = `${parseFloat(style.paddingBottom) + scrollbarY}px`;
+  };
+  const syncScroll = () => {
+    backdrop.scrollTop = ta.scrollTop;
+    backdrop.scrollLeft = ta.scrollLeft;
+  };
+  const paint = () => {
+    const text = ta.value;
+    let html = '', at = 0;
+    for (const ref of wikiRefMatches(text)) {
+      html += esc(text.slice(at, ref.start));
+      html += `<mark class="wiki-ref wiki-ref-${ref.kind}">${esc(text.slice(ref.start, ref.end))}</mark>`;
+      at = ref.end;
+    }
+    backdrop.innerHTML = html + esc(text.slice(at)) + (text.endsWith('\n') ? '<br>' : '');
+    syncScroll();
+  };
+  const sync = () => { syncMetrics(); paint(); };
+  ta.addEventListener('input', paint, { signal });
+  ta.addEventListener('scroll', syncScroll, { signal });
+  ta.addEventListener('mousemove', (event) => ta.classList.toggle('wiki-ref-modifier', event.ctrlKey || event.metaKey), { signal });
+  ta.addEventListener('mouseleave', () => ta.classList.remove('wiki-ref-modifier'), { signal });
+  ta.addEventListener('click', (event) => {
+    if (!(event.ctrlKey || event.metaKey)) return;
+    const pos = ta.selectionStart;
+    const ref = wikiRefMatches(ta.value).find((candidate) => pos >= candidate.start && pos <= candidate.end);
+    if (!ref) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.open(wikiRefHref(ref, projectId), '_blank', 'noopener');
+  }, { signal });
+  if (typeof ResizeObserver !== 'undefined') {
+    const observer = new ResizeObserver(sync);
+    observer.observe(ta);
+    signal.addEventListener('abort', () => observer.disconnect(), { once: true });
+  }
+  sync();
+}
 
 // Viewport-relative pixel position of a caret offset inside a textarea, via a
 // mirror div that copies the textarea's text metrics (the standard technique).
@@ -8610,27 +8740,29 @@ function wireWikiMention(ta, projectId) {
   sweepWikiMentionWirings();
   const controller = new AbortController();
   const { signal } = controller;
+  wireWikiRefDecoration(ta, projectId, signal);
   const orgId = projectById(projectId)?.organizationId;
   let menu = null, items = [], active = 0, token = null, seq = 0;
 
   const close = () => { menu?.remove(); menu = null; items = []; token = null; };
   wikiMentionWirings.add({ ta, controller, close });
-  // The @-token immediately before the caret — only at the start or right after
-  // whitespace (so `b@`, `\@`, `(@` don't trigger), and never inside an inline
-  // code span (odd count of backticks before the @). Mirrors parseWikiRefs.
+  // The unfinished `[[…` immediately before the caret. It may sit next to prose
+  // punctuation, but not behind an escaping backslash or inside Markdown code.
   const tokenAt = () => {
     const pos = ta.selectionStart;
     if (pos == null || pos !== ta.selectionEnd) return null;
-    const m = /(?:^|\s)@([^\s@]*)$/.exec(ta.value.slice(0, pos));
+    const m = /\[\[([^\s\[\]]*)$/.exec(ta.value.slice(0, pos));
     if (!m) return null;
-    const at = pos - m[1].length - 1;
-    if ((ta.value.slice(0, at).match(/`/g) || []).length % 2 === 1) return null;
+    const at = pos - m[1].length - 2;
+    let slashes = 0;
+    for (let i = at - 1; i >= 0 && ta.value[i] === '\\'; i--) slashes++;
+    if (slashes % 2 || wikiMarkdownCodeRanges(ta.value).some(([start, end]) => at >= start && at < end)) return null;
     return { start: at, end: pos, query: m[1] };
   };
   const parseQuery = (q) => /^proj:/i.test(q) ? { scopes: ['project'], q: q.slice(5) }
     : /^org:/i.test(q) ? { scopes: ['organization'], q: q.slice(4) }
     : { scopes: ['project', 'organization'], q };
-  const tokenFor = (s) => `@${s.scope === 'project' ? 'proj' : 'org'}:${s.ref}`;
+  const tokenFor = (s) => `[[${s.scope === 'project' ? 'proj' : 'org'}:${s.ref}]]`;
   const glyph = (s) => s.kind === 'label' ? '🏷' : s.kind === 'folder' ? '🗀' : s.scope === 'project' ? '⚡' : '✦';
 
   const fetchSuggestions = async (q) => {
@@ -8860,7 +8992,7 @@ function renderWikiEditor(info, proj, pane, page) {
       <div class="wiki-fields" id="wiki-form">
         <label>Name<input id="wf-name" value="${esc(fields.name || '')}" placeholder="defaults to the folder name"></label>
         <label>Description<input id="wf-desc" value="${esc(fields.description || '')}" placeholder="one line for the table of contents"></label>
-        <label title="Comma-separated. Every entry is always in the table of contents; a task inlines an entry in full by tagging its label with @proj:tag:… (or @org:tag:…). Add “default” to inline it into every task.">Labels (add “default” to include with every task)<input id="wf-labels" value="${esc(fields.labels || '')}" placeholder="e.g. default, security"></label>
+        <label title="Comma-separated. Every entry is always in the table of contents; a task inlines an entry in full by referencing its label with [[proj:tag:…]] (or [[org:tag:…]]). Add “default” to inline it into every task.">Labels (add “default” to include with every task)<input id="wf-labels" value="${esc(fields.labels || '')}" placeholder="e.g. default, security"></label>
         <label>Importance<input id="wf-importance" type="number" step="any" value="${esc(fields.importance ?? '')}" placeholder="0"></label>
       </div>
       <div class="wiki-body-bar">
@@ -8947,7 +9079,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-access="project" hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -8980,10 +9112,10 @@ function settingsView(proj) {
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
-    <div class="settings-section-title" id="project-advanced" data-settings-access="project" hidden><div>Advanced</div></div>
-    <div class="card" data-settings-access="project" hidden style="border-color:var(--danger-weak)">
-      <div class="section-h" style="color:var(--danger)">Danger zone</div>
-      <button class="btn danger" id="delete-project">Delete project</button>
+    <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="card" data-settings-advanced hidden>
+      <div class="section-h" data-settings-access="project" hidden>Project name</div>
+      <div class="inline-form"><input id="project-name" value="${esc(proj.name)}" aria-label="Project name" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save name</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
     </div></div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
@@ -9484,6 +9616,20 @@ function wireSettingsView(proj) {
     }),
   );
   wirePaymentsCard('project', proj.id, proj.organizationId);
+  const renameProject = async () => {
+    const name = $('#project-name')?.value.trim();
+    if (!name) return toast('Project name is required', true);
+    try {
+      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+      await loadProjects();
+      toast('Project renamed');
+      await go(`${projectRoute(proj.id, 'settings')}${location.hash}`, { replace: true });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#rename-project')?.addEventListener('click', renameProject);
+  $('#project-name')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
+  });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -9492,15 +9638,17 @@ function wireSettingsView(proj) {
       const wasCurrent = S.projectId === proj.id;
       await loadProjects();
       if (wasCurrent) {
-        // Route into the next remaining project (or the dashboard) so its
-        // tasks/tags/views/search all load fresh and the URL stops pointing at
-        // the now-deleted project. S.projectId still holds the deleted id here,
-        // which keeps applyRoute's switch-guard armed so the old project's view
-        // state (query/selected view/cursor) gets cleared.
-        const next = S.projects[0];
+        // Stay inside the deleted project's organization. The project list spans
+        // every organization the user can access, so its first item is not a safe
+        // fallback (it could unexpectedly switch workspaces). S.projectId still
+        // holds the deleted id here, which keeps applyRoute's switch-guard armed
+        // when another project exists and clears the old project's view state.
+        const deletedOrganizationId = proj.organizationId || S.organizationId;
+        const next = firstProjectForOrganization(deletedOrganizationId);
         if (next) return go(projectRoute(next.id));
         S.projectId = null;
-        return go(globalRoute('dashboard'));
+        S.organizationId = deletedOrganizationId;
+        return go(globalRoute('dashboard', organizationById(deletedOrganizationId)));
       }
       renderRail();
       renderMain();
@@ -11216,30 +11364,33 @@ async function wireOutboundEmailCard() {
 function profileRow(p, scope) {
   const inherited = p.scope === 'inherited';
   const ownScope = scope === 'project' ? 'project' : 'organization';
+  const providerVisible = AGENT_PROVIDERS.includes(p.provider);
+  const provider = agentProviderChoice(p.provider);
+  const model = providerVisible ? p.model : '';
+  const effort = providerVisible ? p.effort : '';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
-    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
+    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} ${usedBy}
       ${inherited ? `<span class="chip" title="Using the next default up; edit to create a ${ownScope} override">inherited</span>` : `<span class="chip">${ownScope} override</span>`}</div>
     <div class="agent-profile-controls">
-      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
-        <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
+        <input class="pf-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
         <div class="combo-menu" hidden></div>
       </div>
-      ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
+      ${effortSelectHtml('pf-effort', provider, model, effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
     <div style="display:flex;gap:8px">
-      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
+      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save agent</button>
       ${p.scope === ownScope ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
     </div>
   </div>`;
 }
 
-// Render + wire the agents editor for a scope (organization or project). Software
-// Dev has only a Do agent; the remaining Merge profile belongs to merge-only and
-// is therefore shown honestly as its own role instead of being coupled to Do.
+// Render + wire the shared operational Agent editor for an organization or
+// project. All coding workflows, including Merge-only, resolve this one profile.
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
@@ -11336,7 +11487,7 @@ async function hydrateAccounts(organizationId = S.organizationId) {
 
 function profilesCard(scope) {
   return `<div class="card agent-profile-settings" id="profiles-card-${scope}">
-    <div class="section-h">Agents</div>
+    <div class="section-h">Agent</div>
     <p style="color:var(--ink-2);margin-top:0">Who does the work: model, turn cap, and account pool.${scope === 'project' ? ' Overrides the organization defaults for this project.' : ''}</p>
     <div id="profiles-list-${scope}">Loading…</div>
     <div class="settings-divider"></div>
@@ -12245,7 +12396,10 @@ function organizationView() {
         <p class="data-export-note">Passwords, tokens, and stored credentials are never included.</p></div>
       <button class="btn sm" id="export-organization" type="button">Export organization data</button>
     </div>
-    ${org?.kind === 'team' ? '<details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Delete organization</b><span>Permanently remove this organization and its data</span></summary><p class="task-sub">This cannot be undone. Export the organization first if you need to keep a copy.</p><button class="btn sm danger" id="delete-organization">Delete organization</button></details>' : ''}
+    <div class="card" data-settings-access="organization" hidden>
+      <div class="section-h">Organization name</div>
+      <div class="inline-form"><input id="organization-name" value="${esc(org?.name || '')}" aria-label="Organization name"><button class="btn sm primary" id="rename-organization">Save name</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div>
+    </div>
     </div></div></div>`;
 }
 
@@ -12496,6 +12650,21 @@ async function hydrateOrganizationView() {
     block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   });
   $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+  const renameOrganization = async () => {
+    const name = $('#organization-name')?.value.trim();
+    if (!name) return toast('Organization name is required', true);
+    try {
+      await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+      await loadOrganizations();
+      toast('Organization renamed');
+      renderShell();
+      renderMain();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#rename-organization')?.addEventListener('click', renameOrganization);
+  $('#organization-name')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
+  });
   $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
 }
 
@@ -12634,7 +12803,6 @@ const HOST_COMMANDS = [
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
-  { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
   { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g D', run: () => switchTab('dashboard') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },

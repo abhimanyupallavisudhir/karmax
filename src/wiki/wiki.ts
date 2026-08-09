@@ -25,8 +25,9 @@ import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
  *   - an entry labelled `default` is inlined for every task (this is how a
  *     scope's "general prompt" is expressed — it is just a `default` entry);
  *   - a task additionally inlines the entries it tags in its prompt with
- *     `@proj:…`/`@org:…` — a single page, a whole `label` (`@proj:tag:…`), or a
- *     folder (`@proj:some/section/*`). See `parseWikiRefs`/`resolveWikiRefs`.
+ *     `[[proj:…]]`/`[[org:…]]` — a single page, a whole `label`
+ *     (`[[proj:tag:…]]`), or a folder (`[[proj:some/section/*]]`). See
+ *     `parseWikiRefs`/`resolveWikiRefs`.
  * `importance` orders siblings (higher first) and decides which entries survive
  * a TOC `[more…]` fold. The built-in karmax working instructions are a virtual
  * read-only `default` entry under `@builtin/` — the `@` first segment is
@@ -626,62 +627,136 @@ export function searchWiki(root: string, query: string, limit = 50): WikiSearchH
   return hits;
 }
 
-// ─── Tagging wiki context onto a task (`@proj:…` / `@org:…` in the prompt) ─────
+// ─── Tagging wiki context onto a task (`[[proj:…]]` / `[[org:…]]`) ───────
 
 /** A reference a task's prompt makes to wiki content it wants inlined in full:
  *  a single `page`, an entire `label`, or a `folder` and everything under it. */
 export interface WikiRef {
   scope: WikiScope;
   kind: 'page' | 'label' | 'folder';
-  /** Page path, label name, or folder path (already `@…`-token stripped). */
+  /** Page path, label name, or folder path (already wiki-markup stripped). */
   value: string;
+}
+
+/** A parsed reference together with its exact source range. Keeping ranges in
+ *  the shared grammar lets callers decorate or inspect text without trying to
+ *  rediscover where a reference came from. */
+export interface WikiRefMatch extends WikiRef {
+  start: number;
+  end: number;
+  raw: string;
 }
 
 /** The wiki-context tokens a task gets when it never touches the context field:
  *  the two scopes' `default` labels (so `default` pages are inlined by default,
  *  and a task can opt out by clearing them from the field). */
-export const DEFAULT_CONTEXT_TOKENS = ['@proj:tag:default', '@org:tag:default'];
+export const DEFAULT_CONTEXT_TOKENS = ['[[proj:tag:default]]', '[[org:tag:default]]'];
 
-/** Blank out inline `` `code` `` and fenced ```code``` regions so an `@…` inside
- *  them is never read as a tag (positions are irrelevant to ref extraction). */
-function stripCodeSpans(text: string): string {
-  return String(text ?? '').replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
+/** Markdown code ranges. Fences follow CommonMark's important rules (up to
+ *  three leading spaces, backtick or tilde runs, a closing run at least as long
+ *  as the opener); inline spans close only on an equal-length backtick run.
+ *  Unclosed inline delimiters are ordinary text, while an unclosed fence owns
+ *  the remainder of the document. */
+function markdownCodeRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const fenced: Array<[number, number]> = [];
+  const indented: Array<[number, number]> = [];
+  let open: { char: '`' | '~'; length: number; start: number } | undefined;
+  let offset = 0;
+  while (offset < text.length) {
+    const newline = text.indexOf('\n', offset);
+    const end = newline < 0 ? text.length : newline + 1;
+    const line = text.slice(offset, newline < 0 ? text.length : newline).replace(/\r$/, '');
+    if (open) {
+      const close = /^ {0,3}(`{3,}|~{3,})[\t ]*$/.exec(line);
+      if (close && close[1]![0] === open.char && close[1]!.length >= open.length) {
+        fenced.push([open.start, end]);
+        open = undefined;
+      }
+    } else {
+      const begin = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (begin && (begin[1]![0] !== '`' || !begin[2]!.includes('`'))) {
+        open = { char: begin[1]![0] as '`' | '~', length: begin[1]!.length, start: offset };
+      } else if (/^(?: {4}|\t)/.test(line)) indented.push([offset, end]);
+    }
+    offset = end;
+  }
+  if (open) fenced.push([open.start, text.length]);
+  ranges.push(...fenced, ...indented);
+
+  const blockAt = (at: number) => ranges.find(([start, end]) => at >= start && at < end);
+  for (let i = 0; i < text.length;) {
+    const block = blockAt(i);
+    if (block) {
+      const range = block;
+      i = range[1];
+      continue;
+    }
+    if (text[i] !== '`') { i++; continue; }
+    let length = 1;
+    while (text[i + length] === '`') length++;
+    const boundary = ranges.filter(([start]) => start > i).reduce((min, [start]) => Math.min(min, start), text.length);
+    let close = i + length;
+    while (close < boundary) {
+      close = text.indexOf('`'.repeat(length), close);
+      if (close < 0 || close >= boundary) { close = -1; break; }
+      const exact = text[close - 1] !== '`' && text[close + length] !== '`';
+      if (exact) break;
+      close += length;
+    }
+    if (close >= 0 && close < text.length) {
+      ranges.push([i, close + length]);
+      i = close + length;
+    } else {
+      i += length;
+    }
+  }
+  return ranges.sort((a, b) => a[0] - b[0]);
 }
 
 /**
- * Extract every `@proj:…` / `@org:…` tag from free text (a task prompt, a
- * follow-up). A tag counts only at the start or right after whitespace — never
- * mid-word (`b@…`, `\@…`) or inside code spans — so ordinary prose is left
- * alone. Grammar of the part after the scope colon:
+ * Locate every `[[proj:…]]` / `[[org:…]]` reference in free text (a task
+ * prompt, review prompt, or follow-up). Backslash-escaped openers and references
+ * inside Markdown inline/fenced code are literal examples, never context.
+ * Grammar of the part after the scope colon:
  *   `tag:<label>`   → a whole label            (kind `label`)
  *   `<path>/*`      → a folder and its subtree  (kind `folder`)
  *   `<path>`        → one page                  (kind `page`)
- * A token runs to the next whitespace; trailing sentence punctuation is trimmed.
+ * Values are deliberately whitespace/bracket-free, making the closing `]]`
+ * unambiguous and keeping stored tokens portable between prose and form fields.
  */
-export function parseWikiRefs(text: string): WikiRef[] {
-  const out: WikiRef[] = [];
-  // Case-insensitive on the scope word: the task-form UI already normalizes and
-  // keeps `@PROJ:` tokens, so matching case-sensitively here meant such a token
-  // persisted in the UI and silently inlined nothing.
-  const re = /(?<=^|\s)@(proj|org):(\S+)/gi;
+export function scanWikiRefs(text: string): WikiRefMatch[] {
+  const source = String(text ?? '');
+  const out: WikiRefMatch[] = [];
+  const code = markdownCodeRanges(source);
+  const inCode = (start: number, end: number) => code.some(([a, b]) => start < b && end > a);
+  const re = /\[\[(proj|org):([^\s\[\]]+)\]\]/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(stripCodeSpans(text)))) {
+  while ((m = re.exec(source))) {
+    const start = m.index;
+    const end = start + m[0].length;
+    let slashes = 0;
+    for (let i = start - 1; i >= 0 && source[i] === '\\'; i--) slashes++;
+    if (slashes % 2 || inCode(start, end)) continue;
     const scope: WikiScope = m[1]!.toLowerCase() === 'proj' ? 'project' : 'organization';
-    let rest = m[2]!.replace(/[.,;:!?)"'\]]+$/, ''); // trim trailing sentence punctuation
-    if (!rest) continue;
+    const rest = m[2]!;
+    let kind: WikiRef['kind'] = 'page';
+    let value = rest;
     if (/^tag:/i.test(rest)) {
-      // The label VALUE stays case-sensitive (labels are user data); only the
-      // `tag:` marker is normalized.
-      const value = rest.slice(4).replace(/\/+$/, '');
-      if (value) out.push({ scope, kind: 'label', value });
+      kind = 'label';
+      value = rest.slice(4).replace(/\/+$/, '');
     } else if (rest.endsWith('/*')) {
-      const value = rest.slice(0, -2);
-      if (value) out.push({ scope, kind: 'folder', value });
-    } else {
-      out.push({ scope, kind: 'page', value: rest });
+      kind = 'folder';
+      value = rest.slice(0, -2);
     }
+    if (value) out.push({ scope, kind, value, start, end, raw: m[0] });
   }
   return out;
+}
+
+/** Extract references without their source-location metadata. */
+export function parseWikiRefs(text: string): WikiRef[] {
+  return scanWikiRefs(text).map(({ scope, kind, value }) => ({ scope, kind, value }));
 }
 
 /** Resolve the refs that target `scope` into the set of page paths they name
@@ -712,7 +787,7 @@ export function resolveWikiRefs(refs: WikiRef[], scope: WikiScope, root: string,
 
 export interface WikiSuggestion {
   kind: 'page' | 'label' | 'folder';
-  /** The value to append after `@proj:`/`@org:` to insert this suggestion. */
+  /** The value to append after `[[proj:`/`[[org:` to insert this suggestion. */
   ref: string;
   /** Display label. */
   name: string;
@@ -907,9 +982,9 @@ function pageBody(page: WikiPage): string {
  * entries from ANY world (the tools run host-side).
  *
  * Which entries are inlined = the task's **wiki-context tokens** (`contextTokens`,
- * defaulting to `@proj:tag:default @org:tag:default` when the task never set the
+ * defaulting to `[[proj:tag:default]] [[org:tag:default]]` when the task never set the
  * field — so `default` pages inline by default, and a task can opt out by
- * clearing them) UNION the `@proj:…`/`@org:…` tags written inline in the
+ * clearing them) UNION the `[[proj:…]]`/`[[org:…]]` references written inline in the
  * prompt/follow-ups (`taggedText`). The built-in working instructions are always
  * delivered regardless (they are not subject to the context field).
  */
@@ -922,14 +997,23 @@ export function buildWikiPromptContext(args: {
   projectRoot?: string;
   /** External override for the built-in instructions (tests/deployments). */
   builtinInstructions?: string;
-  /** Task text (prompt + follow-ups) scanned for `@proj:…`/`@org:…` tags. */
+  /** Task text scanned for `[[proj:…]]`/`[[org:…]]` references. */
   taggedText?: string;
   /** The task's wiki-context field tokens; `undefined` ⇒ the default tokens. */
   contextTokens?: string[];
 }): string {
   const orgRoot = args.organizationId ? wikiRoot(args.contentDir, 'organization', args.organizationId) : undefined;
   const builtins = args.builtinInstructions === undefined ? resolveBuiltins(orgRoot) : [];
-  const tokens = (args.contextTokens ?? DEFAULT_CONTEXT_TOKENS).map((t) => (t.startsWith('@') ? t : `@${t}`));
+  // Old tasks may still carry the former @-tokens in their dedicated context
+  // field. Read those forward here, but never recognize them in prose: new and
+  // edited text has one unambiguous canonical syntax.
+  const tokens = (args.contextTokens ?? DEFAULT_CONTEXT_TOKENS).map((token) => {
+    const t = String(token).trim();
+    if (/^\[\[(?:proj|org):[^\s\[\]]+\]\]$/i.test(t)) return t;
+    if (/^@(proj|org):\S+$/i.test(t)) return `[[${t.slice(1)}]]`;
+    if (/^(proj|org):\S+$/i.test(t)) return `[[${t}]]`;
+    return t;
+  });
   const refs = [...parseWikiRefs(tokens.join(' ')), ...(args.taggedText ? parseWikiRefs(args.taggedText) : [])];
   const entryOf = ({ content: _c, files: _f, ...entry }: WikiPage): WikiEntry => entry;
   const sections: string[] =
@@ -977,7 +1061,7 @@ export function buildWikiPromptContext(args: {
       `Wiki access (works from any world, including cloud sandboxes): read_wiki(scope, id, path?) — no path lists a full table of contents (expanding any [more…]), a section path lists that section, a skill path returns its full markdown; search_wiki(scope, id, query) greps every wiki page. ` +
         `Scopes here: ${scopes.map((s) => `${s.scope} id "${s.id}"`).join(', ')}. ` +
         `To add or update an entry, platform_request PUT ${scopes.map(apiBase).join('/page or ')}/page with {path, content, kind} (SKILL.md format: YAML frontmatter name/description/labels/importance, then markdown; label an entry \`default\` to inline it into every task). ` +
-        `To inline a page/label/folder into a task's context, tag it in the prompt as \`@proj:<path>\` / \`@org:<path>\` (a whole label is \`@proj:tag:<label>\`, a folder is \`@proj:<section>/*\`); create_task also accepts a \`wikiContext\` array of these tokens.`,
+        `To inline a page/label/folder into a task's context, reference it as \`[[proj:<path>]]\` / \`[[org:<path>]]\` (a whole label is \`[[proj:tag:<label>]]\`, a folder is \`[[proj:<section>/*]]\`); create_task also accepts a \`wikiContext\` array of these references.`,
     );
   }
   return sections.join('\n\n');

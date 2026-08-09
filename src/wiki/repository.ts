@@ -40,6 +40,36 @@ function setRemote(root: string, remote: string): void {
   git(root, exists ? ['remote', 'set-url', 'origin', remote] : ['remote', 'add', 'origin', remote]);
 }
 
+/** Canonical wiki writes and remote reconciliation both mutate the same `main`
+ * worktree. Keep them in one per-repository lane: otherwise a second browser
+ * save can commit while the first save is fetching/merging origin, or startup's
+ * best-effort remote wiring can race an interface edit through Git's index. */
+const projectWikiOperations = new Map<string, Promise<unknown>>();
+
+async function serializeProjectWikiOperation<T>(root: string, operation: () => Promise<T> | T): Promise<T> {
+  const key = path.resolve(root);
+  const previous = projectWikiOperations.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  projectWikiOperations.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (projectWikiOperations.get(key) === current) projectWikiOperations.delete(key);
+  }
+}
+
+export class ProjectWikiPublishError extends Error {
+  readonly code = 'wiki_remote_sync_failed';
+  readonly status = 502;
+
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Project wiki was committed locally, but publishing it to GitHub failed: ${detail}`);
+    this.name = 'ProjectWikiPublishError';
+    this.cause = cause;
+  }
+}
+
 /** Existing project wiki folders are migrated in place: initializing Git does
  * not rewrite any page, and the first commit simply establishes their baseline. */
 export function ensureProjectWikiRepository(contentDir: string, projectId: string): string {
@@ -146,7 +176,7 @@ export function projectWikiBranchView(contentDir: string, projectId: string, ref
   return view;
 }
 
-export async function setProjectWikiRemote(root: string, remote: string, credential: GitCredential): Promise<void> {
+async function reconcileProjectWikiRemote(root: string, remote: string, credential: GitCredential): Promise<void> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-auth-'));
   try {
     const { env } = materializeGitCredential(dir, credential);
@@ -188,4 +218,32 @@ export async function setProjectWikiRemote(root: string, remote: string, credent
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** Wire/reconcile a canonical project wiki with its remote. This shares the
+ * same lane as interface edits, so startup synchronization cannot race a save. */
+export async function setProjectWikiRemote(root: string, remote: string, credential: GitCredential): Promise<void> {
+  await serializeProjectWikiOperation(root, () => reconcileProjectWikiRemote(root, remote, credential));
+}
+
+/** Apply one canonical wiki mutation and publish its resulting commit before
+ * acknowledging the write. `publish` is resolved inside the repository lane so
+ * its short-lived credential and the fetch/merge/push are contiguous with the
+ * commit. A task-branch edit must not use this helper: it lands through the
+ * task's ordinary Review/Merge path instead. */
+export async function mutateAndPublishProjectWiki<T>(
+  root: string,
+  mutation: () => T,
+  publish: () => Promise<{ remote: string; credential: GitCredential } | undefined>,
+): Promise<T> {
+  return serializeProjectWikiOperation(root, async () => {
+    const result = mutation();
+    try {
+      const target = await publish();
+      if (target) await reconcileProjectWikiRemote(root, target.remote, target.credential);
+    } catch (error) {
+      throw new ProjectWikiPublishError(error);
+    }
+    return result;
+  });
 }

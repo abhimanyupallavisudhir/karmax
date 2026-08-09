@@ -35,6 +35,7 @@ global.toast = () => { calls.push('toast'); };
 global.loadTasks = async () => { calls.push('loadTasks'); S.tasks = [{ id: 't_new', projectId: S.projectId }]; };
 global.loadOrg = async () => { calls.push(`loadOrg:${S.projectId}`); S.orgProjectId = S.projectId; S.views = [{ id: 'vB' }]; };
 global.loadOrganizationRuntimeCatalog = async () => {};
+global.loadCollaboration = async () => { calls.push(`loadCollaboration:${S.organizationId}`); };
 global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
 global.renderRail = () => { calls.push('renderRail'); };
 global.renderMain = () => { calls.push('renderMain'); };
@@ -45,6 +46,7 @@ global.resolveProjectTaskKey = async () => null;
 global.openTask = async () => {};
 global.renderTaskPage = () => {};
 global.closeTaskDom = () => { calls.push('closeTaskDom'); };
+global.syncOrganizationSwitcher = () => { calls.push(`syncOrganizationSwitcher:${S.organizationId}`); };
 
 // Previous project 'A' with a live query, a stale search result and a roving
 // cursor — none of which belong to project 'B'.
@@ -97,6 +99,25 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   global.resolveProjectTaskKey = async () => 't7';
   await applyRoute();
   ok(S.search === 'tag:bug sort:priority-desc', 'opening a task does not wipe the list query');
+
+  // A cross-organization project route owns the organization context. The
+  // persistent top-left picker and collaboration catalog must follow it too;
+  // neither is recreated as the SPA navigates.
+  calls = [];
+  location.pathname = '/globex/b';
+  S.organizationId = 'org_acme';
+  S.projectId = 'A';
+  S.tasks = [];
+  global.parseRoute = () => ({ name: 'project', org: 'globex', slug: 'b', tab: 'tasks', taskKey: null, q: '' });
+  global.organizationBySlug = (slug) => slug === 'globex' ? { id: 'org_globex', slug } : null;
+  global.projectBySlug = (slug, organizationId) => slug === 'b' && organizationId === 'org_globex'
+    ? { id: 'B', name: 'B', organizationId: 'org_globex' }
+    : null;
+  global.resolveProjectTaskKey = async () => null;
+  await applyRoute();
+  ok(S.organizationId === 'org_globex', 'the project URL selects its owning organization');
+  ok(calls.includes('syncOrganizationSwitcher:org_globex'), 'the top-left organization picker follows the project URL');
+  ok(calls.includes('loadCollaboration:org_globex'), 'organization-scoped data reloads after cross-organization navigation');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

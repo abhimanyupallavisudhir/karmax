@@ -358,10 +358,12 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       args: [{ domain, state: { domain, queue: [], current: 'held', processed: 0 } }],
     });
 
-  // Both behaviors below are pinned to mergeOnly@1.6.0 — the version the manifest
-  // stamps on every new merge-only task. They are deliberately NOT retrofitted onto
-  // older pins: each changes the commands a workflow task emits at a point older
-  // executions already recorded, which would be a NonDeterminismError on replay.
+  // Both behaviors below are pinned to mergeOnly@1.6.0, where the deterministic
+  // protocol was introduced. Current 1.7 keeps that protocol and changes only
+  // the manifest/input Agent wiring. These behaviors are deliberately NOT
+  // retrofitted onto older pins: each changes the commands a workflow task emits
+  // at a point older executions already recorded, which would be a
+  // NonDeterminismError on replay.
   // The `keeps the pre-1.5 shape` test below is the other half of that contract.
   // (1.6.0, not 1.5.0: master published its own 1.5.0 concurrently — see SPEC §4.5.)
   it('merge-only 1.6: cancelling while queued for a merge slot releases the world instead of leaking it', async () => {

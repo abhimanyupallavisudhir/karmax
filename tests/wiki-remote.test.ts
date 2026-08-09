@@ -11,6 +11,8 @@ import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrat
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../src/wiki/repository.js';
 import { paths } from '../src/config/paths.js';
 import { Gateway } from '../src/gateway/server.js';
+import { KarmaxApi } from '../src/platform/api.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
 
 describe('project wiki remote provisioning', () => {
   let home: string;
@@ -82,6 +84,73 @@ describe('project wiki remote provisioning', () => {
 
     (gateway as any).fanout.close();
     store.close();
+  });
+
+  it('publishes canonical interface saves and deletes before acknowledging them', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const project = store.createProject('Widgets', {}, organization.id);
+    const bare = path.join(home, 'interface-saves.git');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', bare]);
+    const sshUrl = 'git@github.com:acme/widgets-wiki.git';
+    const repository = store.upsertRepository({
+      organizationId: organization.id,
+      provider: 'github',
+      providerId: 'interface-saves',
+      owner: 'acme',
+      name: 'widgets-wiki',
+      sshUrl,
+      defaultBranch: 'main',
+      private: true,
+    });
+    store.setProjectWikiRepository(project.id, repository.id);
+    const root = ensureProjectWikiRepository(paths().content, project.id);
+    execFileSync('git', ['-C', root, 'config', `url.${bare}.insteadOf`, sshUrl]);
+    const credentialRequests: string[] = [];
+    const githubApp = {
+      brokerCredentials: async (requested: typeof repository) => {
+        credentialRequests.push(requested.id);
+        return { env: {} };
+      },
+    };
+    const tokens = new TokenAuthority();
+    const token = tokens.mintPrincipal('user:owner', ['project:read', 'skill:write'],
+      project.id, 60_000, organization.id).token;
+    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens,
+      contentDir: paths().content, githubApp } as any);
+
+    try {
+      await api.saveWikiPageResolved(token, 'project', project.id, {
+        path: 'notes/published',
+        content: 'Published from the interface.',
+        create: true,
+      });
+      expect(execFileSync('git', ['--git-dir', bare, 'show', 'main:notes/published/SKILL.md'],
+        { encoding: 'utf8' })).toBe('Published from the interface.');
+
+      // Two browser requests may arrive together. Their local commit + remote
+      // reconciliation transactions must serialize rather than racing Git's
+      // shared canonical index or overwriting one another at origin.
+      await Promise.all([
+        api.saveWikiPageResolved(token, 'project', project.id,
+          { path: 'notes/a', content: 'A', create: true }),
+        api.saveWikiPageResolved(token, 'project', project.id,
+          { path: 'notes/b', content: 'B', create: true }),
+      ]);
+      expect(execFileSync('git', ['--git-dir', bare, 'show', 'main:notes/a/SKILL.md'],
+        { encoding: 'utf8' })).toBe('A');
+      expect(execFileSync('git', ['--git-dir', bare, 'show', 'main:notes/b/SKILL.md'],
+        { encoding: 'utf8' })).toBe('B');
+
+      await api.deleteWikiPageResolved(token, 'project', project.id, 'notes/published');
+      expect(() => execFileSync('git', ['--git-dir', bare, 'show', 'main:notes/published/SKILL.md'],
+        { stdio: 'pipe' })).toThrow();
+      expect(credentialRequests).toEqual([
+        repository.id, repository.id, repository.id, repository.id,
+      ]);
+    } finally {
+      store.close();
+    }
   });
 
   it('keeps the stable SSH-shaped remote and never persists the HTTPS token', async () => {

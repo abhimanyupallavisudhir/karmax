@@ -113,6 +113,12 @@ export async function mergeOnlyV1_6(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true, true, true, true, true);
 }
 
+/** Merge-only now consumes the shared operational Agent setting. This changes
+ * only manifest/input wiring; the deterministic merge protocol is unchanged. */
+export async function mergeOnlyV1_7(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);

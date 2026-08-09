@@ -25,6 +25,29 @@ describe('Project settings browser source', () => {
     expect(organization).toContain('<p class="settings-intro">Organization settings</p>');
   });
 
+  it('places permission-gated rename controls in Advanced settings', () => {
+    const project = source.slice(source.indexOf('function settingsView('), source.indexOf('function cloudEnvironmentCard('));
+    const organization = source.slice(source.indexOf('function organizationView('), source.indexOf('function pendingInvitationRow('));
+    const projectWiring = extractFunction('wireSettingsView');
+    const organizationWiring = extractFunction('hydrateOrganizationView');
+
+    expect(project).toContain('id="project-name"');
+    expect(project).toContain('id="rename-project"');
+    expect(project).toContain('data-settings-access="projectDelete"');
+    expect(organization).toContain('id="organization-name"');
+    expect(organization).toContain('id="rename-organization"');
+    expect(projectWiring).toContain("method: 'PATCH'");
+    expect(organizationWiring).toContain("method: 'PATCH'");
+  });
+
+  it('keeps the post-delete fallback inside the deleted project’s organization', () => {
+    const projectWiring = extractFunction('wireSettingsView');
+
+    expect(projectWiring).toContain('firstProjectForOrganization(deletedOrganizationId)');
+    expect(projectWiring).toContain("globalRoute('dashboard', organizationById(deletedOrganizationId))");
+    expect(projectWiring).not.toContain('const next = S.projects[0]');
+  });
+
   it('formats discovered and revision byte sizes without a missing global', () => {
     const formatBytes = Function(`${extractFunction('formatBytes')}; return formatBytes;`)() as (value: unknown) => string;
     expect(formatBytes(0)).toBe('0 B');

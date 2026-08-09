@@ -27,15 +27,14 @@ import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, valid
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
-import { defaultBranch } from '../world/git.js';
-import { expandPath } from '../util/expand.js';
+import { repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
-import { commitProjectWiki, ensureProjectWikiRepository, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
+import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
@@ -187,8 +186,11 @@ function assertInMergeDomain(task: TaskRecord, domain: string): void {
 /** A failed execution is terminal, but a recoverable workflow can start a
  * replacement run from its persisted world/conversation checkpoint. These mirror
  * escalation's controls; signalTask gives them terminal-aware semantics. */
+const RETRY_ACTION = (): TaskView['actions'][number] =>
+  ({ name: 'retry', kind: 'signal', label: 'Retry', enabled: true });
+
 const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
-  { name: 'retry', kind: 'signal', label: 'Retry', enabled: true },
+  RETRY_ACTION(),
   {
     name: 'followUp',
     kind: 'signal',
@@ -683,7 +685,7 @@ export class KarmaxApi {
       prompt?: string;
       /** Images attached to the initial prompt (references, never inline bytes). */
       images?: ImageRef[];
-      /** Wiki context to inline, as `@proj:…`/`@org:…` tokens (see TaskParams.wikiContext). */
+      /** Wiki context to inline, as `[[proj:…]]`/`[[org:…]]` references (see TaskParams.wikiContext). */
       wikiContext?: string[];
       workflow?: string;
       base?: string;
@@ -746,6 +748,11 @@ export class KarmaxApi {
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
+    // Authority-owned fields are minted below. An API caller may never inject a
+    // delegated subject or substitute the task-pinned external account through
+    // the otherwise-open workflow params bag.
+    delete taskOverrides._authorization;
+    delete taskOverrides._githubAccountId;
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
@@ -774,9 +781,11 @@ export class KarmaxApi {
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
-    const githubAccountId = createdBy?.kind === 'user'
-      ? this.deps.githubApp?.activeUserAccountId(createdBy.userId)
-      : undefined;
+    const githubAccountId = caller.kind === 'agent'
+      ? caller.externalIdentities?.githubAccountId
+      : caller.humanSubject
+        ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
+        : undefined;
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
@@ -788,7 +797,7 @@ export class KarmaxApi {
     // project/global defaults could never reach an unqueued task. Keeping the
     // task sparse means it re-resolves against the live defaults when it's
     // finally queued (createTask below for immediate start, queueTask for drafts).
-    const task = this.deps.store.createTask({
+    let task = this.deps.store.createTask({
       projectId: args.projectId,
       title,
       workflow,
@@ -811,6 +820,24 @@ export class KarmaxApi {
       delegate: args.delegate,
       confirmationPolicy,
     });
+    const authorizationScope = authorization as typeof authorization & {
+      scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
+    };
+    const delegation = this.deps.tokens.delegateHuman(token, {
+      taskId: task.id,
+      projectId: authorizationScope.scope ? undefined : task.projectId,
+      projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
+      organizationId: authorizationScope.scope === 'global' ? undefined
+        : (authorizationScope.organizationId ?? project.organizationId),
+      externalIdentities: githubAccountId ? { githubAccountId } : undefined,
+    });
+    if (delegation) {
+      this.deps.store.updateTaskParams(task.id, {
+        ...task.params,
+        _authorization: { ...(task.params._authorization as object), delegationId: delegation.id },
+      });
+      task = this.deps.store.getTask(task.id)!;
+    }
     this.persistTaskCredentialPolicies(task);
     // Advisory only: GitHub is an external policy authority, so this can become
     // stale and is always revalidated at Merge. Still, catching the common
@@ -881,10 +908,19 @@ export class KarmaxApi {
       const { triggerState: _triggerState, repeatable: _repeatable, runOf: _runOf,
         archived: _archived, draft: _draft, ...copied } = task.params;
       for (let n = 1; n < attemptCount; n++) {
-        const alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
+        let alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
           parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
           assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy });
+        if (delegation) {
+          const alternateDelegation = this.deps.tokens.deriveHumanDelegation(delegation.id, {
+            taskId: alt.id, projectId: delegation.projectId, projectIds: delegation.projectIds,
+            organizationId: delegation.organizationId,
+          });
+          this.deps.store.updateTaskParams(alt.id, { ...alt.params,
+            _authorization: { ...(alt.params._authorization as object), delegationId: alternateDelegation.id } });
+          alt = this.deps.store.getTask(alt.id)!;
+        }
         this.persistTaskCredentialPolicies(alt);
         if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
         createdAlternates.push(alt);
@@ -945,6 +981,7 @@ export class KarmaxApi {
     input.workflow = workflow;
     input.grant = authorization.capabilities;
     input.grantPrincipal = caller.principal;
+    input.delegationId = delegation?.id;
     input.authorizationProfile = authorization.profileId;
     input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
@@ -1002,17 +1039,18 @@ export class KarmaxApi {
       resolved.remote = 'pr';
     this.materializeUnifiedAgents(resolved, project.id);
 
-    // Auto-detect the repo's default branch when base/target weren't set anywhere,
-    // instead of guessing "main" (which would create a phantom target branch).
+    // Auto-detect the repo's branch policy when base/target weren't set anywhere,
+    // instead of guessing "main" (which would make hosted task views disagree
+    // with the enrolled repository policy used later during provisioning).
     const firstSet = (name: string) => layers.map((l) => l?.[name]).find((v) => v !== undefined && v !== null && v !== '');
     const explicitBase = firstSet('base');
     const explicitTarget = firstSet('target');
-    const repo0 = project.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
+    const repo0 = effectiveRepos(resolved, project.config)[0];
     if (repo0 && (!explicitBase || !explicitTarget)) {
-      const db = await defaultBranch(repo0).catch(() => undefined);
-      if (db) {
-        if (!explicitBase) resolved.base = db;
-        if (!explicitTarget) resolved.target = db;
+      const branches = await repositoryBranchDefaults(this.deps.store, project, repo0);
+      if (branches) {
+        if (!explicitBase) resolved.base = branches.base;
+        if (!explicitTarget) resolved.target = branches.target;
       }
     }
     return resolved;
@@ -1199,9 +1237,10 @@ export class KarmaxApi {
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
-    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string } | undefined;
+    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string; delegationId?: string } | undefined;
     input.grant = auth?.capabilities ?? ['task:signal'];
     input.grantPrincipal = auth?.principal ?? 'system:legacy-task';
+    input.delegationId = auth?.delegationId;
     input.authorizationProfile = auth?.profileId ?? 'legacy';
     input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
@@ -1387,6 +1426,20 @@ export class KarmaxApi {
       .setTaskPolicies(task.id, authorization?.credentialPolicies ?? {});
   }
 
+  private inheritTaskDelegation(source: TaskRecord, target: TaskRecord): TaskRecord {
+    const sourceAuthorization = source.params?._authorization as { delegationId?: string } | undefined;
+    if (!sourceAuthorization?.delegationId) return target;
+    const parent = this.deps.tokens.deriveHumanDelegation(sourceAuthorization.delegationId, {
+      taskId: target.id, projectId: target.projectId,
+      organizationId: this.deps.store.getProject(target.projectId)?.organizationId,
+    });
+    this.deps.store.updateTaskParams(target.id, { ...target.params,
+      _authorization: { ...(target.params._authorization as object), delegationId: parent.id },
+      ...(parent.externalIdentities?.githubAccountId
+        ? { _githubAccountId: parent.externalIdentities.githubAccountId } : {}) });
+    return this.deps.store.getTask(target.id)!;
+  }
+
   /** Change the job-shaped grant on a task — before it starts, or in-flight while
    * it runs (SPEC §5.5). The selected profile is always re-attenuated against the
    * immediate bearer, so an agent cannot use a human principal recorded on the
@@ -1415,8 +1468,10 @@ export class KarmaxApi {
     if (typeof requested !== 'string' && authorization.attenuated)
       throw new CapabilityError('you cannot grant an authorization level you do not hold for the selected scope');
     this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
-    const priorPolicies = (task.params?._authorization as { credentialPolicies?: VaultTaskPolicyOverrides } | undefined)
-      ?.credentialPolicies;
+    const priorAuthorization = task.params?._authorization as {
+      credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string;
+    } | undefined;
+    const priorPolicies = priorAuthorization?.credentialPolicies;
     const policies = credentialPolicies === undefined
       ? (priorPolicies ?? {})
       : this.credentialPolicyOverrides(
@@ -1443,7 +1498,7 @@ export class KarmaxApi {
     }
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...authorization, principal: caller.principal, credentialPolicies: policies },
+      _authorization: { ...priorAuthorization, ...authorization, principal: caller.principal, credentialPolicies: policies },
     });
     const updated = this.deps.store.getTask(taskId)!;
     this.persistTaskCredentialPolicies(updated);
@@ -1487,7 +1542,7 @@ export class KarmaxApi {
     // project-scoped token cannot spawn a run from another project's series.
     const caller = this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId });
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
-    const run = this.deps.store.createTask({
+    let run = this.deps.store.createTask({
       projectId: series.projectId,
       listId: series.listId,
       title: series.title,
@@ -1500,6 +1555,7 @@ export class KarmaxApi {
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     });
+    run = this.inheritTaskDelegation(series, run);
     this.persistTaskCredentialPolicies(run);
     const { startType, input } = await this.buildStart(run);
     try {
@@ -1793,7 +1849,7 @@ export class KarmaxApi {
       this.deps.store.getProject(source.projectId)?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group.confirmer !== undefined) workflowParams[confirmerField.name] = group.confirmer;
-    const attempt = this.deps.store.createTask({
+    let attempt = this.deps.store.createTask({
       projectId: source.projectId,
       listId: source.listId,
       title: source.title,
@@ -1807,6 +1863,7 @@ export class KarmaxApi {
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
     });
+    attempt = this.inheritTaskDelegation(source, attempt);
     this.persistTaskCredentialPolicies(attempt);
     if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
     if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
@@ -1863,14 +1920,31 @@ export class KarmaxApi {
    * edit; roles prevents an unrelated, stale conversation from accepting input.
    */
   private lifecycleActions(view: TaskView): TaskView['actions'] {
+    const actions = [...view.actions];
+    // software-dev's infrastructure path deliberately remains in its public
+    // stage while it backs off, and its retry signal can wake that timer early.
+    // The workflow used to advertise Retry only after the outage exhausted every
+    // backoff and escalated, making its already-supported early recovery signal
+    // unreachable from the UI (task #5). Project it here instead of changing the
+    // deterministic workflow so already-running version-pinned executions are
+    // repaired too. Match the workflow-owned retry message narrowly: an ordinary
+    // Do error must not acquire a control that has no corresponding parked wait.
+    const infrastructureBackoff = RECOVERABLE_WORKFLOWS.has(view.workflow)
+      && (view.status === 'active' || view.status === 'waiting')
+      && view.waitingFor?.kind !== 'human'
+      && view.error?.startsWith('infrastructure: ')
+      && / — retrying .+ in \d+s \(\d+\/\d+\)$/.test(view.error);
+    if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
+      actions.unshift(RETRY_ACTION());
+
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
-      return view.actions;
+      return actions;
     const role = this.humanHoldRole(view);
-    const actions = view.actions
+    const heldActions = actions
       .filter((action) => action.name !== 'followUp' && (action.name !== 'confirm' || origin === 'review'));
-    if (role) actions.splice(origin === 'review' ? 1 : 0, 0, FOLLOW_UP_ACTION(role));
-    return actions;
+    if (role) heldActions.splice(origin === 'review' ? 1 : 0, 0, FOLLOW_UP_ACTION(role));
+    return heldActions;
   }
 
   /** Honest action set for the short replacement-start window before first publish. */
@@ -2100,7 +2174,7 @@ export class KarmaxApi {
     if (!transcript) {
       transcript = {
         role,
-        label: role === 'do' ? 'Do agent' : role === 'merge' ? 'Merge agent' : role === 'resolve' ? 'Resolve agent' : 'Confirm agent',
+        label: role === 'do' ? 'Agent' : role === 'merge' ? 'Merge agent' : role === 'resolve' ? 'Resolve agent' : 'Confirm agent',
         messages: [],
       };
       transcripts.push(transcript);
@@ -2603,7 +2677,7 @@ export class KarmaxApi {
     const view = await this.getTaskView(token, taskId);
     const transcripts = view?.transcripts?.length
       ? view.transcripts
-      : [{ role: 'do', label: 'Do', messages: view?.messages ?? [] }];
+      : [{ role: 'do', label: 'Agent', messages: view?.messages ?? [] }];
     return transcripts.map((t) => {
       const session = this.deps.store.kvGet(`session:${taskId}:${t.role}`) || undefined;
       let provider: string | undefined;
@@ -3602,7 +3676,7 @@ export class KarmaxApi {
   }
 
   /** Rank pages, labels, and folders of one scope against a typed query — what
-   *  the task-form `@proj:…`/`@org:…` mention dropdown searches. */
+   *  the task-form wiki-reference dropdown searches. */
   suggestWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
     const root = this.wikiScope(token, scope, id, false, selector).root;
     return { scope, id, query, suggestions: suggestWiki(root, query) };
@@ -3766,7 +3840,18 @@ export class KarmaxApi {
     args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
-    if (!remote) return this.saveWikiPage(token, scope, id, args, selector);
+    if (!remote) {
+      if (scope !== 'project') return this.saveWikiPage(token, scope, id, args, selector);
+      const view = this.wikiScope(token, scope, id, true, selector);
+      // The default branch is the user-facing canonical wiki. Publish that
+      // commit immediately when the project owns a GitHub remote. Live task
+      // checkouts stay on their task branch and land through Review/Merge.
+      if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
+        return mutateAndPublishProjectWiki(view.root,
+          () => this.saveWikiPage(token, scope, id, args, selector),
+          () => this.projectWikiPublishTarget(id));
+      return this.saveWikiPage(token, scope, id, args, selector);
+    }
     try {
       if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path))
         moveWikiPage(remote.root, args.prevPath, args.path);
@@ -3779,12 +3864,32 @@ export class KarmaxApi {
   async deleteWikiPageResolved(token: string, scope: WikiScope, id: string, rel: string,
     selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
-    if (!remote) return this.deleteWikiPage(token, scope, id, rel, selector);
+    if (!remote) {
+      if (scope !== 'project') return this.deleteWikiPage(token, scope, id, rel, selector);
+      const view = this.wikiScope(token, scope, id, true, selector);
+      if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
+        return mutateAndPublishProjectWiki(view.root,
+          () => this.deleteWikiPage(token, scope, id, rel, selector),
+          () => this.projectWikiPublishTarget(id));
+      return this.deleteWikiPage(token, scope, id, rel, selector);
+    }
     try {
       const deleted = deleteWikiPage(remote.root, rel, { recursive: selector.recursive });
       if (deleted) await remote.flush(`wiki: delete ${safeWikiPath(rel)}`);
       return { deleted };
     } finally { await remote.release(); }
+  }
+
+  /** Resolve a fresh, repository-scoped App credential for one canonical wiki
+   * publish. No linked remote means the local repository remains authoritative. */
+  private async projectWikiPublishTarget(projectId: string) {
+    const repository = this.deps.store.projectWiki(projectId)?.repository;
+    if (!repository) return undefined;
+    if (!this.deps.githubApp) throw new Error('the GitHub App is unavailable for this linked project wiki');
+    return {
+      remote: repository.sshUrl,
+      credential: await this.deps.githubApp.brokerCredentials(repository),
+    };
   }
 
   private readWikiFromRoot(scope: WikiScope, id: string, rel: string, root: string,
@@ -3888,7 +3993,7 @@ export class KarmaxApi {
       : { profileId: 'caller', capabilities: caller.caps, attenuated: false };
     const mergeOnlyVersion = MANIFESTS.find((m) => m.name === 'merge-only')?.version;
     if (!mergeOnlyVersion) throw new Error('bundled merge-only manifest is missing');
-    const task = this.deps.store.createTask({
+    let task = this.deps.store.createTask({
       projectId: args.projectId,
       title: args.title,
       workflow: 'merge-only',
@@ -3901,6 +4006,17 @@ export class KarmaxApi {
       },
       createdBy: principalRefOf(caller.principal),
     });
+    const workflowDelegation = this.deps.tokens.delegateHuman(token, {
+      taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,
+      externalIdentities: caller.externalIdentities,
+    });
+    if (workflowDelegation) {
+      this.deps.store.updateTaskParams(task.id, { ...task.params,
+        _authorization: { ...(task.params._authorization as object), delegationId: workflowDelegation.id },
+        ...(workflowDelegation.externalIdentities?.githubAccountId
+          ? { _githubAccountId: workflowDelegation.externalIdentities.githubAccountId } : {}) });
+      task = this.deps.store.getTask(task.id)!;
+    }
     const input = {
       taskId: task.id,
       projectId: args.projectId,
@@ -3913,6 +4029,7 @@ export class KarmaxApi {
       workflowEdit: true,
       grant: authorization.capabilities,
       grantPrincipal: caller.principal,
+      delegationId: workflowDelegation?.id,
       authorizationProfile: authorization.profileId,
     } as TaskInput;
     try {
