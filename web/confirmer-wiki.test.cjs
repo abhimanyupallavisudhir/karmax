@@ -35,7 +35,7 @@ const resetConfirmer = extractFn('resetConfirmerField');
 ok(wireConfirmer.includes('wireConfirmerWikiPrompts(row)'), 'newly added review layers are wired');
 ok(wireConfirmer.includes('wireConfirmerWikiPrompts(box)'), 'initial review layers are wired');
 ok(resetConfirmer.includes('wireConfirmerWikiPrompts(list)'), 'reset/re-rendered review layers are wired');
-ok(src.includes('Type @ to add context from the wiki.'), 'the field advertises wiki context search');
+ok(src.includes('Type [[ to add context from the wiki.'), 'the field advertises wiki context search');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

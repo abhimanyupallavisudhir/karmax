@@ -1569,7 +1569,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let wikiSnapshot: { root: string; release(): void } | undefined;
       try {
         const { buildWikiPromptContext } = await import('../wiki/wiki.js');
-        // Wiki pages the task tags in its prompt/follow-ups (`@proj:…`/`@org:…`)
+        // Wiki pages the task references in its prompt/follow-ups (`[[proj:…]]`/`[[org:…]]`)
         // are inlined in full, as are the tokens in the task's wiki-context field
         // (`params.wikiContext`, read fresh here like the wiki content itself;
         // absent ⇒ the default `tag:default` tokens apply).

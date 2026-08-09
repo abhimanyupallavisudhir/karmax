@@ -686,7 +686,7 @@ export class KarmaxApi {
       prompt?: string;
       /** Images attached to the initial prompt (references, never inline bytes). */
       images?: ImageRef[];
-      /** Wiki context to inline, as `@proj:…`/`@org:…` tokens (see TaskParams.wikiContext). */
+      /** Wiki context to inline, as `[[proj:…]]`/`[[org:…]]` references (see TaskParams.wikiContext). */
       wikiContext?: string[];
       workflow?: string;
       base?: string;
@@ -3688,7 +3688,7 @@ export class KarmaxApi {
   }
 
   /** Rank pages, labels, and folders of one scope against a typed query — what
-   *  the task-form `@proj:…`/`@org:…` mention dropdown searches. */
+   *  the task-form wiki-reference dropdown searches. */
   suggestWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
     const root = this.wikiScope(token, scope, id, false, selector).root;
     return { scope, id, query, suggestions: suggestWiki(root, query) };
