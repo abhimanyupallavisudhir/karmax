@@ -127,6 +127,9 @@ function slugify(s) {
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+function firstProjectForOrganization(organizationId) {
+  return (S.projects || []).find((p) => p.organizationId === organizationId);
+}
 // Resolve a URL slug back to a project, optionally scoped to one organization
 // (project slugs need only be unique within their org). Matches the slugified name
 // (the common, human case), falling back to a raw project id for safety. On a slug
@@ -9438,15 +9441,17 @@ function wireSettingsView(proj) {
       const wasCurrent = S.projectId === proj.id;
       await loadProjects();
       if (wasCurrent) {
-        // Route into the next remaining project (or the dashboard) so its
-        // tasks/tags/views/search all load fresh and the URL stops pointing at
-        // the now-deleted project. S.projectId still holds the deleted id here,
-        // which keeps applyRoute's switch-guard armed so the old project's view
-        // state (query/selected view/cursor) gets cleared.
-        const next = S.projects[0];
+        // Stay inside the deleted project's organization. The project list spans
+        // every organization the user can access, so its first item is not a safe
+        // fallback (it could unexpectedly switch workspaces). S.projectId still
+        // holds the deleted id here, which keeps applyRoute's switch-guard armed
+        // when another project exists and clears the old project's view state.
+        const deletedOrganizationId = proj.organizationId || S.organizationId;
+        const next = firstProjectForOrganization(deletedOrganizationId);
         if (next) return go(projectRoute(next.id));
         S.projectId = null;
-        return go(globalRoute('dashboard'));
+        S.organizationId = deletedOrganizationId;
+        return go(globalRoute('dashboard', organizationById(deletedOrganizationId)));
       }
       renderRail();
       renderMain();
