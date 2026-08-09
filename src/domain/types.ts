@@ -1445,6 +1445,8 @@ export interface TaskInput {
   grant?: string[];
   /** Principal and job-shaped profile from which `grant` was attenuated. */
   grantPrincipal?: string;
+  /** Opaque token-authority provenance for a verified delegated human subject. */
+  delegationId?: string;
   authorizationProfile?: string;
   /**
    * Snapshot of the process-wide Resolve-agent flag. It is carried in workflow

@@ -7,7 +7,26 @@
  * *and* untested. When a route is added to `src/gateway/server.ts`, add it here.
  */
 export const PLATFORM_API_CATALOG = {
-  note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
+  note: 'Every route is authenticated and capability checked. Identity requirements are independent: human-subject accepts secure task-agent delegation; interactive-human requires a live browser session. Colon-prefixed names are path parameters.',
+  identityRequirements: {
+    capability: 'Default. No user identity is implied by a capability grant.',
+    humanSubject: [
+      'POST /api/organizations',
+      'POST /api/organizations/:organizationId/repositories/create',
+      'GET /api/projects/:projectId/github-merge-eligibility',
+      'POST /api/organizations/:organizationId/git-profiles/reuse-user',
+    ],
+    interactiveHuman: [
+      'GET /api/user/export', 'POST /api/invitations/accept',
+      'DELETE /api/organizations/:organizationId',
+      'POST /api/users', 'DELETE /api/users/:userId',
+      'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
+      'GET|POST|PUT|DELETE /api/user/github-accounts|git-profiles',
+      'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize',
+      'POST /api/organizations/:organizationId/payments/connect',
+      'POST /api/vault/items/:itemId/reveal',
+    ],
+  },
   resources: ['GET /api/resource-drivers'],
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId (PATCH body {name} or {config})',
@@ -34,16 +53,14 @@ export const PLATFORM_API_CATALOG = {
   organizations: [
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     'GET /api/settings/installation (global operator-only Installation page probe)',
-    // POST needs a human account: it calls bootstrapOrganizationOwner, and a scoped
-    // agent token has no session.userId. Same for /invitations/accept below.
-    'GET|POST /api/organizations (POST requires a human identity — an agent token cannot own an organization)',
+    'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
     'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',
     'GET|POST /api/organizations/:organizationId/members', 'DELETE /api/organizations/:organizationId/members/:userId',
     'GET|POST /api/organizations/:organizationId/invitations',
-    'POST /api/invitations/accept (body {token}; requires a human identity)',
+    'POST /api/invitations/accept (body {token}; interactive human + verified email required)',
     'GET|POST /api/organizations/:organizationId/teams', 'PATCH|DELETE /api/organizations/:organizationId/teams/:teamId',
     'GET|POST /api/organizations/:organizationId/teams/:teamId/members',
     'DELETE /api/organizations/:organizationId/teams/:teamId/members/:userId',
@@ -53,13 +70,13 @@ export const PLATFORM_API_CATALOG = {
   sourceControl: [
     'GET|PUT /api/projects/:projectId/repository-sources',
     'GET|POST /api/projects/:projectId/repositories',
-    'GET /api/projects/:projectId/github-merge-eligibility (live external GitHub permission preflight)',
+    'GET /api/projects/:projectId/github-merge-eligibility (verified human subject; delegation accepted; live external GitHub permission preflight)',
     'DELETE /api/projects/:projectId/repositories/:repositoryId',
     'GET|POST /api/organizations/:organizationId/repositories',
-    'POST /api/organizations/:organizationId/repositories/create (requires an authorized human GitHub identity)',
+    'POST /api/organizations/:organizationId/repositories/create (verified human subject; delegation accepted only with the authority-pinned GitHub account)',
     'GET /api/organizations/:organizationId/git-connections',
     'GET|PUT /api/organizations/:organizationId/github/app',
-    'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize|refresh (OAuth/install redirects require a human identity)',
+    'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize (interactive human required for OAuth/install redirects); refresh is capability-only',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',

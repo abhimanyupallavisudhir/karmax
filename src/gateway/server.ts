@@ -60,6 +60,8 @@ import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
+import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
+  resolveCallerIdentity } from '../platform/identity.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -532,7 +534,7 @@ export class Gateway {
     }
     const sid = `s_${crypto.randomBytes(18).toString('hex')}`;
     const apiToken = this.deps.tokens.mintPrincipal(`user:${user}`, USER_CAPS).token;
-    const session: Session = { user, apiToken };
+    const session: Session = { user, userId: user, apiToken };
     this.sessions.set(sid, session);
     return { sid, session };
   }
@@ -1206,6 +1208,8 @@ export class Gateway {
     const token = session.apiToken;
     const { api, store } = this.deps;
     let authRecord = this.deps.tokens.verify(token);
+    if (!authRecord) return this.json(res, 401, { error: 'unauthorized' });
+    let callerIdentity = resolveCallerIdentity(authRecord, session.userId);
     const organizationResource = p.match(/^\/api\/organizations\/([^/]+)\/(accounts|git-profiles|credentials|workflows)(\/.*)?$/);
     // The legacy un-namespaced aliases (`/api/accounts`, `/api/git-profiles`,
     // `/api/credentials`) carry no organization, and `requestScope` derives none
@@ -1238,14 +1242,20 @@ export class Gateway {
         method === 'POST' || this.deps.store.listOrganizations(session.userId).some((organization) =>
           allows(this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id) ?? [], required))
       );
-      const principal = checked.record?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+      const auditedIdentity = resolveCallerIdentity(checked.record ?? authRecord, session.userId);
+      const principal = actorPrincipal(auditedIdentity.actor);
       if (!checked.ok && !collectionAllowed && !organizationCollectionAllowed) {
         this.deps.authorization?.audit(principal, `http.denied.${required}`, auditScope,
-          { path: p, method, reason: checked.reason ?? `missing capability ${required}` });
+          { path: p, method, reason: checked.reason ?? `missing capability ${required}`,
+            ...identityAuditDetail(auditedIdentity) });
         return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
       }
-      if (checked.ok) authRecord = checked.record;
-      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope, { path: p });
+      if (checked.ok && checked.record) {
+        authRecord = checked.record;
+        callerIdentity = resolveCallerIdentity(authRecord, session.userId);
+      }
+      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope,
+        { path: p, ...identityAuditDetail(auditedIdentity) });
     }
 
     try {
@@ -1258,12 +1268,13 @@ export class Gateway {
       if (p === '/api/user/export' && method === 'GET') {
         // Broad task-agent capabilities never imply ownership of a human's
         // personal archive. Only a verified browser identity has `session.userId`.
-        if (!session.userId || !this.deps.identity)
+        const subject = requireInteractiveHuman(callerIdentity);
+        if (!this.deps.identity)
           return this.json(res, 401, { error: 'a signed-in user account is required' });
-        const identityData = this.deps.identity.exportUserData(session.userId);
+        const identityData = this.deps.identity.exportUserData(subject.userId);
         const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
-        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId));
-        const linked = store.exportUserData(session.userId, String(identityData.profile.email ?? session.email ?? ''));
+        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, userGitScope(subject.userId));
+        const linked = store.exportUserData(subject.userId, String(identityData.profile.email ?? session.email ?? ''));
         const { format, version, exportedAt, security, ...linkedData } = linked;
         const value = {
           format,
@@ -1321,25 +1332,35 @@ export class Gateway {
       // organization-scoped token above, so identifiers cannot cross tenants.
       if (p === '/api/organizations' && method === 'GET') {
         const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
-        return this.json(res, 200, canAuditAll ? store.listOrganizations() : store.listOrganizations(session.userId));
+        if (canAuditAll) return this.json(res, 200, store.listOrganizations());
+        if (authRecord.organizationId)
+          return this.json(res, 200, [store.getOrganization(authRecord.organizationId)].filter(Boolean));
+        const scopedOrganizationIds = new Set([
+          ...(authRecord.projectId ? [store.getProject(authRecord.projectId)?.organizationId] : []),
+          ...(authRecord.projectIds ?? []).map((projectId) => store.getProject(projectId)?.organizationId),
+        ].filter((value): value is string => Boolean(value)));
+        if (scopedOrganizationIds.size)
+          return this.json(res, 200, [...scopedOrganizationIds].map((id) => store.getOrganization(id)).filter(Boolean));
+        return this.json(res, 200, store.listOrganizations(callerIdentity.humanSubject?.userId));
       }
       if (p === '/api/organizations' && method === 'POST') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireHumanSubject(callerIdentity);
         const b = await this.body(req);
         let organization;
         try {
           organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
-            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
-        this.deps.authorization?.bootstrapOrganizationOwner(`user:${session.userId}`, session.userId, organization.id);
+        this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id);
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
-        if (!session.userId || !session.email) return this.json(res, 400, { error: 'a verified account is required' });
+        const subject = requireInteractiveHuman(callerIdentity);
+        if (!session.email) return this.json(res, 400, { error: 'a verified account is required' });
         const b = await this.body(req);
         try {
-          const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
-          this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${session.userId}`,
+          const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), subject.userId, session.email);
+          this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
           return this.json(res, 200, membership);
         } catch (e) {
@@ -1387,6 +1408,7 @@ export class Gateway {
           `krmax-${label}-export-${new Date().toISOString().slice(0, 10)}.json`, value);
       }
       if (organizationMatch && method === 'DELETE') {
+        requireInteractiveHuman(callerIdentity);
         const organizationId = organizationMatch[1]!;
         const organization = store.getOrganization(organizationId);
         if (!organization) return this.json(res, 404, { error: 'organization not found' });
@@ -1450,11 +1472,11 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           const authorization = authorizationSelectionFromBody(b.authorization) ?? legacyAuthorizationSelection(b.profileId);
-          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+          this.deps.authorization?.assertCanGrantSelection(actorPrincipal(callerIdentity.actor),
             organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const existing = store.organizationMembership(organizationId, String(b.userId));
           const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
-          this.deps.authorization?.replacePrincipalAuthorization(authRecord?.principal ?? `user:${session.userId}`,
+          this.deps.authorization?.replacePrincipalAuthorization(actorPrincipal(callerIdentity.actor),
             `user:${membership.userId}`, organizationId, authorization,
             authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           return this.json(res, 200, { ...membership, authorization });
@@ -1463,7 +1485,7 @@ export class Gateway {
       const organizationMember = p.match(/^\/api\/organizations\/([^/]+)\/members\/([^/]+)$/);
       if (organizationMember && method === 'DELETE') {
         store.deprovisionOrganizationUser(organizationMember[1]!, organizationMember[2]!);
-        this.deps.authorization?.revoke(`user:${session.userId}`, `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`);
+        this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`);
         return this.json(res, 200, { ok: true });
       }
       const invitations = p.match(/^\/api\/organizations\/([^/]+)\/invitations$/);
@@ -1473,10 +1495,10 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           const authorization = authorizationSelectionFromBody(b.authorization) ?? legacyAuthorizationSelection(b.profileId);
-          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+          this.deps.authorization?.assertCanGrantSelection(actorPrincipal(callerIdentity.actor),
             organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const result = store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: 'member', authorization, invitedBy: `user:${session.userId}` });
+            role: 'member', authorization, invitedBy: actorPrincipal(callerIdentity.actor) });
           // Auto-deliver the invite when outbound email is configured; the copyable
           // link is still returned as a fallback (and for email-less installs).
           let emailed = false;
@@ -1556,7 +1578,7 @@ export class Gateway {
           if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
           const connected = await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? ''));
           for (const project of store.listProjects().filter((candidate) => candidate.organizationId === organizationId))
-            await this.ensureProjectWiki(project, session.userId);
+            await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           return this.json(res, 200, connected);
         }
         if (method === 'DELETE' && connectionId) {
@@ -1589,7 +1611,7 @@ export class Gateway {
       const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
       if (githubAppSetup) {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
-        if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
+        if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(callerIdentity.humanSubject?.userId));
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'settings:write').ok)
             return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });
@@ -1603,13 +1625,13 @@ export class Gateway {
       }
       const githubManifest = p.match(/^\/api\/organizations\/([^/]+)\/github\/app-manifest$/);
       if (githubManifest && method === 'POST') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!this.deps.tokens.check(token, 'settings:write').ok)
           return this.json(res, 403, { error: 'Only a Krmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
-        const state = store.createGithubInstallState(githubManifest[1]!, session.userId,
+        const state = store.createGithubInstallState(githubManifest[1]!, subject.userId,
           b.returnTo === 'profile' ? { returnTo: 'profile', selectAccount: true } : {});
         try {
           const publicUrl = this.githubPublicUrl(req, b.publicUrl);
@@ -1619,18 +1641,18 @@ export class Gateway {
       }
       const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
       if (githubAuthorize && method === 'POST') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const b = await this.body(req);
         const reconnectAccountId = b.accountId ? String(b.accountId) : undefined;
         let reconnectLogin: string | undefined;
         if (reconnectAccountId) {
-          const account = (await this.deps.githubApp.listUserAccounts(session.userId))
+          const account = (await this.deps.githubApp.listUserAccounts(subject.userId))
             .find((candidate) => candidate.id === reconnectAccountId);
           if (!account) return this.json(res, 404, { error: 'GitHub account is not connected' });
           reconnectLogin = account.login;
         }
-        const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId,
+        const state = store.createGithubInstallState(githubAuthorize[1]!, subject.userId,
           b.returnTo === 'profile' ? { returnTo: 'profile', githubAccountId: reconnectAccountId,
             githubLogin: reconnectLogin, selectAccount: b.mode === 'add' } : {});
         try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req), {
@@ -1640,9 +1662,9 @@ export class Gateway {
       }
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
       if (githubInstallUrl && method === 'POST') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
-        const state = store.createGithubInstallState(githubInstallUrl[1]!, session.userId);
+        const state = store.createGithubInstallState(githubInstallUrl[1]!, subject.userId);
         return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
       }
       const githubRefresh = p.match(/^\/api\/organizations\/([^/]+)\/github\/refresh$/);
@@ -1653,7 +1675,7 @@ export class Gateway {
           for (const connection of store.listGitConnections(githubRefresh[1]!))
             repositories.push(...await this.deps.githubApp.reconcile(connection));
           for (const project of store.listProjects().filter((candidate) => candidate.organizationId === githubRefresh[1]))
-            await this.ensureProjectWiki(project, session.userId);
+            await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           return this.json(res, 200, { repositories, count: repositories.length });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
@@ -1673,15 +1695,20 @@ export class Gateway {
       }
       const createOrganizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/create$/);
       if (createOrganizationRepository && method === 'POST') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
         const b = await this.body(req);
         const connection = store.getGitConnection(String(b.gitConnectionId ?? ''));
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
           return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
         try {
-          return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, session.userId,
-            { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined, private: b.private !== false }));
+          const githubAccountId = callerIdentity.actor.kind === 'task-agent'
+            ? subject.externalIdentities?.githubAccountId : undefined;
+          if (callerIdentity.actor.kind === 'task-agent' && !githubAccountId)
+            return this.json(res, 403, { error: 'the delegated task has no pinned GitHub account' });
+          return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
+            { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
+              private: b.private !== false }, { accountId: githubAccountId }));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
@@ -1695,8 +1722,9 @@ export class Gateway {
             project = store.createProject(String(b.name ?? 'New project'),
               normalizeConfig(b.config, false, this.deps.hosted === true), organizationId);
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
-          if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
-          await this.ensureProjectWiki(project, session.userId);
+          if (callerIdentity.humanSubject) store.setProjectMembership(project.id,
+            { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner');
+          await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
         }
@@ -1785,24 +1813,26 @@ export class Gateway {
       }
 
       if (p === '/api/inbox' && method === 'GET') {
-        if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        const items = store.listInbox(session.userId, requestedScope.organizationId,
+        const subject = requireInteractiveHuman(callerIdentity);
+        if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        const items = store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
         const headers = store.taskHeaders(items.map((item) => item.taskId));
         return this.json(res, 200, items.map((item) => ({ ...item, task: headers.get(item.taskId) })));
       }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireInteractiveHuman(callerIdentity);
         const b = await this.body(req);
-        return this.json(res, 200, store.markInbox(session.userId, inboxItem[1]!, b.unread !== false) ?? null);
+        return this.json(res, 200, store.markInbox(subject.userId, inboxItem[1]!, b.unread !== false) ?? null);
       }
       if (p === '/api/inbox/preferences') {
-        if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(session.userId, requestedScope.organizationId));
+        const subject = requireInteractiveHuman(callerIdentity);
+        if (!requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
-          return this.json(res, 200, store.setDeliveryPreferences({ userId: session.userId, organizationId: requestedScope.organizationId,
+          return this.json(res, 200, store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
         }
       }
@@ -1813,17 +1843,19 @@ export class Gateway {
         return this.json(res, 200, (this.deps.identity?.listUsers() ?? []).map((u) => ({ ...u, grants: this.deps.authorization?.grants(`user:${u.id}`) ?? [] })));
       }
       if (p === '/api/users' && method === 'POST') {
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.identity) return this.json(res, 400, { error: 'identity service unavailable' });
         const b = await this.body(req);
         const user = await this.deps.identity.createUser({ name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') });
-        if (b.profileId) this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
+        if (b.profileId) this.deps.authorization?.grant(`user:${subject.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
         return this.json(res, 200, user);
       }
       const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
       if (userMatch && method === 'DELETE') {
-        if (userMatch[1] === session.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
+        const subject = requireInteractiveHuman(callerIdentity);
+        if (userMatch[1] === subject.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
         await this.deps.identity?.removeUser(userMatch[1]!);
-        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(`user:${session.userId}`, g.principalId, g.scopeKey);
+        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(`user:${subject.userId}`, g.principalId, g.scopeKey);
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/authorization/profiles' && method === 'GET') {
@@ -1837,17 +1869,17 @@ export class Gateway {
       if (p === '/api/authorization/profiles' && method === 'PUT') {
         const b = await this.body(req);
         const scopeKey = (b.projectId ? `project:${b.projectId}` : 'global') as import('../platform/authorization.js').AuthorizationScope;
-        return this.json(res, 200, this.deps.authorization?.saveProfile(`user:${session.userId}`, scopeKey, b.profile));
+        return this.json(res, 200, this.deps.authorization?.saveProfile(actorPrincipal(callerIdentity.actor), scopeKey, b.profile));
       }
       if (p === '/api/authorization/default' && method === 'PUT') {
         const b = await this.body(req);
-        this.deps.authorization?.setDefault(`user:${session.userId}`, String(b.profileId), b.projectId ? String(b.projectId) : undefined);
+        this.deps.authorization?.setDefault(actorPrincipal(callerIdentity.actor), String(b.profileId), b.projectId ? String(b.projectId) : undefined);
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/authorization/grants' && method === 'GET') return this.json(res, 200, this.deps.authorization?.grants() ?? []);
       if (p === '/api/authorization/grants' && method === 'PUT') {
         const b = await this.body(req);
-        return this.json(res, 200, this.deps.authorization?.grant(`user:${session.userId}`, {
+        return this.json(res, 200, this.deps.authorization?.grant(actorPrincipal(callerIdentity.actor), {
           principalId: String(b.principalId), scopeKey: b.projectId ? `project:${b.projectId}` : 'global',
           profileId: String(b.profileId), ...(Array.isArray(b.capabilities) ? { capabilities: b.capabilities } : {}),
         }));
@@ -1950,7 +1982,7 @@ export class Gateway {
           project = store.createProject(b.name ?? 'New project',
             normalizeConfig(b.config, true, false));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
-        await this.ensureProjectWiki(project, session.userId);
+        await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
@@ -2251,7 +2283,7 @@ export class Gateway {
                 revision = await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
               }
             }
-            store.appendAudit({ principalId: session.userId ? `user:${session.userId}` : 'system:legacy-user',
+            store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor),
               action: 'resource:create', scopeKey: `project:${project.id}`, detail: { resourceId: resource.id, driver } });
             return this.json(res, 200, { ...redactResource(store.getResourceAttachment(resource.id)!),
               revision: redactResourceRevision(revision) });
@@ -2499,14 +2531,14 @@ export class Gateway {
           const profileId = String(b.profileId ?? 'developer');
           if (!['viewer', 'developer', 'maintainer'].includes(profileId))
             return this.json(res, 400, { error: 'project access must be Viewer, Developer, or Project maintainer' });
-          this.deps.authorization?.assertCanGrantSelection(authRecord?.principal ?? `user:${session.userId}`,
+          this.deps.authorization?.assertCanGrantSelection(actorPrincipal(callerIdentity.actor),
             project.organizationId, { level: profileId, scope: 'projects', projectIds: [projectId] },
             authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
           const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner'
             : principal.kind === 'user' ? 'member' : profileId);
           if (principal.kind === 'user') {
-            this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${principal.userId}`,
+            this.deps.authorization?.grant(actorPrincipal(callerIdentity.actor), { principalId: `user:${principal.userId}`,
               scopeKey: `project:${projectId}`, profileId });
           }
           return this.json(res, 200, membership);
@@ -2519,7 +2551,7 @@ export class Gateway {
           : projectMember[2] === 'team' ? { kind: 'team' as const, teamId: projectMember[3]! }
           : { kind: 'organization' as const, organizationId: projectMember[3]! };
         store.removeProjectMembership(projectMember[1]!, principal);
-        if (principal.kind === 'user') this.deps.authorization?.revoke(`user:${session.userId}`,
+        if (principal.kind === 'user') this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor),
           `user:${principal.userId}`, `project:${projectMember[1]!}`);
         return this.json(res, 200, { ok: true });
       }
@@ -2534,7 +2566,7 @@ export class Gateway {
             targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
             order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined });
           const project = store.getProject(projectId);
-          if (project) await this.ensureProjectWiki(project, session.userId);
+          if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           return this.json(res, 200, attached);
         }
       }
@@ -2542,7 +2574,7 @@ export class Gateway {
       if (githubMergeEligibility && method === 'GET') {
         const project = store.getProject(githubMergeEligibility[1]!);
         if (!project) return this.json(res, 404, { error: 'project not found' });
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 200, {
           remotePolicy: store.effectiveProjectConfig(project).remote ?? 'none', repositories: [], creatorCanMerge: false, eligibleUserIds: [],
           detail: 'GitHub is not connected for this krmax organization.',
@@ -2574,9 +2606,9 @@ export class Gateway {
         return this.json(res, 200, {
           remotePolicy: store.effectiveProjectConfig(project).remote ?? 'none',
           repositories,
-          creatorCanMerge: eligibleUserIds.includes(session.userId),
+          creatorCanMerge: eligibleUserIds.includes(subject.userId),
           eligibleUserIds,
-          ...(errors[session.userId] ? { detail: errors[session.userId] } : {}),
+          ...(errors[subject.userId] ? { detail: errors[subject.userId] } : {}),
         });
       }
       const projectRepositorySources = p.match(/^\/api\/projects\/([^/]+)\/repository-sources$/);
@@ -2594,7 +2626,7 @@ export class Gateway {
               if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
             }
             const saved = store.setProjectRepositorySources(project.id, repos);
-            await this.ensureProjectWiki(saved, session.userId);
+            await this.ensureProjectWiki(saved, callerIdentity.humanSubject?.userId);
             return this.json(res, 200, saved); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
@@ -2643,7 +2675,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           const project = store.getProject(projectId);
-          if (project) await this.ensureProjectWiki(project, session.userId);
+          if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
           const task = await api.createTask(token, { projectId, ...b });
           return this.json(res, 200, task);
         }
@@ -2828,7 +2860,7 @@ export class Gateway {
       if (queueMatch && method === 'POST') {
         const queued = store.getTask(queueMatch[1]!);
         const project = queued ? store.getProject(queued.projectId) : undefined;
-        if (project) await this.ensureProjectWiki(project, session.userId);
+        if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
@@ -3186,7 +3218,7 @@ export class Gateway {
             return this.json(res, 503, { error: 'payments are unavailable' });
           const { BudgetService } = await import('../autonomy/payments.js');
           const budget = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
-          const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+          const principal = actorPrincipal(callerIdentity.actor);
           const result = action.operation === 'deny'
             ? budget.deny(request.id, principal)
             : await budget.approve(request.id, principal);
@@ -3711,13 +3743,14 @@ export class Gateway {
         return this.json(res, 200, { providers: list, active });
       }
       if ((p === '/api/payments/connect' || organizationPayments?.[2] === 'connect') && method === 'POST') {
+        const subject = requireInteractiveHuman(callerIdentity);
         const b = await this.body(req);
         const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
         if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
         const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
         const result = await prov.connect({
           organizationId,
-          userId: session.userId,
+          userId: subject.userId,
           redirectUri: `${this.publicUrl(req)}/api/payments/stripe/callback`,
         });
         if (result.status === 'connected') {
@@ -3798,7 +3831,7 @@ export class Gateway {
         if (!this.deps.paymentRegistry && !this.deps.payments)
           return this.json(res, 503, { error: 'payments are unavailable' });
         const budget = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
-        const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+        const principal = actorPrincipal(callerIdentity.actor);
         const result = paymentResolve[3] === 'approve'
           ? await budget.approve(request.id, principal)
           : budget.deny(request.id, principal);
@@ -3822,7 +3855,7 @@ export class Gateway {
         // A human session's token is task-unscoped; per-task passes/extensions
         // only ever apply to real task-agent bearers.
         const callerTaskId = authRecord?.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
-        const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+        const principal = actorPrincipal(callerIdentity.actor);
         const defaultField = (type: string): any =>
           ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' })[type];
         const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
@@ -3900,8 +3933,7 @@ export class Gateway {
         // must never use this route as a shortcut around its item grant/policy.
         const viReveal = p.match(/^\/api\/vault\/items\/([^/]+)\/reveal$/);
         if (viReveal && method === 'POST') {
-          if (authRecord?.kind !== 'human')
-            return this.json(res, 403, { error: 'credential inspection requires a human vault administrator' });
+          requireInteractiveHuman(callerIdentity);
           const item = vault.get(viReveal[1]!);
           if (!item) return this.json(res, 404, { error: `no vault item ${viReveal[1]}` });
           const b = await this.body(req);
@@ -4503,27 +4535,27 @@ export class Gateway {
 
       const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity))?)?$/);
       if (githubAccountsResource) {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.githubApp || !this.deps.broker)
           return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId));
+        const gp = new GitProfiles(store, this.deps.broker, undefined, userGitScope(subject.userId));
         const accountId = githubAccountsResource[1] ? decodeURIComponent(githubAccountsResource[1]) : undefined;
         const action = githubAccountsResource[2];
         try {
           if (method === 'GET' && !accountId) {
-            const accounts = await this.deps.githubApp.listUserAccounts(session.userId);
+            const accounts = await this.deps.githubApp.listUserAccounts(subject.userId);
             for (const account of accounts) gp.saveGithubIdentity(account);
             const active = accounts.find((account) => account.active);
             if (active) gp.setActiveGithub(active.id);
-            inheritPersonalGithubProfile(store, this.deps.broker, session.userId);
+            inheritPersonalGithubProfile(store, this.deps.broker, subject.userId);
             return this.json(res, 200, {
               accounts: accounts.map((account) => ({ ...account, profile: gp.githubProfile(account.id) ?? null })),
-              githubApp: this.deps.githubApp.status(session.userId),
+              githubApp: this.deps.githubApp.status(subject.userId),
             });
           }
           if (method === 'POST' && accountId && action === 'active') {
-            await this.deps.githubApp.setActiveUserAccount(session.userId, accountId);
+            await this.deps.githubApp.setActiveUserAccount(subject.userId, accountId);
             return this.json(res, 200, { profile: gp.setActiveGithub(accountId) });
           }
           if (method === 'PUT' && accountId && action === 'identity') {
@@ -4536,7 +4568,7 @@ export class Gateway {
             }) });
           }
           if (method === 'DELETE' && accountId && !action) {
-            const active = await this.deps.githubApp.removeUserAccount(session.userId, accountId);
+            const active = await this.deps.githubApp.removeUserAccount(subject.userId, accountId);
             gp.deleteGithubIdentity(accountId);
             gp.setActiveGithub(active);
             return this.json(res, 200, { ok: true, activeAccountId: active });
@@ -4555,18 +4587,18 @@ export class Gateway {
       if (userGitResource || resourcePath.startsWith('/api/git-profiles')) {
       const gitResourcePath = userGitResource ? `/api/git-profiles${userGitResource[1] ?? ''}` : resourcePath;
       const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
+      const interactiveGitSubject = userGitResource ? requireInteractiveHuman(callerIdentity) : undefined;
       const gitScope = userGitResource
-        ? (session.userId ? userGitScope(session.userId) : undefined)
+        ? userGitScope(interactiveGitSubject!.userId)
         : resourceOrganizationId;
-      if (userGitResource && !gitScope) return this.json(res, 400, { error: 'a human account is required' });
       if (gitResourcePath === '/api/git-profiles' && method === 'GET') {
         const gp = new GitProfiles(store, this.deps.broker, undefined, gitScope!);
         const canManage = userGitResource ? true
           : this.deps.tokens.check(token, 'credential:write', { organizationId: resourceOrganizationId }).ok;
         return this.json(res, 200, {
           profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null, canManage,
-          ...(userGitResource && session.userId && this.deps.githubApp
-            ? { githubApp: this.deps.githubApp.status(session.userId) }
+          ...(userGitResource && interactiveGitSubject && this.deps.githubApp
+            ? { githubApp: this.deps.githubApp.status(interactiveGitSubject.userId) }
             : {}),
         });
       }
@@ -4628,11 +4660,11 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (!userGitResource && gitResourcePath === '/api/git-profiles/reuse-user' && method === 'POST') {
-        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const subject = requireHumanSubject(callerIdentity);
         const organizationProfiles = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
         try {
           const profile = organizationProfiles.reuseUserProfile(
-            new GitProfiles(store, this.deps.broker, undefined, userGitScope(session.userId)));
+            new GitProfiles(store, this.deps.broker, undefined, userGitScope(subject.userId)));
           return this.json(res, 200, { profile, defaultProfile: profile.name });
         } catch (error) {
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });

@@ -745,6 +745,11 @@ export class KarmaxApi {
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
+    // Authority-owned fields are minted below. An API caller may never inject a
+    // delegated subject or substitute the task-pinned external account through
+    // the otherwise-open workflow params bag.
+    delete taskOverrides._authorization;
+    delete taskOverrides._githubAccountId;
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
@@ -773,9 +778,11 @@ export class KarmaxApi {
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
-    const githubAccountId = createdBy?.kind === 'user'
-      ? this.deps.githubApp?.activeUserAccountId(createdBy.userId)
-      : undefined;
+    const githubAccountId = caller.kind === 'agent'
+      ? caller.externalIdentities?.githubAccountId
+      : caller.humanSubject
+        ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
+        : undefined;
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
@@ -787,7 +794,7 @@ export class KarmaxApi {
     // project/global defaults could never reach an unqueued task. Keeping the
     // task sparse means it re-resolves against the live defaults when it's
     // finally queued (createTask below for immediate start, queueTask for drafts).
-    const task = this.deps.store.createTask({
+    let task = this.deps.store.createTask({
       projectId: args.projectId,
       title,
       workflow,
@@ -810,6 +817,24 @@ export class KarmaxApi {
       delegate: args.delegate,
       confirmationPolicy,
     });
+    const authorizationScope = authorization as typeof authorization & {
+      scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
+    };
+    const delegation = this.deps.tokens.delegateHuman(token, {
+      taskId: task.id,
+      projectId: authorizationScope.scope ? undefined : task.projectId,
+      projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
+      organizationId: authorizationScope.scope === 'global' ? undefined
+        : (authorizationScope.organizationId ?? project.organizationId),
+      externalIdentities: githubAccountId ? { githubAccountId } : undefined,
+    });
+    if (delegation) {
+      this.deps.store.updateTaskParams(task.id, {
+        ...task.params,
+        _authorization: { ...(task.params._authorization as object), delegationId: delegation.id },
+      });
+      task = this.deps.store.getTask(task.id)!;
+    }
     this.persistTaskCredentialPolicies(task);
     // Advisory only: GitHub is an external policy authority, so this can become
     // stale and is always revalidated at Merge. Still, catching the common
@@ -880,10 +905,19 @@ export class KarmaxApi {
       const { triggerState: _triggerState, repeatable: _repeatable, runOf: _runOf,
         archived: _archived, draft: _draft, ...copied } = task.params;
       for (let n = 1; n < attemptCount; n++) {
-        const alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
+        let alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
           parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
           assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy });
+        if (delegation) {
+          const alternateDelegation = this.deps.tokens.deriveHumanDelegation(delegation.id, {
+            taskId: alt.id, projectId: delegation.projectId, projectIds: delegation.projectIds,
+            organizationId: delegation.organizationId,
+          });
+          this.deps.store.updateTaskParams(alt.id, { ...alt.params,
+            _authorization: { ...(alt.params._authorization as object), delegationId: alternateDelegation.id } });
+          alt = this.deps.store.getTask(alt.id)!;
+        }
         this.persistTaskCredentialPolicies(alt);
         if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
         createdAlternates.push(alt);
@@ -944,6 +978,7 @@ export class KarmaxApi {
     input.workflow = workflow;
     input.grant = authorization.capabilities;
     input.grantPrincipal = caller.principal;
+    input.delegationId = delegation?.id;
     input.authorizationProfile = authorization.profileId;
     input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
@@ -1199,9 +1234,10 @@ export class KarmaxApi {
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
-    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string } | undefined;
+    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string; delegationId?: string } | undefined;
     input.grant = auth?.capabilities ?? ['task:signal'];
     input.grantPrincipal = auth?.principal ?? 'system:legacy-task';
+    input.delegationId = auth?.delegationId;
     input.authorizationProfile = auth?.profileId ?? 'legacy';
     input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
@@ -1387,6 +1423,20 @@ export class KarmaxApi {
       .setTaskPolicies(task.id, authorization?.credentialPolicies ?? {});
   }
 
+  private inheritTaskDelegation(source: TaskRecord, target: TaskRecord): TaskRecord {
+    const sourceAuthorization = source.params?._authorization as { delegationId?: string } | undefined;
+    if (!sourceAuthorization?.delegationId) return target;
+    const parent = this.deps.tokens.deriveHumanDelegation(sourceAuthorization.delegationId, {
+      taskId: target.id, projectId: target.projectId,
+      organizationId: this.deps.store.getProject(target.projectId)?.organizationId,
+    });
+    this.deps.store.updateTaskParams(target.id, { ...target.params,
+      _authorization: { ...(target.params._authorization as object), delegationId: parent.id },
+      ...(parent.externalIdentities?.githubAccountId
+        ? { _githubAccountId: parent.externalIdentities.githubAccountId } : {}) });
+    return this.deps.store.getTask(target.id)!;
+  }
+
   /** Change the job-shaped grant on a task — before it starts, or in-flight while
    * it runs (SPEC §5.5). The selected profile is always re-attenuated against the
    * immediate bearer, so an agent cannot use a human principal recorded on the
@@ -1415,8 +1465,10 @@ export class KarmaxApi {
     if (typeof requested !== 'string' && authorization.attenuated)
       throw new CapabilityError('you cannot grant an authorization level you do not hold for the selected scope');
     this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
-    const priorPolicies = (task.params?._authorization as { credentialPolicies?: VaultTaskPolicyOverrides } | undefined)
-      ?.credentialPolicies;
+    const priorAuthorization = task.params?._authorization as {
+      credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string;
+    } | undefined;
+    const priorPolicies = priorAuthorization?.credentialPolicies;
     const policies = credentialPolicies === undefined
       ? (priorPolicies ?? {})
       : this.credentialPolicyOverrides(
@@ -1443,7 +1495,7 @@ export class KarmaxApi {
     }
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...authorization, principal: caller.principal, credentialPolicies: policies },
+      _authorization: { ...priorAuthorization, ...authorization, principal: caller.principal, credentialPolicies: policies },
     });
     const updated = this.deps.store.getTask(taskId)!;
     this.persistTaskCredentialPolicies(updated);
@@ -1487,7 +1539,7 @@ export class KarmaxApi {
     // project-scoped token cannot spawn a run from another project's series.
     const caller = this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId });
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
-    const run = this.deps.store.createTask({
+    let run = this.deps.store.createTask({
       projectId: series.projectId,
       listId: series.listId,
       title: series.title,
@@ -1500,6 +1552,7 @@ export class KarmaxApi {
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     });
+    run = this.inheritTaskDelegation(series, run);
     this.persistTaskCredentialPolicies(run);
     const { startType, input } = await this.buildStart(run);
     try {
@@ -1793,7 +1846,7 @@ export class KarmaxApi {
       this.deps.store.getProject(source.projectId)?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group.confirmer !== undefined) workflowParams[confirmerField.name] = group.confirmer;
-    const attempt = this.deps.store.createTask({
+    let attempt = this.deps.store.createTask({
       projectId: source.projectId,
       listId: source.listId,
       title: source.title,
@@ -1807,6 +1860,7 @@ export class KarmaxApi {
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
     });
+    attempt = this.inheritTaskDelegation(source, attempt);
     this.persistTaskCredentialPolicies(attempt);
     if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
     if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
@@ -3919,7 +3973,7 @@ export class KarmaxApi {
       : { profileId: 'caller', capabilities: caller.caps, attenuated: false };
     const mergeOnlyVersion = MANIFESTS.find((m) => m.name === 'merge-only')?.version;
     if (!mergeOnlyVersion) throw new Error('bundled merge-only manifest is missing');
-    const task = this.deps.store.createTask({
+    let task = this.deps.store.createTask({
       projectId: args.projectId,
       title: args.title,
       workflow: 'merge-only',
@@ -3932,6 +3986,17 @@ export class KarmaxApi {
       },
       createdBy: principalRefOf(caller.principal),
     });
+    const workflowDelegation = this.deps.tokens.delegateHuman(token, {
+      taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,
+      externalIdentities: caller.externalIdentities,
+    });
+    if (workflowDelegation) {
+      this.deps.store.updateTaskParams(task.id, { ...task.params,
+        _authorization: { ...(task.params._authorization as object), delegationId: workflowDelegation.id },
+        ...(workflowDelegation.externalIdentities?.githubAccountId
+          ? { _githubAccountId: workflowDelegation.externalIdentities.githubAccountId } : {}) });
+      task = this.deps.store.getTask(task.id)!;
+    }
     const input = {
       taskId: task.id,
       projectId: args.projectId,
@@ -3944,6 +4009,7 @@ export class KarmaxApi {
       workflowEdit: true,
       grant: authorization.capabilities,
       grantPrincipal: caller.principal,
+      delegationId: workflowDelegation?.id,
       authorizationProfile: authorization.profileId,
     } as TaskInput;
     try {
