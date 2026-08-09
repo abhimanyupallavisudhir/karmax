@@ -3506,7 +3506,11 @@ export class Gateway {
         } catch (error) {
           if (error instanceof CapabilityError) throw error;
           const conflict = /already exists/.test(String((error as Error)?.message));
-          return this.json(res, conflict ? 409 : 400, { error: error instanceof Error ? error.message : String(error) });
+          const declaredStatus = Number((error as { status?: unknown })?.status);
+          const status = Number.isInteger(declaredStatus) && declaredStatus >= 400 && declaredStatus <= 599
+            ? declaredStatus
+            : conflict ? 409 : 400;
+          return this.json(res, status, { error: error instanceof Error ? error.message : String(error) });
         }
       }
 
