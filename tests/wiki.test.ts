@@ -851,6 +851,10 @@ describe('remote task wiki views', () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Remote org' });
     const project = store.createProject('Remote project', {}, organization.id);
+    const wikiRepository = store.upsertRepository({ organizationId: organization.id, provider: 'github',
+      providerId: 'remote-task-wiki', owner: 'acme', name: 'wiki',
+      sshUrl: 'git@github.com:acme/wiki.git', defaultBranch: 'main', private: true });
+    store.setProjectWikiRepository(project.id, wikiRepository.id);
     const task = store.createTask({ projectId: project.id, title: 'Cloud task', workflow: 'software-dev',
       workflowVersion: '1.0.0', params: { prompt: 'x' } });
     const root = '/remote/world';
@@ -881,13 +885,16 @@ describe('remote task wiki views', () => {
     const token = tokens.mint({ taskId: task.id, profileId: 'do', principal: `task-agent:${task.id}:do`,
       projectId: project.id, organizationId: organization.id,
       ceiling: ['project:read', 'skill:write'], grantorCaps: ['project:read', 'skill:write'] }).token;
-    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir, worlds } as any);
+    let canonicalPublishAttempts = 0;
+    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir, worlds,
+      githubApp: { brokerCredentials: async () => { canonicalPublishAttempts++; return { env: {} }; } } } as any);
     try {
       expect((await api.readWikiResolved(token, 'project', project.id, 'notes/live') as any).page.content).toBe('Live branch.');
       await api.saveWikiPageResolved(token, 'project', project.id,
         { path: 'notes/live', content: 'Changed remotely.' });
       expect(files.get('project-wiki/notes/live/SKILL.md')!.toString()).toBe('Changed remotely.');
       expect(commits).toEqual(['wiki: update notes/live']);
+      expect(canonicalPublishAttempts).toBe(0); // task branch still lands through Review/Merge
       expect(readWikiPage(ensureProjectWikiRepository(contentDir, project.id), 'notes/live')).toBeUndefined();
 
       files.set('project-wiki/notes/prompt/SKILL.md', Buffer.from('Instructions from the remote task branch.'));

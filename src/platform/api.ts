@@ -35,7 +35,7 @@ import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
-import { commitProjectWiki, ensureProjectWikiRepository, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
+import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
@@ -3766,7 +3766,18 @@ export class KarmaxApi {
     args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
     selector: { taskId?: string; branch?: string } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
-    if (!remote) return this.saveWikiPage(token, scope, id, args, selector);
+    if (!remote) {
+      if (scope !== 'project') return this.saveWikiPage(token, scope, id, args, selector);
+      const view = this.wikiScope(token, scope, id, true, selector);
+      // The default branch is the user-facing canonical wiki. Publish that
+      // commit immediately when the project owns a GitHub remote. Live task
+      // checkouts stay on their task branch and land through Review/Merge.
+      if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
+        return mutateAndPublishProjectWiki(view.root,
+          () => this.saveWikiPage(token, scope, id, args, selector),
+          () => this.projectWikiPublishTarget(id));
+      return this.saveWikiPage(token, scope, id, args, selector);
+    }
     try {
       if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path))
         moveWikiPage(remote.root, args.prevPath, args.path);
@@ -3779,12 +3790,32 @@ export class KarmaxApi {
   async deleteWikiPageResolved(token: string, scope: WikiScope, id: string, rel: string,
     selector: { taskId?: string; branch?: string; recursive?: boolean } = {}) {
     const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
-    if (!remote) return this.deleteWikiPage(token, scope, id, rel, selector);
+    if (!remote) {
+      if (scope !== 'project') return this.deleteWikiPage(token, scope, id, rel, selector);
+      const view = this.wikiScope(token, scope, id, true, selector);
+      if (view.branch === PROJECT_WIKI_BRANCH && !view.taskId)
+        return mutateAndPublishProjectWiki(view.root,
+          () => this.deleteWikiPage(token, scope, id, rel, selector),
+          () => this.projectWikiPublishTarget(id));
+      return this.deleteWikiPage(token, scope, id, rel, selector);
+    }
     try {
       const deleted = deleteWikiPage(remote.root, rel, { recursive: selector.recursive });
       if (deleted) await remote.flush(`wiki: delete ${safeWikiPath(rel)}`);
       return { deleted };
     } finally { await remote.release(); }
+  }
+
+  /** Resolve a fresh, repository-scoped App credential for one canonical wiki
+   * publish. No linked remote means the local repository remains authoritative. */
+  private async projectWikiPublishTarget(projectId: string) {
+    const repository = this.deps.store.projectWiki(projectId)?.repository;
+    if (!repository) return undefined;
+    if (!this.deps.githubApp) throw new Error('the GitHub App is unavailable for this linked project wiki');
+    return {
+      remote: repository.sshUrl,
+      credential: await this.deps.githubApp.brokerCredentials(repository),
+    };
   }
 
   private readWikiFromRoot(scope: WikiScope, id: string, rel: string, root: string,
