@@ -67,15 +67,16 @@ const AGENT_GROUP_ROLES: readonly string[] = ['do', 'merge', ...(RESOLVE_AGENT_E
  */
 function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undefined)[], out: ValueMap): void {
   const names = new Set(manifest.params.filter((f) => f.type === 'agent' && f.role).map((f) => f.role));
-  // Current software-dev has one operational agent: Do also owns proposal
-  // preparation and merge-conflict repair. Preserve values saved by the former
-  // compact Do+Merge editor, whose wire shape used `agent:unified`.
+  // Current coding workflows have one operational Agent. Preserve values saved
+  // by the former compact Do+Merge editor (`agent:unified`) and by old
+  // Merge-only drafts (`agent:merge`) without recreating the removed role.
   if (names.has('do') && !names.has('merge')) {
     let resolved = out['agent:do'];
     for (let i = layers.length - 1; i >= 0; i--) {
       const layer = layers[i];
       if (!layer) continue;
-      resolved = pick(layer['agent:do'], pick(layer['agent:unified'], resolved));
+      const legacyMerge = manifest.name === 'merge-only' ? pick(layer['agent:merge'], resolved) : resolved;
+      resolved = pick(layer['agent:do'], pick(layer['agent:unified'], legacyMerge));
     }
     if (resolved !== undefined) {
       out['agent:do'] = resolved;

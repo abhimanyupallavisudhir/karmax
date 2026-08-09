@@ -46,8 +46,13 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(sd).toBeTruthy();
     const fieldNames = sd.params.map((f: any) => f.name);
     expect(fieldNames).toEqual(expect.arrayContaining(['prompt', 'agent:do', 'base', 'target', 'repos', 'remote']));
+    expect(fieldNames).not.toContain('agent:merge');
     expect(fieldNames).not.toContain('gitProfile');
     expect(sd.params.find((f: any) => f.name === 'agent:do').type).toBe('agent');
+    expect(sd.params.find((f: any) => f.name === 'agent:do').label).toBe('Agent');
+    const mergeOnly = schema.find((s: any) => s.name === 'merge-only');
+    expect(mergeOnly.params.find((f: any) => f.type === 'agent')).toMatchObject({ name: 'agent:do', role: 'do', label: 'Agent' });
+    expect(mergeOnly.params.some((f: any) => f.name === 'agent:merge')).toBe(false);
     // each workflow serves its own lifecycle stages (drives the pipeline UI)
     expect(sd.stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'pr', 'review', 'merge', 'done']);
     expect(schema.map((s: any) => s.name)).not.toContain('just-do');

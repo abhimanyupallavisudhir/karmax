@@ -53,6 +53,14 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     expect(migratedSeparated['agent:do']).toEqual(doAgent);
     expect(migratedSeparated['agent:merge']).toBeUndefined();
   });
+
+  it('migrates old Merge-only agent overrides onto the shared Agent field', () => {
+    const mergeOnly = manifest('merge-only')!;
+    const legacy = { provider: 'claude', model: 'legacy-merge-model' };
+    const resolved = resolveParams(mergeOnly, { task: { 'agent:merge': legacy } });
+    expect(resolved['agent:do']).toEqual(legacy);
+    expect(resolved['agent:merge']).toBeUndefined();
+  });
 });
 
 describe('resolveParams treats an empty list at a layer as "inherit", not an override', () => {

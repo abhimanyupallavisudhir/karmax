@@ -23,8 +23,11 @@ describe('profile + account management settings backend', () => {
     const updated = await fetch(`${base}/api/profiles`, {
       method: 'PUT',
       headers: auth(),
+      // Old clients/installations may still submit the retired label. The
+      // manifest-owned role vocabulary canonicalizes it to "Agent".
       body: JSON.stringify({ id: 'do-default', name: 'Do agent', role: 'do', provider: 'codex', model: 'gpt-4.1', effort: 'high', capabilities: ['signal-completion'], maxTurns: 30 }),
     }).then(J);
+    expect(updated.name).toBe('Agent');
     expect(updated.provider).toBe('codex');
     expect(updated.model).toBe('gpt-4.1');
     const list = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
@@ -97,9 +100,9 @@ describe('profile + account management settings backend', () => {
       method: 'PUT',
       headers: auth(),
       body: JSON.stringify({
-        id: 'merge-default',
-        role: 'merge',
-        name: 'Merge agent',
+        id: 'do-default',
+        role: 'do',
+        name: 'Agent',
         provider: 'claude',
         // The ceiling belongs to the workflow role, not to this profile: a submitted
         // one must neither narrow the role nor escalate it.
@@ -113,9 +116,23 @@ describe('profile + account management settings backend', () => {
     expect(saved.allowedAccounts).toBeUndefined();
     expect(saved.auth).toBeUndefined();
     expect(saved.capabilities).toBeUndefined();
-    expect(h.store.getProfile('merge-default')!.capabilities).toBeUndefined();
+    expect(h.store.getProfile('do-default')!.capabilities).toBeUndefined();
     const list = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
     expect(list.every((p: any) => p.capabilities === undefined)).toBe(true);
+  });
+
+  it('exposes one shared Agent profile and retires the Merge profile API', async () => {
+    const list = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
+    const operational = list.filter((p: any) => p.role !== 'confirm');
+    expect(operational).toHaveLength(1);
+    expect(operational[0]).toMatchObject({ role: 'do', name: 'Agent' });
+    expect(operational[0].roleWorkflows).toEqual(expect.arrayContaining(['software-dev', 'goal', 'merge-only']));
+
+    const retired = await fetch(`${base}/api/profiles`, {
+      method: 'PUT', headers: auth(),
+      body: JSON.stringify({ id: 'merge-default', role: 'merge', name: 'Merge agent', provider: 'claude' }),
+    });
+    expect(retired.status).toBe(400);
   });
 
   it('supports project-scoped profile overrides that fall back to global (1e)', async () => {
@@ -130,7 +147,7 @@ describe('profile + account management settings backend', () => {
     await fetch(`${base}/api/profiles?projectId=${project.id}`, {
       method: 'PUT',
       headers: auth(),
-      body: JSON.stringify({ projectId: project.id, role: 'do', name: 'Do agent', provider: 'codex', capabilities: [], effort: 'low' }),
+      body: JSON.stringify({ projectId: project.id, role: 'do', name: 'Agent', provider: 'codex', capabilities: [], effort: 'low' }),
     });
     view = await fetch(`${base}/api/profiles?projectId=${project.id}`, { headers: auth() }).then(J);
     const overridden = view.find((p: any) => p.role === 'do');
@@ -154,11 +171,11 @@ describe('profile + account management settings backend', () => {
 
     await fetch(`${base}/api/profiles?organizationId=${acme.id}`, {
       method: 'PUT', headers: auth(),
-      body: JSON.stringify({ organizationId: acme.id, role: 'do', name: 'Do agent', provider: 'codex', model: 'gpt-acme' }),
+      body: JSON.stringify({ organizationId: acme.id, role: 'do', name: 'Agent', provider: 'codex', model: 'gpt-acme' }),
     });
     await fetch(`${base}/api/profiles?organizationId=${beta.id}`, {
       method: 'PUT', headers: auth(),
-      body: JSON.stringify({ organizationId: beta.id, role: 'do', name: 'Do agent', provider: 'claude', model: 'claude-beta' }),
+      body: JSON.stringify({ organizationId: beta.id, role: 'do', name: 'Agent', provider: 'claude', model: 'claude-beta' }),
     });
 
     const [acmeProfiles, betaProfiles, acmeProjectProfiles, betaProjectProfiles] = await Promise.all([
