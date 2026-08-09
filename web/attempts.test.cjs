@@ -9,7 +9,10 @@ function extractFn(name) {
   const start = src.indexOf(`function ${name}(`);
   if (start < 0) throw new Error(`${name} not found`);
   let depth = 0;
-  const open = src.indexOf('{', start);
+  // Find the function body's opening brace, not a destructured parameter's.
+  const signatureEnd = src.indexOf(') {', start);
+  const open = signatureEnd < 0 ? -1 : signatureEnd + 2;
+  if (open < 0) throw new Error(`${name} signature not found`);
   for (let i = open; i < src.length; i++) {
     if (src[i] === '{') depth++;
     else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
@@ -34,6 +37,12 @@ eval(extractFn('taskRecord'));
 eval(extractFn('stageLabel'));
 eval(extractFn('stageIndicator'));
 eval(extractFn('taskAttempts'));
+global.workflowLabel = (workflow) => workflow;
+global.priorityFlag = () => '';
+global.tagChips = () => '';
+global.pipeline = () => '';
+eval(extractFn('customBranch'));
+eval(extractFn('taskRow'));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -51,6 +60,15 @@ ok((html.match(/data-stage-move=/g) || []).length === 2, 'every attempt owns its
 ok(html.includes('Waiting for human input') && html.includes('Queue'), 'attempt menus render their distinct server-advertised moves');
 ok(taskRecord('attempt-2')?.params?.draft === true, 'task page resolves non-principal records from the attempt group');
 ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft stage is labelled clearly');
+const archivedDraftRow = taskRow({
+  id: 'attempt-2', title: 'Task', workflow: 'software-dev', num: 14,
+  params: { draft: true, archived: true },
+  lastView: { stage: 'setup', status: 'waiting', state: { draft: true } },
+});
+ok(archivedDraftRow.includes('data-id="attempt-2"') && !archivedDraftRow.includes('data-draft='),
+  'an archived draft principal opens the logical task page instead of the standalone draft form');
+ok(archivedDraftRow.includes('data-unarchive="attempt-2"') && archivedDraftRow.includes('archived</span>'),
+  'an archived draft principal exposes its archived state and Unarchive control');
 
 // Clicking either a sibling or the principal performs an explicit attempt switch,
 // which prevents principal auto-redirection from snapping the page back.
