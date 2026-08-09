@@ -115,6 +115,9 @@ eq(parseRoute('/acme/website-redesign'),
 eq(parseRoute('/acme/website-redesign/queue'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: '' },
   'parse a project tab');
+eq(parseRoute('/acme/website-redesign/activity'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'activity', taskKey: null, taskTab: null, q: '' },
+  'the hidden Activity debugger remains reachable by direct URL');
 eq(parseRoute('/acme/website-redesign/tasks/42'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '' },
   'parse a task permalink');
