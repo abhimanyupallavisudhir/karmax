@@ -15,10 +15,10 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
-import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers } from '../platform/params.js';
+import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
-import { defaultBranch } from '../world/git.js';
+import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
@@ -4792,14 +4792,17 @@ export class Gateway {
           if (orgProvider !== undefined) globalVals.worldProvider = orgProvider;
         }
         if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
-        // Detect the repo's real default branch so placeholders show it (not "main").
-        const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
-        const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
+        // Detect the effective repository policy so placeholders agree with the
+        // branch provisioning and pull requests will actually use.
+        const repo0 = project
+          ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config)[0]
+          : undefined;
+        const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
         const enrich = (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
           const out = this.enrichAgentDefaults(m, vals, projectId);
-          if (db) {
-            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = db;
-            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = db;
+          if (branches) {
+            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
+            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
           }
           return out;
         };

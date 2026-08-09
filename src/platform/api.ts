@@ -27,8 +27,7 @@ import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, valid
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
-import { defaultBranch } from '../world/git.js';
-import { expandPath } from '../util/expand.js';
+import { repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -1002,17 +1001,18 @@ export class KarmaxApi {
       resolved.remote = 'pr';
     this.materializeUnifiedAgents(resolved, project.id);
 
-    // Auto-detect the repo's default branch when base/target weren't set anywhere,
-    // instead of guessing "main" (which would create a phantom target branch).
+    // Auto-detect the repo's branch policy when base/target weren't set anywhere,
+    // instead of guessing "main" (which would make hosted task views disagree
+    // with the enrolled repository policy used later during provisioning).
     const firstSet = (name: string) => layers.map((l) => l?.[name]).find((v) => v !== undefined && v !== null && v !== '');
     const explicitBase = firstSet('base');
     const explicitTarget = firstSet('target');
-    const repo0 = project.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
+    const repo0 = effectiveRepos(resolved, project.config)[0];
     if (repo0 && (!explicitBase || !explicitTarget)) {
-      const db = await defaultBranch(repo0).catch(() => undefined);
-      if (db) {
-        if (!explicitBase) resolved.base = db;
-        if (!explicitTarget) resolved.target = db;
+      const branches = await repositoryBranchDefaults(this.deps.store, project, repo0);
+      if (branches) {
+        if (!explicitBase) resolved.base = branches.base;
+        if (!explicitTarget) resolved.target = branches.target;
       }
     }
     return resolved;

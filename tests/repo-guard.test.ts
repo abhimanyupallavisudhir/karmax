@@ -98,6 +98,34 @@ describe('repository selection validation', () => {
     expect(store.getProject(p.id)?.config).toMatchObject({ repos: [repository.sshUrl], defaultBase: 'trunk', defaultTarget: 'trunk' });
   });
 
+  it('resolves hosted branch defaults from the enrolled repository before starting the task', async () => {
+    const p = store.createProject('Hosted defaults', { worldProvider: 'e2b' });
+    const repository = store.upsertRepository({ organizationId: p.organizationId!, provider: 'github',
+      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'master', private: true });
+    // This is the hosted repository-picker path. It attaches the catalog entry
+    // without baking its branch into ProjectConfig, so the manifest still
+    // resolves its generic "main" fallback before branch auto-detection.
+    store.setProjectRepositorySources(p.id, [repository.sshUrl]);
+    expect(store.getProject(p.id)?.config).toMatchObject({ repos: [repository.sshUrl] });
+    expect(store.getProject(p.id)?.config.defaultBase).toBeUndefined();
+
+    api = new KarmaxApi({ store, client: { workflow: { start: async (...a: unknown[]) => { started.push(a); return {}; } } } as any,
+      taskQueue: 'tq', tokens, hosted: true });
+    await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+
+    const input = (started[0]![1] as any).args[0];
+    expect(input.base).toBe('master');
+    expect(input.target).toBe('master');
+
+    // A real task-level choice remains authoritative; repository metadata only
+    // replaces the unsaved field fallback.
+    await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'y',
+      params: { base: 'release', target: 'production' } });
+    const overridden = (started[1]![1] as any).args[0];
+    expect(overridden.base).toBe('release');
+    expect(overridden.target).toBe('production');
+  });
+
   it('snapshots and reports the exact Codex selection for the Software Dev Do agent', async () => {
     const p = store.createProject('Codex', { repos: ['/some/repo'] });
     const selected = { provider: 'codex' as const, model: 'gpt-5.6-sol', effort: 'high' as const };
