@@ -52,6 +52,8 @@ import {
   ResourceRevision,
   ResourceLease,
   ResourceCandidate,
+  StorageLocation,
+  StorageLocationUsage,
   DEFAULT_URGENCY,
   URGENCY_LEVELS,
   normalizeUrgency,
@@ -399,14 +401,14 @@ export class Store {
         name TEXT NOT NULL, driver TEXT NOT NULL, target TEXT NOT NULL,
         access TEXT NOT NULL, isolation TEXT NOT NULL, source TEXT NOT NULL,
         credentialHandles TEXT NOT NULL, currentRevisionId TEXT, publish TEXT NOT NULL,
-        enabled INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        storageLocationId TEXT, enabled INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
         UNIQUE(projectId, name)
       );
       CREATE TABLE IF NOT EXISTS resource_revisions (
         id TEXT PRIMARY KEY, attachmentId TEXT NOT NULL, parentRevisionId TEXT,
         engine TEXT NOT NULL, sealedRef TEXT NOT NULL, rootDigest TEXT NOT NULL,
         bytes INTEGER NOT NULL, files INTEGER, metadata TEXT, createdByTaskId TEXT,
-        createdAt INTEGER NOT NULL
+        storageLocationId TEXT, createdAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS resource_leases (
         id TEXT PRIMARY KEY, attachmentId TEXT NOT NULL, revisionId TEXT,
@@ -418,9 +420,21 @@ export class Store {
       CREATE TABLE IF NOT EXISTS resource_snapshot_chunks (
         organizationId TEXT NOT NULL,
         chunkId TEXT NOT NULL,
+        storageLocationId TEXT,
         refs INTEGER NOT NULL,
         bytes INTEGER NOT NULL,
         PRIMARY KEY(organizationId, chunkId)
+      );
+      CREATE TABLE IF NOT EXISTS storage_locations (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL,
+        kind TEXT NOT NULL, config TEXT NOT NULL, credentialHandle TEXT,
+        isDefault INTEGER NOT NULL, status TEXT NOT NULL, lastCheckedAt INTEGER,
+        lastError TEXT, quotaBytes INTEGER, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        UNIQUE(organizationId, name)
+      );
+      CREATE TABLE IF NOT EXISTS storage_upload_reservations (
+        uploadId TEXT PRIMARY KEY, organizationId TEXT NOT NULL, storageLocationId TEXT NOT NULL,
+        bytes INTEGER NOT NULL, expiresAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS resource_candidates (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
@@ -619,6 +633,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_resource_revisions_attachment ON resource_revisions(attachmentId, createdAt DESC);
       CREATE INDEX IF NOT EXISTS idx_resource_leases_world ON resource_leases(worldId, worldGeneration);
       CREATE INDEX IF NOT EXISTS idx_resource_candidates_task ON resource_candidates(taskId, state, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_storage_locations_org ON storage_locations(organizationId, isDefault DESC, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_storage_upload_expiry ON storage_upload_reservations(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_runner_pools_org ON runner_pools(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_provider_connections_org ON world_provider_connections(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_leases_pool ON world_leases(runnerPoolId, state, priority DESC, createdAt);
@@ -716,6 +732,15 @@ export class Store {
     if (!cols.some((c) => c.name === 'confirmationPolicy')) this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT');
     const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
     if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
+    const attachmentCols = this.db.prepare('PRAGMA table_info(resource_attachments)').all() as { name: string }[];
+    if (!attachmentCols.some((c) => c.name === 'storageLocationId'))
+      this.db.exec('ALTER TABLE resource_attachments ADD COLUMN storageLocationId TEXT');
+    const revisionCols = this.db.prepare('PRAGMA table_info(resource_revisions)').all() as { name: string }[];
+    if (!revisionCols.some((c) => c.name === 'storageLocationId'))
+      this.db.exec('ALTER TABLE resource_revisions ADD COLUMN storageLocationId TEXT');
+    const chunkCols = this.db.prepare('PRAGMA table_info(resource_snapshot_chunks)').all() as { name: string }[];
+    if (!chunkCols.some((c) => c.name === 'storageLocationId'))
+      this.db.exec('ALTER TABLE resource_snapshot_chunks ADD COLUMN storageLocationId TEXT');
 
     // Existing installs become one personal organization. The fixed id makes the
     // migration idempotent and gives bootstrapping code a stable tenant to claim.
@@ -1078,6 +1103,8 @@ export class Store {
         .map(({ sealedDriverRef: _sealed, ...row }) => row),
       resource_candidates: rowsFor(this.db, 'resource_candidates', 'taskId', taskIds)
         .map(({ vaultItemId: _item, vaultField: _field, ...row }) => row),
+      storage_locations: selectRows(this.db, 'storage_locations', 'organizationId=?', [organizationId])
+        .map(({ credentialHandle: _credential, ...row }) => ({ ...row, credentialHandle: null })),
       project_memberships: rowsFor(this.db, 'project_memberships', 'projectId', projectIds),
       task_lists: rowsFor(this.db, 'task_lists', 'projectId', projectIds),
       tasks: rowsFor(this.db, 'tasks', 'projectId', projectIds),
@@ -1363,6 +1390,9 @@ export class Store {
       this.db.prepare('DELETE FROM world_leases WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM runner_pools WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM world_provider_connections WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM resource_snapshot_chunks WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM storage_upload_reservations WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM storage_locations WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM inbox WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId);
@@ -3549,10 +3579,10 @@ export class Store {
       createdAt: now, updatedAt: input.updatedAt ?? now };
     validateResourceAttachment(value);
     this.db.prepare(`INSERT INTO resource_attachments (id, organizationId, projectId, name, driver, target,
-      access, isolation, source, credentialHandles, currentRevisionId, publish, enabled, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
+      access, isolation, source, credentialHandles, currentRevisionId, publish, storageLocationId, enabled, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
         value.name, value.driver, JSON.stringify(value.target), value.access, value.isolation, JSON.stringify(value.source),
-        JSON.stringify(value.credentialHandles), value.currentRevisionId ?? null, value.publish, value.enabled ? 1 : 0,
+        JSON.stringify(value.credentialHandles), value.currentRevisionId ?? null, value.publish, value.storageLocationId ?? null, value.enabled ? 1 : 0,
         value.createdAt, value.updatedAt);
     return value;
   }
@@ -3570,15 +3600,15 @@ export class Store {
   }
 
   updateResourceAttachment(id: string, patch: Partial<Pick<ResourceAttachment,
-    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'publish' | 'enabled'>>): ResourceAttachment {
+    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'storageLocationId' | 'publish' | 'enabled'>>): ResourceAttachment {
     const current = this.getResourceAttachment(id);
     if (!current) throw new Error('resource attachment not found');
     const next = { ...current, ...patch, updatedAt: Date.now() };
     validateResourceAttachment(next);
     this.db.prepare(`UPDATE resource_attachments SET name=?, target=?, access=?, isolation=?, source=?,
-      credentialHandles=?, publish=?, enabled=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
-        next.access, next.isolation, JSON.stringify(next.source), JSON.stringify(next.credentialHandles), next.publish,
-        next.enabled ? 1 : 0, next.updatedAt, id);
+      credentialHandles=?, storageLocationId=?, publish=?, enabled=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
+        next.access, next.isolation, JSON.stringify(next.source), JSON.stringify(next.credentialHandles),
+        next.storageLocationId ?? null, next.publish, next.enabled ? 1 : 0, next.updatedAt, id);
     return next;
   }
 
@@ -3603,9 +3633,10 @@ export class Store {
     const value: ResourceRevision = { ...input, id: input.id ?? newId('revision'), createdAt: input.createdAt ?? Date.now() };
     if (!this.getResourceAttachment(value.attachmentId)) throw new Error('resource attachment not found');
     this.db.prepare(`INSERT INTO resource_revisions (id, attachmentId, parentRevisionId, engine, sealedRef,
-      rootDigest, bytes, files, metadata, createdByTaskId, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      rootDigest, bytes, files, metadata, createdByTaskId, storageLocationId, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         value.id, value.attachmentId, value.parentRevisionId ?? null, value.engine, value.sealedRef, value.rootDigest,
-        value.bytes, value.files ?? null, jsonOrNull(value.metadata), value.createdByTaskId ?? null, value.createdAt);
+        value.bytes, value.files ?? null, jsonOrNull(value.metadata), value.createdByTaskId ?? null,
+        value.storageLocationId ?? null, value.createdAt);
     return value;
   }
 
@@ -3736,11 +3767,109 @@ export class Store {
       .run(state, sealedDriverRef ?? null, state === 'released' ? Date.now() : null, id);
   }
 
-  retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>): void {
-    const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, refs, bytes)
-      VALUES (?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+  // ─── Organization storage locations and physical snapshot accounting ─────
+
+  saveStorageLocation(input: Omit<StorageLocation, 'createdAt' | 'updatedAt'>
+    & Partial<Pick<StorageLocation, 'createdAt' | 'updatedAt'>>): StorageLocation {
+    if (!this.getOrganization(input.organizationId)) throw new Error('storage organization not found');
+    if (!['managed', 's3'].includes(input.kind)) throw new Error('unsupported storage location kind');
+    const now = Date.now();
+    const value: StorageLocation = { ...input, createdAt: input.createdAt ?? now, updatedAt: input.updatedAt ?? now };
     this.db.exec('BEGIN IMMEDIATE');
-    try { for (const chunk of chunks) insert.run(organizationId, chunk.id, chunk.bytes); this.db.exec('COMMIT'); }
+    try {
+      if (value.isDefault) this.db.prepare('UPDATE storage_locations SET isDefault=0, updatedAt=? WHERE organizationId=?')
+        .run(now, value.organizationId);
+      this.db.prepare(`INSERT INTO storage_locations (id, organizationId, name, kind, config, credentialHandle,
+        isDefault, status, lastCheckedAt, lastError, quotaBytes, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, config=excluded.config,
+          credentialHandle=excluded.credentialHandle, isDefault=excluded.isDefault, status=excluded.status,
+          lastCheckedAt=excluded.lastCheckedAt, lastError=excluded.lastError, quotaBytes=excluded.quotaBytes,
+          updatedAt=excluded.updatedAt`).run(value.id, value.organizationId, value.name, value.kind,
+          JSON.stringify(value.config), value.credentialHandle ?? null, value.isDefault ? 1 : 0, value.status,
+          value.lastCheckedAt ?? null, value.lastError ?? null, value.quotaBytes ?? null, value.createdAt, value.updatedAt);
+      this.db.exec('COMMIT');
+      return this.getStorageLocation(value.id)!;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  getStorageLocation(id: string): StorageLocation | undefined {
+    const row = this.db.prepare('SELECT * FROM storage_locations WHERE id=?').get(id) as any;
+    return row ? storageLocationRow(row) : undefined;
+  }
+
+  listStorageLocations(organizationId: string): StorageLocation[] {
+    return (this.db.prepare('SELECT * FROM storage_locations WHERE organizationId=? ORDER BY isDefault DESC, createdAt')
+      .all(organizationId) as any[]).map(storageLocationRow);
+  }
+
+  deleteStorageLocation(id: string): StorageLocation | undefined {
+    const value = this.getStorageLocation(id);
+    if (!value) return undefined;
+    const refs = Number((this.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM resource_attachments WHERE storageLocationId=?) +
+      (SELECT COUNT(*) FROM resource_revisions WHERE storageLocationId=?) AS n`).get(id, id) as any)?.n ?? 0);
+    if (refs) throw new Error('storage location is still used by project resources or revisions');
+    this.db.prepare('DELETE FROM storage_locations WHERE id=?').run(id);
+    return value;
+  }
+
+  storageLocationUsage(locationId: string): StorageLocationUsage {
+    const location = this.getStorageLocation(locationId);
+    if (!location) throw new Error('storage location not found');
+    const retainedBytes = Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
+      FROM resource_snapshot_chunks WHERE organizationId=? AND storageLocationId=?`)
+      .get(location.organizationId, locationId) as any)?.bytes ?? 0);
+    return { locationId, retainedBytes, quotaBytes: location.quotaBytes,
+      ...(location.quotaBytes == null ? {} : { availableBytes: Math.max(0, location.quotaBytes - retainedBytes) }) };
+  }
+
+  backfillManagedStorageLocation(organizationId: string, locationId: string): void {
+    this.db.prepare(`UPDATE resource_snapshot_chunks SET storageLocationId=?
+      WHERE organizationId=? AND storageLocationId IS NULL`).run(locationId, organizationId);
+  }
+
+  reserveStorageUpload(uploadId: string, organizationId: string, storageLocationId: string,
+    bytes: number, expiresAt: number): void {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('invalid storage upload reservation');
+    const location = this.getStorageLocation(storageLocationId);
+    if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const total = Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
+        FROM storage_upload_reservations WHERE storageLocationId=? AND uploadId<>?`)
+        .get(storageLocationId, uploadId) as any)?.bytes ?? 0) + bytes;
+      if (location.quotaBytes != null && total > location.quotaBytes)
+        throw new Error(`managed upload quota exceeded (${total} temporary bytes, ${location.quotaBytes} byte limit)`);
+      this.db.prepare(`INSERT INTO storage_upload_reservations (uploadId, organizationId, storageLocationId, bytes, expiresAt)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(uploadId) DO UPDATE SET bytes=excluded.bytes, expiresAt=excluded.expiresAt`)
+        .run(uploadId, organizationId, storageLocationId, bytes, expiresAt);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  releaseStorageUpload(uploadId: string): void {
+    this.db.prepare('DELETE FROM storage_upload_reservations WHERE uploadId=?').run(uploadId);
+  }
+
+  retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void {
+    const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
+      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (storageLocationId) {
+        const location = this.getStorageLocation(storageLocationId);
+        if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
+        const newBytes = chunks.reduce((sum, chunk) => sum + (this.db.prepare(
+          'SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunk.id) ? 0 : chunk.bytes), 0);
+        const used = Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes FROM resource_snapshot_chunks
+          WHERE organizationId=? AND storageLocationId=?`).get(organizationId, storageLocationId) as any)?.bytes ?? 0);
+        if (location.quotaBytes != null && used + newBytes > location.quotaBytes)
+          throw new Error(`managed storage quota exceeded (${used + newBytes} bytes requested, ${location.quotaBytes} byte limit)`);
+      }
+      for (const chunk of chunks) insert.run(organizationId, chunk.id, storageLocationId ?? null, chunk.bytes);
+      this.db.exec('COMMIT');
+    }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
@@ -4556,6 +4685,11 @@ export class Store {
       .run(k, v);
   }
 
+  kvEntries(prefix: string): Array<{ key: string; value: string }> {
+    return (this.db.prepare('SELECT k, v FROM kv WHERE k LIKE ? ORDER BY k').all(`${prefix}%`) as any[])
+      .map((row) => ({ key: String(row.k), value: String(row.v) }));
+  }
+
   kvDelete(k: string): void { this.db.prepare('DELETE FROM kv WHERE k=?').run(k); }
 
   close() {
@@ -4590,15 +4724,26 @@ function resourceAttachmentRow(row: any): ResourceAttachment {
   return { id: row.id, organizationId: row.organizationId, projectId: row.projectId, name: row.name,
     driver: row.driver, target: JSON.parse(row.target), access: row.access, isolation: row.isolation,
     source: JSON.parse(row.source), credentialHandles: JSON.parse(row.credentialHandles),
+    storageLocationId: row.storageLocationId ?? undefined,
     currentRevisionId: row.currentRevisionId ?? undefined, publish: row.publish, enabled: Boolean(row.enabled),
     createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt) };
 }
 
 function resourceRevisionRow(row: any): ResourceRevision {
   return { id: row.id, attachmentId: row.attachmentId, parentRevisionId: row.parentRevisionId ?? undefined,
-    engine: row.engine, sealedRef: row.sealedRef, rootDigest: row.rootDigest, bytes: Number(row.bytes),
+    engine: row.engine, storageLocationId: row.storageLocationId ?? undefined,
+    sealedRef: row.sealedRef, rootDigest: row.rootDigest, bytes: Number(row.bytes),
     files: row.files == null ? undefined : Number(row.files), metadata: parseJsonOptional(row.metadata),
     createdByTaskId: row.createdByTaskId ?? undefined, createdAt: Number(row.createdAt) };
+}
+
+function storageLocationRow(row: any): StorageLocation {
+  return { id: row.id, organizationId: row.organizationId, name: row.name, kind: row.kind,
+    config: JSON.parse(row.config), credentialHandle: row.credentialHandle ?? undefined,
+    isDefault: Boolean(row.isDefault), status: row.status,
+    lastCheckedAt: row.lastCheckedAt == null ? undefined : Number(row.lastCheckedAt),
+    lastError: row.lastError ?? undefined, quotaBytes: row.quotaBytes == null ? undefined : Number(row.quotaBytes),
+    createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt) };
 }
 
 function resourceLeaseRow(row: any): ResourceLease {

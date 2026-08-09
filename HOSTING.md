@@ -29,6 +29,7 @@ file an operator setting lives only as long as the shell that exported it, and
 | `KARMAX_HOME`, `KARMAX_HOST`, `KARMAX_PORT`, `KARMAX_PUBLIC_URL`, `KARMAX_PREVIEW_ORIGIN` | operator | Infrastructure and origins. |
 | `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
 | `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires a real Temporal address; managed multi-node requires S3. |
+| `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Hard physical snapshot-byte allowance per organization. Hosted defaults to 5 GiB; `0` means unlimited and is unsuitable for open registration. |
 | `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). |
 | `KARMAX_GOOGLE_CLIENT_ID`, `KARMAX_GOOGLE_CLIENT_SECRET` | operator | Optional "Continue with Google". Separate from `KARMAX_OIDC_*` deliberately: that slot holds exactly one provider, so an install pointed at its company IdP would otherwise have to choose between the two. Set both or neither — the button appears only when both are non-empty. Register `https://<your-karmax-origin>/api/auth/callback/google` as the authorized redirect URI in the Google Cloud console; Better Auth serves that path itself, so it must match `KARMAX_PUBLIC_URL` exactly. Only the default `openid`/`email`/`profile` scopes are requested and no refresh token is asked for: karmax wants an identity, not access to the user's Google data, and an unused refresh token is only a long-lived secret to leak. A Google login on an address that already has a **verified** email+password account links into it rather than creating a duplicate; on an *unverified* one it is refused (the sign-in card explains why), because karmax's signup never proved that account owns the address. Read the comment in `src/auth/identity.ts` before relaxing either half of that. |
 | `KARMAX_MAX_WFT` / `_ACT` / `_CACHED_WORKFLOWS`, `KARMAX_AGENT_*` | operator | Worker and host-admission capacity. |
@@ -118,10 +119,13 @@ finds the URL, and each signup provisions its own personal-workspace
 organization. That is intentional for a public SaaS. Two consequences worth
 knowing:
 
-- **Cost is bounded; storage is not.** A new tenant has no agent credential and
-  no cloud-world provider, so they cannot spend your model tokens or boot a
-  sandbox — every turn fails closed. They *can* create projects, tasks, wiki
-  pages and attachments, which the `signup` zone bounds but does not eliminate.
+- **Compute and managed project storage are bounded.** A new tenant has no agent
+  credential and no cloud-world provider, so they cannot spend your model tokens
+  or boot a sandbox — every turn fails closed. Versioned project data is admitted
+  against `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` using physical encrypted-chunk
+  accounting. The hosted default is 5 GiB per organization. Wiki/metadata growth
+  remains small-row database traffic and should still be covered by deployment
+  disk monitoring and abuse controls.
 - **Email addresses are unverified.** `emailVerification.sendOnSignUp` is on, but
   `requireEmailVerification` is not set, so an account is usable immediately and
   the address may be junk. Turning it on is a one-line change in
@@ -133,6 +137,27 @@ knowing:
 
 To run invite-only instead, gate `/api/signup` behind the existing
 organization-invitation flow, which is already token-hash validated.
+
+## Managed storage and customer-owned S3
+
+The deployment object store remains the control-plane default: portable world
+checkpoints, promoted artifacts, and organizations that need no special setup use
+operator storage. Versioned project resources can instead select an
+organization-owned S3-compatible location under **Organization settings → Data
+storage**. The bucket configuration is safe metadata; access keys live only in
+the encrypted credential broker. A connection must pass a write/read/delete
+probe before it can become the organization default.
+
+Storage placement is pinned on every immutable resource revision. Changing the
+default affects only new revisions; old revisions continue restoring from their
+original bucket. Chunk names include the customer-location identity, preserving
+tenant-local deduplication without confusing copies held in two buckets.
+
+Use a dedicated bucket policy restricted to the configured prefix. Customer S3
+is billed by the customer and therefore has no krmax managed-storage ceiling.
+This is for large *versioned* data. A live bucket, database, or API should instead
+be configured as a project Service so tasks access it directly and krmax stores
+no snapshot copy.
 
 ## Payment rails
 

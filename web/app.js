@@ -9045,10 +9045,15 @@ async function hydrateProjectSecrets(proj) {
 async function hydrateProjectData(proj) {
   const box = $('#project-data-box'); if (!box) return;
   try {
-    const all = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
+    const [all, storageLocations] = await Promise.all([
+      api(`/api/projects/${encodeURIComponent(proj.id)}/resources`),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/storage`).catch(() => []),
+    ]);
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
+    const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
+      || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when krmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
-      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
@@ -9056,6 +9061,7 @@ async function hydrateProjectData(proj) {
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
+          <label class="form-row"><span>Storage</span><select id="data-storage">${storageLocations.filter((location) => location.status === 'ready').map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select></label>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
           <label class="form-row wide"><span>Or upload a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
@@ -9102,6 +9108,7 @@ async function hydrateProjectData(proj) {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
           name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
           access: $('#data-access').value, isolation: 'fork', publish: $('#data-publish').value,
+          storageLocationId: $('#data-storage')?.value || undefined,
           sourcePath: $('#data-source')?.value.trim() || undefined,
         }) });
         if (files.length) await uploadResourceFiles(proj.id, created.id, files,
@@ -12213,7 +12220,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Where tasks run</a><a href="#settings-storage">Data storage</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -12225,6 +12232,9 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+
+    <div class="settings-section-title" id="settings-storage"><div>Data storage<small>Bounded managed storage or your own S3-compatible bucket</small></div></div>
+    <div class="card"><div id="org-storage">Loading…</div></div>
 
     ${globalSettingsView(true)}
 
@@ -12275,7 +12285,7 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
-  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
+  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
     api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
     api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
@@ -12286,6 +12296,7 @@ async function hydrateOrganizationView() {
     api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
     api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
     Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+    api(`/api/organizations/${organizationId}/storage`).catch(() => []),
   ]);
   if (!renderIsCurrent()) return;
   const pendingInvitations = invitations.filter((invitation) => !invitation.acceptedAt);
@@ -12343,6 +12354,14 @@ async function hydrateOrganizationView() {
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
     <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select><input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds"><button class="btn sm" id="runner-create">Add pool</button></div>`;
+  $('#org-storage').innerHTML = `<div class="project-help-callout"><span class="callout-mark">i</span><div><b>Managed storage is intentionally bounded.</b> Connect your own bucket for large versioned datasets. For live or frequently changing data, add the bucket as a project Service instead of copying it into krmax.</div></div>
+    ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+    <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
+      <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
+      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-karmax"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
+      <label class="form-row">Restricted prefix<input id="storage-prefix" value="karmax/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
+      <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
+      <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the krmax vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
   const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
   const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
     : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
@@ -12398,6 +12417,31 @@ async function hydrateOrganizationView() {
     });
     row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
     row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  });
+  $('#storage-connect')?.addEventListener('click', async () => {
+    try {
+      const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
+        name: $('#storage-name').value, endpoint: $('#storage-endpoint').value, bucket: $('#storage-bucket').value,
+        region: $('#storage-region').value, prefix: $('#storage-prefix').value,
+        accessKeyId: $('#storage-access-key').value, secretAccessKey: $('#storage-secret-key').value,
+      }) });
+      await api(`/api/organizations/${organizationId}/storage/${encodeURIComponent(created.id)}/test`, { method: 'POST', body: '{}' });
+      toast('Customer storage connected'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); }
+  });
+  $('#org-storage')?.querySelectorAll('[data-storage]').forEach((row) => {
+    const id = encodeURIComponent(row.dataset.storage);
+    row.querySelector('.storage-test')?.addEventListener('click', async () => { try {
+      await api(`/api/organizations/${organizationId}/storage/${id}/test`, { method: 'POST', body: '{}' }); toast('Storage connection verified'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); await hydrateOrganizationView(); } });
+    row.querySelector('.storage-default')?.addEventListener('click', async () => { try {
+      await api(`/api/organizations/${organizationId}/storage/${id}/default`, { method: 'PUT', body: '{}' }); toast('Default storage updated'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); } });
+    row.querySelector('.storage-delete')?.addEventListener('click', async () => {
+      if (!confirm('Remove this storage connection? It is allowed only when no resource or revision uses it.')) return;
+      try { await api(`/api/organizations/${organizationId}/storage/${id}`, { method: 'DELETE' }); await hydrateOrganizationView(); }
+      catch (error) { toast(error.message, true); }
+    });
   });
   $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);

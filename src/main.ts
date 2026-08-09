@@ -31,6 +31,7 @@ import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
+import { StorageLocationService } from './store/storage-locations.js';
 import { WorldCheckpointService } from './world/checkpoint.js';
 import { RunnerPoolService, WorldLifecycleManager } from './world/runners.js';
 import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
@@ -219,8 +220,16 @@ async function main() {
         secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
       })
     : new LocalObjectStore(p.objects);
-  const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker);
-  const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker, { client, taskQueue: TASK_QUEUE });
+  const configuredStorageQuota = process.env.KARMAX_MANAGED_STORAGE_QUOTA_BYTES;
+  const managedStorageQuotaBytes = configuredStorageQuota == null
+    ? (deployment.hosted ? 5 * 1024 * 1024 * 1024 : undefined)
+    : Number(configuredStorageQuota) > 0 ? Math.floor(Number(configuredStorageQuota)) : undefined;
+  const storageLocations = new StorageLocationService(store, objectStore, broker, managedStorageQuotaBytes,
+    !deployment.hosted);
+  for (const organization of store.listOrganizations()) storageLocations.ensureManaged(organization.id);
+  const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker, storageLocations);
+  const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker,
+    { client, taskQueue: TASK_QUEUE }, storageLocations);
   const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
   const runners = new RunnerPoolService(store);
   const worldAccess = new WorldAccessService(store, worlds, runners, resources);
