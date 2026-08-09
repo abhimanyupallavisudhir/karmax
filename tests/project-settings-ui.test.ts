@@ -40,6 +40,14 @@ describe('Project settings browser source', () => {
     expect(organizationWiring).toContain("method: 'PATCH'");
   });
 
+  it('keeps the post-delete fallback inside the deleted project’s organization', () => {
+    const projectWiring = extractFunction('wireSettingsView');
+
+    expect(projectWiring).toContain('firstProjectForOrganization(deletedOrganizationId)');
+    expect(projectWiring).toContain("globalRoute('dashboard', organizationById(deletedOrganizationId))");
+    expect(projectWiring).not.toContain('const next = S.projects[0]');
+  });
+
   it('formats discovered and revision byte sizes without a missing global', () => {
     const formatBytes = Function(`${extractFunction('formatBytes')}; return formatBytes;`)() as (value: unknown) => string;
     expect(formatBytes(0)).toBe('0 B');
