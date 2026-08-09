@@ -6252,8 +6252,9 @@ function overviewTab(v) {
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
+  const requestedInput = humanWaitDetail(v);
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
@@ -6386,6 +6387,10 @@ function conversationPane(v, t) {
   const presence = conversationPresence(v, t);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
+  const requestedInput = canFollowUp ? humanWaitDetail(v) : '';
+  const request = requestedInput
+    ? `<div class="msg system"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderMessageBody(requestedInput)}</div></div>`
+    : '';
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
@@ -6404,7 +6409,7 @@ function conversationPane(v, t) {
       <span style="flex:1"></span>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
     ${fu}`;
 }
 
@@ -6919,6 +6924,15 @@ function waitingText(w) {
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
+}
+
+// A targeted human hold carries the actual question a person must answer. Keep
+// compact labels stable via waitingText(), but never hide this detail on the task
+// page—the agent may have used its final tool call to deliver the findings and
+// decision request, so omitting it makes a successful escalation look cut off.
+function humanWaitDetail(v) {
+  if (v?.status !== 'waiting' || v.waitingFor?.kind !== 'human') return '';
+  return typeof v.waitingFor.detail === 'string' ? v.waitingFor.detail.trim() : '';
 }
 
 // A CLI command to FORK this agent's session into the user's terminal — a branched

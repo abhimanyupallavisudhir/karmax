@@ -10,6 +10,7 @@ import type { TaskView } from '../src/domain/types.js';
 import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
 import { PermissionRequests } from '../src/platform/permission-requests.js';
 import { sameProposalIdentity } from '../src/workflows/software-dev.js';
+import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -22,10 +23,11 @@ function fixture() {
   const signalled: Array<{ id: string; signal: string; args: unknown[] }> = [];
   const hiddenTurnIds = ['hidden-account-turn'];
   let liveViewOverride: TaskView | undefined;
+  let gracefulResult: (() => Promise<unknown>) | undefined;
   const client = {
     workflow: {
       getHandle(id: string) {
-        return {
+        const handle: any = {
           async terminate(reason: string) { terminated.push(`${id}:${reason}`); },
           async signal(signal: string, ...args: unknown[]) { signalled.push({ id, signal, args }); },
           async executeUpdate(_name: string, options: { args: [string] }) {
@@ -43,6 +45,8 @@ function fixture() {
             throw new Error('no live query');
           },
         };
+        if (gracefulResult) handle.result = gracefulResult;
+        return handle;
       },
       async signalWithStart(_type: string, options: any) {
         signalled.push({ id: options.workflowId, signal: options.signal, args: options.signalArgs });
@@ -78,6 +82,7 @@ function fixture() {
   return {
     store, project, tokens, token, api, task, view, starts, terminated, signalled,
     setLiveView(view?: TaskView) { liveViewOverride = view; },
+    setGracefulResult(result?: () => Promise<unknown>) { gracefulResult = result; },
   };
 }
 
@@ -167,6 +172,32 @@ describe('task stage transitions', () => {
     expect(f.starts[0]!.options.args[0].recovery.humanWait).toEqual({
       audience: ['@creator'], detail: 'Approve the release window',
     });
+  });
+
+  it('interlocks a graceful old-run shutdown until its replacement is durable', async () => {
+    const f = fixture();
+    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
+    f.store.updateTaskParams(f.task.id, { ...f.task.params, _workflowRunId: 'old-run' });
+    let markedRun: string | undefined;
+    f.setGracefulResult(async () => {
+      const raw = f.store.kvGet(lifecycleReplacementKey(f.task.id));
+      markedRun = raw ? JSON.parse(raw).runId : undefined;
+      return { stage: 'cancelled' };
+    });
+
+    await f.api.escalateToHuman(f.token, {
+      taskId: f.task.id,
+      audience: ['@creator'],
+      message: 'Choose a direction',
+    });
+
+    expect(markedRun).toBe('old-run');
+    expect(f.store.kvGet(lifecycleReplacementKey(f.task.id))).toBeUndefined();
+    expect(f.terminated).toEqual([]);
+    expect(f.signalled).toContainEqual(expect.objectContaining({
+      id: f.task.id,
+      signal: 'prepareLifecycleReplacement',
+    }));
   });
 
   it('advertises human hold, destructive Draft, and reversible Done before Jayadratha', async () => {

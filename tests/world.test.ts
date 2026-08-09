@@ -11,6 +11,7 @@ import { Store } from '../src/store/db.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { ApplicationFailure } from '@temporalio/common';
+import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -92,6 +93,47 @@ describe('WorktreeProvider (real git)', () => {
       } as any);
       expect(parked).toBe(true);
       expect(store.worldState(task.id)).toBe('parked');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('does not publish the old run as cancelled during a lifecycle replacement', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Replacement', {});
+    const task = store.createTask({ projectId: project.id, title: 'Still alive', workflow: 'software-dev',
+      workflowVersion: '1.22.0', params: { prompt: 'x' } as any });
+    const active = {
+      taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'do', status: 'active',
+      messages: [], actions: [], state: {}, updatedAt: 1,
+    } as any;
+    store.saveView(task.id, active);
+    store.appendEvent({ taskId: task.id, type: 'agent.output', ts: 1, payload: { text: 'preserve me' } });
+    store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({ requestedAt: Date.now() }));
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+
+    try {
+      await core.publishView(task.id, {
+        ...active, stage: 'cancelled', status: 'cancelled',
+        state: { cancelled: true, cancelledFrom: 'do' }, updatedAt: 2,
+      });
+
+      expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'do', status: 'active' });
+      expect(store.getTask(task.id)?.params.archived).not.toBe(true);
+      expect(store.eventsSince(task.id, 0)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'agent.output', payload: { text: 'preserve me' } }),
+      ]));
+      expect(store.eventsSince(task.id, 0).some((event) =>
+        event.type === 'view.updated' && event.payload.status === 'cancelled')).toBe(false);
+
+      // A real cancellation has no replacement marker and remains terminal.
+      store.kvDelete(lifecycleReplacementKey(task.id));
+      await core.publishView(task.id, {
+        ...active, stage: 'cancelled', status: 'cancelled',
+        state: { cancelled: true, cancelledFrom: 'do' }, updatedAt: 3,
+      });
+      expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'cancelled', status: 'cancelled' });
     } finally {
       store.close();
     }
