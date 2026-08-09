@@ -211,12 +211,22 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     });
     const atReview = await poll(task.id, 'review'); // awaiting review → status waiting
     expect(atReview.status).toBe('waiting');
-    // archiving a live/awaiting-review task is allowed — it only hides, execution continues
-    const liveArchive = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
+    // Add a sibling Draft and archive through that non-principal attempt. Archive
+    // belongs to the logical task: the projected principal and every sibling must
+    // move together or the task appears in the wrong list section.
+    const draftAttempt = await post(`/api/tasks/${task.id}/attempts`, {});
+    const liveArchive = await fetch(`${base}/api/tasks/${draftAttempt.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
     expect(liveArchive.status).toBe(200);
     // hidden from the default list while still live
     const hiddenWhileLive = await get(`/api/projects/${projectId}/tasks`);
     expect(hiddenWhileLive.find((t: any) => t.id === task.id)).toBeUndefined();
+    const archivedWhileLive = await get(`/api/projects/${projectId}/tasks?includeArchived=1`);
+    expect(archivedWhileLive.find((t: any) => t.id === task.id)?.params.archived).toBe(true);
+    const activeSearch = await get(`/api/projects/${projectId}/search?q=${encodeURIComponent('-is:archived')}`);
+    expect(activeSearch.tasks.find((t: any) => t.id === task.id)).toBeUndefined();
+    const archivedSearch = await get(`/api/projects/${projectId}/search?q=${encodeURIComponent('is:archived')}`);
+    expect(archivedSearch.tasks.find((t: any) => t.id === task.id)?.params.archived).toBe(true);
+    expect((await get(`/api/tasks/${task.id}/attempts`)).attempts.every((attempt: any) => attempt.params.archived === true)).toBe(true);
     // un-archive so we can finish it, then archive the finished task
     await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: false }) });
     await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm' });

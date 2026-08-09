@@ -2947,10 +2947,12 @@ export class Gateway {
         if (!t) return this.json(res, 404, { error: 'no such task' });
         const archived = b.archived !== false; // default: archive
         // Archiving only hides from the default list; it never touches the task's
-        // execution. Any task can be archived/un-archived regardless of status —
-        // a running task keeps running while hidden, and the built-in `is:archived`
+        // execution. It applies to the logical task, not just the selected attempt:
+        // list/search project one principal row, so divergent sibling flags would
+        // make the task appear in the wrong section after principal re-election.
+        // A running task keeps running while hidden, and the built-in `is:archived`
         // view (or `includeArchived=1`) brings it back into view at any time.
-        store.updateTaskParams(archiveMatch[1]!, { ...t.params, archived });
+        store.setTaskArchived(archiveMatch[1]!, archived);
         return this.json(res, 200, { ok: true, archived });
       }
       const notesMatch = p.match(/^\/api\/tasks\/([^/]+)\/notes$/);
