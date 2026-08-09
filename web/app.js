@@ -423,6 +423,24 @@ async function applyRoute() {
     await loadTasks().catch(() => {});
     if (!routeIsCurrent()) return;
   }
+  // Returning from a task to the same list is a local navigation. Its complete
+  // last-painted data is still in memory, so reveal it before refreshing tags,
+  // views, fields, and the authoritative search result. Previously `u` appeared
+  // ignored until all four requests completed on a busy/remote host. Restrict the
+  // optimistic paint to the exact same project + query: cross-project and changed-
+  // query routes still wait rather than flashing unrelated results.
+  const incomingListQuery = r.q || '';
+  const canPaintCachedList = tab === 'tasks'
+    && !r.taskKey
+    && pid === S.projectId
+    && incomingListQuery === S.search
+    && S.orgProjectId === pid;
+  if (canPaintCachedList) {
+    S.tab = tab;
+    closeTaskDom();
+    renderRail();
+    renderMain();
+  }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
@@ -438,7 +456,7 @@ async function applyRoute() {
   if (tab === 'tasks' && !taskId) {
     // The list is query-driven and the URL owns the query: a pasted, bookmarked,
     // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
-    S.search = r.q || '';
+    S.search = incomingListQuery;
     await runSearch().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -2049,6 +2067,10 @@ async function boot() {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
     S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
+    // The boot catalog is already scoped to the selected project's organization.
+    // Mark it as such so the first route reconciliation does not immediately fetch
+    // the same schema + model catalog again before it can paint.
+    S.catalogOrganizationId = S.organizationId;
     if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
   connectWs();
@@ -2880,6 +2902,9 @@ function scheduleTaskPageRender() {
 function renderMain() {
   const main = $('#main');
   if (!main) return;
+  // A preload begun on the task list must not survive a trip through settings,
+  // where the defaults it captured may have just been edited.
+  if (S.tab !== 'tasks') taskFormDefaultRequests.clear();
   // A task page owns #main while a task is open. Background list refreshes land
   // here (WS-driven refreshTasks) — repaint the page from the freshest state
   // instead of the list. S.view is null for a repeatable series (its config page
@@ -3965,6 +3990,14 @@ function wireTasksView() {
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
+  // Hide the defaultBranch/settings round-trip behind the time the user spends
+  // reading or typing in the quick composer. Changing the workflow starts the
+  // corresponding one-shot preload as well.
+  const quickWorkflow = $('#new-wf');
+  if (quickWorkflow) {
+    requestTaskFormDefaults(S.projectId, quickWorkflow.value);
+    quickWorkflow.addEventListener('change', () => requestTaskFormDefaults(S.projectId, quickWorkflow.value));
+  }
   // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
   applyCursor();
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
@@ -4278,6 +4311,41 @@ function initialTaskFormSavedSignature(draft, seedText, signature) {
   return draft || !seedText ? signature : null;
 }
 
+// Resolving task defaults can invoke defaultBranch on the server (a git
+// subprocess), so begin it while the quick composer is merely visible. The map
+// holds only a one-shot request: opening the form consumes and removes it, which
+// avoids retaining stale settings after the user edits defaults elsewhere.
+const taskFormDefaultRequests = new Map();
+function taskFormDefaultsKey(projectId, workflow) { return `${projectId}\u0000${workflow}`; }
+function requestTaskFormDefaults(projectId, workflow) {
+  const key = taskFormDefaultsKey(projectId, workflow);
+  let request = taskFormDefaultRequests.get(key);
+  if (!request) {
+    request = api(`/api/defaults/${projectId}/${workflow}`)
+      .then((result) => result?.task?.inherited || {})
+      .catch(() => ({}));
+    taskFormDefaultRequests.set(key, request);
+  }
+  return request;
+}
+async function consumeTaskFormDefaults(projectId, workflow) {
+  const key = taskFormDefaultsKey(projectId, workflow);
+  const request = requestTaskFormDefaults(projectId, workflow);
+  try { return await request; }
+  finally { if (taskFormDefaultRequests.get(key) === request) taskFormDefaultRequests.delete(key); }
+}
+
+function taskFormLoadingPage(project, draft) {
+  return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
+    <div class="tf-head"><div class="tf-head-inner">
+      <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+      <h2>${draft ? 'Edit task' : 'New task'}</h2>
+      ${project ? `<span class="tf-crumb">in ${esc(project.name)}</span>` : ''}
+    </div></div>
+    <div class="tf-loading" role="status"><span class="global-search-loading">Loading task form…</span></div>
+  </div>`;
+}
+
 // Identity of the task form currently mounted in the overlay. Opening a new form
 // bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
 // tell it has been superseded and bail — otherwise its timer fires against the new
@@ -4306,8 +4374,17 @@ async function openTaskForm(workflow, draft, seedText) {
   if (seedText) {
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
-  let inherited = {};
-  try { inherited = (await api(`/api/defaults/${projectId}/${wf}`)).task.inherited; } catch {}
+  const root = $('#overlay-root');
+  const proj = S.projects.find((p) => p.id === projectId);
+  // A keypress must always have an immediate visible result, even if the VPS is
+  // currently slow. Usually the prefetched defaults below are already resolved
+  // and this loading page never reaches a paint; otherwise it provides instant
+  // feedback while keeping the not-yet-hydrated controls safely non-interactive.
+  root.innerHTML = taskFormLoadingPage(proj, draft);
+  $('#tf-close').addEventListener('click', () => {
+    if (activeFormToken === formToken) activeFormToken = null;
+    root.innerHTML = '';
+  });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
   const storedAuthorization = draft?.params?._authorization || {};
@@ -4319,16 +4396,21 @@ async function openTaskForm(workflow, draft, seedText) {
   // A draft can open directly from the list, without its task page having loaded
   // the intent. Fetch the group so the shared confirmer freezes after any sibling
   // queues, while remaining editable (and propagated) when every sibling is a draft.
-  let formAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
-  if (draft?.id && !formAttemptGroup) {
-    try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
-  }
-  const root = $('#overlay-root');
+  const cachedAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
+  const attemptGroupRequest = draft?.id && !cachedAttemptGroup
+    ? api(`/api/tasks/${draft.id}/attempts`).catch(() => null)
+    : Promise.resolve(cachedAttemptGroup);
+  const [inherited, formAttemptGroup] = await Promise.all([
+    consumeTaskFormDefaults(projectId, wf),
+    attemptGroupRequest,
+  ]);
+  // The user may have dismissed the loading page or navigated while either
+  // request was in flight. Never let a late response reopen the old form.
+  if (activeFormToken !== formToken) return;
   // Rendered as a full PAGE (GitHub-issue-creation style), not a dialog: the big
   // prompt editor + workflow parameters fill the main column; organization
   // metadata (priority/tags, authorization, attempts, notes) lives in a sidebar.
   // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
-  const proj = S.projects.find((p) => p.id === projectId);
   const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
   root.innerHTML = `
     <div class="task-form-page" id="tf-page" tabindex="-1">

@@ -93,6 +93,24 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   ok(S.search === 'tag:bug sort:priority-desc', 'the list query comes from the URL, not from memory');
   ok(S.cursorId === 't_new', 'same-project navigation preserves the roving cursor');
 
+  // Returning from a task must reveal the already-loaded same-project list before
+  // a slow authoritative search finishes. This is the perceived-latency contract
+  // for the `u` shortcut: navigation feedback is local, freshness follows async.
+  calls = [];
+  S.selected = 't_new';
+  S.orgProjectId = 'B';
+  let finishSearch;
+  global.runSearch = () => { calls.push('runSearch:pending'); return new Promise((resolve) => { finishSearch = resolve; }); };
+  const returning = applyRoute();
+  await new Promise((resolve) => setImmediate(resolve));
+  ok(calls.includes('closeTaskDom'), 'same-list return closes the task before the refresh finishes');
+  ok(calls.indexOf('renderMain') >= 0 && calls.indexOf('renderMain') < calls.indexOf('runSearch:pending'),
+    'same-list return paints cached results before awaiting search');
+  finishSearch();
+  await returning;
+  S.selected = null;
+  global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
+
   // A task permalink carries no ?q= (it is about the task): it must leave the
   // working query alone so closing the task returns to the same filtered list.
   global.parseRoute = () => ({ name: 'project', slug: 'b', tab: 'tasks', taskKey: '7', q: '' });

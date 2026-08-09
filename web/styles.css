@@ -545,6 +545,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
 .tf-head select { flex: none; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 9px; font-weight: 550; }
 .tf-scroll { flex: 1; overflow-y: auto; }
+.tf-loading { flex: 1; display: grid; place-items: center; color: var(--ink-3); }
 .tf-columns {
   padding-top: 26px; padding-bottom: 56px;
   display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px 44px;
