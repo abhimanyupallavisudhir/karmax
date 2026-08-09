@@ -668,6 +668,45 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, since: { type: 'number' } }, required: ['task_id'] },
   },
   {
+    name: 'list_github_actions_runs',
+    description: 'List GitHub Actions workflow runs for a repository attached to this task’s project. Omit repository only when the project has one attached GitHub repository.',
+    parameters: {
+      type: 'object',
+      properties: {
+        repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
+        branch: { type: 'string' }, event: { type: 'string' },
+        status: { type: 'string', enum: ['completed', 'action_required', 'cancelled', 'failure', 'neutral', 'skipped', 'stale', 'success', 'timed_out', 'in_progress', 'queued', 'requested', 'waiting', 'pending'] },
+        workflow: { description: 'Numeric workflow id or file name such as deploy.yml.', anyOf: [{ type: 'string' }, { type: 'number' }] },
+        page: { type: 'number' }, per_page: { type: 'number' },
+      },
+    },
+  },
+  {
+    name: 'inspect_github_actions_run',
+    description: 'Inspect one Actions run, including failed jobs/steps, bounded log excerpts, and artifact metadata. GitHub credentials and signed log URLs never enter the task world.',
+    parameters: { type: 'object', properties: {
+      repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
+      run_id: { type: 'number' },
+    }, required: ['run_id'] },
+  },
+  {
+    name: 'manage_github_actions_run',
+    description: 'Rerun failed jobs, rerun a whole run, or cancel a run. Requires github:actions:write; request that exact capability if the task lacks it.',
+    parameters: { type: 'object', properties: {
+      repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
+      run_id: { type: 'number' }, action: { type: 'string', enum: ['rerun-failed', 'rerun', 'cancel'] },
+    }, required: ['run_id', 'action'] },
+  },
+  {
+    name: 'dispatch_github_actions_workflow',
+    description: 'Dispatch an Actions workflow on a ref. Requires github:actions:write; request that exact capability if the task lacks it.',
+    parameters: { type: 'object', properties: {
+      repository: { type: 'string', description: 'Attached repository id, name, or owner/name.' },
+      workflow: { description: 'Numeric workflow id or file name such as deploy.yml.', anyOf: [{ type: 'string' }, { type: 'number' }] },
+      ref: { type: 'string' }, inputs: { type: 'object', additionalProperties: { anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }] } },
+    }, required: ['workflow', 'ref'] },
+  },
+  {
     name: 'describe_platform',
     description: 'Describe the complete administrative API exposed by platform_request.',
     parameters: { type: 'object', properties: {} },
@@ -1148,6 +1187,29 @@ export function platformToolHandlers(
     },
     async list_events(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/events?since=${Number(args?.since ?? 0)}`));
+    },
+    async list_github_actions_runs(args) {
+      const query = new URLSearchParams();
+      for (const [key, value] of [['repository', args?.repository], ['branch', args?.branch], ['event', args?.event],
+        ['status', args?.status], ['workflow', args?.workflow], ['page', args?.page], ['perPage', args?.per_page]] as const) {
+        if (value !== undefined && value !== null && String(value) !== '') query.set(key, String(value));
+      }
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs?${query}`));
+    },
+    async inspect_github_actions_run(args) {
+      const repository = args?.repository ? `?repository=${encodeURIComponent(String(args.repository))}` : '';
+      return JSON.stringify(await platformRequest('GET', `/api/agent/github/actions/runs/${Number(args?.run_id)}${repository}`));
+    },
+    async manage_github_actions_run(args) {
+      return JSON.stringify(await platformRequest('POST', `/api/agent/github/actions/runs/${Number(args?.run_id)}`, {
+        repository: args?.repository ? String(args.repository) : undefined, action: String(args?.action ?? ''),
+      }));
+    },
+    async dispatch_github_actions_workflow(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/github/actions/dispatch', {
+        repository: args?.repository ? String(args.repository) : undefined,
+        workflow: args?.workflow, ref: String(args?.ref ?? ''), inputs: args?.inputs,
+      }));
     },
     async describe_platform() {
       return JSON.stringify(PLATFORM_API_CATALOG);

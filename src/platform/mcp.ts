@@ -58,6 +58,12 @@ export interface PlatformOps {
   getConversation(taskId: string, role?: string): Promise<unknown>;
   forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
+  listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
+    workflow?: string | number; page?: number; perPage?: number }): Promise<unknown>;
+  inspectGithubActionsRun(a: { repository?: string; runId: number }): Promise<unknown>;
+  manageGithubActionsRun(a: { repository?: string; runId: number; action: 'rerun-failed' | 'rerun' | 'cancel' }): Promise<unknown>;
+  dispatchGithubActionsWorkflow(a: { repository?: string; workflow: string | number; ref: string;
+    inputs?: Record<string, string | number | boolean> }): Promise<unknown>;
   publishTaskBranch(): Promise<unknown>;
   importTaskBranch(sourceTaskId: string): Promise<unknown>;
   refreshUpstream(branch?: string): Promise<unknown>;
@@ -119,6 +125,10 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     getConversation: (id, role) => api.taskConversation(getToken(), id, role),
     forkAgent: (a) => api.forkTaskAgent(getToken(), a),
     listEvents: (id, since) => api.taskEvents(getToken(), id, since),
+    listGithubActionsRuns: (a) => api.listGithubActionsRuns(getToken(), a as any),
+    inspectGithubActionsRun: (a) => api.inspectGithubActionsRun(getToken(), a),
+    manageGithubActionsRun: (a) => api.manageGithubActionsRun(getToken(), a),
+    dispatchGithubActionsWorkflow: (a) => api.dispatchGithubActionsWorkflow(getToken(), a),
     publishTaskBranch: () => api.publishTaskBranch(getToken()),
     importTaskBranch: (sourceTaskId) => api.importTaskBranch(getToken(), sourceTaskId),
     refreshUpstream: (branch) => api.refreshUpstream(getToken(), branch),
@@ -205,6 +215,24 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     getConversation: (id, role) => req(`/api/tasks/${id}/conversation${role ? `?role=${encodeURIComponent(role)}` : ''}`),
     forkAgent: (a) => req(`/api/tasks/${a.taskId}/fork-agent`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
     listEvents: (id, since = 0) => req(`/api/tasks/${id}/events?since=${since}`),
+    listGithubActionsRuns: (a) => {
+      const query = new URLSearchParams();
+      if (a.repository) query.set('repository', a.repository);
+      if (a.branch) query.set('branch', a.branch);
+      if (a.event) query.set('event', a.event);
+      if (a.status) query.set('status', a.status);
+      if (a.workflow !== undefined) query.set('workflow', String(a.workflow));
+      if (a.page !== undefined) query.set('page', String(a.page));
+      if (a.perPage !== undefined) query.set('perPage', String(a.perPage));
+      return req(`/api/agent/github/actions/runs?${query}`);
+    },
+    inspectGithubActionsRun: (a) => req(`/api/agent/github/actions/runs/${a.runId}${a.repository ? `?repository=${encodeURIComponent(a.repository)}` : ''}`),
+    manageGithubActionsRun: (a) => req(`/api/agent/github/actions/runs/${a.runId}`, {
+      method: 'POST', body: JSON.stringify({ repository: a.repository, action: a.action }),
+    }),
+    dispatchGithubActionsWorkflow: (a) => req('/api/agent/github/actions/dispatch', {
+      method: 'POST', body: JSON.stringify(a),
+    }),
     publishTaskBranch: () => req('/api/agent/git/publish', { method: 'POST', body: '{}' }),
     importTaskBranch: (sourceTaskId) => req('/api/agent/git/import', { method: 'POST', body: JSON.stringify({ sourceTaskId }) }),
     refreshUpstream: (branch) => req('/api/agent/git/refresh-upstream', { method: 'POST', body: JSON.stringify({ branch }) }),
@@ -440,6 +468,29 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     async (a) => wrap(() => ops.requestAgentAction(a)),
   );
   server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
+  server.registerTool('list_github_actions_runs', {
+    description: 'List GitHub Actions workflow runs for a repository attached to the calling task’s project. The GitHub credential remains in the control plane.',
+    inputSchema: {
+      repository: z.string().optional(), branch: z.string().optional(), event: z.string().optional(),
+      status: z.enum(['completed', 'action_required', 'cancelled', 'failure', 'neutral', 'skipped', 'stale',
+        'success', 'timed_out', 'in_progress', 'queued', 'requested', 'waiting', 'pending']).optional(),
+      workflow: z.union([z.string(), z.number().int().positive()]).optional(),
+      page: z.number().int().min(1).max(1000).optional(), perPage: z.number().int().min(1).max(100).optional(),
+    },
+  }, async (a) => wrap(() => ops.listGithubActionsRuns(a)));
+  server.registerTool('inspect_github_actions_run', {
+    description: 'Inspect one GitHub Actions run, its jobs, failed steps, bounded diagnostic log excerpts, and artifact metadata. Signed log URLs and GitHub tokens are never returned.',
+    inputSchema: { repository: z.string().optional(), runId: z.number().int().positive() },
+  }, async (a) => wrap(() => ops.inspectGithubActionsRun(a)));
+  server.registerTool('manage_github_actions_run', {
+    description: 'Rerun failed jobs, rerun an entire run, or cancel a run in a repository attached to this task’s project. Requires separately approved GitHub Actions write authority.',
+    inputSchema: { repository: z.string().optional(), runId: z.number().int().positive(), action: z.enum(['rerun-failed', 'rerun', 'cancel']) },
+  }, async (a) => wrap(() => ops.manageGithubActionsRun(a)));
+  server.registerTool('dispatch_github_actions_workflow', {
+    description: 'Dispatch a workflow on a ref in a repository attached to this task’s project. Requires separately approved GitHub Actions write authority.',
+    inputSchema: { repository: z.string().optional(), workflow: z.union([z.string(), z.number().int().positive()]),
+      ref: z.string(), inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional() },
+  }, async (a) => wrap(() => ops.dispatchGithubActionsWorkflow(a)));
   server.registerTool('publish_task_branch', {
     description: 'Publish this task’s clean, committed branch through Karmax’s trusted Git broker so another agent can import it.', inputSchema: {},
   }, async () => wrap(() => ops.publishTaskBranch()));

@@ -239,6 +239,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (p.startsWith('/api/agent/github/actions')) return read ? 'github:actions:read' : 'github:actions:write';
   if (p === '/api/agent/resource-candidates') return 'task:review:write';
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
@@ -3027,6 +3028,47 @@ export class Gateway {
       if (p === '/api/agent/git/publish' && method === 'POST') {
         try { return this.json(res, 200, await api.publishTaskBranch(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/github/actions/runs' && method === 'GET') {
+        try {
+          return this.json(res, 200, await api.listGithubActionsRuns(token, {
+            repository: url.searchParams.get('repository') ?? undefined,
+            branch: url.searchParams.get('branch') ?? undefined,
+            event: url.searchParams.get('event') ?? undefined,
+            status: (url.searchParams.get('status') as any) ?? undefined,
+            workflow: url.searchParams.get('workflow') ?? undefined,
+            page: url.searchParams.has('page') ? Number(url.searchParams.get('page')) : undefined,
+            perPage: url.searchParams.has('perPage') ? Number(url.searchParams.get('perPage')) : undefined,
+          }));
+        } catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const githubActionsRun = p.match(/^\/api\/agent\/github\/actions\/runs\/(\d+)$/);
+      if (githubActionsRun && method === 'GET') {
+        try { return this.json(res, 200, await api.inspectGithubActionsRun(token, {
+          repository: url.searchParams.get('repository') ?? undefined, runId: Number(githubActionsRun[1]),
+        })); }
+        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (githubActionsRun && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.manageGithubActionsRun(token, {
+          repository: b.repository ? String(b.repository) : undefined, runId: Number(githubActionsRun[1]),
+          action: String(b.action ?? '') as any,
+        })); }
+        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/github/actions/dispatch' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.dispatchGithubActionsWorkflow(token, {
+          repository: b.repository ? String(b.repository) : undefined,
+          workflow: typeof b.workflow === 'number' ? b.workflow : String(b.workflow ?? ''),
+          ref: String(b.ref ?? ''), inputs: b.inputs && typeof b.inputs === 'object' && !Array.isArray(b.inputs) ? b.inputs : undefined,
+        })); }
+        catch (error) { return this.json(res, Number((error as any)?.status ?? 409),
+          { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/git/import' && method === 'POST') {
         const b = await this.body(req);
