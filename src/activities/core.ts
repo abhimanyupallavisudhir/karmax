@@ -1319,6 +1319,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         scope?: 'projects' | 'organization' | 'global';
         projectIds?: string[];
         organizationId?: string;
+        delegationId?: string;
       } | undefined;
       const grant = [...new Set([
         ...(storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT),
@@ -1347,6 +1348,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           audience: 'karmax-platform',
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           worldGeneration: args.worldHandle.generation,
+          delegationId: storedAuthorization?.delegationId ?? args.task.delegationId,
           ceiling,
           grantorCaps: grant,
         });
@@ -3700,7 +3702,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async prepareChildTask(args: PrepareChildArgs): Promise<TaskInput> {
       const parent = store.getTask(args.parentTaskId);
-      const child = store.createTask({
+      let child = store.createTask({
         projectId: args.projectId,
         listId: parent?.listId,
         title: args.title,
@@ -3728,10 +3730,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ? [`merge-into:${args.parentBranch}`]
         : [];
       const grant = [...delegation, ...mergeBack];
+      const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
+      const humanDelegation = parentAuthorization?.delegationId && deps.tokens
+        ? deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, {
+            taskId: child.id, projectId: args.projectId,
+            organizationId: store.getProject(args.projectId)?.organizationId,
+          })
+        : undefined;
       store.updateTaskParams(child.id, {
         ...child.params,
-        _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`, capabilities: grant, attenuated: true },
+        _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`,
+          capabilities: grant, attenuated: true, ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
+        ...(humanDelegation?.externalIdentities?.githubAccountId
+          ? { _githubAccountId: humanDelegation.externalIdentities.githubAccountId } : {}),
       });
+      child = store.getTask(child.id)!;
       return {
         taskId: child.id,
         projectId: args.projectId,
@@ -3745,6 +3758,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         resolveAgentEnabled: args.resolveAgentEnabled,
         grant,
         grantPrincipal: `task:${args.parentTaskId}`,
+        delegationId: humanDelegation?.id,
         authorizationProfile: 'inherited-child',
       };
     },
