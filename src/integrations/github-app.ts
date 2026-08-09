@@ -688,16 +688,25 @@ export class GitHubAppService {
   }, options: { accountId?: string } = {}): Promise<Repository> {
     const connection = this.store.getGitConnection(connectionId);
     if (!connection) throw new Error('GitHub connection not found');
+    const accounts = await this.listUserAccounts(userId);
+    const account = options.accountId
+      ? accounts.find((candidate) => candidate.id === options.accountId)
+      : accounts.find((candidate) => candidate.active) ?? accounts[0];
+    if (!account) throw new Error('GitHub account is not connected for this user');
+    // A personal installation can create only in its own account. Check before
+    // POST /user/repos so a mismatched delegated account cannot create a repo and
+    // then fail later while enrolling it into somebody else's installation.
+    if (connection.accountType === 'User' && account.login.toLowerCase() !== connection.accountLogin.toLowerCase())
+      throw new Error('selected GitHub account does not match this GitHub App connection');
     const name = this.repositoryName(input.name);
     const pathname = connection.accountType === 'Organization'
       ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
       : '/user/repos';
-    if (options.accountId) await this.assertUserAccount(userId, options.accountId);
     const created = await this.userRequest<GitHubRepositoryPayload>(userId, pathname, {
       method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
         private: input.private !== false, auto_init: input.autoInit !== false }),
-    }, options.accountId);
-    return this.enrollRepository(connection, userId, created, input.defaultBranch, options.accountId);
+    }, account.id);
+    return this.enrollRepository(connection, userId, created, input.defaultBranch, account.id);
   }
 
   /** Idempotently provision a platform-owned repository. A previous attempt can

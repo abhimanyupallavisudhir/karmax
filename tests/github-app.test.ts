@@ -42,8 +42,10 @@ describe('GitHub App integration', () => {
     const store = new Store(':memory:');
     const broker = new CredentialBroker(new Vault(dir));
     broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const calls: Array<{ path: string; method: string }> = [];
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
+      calls.push({ path: url.pathname, method: init.method ?? 'GET' });
       if (url.pathname === '/login/oauth/access_token') {
         const code = new URLSearchParams(String(init.body)).get('code');
         return Response.json({ access_token: code === 'second' ? 'token-2' : 'token-1' });
@@ -63,6 +65,14 @@ describe('GitHub App integration', () => {
       expect.objectContaining({ id: '2', login: 'second', active: true }),
     ]);
     await service.setActiveUserAccount('owner', '1');
+    const organization = store.createOrganization({ name: 'Personal', ownerUserId: 'owner' });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'first', accountType: 'User' });
+    await expect(service.createRepository(connection.id, 'owner', { name: 'not-owned' }, { accountId: '999' }))
+      .rejects.toThrow('GitHub account is not connected for this user');
+    await expect(service.createRepository(connection.id, 'owner', { name: 'wrong-owner' }, { accountId: '2' }))
+      .rejects.toThrow('selected GitHub account does not match this GitHub App connection');
+    expect(calls).not.toContainEqual({ path: '/user/repos', method: 'POST' });
     expect(service.activeUserAccountId('owner')).toBe('1');
     expect(await service.removeUserAccount('owner', '2')).toBe('1');
     await expect(service.removeUserAccount('owner', '1')).rejects.toThrow('Connect a new GitHub account first');
@@ -202,6 +212,7 @@ describe('GitHub App integration', () => {
     const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = new URL(String(input));
       calls.push({ path: url.pathname, method: init.method ?? 'GET' });
+      if (url.pathname === '/user') return Response.json({ id: 1, login: 'owner' });
       if (url.pathname === '/repos/acme/project-wiki' && init.method !== 'POST') return Response.json(payload);
       if (url.pathname === '/repos/acme/public-wiki' && init.method !== 'POST')
         return Response.json({ ...payload, id: 78, name: 'public-wiki', private: false,
