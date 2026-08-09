@@ -5,7 +5,7 @@ const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 
 function extractFn(name) {
-  const start = src.search(new RegExp(`^function ${name}\\(`, 'm'));
+  const start = src.search(new RegExp(`^(?:async )?function ${name}\\(`, 'm'));
   if (start < 0) throw new Error(`${name} not found`);
   let parens = 0;
   let open = -1;
@@ -126,6 +126,11 @@ ok(html.includes('<span>2 unread</span>'), 'the All toolbar count excludes routi
 // Behaviour lives in one place — the profile — not next to the list it affects.
 ok(html.includes(`href="/profile#notifications"`), 'the panel points at the user-scoped notification settings');
 ok(!html.includes('id="save-delivery"'), 'delivery preferences are no longer configured from the list');
+
+const openItem = extractFn('openInboxItem');
+ok(!openItem.includes('await loadTasks'), 'opening an inbox task does not preload its project before navigation');
+ok(openItem.indexOf('markInboxItemReadLocally(item)') < openItem.indexOf('return go('),
+  'opening an inbox task updates bookkeeping locally and navigates immediately');
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

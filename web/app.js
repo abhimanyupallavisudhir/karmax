@@ -75,6 +75,7 @@ const S = {
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
+  searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
@@ -308,6 +309,18 @@ async function resolveProjectTaskKey(projectId, key) {
   return local ? local.id : key; // raw-id fallback
 }
 
+// Cross-project/organization navigation may genuinely need data that is not in
+// memory. It still owns the main cell synchronously, so the previous page never
+// masquerades as an ignored click while those requests run.
+function renderRouteLoadingPage(title, label = 'Loading…') {
+  const main = $('#main');
+  if (!main) return;
+  main.innerHTML = `<div class="route-loading" role="status" aria-busy="true">
+    <b>${esc(title || 'Opening')}</b>
+    <span class="global-search-loading">${esc(label)}</span>
+  </div>`;
+}
+
 async function applyRoute() {
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
@@ -342,6 +355,7 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        renderRouteLoadingPage(org.name, 'Switching organization…');
       }
       syncOrganizationSwitcher();
       if (organizationChanged) {
@@ -397,6 +411,13 @@ async function applyRoute() {
     return go(dest, { replace: true });
   }
   const pid = proj.id;
+  const sameProject = pid === S.projectId;
+  const selectedRecord = taskRecord(S.selected);
+  const selectedKey = selectedRecord && String(selectedRecord.num ?? selectedRecord.id);
+  if (r.taskKey && selectedKey !== String(r.taskKey))
+    renderRouteLoadingPage(`Task ${/^\d+$/.test(r.taskKey) ? `#${r.taskKey}` : ''}`.trim(), 'Loading task…');
+  else if (!r.taskKey && !sameProject)
+    renderRouteLoadingPage(proj.name, 'Loading project…');
   S.organizationId = proj.organizationId || S.organizationId;
   syncOrganizationSwitcher();
   if (S.organizationId !== previousOrganizationId) {
@@ -406,7 +427,7 @@ async function applyRoute() {
   await loadOrganizationRuntimeCatalog();
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
-  if (pid !== S.projectId) {
+  if (!sameProject) {
     // Switching projects: drop the previous project's per-project view state so
     // its query/roving-cursor/search-result can't bleed into the new project
     // (they'd otherwise re-run the old query against new data and highlight a
@@ -415,6 +436,7 @@ async function applyRoute() {
     S.projectId = pid;
     S.search = '';
     S.searchResult = null;
+    S.searchPending = false;
     S.cursorId = null;
     await loadTasks().catch(() => {});
     if (!routeIsCurrent()) return;
@@ -423,25 +445,34 @@ async function applyRoute() {
     await loadTasks().catch(() => {});
     if (!routeIsCurrent()) return;
   }
-  // Returning from a task to the same list is a local navigation. Its complete
-  // last-painted data is still in memory, so reveal it before refreshing tags,
-  // views, fields, and the authoritative search result. Previously `u` appeared
-  // ignored until all four requests completed on a busy/remote host. Restrict the
-  // optimistic paint to the exact same project + query: cross-project and changed-
-  // query routes still wait rather than flashing unrelated results.
+  // Same-project tabs are local navigation. Their complete last-painted inputs
+  // are already in memory, so reveal the destination before refreshing tags,
+  // views, fields, and (for the task list) the authoritative search result.
+  // A changed task-list query clears the previous server result and paints a
+  // labelled local preview instead of flashing unrelated rows.
   const incomingListQuery = r.q || '';
-  const canPaintCachedList = tab === 'tasks'
-    && !r.taskKey
-    && pid === S.projectId
-    && incomingListQuery === S.search
-    && S.orgProjectId === pid;
-  if (canPaintCachedList) {
+  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
+  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  if (canPaintCachedProject) {
     S.tab = tab;
     closeTaskDom();
+    if (tab === 'tasks' && incomingListQuery !== S.search) {
+      S.search = incomingListQuery;
+      S.searchResult = null;
+      S.searchFailed = false;
+      S.searchPending = true;
+    }
     renderRail();
     renderMain();
+    if (tab === 'activity') seedActivity();
+    if (tab === 'queue') seedQueue();
   }
-  await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  const organizationRefresh = loadOrg().catch(() => false); // tags / saved views / field registry
+  // A task page can open entirely from the loaded task record and paints its own
+  // loading state below. Do not put the metadata refresh back in front of it.
+  // First visits/cross-project routes still wait so they never render foreign tags.
+  if (!r.taskKey || !projectOrganizationLoaded) await organizationRefresh;
+  else organizationRefresh.then(() => { if (routeIsCurrent()) renderRail(); });
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
@@ -2293,6 +2324,7 @@ async function runSearch() {
   if (!projectId) return false;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
+  S.searchPending = true;
   try {
     const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
     if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
@@ -2309,13 +2341,16 @@ async function runSearch() {
     // session tombstones as loadTasks so that late response cannot restore its row.
     S.searchResult = filterDeletedFromSearchResult(r);
     S.searchFailed = false;
+    S.searchPending = false;
     return true;
   } catch {
     // Distinguish "the server couldn't evaluate this" from "nothing matched".
     // Without the flag the view falls back to a client-side filter and shows
     // "No matching tasks", so a server outage reads as a bad query and the user
     // edits a perfectly good one.
-    if (S.searchEpoch === epoch && S.projectId === projectId) { S.searchResult = null; S.searchFailed = true; }
+    if (S.searchEpoch === epoch && S.projectId === projectId) {
+      S.searchResult = null; S.searchFailed = true; S.searchPending = false;
+    }
     return false;
   }
 }
@@ -2334,7 +2369,13 @@ function syncQueryUrl() {
 let searchDebounce = null;
 function scheduleSearch() {
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(async () => { syncQueryUrl(); await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+  searchDebounce = setTimeout(async () => {
+    syncQueryUrl();
+    const search = runSearch();
+    if (S.tab === 'tasks') renderMain();
+    await search;
+    if (S.tab === 'tasks') renderMain();
+  }, 180);
 }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
@@ -2345,7 +2386,9 @@ async function setQuery(q) {
   const box = $('#task-search');
   if (box) box.value = S.search;
   syncQueryUrl();
-  await runSearch();
+  const search = runSearch();
+  if (S.tab === 'tasks') renderMain();
+  await search;
   if (S.tab === 'tasks') renderMain();
 }
 
@@ -3176,11 +3219,12 @@ function tasksView() {
     </div>
     <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="organizer">
-      <div class="search-box">
+      <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
       </div>
       ${viewsBar()}
       ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
@@ -3955,6 +3999,14 @@ function wireTasksView() {
     const images = S.newTaskImages || [];
     if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
+    const composer = input.closest('.composer');
+    if (composer?.classList.contains('busy')) return;
+    const setBusy = (busy) => {
+      composer?.classList.toggle('busy', busy);
+      composer?.setAttribute('aria-busy', String(busy));
+      composer?.querySelectorAll('button,select').forEach((control) => { control.disabled = busy; });
+    };
+    setBusy(true);
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
@@ -3967,6 +4019,8 @@ function wireTasksView() {
       await refreshTasks();
     } catch (e) {
       toast(e.message, true);
+    } finally {
+      if (composer?.isConnected) setBusy(false);
     }
   };
   $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
@@ -4875,6 +4929,27 @@ function defaultTaskTab(v) {
   return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
 }
 
+// Task navigation owns the main cell immediately. The compact view normally
+// arrives quickly, but under host load the old list/task used to remain visible
+// with no acknowledgement that the click had landed.
+function renderTaskLoadingPage(rec, error) {
+  const main = $('#main');
+  if (!main) return;
+  const title = rec?.title || 'Task';
+  main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
+    <div class="tp-head"><div class="row1">
+      <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+      ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
+      <h2>${esc(title)}</h2>
+    </div></div>
+    <div class="tf-loading" role="status">${error
+      ? `<div class="task-load-error"><b>Couldn’t load this task</b><span>${esc(error)}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
+      : '<span class="global-search-loading">Loading task…</span>'}</div>
+  </div>`;
+  $('#tp-back')?.addEventListener('click', closeTask);
+  $('#task-load-retry')?.addEventListener('click', () => openTask(rec?.id || S.selected, S.taskTab, !!S.viewingAttempt));
+}
+
 // The config page for a repeatable series: edit its parameters + triggers, see
 // its runs, and Run again. Saved via the same in-place path as a waiting task
 // (updateArmedParams) — the series never runs its own workflow, so there is no
@@ -4883,9 +4958,10 @@ async function renderSeriesPage(rec) {
   const wf = rec.workflow;
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = { ...rec.params };
-  let inherited = {};
-  try { inherited = (await api(`/api/defaults/${rec.projectId}/${wf}`)).task.inherited; } catch {}
-  const runs = await api(`/api/tasks/${rec.id}/runs`).catch(() => []);
+  const [inherited, runs] = await Promise.all([
+    consumeTaskFormDefaults(rec.projectId, wf),
+    api(`/api/tasks/${rec.id}/runs`).catch(() => []),
+  ]);
   const main = $('#main');
   if (!main || S.selected !== rec.id) return; // navigated away while fetching
   main.innerHTML = `
@@ -5046,14 +5122,14 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // A repeatable series has no running workflow — open the config page instead
   // (edit its parameters + triggers, see its runs, run again).
   const rec = taskRecord(taskId);
+  S.selected = taskId;
+  S.viewingAttempt = explicitAttempt ? taskId : null;
+  S.view = null;
+  renderTaskLoadingPage(rec);
   if (rec?.params?.repeatable) {
-    S.selected = taskId;
-    S.view = null;
     await renderSeriesPage(rec);
     return;
   }
-  S.selected = taskId;
-  S.viewingAttempt = explicitAttempt ? taskId : null;
   S.taskEvents = [];
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
@@ -5118,7 +5194,11 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.approvalRequests = approvalRequests;
     S.permissionRequests = permissionRequests;
     S.approvalItems = approvalItems;
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    if (S.selected === taskId) renderTaskLoadingPage(rec, e.message);
+    return;
+  }
   renderTaskPage();
   // Param defaults only feed the Parameters tab, and resolving them costs a git
   // subprocess (defaultBranch) on the server — so they used to add that latency to
@@ -5978,6 +6058,7 @@ function wireReviewActions(v) {
     btn.addEventListener('click', async () => {
       const idx = Number(btn.getAttribute('data-idx'));
       const kind = btn.getAttribute('data-kind');
+      btn.disabled = true;
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         if (kind === 'open') { openArtifact(r.url, r.external); return; }
@@ -6010,6 +6091,7 @@ function wireReviewActions(v) {
           r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
         }
       } catch (e) { toast(e.message, true); }
+      finally { if (btn.isConnected) btn.disabled = false; }
     });
   });
 }
@@ -6792,10 +6874,20 @@ function wireCheckinSidebar(v) {
 
 async function openLocalCheckout(v) {
   if (hostLocal()) return materializeLocalCheckout(v);
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
+  </div></div>`;
+  const wireClose = () => {
+    host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
+    host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  };
+  wireClose();
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
-  catch (error) { return toast(error.message, true); }
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  catch (error) { host.remove(); return toast(error.message, true); }
+  if (!host.isConnected) return;
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
@@ -6807,8 +6899,7 @@ async function openLocalCheckout(v) {
     <p class="task-sub">krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
     <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
   </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  wireClose();
   host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
     const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
   })));
@@ -6823,12 +6914,19 @@ async function openLocalCheckout(v) {
 }
 
 async function materializeLocalCheckout(v, session) {
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Materializing a local checkout…</span></div>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   let checkout;
   try {
     checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
-  } catch (error) { toast(error.message, true); return null; }
+  } catch (error) { host.remove(); toast(error.message, true); return null; }
+  if (!host.isConnected) return null;
   const fork = session ? forkCommandFor(session, checkout.cwd) : '';
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
     <p class="task-sub">krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
@@ -7542,6 +7640,9 @@ function wireFollowups(v) {
     const send = async () => {
       const text = ta.value.trim();
       if (!text && !store.length) return;
+      if (btn.disabled) return;
+      btn.disabled = true;
+      box.setAttribute('aria-busy', 'true');
       try {
         const result = await api(`/api/tasks/${v.taskId}/signal`, {
           method: 'POST',
@@ -7572,6 +7673,10 @@ function wireFollowups(v) {
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
+      finally {
+        if (btn.isConnected) btn.disabled = false;
+        if (box.isConnected) box.removeAttribute('aria-busy');
+      }
     };
     btn.addEventListener('click', send);
     // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances.
@@ -11885,14 +11990,14 @@ function playNotificationSound(urgency = 'normal') {
 async function openInboxItem(item) {
   if (!item?.task) return;
   if (item.unread) {
-    try {
-      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) });
-      markInboxItemReadLocally(item);
-    } catch {}
+    // Reading the notification is bookkeeping, not a prerequisite for opening
+    // its task. Update the badge locally and let the PATCH finish behind the
+    // navigation; restore unread state if it fails.
+    markInboxItemReadLocally(item);
+    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
+      .catch(() => { item.unread = true; updateBell(); });
   }
   const project = projectById(item.task.projectId); if (!project) return;
-  S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
-  await loadTasks().catch(() => {});
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
   return go(`${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
