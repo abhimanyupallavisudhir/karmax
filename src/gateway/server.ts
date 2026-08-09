@@ -10,6 +10,7 @@ import type { TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
+import { ConversationImportError, ConversationImportStore, MAX_CONVERSATION_IMPORT_BYTES } from '../agent/conversation-source.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
@@ -203,7 +204,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   }
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search/fields') return 'task:read';
-  if (p === '/api/attachments') return 'task:create';
+  if (p === '/api/attachments' || p === '/api/conversation-imports') return 'task:create';
   // Reading one back is a read of the task content it belongs to. The exact match
   // above does not cover `/api/attachments/:id`, which therefore fell through to the
   // conservative fallback — an implicit binding for a route that serves task bytes.
@@ -470,6 +471,7 @@ export class Gateway {
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
+  private conversationImports = new ConversationImportStore();
   private modelCatalog = new Map<string, { at: number; value: ModelCatalog }>();
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout: DurableEventFanout;
@@ -1410,8 +1412,10 @@ export class Gateway {
         this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
         store.deleteOrganization(organizationId);
-        for (const attachmentId of resources.attachmentIds)
-          if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+        for (const attachmentId of resources.attachmentIds) if (!store.attachmentIsScoped(attachmentId)) {
+          this.attachments.delete(attachmentId);
+          this.conversationImports.delete(attachmentId);
+        }
         return this.json(res, 200, { deleted: true, organizationId });
       }
       const identityPolicy = p.match(/^\/api\/organizations\/([^/]+)\/identity-policy$/);
@@ -1914,6 +1918,25 @@ export class Gateway {
         }
       }
 
+      // Codex / Claude conversation exports. Like image attachments, the bytes
+      // remain out of Temporal history; task params carry only a scoped hash.
+      if (p === '/api/conversation-imports' && method === 'POST') {
+        if (!requestedScope.projectId) return this.json(res, 400, { error: 'projectId is required' });
+        if (!store.getProject(requestedScope.projectId)) return this.json(res, 404, { error: 'project not found' });
+        try {
+          const filename = url.searchParams.get('filename') ?? 'conversation.jsonl';
+          const ref = this.conversationImports.put(
+            await this.rawBody(req, MAX_CONVERSATION_IMPORT_BYTES), filename,
+          );
+          store.grantAttachment(ref.id, requestedScope.projectId);
+          return this.json(res, 200, ref);
+        } catch (error) {
+          if (error instanceof ConversationImportError || error instanceof AttachmentError)
+            return this.json(res, 400, { error: error.message });
+          throw error;
+        }
+      }
+
       // projects
       if (p === '/api/projects' && method === 'GET') {
         const projects = store.listProjects();
@@ -1971,8 +1994,10 @@ export class Gateway {
           if (!store.getProject(id)) return this.json(res, 404, { error: 'project not found' });
           const resources = await this.removeProjectExternalResources(id, 'project deleted');
           store.deleteProject(id);
-          for (const attachmentId of resources.attachmentIds)
-            if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+          for (const attachmentId of resources.attachmentIds) if (!store.attachmentIsScoped(attachmentId)) {
+            this.attachments.delete(attachmentId);
+            this.conversationImports.delete(attachmentId);
+          }
           return this.json(res, 200, { deleted: true, projectId: id });
         }
       }
@@ -3375,9 +3400,9 @@ export class Gateway {
         const id = sessMatch[1]!;
         const t = store.getTask(id);
         // Include the exact effective agent selection captured at queue time (and
-        // kept current after an accepted in-flight retune). Besides powering the
-        // CLI fork command, the expanded task form uses this to prefill a newly
-        // selected fork with the source agent's provider/model/effort.
+        // kept current after an accepted in-flight retune). This powers the CLI
+        // fork command and the task picker's agent details; the destination form
+        // deliberately keeps its own independently selected provider/model.
         const agents = (await api.getTaskView(token, id).catch(() => undefined))?.agents;
         const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'] }> = {};
         for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {

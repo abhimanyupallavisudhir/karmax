@@ -639,6 +639,38 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(typeof login.loggedIn).toBe('boolean');
   });
 
+  it('uploads project-scoped Codex and Claude conversations for agent forks', async () => {
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Conversation imports' }) }).then((response) => response.json());
+    const transcript = Buffer.from([
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Keep this context' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Context kept' }] } }),
+    ].join('\n'));
+    const uploaded = await fetch(`${base}/api/conversation-imports?projectId=${project.id}&filename=claude.jsonl`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/x-ndjson' }, body: transcript,
+    });
+    expect(uploaded.status).toBe(200);
+    const ref: any = await uploaded.json();
+    expect(ref).toMatchObject({ name: 'claude.jsonl', provider: 'claude', messageCount: 2, bytes: transcript.length });
+
+    const taskResponse = await fetch(`${base}/api/projects/${project.id}/tasks`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      projectId: project.id, title: 'Fork upload', draft: true,
+      params: { prompt: 'Continue', 'agent:do': { provider: 'mock', resumeFrom: { importId: ref.id, importName: ref.name } } },
+    }) });
+    expect(taskResponse.status).toBe(200);
+    const task: any = await taskResponse.json();
+    expect((task.params['agent:do'] as any).resumeFrom).toEqual({ importId: ref.id, importName: ref.name });
+
+    const other: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Other import scope' }) }).then((response) => response.json());
+    const denied = await fetch(`${base}/api/projects/${other.id}/tasks`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      projectId: other.id, title: 'Cross-project import', draft: true,
+      params: { prompt: 'Continue', 'agent:do': { provider: 'mock', resumeFrom: { importId: ref.id } } },
+    }) });
+    expect(denied.status).toBe(404);
+    await expect(denied.json()).resolves.toMatchObject({ error: expect.stringMatching(/not found in this project/) });
+  });
+
   it('attaches redacted resources and completes a resumable binary upload', async () => {
     const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());

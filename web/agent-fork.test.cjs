@@ -34,6 +34,8 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
+ok(closed.includes('Upload conversation'), 'Codex and Claude conversation files can be uploaded');
+ok(closed.includes('provider conversation ID or a ChatGPT/Claude share link'), 'provider ids and public share links use one compact field');
 
 const existing = renderAgentField(
   { role: 'do', name: 'agent:do' },
@@ -43,6 +45,12 @@ const existing = renderAgentField(
 ok(existing.includes('class="af-resume-enabled" checked'), 'an already-selected task fork checks the box');
 ok(existing.includes('class="af-resume-panel" >'), 'an already-selected task fork starts expanded');
 ok(existing.includes('value="gpt-source"'), 'existing fork parameters remain visible');
+const imported = renderAgentField(
+  { role: 'do', name: 'agent:do' },
+  { provider: 'claude', resumeFrom: { importId: 'abc', importName: 'session.jsonl' } },
+  {},
+);
+ok(imported.includes('class="af-resume-enabled" checked') && imported.includes('session.jsonl'), 'an uploaded conversation is restored as the visible source');
 
 const listeners = new Map();
 const element = (extra = {}) => ({
@@ -58,6 +66,8 @@ const panel = element({ key: 'panel' });
 const chosen = element({ key: 'chosen', dataset: { resume: 'null' } });
 const pick = element({ key: 'pick' });
 const sessionInput = element({ key: 'session', value: '' });
+const upload = element({ key: 'upload' });
+const fileInput = element({ key: 'file', files: [], click() {} });
 const classes = new Set();
 const box = {
   querySelector(selector) {
@@ -65,6 +75,7 @@ const box = {
       '.af-model-combo': null, '.af-provider': provider, '.af-model': model,
       '.af-effort': effort, '.af-resume-enabled': enabled, '.af-resume-panel': panel,
       '.af-resume-chosen': chosen, '.af-resume-pick': pick, '.af-resume-session': sessionInput,
+      '.af-resume-upload': upload, '.af-resume-file': fileInput,
     }[selector];
   },
   classList: { toggle(name, on) { on ? classes.add(name) : classes.delete(name); } },
@@ -75,6 +86,8 @@ global.modelOptions = () => [];
 global.refreshEffortSelect = () => {};
 let picker;
 global.openTaskPicker = (config) => { picker = config; };
+global.uploadConversation = async () => ({});
+global.toast = () => {};
 eval(extractFn('wireAgentBox'));
 
 wireAgentBox(box);
@@ -87,13 +100,13 @@ picker.onPick({
   task: { id: 'task_source', num: 42, title: 'Source' }, role: 'do',
   session: { id: 'session-1', provider: 'codex', model: 'gpt-source', effort: 'high' },
 });
-ok(provider.value === 'codex' && provider.disabled, 'selection copies and locks the source provider');
-ok(model.value === 'gpt-source' && !model.disabled, 'selection copies the model but leaves it editable');
-ok(effort.value === 'high' && !effort.disabled, 'selection copies reasoning effort but leaves it editable');
+ok(provider.value === 'claude' && !provider.disabled, 'source selection leaves the new agent provider editable');
+ok(model.value === '' && !model.disabled, 'source selection leaves the new agent model unchanged');
+ok(effort.value === '' && !effort.disabled, 'source selection leaves reasoning effort unchanged');
 ok(readResume(box)?.taskId === 'task_source', 'checked selection is collected as a task fork');
 enabled.checked = false;
 listeners.get('enabled:change')();
-ok(panel.hidden && !provider.disabled, 'unchecking collapses the panel and unlocks provider customization');
+ok(panel.hidden && !provider.disabled, 'unchecking collapses the panel and preserves provider customization');
 ok(readResume(box) === undefined, 'unchecked fork is omitted from submitted parameters');
 enabled.checked = true;
 listeners.get('enabled:change')();

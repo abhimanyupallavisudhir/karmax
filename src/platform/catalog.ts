@@ -219,6 +219,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/inbox/preferences (human identity only)',
     'GET /api/meta (deployment flags: hosted, hostLocal, safeMode — tells you which host-local routes exist here)',
     'POST /api/attachments (JSON dataUrl or image bytes)', 'GET /api/attachments/:attachmentId',
+    'POST /api/conversation-imports (Codex/Claude JSON or JSONL bytes)',
     'POST /api/logout', 'GET /api/health/live', 'GET /api/health/ready',
     'GET /api/platform (this catalog)', 'WS /ws (authorized event stream)',
   ],

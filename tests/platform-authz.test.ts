@@ -125,12 +125,22 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
       params: { 'agent:do': { resumeFrom: { taskId: foreign.id, role: 'do' } } } }));
     await denied(() => api.updateArmedParams(token, own.id,
       { prompt: 'go', 'agent:do': { resumeFrom: { taskId: foreign.id, role: 'do' } } }));
+    await denied(() => api.createTask(token, { projectId: mine, title: 'Nested exfiltrate', prompt: 'go',
+      params: { draft: true, confirm: { layers: [{ kind: 'agent', resumeFrom: { taskId: foreign.id, role: 'do' } }] } } }));
 
     // Nothing was created before the refusal.
     expect(store.listTasks(mine).map((t) => t.title)).toEqual(['Mine']);
     // A resume pointer at an unknown task is a 404, not a silent pass-through.
     await expect(api.createTask(token, { projectId: mine, title: 'Ghost', prompt: 'go',
       params: { 'agent:do': { resumeFrom: { taskId: 'task_missing' } } } })).rejects.toBeInstanceOf(NotFoundError);
+
+    const importId = 'a'.repeat(64);
+    await expect(api.createTask(token, { projectId: mine, title: 'Unscoped import', prompt: 'go', draft: true,
+      params: { 'agent:do': { resumeFrom: { importId } } } })).rejects.toBeInstanceOf(NotFoundError);
+    store.grantAttachment(importId, mine);
+    await expect(api.createTask(token, { projectId: mine, title: 'Scoped import', prompt: 'go', draft: true,
+      params: { 'agent:do': { resumeFrom: { importId, importName: 'session.jsonl' } } } }))
+      .resolves.toMatchObject({ title: 'Scoped import' });
   });
 
   /**

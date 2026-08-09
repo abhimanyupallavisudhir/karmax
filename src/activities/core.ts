@@ -47,6 +47,8 @@ import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
+import { ConversationImportError, ConversationImportStore, conversationShareProvider,
+  loadSharedConversation, parseConversationBuffer } from '../agent/conversation-source.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -1431,7 +1433,59 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
           : '.claude';
         const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
-        if (spec.resumeFrom.sessionId) {
+        if (spec.resumeFrom.importId) {
+          const bytes = new ConversationImportStore().read(spec.resumeFrom.importId);
+          if (!bytes) {
+            throw ApplicationFailure.create({
+              message: 'Cannot fork this conversation: the uploaded file is no longer available.',
+              type: 'agent-error',
+              nonRetryable: true,
+            });
+          }
+          try {
+            const imported = parseConversationBuffer(bytes, spec.resumeFrom.importName);
+            messages = [
+              ...imported.messages.map((message, index): Message => ({
+                id: `import_${spec.resumeFrom!.importId}_${index}`,
+                role: message.role,
+                text: message.text,
+                ts: index,
+              })),
+              ...args.messages,
+            ];
+            record(args.taskId, 'session.forked', {
+              from: { importId: spec.resumeFrom.importId, importName: spec.resumeFrom.importName },
+              replayed: imported.messages.length,
+              provider: imported.provider,
+              native: false,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw ApplicationFailure.create({ message: `Cannot fork this conversation: ${message}`, type: 'agent-error', nonRetryable: true });
+          }
+        } else if (spec.resumeFrom.sessionId && conversationShareProvider(spec.resumeFrom.sessionId)) {
+          try {
+            const imported = await loadSharedConversation(spec.resumeFrom.sessionId);
+            messages = [
+              ...imported.map((message, index): Message => ({
+                id: `share_${index}`,
+                role: message.role,
+                text: message.text,
+                ts: index,
+              })),
+              ...args.messages,
+            ];
+            record(args.taskId, 'session.forked', {
+              from: { shareUrl: spec.resumeFrom.sessionId },
+              replayed: imported.length,
+              native: false,
+            });
+          } catch (error) {
+            const message = error instanceof ConversationImportError || error instanceof Error
+              ? error.message : String(error);
+            throw ApplicationFailure.create({ message: `Cannot fork shared conversation: ${message}`, type: 'agent-error', nonRetryable: true });
+          }
+        } else if (spec.resumeFrom.sessionId) {
           // A raw pasted provider session id = "continue THIS exact session" (resume,
           // not fork). Materialize it into this turn's (home × world) so the provider
           // resolves it even when the id was minted under a DIFFERENT config home or

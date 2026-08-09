@@ -728,7 +728,12 @@ function renderAgentField(f, spec, inherited) {
   const model = providerVisible ? e.model : '';
   const effort = providerVisible ? e.effort : '';
   const role = f.role || f.name;
-  const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
+  const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId || spec?.resumeFrom?.importId);
+  const savedSource = spec?.resumeFrom?.taskId
+    ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role }
+    : spec?.resumeFrom?.importId
+      ? { importId: spec.resumeFrom.importId, importName: spec.resumeFrom.importName }
+      : null;
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div class="agent-controls">
       <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
@@ -741,9 +746,13 @@ function renderAgentField(f, spec, inherited) {
     </div>
     <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> Fork a previous agent</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
-      <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
-      <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <div class="af-resume-actions">
+        <button type="button" class="btn sm af-resume-pick">⌕ Search tasks…</button>
+        <button type="button" class="btn sm af-resume-upload">↑ Upload conversation</button>
+        <input class="af-resume-file" type="file" accept=".json,.jsonl,.ndjson,application/json" hidden />
+      </div>
+      <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(savedSource))}">${savedSource ? resumeChosenInner(savedSource) : ''}</div>
+      <input class="af-resume-session" placeholder="…or paste a provider conversation ID or a ChatGPT/Claude share link to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
     </div>
   </div>`;
 }
@@ -751,6 +760,10 @@ function renderAgentField(f, spec, inherited) {
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
 function resumeChosenInner(rf, task) {
+  if (rf.importId) {
+    const label = `⑂ ${rf.importName || 'Uploaded conversation'}`;
+    return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
+  }
   const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
   const source = !rf.role || rf.role === 'do' ? 'agent' : `${rf.role} agent`;
   const label = `⑂ forking ${source} of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
@@ -1156,29 +1169,17 @@ function wireAgentBox(box) {
   const chosen = box.querySelector('.af-resume-chosen');
   const enabled = box.querySelector('.af-resume-enabled');
   const panel = box.querySelector('.af-resume-panel');
-  const provider = box.querySelector('.af-provider');
+  const sessionInput = box.querySelector('.af-resume-session');
+  const uploadButton = box.querySelector('.af-resume-upload');
+  const fileInput = box.querySelector('.af-resume-file');
   const syncForkState = () => {
     if (panel) panel.hidden = !enabled?.checked;
-    let taskFork;
-    try { taskFork = enabled?.checked && !!JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { taskFork = false; }
-    // Provider/session identity must match for a native fork. Model and effort are
-    // intentionally left editable: both adapters support retuning those knobs.
-    if (provider) provider.disabled = !!taskFork;
-    box.classList.toggle('af-has-task-fork', !!taskFork);
   };
-  const applySourceAgent = (session) => {
-    if (!session) return;
-    if (session.provider && provider) provider.value = session.provider;
-    if (session.model !== undefined) box.querySelector('.af-model').value = session.model || '';
-    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-    const effort = box.querySelector('.af-effort');
-    if (effort && session.effort && [...effort.options].some((o) => o.value === session.effort)) effort.value = session.effort;
-  };
-  const setResume = (rf, task, session) => {
+  const setResume = (rf, task) => {
     if (!chosen) return;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
-    if (rf) applySourceAgent(session);
+    if (rf && sessionInput) sessionInput.value = '';
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -1186,11 +1187,9 @@ function wireAgentBox(box) {
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
       // Turning the feature off is also a real parameter change. Clear the
-      // dormant source so checking it again cannot silently re-lock a provider
-      // the user customized while the fork was off.
+      // dormant source so checking it again cannot silently revive an old fork.
       if (chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
-      const session = box.querySelector('.af-resume-session');
-      if (session) session.value = '';
+      if (sessionInput) sessionInput.value = '';
     }
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1201,9 +1200,27 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
+      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
     }),
   );
+  sessionInput?.addEventListener('input', () => {
+    if (sessionInput.value.trim() && chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
+  });
+  uploadButton?.addEventListener('click', () => fileInput?.click());
+  fileInput?.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    uploadButton.disabled = true;
+    try {
+      const imported = await uploadConversation(file);
+      setResume({ importId: imported.id, importName: imported.name });
+    } catch (error) {
+      toast(error.message || String(error), true);
+    } finally {
+      uploadButton.disabled = false;
+      fileInput.value = '';
+    }
+  });
   syncForkState();
 }
 function wireAgentFields(root) {
@@ -1419,6 +1436,17 @@ async function uploadImage(file) {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
   return body; // ImageRef
+}
+
+async function uploadConversation(file) {
+  const res = await fetch(`/api/conversation-imports?projectId=${encodeURIComponent(S.projectId)}&filename=${encodeURIComponent(file.name)}`, {
+    method: 'POST',
+    headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
+  return body;
 }
 
 function attachmentUrl(id) {

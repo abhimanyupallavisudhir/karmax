@@ -1208,9 +1208,16 @@ export interface AgentSpec {
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  /** Continue a prior agent session: a source task (+ which role's agent) or a
-   *  raw provider conversation/session id. */
-  resumeFrom?: { taskId?: string; role?: string; sessionId?: string };
+  /** Fork conversation context from a source task, a provider session/share id,
+   *  or an out-of-band uploaded Codex/Claude transcript. */
+  resumeFrom?: {
+    taskId?: string;
+    role?: string;
+    sessionId?: string;
+    importId?: string;
+    /** Display-only original filename; bytes are addressed by importId. */
+    importName?: string;
+  };
 }
 
 /**

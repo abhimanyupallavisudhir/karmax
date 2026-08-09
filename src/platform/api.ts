@@ -630,8 +630,8 @@ export class KarmaxApi {
   }
 
   /**
-   * Authorize every `agent:<role>.resumeFrom.taskId` in a task's params against
-   * the **source** task, not just the task being created/edited.
+   * Authorize every agent `resumeFrom` (including confirmer layers): task sources
+   * against the **source** task, and uploads against the destination project.
    *
    * `resumeFrom` makes the activity runtime (`src/activities/core.ts`) load
    * another task's provider session and splice its transcript into the new
@@ -640,19 +640,34 @@ export class KarmaxApi {
    * holding only `task:create` in its own project could replay any conversation
    * from any sibling project or tenant into an agent it controls. `forkTaskAgent`
    * already models the intended check; this closes the same door on the raw
-   * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
+   * params path (POST /api/tasks, PATCH /api/tasks/:id/params). Uploaded bytes
+   * use the same project-scope table as image attachments, so a hash learned in
+   * another tenant cannot be replayed here.
    */
-  private authorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
-    for (const [key, value] of Object.entries(params ?? {})) {
-      if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
-      const resumeFrom = (value as Record<string, unknown>).resumeFrom;
-      if (!resumeFrom || typeof resumeFrom !== 'object' || Array.isArray(resumeFrom)) continue;
-      const sourceId = (resumeFrom as Record<string, unknown>).taskId;
-      if (typeof sourceId !== 'string' || !sourceId) continue;
-      const source = this.deps.store.getTask(sourceId);
-      if (!source) throw new NotFoundError(`no task ${sourceId} to resume from`);
-      this.require(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId });
-    }
+  private authorizeResumeSources(token: string, params: Record<string, unknown> | undefined, projectId: string): void {
+    const seen = new Set<unknown>();
+    const visit = (value: unknown): void => {
+      if (!value || typeof value !== 'object' || seen.has(value)) return;
+      seen.add(value);
+      if (Array.isArray(value)) { for (const child of value) visit(child); return; }
+      const object = value as Record<string, unknown>;
+      const resumeFrom = object.resumeFrom;
+      if (resumeFrom && typeof resumeFrom === 'object' && !Array.isArray(resumeFrom)) {
+        const source = resumeFrom as Record<string, unknown>;
+        const sourceId = source.taskId;
+        if (typeof sourceId === 'string' && sourceId) {
+          const task = this.deps.store.getTask(sourceId);
+          if (!task) throw new NotFoundError(`no task ${sourceId} to resume from`);
+          this.require(token, 'get_conversation', { projectId: task.projectId, taskId: sourceId });
+        }
+        const importId = source.importId;
+        if (typeof importId === 'string' && importId
+          && !this.deps.store.attachmentAllowed(importId, projectId))
+          throw new NotFoundError('conversation import not found in this project');
+      }
+      for (const child of Object.values(object)) visit(child);
+    };
+    visit(params);
   }
 
   /** Validate configured repository selections without making repositories a
@@ -757,7 +772,7 @@ export class KarmaxApi {
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
-    this.authorizeResumeSources(token, taskOverrides);
+    this.authorizeResumeSources(token, taskOverrides, args.projectId);
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     // Validate any repository selection after resolution so this sees the exact
     // effective list the world will. An empty list is a supported zero-repo run.
@@ -1607,7 +1622,7 @@ export class KarmaxApi {
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
-    this.authorizeResumeSources(token, params);
+    this.authorizeResumeSources(token, params, task.projectId);
     const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
       ...(archived !== undefined ? { archived } : {}),
@@ -2622,18 +2637,28 @@ export class KarmaxApi {
   }
 
   /** Branch a source agent into an independent task/session; the source is never mutated. */
-  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<TaskRecord> {
+  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string;
+    authorizationProfile?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
     if (!source) throw new NotFoundError(`no task ${args.taskId}`);
     const role = args.role ?? 'do';
+    if (args.provider && !['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'].includes(args.provider))
+      throw new ValidationError(`unknown agent provider: ${args.provider}`);
+    if (args.effort && !['low', 'medium', 'high', 'xhigh', 'max'].includes(args.effort))
+      throw new ValidationError(`unknown agent effort: ${args.effort}`);
     if (!this.deps.store.kvGet(`session:${args.taskId}:${role}`) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
     return this.createTask(token, {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
       workflow: 'software-dev',
-      params: { prompt: args.message, 'agent:do': { resumeFrom: { taskId: args.taskId, role } } },
+      params: { prompt: args.message, 'agent:do': {
+        ...(args.provider ? { provider: args.provider } : {}),
+        ...(args.model ? { model: args.model } : {}),
+        ...(args.effort ? { effort: args.effort } : {}),
+        resumeFrom: { taskId: args.taskId, role },
+      } },
       authorizationProfile: args.authorizationProfile,
     });
   }

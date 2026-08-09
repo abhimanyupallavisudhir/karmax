@@ -56,7 +56,9 @@ export interface PlatformOps {
   findTask(projectId: string, num: number): Promise<unknown>;
   listAgents(taskId: string): Promise<unknown>;
   getConversation(taskId: string, role?: string): Promise<unknown>;
-  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<{ id: string }>;
+  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string;
+    provider?: 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock'; model?: string;
+    effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
   publishTaskBranch(): Promise<unknown>;
   importTaskBranch(sourceTaskId: string): Promise<unknown>;
@@ -381,8 +383,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'fork_agent',
     {
-      description: 'Branch an attached agent into a new independent task and native provider session, preserving the source. Use message_agent for later back-and-forth with the fork.',
-      inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(), authorizationProfile: z.string().optional() },
+      description: 'Branch an attached agent into a new independent task, optionally using a different provider/model. The source remains untouched.',
+      inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(), authorizationProfile: z.string().optional(),
+        provider: z.enum(['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock']).optional(), model: z.string().optional(),
+        effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional() },
     },
     async (a) => wrap(async () => (await ops.forkAgent(a)).id),
   );

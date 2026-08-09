@@ -1346,8 +1346,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-toggle input { width: auto; margin: 0; }
 .af-resume-panel { margin: 6px 0 0 22px; }
 .af-resume-panel[hidden] { display: none !important; }
+.af-resume-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .af-resume-session { width: 100%; margin-top: 6px; padding: 7px 10px; }
-.agent-field.af-has-task-fork .af-provider { opacity: .6; cursor: not-allowed; }
 .af-resume-chosen { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
 .af-resume-chosen:empty { display: none; }
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
