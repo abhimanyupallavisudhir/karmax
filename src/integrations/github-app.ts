@@ -403,6 +403,14 @@ export class GitHubAppService {
       .map((account) => ({ ...account, active: account.id === active }));
   }
 
+  /** Revalidate a token-authority-pinned account against the delegated user's
+   * connected OAuth accounts before any external write. */
+  async assertUserAccount(userId: string, accountId: string): Promise<GitHubUserAccount> {
+    const account = (await this.listUserAccounts(userId)).find((candidate) => candidate.id === accountId);
+    if (!account) throw new Error('the pinned GitHub account is not connected to the delegated human');
+    return account;
+  }
+
   async repositoryPermission(userId: string, slug: string, accountId?: string): Promise<GitHubRepositoryPermission> {
     if (!/^[^/\s]+\/[^/\s]+$/.test(slug)) throw new Error('invalid GitHub repository');
     try {
@@ -696,18 +704,19 @@ export class GitHubAppService {
    * installation, and return the durable record. */
   async createRepository(connectionId: string, userId: string, input: {
     name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
-  }): Promise<Repository> {
+  }, options: { accountId?: string } = {}): Promise<Repository> {
     const connection = this.store.getGitConnection(connectionId);
     if (!connection) throw new Error('GitHub connection not found');
     const name = this.repositoryName(input.name);
     const pathname = connection.accountType === 'Organization'
       ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
       : '/user/repos';
+    if (options.accountId) await this.assertUserAccount(userId, options.accountId);
     const created = await this.userRequest<GitHubRepositoryPayload>(userId, pathname, {
       method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
         private: input.private !== false, auto_init: input.autoInit !== false }),
-    });
-    return this.enrollRepository(connection, userId, created, input.defaultBranch);
+    }, options.accountId);
+    return this.enrollRepository(connection, userId, created, input.defaultBranch, options.accountId);
   }
 
   /** Idempotently provision a platform-owned repository. A previous attempt can
@@ -749,7 +758,7 @@ export class GitHubAppService {
   }
 
   private async enrollRepository(connection: GitConnection, userId: string,
-    created: GitHubRepositoryPayload, defaultBranch?: string): Promise<Repository> {
+    created: GitHubRepositoryPayload, defaultBranch?: string, accountId?: string): Promise<Repository> {
     // Installation may have been limited to selected repositories. User
     // authorization lets Karmax enroll the repository without sending the
     // operator back through GitHub settings. The PUT is idempotent for selected
@@ -758,7 +767,7 @@ export class GitHubAppService {
     try {
       await this.userRequest(userId,
         `/user/installations/${encodeURIComponent(connection.installationId)}/repositories/${encodeURIComponent(String(created.id))}`,
-        { method: 'PUT' });
+        { method: 'PUT' }, accountId);
     } catch (error) {
       this.tokenCache.delete(connection.id);
       const installationToken = await this.installationToken(connection);

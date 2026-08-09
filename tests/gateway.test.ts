@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -6,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
+import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -62,6 +64,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const c: any = await (await fetch(`${base}/api/contributions`, { headers: auth() })).json();
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
     expect(c.commands.find((x: any) => x.id === 'nav.notifications')?.keybinding).toBe('g N');
+    expect(c.commands.find((x: any) => x.id === 'nav.activity')).toBeUndefined();
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
     expect(c.slots.some((s: any) => s.workflow === 'agent-queue' && s.contribution.slot === 'queue-panel')).toBe(true);
@@ -168,6 +171,193 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('rejects unauthenticated API calls', async () => {
     const res = await fetch(`${base}/api/projects`);
     expect(res.status).toBe(401);
+  });
+
+  it('enforces capability, delegated-subject, interactive-presence, scope, and audit independently', async () => {
+    const organization = h.store.createOrganization({ name: 'Delegated identity' });
+    const project = h.store.createProject('Delegated project', {}, organization.id);
+    const human = h.tokens.mintPrincipal('user:delegator', ['project:read', 'repository:read', 'repository:write'],
+      project.id, 60_000, organization.id);
+    const delegation = h.tokens.delegateHuman(human.token, {
+      taskId: 'task-delegated', projectId: project.id, organizationId: organization.id,
+      externalIdentities: { githubAccountId: 'acct-42' },
+    })!;
+    const delegated = h.tokens.mint({
+      taskId: 'task-delegated', profileId: 'maintainer', role: 'do', principal: 'user:delegator',
+      projectId: project.id, organizationId: organization.id,
+      ceiling: ['project:read', 'repository:read', 'repository:write'],
+      grantorCaps: ['project:read', 'repository:read', 'repository:write'], delegationId: delegation.id,
+    });
+    const delegatedAuth = { authorization: `Bearer ${delegated.token}`, 'content-type': 'application/json' };
+
+    // The subject check passes. This test gateway has no GitHub App, so the
+    // request reaches integration availability instead of the old browser-only gate.
+    const create = await fetch(`${base}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST', headers: delegatedAuth, body: JSON.stringify({ gitConnectionId: 'missing', name: 'delegated-repo' }),
+    });
+    expect(create.status).toBe(503);
+    expect(await create.json()).toMatchObject({ error: expect.stringMatching(/GitHub App/i) });
+
+    const repository = h.store.upsertRepository({ organizationId: organization.id, provider: 'github',
+      owner: 'acme', name: 'delegated-repo', sshUrl: 'git@github.com:acme/delegated-repo.git',
+      defaultBranch: 'main', private: true });
+    const attach = await fetch(`${base}/api/projects/${project.id}/repositories`, {
+      method: 'POST', headers: delegatedAuth, body: JSON.stringify({ repositoryId: repository.id }),
+    });
+    expect(attach.status).toBe(200);
+    expect(((await attach.json()) as any).repositoryId).toBe(repository.id);
+
+    const capabilityDenied = h.tokens.mint({
+      taskId: 'task-capability-denied', profileId: 'developer', role: 'do', principal: 'user:delegator',
+      projectId: project.id, organizationId: organization.id, ceiling: ['project:read'], grantorCaps: ['project:read'],
+      delegationId: h.tokens.deriveHumanDelegation(delegation.id, {
+        taskId: 'task-capability-denied', projectId: project.id, organizationId: organization.id,
+      }).id,
+    });
+    expect((await fetch(`${base}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST', headers: { authorization: `Bearer ${capabilityDenied.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    })).status).toBe(403);
+
+    const noSubject = h.tokens.mint({ taskId: 'task-autonomous', profileId: 'maintainer', role: 'do',
+      principal: 'autonomous:worker', projectId: project.id, organizationId: organization.id,
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'] });
+    const noSubjectResponse = await fetch(`${base}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST', headers: { authorization: `Bearer ${noSubject.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(noSubjectResponse.status).toBe(403);
+    expect(await noSubjectResponse.json()).toMatchObject({ error: expect.stringMatching(/verified human subject/i) });
+
+    const interactiveOnly = await fetch(`${base}/api/user/export`, { headers: delegatedAuth });
+    expect(interactiveOnly.status).toBe(401);
+    expect(await interactiveOnly.json()).toMatchObject({ error: expect.stringMatching(/interactive human/i) });
+
+    const audit = h.store.auditSince(0, 2000).find((event) =>
+      event.action === 'http.post.repository:write' && event.detail.path.endsWith('/repositories/create')
+      && event.principalId === 'task-agent:task-delegated:do');
+    expect(audit).toMatchObject({
+      detail: { actor: { kind: 'task-agent', taskId: 'task-delegated' },
+        humanSubject: { kind: 'user', userId: 'delegator', presence: 'delegated' } },
+    });
+  });
+
+  it('creates and attaches a repository for a delegated task with its authority-pinned GitHub account', async () => {
+    const organization = h.store.createOrganization({ name: 'Delegated repository creation' });
+    const project = h.store.createProject('Delegated repository project', {}, organization.id);
+    const calls: Array<{ path: string; method: string; authorization?: string }> = [];
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const authorization = new Headers(init.headers).get('authorization') ?? undefined;
+      calls.push({ path: url.pathname, method: init.method ?? 'GET', authorization });
+      if (url.pathname === '/user' && authorization === 'Bearer pinned-token')
+        return Response.json({ id: 42, login: 'pinned-user' });
+      if (url.pathname === '/user' && authorization === 'Bearer active-token')
+        return Response.json({ id: 99, login: 'active-user' });
+      if (url.pathname === '/orgs/acme/repos' && init.method === 'POST' && authorization === 'Bearer pinned-token')
+        return Response.json({ id: 77, name: 'delegated-repo', private: true,
+          ssh_url: 'git@github.com:acme/delegated-repo.git', default_branch: 'main', owner: { login: 'acme' } });
+      if (url.pathname === '/user/installations/123/repositories/77' && init.method === 'PUT'
+        && authorization === 'Bearer pinned-token') return new Response(null, { status: 204 });
+      if (url.pathname === '/app/installations/123/access_tokens' && init.method === 'POST')
+        return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+    };
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    h.broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    const githubApp = new GitHubAppService(h.store, h.broker,
+      { appId: '1', fetch: fakeFetch as typeof fetch });
+    await githubApp.adoptUserAuthorization('delegator', '42', { accessToken: 'pinned-token' });
+    await githubApp.adoptUserAuthorization('delegator', '99', { accessToken: 'active-token' });
+    await githubApp.setActiveUserAccount('delegator', '99');
+    const connection = h.store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '123', accountLogin: 'acme', accountType: 'Organization' });
+    const githubGateway = await h.startGateway({ githubApp });
+
+    const capabilities = ['project:read', 'repository:read', 'repository:write'] as const;
+    const human = h.tokens.mintPrincipal('user:delegator', [...capabilities], project.id, 60_000, organization.id);
+    const delegation = h.tokens.delegateHuman(human.token, {
+      taskId: 'task-create-repository', projectId: project.id, organizationId: organization.id,
+      externalIdentities: { githubAccountId: '42' },
+    })!;
+    const delegated = h.tokens.mint({
+      taskId: 'task-create-repository', profileId: 'maintainer', role: 'do', principal: 'user:delegator',
+      projectId: project.id, organizationId: organization.id, ceiling: [...capabilities],
+      grantorCaps: [...capabilities], delegationId: delegation.id,
+    });
+
+    const delegatedAuth = { authorization: `Bearer ${delegated.token}`, 'content-type': 'application/json' };
+    const createdResponse = await fetch(
+      `${githubGateway.url}/api/organizations/${organization.id}/repositories/create`, {
+        method: 'POST', headers: delegatedAuth, body: JSON.stringify({
+          gitConnectionId: connection.id, name: 'delegated-repo', description: 'Created by a delegated task', private: true,
+        }),
+      });
+    const repository = await createdResponse.json() as any;
+    expect({ status: createdResponse.status, error: repository.error }).toEqual({ status: 200, error: undefined });
+    expect(repository).toMatchObject({ owner: 'acme', name: 'delegated-repo', private: true,
+      gitConnectionId: connection.id });
+    expect(calls).toContainEqual({ path: '/orgs/acme/repos', method: 'POST', authorization: 'Bearer pinned-token' });
+    expect(calls.some((call) => call.authorization === 'Bearer active-token' && call.method === 'POST')).toBe(false);
+
+    const attachedResponse = await fetch(`${base}/api/projects/${project.id}/repositories`, {
+      method: 'POST', headers: delegatedAuth, body: JSON.stringify({ repositoryId: repository.id }),
+    });
+    expect(attachedResponse.status).toBe(200);
+    expect(await attachedResponse.json()).toMatchObject({ projectId: project.id, repositoryId: repository.id });
+    expect(h.store.listProjectRepositories(project.id)).toEqual([
+      expect.objectContaining({ projectId: project.id, repositoryId: repository.id,
+        repository: expect.objectContaining({ name: 'delegated-repo' }) }),
+    ]);
+
+    const denied = h.tokens.mint({ taskId: 'task-repository-denied', profileId: 'developer', role: 'do',
+      principal: 'user:delegator', projectId: project.id, organizationId: organization.id,
+      ceiling: ['project:read'], grantorCaps: ['project:read'] });
+    expect((await fetch(`${githubGateway.url}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST', headers: { authorization: `Bearer ${denied.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ gitConnectionId: connection.id, name: 'denied-repo' }),
+    })).status).toBe(403);
+
+    const unpinnedDelegation = h.tokens.delegateHuman(human.token, {
+      taskId: 'task-repository-unpinned', projectId: project.id, organizationId: organization.id,
+    })!;
+    const unpinned = h.tokens.mint({ taskId: 'task-repository-unpinned', profileId: 'maintainer', role: 'do',
+      principal: 'user:delegator', projectId: project.id, organizationId: organization.id,
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: unpinnedDelegation.id });
+    const unpinnedResponse = await fetch(`${githubGateway.url}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST', headers: { authorization: `Bearer ${unpinned.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ gitConnectionId: connection.id, name: 'unpinned-repo' }),
+    });
+    expect(unpinnedResponse.status).toBe(403);
+    expect(await unpinnedResponse.json()).toMatchObject({ error: expect.stringMatching(/no pinned GitHub account/i) });
+
+    const substitutedDelegation = h.tokens.delegateHuman(human.token, {
+      taskId: 'task-repository-substituted', projectId: project.id, organizationId: organization.id,
+      externalIdentities: { githubAccountId: '404' },
+    })!;
+    const substituted = h.tokens.mint({ taskId: 'task-repository-substituted', profileId: 'maintainer', role: 'do',
+      principal: 'user:delegator', projectId: project.id, organizationId: organization.id,
+      ceiling: ['repository:write'], grantorCaps: ['repository:write'], delegationId: substitutedDelegation.id });
+    const substitutedResponse = await fetch(`${githubGateway.url}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST', headers: { authorization: `Bearer ${substituted.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ gitConnectionId: connection.id, name: 'substituted-repo' }),
+    });
+    expect(substitutedResponse.status).toBe(400);
+    expect(await substitutedResponse.json()).toMatchObject({ error: expect.stringMatching(/pinned GitHub account is not connected/i) });
+    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toHaveLength(1);
+
+    const audits = h.store.auditSince(0, 5000).filter((event) =>
+      event.principalId === 'task-agent:task-create-repository:do');
+    expect(audits).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: 'http.post.repository:write', scopeKey: `organization:${organization.id}`,
+        detail: expect.objectContaining({ path: `/api/organizations/${organization.id}/repositories/create`,
+          actor: expect.objectContaining({ kind: 'task-agent', taskId: 'task-create-repository' }),
+          humanSubject: { kind: 'user', userId: 'delegator', presence: 'delegated' } }) }),
+      expect.objectContaining({ action: 'http.post.repository:write', scopeKey: `project:${project.id}`,
+        detail: expect.objectContaining({ path: `/api/projects/${project.id}/repositories`,
+          actor: expect.objectContaining({ kind: 'task-agent', taskId: 'task-create-repository' }) }) }),
+    ]));
   });
 
   it('reorders projects for the sidebar', async () => {

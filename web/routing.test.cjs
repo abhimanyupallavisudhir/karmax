@@ -61,12 +61,14 @@ eval(extractFn('orgSlug'));
 eval(extractFn('organizationById'));
 eval(extractFn('organizationBySlug'));
 eval(extractFn('currentOrg'));
+eval(extractFn('syncOrganizationSwitcher'));
 eval(extractFn('orgBase'));
 eval(extractFn('parseRoute'));
 eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
 eval(extractFn('encodeQuery'));
 eval(extractFn('globalRoute'));
+eval(extractFn('organizationLandingRoute'));
 eval(extractFn('installationRoute'));
 eval(extractFn('profileRoute'));
 eval(extractFn('taskRecord'));
@@ -94,8 +96,13 @@ eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
 eq(installationRoute(), '/installation', 'installation route is global, not org-prefixed');
 eq(profileRoute(), '/profile', 'profile route is user-scoped, not org-prefixed');
 eq(globalRoute('organization', organizationById('org_globex')), '/globex/settings', 'globalRoute honours an explicit org');
+eq(organizationLandingRoute('org_globex'), '/globex/mobile-app', 'switching organizations navigates into the selected organization');
 S.organizationId = 'org_globex';
 eq(profileRoute(), '/profile', 'profile route is stable when a different organization is selected');
+const organizationSwitcher = { value: 'org_acme' };
+global.$ = (selector) => selector === '#org-switcher' ? organizationSwitcher : null;
+syncOrganizationSwitcher();
+eq(organizationSwitcher.value, 'org_globex', 'the persistent top-left picker follows the active organization');
 S.organizationId = 'org_acme';
 
 // ── parseRoute round-trips the new scheme ─────────────────────────────────────
@@ -115,6 +122,9 @@ eq(parseRoute('/acme/website-redesign'),
 eq(parseRoute('/acme/website-redesign/queue'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: '' },
   'parse a project tab');
+eq(parseRoute('/acme/website-redesign/activity'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'activity', taskKey: null, taskTab: null, q: '' },
+  'the hidden Activity debugger remains reachable by direct URL');
 eq(parseRoute('/acme/website-redesign/tasks/42'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '' },
   'parse a task permalink');
@@ -138,6 +148,7 @@ eq(projectBySlug(r.slug, organizationBySlug(r.org).id)?.id, 'P2', 'and back to t
 // ── Org-scoped slug resolution (collision across orgs) ────────────────────────
 eq(projectBySlug('mobile-app', 'org_acme')?.id, 'P3', 'same slug resolves per-org (acme)');
 eq(projectBySlug('mobile-app', 'org_globex')?.id, 'P2', 'same slug resolves per-org (globex)');
+eq(projectBySlug('P2', 'org_acme'), undefined, 'a raw project id cannot escape the organization named in the URL');
 
 // ── Legacy URLs still parse and are flagged for canonicalisation ──────────────
 eq(parseRoute('/dashboard'), { name: 'global', tab: 'dashboard', legacy: true }, 'legacy /dashboard');

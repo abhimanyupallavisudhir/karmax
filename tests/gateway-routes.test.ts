@@ -80,6 +80,12 @@ describe('gateway route capability binding', () => {
     expect(cap('POST', '/api/organizations/o1/github/install-url')).toBe('repository:write');
   });
 
+  it('requires repository writes for both delegated creation and project attachment', () => {
+    expect(cap('POST', '/api/organizations/o1/repositories/create')).toBe('repository:write');
+    expect(cap('POST', '/api/projects/p1/repositories')).toBe('repository:write');
+    expect(cap('GET', '/api/projects/p1/repositories')).toBe('repository:read');
+  });
+
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
     expect(cap('GET', '/api/user/export')).toBe('none');
     expect(cap('GET', '/api/user/git-profiles')).toBe('none');

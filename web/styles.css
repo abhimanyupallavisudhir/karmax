@@ -552,7 +552,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 }
 .tf-main { min-width: 0; }
 /* The prompt is the body of the "issue" — give it real room. */
-.tf-main .prompt-field > textarea { min-height: 220px; }
+.tf-main .prompt-field > textarea,
+.tf-main .prompt-field > .wiki-ref-editor > textarea { min-height: 220px; }
 .tf-main > .section-h { margin: 26px 0 14px; padding-top: 20px; border-top: 1px solid var(--line); }
 /* Sidebar: hairline-separated metadata sections, GitHub-issue style. */
 .tf-side { min-width: 0; display: flex; flex-direction: column; }
@@ -1444,7 +1445,8 @@ html[data-theme="dark"] .github-signin-btn:active,
    into a separate section. The wrapper carries the border; the textarea is bare. */
 .prompt-field { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .prompt-field:focus-within { border-color: var(--accent); }
-.prompt-field > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
+.prompt-field > textarea,
+.prompt-field > .wiki-ref-editor > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
 .prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
 /* The prompt's clean bottom row: the "wiki context" field — no border, just a
    faint hairline separating it from the prompt text above. */
@@ -1452,7 +1454,36 @@ html[data-theme="dark"] .github-signin-btn:active,
 .prompt-context-row .pc-prefix { flex: none; font-size: 10.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3); cursor: default; user-select: none; padding-top: 2px; }
 .prompt-context { flex: 1; border: none; background: transparent; outline: none; box-shadow: none; resize: none; overflow: hidden; width: 100%; padding: 1px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--accent); }
 .prompt-context::placeholder { color: var(--ink-3); font-family: var(--font-sans, inherit); }
+.prompt-context-row > .wiki-ref-editor { flex: 1; }
 .form-row .prompt-field { background: var(--surface-2); }
+
+/* Wiki-reference editor: the textarea remains the sole editable control while
+   an inert, pixel-aligned mirror underneath colors recognized references. */
+.wiki-ref-editor { position: relative; display: block; width: 100%; min-width: 0; }
+.wiki-ref-backdrop {
+  position: absolute; inset: 0; overflow: hidden; pointer-events: none;
+  white-space: pre-wrap; overflow-wrap: break-word; color: var(--ink);
+  border-style: solid; border-color: transparent; background: transparent;
+}
+.wiki-ref-editor > textarea.wiki-ref-input {
+  position: relative; z-index: 1; display: block; background: transparent !important;
+  color: transparent !important; -webkit-text-fill-color: transparent;
+  caret-color: var(--ink);
+}
+.wiki-ref-editor > textarea.wiki-ref-input::placeholder {
+  color: var(--ink-3); -webkit-text-fill-color: var(--ink-3);
+}
+.wiki-ref-editor > textarea.wiki-ref-input::selection {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.wiki-ref-editor > textarea.wiki-ref-modifier { cursor: pointer; }
+.wiki-ref-backdrop .wiki-ref {
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent);
+  border-radius: 3px; text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  text-underline-offset: 2px;
+}
+.wiki-ref-backdrop .wiki-ref-label { color: var(--ok); background: color-mix(in srgb, var(--ok) 11%, transparent); }
+.wiki-ref-backdrop .wiki-ref-folder { color: var(--warn); background: color-mix(in srgb, var(--warn) 11%, transparent); }
 .img-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
 .img-chip { position: relative; display: inline-flex; }
 .img-chip img {
@@ -1739,7 +1770,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .wiki-editor .wiki-preview { min-height: 120px; padding: 4px 2px; }
 @media (max-width: 850px) { .wiki-editor .wiki-fields { grid-template-columns: 1fr; } }
 
-/* @-mention dropdown: tag wiki pages/labels/folders into a task prompt. */
+/* Wiki-reference dropdown for pages, labels, and folders in prompt editors. */
 .wiki-mention-menu {
   position: fixed; z-index: 90; width: min(360px, 90vw); max-height: 264px; overflow-y: auto;
   background: var(--surface); border: 1px solid var(--line); border-radius: 10px;

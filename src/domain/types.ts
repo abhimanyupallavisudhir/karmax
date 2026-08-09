@@ -870,13 +870,13 @@ export interface TaskParams {
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
   /**
-   * Wiki pages inlined into this task's agent context, as `@proj:…`/`@org:…`
-   * tokens (a page, a whole `@proj:tag:<label>`, or a folder `@proj:<section>/*`).
-   * The task-form "wiki context" field seeds this with `@proj:tag:default` and
-   * `@org:tag:default` so `default`-labelled pages are inlined by default; a task
+   * Wiki pages inlined into this task's agent context, as `[[proj:…]]`/`[[org:…]]`
+   * references (a page, a whole `[[proj:tag:<label>]]`, or a folder
+   * `[[proj:<section>/*]]`). The task-form "wiki context" field seeds this with
+   * both scopes' `tag:default` references so default-labelled pages are inlined; a task
    * opts out by clearing them. Absent (API/quick-add) ⇒ the default tokens apply.
    * Resolved fresh each turn by `buildWikiPromptContext` (SPEC §5.4), UNION any
-   * `@…` tags written inline in the prompt/follow-ups.
+   * wiki references written inline in the prompt/follow-ups.
    */
   wikiContext?: string[];
   base?: string;
@@ -1445,6 +1445,8 @@ export interface TaskInput {
   grant?: string[];
   /** Principal and job-shaped profile from which `grant` was attenuated. */
   grantPrincipal?: string;
+  /** Opaque token-authority provenance for a verified delegated human subject. */
+  delegationId?: string;
   authorizationProfile?: string;
   /**
    * Snapshot of the process-wide Resolve-agent flag. It is carried in workflow

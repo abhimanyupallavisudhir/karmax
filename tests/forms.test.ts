@@ -99,7 +99,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
       workflow: 'goal',
       draft: true,
       notes: 'keep this note',
-      params: { prompt: 'prepare the repository', wikiContext: ['@proj:SPEC.md'] },
+      params: { prompt: 'prepare the repository', wikiContext: ['[[proj:SPEC.md]]'] },
     });
 
     const response = await fetch(`${base}/api/tasks/${draft.id}/workflow`, {
@@ -115,7 +115,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
         id: draft.id,
         workflow: 'software-dev',
         executionWorkflow: 'software-dev',
-        params: { draft: true, prompt: 'prepare the repository', wikiContext: ['@proj:SPEC.md'] },
+        params: { draft: true, prompt: 'prepare the repository', wikiContext: ['[[proj:SPEC.md]]'] },
         notes: 'keep this note',
       },
     });
