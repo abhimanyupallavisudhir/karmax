@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { scanWikiRefs } from '../src/wiki/wiki.js';
 
 const webDir = path.resolve('web');
 const app = fs.readFileSync(path.join(webDir, 'app.js'), 'utf8');
@@ -188,6 +189,37 @@ describe('widget rendering', () => {
 });
 
 describe('wiki-mention wiring', () => {
+  it('uses the canonical bracket grammar and exactly mirrors Markdown code escaping', () => {
+    const start = app.indexOf('function wikiMarkdownCodeRanges(');
+    const end = app.indexOf('function wikiRefHref(', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const helpers = new Function(`${app.slice(start, end)}; return { wikiRefMatches };`)() as {
+      wikiRefMatches: (text: string) => Array<{ raw: string; value: string; start: number; end: number }>;
+    };
+    const text = '[[proj:live]] `[[proj:inline]]`\n```ts\n[[org:fenced]]\n```\n\\[[proj:escaped]] [[org:tag:ok]]';
+    expect(helpers.wikiRefMatches(text).map((ref) => ref.raw)).toEqual(['[[proj:live]]', '[[org:tag:ok]]']);
+    for (const ref of helpers.wikiRefMatches(text)) expect(text.slice(ref.start, ref.end)).toBe(ref.raw);
+    const corpus = [
+      text,
+      '`` code ` [[proj:long]] `` [[org:plain]]',
+      '    [[proj:indented]]\n[[proj:active]]',
+      '~~~\n[[org:tilde]]\n~~~\n[[org:after]]',
+      '` unmatched [[proj:before]]\n```\n[[proj:block]]\n```\n[[proj:after]] `',
+      '\\\\[[PROJ:case/kept]] \\[[org:escaped]] [[proj:folder/*]]',
+    ];
+    for (const sample of corpus) expect(helpers.wikiRefMatches(sample)).toEqual(scanWikiRefs(sample));
+  });
+
+  it('decorates and links every editor surface through the shared wiring', () => {
+    expect(app).toContain('wireWikiRefDecoration(ta, projectId, signal)');
+    expect(app).toContain("window.open(wikiRefHref(ref, projectId), '_blank', 'noopener')");
+    expect(app).toContain("querySelector('textarea[data-field=\"prompt\"]')");
+    expect(app).toContain("querySelectorAll('.cf-prompt')");
+    expect(app).toContain("querySelector('.followup-input')");
+    expect(css).toContain('.wiki-ref-backdrop .wiki-ref');
+  });
+
   it('scopes its listeners so re-rendered textareas do not leak', () => {
     const fn = app.slice(app.indexOf('function wireWikiMention('), app.indexOf('// ── the path-as-title control'));
     expect(fn).toContain('new AbortController()');

@@ -16,6 +16,7 @@ import {
   buildWikiPromptContext,
   parseFrontmatter,
   parseWikiRefs,
+  scanWikiRefs,
   resolveWikiRefs,
   safeWikiPath,
   wikiRoot,
@@ -166,9 +167,9 @@ describe('labels / importance frontmatter', () => {
   });
 });
 
-describe('wiki refs (@proj:… / @org:… tags) and suggestions', () => {
-  it('parses page / label / folder tags, ignoring surrounding punctuation', () => {
-    const refs = parseWikiRefs('See @proj:guides/e2e-runbook and @org:tag:security, plus @proj:guides/* — done. a@b.com untouched');
+describe('wiki refs ([[proj:…]] / [[org:…]]) and suggestions', () => {
+  it('parses page / label / folder references next to ordinary punctuation', () => {
+    const refs = parseWikiRefs('See ([[proj:guides/e2e-runbook]]) and [[org:tag:security]], plus [[proj:guides/*]] — done.');
     expect(refs).toEqual([
       { scope: 'project', kind: 'page', value: 'guides/e2e-runbook' },
       { scope: 'organization', kind: 'label', value: 'security' },
@@ -176,19 +177,39 @@ describe('wiki refs (@proj:… / @org:… tags) and suggestions', () => {
     ]);
   });
 
-  it('ignores @ that is mid-word, escaped, or inside code spans', () => {
-    // Only a tag at the start or right after whitespace counts.
-    expect(parseWikiRefs('email a@proj:x, path b/@proj:y, escaped \\@proj:z, paren (@proj:w')).toEqual([]);
-    // Inline `code` and fenced ```blocks``` are stripped before scanning.
-    expect(parseWikiRefs('use `@proj:in-code` here')).toEqual([]);
-    expect(parseWikiRefs('```\n@proj:in-fence\n```\nbut @proj:live counts')).toEqual([
+  it('ignores escaped references and every Markdown code form', () => {
+    expect(parseWikiRefs('escaped \\[[proj:no]] but \\\\[[proj:yes]]')).toEqual([
+      { scope: 'project', kind: 'page', value: 'yes' },
+    ]);
+    expect(parseWikiRefs('use `[[proj:inline]]` and `` code ` [[org:long]] `` here')).toEqual([]);
+    expect(parseWikiRefs('```ts\n[[proj:fenced]]\n````\nstill fenced\n```\n[[proj:also-fenced]]')).toEqual([]);
+    expect(parseWikiRefs('   ~~~~ name\n[[org:tilde-fence]]\n~~~~\nbut [[proj:live]] counts')).toEqual([
       { scope: 'project', kind: 'page', value: 'live' },
     ]);
-    // Start-of-string and newline-led tags still count.
-    expect(parseWikiRefs('@proj:first\n@org:tag:second')).toEqual([
+    expect(parseWikiRefs('    [[proj:indented-code]]\n\t[[org:tab-code]]\n[[proj:plain]]')).toEqual([
+      { scope: 'project', kind: 'page', value: 'plain' },
+    ]);
+    expect(parseWikiRefs('` unmatched before fence [[proj:before]]\n```\n[[proj:fenced]]\n```\n[[proj:after]] `')).toEqual([
+      { scope: 'project', kind: 'page', value: 'before' },
+      { scope: 'project', kind: 'page', value: 'after' },
+    ]);
+    // An unmatched inline delimiter is ordinary Markdown text; an unmatched
+    // fenced delimiter owns the rest of the document.
+    expect(parseWikiRefs('` unmatched [[proj:live]]')).toEqual([
+      { scope: 'project', kind: 'page', value: 'live' },
+    ]);
+    expect(parseWikiRefs('```\n[[proj:not-live]]')).toEqual([]);
+    expect(parseWikiRefs('[[PROJ:first]]\n[[org:tag:second]]')).toEqual([
       { scope: 'project', kind: 'page', value: 'first' },
       { scope: 'organization', kind: 'label', value: 'second' },
     ]);
+  });
+
+  it('reports exact source ranges for editor decoration and click targets', () => {
+    const text = 'before [[proj:guides/a]] after';
+    const [match] = scanWikiRefs(text);
+    expect(match).toMatchObject({ start: 7, end: 24, raw: '[[proj:guides/a]]', value: 'guides/a' });
+    expect(text.slice(match!.start, match!.end)).toBe(match!.raw);
   });
 
   it('resolves a page, a folder subtree, and a label into the pages they name', () => {
@@ -198,14 +219,14 @@ describe('wiki refs (@proj:… / @org:… tags) and suggestions', () => {
       writeWikiPage(root, 'guides/sub/b', '---\ndescription: d\n---\nx');
       writeWikiPage(root, 'loose', '---\nlabels: security\n---\nx');
       const tree = listWiki(root);
-      const page = resolveWikiRefs(parseWikiRefs('@proj:guides/a'), 'project', root, tree);
+      const page = resolveWikiRefs(parseWikiRefs('[[proj:guides/a]]'), 'project', root, tree);
       expect(page).toEqual(['guides/a']);
-      const folder = resolveWikiRefs(parseWikiRefs('@proj:guides/*'), 'project', root, tree).sort();
+      const folder = resolveWikiRefs(parseWikiRefs('[[proj:guides/*]]'), 'project', root, tree).sort();
       expect(folder).toEqual(['guides/a', 'guides/sub/b']);
-      const label = resolveWikiRefs(parseWikiRefs('@proj:tag:security'), 'project', root, tree).sort();
+      const label = resolveWikiRefs(parseWikiRefs('[[proj:tag:security]]'), 'project', root, tree).sort();
       expect(label).toEqual(['guides/a', 'loose']);
       // Scope-mismatched refs and non-existent pages resolve to nothing.
-      expect(resolveWikiRefs(parseWikiRefs('@org:guides/a @proj:nope'), 'project', root, tree)).toEqual([]);
+      expect(resolveWikiRefs(parseWikiRefs('[[org:guides/a]] [[proj:nope]]'), 'project', root, tree)).toEqual([]);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -477,8 +498,8 @@ describe('a page may not be created on top of a section', () => {
 });
 
 describe('wiki refs are matched case-insensitively', () => {
-  it('parses @PROJ:/@Org: the way the UI keeps them', () => {
-    expect(parseWikiRefs('see @PROJ:guides/one and @Org:tag:Default')).toEqual([
+  it('parses [[PROJ:…]]/[[Org:…]] while preserving path and label case', () => {
+    expect(parseWikiRefs('see [[PROJ:guides/one]] and [[Org:tag:Default]]')).toEqual([
       { scope: 'project', kind: 'page', value: 'guides/one' },
       { scope: 'organization', kind: 'label', value: 'Default' },
     ]);
@@ -511,7 +532,7 @@ describe('buildWikiPromptContext', () => {
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
 
-  it('inlines the pages a task tags in its prompt (`@proj:…`/`@org:…`) in full', () => {
+  it('inlines the pages a task references in its prompt (`[[proj:…]]`/`[[org:…]]`) in full', () => {
     const contentDir = tmp();
     try {
       const orgRoot = wikiRoot(contentDir, 'organization', 'org1');
@@ -525,12 +546,12 @@ describe('buildWikiPromptContext', () => {
       expect(plain).not.toContain('Deploy body.');
       expect(plain).not.toContain('Threat model body.');
       // Tagged: a project folder + an org label are both inlined in full.
-      const tagged = buildWikiPromptContext({ ...base, taggedText: 'Do the deploy @proj:runbooks/* using @org:tag:security' });
+      const tagged = buildWikiPromptContext({ ...base, taggedText: 'Do the deploy [[proj:runbooks/*]] using [[org:tag:security]]' });
       expect(tagged).toContain('Deploy body.');
       expect(tagged).toContain('Rollback body.');
       expect(tagged).toContain('Threat model body.');
       // The wiki-context field inlines the same way, independent of the prompt.
-      const viaField = buildWikiPromptContext({ ...base, contextTokens: ['@proj:runbooks/deploy'] });
+      const viaField = buildWikiPromptContext({ ...base, contextTokens: ['[[proj:runbooks/deploy]]'] });
       expect(viaField).toContain('Deploy body.');
       expect(viaField).not.toContain('Rollback body.');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
@@ -749,7 +770,7 @@ describe('project wiki git branches', () => {
         contentDir,
         projectId: 'p1',
         projectRoot: taskRoot,
-        contextTokens: ['@proj:rules/review'],
+        contextTokens: ['[[proj:rules/review]]'],
       });
       expect(prompt).toContain('Task-branch instructions.');
       expect(prompt).not.toContain('Canonical instructions.');
@@ -922,7 +943,7 @@ describe('remote task wiki views', () => {
           projectId: project.id,
           project: {},
           title: task.title,
-          prompt: 'Follow @proj:notes/prompt',
+          prompt: 'Follow [[proj:notes/prompt]]',
           workflow: 'software-dev',
         } as any,
       });

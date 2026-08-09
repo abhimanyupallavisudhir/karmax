@@ -259,7 +259,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
         + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
         + '`tags` accepts names or `a/b` paths and creates missing ones. '
-        + 'To inline wiki context into the new task, pass wikiContext: an array of `@proj:…`/`@org:…` tokens — a page (@proj:guides/deploy), a whole label (@proj:tag:security), or a folder (@proj:runbooks/*). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
+        + 'To inline wiki context into the new task, pass wikiContext: an array of `[[proj:…]]`/`[[org:…]]` references — a page ([[proj:guides/deploy]]), a whole label ([[proj:tag:security]]), or a folder ([[proj:runbooks/*]]). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
       inputSchema: {
         projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional(),
         wikiContext: z.array(z.string()).optional(),
