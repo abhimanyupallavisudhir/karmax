@@ -494,6 +494,64 @@ describe('GitHub-authoritative merge activity', () => {
     );
   });
 
+  it('reconciles concurrent canonical and task edits after a project-wiki PR merge', async () => {
+    const repo = await repoWithGithubOrigin('wiki-divergence-after-merge');
+    const writer = path.join(tmp, 'wiki-provider-writer');
+    await gitOrThrow(tmp, ['clone', '-q', path.join(tmp, 'wiki-divergence-after-merge-origin.git'), writer]);
+    await ensureIdentity(writer);
+
+    fs.writeFileSync(path.join(repo, 'canonical-memory.md'), 'saved through the live wiki\n');
+    await gitOrThrow(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'wiki: update canonical-memory']);
+
+    fs.writeFileSync(path.join(writer, 'task-memory.md'), 'landed through Review\n');
+    await gitOrThrow(writer, ['add', '-A']);
+    await gitOrThrow(writer, ['commit', '-q', '-m', 'wiki: update task-memory']);
+    await gitOrThrow(writer, ['push', '-q', 'origin', 'main']);
+    const landedSha = (await gitOrThrow(writer, ['rev-parse', 'HEAD'])).trim();
+
+    const fetcher = (async () => Response.json({
+      number: 93, html_url: 'https://github.test/acme/widgets/pull/93', state: 'closed', merged: true,
+      merged_at: '2026-08-09T00:00:00Z', merge_commit_sha: landedSha,
+      head: { ref: 'karmax/task_wiki', sha: landedSha }, base: { ref: 'main' },
+    })) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+      brokerCredentials: async () => ({ env: {} }),
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Wiki divergence');
+    const wiki = core.store.upsertRepository({
+      organizationId: project.organizationId!, provider: 'github', providerId: 'wiki-93',
+      owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
+    });
+    core.store.setProjectWikiRepository(project.id, wiki.id);
+    const task = core.store.createTask({ projectId: project.id, title: 'Merge wiki memory', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const handle = {
+      id: task.id, kind: 'worktree', root: repo, workdir: repo, branch: 'karmax/task_wiki', base: 'main',
+      repo, meta: { projectId: project.id }, repos: [{ name: 'widgets', role: 'project-wiki', repo, root: repo,
+        branch: 'karmax/task_wiki', base: 'main', target: 'main', localPath: repo, sourceAuthority: 'origin' }],
+    } as any;
+    const ref: TaskPullRequest = { repo: 'widgets', slug: SLUG, number: 93,
+      url: 'https://github.test/acme/widgets/pull/93', state: 'open', headSha: landedSha };
+
+    await expect(core.mergeGithubPrs(handle, [ref])).resolves.toMatchObject({ status: 'merged' });
+    expect(fs.readFileSync(path.join(repo, 'canonical-memory.md'), 'utf8')).toBe('saved through the live wiki\n');
+    expect(fs.readFileSync(path.join(repo, 'task-memory.md'), 'utf8')).toBe('landed through Review\n');
+    const reconciledSha = (await gitOrThrow(repo, ['rev-parse', 'main'])).trim();
+    expect((await gitOrThrow(repo, ['rev-list', '--parents', '-n', '1', reconciledSha])).trim().split(' ')).toHaveLength(3);
+    const origin = path.join(tmp, 'wiki-divergence-after-merge-origin.git');
+    expect((await gitOrThrow(origin, ['show', 'main:canonical-memory.md'])).trim()).toBe('saved through the live wiki');
+    expect((await gitOrThrow(origin, ['show', 'main:task-memory.md'])).trim()).toBe('landed through Review');
+    const events = core.store.eventsSince(task.id, 0).map((event: any) => event.type);
+    expect(events).toEqual(expect.arrayContaining(['checkout.synced', 'merge.result']));
+    expect(events).not.toContain('checkout.sync-blocked');
+  });
+
   it('completes an authoritative provider merge while preserving a dirty local target checkout', async () => {
     const repo = await repoWithGithubOrigin('dirty-mirror-after-merge');
     const writer = path.join(tmp, 'dirty-provider-writer');

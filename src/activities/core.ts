@@ -53,7 +53,7 @@ import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { paths } from '../config/paths.js';
-import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
+import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
@@ -525,9 +525,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   /** Mirror a provider-owned PR target back into the configured host checkout.
    * GitHub may be the protected-history authority while the local checkout is
-   * still the source this Karmax process loaded. A task is not locally complete
-   * until that branch is a clean fast-forward mirror; a divergent/dirty target
-   * is preserved and surfaced outside every merge queue. */
+   * still the source this Karmax process loaded. Project-wiki histories are the
+   * exception to the ordinary fast-forward-only rule: canonical UI edits and a
+   * task PR may legitimately advance the two sides concurrently, so reconcile
+   * and publish both histories through the wiki's serialized mutation lane.
+   * Ordinary repositories still preserve divergent/dirty targets for explicit
+   * operator reconciliation. */
   async function syncGithubTargetToLocal(
     handle: WorldHandle,
     ref: TaskPullRequest,
@@ -541,6 +544,64 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     const repository = await enrolledRepositoryForCheckout(handle, checkout);
     const trackingRef = `refs/remotes/origin/${target}`;
+    const finish = async (initial: LocalTargetSyncResult, source: string): Promise<LocalTargetSyncResult> => {
+      let result = initial;
+      if (result.coherent && expectedLandedSha) {
+        const containsLanding = await hostGit(authority, [
+          'merge-base', '--is-ancestor', expectedLandedSha, trackingRef,
+        ]);
+        if (containsLanding.code !== 0) result = {
+          coherent: false,
+          retryable: true,
+          target,
+          sha: result.sha,
+          checkout: result.checkout,
+          detail: `GitHub reports ${expectedLandedSha} landed, but ${source} does not contain it yet.`,
+        };
+      }
+      record(handle.id, result.coherent ? 'checkout.synced' : 'checkout.sync-blocked', {
+        repo: checkout.name,
+        target,
+        sha: result.sha,
+        updated: result.updated,
+        checkout: result.checkout ?? authority,
+        detail: result.detail,
+      });
+      if (result.coherent) {
+        // The live-restart loop keys off the same event as deterministic local
+        // landing. It can now restart npm-start Karmax after a GitHub PR advances
+        // the checkout this process loaded, instead of continuing on stale code.
+        record(handle.id, 'merge.result', {
+          merged: true,
+          sha: result.sha,
+          target,
+          checkout: result.checkout ?? authority,
+          provider: 'github',
+        });
+      }
+      return result;
+    };
+
+    if (checkout.role === 'project-wiki' && target === PROJECT_WIKI_BRANCH && repository && deps.githubApp) {
+      let result: LocalTargetSyncResult;
+      try {
+        await setProjectWikiRemote(authority, repository.sshUrl,
+          await deps.githubApp.brokerCredentials(repository));
+        // Reconciliation fetches, merges, and pushes origin/main. Reuse the
+        // ordinary mirror check to verify the checkout and tracking ref ended
+        // at the same clean commit before announcing local coherence.
+        result = await syncLocalTarget(authority, target, trackingRef);
+      } catch (error) {
+        result = {
+          coherent: false,
+          target,
+          checkout: authority,
+          detail: `GitHub merged the project-wiki pull request, but Karmax could not reconcile concurrent canonical and task edits: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      return finish(result, 'the reconciled project wiki');
+    }
+
     const fetched = await hostGitWithRepositoryCredential(repository, authority, [
       'fetch', '--no-tags', 'origin', `+refs/heads/${target}:${trackingRef}`,
     ], { GIT_TERMINAL_PROMPT: '0', ...gitEnvFor(handle, handle.id) });
@@ -553,43 +614,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       };
     }
 
-    let result = await syncLocalTarget(authority, target, trackingRef);
-    if (result.coherent && expectedLandedSha) {
-      const containsLanding = await hostGit(authority, [
-        'merge-base', '--is-ancestor', expectedLandedSha, trackingRef,
-      ]);
-      if (containsLanding.code !== 0) {
-        result = {
-          coherent: false,
-          retryable: true,
-          target,
-          sha: result.sha,
-          checkout: result.checkout,
-          detail: `GitHub reports ${expectedLandedSha} landed, but the fetched origin/${target} does not contain it yet.`,
-        };
-      }
-    }
-    record(handle.id, result.coherent ? 'checkout.synced' : 'checkout.sync-blocked', {
-      repo: checkout.name,
-      target,
-      sha: result.sha,
-      updated: result.updated,
-      checkout: result.checkout ?? authority,
-      detail: result.detail,
-    });
-    if (result.coherent) {
-      // The live-restart loop keys off the same event as deterministic local
-      // landing. It can now restart npm-start Karmax after a GitHub PR advances
-      // the checkout this process loaded, instead of continuing on stale code.
-      record(handle.id, 'merge.result', {
-        merged: true,
-        sha: result.sha,
-        target,
-        checkout: result.checkout ?? authority,
-        provider: 'github',
-      });
-    }
-    return result;
+    return finish(await syncLocalTarget(authority, target, trackingRef), `the fetched origin/${target}`);
   }
 
   /** Static-token compatibility for PR operations. Human work first resolves
