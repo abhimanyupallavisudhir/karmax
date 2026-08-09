@@ -107,6 +107,7 @@ describe('GitHub App integration', () => {
     // Installation events arrive automatically; the PR lifecycle must be asked for.
     expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group']);
     expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'read');
+    expect(manifest.manifest).toHaveProperty('default_permissions.actions', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.statuses', 'read');
     expect(manifest.manifest).not.toHaveProperty('default_permissions.administration');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');

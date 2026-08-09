@@ -83,6 +83,7 @@ import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platfor
 const DEFAULT_GRANT = [
   'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
   'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+  'github:actions:read',
 ];
 
 // A confirmer belongs to a logical task, so sibling attempts must not review in

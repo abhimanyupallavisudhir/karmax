@@ -52,6 +52,7 @@ import { itemHandle } from '../autonomy/vault-items.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
+import type { GithubActionsStatus } from '../integrations/github-actions.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -2728,6 +2729,91 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
     return this.deps.store.eventsSince(taskId, since, limit);
+  }
+
+  /** Resolve an Actions request through the calling task's project attachment.
+   * Repository names supplied in prompts are never an authority source. */
+  private githubActionsTask(token: string, tool: 'list_github_actions_runs' | 'inspect_github_actions_run'
+    | 'manage_github_actions_run' | 'dispatch_github_actions_workflow', repositoryRef?: string) {
+    const caller = this.require(token, tool);
+    if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
+    const task = this.deps.store.getTask(caller.taskId);
+    if (!task) throw new NotFoundError('calling task not found');
+    this.require(token, tool, { projectId: task.projectId, taskId: task.id });
+    if (!this.deps.githubApp) throw new Error('Connect GitHub in organization settings, then try again.');
+    const linked = this.deps.store.listProjectRepositories(task.projectId).map((entry) => entry.repository)
+      .filter((repository) => repository.provider === 'github' && repository.gitConnectionId);
+    if (!linked.length) throw new Error('This project has no attached GitHub repository with an active App installation.');
+    const selector = repositoryRef?.trim().toLowerCase();
+    let matches = linked;
+    if (selector) matches = linked.filter((repository) => repository.id.toLowerCase() === selector
+      || repository.name.toLowerCase() === selector
+      || `${repository.owner}/${repository.name}`.toLowerCase() === selector);
+    if (!selector && linked.length > 1)
+      throw new Error('repository is required because this project has more than one attached GitHub repository');
+    if (!matches.length) throw new NotFoundError('repository is not attached to the calling task’s project');
+    if (matches.length > 1) throw new Error('repository name is ambiguous; use owner/name or the repository id');
+    const repository = matches[0]!;
+    return { task, repository, api: this.deps.githubApp.actions(repository) };
+  }
+
+  private githubActionsEvent(taskId: string, type: string, payload: Record<string, unknown>): void {
+    const event = { taskId, type, ts: Date.now(), payload };
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus?.emit({ ...event, seq });
+  }
+
+  async listGithubActionsRuns(token: string, input: { repository?: string; branch?: string; event?: string;
+    status?: GithubActionsStatus; workflow?: string | number; page?: number; perPage?: number }) {
+    const { task, repository, api } = this.githubActionsTask(token, 'list_github_actions_runs', input.repository);
+    const result = await api.listRuns(`${repository.owner}/${repository.name}`, input);
+    this.githubActionsEvent(task.id, 'github.actions.runs-read', {
+      repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`,
+      page: result.page, returned: result.runs.length,
+      ...(input.branch ? { branch: input.branch } : {}), ...(input.workflow ? { workflow: input.workflow } : {}),
+    });
+    return result;
+  }
+
+  async inspectGithubActionsRun(token: string, input: { repository?: string; runId: number }) {
+    const { task, repository, api } = this.githubActionsTask(token, 'inspect_github_actions_run', input.repository);
+    const result = await api.inspectFailure(`${repository.owner}/${repository.name}`, input.runId);
+    this.githubActionsEvent(task.id, 'github.actions.run-inspected', {
+      repositoryId: repository.id, slug: `${repository.owner}/${repository.name}`, runId: input.runId,
+      jobs: result.jobs.length, failedJobs: result.failedJobs.length, artifacts: result.artifacts.length,
+      logBytes: result.failedJobs.reduce((total, job) => total + (job.log?.downloadedBytes ?? 0), 0),
+    });
+    return result;
+  }
+
+  async manageGithubActionsRun(token: string, input: {
+    repository?: string; runId: number; action: 'rerun-failed' | 'rerun' | 'cancel';
+  }) {
+    if (!['rerun-failed', 'rerun', 'cancel'].includes(input.action))
+      throw new Error('action must be rerun-failed, rerun, or cancel');
+    const { task, repository, api } = this.githubActionsTask(token, 'manage_github_actions_run', input.repository);
+    const slug = `${repository.owner}/${repository.name}`;
+    const result = input.action === 'cancel'
+      ? await api.cancel(slug, input.runId)
+      : await api.rerun(slug, input.runId, input.action === 'rerun-failed');
+    this.githubActionsEvent(task.id, 'github.actions.run-operated', {
+      repositoryId: repository.id, slug, runId: input.runId, action: input.action,
+    });
+    return result;
+  }
+
+  async dispatchGithubActionsWorkflow(token: string, input: {
+    repository?: string; workflow: string | number; ref: string;
+    inputs?: Record<string, string | number | boolean>;
+  }) {
+    const { task, repository, api } = this.githubActionsTask(token, 'dispatch_github_actions_workflow', input.repository);
+    const slug = `${repository.owner}/${repository.name}`;
+    const result = await api.dispatch(slug, input.workflow, input.ref, input.inputs);
+    this.githubActionsEvent(task.id, 'github.actions.workflow-dispatched', {
+      repositoryId: repository.id, slug, workflow: input.workflow, ref: input.ref,
+      inputNames: Object.keys(input.inputs ?? {}).sort(),
+    });
+    return result;
   }
 
   // ─── Search & organization (task search / views — PLAN-search-views) ─────────
