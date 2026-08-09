@@ -143,8 +143,8 @@ organization-invitation flow, which is already token-hash validated.
 The deployment object store remains the control-plane default: portable world
 checkpoints, promoted artifacts, and organizations that need no special setup use
 operator storage. Versioned project resources can instead select an
-organization-owned S3-compatible location under **Organization settings → Data
-storage**. The bucket configuration is safe metadata; access keys live only in
+organization-owned S3-compatible location under **Organization settings →
+Projects → Data storage**. The bucket configuration is safe metadata; access keys live only in
 the encrypted credential broker. A connection must pass a write/read/delete
 probe before it can become the organization default.
 
