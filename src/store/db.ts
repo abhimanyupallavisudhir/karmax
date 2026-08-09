@@ -816,6 +816,16 @@ export class Store {
     );
   }
 
+  renameProject(id: string, name: string): Project {
+    const existing = this.getProject(id);
+    if (!existing) throw new Error(`no project ${id}`);
+    const nextName = name.trim();
+    if (!nextName) throw new Error('project name is required');
+    assertRoutableName('project', nextName);
+    this.db.prepare('UPDATE projects SET name = ? WHERE id = ?').run(nextName, id);
+    return { ...existing, name: nextName };
+  }
+
   /** Move a project so it sits immediately before `beforeProjectId` in the sidebar,
    * or last when that is omitted/unknown. Only the moved project's own organization
    * is touched, and its rows are re-densified to 0…n-1 so repeated drags stay stable.
@@ -1033,6 +1043,15 @@ export class Store {
   getOrganization(id: string): Organization | undefined {
     const r = this.db.prepare('SELECT * FROM organizations WHERE id = ?').get(id) as any;
     return r ? rowToOrganization(r) : undefined;
+  }
+
+  renameOrganization(id: string, name: string): Organization {
+    const existing = this.getOrganization(id);
+    if (!existing) throw new Error(`no organization ${id}`);
+    const nextName = name.trim();
+    if (!nextName) throw new Error('organization name is required');
+    this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(nextName, id);
+    return { ...existing, name: nextName };
   }
 
   listOrganizations(userId?: string): Organization[] {

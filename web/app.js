@@ -8886,7 +8886,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-access="project" hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -8919,10 +8919,10 @@ function settingsView(proj) {
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div></div>
-    <div class="settings-section-title" id="project-advanced" data-settings-access="project" hidden><div>Advanced</div></div>
-    <div class="card" data-settings-access="project" hidden style="border-color:var(--danger-weak)">
-      <div class="section-h" style="color:var(--danger)">Danger zone</div>
-      <button class="btn danger" id="delete-project">Delete project</button>
+    <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="card" data-settings-advanced hidden>
+      <div class="section-h" data-settings-access="project" hidden>Project name</div>
+      <div class="inline-form"><input id="project-name" value="${esc(proj.name)}" aria-label="Project name" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save name</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
     </div></div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
@@ -9416,6 +9416,20 @@ function wireSettingsView(proj) {
     }),
   );
   wirePaymentsCard('project', proj.id, proj.organizationId);
+  const renameProject = async () => {
+    const name = $('#project-name')?.value.trim();
+    if (!name) return toast('Project name is required', true);
+    try {
+      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+      await loadProjects();
+      toast('Project renamed');
+      await go(`${projectRoute(proj.id, 'settings')}${location.hash}`, { replace: true });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#rename-project')?.addEventListener('click', renameProject);
+  $('#project-name')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
+  });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -12179,7 +12193,10 @@ function organizationView() {
         <p class="data-export-note">Passwords, tokens, and stored credentials are never included.</p></div>
       <button class="btn sm" id="export-organization" type="button">Export organization data</button>
     </div>
-    ${org?.kind === 'team' ? '<details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Delete organization</b><span>Permanently remove this organization and its data</span></summary><p class="task-sub">This cannot be undone. Export the organization first if you need to keep a copy.</p><button class="btn sm danger" id="delete-organization">Delete organization</button></details>' : ''}
+    <div class="card" data-settings-access="organization" hidden>
+      <div class="section-h">Organization name</div>
+      <div class="inline-form"><input id="organization-name" value="${esc(org?.name || '')}" aria-label="Organization name"><button class="btn sm primary" id="rename-organization">Save name</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div>
+    </div>
     </div></div></div>`;
 }
 
@@ -12396,6 +12413,21 @@ async function hydrateOrganizationView() {
     block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   });
   $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+  const renameOrganization = async () => {
+    const name = $('#organization-name')?.value.trim();
+    if (!name) return toast('Organization name is required', true);
+    try {
+      await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+      await loadOrganizations();
+      toast('Organization renamed');
+      renderShell();
+      renderMain();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#rename-organization')?.addEventListener('click', renameOrganization);
+  $('#organization-name')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); renameOrganization(); }
+  });
   $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
 }
 
