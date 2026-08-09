@@ -55,6 +55,7 @@ eval(extractConst('ORG_VIEWS'));
 eval(extractFn('slugify'));
 eval(extractFn('projectSlug'));
 eval(extractFn('projectById'));
+eval(extractFn('firstProjectForOrganization'));
 eval(extractFn('projectBySlug'));
 eval(extractFn('orgSlug'));
 eval(extractFn('organizationById'));
@@ -84,6 +85,8 @@ eq(projectRoute('P1'), '/acme/website-redesign', 'project tasks route omits the 
 eq(projectRoute('P1', 'queue'), '/acme/website-redesign/queue', 'a non-default project tab is appended');
 eq(projectRoute('P1', 'settings'), '/acme/website-redesign/settings', 'project settings route');
 eq(projectRoute('P2'), '/globex/mobile-app', 'project route uses the project’s OWN org, not the current one');
+eq(firstProjectForOrganization('org_globex')?.id, 'P2', 'project fallback skips an earlier project from another organization');
+eq(firstProjectForOrganization('org_missing'), undefined, 'project fallback does not borrow a project from another organization');
 eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under /<org>/<project>/tasks/:num');
 eq(globalRoute('dashboard'), '/acme/dashboard', 'dashboard route is org-prefixed');
 eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
