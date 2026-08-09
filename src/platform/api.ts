@@ -186,8 +186,11 @@ function assertInMergeDomain(task: TaskRecord, domain: string): void {
 /** A failed execution is terminal, but a recoverable workflow can start a
  * replacement run from its persisted world/conversation checkpoint. These mirror
  * escalation's controls; signalTask gives them terminal-aware semantics. */
+const RETRY_ACTION = (): TaskView['actions'][number] =>
+  ({ name: 'retry', kind: 'signal', label: 'Retry', enabled: true });
+
 const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
-  { name: 'retry', kind: 'signal', label: 'Retry', enabled: true },
+  RETRY_ACTION(),
   {
     name: 'followUp',
     kind: 'signal',
@@ -1863,14 +1866,31 @@ export class KarmaxApi {
    * edit; roles prevents an unrelated, stale conversation from accepting input.
    */
   private lifecycleActions(view: TaskView): TaskView['actions'] {
+    const actions = [...view.actions];
+    // software-dev's infrastructure path deliberately remains in its public
+    // stage while it backs off, and its retry signal can wake that timer early.
+    // The workflow used to advertise Retry only after the outage exhausted every
+    // backoff and escalated, making its already-supported early recovery signal
+    // unreachable from the UI (task #5). Project it here instead of changing the
+    // deterministic workflow so already-running version-pinned executions are
+    // repaired too. Match the workflow-owned retry message narrowly: an ordinary
+    // Do error must not acquire a control that has no corresponding parked wait.
+    const infrastructureBackoff = RECOVERABLE_WORKFLOWS.has(view.workflow)
+      && (view.status === 'active' || view.status === 'waiting')
+      && view.waitingFor?.kind !== 'human'
+      && view.error?.startsWith('infrastructure: ')
+      && / — retrying .+ in \d+s \(\d+\/\d+\)$/.test(view.error);
+    if (infrastructureBackoff && !actions.some((action) => action.name === 'retry'))
+      actions.unshift(RETRY_ACTION());
+
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
     if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
-      return view.actions;
+      return actions;
     const role = this.humanHoldRole(view);
-    const actions = view.actions
+    const heldActions = actions
       .filter((action) => action.name !== 'followUp' && (action.name !== 'confirm' || origin === 'review'));
-    if (role) actions.splice(origin === 'review' ? 1 : 0, 0, FOLLOW_UP_ACTION(role));
-    return actions;
+    if (role) heldActions.splice(origin === 'review' ? 1 : 0, 0, FOLLOW_UP_ACTION(role));
+    return heldActions;
   }
 
   /** Honest action set for the short replacement-start window before first publish. */

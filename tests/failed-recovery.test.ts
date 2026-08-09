@@ -14,6 +14,48 @@ describe('failed software-dev recovery', () => {
   const dirs: string[] = [];
   afterEach(() => dirs.splice(0).forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
 
+  it('offers Retry while a live infrastructure backoff can be woken early', async () => {
+    const store = new Store(':memory:');
+    const tokens = new TokenAuthority();
+    const token = tokens.mint({
+      taskId: 'operator', profileId: 'do', principal: 'user:test',
+      ceiling: ['read-task', 'signal-task'], grantorCaps: ['read-task', 'signal-task'],
+    }).token;
+    const project = store.createProject('Infrastructure recovery');
+    const task = store.createTask({
+      projectId: project.id, title: 'Transient outage', workflow: 'software-dev',
+      workflowVersion: bundledVersion('software-dev'), params: { prompt: 'keep going' },
+    });
+    const actions = [
+      {
+        name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true,
+        args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
+      },
+      { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true },
+    ] as any;
+    const backoff = {
+      taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'do', status: 'active',
+      messages: [], actions, state: {}, updatedAt: 1,
+      error: 'infrastructure: E2B request handshake timed out — retrying do in 30s (1/5)',
+    } as any;
+    store.saveView(task.id, backoff);
+
+    const signals: string[] = [];
+    const client = { workflow: { getHandle: () => ({ signal: async (name: string) => void signals.push(name) }) } } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
+
+    const retryable = await api.getTaskView(token, task.id);
+    expect(retryable?.actions.map((action) => action.name)).toEqual(['retry', 'followUp', 'cancel']);
+    await api.signalTask(token, task.id, 'retry');
+    expect(signals).toEqual(['retry']);
+
+    // Retry is a control for the workflow's parked timer, not a generic Do
+    // action: an ordinary running/error snapshot must retain its original set.
+    store.saveView(task.id, { ...backoff, error: 'ordinary agent failure', updatedAt: 2 });
+    const ordinary = await api.getTaskView(token, task.id);
+    expect(ordinary?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
+  });
+
   /**
    * Regression: both recovery gates were bare `workflow === 'software-dev'`
    * string tests, so a Goal task — which delegates to the very same
