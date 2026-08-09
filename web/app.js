@@ -2866,8 +2866,10 @@ function renderMain() {
   // clears S.wikiEditing first.
   if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
-  const tabs = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', wiki: 'Wiki', settings: 'Project settings' };
+  // Activity remains available by direct URL for debugging, but is deliberately
+  // absent from user-facing navigation.
+  const tabs = ['tasks', 'queue', 'wiki', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: 'Project settings' };
   const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -12571,7 +12573,6 @@ const HOST_COMMANDS = [
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
-  { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
   { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g D', run: () => switchTab('dashboard') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },
