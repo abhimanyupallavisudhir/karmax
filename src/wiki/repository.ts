@@ -179,6 +179,12 @@ export function projectWikiBranchView(contentDir: string, projectId: string, ref
 async function reconcileProjectWikiRemote(root: string, remote: string, credential: GitCredential): Promise<void> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-auth-'));
   try {
+    // The canonical checkout is shared with the wiki editor. Its normal writes
+    // are committed before entering this serialized lane, so dirt here means an
+    // interrupted/manual operation that must be preserved rather than swept
+    // into an automatic remote reconciliation merge.
+    const status = git(root, ['status', '--porcelain']);
+    if (status) throw new Error(`canonical project wiki has uncommitted changes:\n${status}`);
     const { env } = materializeGitCredential(dir, credential);
     setRemote(root, remote);
     // A PR-policy task is landed by GitHub, so origin/main can legitimately be
