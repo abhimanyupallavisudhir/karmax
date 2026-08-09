@@ -137,8 +137,7 @@ function firstProjectForOrganization(organizationId) {
 function projectBySlug(slug, organizationId) {
   const s = slugify(slug);
   const pool = (S.projects || []).filter((p) => !organizationId || p.organizationId === organizationId);
-  return pool.find((p) => slugify(p.name) === s) || pool.find((p) => p.id === slug)
-    || (S.projects || []).find((p) => p.id === slug);
+  return pool.find((p) => slugify(p.name) === s) || pool.find((p) => p.id === slug);
 }
 
 // Organizations own the top path segment. They carry a persisted slug; fall back
@@ -166,6 +165,16 @@ function currentOrg() {
   return organizationById(S.organizationId)
     || organizationById(projectById(S.projectId)?.organizationId)
     || (S.organizations || [])[0];
+}
+
+// The shell outlives every in-app navigation, so changing route state does not
+// recreate its organization picker. Keep that persistent control aligned with
+// the organization whose data the route selected (including the initial deep
+// link and Back/Forward navigation).
+function syncOrganizationSwitcher() {
+  const switcher = $('#org-switcher');
+  const organization = currentOrg();
+  if (switcher && organization && switcher.value !== organization.id) switcher.value = organization.id;
 }
 // `/<org>` prefix for the current (or a given) organization; '' when none is known.
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
@@ -243,6 +252,16 @@ function globalRoute(tab, org = currentOrg()) {
   return `${orgBase(org)}/${seg}`;
 }
 
+// Destination for an explicit organization-picker selection. Build it from the
+// selected organization rather than mutating S first; applyRoute then performs
+// the context switch from the URL as the single source of truth.
+function organizationLandingRoute(organizationId) {
+  const organization = organizationById(organizationId);
+  if (!organization) return null;
+  const project = firstProjectForOrganization(organization.id);
+  return project ? projectRoute(project.id) : globalRoute('organization', organization);
+}
+
 function installationRoute() { return '/installation'; }
 
 // The profile belongs to the signed-in user, not to the selected organization.
@@ -318,9 +337,14 @@ async function applyRoute() {
     // Select the organization named in the URL (if any) before painting.
     if (r.org) {
       const org = organizationBySlug(r.org);
-      if (org && org.id !== S.organizationId) {
+      if (!org) { toast('Organization not found', true); return go('/', { replace: true }); }
+      const organizationChanged = org.id !== S.organizationId;
+      if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+      }
+      syncOrganizationSwitcher();
+      if (organizationChanged) {
         await loadCollaboration().catch(() => {});
         if (!routeIsCurrent()) return;
       }
@@ -356,11 +380,14 @@ async function applyRoute() {
     return;
   }
   // project / task routes → resolve the org + project (by name-slug) + optional open task
+  const previousOrganizationId = S.organizationId;
+  let routeOrganization = null;
   if (r.org) {
-    const org = organizationBySlug(r.org);
-    if (org) S.organizationId = org.id;
+    routeOrganization = organizationBySlug(r.org);
+    if (!routeOrganization) { toast('Organization not found', true); return go('/', { replace: true }); }
+    S.organizationId = routeOrganization.id;
   }
-  const proj = projectBySlug(r.slug, S.organizationId) || projectBySlug(r.slug);
+  const proj = projectBySlug(r.slug, routeOrganization?.id);
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
@@ -371,6 +398,11 @@ async function applyRoute() {
   }
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
+  syncOrganizationSwitcher();
+  if (S.organizationId !== previousOrganizationId) {
+    await loadCollaboration().catch(() => {});
+    if (!routeIsCurrent()) return;
+  }
   await loadOrganizationRuntimeCatalog();
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
@@ -2627,13 +2659,10 @@ function renderShell() {
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
-  $('#org-switcher')?.addEventListener('change', async (e) => {
+  $('#org-switcher')?.addEventListener('change', (e) => {
     if (e.target.value === '__new') return createOrganization();
-    S.organizationId = e.target.value;
-    const project = S.projects.find((p) => p.organizationId === S.organizationId);
-    S.projectId = project?.id || null;
-    await loadCollaboration().catch(() => {});
-    return go(project ? projectRoute(project.id) : globalRoute('organization'));
+    const route = organizationLandingRoute(e.target.value);
+    return route ? go(route) : syncOrganizationSwitcher();
   });
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
