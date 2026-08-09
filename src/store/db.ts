@@ -2422,6 +2422,18 @@ export class Store {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
   }
 
+  /** Archive/unarchive the logical task, regardless of which attempt initiated it.
+   * List and search surfaces project only the current principal attempt, so letting
+   * siblings carry different archive flags can put the same task in neither list
+   * (or the wrong one) depending on which attempt happens to be principal. */
+  setTaskArchived(taskOrIntentId: string, archived: boolean) {
+    const task = this.getTask(taskOrIntentId);
+    if (!task) return;
+    this.db.prepare(`UPDATE tasks
+      SET params = json_set(params, '$.archived', json(?))
+      WHERE intentId = ?`).run(archived ? 'true' : 'false', task.intentId ?? task.id);
+  }
+
   /** Re-pin a terminal task when recovery deliberately migrates it to a newer
    * compatible workflow implementation. Ordinary starts never rewrite pins. */
   setTaskWorkflowVersion(taskId: string, workflowVersion: string) {
