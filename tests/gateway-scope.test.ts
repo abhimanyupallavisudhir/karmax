@@ -40,6 +40,7 @@ describe('gateway request scope for bare-id routes', () => {
   let liveView: any;
   /** What the stub GitHub webhook handler throws on the next delivery. */
   let webhookFailure: Error | undefined;
+  let provisionedAs: { connectionId: string; userId: string; accountId?: string } | undefined;
 
   const auth = () => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
 
@@ -81,6 +82,14 @@ describe('gateway request scope for bare-id routes', () => {
       worlds: new WorldRegistry(),
       githubApp: {
         status: () => ({ userAuthorized: false }),
+        configured: () => true,
+        createRepository: async (connectionId: string, userId: string, input: any, options?: { accountId?: string }) => {
+          provisionedAs = { connectionId, userId, ...(options?.accountId ? { accountId: options.accountId } : {}) };
+          const connection = store.getGitConnection(connectionId)!;
+          return store.upsertRepository({ organizationId: connection.organizationId, provider: 'github', providerId: '77',
+            owner: connection.accountLogin, name: input.name, sshUrl: `git@github.com:${connection.accountLogin}/${input.name}.git`,
+            defaultBranch: 'main', private: input.private !== false, gitConnectionId: connection.id });
+        },
         handleWebhook: async () => {
           if (webhookFailure) throw webhookFailure;
           return { ok: true, events: [] };
@@ -141,6 +150,42 @@ describe('gateway request scope for bare-id routes', () => {
 
     const foreign = await fetch(`${base}/api/settings/access?projectId=${theirs}`, { headers: auth() });
     expect(foreign.status).toBe(403);
+  });
+
+  it('creates and attaches a repository through a Maintainer task’s pinned GitHub identity', async () => {
+    const organizationId = store.getProject(mine)!.organizationId!;
+    const project = store.createProject('Provisioned repository', {}, organizationId);
+    const connection = store.upsertGitConnection({ organizationId, provider: 'github', installationId: '42',
+      accountLogin: 'acme', accountType: 'Organization' });
+    const human = tokens.mintPrincipal('user:a', ['repository:read', 'repository:write'],
+      project.id, 60_000, organizationId);
+    const delegation = tokens.delegateHuman(human.token, {
+      taskId: 'task-repository-provisioning', projectId: project.id, organizationId,
+      externalIdentities: { githubAccountId: 'github-account-7' },
+    })!;
+    const maintainer = tokens.mint({ taskId: 'task-repository-provisioning', profileId: 'maintainer', role: 'do',
+      principal: 'user:a', projectId: project.id, organizationId,
+      ceiling: ['repository:read', 'repository:write'], grantorCaps: ['repository:read', 'repository:write'],
+      delegationId: delegation.id });
+    const headers = { authorization: `Bearer ${maintainer.token}`, 'content-type': 'application/json' };
+
+    const createdResponse = await fetch(`${base}/api/organizations/${organizationId}/repositories/create`, {
+      method: 'POST', headers, body: JSON.stringify({ gitConnectionId: connection.id, name: 'panagent',
+        description: 'Portable agent conversations', private: true }),
+    });
+    expect(createdResponse.status).toBe(200);
+    const repository: any = await createdResponse.json();
+    expect(repository).toMatchObject({ organizationId, name: 'panagent', private: true });
+    expect(provisionedAs).toEqual({ connectionId: connection.id, userId: 'a', accountId: 'github-account-7' });
+
+    const attachedResponse = await fetch(`${base}/api/projects/${project.id}/repositories`, {
+      method: 'POST', headers, body: JSON.stringify({ repositoryId: repository.id }),
+    });
+    expect(attachedResponse.status).toBe(200);
+    expect(store.listProjectRepositories(project.id)).toEqual([
+      expect.objectContaining({ projectId: project.id, repositoryId: repository.id,
+        repository: expect.objectContaining({ name: 'panagent' }) }),
+    ]);
   });
 
   it('renames only with edit authority in the matching project or organization', async () => {
