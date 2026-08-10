@@ -66,10 +66,20 @@ describe('Project settings browser source', () => {
     expect(settings).not.toContain('Agent-manageable by design');
   });
 
+  it('keeps organization repository and storage controls in one Projects pane', () => {
+    const organization = source.slice(source.indexOf('function organizationView('), source.indexOf('function pendingInvitationRow('));
+    expect(organization).toContain('<a href="#settings-code">Projects</a>');
+    expect(organization).not.toContain('<a href="#settings-storage">Data storage</a>');
+    expect(organization).toContain('id="settings-code"><div>Projects');
+    expect(organization).toContain('<div class="section-h">Git &amp; GitHub</div>');
+    expect(organization).toContain('<div class="section-h" id="settings-storage">Data storage</div>');
+  });
+
   it('explains data locations and the Data/Service/S3 boundary', () => {
     const data = source.slice(source.indexOf('async function hydrateProjectData('), source.indexOf('async function hydrateProjectServices('));
     const services = source.slice(source.indexOf('async function hydrateProjectServices('), source.indexOf('async function hydrateProjectEnvironment('));
     expect(data).toContain('Data or Service?');
+    expect(data).toContain('Storage field only decides where those encrypted revisions live');
     expect(data).toContain('Mount at path <small>(repo-relative)</small>');
     expect(data).toContain('Import from local path');
     expect(data).toContain('formatBytes(proposal.bytes)');

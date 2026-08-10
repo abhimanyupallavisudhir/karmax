@@ -1372,6 +1372,46 @@ export class Gateway {
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationStorage = p.match(/^\/api\/organizations\/([^/]+)\/storage(?:\/([^/]+))?(?:\/(test|default))?$/);
+      if (organizationStorage) {
+        const organizationId = organizationStorage[1]!;
+        const storage = this.deps.resources?.storageLocationService();
+        if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
+        if (!storage) return this.json(res, 503, { error: 'organization storage is unavailable' });
+        try {
+          if (method === 'GET' && !organizationStorage[2]) return this.json(res, 200, storage.list(organizationId));
+          if (method === 'POST' && !organizationStorage[2]) {
+            const b = await this.body(req);
+            const location = await storage.connectS3(organizationId, {
+              name: String(b.name ?? 'Customer S3'), endpoint: String(b.endpoint ?? ''), bucket: String(b.bucket ?? ''),
+              region: b.region == null ? undefined : String(b.region), prefix: b.prefix == null ? undefined : String(b.prefix),
+              accessKeyId: b.accessKeyId == null ? undefined : String(b.accessKeyId),
+              secretAccessKey: b.secretAccessKey == null ? undefined : String(b.secretAccessKey),
+              sessionToken: b.sessionToken == null ? undefined : String(b.sessionToken),
+            });
+            return this.json(res, 200, storage.view(organizationId, location.id));
+          }
+          const id = organizationStorage[2]!;
+          if (method === 'PUT' && organizationStorage[3] === 'default')
+            return this.json(res, 200, storage.view(organizationId, storage.setDefault(organizationId, id).id));
+          if (method === 'POST' && organizationStorage[3] === 'test')
+            return this.json(res, 200, storage.view(organizationId, (await storage.test(organizationId, id)).id));
+          if (method === 'PUT' && !organizationStorage[3]) {
+            const b = await this.body(req);
+            const location = await storage.connectS3(organizationId, { id,
+              name: String(b.name ?? 'Customer S3'), endpoint: String(b.endpoint ?? ''), bucket: String(b.bucket ?? ''),
+              region: b.region == null ? undefined : String(b.region), prefix: b.prefix == null ? undefined : String(b.prefix),
+              accessKeyId: b.accessKeyId == null ? undefined : String(b.accessKeyId),
+              secretAccessKey: b.secretAccessKey == null ? undefined : String(b.secretAccessKey),
+              sessionToken: b.sessionToken == null ? undefined : String(b.sessionToken),
+            });
+            return this.json(res, 200, storage.view(organizationId, location.id));
+          }
+          if (method === 'DELETE' && !organizationStorage[3]) {
+            storage.delete(organizationId, id); return this.json(res, 200, { deleted: true });
+          }
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       if (organizationMatch && method === 'PATCH') {
         const b = await this.body(req);
         if (typeof b.name !== 'string') return this.json(res, 400, { error: 'organization name is required' });
@@ -1431,6 +1471,9 @@ export class Gateway {
         await this.deps.githubApp?.disconnectOrganization(organizationId);
         for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
           this.deps.providerConnections?.delete(organizationId, connection.provider);
+        const storageLocations = this.deps.resources?.storageLocationService();
+        for (const location of storageLocations?.list(organizationId) ?? [])
+          if (location.kind === 's3') storageLocations!.delete(organizationId, location.id);
         this.deps.resources?.deleteOrganizationKey(organizationId);
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
         const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
@@ -2276,6 +2319,9 @@ export class Gateway {
               target: normalizeResourceTarget(b.target, driver, String(b.name ?? 'resource')),
               access: b.access === 'write' ? 'write' : 'read', isolation: b.isolation === 'shared' ? 'shared' : 'fork',
               source: b.source && typeof b.source === 'object' ? b.source : {}, credentialHandles,
+              storageLocationId: isSnapshotResourceDriver(driver)
+                ? this.deps.resources.storageLocationFor(project.organizationId, b.storageLocationId == null ? undefined : String(b.storageLocationId))
+                : undefined,
               publish: b.publish === 'review' ? 'review' : 'discard' });
             let revision;
             if (isSnapshotResourceDriver(driver)) {
@@ -2350,6 +2396,9 @@ export class Gateway {
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
               ...(b.source && typeof b.source === 'object' ? { source: b.source } : {}),
+              ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
+                ? { storageLocationId: this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId)) }
+                : {}),
               ...(b.credentialHandles ? { credentialHandles: b.credentialHandles } : {}),
             });
             if (secretUpdate) this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value);
@@ -2387,11 +2436,16 @@ export class Gateway {
         if (!resource || resource.projectId !== resourceUploadCreate[1]) return this.json(res, 404, { error: 'resource not found' });
         if (stagedResourceCandidate(resource)) return this.json(res, 409,
           { error: 'staged resource candidates cannot be modified before Review' });
-        if (!isSnapshotResourceDriver(resource.driver) || !this.deps.objects) return this.json(res, 400, { error: 'resumable uploads require a snapshot resource and object store' });
+        if (!isSnapshotResourceDriver(resource.driver) || !this.deps.objects || !this.deps.resources)
+          return this.json(res, 400, { error: 'resumable uploads require a snapshot resource and object store' });
+        await cleanupExpiredResourceUploads(store, this.deps.resources, this.deps.objects);
         const id = newId('resource-upload');
+        const storageLocationId = this.deps.resources.storageLocationFor(resource.organizationId, resource.storageLocationId);
         const upload: ResourceUploadSession = { id, organizationId: resource.organizationId, projectId: resource.projectId,
-          attachmentId: resource.id, files: {}, bytes: 0, createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60_000 };
+          attachmentId: resource.id, storageLocationId, files: {}, bytes: 0, createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60_000 };
         store.kvSet(resourceUploadKey(id), JSON.stringify(upload));
+        if (storageLocationId) this.deps.resources.storageLocationService()
+          ?.reserveUpload(id, resource.organizationId, storageLocationId, 0, upload.expiresAt);
         return this.json(res, 200, { id, partBytes: RESOURCE_UPLOAD_PART_BYTES, expiresAt: upload.expiresAt });
       }
       const resourceUpload = p.match(/^\/api\/resource-uploads\/([^/]+)$/);
@@ -2400,8 +2454,14 @@ export class Gateway {
           return this.json(res, 403, { error: 'task agents cannot modify durable project resource uploads directly' });
         const upload = resourceUploadSession(store, resourceUpload[1]!);
         if (!upload || upload.projectId !== url.searchParams.get('projectId')) return this.json(res, 404, { error: 'resource upload not found' });
-        if (!this.deps.objects || !this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
-        if (upload.expiresAt < Date.now()) return this.json(res, 410, { error: 'resource upload expired' });
+        if (!this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
+        const attachment = store.getResourceAttachment(upload.attachmentId);
+        if (!attachment || attachment.organizationId !== upload.organizationId) return this.json(res, 410, { error: 'resource upload target no longer exists' });
+        const uploadObjects = this.deps.resources.objectStoreFor({ ...attachment, storageLocationId: upload.storageLocationId });
+        if (upload.expiresAt < Date.now()) {
+          await discardResourceUpload(store, upload, uploadObjects, this.deps.resources.storageLocationService());
+          return this.json(res, 410, { error: 'resource upload expired' });
+        }
         if (method === 'PUT') {
           const relative = String(url.searchParams.get('path') ?? '');
           const part = Number(url.searchParams.get('part'));
@@ -2411,7 +2471,19 @@ export class Gateway {
           const record = upload.files[relative] ?? { parts: [], bytes: 0 };
           if (part !== record.parts.length) return this.json(res, 409, { error: `expected part ${record.parts.length}` });
           const objectKey = resourceUploadObjectKey(upload, relative, part);
-          await this.deps.objects.put(objectKey, data);
+          const previousBytes = upload.bytes;
+          try {
+            if (upload.storageLocationId) this.deps.resources.storageLocationService()
+              ?.reserveUpload(upload.id, upload.organizationId, upload.storageLocationId,
+                previousBytes + data.length, upload.expiresAt);
+            await uploadObjects.put(objectKey, data);
+          }
+          catch (error) {
+            if (upload.storageLocationId) this.deps.resources.storageLocationService()
+              ?.reserveUpload(upload.id, upload.organizationId, upload.storageLocationId, previousBytes, upload.expiresAt);
+            const message = error instanceof Error ? error.message : String(error);
+            return this.json(res, /quota exceeded/i.test(message) ? 413 : 502, { error: message });
+          }
           record.parts.push({ objectKey, bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') });
           record.bytes += data.length; upload.bytes += data.length; upload.files[relative] = record;
           store.kvSet(resourceUploadKey(upload.id), JSON.stringify(upload));
@@ -2422,16 +2494,16 @@ export class Gateway {
             if (!Object.keys(upload.files).length) throw new Error('upload has no files');
             const revision = await this.deps.resources.importFiles(upload.attachmentId,
               Object.entries(upload.files).map(([relative, record]) => ({ path: relative, bytes: record.bytes,
-                data: uploadedFileChunks(this.deps.objects!, record.parts) })));
+                data: uploadedFileChunks(uploadObjects, record.parts) })));
             await Promise.allSettled(Object.values(upload.files).flatMap((record) => record.parts)
-              .map((part) => this.deps.objects!.delete(part.objectKey)));
+              .map((part) => uploadObjects.delete(part.objectKey)));
             store.kvDelete(resourceUploadKey(upload.id));
+            this.deps.resources.storageLocationService()?.releaseUpload(upload.id);
             return this.json(res, 200, redactResourceRevision(revision));
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
         if (method === 'DELETE') {
-          for (const record of Object.values(upload.files)) for (const part of record.parts) await this.deps.objects.delete(part.objectKey);
-          store.kvDelete(resourceUploadKey(upload.id));
+          await discardResourceUpload(store, upload, uploadObjects, this.deps.resources.storageLocationService());
           return this.json(res, 200, { deleted: true });
         }
       }
@@ -6331,6 +6403,7 @@ const RESOURCE_UPLOAD_PART_BYTES = 8 * 1024 * 1024;
 interface ResourceUploadPart { objectKey: string; bytes: number; sha256: string }
 interface ResourceUploadSession {
   id: string; organizationId: string; projectId: string; attachmentId: string;
+  storageLocationId?: string;
   files: Record<string, { parts: ResourceUploadPart[]; bytes: number }>;
   bytes: number; createdAt: number; expiresAt: number;
 }
@@ -6352,5 +6425,34 @@ async function* uploadedFileChunks(objects: ObjectStore, parts: ResourceUploadPa
     if (data.length !== part.bytes || crypto.createHash('sha256').update(data).digest('hex') !== part.sha256)
       throw new Error('resource upload part failed integrity verification');
     yield data;
+  }
+}
+
+async function discardResourceUpload(store: Store, upload: ResourceUploadSession, objects: ObjectStore,
+  storage?: import('../store/storage-locations.js').StorageLocationService): Promise<void> {
+  await Promise.allSettled(Object.values(upload.files).flatMap((record) => record.parts)
+    .map((part) => objects.delete(part.objectKey)));
+  store.kvDelete(resourceUploadKey(upload.id));
+  storage?.releaseUpload(upload.id);
+}
+
+/** Abandoned browser uploads are durable only for their 24-hour resume window.
+ * Sweep opportunistically whenever another upload begins; S3 lifecycle rules
+ * remain a second safety net for a completely idle installation. */
+async function cleanupExpiredResourceUploads(store: Store,
+  resources: import('../world/resources.js').ProjectResourceService, fallback: ObjectStore): Promise<void> {
+  for (const entry of store.kvEntries('resource-upload:')) {
+    let upload: ResourceUploadSession;
+    try { upload = JSON.parse(entry.value) as ResourceUploadSession; } catch { store.kvDelete(entry.key); continue; }
+    if (upload.expiresAt >= Date.now()) continue;
+    let objects = fallback;
+    try {
+      if (upload.storageLocationId) objects = resources.storageLocationService()?.objectStore(upload.storageLocationId) ?? fallback;
+      else {
+        const attachment = store.getResourceAttachment(upload.attachmentId);
+        if (attachment) objects = resources.objectStoreFor(attachment);
+      }
+    } catch { continue; } // preserve metadata so a temporarily unavailable customer bucket can be retried
+    await discardResourceUpload(store, upload, objects, resources.storageLocationService());
   }
 }

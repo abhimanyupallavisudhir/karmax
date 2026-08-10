@@ -520,6 +520,9 @@ export interface ResourceAttachment {
   isolation: ResourceIsolation;
   source: Record<string, unknown>;
   credentialHandles: string[];
+  /** Where new immutable revisions are written. Existing revisions remain pinned
+   * to their own location when this default changes. */
+  storageLocationId?: string;
   currentRevisionId?: string;
   publish: ResourcePublishPolicy;
   enabled: boolean;
@@ -534,6 +537,8 @@ export interface ResourceRevision {
   attachmentId: string;
   parentRevisionId?: string;
   engine: string;
+  /** Immutable data-plane placement. Undefined is the legacy managed store. */
+  storageLocationId?: string;
   sealedRef: string;
   rootDigest: string;
   bytes: number;
@@ -541,6 +546,32 @@ export interface ResourceRevision {
   metadata?: Record<string, unknown>;
   createdByTaskId?: string;
   createdAt: number;
+}
+
+/** Organization-owned object-storage placement. Credentials are deliberately
+ * absent from the returned configuration and live only behind credentialHandle. */
+export interface StorageLocation {
+  id: string;
+  organizationId: string;
+  name: string;
+  kind: 'managed' | 's3';
+  config: { endpoint?: string; bucket?: string; region?: string; prefix?: string };
+  credentialHandle?: string;
+  isDefault: boolean;
+  status: 'ready' | 'untested' | 'error';
+  lastCheckedAt?: number;
+  lastError?: string;
+  /** Hard physical-byte ceiling. Undefined means customer-billed/unlimited. */
+  quotaBytes?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface StorageLocationUsage {
+  locationId: string;
+  retainedBytes: number;
+  quotaBytes?: number;
+  availableBytes?: number;
 }
 
 /** A task-owned proposal to make newly-created non-Git state a project

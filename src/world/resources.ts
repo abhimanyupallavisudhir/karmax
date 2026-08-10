@@ -6,6 +6,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { IgnoredResourceInventory, Project, ResourceAttachment, ResourceAccess, ResourceCandidate,
   ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
+import type { StorageLocationService } from '../store/storage-locations.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
@@ -28,7 +29,7 @@ const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
 interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: string[] }
 interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number }
-interface SnapshotRef { objectKey: string; sha256: string }
+interface SnapshotRef { objectKey: string; sha256: string; storageLocationId?: string }
 export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number }
 export interface CopyGlobsMigrationResult {
   environmentSecrets: string[];
@@ -50,7 +51,7 @@ export interface ProposedResourceCandidate {
 export interface SnapshotEngine {
   readonly id: string;
   capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>): Promise<{
-    sealedRef: string; rootDigest: string; bytes: number; files: number;
+    sealedRef: string; rootDigest: string; bytes: number; files: number; storageLocationId?: string;
   }>;
   restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>): Promise<void>;
   manifest(revision: ResourceRevision): Promise<SnapshotManifest>;
@@ -62,52 +63,77 @@ export interface SnapshotEngine {
  * can replace this compatibility implementation without changing durable rows. */
 export class ObjectSnapshotEngine implements SnapshotEngine {
   readonly id = 'object-snapshot@1';
-  constructor(private objects: ObjectStore, private broker: CredentialBroker) {}
+  constructor(private objects: ObjectStore, private broker: CredentialBroker,
+    private storageLocations?: StorageLocationService) {}
+
+  objectStoreForAttachment(attachment: ResourceAttachment): ObjectStore {
+    const id = this.storageLocations?.requireForOrganization(attachment.organizationId, attachment.storageLocationId).id
+      ?? attachment.storageLocationId;
+    return id && this.storageLocations ? this.storageLocations.objectStore(id) : this.objects;
+  }
 
   async capture(attachment: ResourceAttachment, files: AsyncIterable<SnapshotInputFile>) {
     const key = this.key(attachment.organizationId);
+    const storageLocationId = this.storageLocations
+      ? this.storageLocations.requireForOrganization(attachment.organizationId, attachment.storageLocationId).id
+      : attachment.storageLocationId;
+    const chunkNamespace = storageLocationId && this.storageLocations
+      && this.storageLocations.requireForOrganization(attachment.organizationId, storageLocationId).kind === 's3'
+      ? storageLocationId : undefined;
+    const objects = storageLocationId && this.storageLocations ? this.storageLocations.objectStore(storageLocationId) : this.objects;
     const manifestFiles: SnapshotFile[] = [];
     const retained = new Map<string, number>();
     let total = 0;
-    for await (const input of files) {
-      const relative = safePath(input.path);
-      const chunks: string[] = [];
-      const digest = crypto.createHash('sha256');
-      let fileBytes = 0;
-      for await (const plain of fixedChunks(input.data)) {
-        const plainHash = sha256(plain);
-        // HMAC-scoped names deduplicate within a tenant without leaking a global
-        // plaintext hash to the object-store operator.
-        const chunkId = crypto.createHmac('sha256', key).update(plainHash).digest('hex');
-        await this.objects.put(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`, sealDeterministic(key, chunkId, plain));
-        chunks.push(chunkId);
-        retained.set(chunkId, plain.length);
-        digest.update(plain);
-        fileBytes += plain.length;
+    try {
+      for await (const input of files) {
+        const relative = safePath(input.path);
+        const chunks: string[] = [];
+        const digest = crypto.createHash('sha256');
+        let fileBytes = 0;
+        for await (const plain of fixedChunks(input.data)) {
+          const plainHash = sha256(plain);
+          // HMAC-scoped names deduplicate within a tenant without leaking a global
+          // plaintext hash to the object-store operator. Customer locations join
+          // the namespace so the same chunk can safely live in two buckets.
+          const chunkId = crypto.createHmac('sha256', key)
+            .update(chunkNamespace ? `${chunkNamespace}\0${plainHash}` : plainHash).digest('hex');
+          if (!retained.has(chunkId)) {
+            this.chunkAccounting?.retain(attachment.organizationId, [{ id: chunkId, bytes: plain.length }], storageLocationId);
+            retained.set(chunkId, plain.length);
+          }
+          await objects.put(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`, sealDeterministic(key, chunkId, plain));
+          chunks.push(chunkId);
+          digest.update(plain);
+          fileBytes += plain.length;
+        }
+        total += fileBytes;
+        manifestFiles.push({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks });
       }
-      total += fileBytes;
-      manifestFiles.push({ path: relative, bytes: fileBytes, sha256: digest.digest('hex'), chunks });
+      manifestFiles.sort((a, b) => a.path.localeCompare(b.path));
+      const rootDigest = sha256(Buffer.from(JSON.stringify(manifestFiles)));
+      const manifest: SnapshotManifest = { version: 1, attachmentId: attachment.id, files: manifestFiles, rootDigest, bytes: total };
+      const encrypted = sealRandom(key, Buffer.from(JSON.stringify(manifest)));
+      const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/${newId('snapshot')}.bin`;
+      await objects.put(objectKey, encrypted);
+      return { sealedRef: JSON.stringify({ objectKey, sha256: sha256(encrypted), storageLocationId } satisfies SnapshotRef),
+        rootDigest, bytes: total, files: manifestFiles.length, storageLocationId };
+    } catch (error) {
+      const zero = this.chunkAccounting?.release(attachment.organizationId, [...retained.keys()]) ?? [];
+      await Promise.allSettled(zero.map((chunkId) => objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`)));
+      throw error;
     }
-    manifestFiles.sort((a, b) => a.path.localeCompare(b.path));
-    const rootDigest = sha256(Buffer.from(JSON.stringify(manifestFiles)));
-    const manifest: SnapshotManifest = { version: 1, attachmentId: attachment.id, files: manifestFiles, rootDigest, bytes: total };
-    const encrypted = sealRandom(key, Buffer.from(JSON.stringify(manifest)));
-    const objectKey = `resources/${attachment.organizationId}/manifests/${attachment.id}/${newId('snapshot')}.bin`;
-    await this.objects.put(objectKey, encrypted);
-    this.chunkAccounting?.retain(attachment.organizationId, [...retained].map(([id, bytes]) => ({ id, bytes })));
-    return { sealedRef: JSON.stringify({ objectKey, sha256: sha256(encrypted) } satisfies SnapshotRef),
-      rootDigest, bytes: total, files: manifestFiles.length };
   }
 
   async restore(revision: ResourceRevision, write: (path: string, data: Buffer, offset: number) => Promise<void>): Promise<void> {
     const manifest = await this.manifest(revision);
     const attachment = this.attachmentFor(revision);
     const key = this.key(attachment.organizationId);
+    const objects = this.objectsForRevision(revision);
     for (const file of manifest.files) {
       const digest = crypto.createHash('sha256');
       let offset = 0;
       for (const chunkId of file.chunks) {
-        const encrypted = await this.objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
+        const encrypted = await objects.get(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
         const data = openDeterministic(key, chunkId, encrypted);
         digest.update(data);
         await write(file.path, data, offset);
@@ -121,7 +147,7 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   async manifest(revision: ResourceRevision): Promise<SnapshotManifest> {
     const attachment = this.attachmentFor(revision);
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
-    const encrypted = await this.objects.get(ref.objectKey);
+    const encrypted = await this.objectsForRevision(revision, ref).get(ref.objectKey);
     if (sha256(encrypted) !== ref.sha256) throw new Error('resource manifest integrity mismatch');
     const manifest = JSON.parse(openRandom(this.key(attachment.organizationId), encrypted).toString('utf8')) as SnapshotManifest;
     if (manifest.version !== 1 || manifest.attachmentId !== attachment.id || manifest.rootDigest !== revision.rootDigest)
@@ -133,10 +159,11 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
     const attachment = this.attachmentFor(revision);
     const manifest = await this.manifest(revision);
     const ref = JSON.parse(revision.sealedRef) as SnapshotRef;
-    await this.objects.delete(ref.objectKey);
+    const objects = this.objectsForRevision(revision, ref);
+    await objects.delete(ref.objectKey);
     const zero = this.chunkAccounting?.release(attachment.organizationId,
       [...new Set(manifest.files.flatMap((file) => file.chunks))]) ?? [];
-    for (const chunkId of zero) await this.objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
+    for (const chunkId of zero) await objects.delete(`resources/${attachment.organizationId}/chunks/${chunkId}.bin`);
   }
 
   private attachmentFor(revision: ResourceRevision): ResourceAttachment {
@@ -147,10 +174,15 @@ export class ObjectSnapshotEngine implements SnapshotEngine {
   private attachmentResolver?: (id: string) => ResourceAttachment | undefined;
   setAttachmentResolver(resolve: (id: string) => ResourceAttachment | undefined): void { this.attachmentResolver = resolve; }
   private chunkAccounting?: {
-    retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>): void;
+    retain(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void;
     release(organizationId: string, chunkIds: string[]): string[];
   };
   setChunkAccounting(value: NonNullable<ObjectSnapshotEngine['chunkAccounting']>): void { this.chunkAccounting = value; }
+
+  private objectsForRevision(revision: ResourceRevision, ref?: SnapshotRef): ObjectStore {
+    const locationId = ref?.storageLocationId ?? revision.storageLocationId;
+    return locationId && this.storageLocations ? this.storageLocations.objectStore(locationId) : this.objects;
+  }
 
   private key(organizationId: string): Buffer {
     const handle = `${RESOURCE_KEY_PREFIX}${organizationId}`;
@@ -166,12 +198,24 @@ export class ProjectResourceService {
   private publishLocks = new Map<string, Promise<void>>();
 
   constructor(private store: Store, private worlds: WorldRegistry, private engine: SnapshotEngine,
-    private broker: CredentialBroker, private coordinator?: { client: Client; taskQueue: string }) {
+    private broker: CredentialBroker, private coordinator?: { client: Client; taskQueue: string },
+    private storageLocations?: StorageLocationService) {
     if (engine instanceof ObjectSnapshotEngine) engine.setAttachmentResolver((id) => store.getResourceAttachment(id));
     if (engine instanceof ObjectSnapshotEngine) engine.setChunkAccounting({
-      retain: (organizationId, chunks) => store.retainResourceChunks(organizationId, chunks),
+      retain: (organizationId, chunks, storageLocationId) => store.retainResourceChunks(organizationId, chunks, storageLocationId),
       release: (organizationId, chunks) => store.releaseResourceChunks(organizationId, chunks),
     });
+  }
+
+  storageLocationFor(organizationId: string, requested?: string): string | undefined {
+    return this.storageLocations?.requireForOrganization(organizationId, requested).id ?? requested;
+  }
+
+  storageLocationService(): StorageLocationService | undefined { return this.storageLocations; }
+
+  objectStoreFor(attachment: ResourceAttachment): ObjectStore {
+    if (!(this.engine instanceof ObjectSnapshotEngine)) throw new Error('resource uploads require an object-backed snapshot engine');
+    return this.engine.objectStoreForAttachment(attachment);
   }
 
   /** Materialize all enabled project defaults into a newly-created generation. */

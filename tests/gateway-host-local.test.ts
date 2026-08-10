@@ -66,6 +66,7 @@ describe('host-filesystem endpoints follow hostLocal, not hosted', () => {
       hosted: false,
       hostLocal: false,
       resources: {
+        storageLocationFor: () => undefined,
         importDirectory: async (_id: string, dir: string) => { imported.push(dir); return { id: 'rev_1', files: [] }; },
         importFiles: async () => ({ id: 'rev_2', files: [] }),
       } as any,
