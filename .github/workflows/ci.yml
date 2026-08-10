@@ -19,6 +19,20 @@ jobs:
   test:
     name: typecheck + tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: karmax_test
+          POSTGRES_PASSWORD: karmax_test
+          POSTGRES_DB: karmax_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U karmax_test -d karmax_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     # The suite is sequential by design (vitest.config.ts forces singleFork):
     # several concurrent Temporal servers would exhaust the runner. ~10 min of
     # real work, with headroom for a slow runner.
@@ -29,6 +43,7 @@ jobs:
       KARMAX_SKIP_LIVE: '1'
       KARMAX_SKIP_DOCKER: '1'
       TEMPORAL_CLI_VERSION: '1.7.2'
+      KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

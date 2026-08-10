@@ -14,7 +14,9 @@ Compose plugin, clone Karmax, and run:
 ```
 
 That single command generates stable keys, validates the configuration, builds
-Karmax, and starts PostgreSQL, Temporal, the Karmax app/worker, and Caddy. It
+Karmax, and starts PostgreSQL, Temporal, the Karmax app/worker, and Caddy. The
+same PostgreSQL service holds separate `karmax`, `temporal`, and
+`temporal_visibility` databases. It
 waits for the complete stack to become healthy. No `.env` editing, certificate
 generation, GitHub App creation, or provider key files are required.
 
@@ -137,15 +139,15 @@ release their execution lease when finished.
 ./deploy/karmax restore BACKUP_DIR  # verified, explicit destructive prompt
 ```
 
-A backup includes a consistent online snapshot of Karmax metadata, identity,
-the encrypted credential vault, attachments, local object/checkpoint data,
-Temporal's two PostgreSQL databases, and the stable decryption/signing keys.
+A backup includes PostgreSQL dumps of Karmax metadata, identity, and Temporal,
+plus a consistent online snapshot of the encrypted credential vault,
+attachments, local object/checkpoint data, and stable decryption/signing keys.
 Task VMs are deliberately excluded: Git plus encrypted portable checkpoints are
 their durable form. Copy backups to encrypted off-host storage. Anyone holding a
 backup can recover the vault, so protect it like production credentials.
 
-`restore` verifies Karmax's per-file hashes before changing data, restores both
-Temporal databases, reapplies the current Temporal schema, and retains the
+`restore` verifies Karmax's per-file hashes before changing data, restores the
+Karmax and Temporal databases, reapplies the current Temporal schema, and retains the
 destination's domain. It requires typing `RESTORE` and will not delete Docker
 volumes as part of ordinary `down` or `update` operations.
 
@@ -161,27 +163,29 @@ tracked and billable in diagnostics instead of being falsely reported as free.
 ## Managed/enterprise cell
 
 `compose.turnkey.yml` is deliberately a single active control-plane writer with
-durable local object storage and an embedded PostgreSQL-backed Temporal cluster.
+durable local object storage and an embedded PostgreSQL-backed data/Temporal cluster.
 It is the clean choice for one VPS and can serve many users, but its availability
 is that VPS plus your backup/restore policy.
 
-Larger installations can use `compose.hosted.yml` with managed Temporal, S3,
-load-balancer storage, and one active Karmax cell. Copy `.env.example`, provide
-the listed infrastructure secrets under `deploy/.secrets`, and validate with:
+Larger installations can use `compose.hosted.yml` with managed PostgreSQL,
+managed Temporal, S3, and one active Karmax cell. Copy `.env.example`, provide
+the listed infrastructure secrets under `deploy/.secrets` (including a complete
+PostgreSQL connection string in `database_url`), and validate with:
 
 ```bash
 docker compose --env-file deploy/.env.example \
   -f deploy/compose.hosted.yml config
 ```
 
-Do not scale one cell to multiple app writers or mount its SQLite volume into
-two live containers. Assign organizations to separate cells for horizontal
-scale or residency. Managed provider and GitHub credentials still belong in the
+Do not scale one cell to multiple app writers yet: workflow worker ownership and
+other process-local coordinators still assume one active writer even though the
+database is remote. Assign organizations to separate cells for horizontal scale
+or residency. Managed provider and GitHub credentials still belong in the
 Karmax UI/vault, not Compose.
 
 Health endpoints are `/api/health/live` and `/api/health/ready`; diagnostics and
 metrics require the diagnostic capability. Hosted startup fails closed unless
-HTTPS origins are separated, stable keys exist, Temporal is durable, and the
-object-store profile is appropriate. Hosted projects cannot select worktree,
+HTTPS origins are separated, stable keys exist, PostgreSQL and Temporal are
+durable, and the object-store profile is appropriate. Hosted projects cannot select worktree,
 memory, or Docker worlds, so repository code never executes in the control-plane
 container.

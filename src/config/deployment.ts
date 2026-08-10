@@ -44,6 +44,7 @@ export function hostLocal(env: NodeJS.ProcessEnv = process.env): boolean {
 
 const SECRET_FILE_ENV = [
   'KARMAX_AUTH_SECRET', 'KARMAX_VAULT_KEY', 'KARMAX_WORLD_REF_KEY',
+  'KARMAX_DATABASE_URL',
   'KARMAX_TEMPORAL_API_KEY', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY',
   'KARMAX_S3_SESSION_TOKEN', 'KARMAX_OIDC_CLIENT_SECRET', 'KARMAX_GOOGLE_CLIENT_SECRET',
   'KARMAX_GITHUB_OAUTH_CLIENT_SECRET',
@@ -118,6 +119,8 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
   if (!env.KARMAX_AUTH_SECRET || env.KARMAX_AUTH_SECRET.length < 32) failures.push('KARMAX_AUTH_SECRET must contain at least 32 characters');
   if (!env.KARMAX_VAULT_KEY || env.KARMAX_VAULT_KEY.length < 32) failures.push('KARMAX_VAULT_KEY must contain at least 32 characters');
   if (!env.KARMAX_WORLD_REF_KEY || env.KARMAX_WORLD_REF_KEY.length < 32) failures.push('KARMAX_WORLD_REF_KEY must contain at least 32 characters');
+  if (!env.KARMAX_DATABASE_URL || !/^postgres(?:ql)?:\/\//i.test(env.KARMAX_DATABASE_URL))
+    failures.push('KARMAX_DATABASE_URL must point at PostgreSQL');
   if (!env.KARMAX_TEMPORAL_ADDRESS) failures.push('KARMAX_TEMPORAL_ADDRESS must point at a durable Temporal service');
   if (config.singleNode) {
     if (!['local', 's3'].includes(env.KARMAX_OBJECT_STORE ?? ''))

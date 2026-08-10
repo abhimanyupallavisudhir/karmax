@@ -1,11 +1,13 @@
 import { betterAuth } from 'better-auth';
 import { admin, genericOAuth } from 'better-auth/plugins';
 import { getMigrations } from 'better-auth/db/migration';
-import { DatabaseSync } from 'node:sqlite';
+import { Pool } from 'pg';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { canonicalAccountName } from '../domain/account-names.js';
+import { openSqlDatabase, type SqlDatabase } from '../store/sql.js';
+import { importSqliteDatabase, type SqliteImportResult } from '../store/postgres-migration.js';
 
 export interface IdentityUser {
   id: string;
@@ -70,6 +72,8 @@ export interface GitHubAuthorization {
 }
 
 export interface IdentityOptions {
+  /** PostgreSQL target for hosted identity state; dbFile remains the import source. */
+  databaseUrl?: string;
   baseURL?: string | { allowedHosts: string[]; fallback?: string };
   secret?: string;
   oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
@@ -91,7 +95,9 @@ export interface IdentityOptions {
  */
 export class IdentityService {
   readonly auth: any;
-  private db: DatabaseSync;
+  private db: SqlDatabase;
+  private pool?: Pool;
+  migration?: SqliteImportResult;
   private organizationNames?: () => Array<{ id: string; name: string }>;
 
   /** Installation-wide outbound email, injected after construction (main.ts wires
@@ -110,7 +116,8 @@ export class IdentityService {
    * legacy standalone OAuth fallback). */
   readonly githubEnabled: boolean;
   private constructor(dbFile: string, opts: IdentityOptions = {}) {
-    this.db = new DatabaseSync(dbFile);
+    this.db = openSqlDatabase(opts.databaseUrl ?? dbFile);
+    this.pool = opts.databaseUrl ? new Pool({ connectionString: opts.databaseUrl }) : undefined;
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
     // runs the gateway, the worker and every activity in one process, so a
     // concurrent writer must wait rather than fail with SQLITE_BUSY.
@@ -159,7 +166,7 @@ export class IdentityService {
     };
     this.auth = betterAuth({
       appName: 'krmax',
-      database: this.db,
+      database: this.pool ?? this.db.native,
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
       // Native Better Auth social sign-in. No gateway routes are needed:
@@ -277,6 +284,8 @@ export class IdentityService {
     const service = new IdentityService(dbFile, opts);
     const { runMigrations } = await getMigrations(service.auth.options);
     await runMigrations();
+    if (opts.databaseUrl)
+      service.migration = importSqliteDatabase(dbFile, service.db, 'identity', { sentinelTable: 'user' });
     // Better Auth intentionally permits duplicate display names, but every
     // karmax user owns a same-named personal organization. This index closes the
     // concurrent-signup gap around the cross-store application check.
@@ -417,5 +426,10 @@ export class IdentityService {
       this.db.exec('ROLLBACK');
       throw e;
     }
+  }
+
+  async close(): Promise<void> {
+    this.db.close();
+    await this.pool?.end();
   }
 }

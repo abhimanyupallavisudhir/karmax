@@ -1,15 +1,11 @@
-import { createRequire } from 'node:module';
-import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { canonicalAccountName } from '../domain/account-names.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
-
-// node:sqlite is a newer builtin that bundlers (vite/vitest) cannot statically
-// resolve, so load it through createRequire at runtime.
-const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
+import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
 import {
   Project,
@@ -122,12 +118,12 @@ export const isReviewRequestEvent = (type: string): boolean =>
  * append-only event log that powers the live UI stream.
  */
 export class Store {
-  readonly db: DatabaseSyncType;
+  readonly db: SqlDatabase;
   private userNames?: () => Array<{ id: string; name: string }>;
 
   constructor(dbPath = ':memory:') {
-    if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = new DatabaseSync(dbPath);
+    if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    this.db = openSqlDatabase(dbPath);
     // busy_timeout first: waiting (up to 5s) on a locked database beats failing
     // the caller outright. tsx-watch restarts overlap the outgoing and incoming
     // app for a few seconds, and the newcomer's boot writes (migrations,
@@ -684,8 +680,10 @@ export class Store {
     // reached 2,492 unread rows across 216 tasks. Collapse each group onto its
     // OLDEST row (the ask's true age) before the invariant becomes an index.
     if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_inbox_live'").get()) {
-      const duplicates = `SELECT id FROM inbox WHERE id NOT IN
-        (SELECT id FROM (SELECT id, MIN(createdAt) FROM inbox GROUP BY userId, taskId, kind))`;
+      const duplicates = `SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY userId, taskId, kind ORDER BY createdAt, id) AS duplicateRank
+        FROM inbox
+      ) ranked WHERE duplicateRank > 1`;
       this.db.exec(`DELETE FROM delivery_outbox WHERE inboxId IN (${duplicates});
         DELETE FROM inbox WHERE id IN (${duplicates});
         CREATE UNIQUE INDEX idx_inbox_live ON inbox(userId, taskId, kind);`);
@@ -1548,7 +1546,7 @@ export class Store {
       WHERE o.kind='personal'
         AND m.userId = (SELECT firstOwner.userId FROM organization_memberships firstOwner
           WHERE firstOwner.organizationId=o.id AND firstOwner.role='owner'
-          ORDER BY firstOwner.joinedAt, firstOwner.rowid LIMIT 1)
+          ORDER BY firstOwner.joinedAt, firstOwner.userId LIMIT 1)
       ORDER BY o.createdAt, m.joinedAt`).all() as Array<{ id: string; name: string; userId: string }>;
     let changed = 0;
     this.db.exec('BEGIN IMMEDIATE');
@@ -3187,7 +3185,7 @@ export class Store {
       (this.db.prepare(`SELECT ${column} value, COUNT(*) count FROM ${table} GROUP BY ${column}`).all() as any[])
         .map((row) => [String(row.value), Number(row.count)]),
     );
-    // Count statuses inside SQLite. Selecting `lastView` and JSON.parsing it in
+    // Count statuses inside the database. Selecting `lastView` and JSON.parsing it in
     // Node allocated every task's FULL transcript just to read one string — the
     // exact pattern `listTaskSummaries` documents as having pushed a few hundred
     // tasks past 1 GiB RSS — and this runs on every Prometheus scrape (15 s by
@@ -4945,6 +4943,26 @@ export class Store {
   close() {
     this.db.close();
   }
+
+  /** Apply idempotent row migrations after a legacy database has been imported. */
+  finishLegacyImport(): void {
+    this.migrate();
+    this.migrateData();
+  }
+}
+
+/** Open the configured backend and import the legacy SQLite store once. */
+export function openStore(sqliteFile: string, databaseUrl?: string): { store: Store; migration?: SqliteImportResult } {
+  if (!databaseUrl) return { store: new Store(sqliteFile) };
+  const store = new Store(databaseUrl);
+  try {
+    const migration = importSqliteDatabase(sqliteFile, store.db, 'store', { sentinelTable: 'tasks' });
+    if (migration.imported) store.finishLegacyImport();
+    return { store, migration };
+  } catch (error) {
+    store.close();
+    throw error;
+  }
 }
 
 function cardRow(r: any) {
@@ -5013,7 +5031,7 @@ function resourceCandidateRow(row: any): ResourceCandidate {
     resolvedAt: row.resolvedAt == null ? undefined : Number(row.resolvedAt), resolvedBy: row.resolvedBy ?? undefined };
 }
 
-function selectRows(db: DatabaseSyncType, table: string, where: string, args: any[]): any[] {
+function selectRows(db: SqlDatabase, table: string, where: string, args: any[]): any[] {
   return db.prepare(`SELECT * FROM ${table} WHERE ${where}`).all(...args) as any[];
 }
 
@@ -5028,7 +5046,7 @@ function chunked<T>(values: T[], run: (chunk: T[]) => void): void {
   for (let i = 0; i < values.length; i += SQL_VARIABLE_CHUNK) run(values.slice(i, i + SQL_VARIABLE_CHUNK));
 }
 
-function rowsFor(db: DatabaseSyncType, table: string, column: string, values: string[]): any[] {
+function rowsFor(db: SqlDatabase, table: string, column: string, values: string[]): any[] {
   if (!values.length) return [];
   const out: any[] = [];
   chunked(values, (chunk) => {
@@ -5037,7 +5055,7 @@ function rowsFor(db: DatabaseSyncType, table: string, column: string, values: st
   return out;
 }
 
-export function deleteRows(db: DatabaseSyncType, table: string, column: string, values: string[]): void {
+export function deleteRows(db: SqlDatabase, table: string, column: string, values: string[]): void {
   chunked(values, (chunk) => {
     db.prepare(`DELETE FROM ${table} WHERE ${column} IN (${chunk.map(() => '?').join(',')})`).run(...chunk);
   });

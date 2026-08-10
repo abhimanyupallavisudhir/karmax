@@ -19,9 +19,12 @@ temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER"
 temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER" -p "$port" --db temporal setup-schema -v 0.0 || true
 temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER" -p "$port" --db temporal_visibility create || true
 temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER" -p "$port" --db temporal_visibility setup-schema -v 0.0 || true
+# Karmax owns this database's schema. Keeping it separate from Temporal makes
+# backup/restore and a later move to managed PostgreSQL independently possible.
+temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER" -p "$port" --db karmax create || true
 
 temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER" -p "$port" --db temporal \
   update-schema -d /etc/temporal/schema/postgresql/v12/temporal/versioned
 temporal-sql-tool --plugin postgres12 --ep "$POSTGRES_SEEDS" -u "$POSTGRES_USER" -p "$port" --db temporal_visibility \
   update-schema -d /etc/temporal/schema/postgresql/v12/visibility/versioned
-echo 'Temporal PostgreSQL schemas are ready.'
+echo 'Temporal schemas and Karmax PostgreSQL database are ready.'

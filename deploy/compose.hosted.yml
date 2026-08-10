@@ -17,6 +17,7 @@ services:
       KARMAX_AUTH_SECRET_FILE: /run/secrets/auth_secret
       KARMAX_VAULT_KEY_FILE: /run/secrets/vault_key
       KARMAX_WORLD_REF_KEY_FILE: /run/secrets/world_ref_key
+      KARMAX_DATABASE_URL_FILE: /run/secrets/database_url
       KARMAX_TEMPORAL_ADDRESS: ${KARMAX_TEMPORAL_ADDRESS:?set external Temporal address}
       KARMAX_TEMPORAL_NAMESPACE: ${KARMAX_TEMPORAL_NAMESPACE:-karmax}
       KARMAX_TEMPORAL_API_KEY_FILE: /run/secrets/temporal_api_key
@@ -44,6 +45,7 @@ services:
       - auth_secret
       - vault_key
       - world_ref_key
+      - database_url
       - temporal_api_key
       - s3_access_key
       - s3_secret_key
@@ -76,6 +78,7 @@ secrets:
   auth_secret: { file: ./.secrets/auth_secret }
   vault_key: { file: ./.secrets/vault_key }
   world_ref_key: { file: ./.secrets/world_ref_key }
+  database_url: { file: ./.secrets/database_url }
   temporal_api_key: { file: ./.secrets/temporal_api_key }
   s3_access_key: { file: ./.secrets/s3_access_key }
   s3_secret_key: { file: ./.secrets/s3_secret_key }
