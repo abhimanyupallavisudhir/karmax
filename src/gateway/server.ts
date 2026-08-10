@@ -915,15 +915,16 @@ export class Gateway {
     if (p === '/api/github/webhook' && method === 'POST' && this.deps.githubApp) {
       try {
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const deliveryId = String(req.headers['x-github-delivery'] ?? '');
         const result = await this.deps.githubApp.handleWebhook(
-          String(req.headers['x-github-event'] ?? ''), String(req.headers['x-github-delivery'] ?? ''), raw,
+          String(req.headers['x-github-event'] ?? ''), deliveryId, raw,
           typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
         );
         // GitHub's PR lifecycle enters karmax as ordinary task events, so the
         // timeline and `event` triggers see it like any other happening (SPEC §5.4).
         // The service already resolved each event to a task of the installing
         // organization, so dispatch is unconditional here.
-        const { events, ...body } = result;
+        const { events, projectEvents, ...body } = result;
         for (const event of events ?? []) {
           this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
           const task = this.deps.store.getTask(event.taskId);
@@ -931,7 +932,60 @@ export class Gateway {
             && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
             await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
         }
-        return this.json(res, 200, { ...body, ...(events?.length ? { dispatched: events.length } : {}) });
+        let recoveries = 0;
+        try {
+          for (const event of projectEvents ?? []) {
+            const key = `github:workflow-recovery:${event.projectId}:${event.payload.repositoryId}:${event.payload.runId}`;
+            const previous = this.deps.store.kvGet(key);
+            if (previous?.startsWith('task_')) continue;
+            // A process may have died after the claim but before task creation.
+            // Reclaim an abandoned marker; fresh markers still serialize a
+            // concurrent workflow_run/check_run pair for the same Actions run.
+            if (previous?.startsWith('pending:')) {
+              const claimedAt = Number(previous.slice('pending:'.length));
+              if (Number.isFinite(claimedAt) && Date.now() - claimedAt < 10 * 60_000) continue;
+              this.deps.store.kvDelete(key);
+            }
+            if (!this.deps.store.kvClaim(key, `pending:${Date.now()}`)) continue;
+            try {
+              const project = this.deps.store.getProject(event.projectId);
+              if (!project) { this.deps.store.kvDelete(key); continue; }
+              const source = event.payload.originatingTaskId
+                ? `\nOriginating task: ${event.payload.originatingTaskId}` : '';
+              const token = this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
+                event.projectId, 10 * 60_000, project.organizationId).token;
+              const task = await this.deps.api.createTask(token, {
+                projectId: event.projectId,
+                title: `Repair failed GitHub workflow: ${event.payload.workflow}`,
+                prompt: [
+                  `A post-merge GitHub workflow failed for ${event.payload.repository}.`,
+                  `Workflow: ${event.payload.workflow}`,
+                  `Conclusion: ${event.payload.conclusion}`,
+                  `Exact revision: ${event.payload.headSha || 'not reported'}`,
+                  `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${source}`,
+                  '',
+                  'Inspect the complete failed run and classify it before changing code. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
+                ].join('\n'),
+              });
+              this.deps.store.kvSet(key, task.id);
+              this.emitTaskEvent({ taskId: task.id, type: event.type, ts: Date.now(), payload: event.payload });
+              recoveries++;
+            } catch (error) {
+              this.deps.store.kvDelete(key);
+              throw error;
+            }
+          }
+        } catch (error) {
+          // handleWebhook already claimed this delivery. Release it when the
+          // downstream task dispatch fails so GitHub's redelivery can finish
+          // the recovery instead of being discarded as a duplicate.
+          this.deps.store.releaseGithubDelivery(deliveryId);
+          throw error;
+        }
+        return this.json(res, 200, { ...body,
+          ...(events?.length ? { dispatched: events.length } : {}),
+          ...(recoveries ? { recoveries } : {}),
+        });
       } catch (error) {
         // Only a genuine signature failure is a 401. Answering 401 for ANY
         // exception made GitHub redeliver — but `handleWebhook` has already

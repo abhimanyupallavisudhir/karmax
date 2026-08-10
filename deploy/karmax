@@ -116,7 +116,8 @@ wait_ready() {
     if [ "$attempt" -ge 90 ]; then
       dc ps
       dc logs --tail=100 app temporal >&2 || true
-      die 'Karmax did not become ready; the diagnostic logs are above'
+      echo 'karmax: Karmax did not become ready; the diagnostic logs are above' >&2
+      return 1
     fi
     sleep 2
   done
@@ -145,7 +146,7 @@ cmd_up() {
   dc config --quiet
   note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
   dc up -d --build --remove-orphans
-  wait_ready
+  wait_ready || die 'Karmax failed its readiness check'
   print_finish
 }
 
@@ -229,7 +230,7 @@ cmd_restore() {
   dc build app
   dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- /restore
   dc up -d --remove-orphans
-  wait_ready
+  wait_ready || die 'Karmax failed its readiness check after restore'
   note 'Restore complete.'
   print_finish
 }
@@ -237,25 +238,52 @@ cmd_restore() {
 cmd_update() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured'
-  cmd_backup
-  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if [ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]; then
-      note 'Fast-forwarding the Karmax source checkout…'
-      git -C "$ROOT_DIR" pull --ff-only
-    else
-      # This used to carry on and rebuild the current revision. Run by hand that
-      # is merely surprising; run from the post-push workflow it is a lie — the
-      # deploy reports success while the commit CI just validated never reaches
-      # the instance, and the drift is invisible until someone SSHes in.
-      git -C "$ROOT_DIR" status --short --untracked-files=no >&2
-      die 'the source checkout has local changes, so it cannot be fast-forwarded.
-Commit or discard the files listed above (git -C '"$ROOT_DIR"' checkout -- .), then deploy again.'
-    fi
+  requested=${1:-origin/master}
+  case "$requested" in -*) die "invalid deployment revision: $requested" ;; esac
+  git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die 'the deployment source is not a Git checkout'
+  if [ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]; then
+    git -C "$ROOT_DIR" status --short --untracked-files=no >&2
+    die 'the source checkout has local changes, so it cannot deploy an exact validated revision'
   fi
-  dc build --pull app
-  dc up -d --remove-orphans
-  wait_ready
-  note 'Update complete.'
+
+  # Resolve after fetching, but deploy the caller's immutable SHA — never
+  # whatever happens to be at master by the time a slow CI run reaches SSH.
+  git -C "$ROOT_DIR" fetch --prune origin master
+  target=$(git -C "$ROOT_DIR" rev-parse --verify "$requested^{commit}") \
+    || die "deployment revision does not exist: $requested"
+  upstream=$(git -C "$ROOT_DIR" rev-parse --verify 'origin/master^{commit}')
+  git -C "$ROOT_DIR" merge-base --is-ancestor "$target" "$upstream" \
+    || die "refusing to deploy $target because it is not on origin/master"
+  previous=$(git -C "$ROOT_DIR" rev-parse --verify HEAD)
+
+  # A delayed older workflow must never roll production backward after a newer
+  # validated revision has already landed.
+  if [ "$previous" != "$target" ] && git -C "$ROOT_DIR" merge-base --is-ancestor "$target" "$previous"; then
+    note "Skipping superseded deployment $target; production source is already at $previous."
+    return 0
+  fi
+  git -C "$ROOT_DIR" merge-base --is-ancestor "$previous" "$target" \
+    || [ "$previous" = "$target" ] \
+    || die "deployment source $previous and requested revision $target have diverged"
+
+  cmd_backup
+  note "Checking out validated revision $target…"
+  git -C "$ROOT_DIR" checkout --detach "$target"
+
+  if dc build --pull app && dc up -d --remove-orphans && wait_ready; then
+    note "Update complete at $target."
+    return 0
+  fi
+
+  # The previous image may have been replaced under the Compose service tag, so
+  # rebuild it from the previous exact source before bringing the service back.
+  note "Deployment $target failed; rolling back to $previous…"
+  git -C "$ROOT_DIR" checkout --detach "$previous"
+  if dc build app && dc up -d --remove-orphans && wait_ready; then
+    die "deployment $target failed; production was restored to $previous"
+  fi
+  die "deployment $target failed and automatic rollback to $previous also failed"
 }
 
 usage() {
@@ -268,7 +296,7 @@ Usage: ./deploy/karmax COMMAND
   logs [SERVICE]               Follow logs (app by default)
   backup [DIRECTORY]           Snapshot Karmax, object data, Temporal, and keys
   restore DIRECTORY            Verify and restore a complete snapshot
-  update                        Backup, fast-forward when clean, rebuild, and restart
+  update [REVISION]             Backup, deploy an exact master revision, and restart
   down                          Stop everything without deleting durable data
 EOF
 }

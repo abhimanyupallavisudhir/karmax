@@ -11,6 +11,7 @@ import type { AgentAdapter } from '../src/agent/types.js';
 import { worldRepos } from '../src/world/types.js';
 import { mergeQueueId } from '../src/coordinators/names.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
+import { GithubActionsApi } from '../src/integrations/github-actions.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -37,6 +38,8 @@ let releaseFrontHeldRepair: (() => void) | undefined;
 let frontHeldRepairGate: Promise<void> = Promise.resolve();
 const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
 let exactCandidateRevisions = 0;
+let actionsRunAttempt = 1;
+let actionsReruns = 0;
 
 async function remoteForBranch(branch: string, slug?: string): Promise<string | undefined> {
   if (slug && remoteBySlug.has(slug)) return remoteBySlug.get(slug);
@@ -71,6 +74,24 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   const body = init.body ? JSON.parse(String(init.body)) : {};
   const json = (status: number, value: unknown) =>
     new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+  if (u.pathname === `/repos/${SLUG}/actions/runs/42` && method === 'GET') return json(200, {
+    id: 42, name: 'CI', workflow_id: 7, run_number: 1, run_attempt: actionsRunAttempt,
+    event: 'pull_request', status: 'completed', conclusion: 'failure', head_branch: prs[0]?.head?.ref,
+    head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/42`,
+    created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
+  });
+  if (u.pathname === `/repos/${SLUG}/actions/runs/42/jobs` && method === 'GET') return json(200, { jobs: [{
+    id: 99, name: 'unit tests', status: 'completed', conclusion: 'timed_out',
+    html_url: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+    steps: [{ number: 1, name: 'Run tests', status: 'completed', conclusion: 'timed_out' }],
+  }] });
+  if (u.pathname === `/repos/${SLUG}/actions/runs/42/artifacts` && method === 'GET') return json(200, { artifacts: [] });
+  if (u.pathname === `/repos/${SLUG}/actions/jobs/99/logs` && method === 'GET')
+    return new Response('Error: The hosted runner lost communication with the server\n');
+  if (u.pathname === `/repos/${SLUG}/actions/runs/42/rerun-failed-jobs` && method === 'POST') {
+    actionsReruns++;
+    return new Response(null, { status: 201 });
+  }
   const list = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
   if (list && method === 'GET') {
     const branch = u.searchParams.get('head')?.split(':')[1];
@@ -258,7 +279,9 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         activeUserAccountId: (userId: string) => `${userId}-github`,
         repositoryPermission: async (_userId: string, slug: string) => ({ slug, permission: 'write', canMerge: true }),
         userAccessToken: async (userId: string) => `${userId}-token`,
+        installationToken: async () => 'installation-token',
         brokerCredentials: async () => ({ env: {} }),
+        actions: () => new GithubActionsApi('installation-token', { apiBase: 'https://api.github.test', fetch: fetcher }),
       } as any,
     });
   }, 120_000);
@@ -286,6 +309,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     frontHeldRepairGate = Promise.resolve();
     exactCandidateTurns.length = 0;
     exactCandidateRevisions = 0;
+    actionsRunAttempt = 1;
+    actionsReruns = 0;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -552,6 +577,43 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadiness = {};
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done', sha: prs[0].merge_commit_sha });
+  }, 120_000);
+
+  it('reruns one transient Actions failure on the exact PR head without asking the agent to edit code', async () => {
+    const repo = await repoWithOrigin('github-transient-ci');
+    const project = h.store.createProject('Transient GitHub CI', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'transient-actions', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'transient-repo',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Retry transient CI', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write transient.md :: no code defect\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 25,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'TIMED_OUT',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    await handle.signal('confirm');
+    await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(1);
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 }).toBe('Waiting for CI');
+    expect(h.store.eventsSince(task.id, 0).filter((event) => event.type === 'github.ci.rerun-requested')).toHaveLength(1);
+    // GitHub now reports the same exact head green. No Do repair/re-review turn
+    // was needed for a provider interruption.
+    githubReadiness = {};
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(actionsReruns).toBe(1);
   }, 120_000);
 
   it('v1.16 preserves intent authorization and automatically reviews a CI repair before landing', async () => {

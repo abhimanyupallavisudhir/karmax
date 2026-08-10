@@ -1,0 +1,59 @@
+name: Deploy
+
+# Deployment is a separate post-merge concern. A failed production rollout must
+# not masquerade as a failed PR validation check, and only the exact master SHA
+# whose CI workflow completed successfully is eligible for promotion.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full master commit SHA to redeploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy to production
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    # Retain every validated candidate. The remote updater independently refuses
+    # to move backwards if GitHub starts waiting jobs out of dispatch order.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+      queue: max
+    env:
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
+    steps:
+      - name: Deploy the validated revision over SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+        run: |
+          case "$DEPLOY_SHA" in
+            ''|*[!0-9a-fA-F]*) echo "invalid deployment SHA: $DEPLOY_SHA" >&2; exit 1 ;;
+          esac
+          [ "${#DEPLOY_SHA}" -eq 40 ] || { echo "deployment SHA must be 40 hexadecimal characters" >&2; exit 1; }
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+          # The host key is pinned above, so an unknown one is a failure rather
+          # than something to trust on first use.
+          ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" "
+            set -eu
+            cd /opt/karmax
+            ./deploy/karmax update '$DEPLOY_SHA'
+            find deploy/backups -mindepth 1 -maxdepth 1 -type d -mtime +14 \\
+              -exec rm -rf {} + 2>/dev/null || true
+          "

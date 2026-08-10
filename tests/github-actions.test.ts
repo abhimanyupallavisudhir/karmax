@@ -3,6 +3,11 @@ import {
   GithubActionsApi,
   GithubActionsApiError,
   actionLogExcerpt,
+  classifyGithubActionsFailure,
+  classifyGithubActionsDiagnostic,
+  githubActionsRunIdFromUrl,
+  renderGithubActionsFailure,
+  type GithubActionsFailureInspection,
 } from '../src/integrations/github-actions.js';
 
 const run = (overrides: Record<string, unknown> = {}) => ({
@@ -14,6 +19,34 @@ const run = (overrides: Record<string, unknown> = {}) => ({
 });
 
 describe('GitHub Actions API', () => {
+  const inspection = (log: string, overrides: Partial<GithubActionsFailureInspection['run']> = {}): GithubActionsFailureInspection => ({
+    run: {
+      id: 42, name: 'CI', workflowId: 7, runNumber: 11, attempt: 1, event: 'pull_request',
+      status: 'completed', conclusion: 'failure', branch: 'karmax/task', headSha: 'abc123',
+      url: 'https://github.test/acme/app/actions/runs/42', createdAt: '', updatedAt: '', ...overrides,
+    },
+    jobs: [],
+    failedJobs: [{ id: 99, name: 'test', status: 'completed', conclusion: 'failure', url: 'https://github.test/jobs/99',
+      steps: [{ number: 1, name: 'Run tests', status: 'completed', conclusion: 'failure' }],
+      log: { excerpt: log, downloadedBytes: log.length, truncated: false } }],
+    artifacts: [], notices: [],
+  });
+
+  it('classifies code, transient, account/configuration, and post-merge failures by owner', () => {
+    expect(classifyGithubActionsFailure(inspection('AssertionError: expected 2 to equal 3')).disposition).toBe('revision');
+    expect(classifyGithubActionsFailure(inspection('The hosted runner lost communication with the server')).disposition).toBe('retry');
+    expect(classifyGithubActionsFailure(inspection('The job was not started because recent account payments have failed or your spending limit needs to be increased')).disposition).toBe('human');
+    expect(classifyGithubActionsDiagnostic('Workflow did not start because your spending limit needs to be increased')).toBe('human');
+    expect(classifyGithubActionsDiagnostic('AssertionError: expected 2 to equal 3')).toBeUndefined();
+    const deployment = classifyGithubActionsFailure(inspection('backup contains a symbolic link', {
+      name: 'Deploy', event: 'workflow_run', branch: 'master',
+    }), { postMerge: true });
+    expect(deployment.disposition).toBe('deployment');
+    expect(renderGithubActionsFailure(deployment)).toContain('backup contains a symbolic link');
+    expect(githubActionsRunIdFromUrl('https://github.com/acme/app/actions/runs/123/job/456')).toBe(123);
+    expect(githubActionsRunIdFromUrl('https://github.com/acme/app/pull/1')).toBeUndefined();
+  });
+
   it('lists normalized runs with bounded provider filters', async () => {
     let requested = '';
     const api = new GithubActionsApi('installation-token', { apiBase: 'https://api.github.test',

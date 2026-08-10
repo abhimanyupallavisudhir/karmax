@@ -103,7 +103,9 @@ export async function createBackup(options: {
   try {
     for (const component of COMPONENTS) {
       if (component === 'temporal' || component === 'objects' || component === 'state') continue;
-      copyTree(path.join(home, component), path.join(payload, component));
+      if (component === 'config-homes')
+        await copyConfigHomes(path.join(home, component), path.join(payload, component));
+      else copyTree(path.join(home, component), path.join(payload, component));
     }
 
     // Copy non-database state such as the local auth secret, but never transient
@@ -261,6 +263,69 @@ async function backupSqlite(source: string, destination: string): Promise<void> 
   const db: DatabaseSyncType = new sqlite.DatabaseSync(source, { readOnly: true });
   try { await sqlite.backup(db, destination); } finally { db.close(); }
   fs.chmodSync(destination, 0o600);
+}
+
+/**
+ * Provider config homes contain both durable identity/session state and runtime
+ * scratch space. Codex in particular creates executable helper symlinks below
+ * `<CODEX_HOME>/tmp/arg0` while starting a process. Copying that subtree is both
+ * useless (the absolute targets belong to one particular application image) and
+ * incompatible with the backup format's deliberate no-symlink invariant.
+ *
+ * Match the stable boundary we own — a managed Codex home's root `tmp/` — never
+ * the provider's random `codex-arg0XXXXXX` implementation detail. Symlinks in
+ * every durable subtree remain a hard error through `listFiles(payload)`.
+ *
+ * Config homes also contain provider-owned WAL-mode SQLite databases. Copying a
+ * live database plus its WAL as ordinary files can produce a torn snapshot, so
+ * discover real SQLite files, omit their sidecars from the tree copy, and use
+ * the same online backup API as Karmax's own databases.
+ */
+async function copyConfigHomes(source: string, destination: string): Promise<void> {
+  if (!fs.existsSync(source)) return;
+  const databases = discoverConfigHomeSqlite(source);
+  const omitted = new Set(databases.flatMap((file) => [file, `${file}-wal`, `${file}-shm`]));
+  copyTree(source, destination, (file) => {
+    const relative = path.relative(source, file);
+    return !isManagedCodexTemp(relative) && !omitted.has(file);
+  });
+  for (const database of databases)
+    await backupSqlite(database, path.join(destination, path.relative(source, database)));
+}
+
+function discoverConfigHomeSqlite(root: string): string[] {
+  const out: string[] = [];
+  const visit = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      const relative = path.relative(root, file);
+      if (isManagedCodexTemp(relative)) continue;
+      if (entry.isSymbolicLink()) continue; // copied, then rejected by listFiles(payload)
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && /\.(?:db|sqlite)$/i.test(entry.name) && isSqliteDatabase(file)) out.push(file);
+    }
+  };
+  visit(root);
+  return out;
+}
+
+function isManagedCodexTemp(relative: string): boolean {
+  const parts = relative.split(path.sep).filter(Boolean);
+  // Personal homes: `codex-account/tmp/...`
+  // Organization homes: `organizations/<org>/codex-account/tmp/...`
+  const home = parts[0] === 'organizations' ? 2 : 0;
+  return parts[home]?.startsWith('codex-') === true && parts[home + 1] === 'tmp';
+}
+
+function isSqliteDatabase(file: string): boolean {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const header = Buffer.alloc(16);
+      return fs.readSync(fd, header, 0, header.length, 0) === header.length
+        && header.equals(Buffer.from('SQLite format 3\0'));
+    } finally { fs.closeSync(fd); }
+  } catch { return false; }
 }
 
 function copyTree(source: string, destination: string, filter: (file: string) => boolean = () => true): void {

@@ -68,6 +68,50 @@ describe('control-plane backup', () => {
     expect(fs.existsSync(path.join(home, 'vault', 'link'))).toBe(false);
   });
 
+  it('excludes Codex runtime temp symlinks but still rejects symlinks in durable config-home data', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-codex-tmp-'));
+    const home = path.join(root, 'home');
+    roots.push(root);
+    const codex = path.join(home, 'config-homes', 'codex-personal');
+    fs.mkdirSync(path.join(codex, 'tmp', 'arg0', 'codex-arg0abc'), { recursive: true });
+    fs.mkdirSync(path.join(codex, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(codex, 'auth.json'), '{"token":"durable"}');
+    fs.writeFileSync(path.join(codex, 'sessions', 'rollout.jsonl'), '{}\n');
+    fs.symlinkSync('/app/provider/codex', path.join(codex, 'tmp', 'arg0', 'codex-arg0abc', 'apply_patch'));
+
+    const destination = path.join(root, 'snapshot');
+    await createBackup({ home, destination, externalTemporal: true });
+    expect(fs.existsSync(path.join(destination, 'payload', 'config-homes', 'codex-personal', 'tmp'))).toBe(false);
+    expect(fs.readFileSync(path.join(destination, 'payload', 'config-homes', 'codex-personal', 'auth.json'), 'utf8'))
+      .toContain('durable');
+    expect(fs.readFileSync(path.join(destination, 'payload', 'config-homes', 'codex-personal', 'sessions', 'rollout.jsonl'), 'utf8'))
+      .toBe('{}\n');
+
+    fs.symlinkSync('/etc/passwd', path.join(codex, 'sessions', 'escape'));
+    await expect(createBackup({ home, destination: path.join(root, 'unsafe'), externalTemporal: true }))
+      .rejects.toThrow(/symbolic link/i);
+  });
+
+  it('online-snapshots provider SQLite databases without copying WAL sidecars', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-provider-db-'));
+    const home = path.join(root, 'home');
+    roots.push(root);
+    const codex = path.join(home, 'config-homes', 'organizations', 'org-1', 'codex-personal');
+    fs.mkdirSync(codex, { recursive: true });
+    const source = new Store(path.join(codex, 'state.sqlite'));
+    source.kvSet('proof', 'provider-state');
+    const destination = path.join(root, 'snapshot');
+    await createBackup({ home, destination, externalTemporal: true });
+    source.close();
+
+    const copied = path.join(destination, 'payload', 'config-homes', 'organizations', 'org-1', 'codex-personal', 'state.sqlite');
+    const restored = new Store(copied);
+    expect(restored.kvGet('proof')).toBe('provider-state');
+    restored.close();
+    expect(fs.existsSync(`${copied}-wal`)).toBe(false);
+    expect(fs.existsSync(`${copied}-shm`)).toBe(false);
+  });
+
   it('refuses to snapshot a home with a live app unless allowed', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-live-'));
     const home = path.join(root, 'home');

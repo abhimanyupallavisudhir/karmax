@@ -40,6 +40,15 @@ import {
   type GithubPrApiOptions,
   type GithubPullRequestReadiness,
 } from '../integrations/github-pr.js';
+import {
+  GithubActionsApiError,
+  classifyGithubActionsDiagnostic,
+  classifyGithubActionsFailure,
+  githubActionsRunIdFromUrl,
+  renderGithubActionsFailure,
+  type GithubActionsApi,
+  type GithubActionsFailureDecision,
+} from '../integrations/github-actions.js';
 import type { GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
@@ -2603,7 +2612,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // installation instead: it has the exact repository-scoped Checks and
       // Commit-status permissions declared by the App, without lending those
       // observations the human's identity.
-      const inspectionFor = (slug: string): { api: GithubPrApi; connectionId?: string } => {
+      const inspectionFor = (slug: string): { api: GithubPrApi; actions?: GithubActionsApi; connectionId?: string } => {
         const repository = enrolledGithubRepository(task.projectId, slug);
         const connection = repository?.gitConnectionId
           ? store.getGitConnection(repository.gitConnectionId)
@@ -2614,6 +2623,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               () => deps.githubApp!.installationToken(connection),
               deps.githubPr ?? {},
             ),
+            ...(repository && typeof (deps.githubApp as any).actions === 'function'
+              ? { actions: deps.githubApp!.actions(repository) }
+              : {}),
             connectionId: connection.id,
           }
           : { api };
@@ -2654,6 +2666,94 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           `Pull request ${ref.slug}#${ref.number} has terminally failing CI (${readiness.checks}).`,
           ...(failures.length ? failures : ['GitHub did not expose an individual failed-check summary; inspect the PR checks page.']),
         ].join('\n').slice(0, 64_000);
+      };
+      const ciFailureDecision = async (
+        ref: TaskPullRequest,
+        readiness: GithubPullRequestReadiness,
+        current: TaskPullRequest[],
+        inspection: ReturnType<typeof inspectionFor>,
+      ): Promise<GitHubMergeAuthorization> => {
+        const summary = ciFailureDetail(ref, readiness);
+        const runIds = [...new Set((readiness.failedChecks ?? [])
+          .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
+        const decisions: GithubActionsFailureDecision[] = [];
+        if (inspection.actions) {
+          for (const runId of runIds.slice(0, 4)) {
+            try {
+              const inspected = await inspection.actions.inspectFailure(ref.slug, runId);
+              // A stale check URL must never cause a rerun or repair of a
+              // different revision than the proposal whose landing is held.
+              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha) continue;
+              const checkContext = (readiness.failedChecks ?? [])
+                .filter((check) => githubActionsRunIdFromUrl(check.url) === runId)
+                .map((check) => `${check.name}: ${check.state}\n${check.detail ?? ''}`).join('\n');
+              decisions.push(classifyGithubActionsFailure(inspected, { additionalContext: checkContext }));
+            } catch (error) {
+              record(handle.id, 'github.ci.inspection-failed', {
+                ...ref, runId, detail: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+        if (!decisions.length) {
+          const providerFailure = classifyGithubActionsDiagnostic(summary);
+          if (providerFailure) return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `${summary}\n\nGitHub did not expose an Actions run id that krmax can safely rerun. Resolve the provider/account condition on GitHub, then retry.`,
+            eligibleUserIds: [actorUserId],
+          };
+          return {
+            status: 'needs-revision', prs: current, actorUserId, detail: summary,
+            ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+          };
+        }
+        const detail = decisions.map((decision) => renderGithubActionsFailure(decision)).join('\n\n').slice(0, 128_000);
+        const human = decisions.find((decision) => decision.disposition === 'human');
+        if (human) return {
+          status: 'needs-human', prs: current, actorUserId, detail,
+          eligibleUserIds: [actorUserId],
+        };
+        const revision = decisions.find((decision) => decision.disposition === 'revision');
+        if (revision) return {
+          status: 'needs-revision', prs: current, actorUserId, detail,
+          ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+        };
+        const retry = decisions.find((decision) => decision.disposition === 'retry');
+        if (retry && inspection.actions) {
+          const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
+            && event.payload?.slug === ref.slug && Number(event.payload?.number) === ref.number
+            && Number(event.payload?.runId) === retry.inspection.run.id);
+          const alreadyRequested = reruns.some((event) =>
+            Number(event.payload?.observedAttempt) === retry.inspection.run.attempt);
+          if (!alreadyRequested && reruns.length < 2) {
+            try {
+              await inspection.actions.rerun(ref.slug, retry.inspection.run.id, true);
+              record(handle.id, 'github.ci.rerun-requested', {
+                ...ref, runId: retry.inspection.run.id,
+                observedAttempt: retry.inspection.run.attempt,
+                rerunNumber: reruns.length + 1,
+              });
+            } catch (error) {
+              const blocked = error instanceof GithubActionsApiError && [401, 403, 404, 422].includes(error.status);
+              return {
+                status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
+                detail: `${detail}\n\nGitHub rejected the automatic rerun: ${error instanceof Error ? error.message : String(error)}`,
+                ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
+              };
+            }
+          } else if (!alreadyRequested && reruns.length >= 2) {
+            return {
+              status: 'needs-human', prs: current, actorUserId,
+              detail: `${detail}\n\nThe exact workflow run remained transiently broken after two automatic reruns. Inspect GitHub's runner or repository configuration before retrying.`,
+              eligibleUserIds: [actorUserId],
+            };
+          }
+          return { status: 'waiting', prs: current, actorUserId, detail: 'Waiting for CI' };
+        }
+        return {
+          status: 'needs-revision', prs: current, actorUserId, detail,
+          ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+        };
       };
       for (let ref of prs) {
         let live;
@@ -2768,10 +2868,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           if (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR') {
-            return {
-              status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness),
-              ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
-            };
+            return ciFailureDecision(ref, readiness, current, inspection);
           }
           if (readiness?.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
@@ -2926,10 +3023,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return errorDecision(error, current);
           }
           if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR')
-            return {
-              status: 'needs-revision', prs: current, actorUserId, detail: ciFailureDetail(ref, readiness),
-              ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
-            };
+            return ciFailureDecision(ref, readiness, current, inspection);
           if (readiness.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
               record(handle.id, 'github.merge.authorization-revoked', { ...ref, reason: 'changes-requested' });

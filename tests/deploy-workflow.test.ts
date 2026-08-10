@@ -5,7 +5,8 @@ import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
+const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
+const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'deploy.yml'), 'utf8'));
 const deploy = workflow.jobs.deploy;
 const script: string = JSON.stringify(deploy.steps);
 const operator = fs.readFileSync(path.join(repoRoot, 'deploy', 'karmax'), 'utf8');
@@ -16,24 +17,23 @@ describe('post-push deployment to the public instance', () => {
     expect(script).toContain('deploy/karmax update');
   });
 
-  // The instance this deploys to is public. Shipping a commit that does not
-  // even typecheck would take it down for everyone, and `deploy/karmax update`
-  // restarts the stack in place — there is no staging tier to catch it.
-  it('runs only after the suite and the deploy artifacts have both passed', () => {
-    expect(deploy.needs).toEqual(expect.arrayContaining(['test', 'deploy-artifacts']));
+  it('is separate from PR CI and starts only after the master CI workflow succeeds', () => {
+    expect(ci.jobs.deploy).toBeUndefined();
+    expect(workflow.on.workflow_run.workflows).toContain('CI');
+    expect(workflow.on.workflow_run.branches).toContain('master');
+    expect(deploy.if).toContain("workflow_run.conclusion == 'success'");
   });
 
-  it('never deploys anything but master', () => {
-    expect(deploy.if).toContain("github.ref == 'refs/heads/master'");
+  it('passes the exact SHA validated by CI instead of pulling an arbitrary newer master', () => {
+    expect(JSON.stringify(deploy.env)).toContain('github.event.workflow_run.head_sha');
+    expect(script).toContain("./deploy/karmax update '$DEPLOY_SHA'");
+    expect(operator.split('cmd_update() {')[1]?.split('\n}')[0]).not.toContain('pull --ff-only');
   });
 
-  // `update` snapshots, pulls, rebuilds and restarts one working tree. A second
-  // run entering that while the first is mid-rebuild corrupts both, so the
-  // queue must hold rather than cancel — cancelling would also silently skip
-  // deploying whichever commit lost the race.
-  it('serialises deploys instead of cancelling the one in flight', () => {
+  it('serialises deploys and retains every pending validated revision', () => {
     expect(deploy.concurrency.group).toBe('deploy-production');
     expect(deploy.concurrency['cancel-in-progress']).toBe(false);
+    expect(deploy.concurrency.queue).toBe('max');
   });
 
   // Trust-on-first-use here would let anyone who can answer on port 22 collect
@@ -59,5 +59,12 @@ describe('post-push deployment to the public instance', () => {
   // post-push deploy fail before `git pull`, permanently stranding production.
   it('explicitly permits the pre-deploy online snapshot', () => {
     expect(operator).toContain('npm run backup -- --allow-running "$temporary"');
+  });
+
+  it('rolls back the source and service when readiness fails', () => {
+    const update = operator.split('cmd_update() {')[1]?.split('\n}')[0] ?? '';
+    expect(update).toContain('rolling back');
+    expect(update).toContain('checkout --detach "$previous"');
+    expect(update).toContain('wait_ready');
   });
 });

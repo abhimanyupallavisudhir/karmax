@@ -6,6 +6,7 @@ import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
 import { pullRequestWebhookEvent, reconcilePullRequestView, type GithubPrWebhookEvent } from './github-pr.js';
 import { GithubActionsApi } from './github-actions.js';
+import { githubActionsRunIdFromUrl } from './github-actions.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -75,6 +76,24 @@ export interface GitHubRepositoryPermission {
   canMerge: boolean;
   /** Repository-supported method closest to krmax's merge-commit semantics. */
   mergeMethod: 'merge' | 'squash' | 'rebase';
+}
+
+export interface GithubProjectWebhookEvent {
+  projectId: string;
+  type: 'github.workflow.failed';
+  payload: {
+    repository: string;
+    repositoryId: string;
+    workflow: string;
+    runId: number;
+    attempt: number;
+    conclusion: string;
+    headSha: string;
+    branch: string;
+    url: string;
+    source: 'workflow_run' | 'check_run';
+    originatingTaskId?: string;
+  };
 }
 
 export interface GitHubAppOptions {
@@ -279,7 +298,7 @@ export class GitHubAppService {
       manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
       // PR/check/merge-group lifecycle turns provider progress for a Karmax task
       // into durable events and wakes its reconciliation loop (SPEC §5.4).
-      manifest.default_events = ['pull_request', 'pull_request_review', 'check_run', 'merge_group'];
+      manifest.default_events = ['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run'];
     }
     return {
       action: 'https://github.com/settings/apps/new',
@@ -529,7 +548,7 @@ export class GitHubAppService {
   }
 
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
-  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[] }> {
+  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[]; projectEvents?: GithubProjectWebhookEvent[] }> {
     if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
     // The delivery id is CLAIMED here (so two concurrent copies of one delivery
     // cannot both reconcile) but the claim is provisional: `dispatchWebhook` does
@@ -550,7 +569,7 @@ export class GitHubAppService {
   }
 
   private async dispatchWebhook(event: string, raw: Buffer):
-  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[] }> {
+  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[]; projectEvents?: GithubProjectWebhookEvent[] }> {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
@@ -578,6 +597,8 @@ export class GitHubAppService {
       const repositories = await this.reconcile(saved);
       return { accepted: true, reconciled: repositories.length };
     }
+    const projectEvents = this.failedDefaultBranchWorkflowEvents(event, payload, connection.organizationId);
+    if (event === 'workflow_run') return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
     if (event === 'pull_request' || event === 'pull_request_review' || event === 'check_run') {
       // The PR lifecycle karmax itself started: correlated back to its task so
       // the timeline shows it and `event` triggers can fire on it. Correlation is
@@ -585,19 +606,66 @@ export class GitHubAppService {
       // the tenant that installed this App, or a `karmax/<id>` branch pushed to
       // any repo would inject events into someone else's task.
       const prEvent = pullRequestWebhookEvent(event, payload);
-      if (!prEvent || !this.ownsTask(connection.organizationId, prEvent.taskId)) return { accepted: true };
+      if (!prEvent || !this.ownsTask(connection.organizationId, prEvent.taskId))
+        return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       const view = this.store.getTask(prEvent.taskId)?.lastView;
       if (view) {
         const reconciled = reconcilePullRequestView(view, prEvent.payload);
         if (reconciled !== view) this.store.saveView(prEvent.taskId, reconciled);
       }
-      return { accepted: true, events: [prEvent] };
+      return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
     }
     if (['installation', 'installation_repositories', 'repository'].includes(event)) {
       const repositories = await this.reconcile({ ...connection, provider: 'github' });
       return { accepted: true, reconciled: repositories.length };
     }
     return { accepted: true };
+  }
+
+  /** A merged revision is immutable history. A default-branch workflow failure
+   * therefore fans out to the projects that actually attach this repository;
+   * the gateway turns each event into a new recovery task. check_run is a
+   * compatibility path for Apps that have not yet accepted workflow_run. */
+  private failedDefaultBranchWorkflowEvents(event: string, payload: any,
+    organizationId: string): GithubProjectWebhookEvent[] {
+    if (!['workflow_run', 'check_run'].includes(event) || payload.action !== 'completed') return [];
+    const repositoryPayload = payload.repository;
+    const repository = this.store.listRepositories(organizationId).find((candidate) =>
+      (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
+      || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
+    if (!repository) return [];
+    const failed = new Set(['action_required', 'failure', 'stale', 'startup_failure', 'timed_out']);
+    const workflowRun = payload.workflow_run;
+    const checkRun = payload.check_run;
+    const conclusion = String(workflowRun?.conclusion ?? checkRun?.conclusion ?? '').toLowerCase();
+    const branch = String(workflowRun?.head_branch ?? checkRun?.check_suite?.head_branch ?? '');
+    if (!failed.has(conclusion) || branch !== repository.defaultBranch) return [];
+    const url = String(workflowRun?.html_url ?? checkRun?.details_url ?? '');
+    const runId = Number(workflowRun?.id ?? githubActionsRunIdFromUrl(url)
+      ?? checkRun?.check_suite?.id ?? checkRun?.id);
+    if (!Number.isSafeInteger(runId) || runId <= 0) return [];
+    const headSha = String(workflowRun?.head_sha ?? checkRun?.head_sha ?? checkRun?.check_suite?.head_sha ?? '');
+    const headRefs = [
+      ...(Array.isArray(workflowRun?.pull_requests) ? workflowRun.pull_requests : []),
+      ...(Array.isArray(checkRun?.pull_requests) ? checkRun.pull_requests : []),
+    ].map((pr: any) => String(pr?.head?.ref ?? pr?.head?.label ?? ''));
+    const originatingTaskId = headRefs.map((ref) => ref.match(/(?:^|:)karmax\/(task_[A-Za-z0-9_-]+)/)?.[1]).find(Boolean);
+    const base = {
+      repository: `${repository.owner}/${repository.name}`,
+      repositoryId: repository.id,
+      workflow: String(workflowRun?.name ?? checkRun?.name ?? 'GitHub workflow'),
+      runId,
+      attempt: Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1),
+      conclusion,
+      headSha,
+      branch,
+      url,
+      source: event as 'workflow_run' | 'check_run',
+      ...(originatingTaskId ? { originatingTaskId } : {}),
+    };
+    return this.store.projectIdsForRepository(repository.id).map((projectId) => ({
+      projectId, type: 'github.workflow.failed' as const, payload: base,
+    }));
   }
 
   /** Is `taskId` a live task of the organization that installed the App? */

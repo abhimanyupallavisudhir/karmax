@@ -1891,6 +1891,11 @@ export class Store {
     return (this.db.prepare('SELECT * FROM repositories WHERE organizationId=? ORDER BY owner, name').all(organizationId) as any[]).map(rowToRepository);
   }
 
+  projectIdsForRepository(repositoryId: string): string[] {
+    return (this.db.prepare('SELECT projectId FROM project_repositories WHERE repositoryId=? ORDER BY projectId')
+      .all(repositoryId) as Array<{ projectId: string }>).map((row) => String(row.projectId));
+  }
+
   findRepositoryBySshUrl(organizationId: string, sshUrl: string): Repository | undefined {
     const r = this.db.prepare('SELECT * FROM repositories WHERE organizationId=? AND sshUrl=?').get(organizationId, sshUrl) as any;
     return r ? rowToRepository(r) : undefined;
@@ -4808,6 +4813,10 @@ export class Store {
     this.db
       .prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
       .run(k, v);
+  }
+
+  kvClaim(k: string, v: string): boolean {
+    return Number(this.db.prepare('INSERT OR IGNORE INTO kv (k, v) VALUES (?, ?)').run(k, v).changes) === 1;
   }
 
   kvEntries(prefix: string): Array<{ key: string; value: string }> {

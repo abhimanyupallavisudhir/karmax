@@ -40,6 +40,7 @@ describe('gateway request scope for bare-id routes', () => {
   let liveView: any;
   /** What the stub GitHub webhook handler throws on the next delivery. */
   let webhookFailure: Error | undefined;
+  let webhookProjectEvents: any[] = [];
 
   const auth = () => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
 
@@ -83,7 +84,7 @@ describe('gateway request scope for bare-id routes', () => {
         status: () => ({ userAuthorized: false }),
         handleWebhook: async () => {
           if (webhookFailure) throw webhookFailure;
-          return { ok: true, events: [] };
+          return { accepted: true, events: [], projectEvents: webhookProjectEvents };
         },
       },
     } as any);
@@ -299,5 +300,37 @@ describe('gateway request scope for bare-id routes', () => {
 
     webhookFailure = undefined;
     expect((await deliver()).status).toBe(200);
+  });
+
+  it('creates one durable recovery task for a post-merge workflow failure', async () => {
+    webhookProjectEvents = [{
+      projectId: mine,
+      type: 'github.workflow.failed',
+      payload: {
+        repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Deploy', runId: 700,
+        attempt: 1, conclusion: 'failure', headSha: 'abc123', branch: 'main',
+        url: 'https://github.com/acme/app/actions/runs/700', source: 'workflow_run',
+      },
+    }];
+    const deliver = async (delivery: string) => fetch(`${base}/api/github/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json',
+        'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
+      body: JSON.stringify({ action: 'completed' }),
+    });
+    const first = await deliver('workflow-recovery-1');
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ accepted: true, recoveries: 1 });
+    const recovery = store.listTasks(mine).find((task) => task.title === 'Repair failed GitHub workflow: Deploy');
+    expect(recovery?.params.prompt).toContain('Exact revision: abc123');
+    expect(store.eventsSince(recovery!.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'github.workflow.failed' }),
+    ]));
+
+    // check_run and workflow_run can both describe the same Actions run; the
+    // repository/run key prevents duplicate recovery work across deliveries.
+    const duplicate = await deliver('workflow-recovery-2');
+    expect(duplicate.status).toBe(200);
+    expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
+    webhookProjectEvents = [];
   });
 });

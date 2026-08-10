@@ -105,7 +105,7 @@ describe('GitHub App integration', () => {
       ], default_permissions: { email_addresses: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
-    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group']);
+    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run']);
     expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'read');
     expect(manifest.manifest).toHaveProperty('default_permissions.actions', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.statuses', 'read');
@@ -386,6 +386,10 @@ describe('GitHub App integration', () => {
     store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
     const project = store.createProject('App', {}, organization.id);
+    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github',
+      providerId: '99', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
+      defaultBranch: 'main', private: true });
+    store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
     const task = store.createTask({ projectId: project.id, title: 'Work', workflow: 'software-dev',
       workflowVersion: '1.8.0', params: { prompt: 'do it' } });
     // A task of a DIFFERENT tenant, whose branch name this installation must not
@@ -424,6 +428,25 @@ describe('GitHub App integration', () => {
         check_suite: { head_branch: `karmax/${task.id}` } },
     });
     expect(check.events).toEqual([expect.objectContaining({ taskId: task.id, type: 'github.check.completed' })]);
+    const failedWorkflow = await deliver('workflow_run', 'workflow-1', {
+      installation: { id: 42 }, action: 'completed',
+      repository: { id: 99, full_name: 'acme/app' },
+      workflow_run: { id: 700, name: 'Deploy', run_attempt: 2, conclusion: 'failure',
+        head_branch: 'main', head_sha: 'merged-sha', html_url: 'https://github.com/acme/app/actions/runs/700',
+        pull_requests: [{ head: { ref: `karmax/${task.id}` } }],
+      },
+    });
+    expect(failedWorkflow.projectEvents).toEqual([expect.objectContaining({
+      projectId: project.id, type: 'github.workflow.failed', payload: expect.objectContaining({
+        repository: 'acme/app', workflow: 'Deploy', runId: 700, attempt: 2,
+        branch: 'main', headSha: 'merged-sha', originatingTaskId: task.id,
+      }),
+    })]);
+    const featureFailure = await deliver('workflow_run', 'workflow-2', {
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+      workflow_run: { id: 701, name: 'CI', conclusion: 'failure', head_branch: 'feature', head_sha: 'x' },
+    });
+    expect(featureFailure.projectEvents).toBeUndefined();
     // A branch no karmax task owns is accepted and produces nothing to dispatch.
     expect(await deliver('pull_request', 'pr-2', pull('feature/manual'))).toEqual({ accepted: true });
     // Neither does a branch naming a task in an organization that did not install

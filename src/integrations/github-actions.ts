@@ -73,6 +73,14 @@ export interface GithubActionsFailureInspection {
   notices: string[];
 }
 
+export type GithubActionsFailureDisposition = 'revision' | 'retry' | 'human' | 'deployment';
+
+export interface GithubActionsFailureDecision {
+  disposition: GithubActionsFailureDisposition;
+  reason: string;
+  inspection: GithubActionsFailureInspection;
+}
+
 export type GithubActionsTokenProvider =
   (options?: { forceRefresh?: boolean }) => Promise<string>;
 
@@ -105,6 +113,8 @@ const DEFAULT_MAX_LOG_DOWNLOAD = 8 * 1024 * 1024;
 const DEFAULT_MAX_LOG_EXCERPT = 64 * 1024;
 const DEFAULT_MAX_JOB_LOGS = 8;
 const MAX_JOB_PAGES = 10;
+const HUMAN_CONFIGURATION_FAILURE = /(?:billing|payment|spending limit|budget|prepaid|quota for (?:actions|minutes)|included minutes|actions (?:is|are) disabled|workflow(?:s)? (?:is|are) disabled|no hosted runners?|not permitted to use (?:actions|this action)|resource not accessible by integration|requires? approval|approve and run|action required)/i;
+const TRANSIENT_RUNNER_FAILURE = /(?:the hosted runner|runner (?:has|was|is) (?:lost|disconnected|offline)|failed to (?:acquire|start|create|provision) (?:a )?runner|no runner matching|service unavailable|internal server error|gateway timeout|connection (?:reset|timed out)|network (?:error|failure)|temporary failure|try again later|job was cancelled because|received a shutdown signal|lost communication with the server|the operation was canceled)/i;
 
 export class GithubActionsApi {
   private fetcher: typeof fetch;
@@ -280,6 +290,96 @@ export class GithubActionsApi {
     if (response.status === 401 && typeof this.token === 'function') response = await once(true);
     return response;
   }
+}
+
+/** Classify a completed run by ownership, not by a brittle list of check names.
+ * Pull-request code failures return to the proposal; provider/configuration
+ * failures go to a human; clearly transient runner failures get a bounded
+ * rerun; failures after merge belong to a separate deployment recovery task. */
+export function classifyGithubActionsFailure(
+  inspection: GithubActionsFailureInspection,
+  options: { postMerge?: boolean; additionalContext?: string } = {},
+): GithubActionsFailureDecision {
+  if (options.postMerge) return {
+    disposition: 'deployment',
+    reason: 'The failing workflow ran after the revision was merged; repairing it must not reopen or mutate the completed proposal.',
+    inspection,
+  };
+  const corpus = `${githubActionsFailureCorpus(inspection)}\n${options.additionalContext ?? ''}`;
+  const conclusion = String(inspection.run.conclusion ?? '').toLowerCase();
+  if (HUMAN_CONFIGURATION_FAILURE.test(corpus) || conclusion === 'action_required') return {
+    disposition: 'human',
+    reason: 'GitHub reported an account, billing, permission, approval, runner-availability, or repository configuration problem that changing the proposal cannot fix.',
+    inspection,
+  };
+  if (['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(conclusion)
+    || inspection.failedJobs.some((job) => ['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(String(job.conclusion ?? '').toLowerCase()))
+    || TRANSIENT_RUNNER_FAILURE.test(corpus)) return {
+    disposition: 'retry',
+    reason: 'GitHub reported a transient or interrupted runner failure; rerun the exact revision before asking an agent to change code.',
+    inspection,
+  };
+  return {
+    disposition: 'revision',
+    reason: 'The completed check failed without a provider-level cause, so the exact proposal should be repaired and reviewed again.',
+    inspection,
+  };
+}
+
+/** Classify a provider diagnostic even when GitHub rejected the workflow before
+ * allocating a run/job whose logs can be downloaded. `undefined` means the
+ * text contains no safe provider-level signal and should remain a code failure. */
+export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry' | undefined {
+  if (HUMAN_CONFIGURATION_FAILURE.test(input)) return 'human';
+  if (TRANSIENT_RUNNER_FAILURE.test(input)) return 'retry';
+  return undefined;
+}
+
+/** Render bounded but otherwise complete diagnostics for every failed job that
+ * GitHub exposed. The inspection API already strips signed log URLs and caps
+ * each downloaded log; this adds a total event/prompt boundary. */
+export function renderGithubActionsFailure(
+  decision: GithubActionsFailureDecision,
+  maxChars = 96 * 1024,
+): string {
+  const { run, failedJobs, notices } = decision.inspection;
+  const lines = [
+    `GitHub Actions run ${run.name} #${run.runNumber} (attempt ${run.attempt}) concluded ${run.conclusion ?? run.status}.`,
+    `Revision: ${run.headSha || 'unknown'}`,
+    ...(run.url ? [`Run: ${run.url}`] : []),
+    `Classification: ${decision.disposition} — ${decision.reason}`,
+  ];
+  if (!failedJobs.length) lines.push('GitHub exposed no terminally failing job output.');
+  for (const job of failedJobs) {
+    lines.push('', `Job: ${job.name} (${job.conclusion ?? job.status})${job.url ? ` — ${job.url}` : ''}`);
+    const failedSteps = job.steps.filter((step) => FAILURE_CONCLUSIONS.has(String(step.conclusion ?? '').toLowerCase()));
+    if (failedSteps.length) lines.push(`Failed steps: ${failedSteps.map((step) => step.name).join(', ')}`);
+    if (job.log?.excerpt) lines.push(job.log.excerpt, ...(job.log.truncated ? ['[GitHub log download was truncated at the safety limit.]'] : []));
+    else lines.push('[No job log was available.]');
+  }
+  if (notices.length) lines.push('', 'Inspection notices:', ...notices.map((notice) => `- ${notice}`));
+  const rendered = lines.join('\n').trim();
+  return rendered.length <= maxChars ? rendered : `${rendered.slice(0, maxChars)}\n[Additional diagnostics omitted at the task-event safety limit.]`;
+}
+
+export function githubActionsRunIdFromUrl(value: string | undefined): number | undefined {
+  const match = value?.match(/\/actions\/runs\/(\d+)(?:\/|$)/);
+  if (!match) return undefined;
+  const id = Number(match[1]);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+function githubActionsFailureCorpus(inspection: GithubActionsFailureInspection): string {
+  return [
+    inspection.run.name,
+    inspection.run.displayTitle,
+    inspection.run.conclusion,
+    ...inspection.notices,
+    ...inspection.failedJobs.flatMap((job) => [
+      job.name, job.conclusion, job.log?.excerpt,
+      ...job.steps.flatMap((step) => [step.name, step.conclusion]),
+    ]),
+  ].filter(Boolean).join('\n');
 }
 
 function normalizeRun(raw: any): GithubActionsRun {

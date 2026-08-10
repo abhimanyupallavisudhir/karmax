@@ -40,22 +40,23 @@ function generateSecrets(): string {
   return path.join(sandbox, '.secrets');
 }
 
-describe('turnkey update refuses to deploy a stale revision', () => {
+describe('turnkey update deploys an exact validated revision', () => {
   const script = fs.readFileSync(path.join(deployDir, 'karmax'), 'utf8');
   const update = script.split('cmd_update() {')[1]?.split('\n}')[0] ?? '';
 
-  // The post-push workflow runs `update` and reports whatever it exits with.
-  // Carrying on after a failed fast-forward means CI goes green while the
-  // instance still runs the previous commit — the one failure mode a deploy
-  // pipeline must never have.
-  it('fails instead of rebuilding the old revision when the checkout is dirty', () => {
-    expect(update).toContain('pull --ff-only');
-    const dirtyBranch = update.split('else')[1] ?? '';
-    expect(dirtyBranch, 'the dirty-tree branch must abort').toContain('die');
+  it('fails instead of rebuilding an unknown revision when the checkout is dirty', () => {
+    expect(update).toContain('status --porcelain');
+    expect(update).toContain('cannot deploy an exact validated revision');
   });
 
-  it('names the offending files so the failure is actionable', () => {
-    expect(update).toContain('status --short');
+  it('requires the requested commit to belong to origin/master and never pulls latest', () => {
+    expect(update).toContain('merge-base --is-ancestor "$target" "$upstream"');
+    expect(update).toContain('checkout --detach "$target"');
+    expect(update).not.toContain('pull --ff-only');
+  });
+
+  it('skips delayed deployments instead of rolling production backwards', () => {
+    expect(update).toContain('Skipping superseded deployment');
   });
 });
 
