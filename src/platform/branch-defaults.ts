@@ -9,6 +9,11 @@ export interface RepositoryBranchDefaults {
   target: string;
 }
 
+/** New task records carry this after their common base/target have already been
+ * resolved against repository metadata. Its absence identifies older queued
+ * tasks that still need provisioning's legacy repository-default fallback. */
+export const REPOSITORY_BRANCHES_RESOLVED_PARAM = '_repositoryBranchesResolved';
+
 /**
  * Resolve the branch policy for a project's effective first repository.
  *
