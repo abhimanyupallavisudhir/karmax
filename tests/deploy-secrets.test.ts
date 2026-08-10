@@ -58,6 +58,11 @@ describe('turnkey update deploys an exact validated revision', () => {
   it('skips delayed deployments instead of rolling production backwards', () => {
     expect(update).toContain('Skipping superseded deployment');
   });
+
+  it('uses candidate backup code so an old backup bug cannot block its own fix', () => {
+    expect(update).toContain('cmd_backup_candidate');
+    expect(script).toContain('dc run --rm --no-deps app npm run backup');
+  });
 });
 
 describe('turnkey deployment secrets', () => {

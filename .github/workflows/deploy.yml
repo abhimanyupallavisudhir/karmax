@@ -53,7 +53,14 @@ jobs:
           ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=30 "$TARGET" "
             set -eu
             cd /opt/karmax
-            ./deploy/karmax update '$DEPLOY_SHA'
+            # Execute the updater implementation from the exact validated SHA.
+            # This lets a new revision repair a bug in an older updater before
+            # that bug can block the revision from checking itself out.
+            git fetch --prune origin master
+            git show '$DEPLOY_SHA:deploy/karmax' > ./deploy/.karmax-update
+            chmod 700 ./deploy/.karmax-update
+            trap 'rm -f ./deploy/.karmax-update' EXIT
+            ./deploy/.karmax-update update '$DEPLOY_SHA'
             find deploy/backups -mindepth 1 -maxdepth 1 -type d -mtime +14 \\
               -exec rm -rf {} + 2>/dev/null || true
           "
