@@ -75,6 +75,7 @@ import {
   UPD_WAIT_AGENT,
   agentQueueId,
 } from '../coordinators/names.js';
+import { lifecycleReplacementKey, lifecycleReplacementMatches } from '../platform/lifecycle-replacement.js';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -3641,6 +3642,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async publishView(taskId: string, view: TaskView): Promise<void> {
+      // A platform lifecycle replacement asks the old workflow to wind down via
+      // its cancellation cleanup so turns, children, leases, and worlds settle
+      // cleanly. Its final `cancelled` view is an implementation frame, not a
+      // logical task state: publishing it briefly hid conversation controls and,
+      // more seriously, fired terminal side effects (auto-archive, output pruning,
+      // dependency/collaboration settlement) before the successor run started.
+      //
+      // Keep this compatibility guard in the activity boundary: activity code may
+      // change without replaying immutable workflow histories, so already-running
+      // v1.22 executions receive the repair too.
+      if (view.status === 'cancelled') {
+        let runId: string | undefined;
+        try { runId = activityContext.current().info.workflowExecution?.runId; }
+        catch { /* direct activity invocation in tests */ }
+        const key = lifecycleReplacementKey(taskId);
+        if (lifecycleReplacementMatches(store.kvGet(key), runId)) return;
+      }
       store.saveView(taskId, view);
       // Entering Merge is the logical commitment boundary. The SQLite compare-and-
       // set is the winner lease: exactly one attempt may get past this awaited

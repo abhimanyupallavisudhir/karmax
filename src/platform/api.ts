@@ -51,6 +51,7 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 import { itemHandle } from '../autonomy/vault-items.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
+import { lifecycleReplacementKey } from './lifecycle-replacement.js';
 import type { GithubActionsStatus } from '../integrations/github-actions.js';
 
 export class CapabilityError extends Error {
@@ -2198,6 +2199,13 @@ export class KarmaxApi {
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
     let stoppedGracefully = false;
     if (minor >= 22 && disposition !== 'discard' && typeof (handle as any).result === 'function') {
+      if (disposition === 'replace') {
+        const runId = task.params?._workflowRunId;
+        this.deps.store.kvSet(lifecycleReplacementKey(task.id), JSON.stringify({
+          ...(typeof runId === 'string' && runId ? { runId } : {}),
+          requestedAt: Date.now(),
+        }));
+      }
       try {
         await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
         await withTimeout(Promise.resolve((handle as any).result()), 30_000);
@@ -2281,6 +2289,10 @@ export class KarmaxApi {
       draft: false,
       ...(typeof runId === 'string' && runId ? { _workflowRunId: runId } : {}),
     });
+    // The new run is now durable and its run id (when available) is pinned. Its
+    // first view may race this platform-side projection, but neither belongs to
+    // the stopped run, so the old-run terminal suppression is no longer needed.
+    this.deps.store.kvDelete(lifecycleReplacementKey(task.id));
     const {
       manuallyDoneFrom: _manuallyDoneFrom,
       manuallyDoneView: _manuallyDoneView,
