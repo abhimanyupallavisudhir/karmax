@@ -35,6 +35,7 @@ eval(extractFn('parseKeybinding'));
 eval(extractFn('stepMatches'));
 eval(extractFn('chordCandidates'));
 eval(extractFn('isBareModifier'));
+eval(extractFn('focusedEnterAction'));
 eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
 eval(extractFn('adjacentCheckinPane'));
@@ -109,6 +110,24 @@ ok(!chordCandidates(cmds, [ev('g')], ev('n')).some((c) => c.id === 'nav.notifica
 ok(chordCandidates(cmds, [ev('g')], ev('z')).length === 0, 'g then unknown → no candidates');
 ok(chordCandidates(cmds, [], ev('k', { ctrlKey: true })).map((c) => c.id).join() === 'pal', 'Ctrl+K finds meta+k');
 ok(chordCandidates(cmds, [], ev('t')).length === 0, "bare 't' is not a command (only after 'g')");
+
+// ── Enter follows focus before global list selection ──
+const focused = (kind) => ({ closest: (selector) => {
+  if (kind === 'button') return selector.includes('button') ? {} : null;
+  if (kind === 'chip') return selector.includes('[tabindex="0"]') ? {} : null;
+  if (kind === 'role') return selector.includes('[role="button"]') ? {} : null;
+  return null;
+} });
+ok(focusedEnterAction(ev('Enter'), focused('button')) === 'native', 'Enter leaves a focused native button to browser activation');
+ok(focusedEnterAction(ev('Enter'), focused('chip')) === 'click', 'Enter clicks a focused tabindex control before the list cursor');
+ok(focusedEnterAction(ev('Enter'), focused('role')) === 'click', 'Enter clicks a focused custom role=button control');
+ok(focusedEnterAction(ev('Enter', { ctrlKey: true }), focused('chip')) === null, 'Ctrl+Enter remains available to global commands when a control is focused');
+ok(focusedEnterAction(ev('Enter', { metaKey: true }), focused('button')) === null, 'Cmd+Enter remains available to global commands when a native button is focused');
+ok(focusedEnterAction(ev('x'), focused('chip')) === null, 'non-Enter keys do not activate the focused control');
+ok(src.includes('if (e.defaultPrevented) return;'), 'component-level Enter handlers are not activated a second time by the document dispatcher');
+ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (dispatchKey(e)) return;', src.indexOf('function bindKeys()')), 'focused Enter activation is resolved before global key dispatch');
+ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (overlayOpen)', src.indexOf('function bindKeys()')), 'focused custom controls also activate inside overlays');
+ok(src.includes("id: 'list.quickAdd'") && src.includes("keybinding: 'meta+Enter'") && src.includes("run: () => $('#add-task')?.click()"), 'Ctrl/Cmd+Enter clicks quick-add from anywhere on the task list');
 
 // ── shifted chords survive the Shift keydown (g P / g W / g D / g S) ──
 // The dispatcher skips bare-modifier keydowns so pressing Shift for the second
