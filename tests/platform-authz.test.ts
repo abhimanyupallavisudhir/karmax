@@ -222,6 +222,70 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     expect(store.getTask(second.id)?.params._githubAccountId).toBe('99');
   });
 
+  it('backfills verified delegation when a human elevates an existing task and never does so for automation', async () => {
+    const organizationId = store.getProject(mine)!.organizationId!;
+    let active = '99';
+    const liveUpdates: any[] = [];
+    const authorization = new AuthorizationService(store);
+    authorization.grant('root', { principalId: 'user:a', scopeKey: projectScope(mine), profileId: 'maintainer' });
+    const delegatedApi = new KarmaxApi({ store,
+      client: { workflow: { getHandle: () => ({ executeUpdate: async (name: string, input: unknown) => {
+        liveUpdates.push({ name, input }); return { applied: true };
+      } }) } } as any,
+      taskQueue: 'karmax', tokens, contentDir,
+      worlds: new WorldRegistry(), authorization,
+      githubApp: { activeUserAccountId: () => active } as any });
+    const human = tokens.mintPrincipal('user:a', ['*'], mine, 60_000, organizationId);
+    const legacy = store.createTask({
+      projectId: mine, title: 'Existing user task', workflow: 'software-dev', workflowVersion: '1.0.0',
+      createdBy: { kind: 'user', userId: 'a' },
+      params: { prompt: 'create a repository', _githubAccountId: '42',
+        _authorization: { profileId: 'developer', capabilities: ['task:*'], principal: 'user:a' } } as any,
+    });
+
+    const elevated = await delegatedApi.setTaskAuthorization(human.token, legacy.id, 'maintainer');
+    const elevatedAuthorization = elevated.params._authorization as any;
+    expect(liveUpdates).toEqual([expect.objectContaining({ name: 'updateAuthorization',
+      input: { args: [expect.objectContaining({ grant: expect.arrayContaining(['repository:write']) })] } })]);
+    expect(elevatedAuthorization.capabilities).toContain('repository:write');
+    expect(elevatedAuthorization.delegationId).toMatch(/^dlg_/);
+    // The user has since selected account 99, but this task remains bound to the
+    // authority-owned account 42 that was pinned when its intent was created.
+    expect(elevated.params._githubAccountId).toBe('42');
+    const resumed = tokens.mint({
+      taskId: legacy.id, profileId: 'do', role: 'do', principal: 'user:a',
+      projectId: mine, organizationId,
+      ceiling: ['repository:write'], grantorCaps: elevatedAuthorization.capabilities,
+      delegationId: elevatedAuthorization.delegationId,
+    });
+    expect(resumed.record).toMatchObject({
+      caps: ['repository:write'],
+      humanSubject: { kind: 'user', userId: 'a', presence: 'delegated',
+        externalIdentities: { githubAccountId: '42' } },
+      externalIdentities: { githubAccountId: '42' },
+    });
+
+    active = '100';
+    const autonomousTask = store.createTask({
+      projectId: mine, title: 'Autonomous task', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'create a repository', draft: true,
+        _authorization: { profileId: 'developer', capabilities: ['task:*'], principal: 'system:scheduler' } } as any,
+    });
+    const autonomous = tokens.mintPrincipal('system:scheduler', ['*'], mine, 60_000, organizationId);
+    const autonomousUpdate = await delegatedApi.setTaskAuthorization(autonomous.token, autonomousTask.id, 'maintainer');
+    const autonomousAuthorization = autonomousUpdate.params._authorization as any;
+    expect(autonomousAuthorization.capabilities).toContain('repository:write');
+    expect(autonomousAuthorization.delegationId).toBeUndefined();
+    expect(autonomousUpdate.params._githubAccountId).toBeUndefined();
+    const autonomousRetry = tokens.mint({
+      taskId: autonomousTask.id, profileId: 'do', role: 'do', principal: 'system:scheduler',
+      projectId: mine, organizationId,
+      ceiling: ['repository:write'], grantorCaps: autonomousAuthorization.capabilities,
+    });
+    expect(autonomousRetry.record.caps).toEqual(['repository:write']);
+    expect(autonomousRetry.record.humanSubject).toBeUndefined();
+  });
+
   it('stores explicit multi-project and organization authorization on tasks and refuses over-granting', async () => {
     const organization = store.getProject(mine)!.organizationId!;
     const sibling = store.createProject('Sibling', {}, organization).id;
