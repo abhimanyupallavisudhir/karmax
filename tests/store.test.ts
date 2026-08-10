@@ -302,6 +302,17 @@ describe('Store', () => {
     expect(() => store.renameOrganization(organization.id, '')).toThrow(/required/i);
   });
 
+  it('keeps organization names unique across organizations and users', () => {
+    const store = new Store(':memory:');
+    store.connectUserNames(() => [{ id: 'alice', name: 'Alice' }]);
+    const acme = store.createOrganization({ name: 'Acme' });
+
+    expect(() => store.createOrganization({ name: '  ACME  ' })).toThrow(/already used by an organization/i);
+    expect(() => store.createOrganization({ name: 'alice' })).toThrow(/already used by a user/i);
+    expect(() => store.renameOrganization(acme.id, 'ALICE')).toThrow(/already used by a user/i);
+    expect(store.createOrganization({ name: 'Alice', kind: 'personal', ownerUserId: 'alice' }).name).toBe('Alice');
+  });
+
   it('creates and lists tasks in order', () => {
     const p = store.createProject('Acme');
     const t1 = store.createTask({

@@ -29,6 +29,9 @@ const changedPassword = await identity.changePassword(
 const oldPasswordLogin = await identity.signIn('admin@example.com', 'long-enough-password');
 const newPasswordLogin = await identity.signIn('admin@example.com', 'new-long-enough-password');
 await identity.createUser({ name: 'Dev', email: 'dev@example.com', password: 'another-long-password' });
+let duplicateUserNameBlocked = false;
+try { await identity.createUser({ name: ' DEV ', email: 'other-dev@example.com', password: 'another-long-password' }); }
+catch { duplicateUserNameBlocked = true; }
 let bootstrapBlocked = false;
 try { await identity.bootstrap({ name: 'Again', email: 'again@example.com', password: 'another-long-password' }); }
 catch { bootstrapBlocked = true; }
@@ -84,6 +87,19 @@ const signupProjectsList = signupProjects.ok ? (await signupProjects.json()) as 
 const signupEntersApp = signupProjects.status === 200 && Array.isArray(signupProjectsList) && signupProjectsList.length === 0;
 const signupOrgs = await (await json('/api/organizations', { headers: { cookie: signupCookie } })).json() as any[];
 const signupHasPersonalWorkspace = signupOrgs.length === 1 && signupOrgs[0].kind === 'personal';
+const signupWorkspaceUsesUserName = signupOrgs[0]?.name === 'Waiting user';
+const collidingSignup = await json('/api/signup', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'Root', email: 'root-name-collision@example.com', password: 'collision-password-long' }),
+});
+const collidingDirectSignup = await json('/api/auth/sign-up/email', {
+  method: 'POST',
+  body: JSON.stringify({ name: 'ROOT', email: 'direct-name-collision@example.com', password: 'collision-password-long' }),
+});
+const collidingOrganization = await json('/api/organizations', {
+  method: 'POST', headers: rootHeaders,
+  body: JSON.stringify({ name: ' waiting USER ' }),
+});
 // The org dashboard must be viewable by its own (non-operator) owner: it needs
 // only organization:read, and host/diagnostic data is gated separately. This is
 // the "missing capability diagnostic:read" landing bug.
@@ -125,12 +141,17 @@ process.stdout.write(JSON.stringify({
   oldPasswordRejected: !oldPasswordLogin.ok,
   newPasswordAccepted: newPasswordLogin.ok,
   users: identity.listUsers().length,
+  duplicateUserNameBlocked,
   bootstrapBlocked,
   setupRequired: setupBefore.setupRequired,
   visibleProjects: visibleProjects.map((p) => p.name),
   usersDenied,
   signupEntersApp,
   signupHasPersonalWorkspace,
+  signupWorkspaceUsesUserName,
+  collidingSignupRejected: !collidingSignup.ok,
+  collidingDirectSignupRejected: !collidingDirectSignup.ok,
+  collidingOrganizationRejected: !collidingOrganization.ok,
   signupDashboardOk,
   signupGitOnboardingOnce,
   signupAccountVisible: rootUsers.some((u) => u.email === 'waiting@example.com'),

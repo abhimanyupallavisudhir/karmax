@@ -188,8 +188,11 @@ async function main() {
         inheritPersonalGithubProfile(store, broker, authorization.userId);
       } } } : legacyGithubOauth ? { github: legacyGithubOauth } : {}),
   });
+  identity.connectOrganizationNames(() => store.organizationNameReservations());
+  store.connectUserNames(() => identity.listUsers());
   const installationOwner = identity.listUsers()[0];
   if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
+  store.migratePersonalOrganizationNames(identity.listUsers());
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();
