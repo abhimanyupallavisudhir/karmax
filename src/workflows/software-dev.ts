@@ -11,6 +11,7 @@ import {
   CancellationScope,
   isCancellation,
   ApplicationFailure,
+  ParentClosePolicy,
   log,
   patched,
   type ChildWorkflowHandle,
@@ -2096,6 +2097,17 @@ Inspect the complete current diff and specifically compare its delta from the re
         {
           workflowId: childInput.taskId,
           args: [childInput as SoftwareDevInput],
+          // A sub-task is a durable task in its own right. On parent cancellation
+          // we signal it explicitly below and briefly wait for its cleanup, but a
+          // busy worker can take longer than that bounded wait to acknowledge the
+          // cancelled provider activity. Temporal's default TERMINATE policy then
+          // raced the already-durable signal and killed the child without running
+          // its workflow cleanup. Detach new children so the signal remains the
+          // authority after the parent closes; `patched` preserves the original
+          // StartChild command when replaying histories recorded before this fix.
+          ...(patched('software-dev-detached-subtask-cancellation-v1')
+            ? { parentClosePolicy: ParentClosePolicy.ABANDON }
+            : {}),
         },
       );
       childHandles.set(childInput.taskId, child);
