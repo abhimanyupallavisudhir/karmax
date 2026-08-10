@@ -377,13 +377,19 @@ export async function softwareDevV1_22(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.22.0');
 }
 
+/** Cancellation and GitHub webhook reconciliation preserve GitHub's actual PR
+ * outcome instead of flattening every terminal pull request into "closed". */
+export async function softwareDevV1_23(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.23.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -494,6 +500,7 @@ async function softwareDevImpl(
   const restoresStagePrerequisites = minor >= 22;
   const preservesHumanHoldContext = minor >= 22;
   const interlocksLandingTransitions = minor >= 22;
+  const githubAuthoritativeCancellation = minor >= 23;
   const configuredLandingAuthority = landingAuthorityOf(input.project);
   // The exact-candidate check belongs to the agent that authored and repaired
   // the proposal. Re-enter its Do conversation so it retains both context and
@@ -3572,10 +3579,13 @@ Inspect the complete current diff and specifically compare its delta from the re
     await cancelChildren(liveAgentStates); // don't strand children when we go away
     // A cancelled task must not leave an open pull request proposing work that
     // will never land.
-    if (!lifecycleReplacement && githubPrLifecycle && world && prs.some((p) => p.state === 'open')) {
-      await core.closePrs(world as any, prs, 'The karmax task for this branch was cancelled; closing the pull request.')
-        .catch(() => undefined);
-      prs = prs.map((p) => ({ ...p, state: 'closed' as const }));
+    if (!lifecycleReplacement && githubPrLifecycle && world && prs.length
+      && (githubAuthoritativeCancellation || prs.some((p) => p.state === 'open'))) {
+      const reconciled = await core.closePrs(world as any, prs,
+        'The karmax task for this branch was cancelled; closing the pull request.').catch(() => undefined);
+      prs = githubAuthoritativeCancellation && reconciled
+        ? reconciled
+        : prs.map((p) => ({ ...p, state: 'closed' as const }));
       pr = prs[0];
     }
     await publish();

@@ -6,7 +6,7 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent } from '../src/integrations/github-pr.js';
+import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent, reconcilePullRequestView } from '../src/integrations/github-pr.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 
@@ -1684,19 +1684,50 @@ describe('PR lifecycle after the merge', () => {
     const handle = await core.createWorld({ taskId: 'task_down', repo: await repoWithGithubOrigin('svc'),
       base: 'main', target: 'main', kind: 'worktree' });
     await expect(core.finalizePrs(handle, [ref()], { target: 'main', pushed: ['svc'] })).resolves.toEqual([ref()]);
-    await expect(core.closePrs(handle, [ref()], 'cancelled')).resolves.toBeUndefined();
+    await expect(core.closePrs(handle, [ref()], 'cancelled')).resolves.toEqual([ref()]);
     await core.destroyWorld(handle);
   });
 
   it('closes the still-open PR when the task is cancelled', async () => {
     const { gh, core, handle, prs } = await withOpenPr();
-    await core.closePrs(handle, prs, 'The karmax task for this branch was cancelled; closing the pull request.');
+    const settled = await core.closePrs(handle, prs, 'The karmax task for this branch was cancelled; closing the pull request.');
     expect(gh.prs[0].state).toBe('closed');
+    expect(settled[0]).toMatchObject({ state: 'closed', merged: false });
     expect(gh.comments[0]!.body).toContain('cancelled');
     // A second cancel pass is a no-op: the PR is already closed.
     await core.closePrs(handle, prs, 'again');
     expect(gh.comments).toHaveLength(1);
     await core.destroyWorld(handle);
+  });
+
+  it('reports a manually merged PR as merged instead of merely closed during cancellation', async () => {
+    const { gh, core, handle, prs } = await withOpenPr();
+    gh.prs[0].state = 'closed';
+    gh.prs[0].merged_at = '2026-08-10T00:00:00Z';
+
+    const settled = await core.closePrs(handle, prs, 'cancelled');
+
+    expect(settled[0]).toMatchObject({ state: 'closed', merged: true });
+    expect(gh.comments).toHaveLength(0);
+    await core.destroyWorld(handle);
+  });
+});
+
+describe('GitHub PR state → task view', () => {
+  const pr = { repo: 'app', slug: SLUG, number: 85, url: `https://github.com/${SLUG}/pull/85`,
+    state: 'open' as const };
+  const view = { taskId: 'task_24', title: 'Work', workflow: 'software-dev', stage: 'review' as const,
+    status: 'waiting' as const, messages: [], actions: [], state: {}, updatedAt: 1,
+    pr, prs: [pr], checkouts: [{ name: 'app', branch: 'karmax/task_24', base: 'main', pr }] };
+
+  it('reconciles every PR projection and never regresses an observed merge', () => {
+    const merged = reconcilePullRequestView(view, { repo: SLUG, number: 85, state: 'closed', merged: true });
+    expect(merged.pr).toMatchObject({ state: 'closed', merged: true });
+    expect(merged.prs?.[0]).toMatchObject({ state: 'closed', merged: true });
+    expect(merged.checkouts?.[0]?.pr).toMatchObject({ state: 'closed', merged: true });
+
+    const delayed = reconcilePullRequestView(merged, { repo: SLUG, number: 85, state: 'open', merged: false });
+    expect(delayed.pr).toMatchObject({ state: 'closed', merged: true });
   });
 });
 

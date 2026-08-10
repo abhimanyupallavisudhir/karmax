@@ -12,6 +12,8 @@
  * for automation and compatibility callers.
  */
 
+import type { TaskPullRequest, TaskView } from '../domain/types.js';
+
 export interface GithubPullRequest {
   number: number;
   nodeId?: string;
@@ -556,6 +558,41 @@ export interface GithubPrWebhookEvent {
   taskId: string;
   type: string;
   payload: Record<string, unknown>;
+}
+
+/**
+ * Apply GitHub's latest PR state to every projection of that PR in a task view.
+ * Workflow snapshots are otherwise frozen once an execution ends, even though
+ * the pull request can still be merged, closed, or reopened directly on GitHub.
+ * A merge is immutable, so a delayed older delivery may never regress it.
+ */
+export function reconcilePullRequestView(
+  view: TaskView,
+  payload: Record<string, unknown>,
+): TaskView {
+  const slug = typeof payload.repo === 'string' ? payload.repo.toLowerCase() : '';
+  const number = Number(payload.number);
+  const state = payload.state === 'open' || payload.state === 'closed' ? payload.state : undefined;
+  const merged = payload.merged === true;
+  if (!slug || !Number.isInteger(number) || !state) return view;
+
+  let changed = false;
+  const reconcile = (pr: TaskPullRequest | undefined): TaskPullRequest | undefined => {
+    if (!pr || pr.slug.toLowerCase() !== slug || pr.number !== number) return pr;
+    const nextMerged = Boolean(pr.merged) || merged;
+    const nextState = nextMerged ? 'closed' as const : state;
+    if (pr.state === nextState && Boolean(pr.merged) === nextMerged) return pr;
+    changed = true;
+    return { ...pr, state: nextState, merged: nextMerged };
+  };
+
+  const pr = reconcile(view.pr);
+  const prs = view.prs?.map((candidate) => reconcile(candidate)!);
+  const checkouts = view.checkouts?.map((checkout) => {
+    const next = reconcile(checkout.pr);
+    return next === checkout.pr ? checkout : { ...checkout, pr: next };
+  });
+  return changed ? { ...view, pr, prs, checkouts } : view;
 }
 
 /**

@@ -481,6 +481,34 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(() => h.store.getTask(task.id)?.lastView?.stage, { timeout: 30_000 }).toBe('done');
   }, 120_000);
 
+  it('v1.23 keeps a manually merged PR marked merged when its task is cancelled', async () => {
+    const repo = await repoWithOrigin('manual-merge-before-cancel');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.23.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [{
+        taskId,
+        projectId: 'p1',
+        title: 'Manual merge before cancel',
+        prompt: '@write manual.md :: merged on GitHub\n@run git add -A && git commit -q -m manual\n@openpr',
+        base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+      }],
+    });
+
+    await expect.poll(async () => `${(await view(handle)).stage}/${prs.length}`,
+      { timeout: 30_000 }).toBe('review/1');
+    prs[0].state = 'closed';
+    prs[0].merged_at = new Date().toISOString();
+
+    await handle.signal('cancel');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+    const final = await view(handle);
+    expect(final.pr).toMatchObject({ state: 'closed', merged: true });
+    expect(final.prs[0]).toMatchObject({ state: 'closed', merged: true });
+  }, 120_000);
+
   it('v1.14 returns terminal CI failures to Do with failed-check context, then reviews the repaired head again', async () => {
     const repo = await repoWithOrigin('github-ci-repair');
     const project = h.store.createProject('GitHub CI repair', { repos: [repo], remote: 'pr' });

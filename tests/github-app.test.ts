@@ -405,9 +405,19 @@ describe('GitHub App integration', () => {
         title: 'Work', head: { ref: branch }, base: { ref: 'main' }, ...over },
     });
 
+    const taskPr = { repo: 'app', slug: 'acme/app', number: 3, url: 'https://github.com/acme/app/pull/3',
+      state: 'open' as const };
+    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow,
+      stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: Date.now(),
+      pr: taskPr, prs: [taskPr],
+      checkouts: [{ name: 'app', branch: `karmax/${task.id}`, base: 'main', pr: taskPr }] });
+
     const merged = await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`));
     expect(merged.events).toHaveLength(1);
     expect(merged.events![0]).toMatchObject({ taskId: task.id, type: 'github.pr.merged' });
+    expect(store.getTask(task.id)?.lastView?.pr).toMatchObject({ state: 'closed', merged: true });
+    expect(store.getTask(task.id)?.lastView?.prs?.[0]).toMatchObject({ state: 'closed', merged: true });
+    expect(store.getTask(task.id)?.lastView?.checkouts?.[0]?.pr).toMatchObject({ state: 'closed', merged: true });
     const check = await deliver('check_run', 'check-1', {
       installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
       check_run: { name: 'CI', status: 'completed', conclusion: 'failure',
