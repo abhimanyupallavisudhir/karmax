@@ -203,6 +203,8 @@ a { color: var(--accent); text-decoration: none; }
 /* ── main ───────────────────────────────────────────────────── */
 .main { overflow-y: auto; padding: 0; }
 .main-inner { max-width: 960px; margin: 0 auto; padding: 22px 28px 80px; }
+.route-loading { min-height: 55vh; display: grid; place-content: center; justify-items: center; gap: 10px; color: var(--ink-3); }
+.route-loading > b { color: var(--ink); font-size: 15px; }
 .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 18px; position: sticky; top: 0; background: var(--paper); z-index: 5; }
 .tab { padding: 11px 14px; cursor: pointer; color: var(--ink-2); border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
 .tab:hover { color: var(--ink); }
@@ -213,6 +215,7 @@ a { color: var(--accent); text-decoration: none; }
 
 /* new-task composer */
 .composer { display: flex; gap: 8px; margin-bottom: 18px; }
+.composer.busy { opacity: .68; cursor: progress; }
 .composer input.title-in {
   flex: 1; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r);
   background: var(--surface); outline: none; box-shadow: var(--shadow);
@@ -545,6 +548,10 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
 .tf-head select { flex: none; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 9px; font-weight: 550; }
 .tf-scroll { flex: 1; overflow-y: auto; }
+.tf-loading { flex: 1; display: grid; place-items: center; color: var(--ink-3); }
+.tf-loading.modal-loading { min-height: 180px; }
+.task-load-error { display: flex; flex-direction: column; align-items: center; gap: 8px; max-width: 420px; text-align: center; }
+.task-load-error > span { color: var(--ink-3); }
 .tf-columns {
   padding-top: 26px; padding-bottom: 56px;
   display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px 44px;
@@ -1511,6 +1518,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 .search-box { display: flex; align-items: center; gap: 8px; padding: 2px 4px; }
 .search-box .search-ic { color: var(--ink-3); font-size: 15px; }
+.search-pending { color: var(--ink-3); font-size: 11px; white-space: nowrap; }
 .task-search {
   flex: 1; border: 0; outline: none; background: transparent; color: var(--ink);
   font-size: 14px; font-family: var(--font-ui); padding: 4px 0;

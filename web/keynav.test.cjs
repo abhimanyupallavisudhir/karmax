@@ -158,6 +158,9 @@ ok(draft.quick === true && draft.draft === true && draft.images[0] === 'image-1'
 // that form immediately must therefore see a dirty state and create a draft.
 ok(extractFn('openTaskForm').includes('initialTaskFormSavedSignature(draft, seedText, stateSig(formState()))'),
   'the expanded form uses the carried-text-aware saved baseline');
+const openTaskFormSource = extractFn('openTaskForm');
+ok(openTaskFormSource.indexOf('root.innerHTML = taskFormLoadingPage') < openTaskFormSource.indexOf('await Promise.all'),
+  'the expanded form acknowledges the keypress before awaiting server hydration');
 ok(initialTaskFormSavedSignature(undefined, 'carried quick text', 'seeded-state') === null,
   'quick text starts the expanded form with an unsaved signature');
 ok(initialTaskFormSavedSignature(undefined, '', 'empty-state') === 'empty-state',

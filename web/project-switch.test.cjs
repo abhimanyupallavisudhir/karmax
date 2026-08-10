@@ -39,12 +39,14 @@ global.loadCollaboration = async () => { calls.push(`loadCollaboration:${S.organ
 global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
 global.renderRail = () => { calls.push('renderRail'); };
 global.renderMain = () => { calls.push('renderMain'); };
+global.renderRouteLoadingPage = (title, label) => { calls.push(`renderRouteLoadingPage:${title}:${label}`); };
 global.seedActivity = () => {};
 global.seedQueue = () => {};
 global.renderDashboard = () => {};
 global.resolveProjectTaskKey = async () => null;
-global.openTask = async () => {};
+global.openTask = async (id) => { calls.push(`openTask:${id}`); };
 global.renderTaskPage = () => {};
+global.taskRecord = (id) => S.tasks.find((task) => task.id === id) || null;
 global.closeTaskDom = () => { calls.push('closeTaskDom'); };
 global.syncOrganizationSwitcher = () => { calls.push(`syncOrganizationSwitcher:${S.organizationId}`); };
 
@@ -73,6 +75,9 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   // The switch actually happened and loaded the new project's data.
   ok(S.projectId === 'B', 'projectId switched to the opened project');
   ok(calls.includes('loadTasks'), 'new project tasks were loaded');
+  ok(calls.indexOf('renderRouteLoadingPage:B:Loading project…') >= 0
+    && calls.indexOf('renderRouteLoadingPage:B:Loading project…') < calls.indexOf('loadTasks'),
+  'cross-project navigation paints a loading surface before fetching tasks');
   ok(calls.includes('loadOrg:B'), 'new project tags/views were loaded (not left stale)');
   ok(calls.includes('runSearch'), 'the task list was re-evaluated for the new project');
 
@@ -92,6 +97,50 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   ok(S.projectId === 'B', 'staying on the same project keeps it selected');
   ok(S.search === 'tag:bug sort:priority-desc', 'the list query comes from the URL, not from memory');
   ok(S.cursorId === 't_new', 'same-project navigation preserves the roving cursor');
+
+  // Returning from a task must reveal the already-loaded same-project list before
+  // a slow authoritative search finishes. This is the perceived-latency contract
+  // for the `u` shortcut: navigation feedback is local, freshness follows async.
+  calls = [];
+  S.selected = 't_new';
+  S.orgProjectId = 'B';
+  let finishSearch;
+  global.runSearch = () => { calls.push('runSearch:pending'); return new Promise((resolve) => { finishSearch = resolve; }); };
+  const returning = applyRoute();
+  await new Promise((resolve) => setImmediate(resolve));
+  ok(calls.includes('closeTaskDom'), 'same-list return closes the task before the refresh finishes');
+  ok(calls.indexOf('renderMain') >= 0 && calls.indexOf('renderMain') < calls.indexOf('runSearch:pending'),
+    'same-list return paints cached results before awaiting search');
+  finishSearch();
+  await returning;
+  S.selected = null;
+  global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
+
+  // Other same-project tabs have the same local-first contract. Metadata remains
+  // fresh, but it cannot sit in front of the destination paint.
+  calls = [];
+  let finishMetadata;
+  global.parseRoute = () => ({ name: 'project', slug: 'b', tab: 'queue', taskKey: null, q: '' });
+  global.loadOrg = () => { calls.push('loadOrg:pending'); return new Promise((resolve) => { finishMetadata = resolve; }); };
+  const openingQueue = applyRoute();
+  await new Promise((resolve) => setImmediate(resolve));
+  ok(calls.indexOf('renderMain') >= 0 && calls.indexOf('renderMain') < calls.indexOf('loadOrg:pending'),
+    'same-project tabs paint before metadata refresh');
+  finishMetadata();
+  await openingQueue;
+
+  // A task has its own immediate loading page, so cached organization metadata
+  // also refreshes behind (rather than in front of) opening it.
+  calls = [];
+  let finishTaskMetadata;
+  global.parseRoute = () => ({ name: 'project', slug: 'b', tab: 'tasks', taskKey: '7', q: '' });
+  global.resolveProjectTaskKey = async () => 't7';
+  global.loadOrg = () => { calls.push('loadOrg:task-pending'); return new Promise((resolve) => { finishTaskMetadata = resolve; }); };
+  await applyRoute();
+  ok(calls.includes('openTask:t7'), 'task opening does not await a cached metadata refresh');
+  finishTaskMetadata();
+  await new Promise((resolve) => setImmediate(resolve));
+  global.loadOrg = async () => { calls.push(`loadOrg:${S.projectId}`); S.orgProjectId = S.projectId; };
 
   // A task permalink carries no ?q= (it is about the task): it must leave the
   // working query alone so closing the task returns to the same filtered list.
