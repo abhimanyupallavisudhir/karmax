@@ -44,6 +44,7 @@ const S = {
   projects: [],
   organizations: [],
   organizationId: null,
+  defaultOrganizationId: null,
   organizationMembers: [],
   teams: [],
   users: [],
@@ -165,6 +166,7 @@ function organizationBySlug(slug) {
 function currentOrg() {
   return organizationById(S.organizationId)
     || organizationById(projectById(S.projectId)?.organizationId)
+    || organizationById(S.defaultOrganizationId)
     || (S.organizations || [])[0];
 }
 
@@ -327,7 +329,7 @@ async function applyRoute() {
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(currentPath());
   if (r.name === 'home') {
-    const pid = S.projectId || S.projects[0]?.id;
+    const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
     return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
   }
   if (r.name === 'profile') {
@@ -2085,7 +2087,7 @@ async function boot() {
     if (e.status === 403) return renderAccessPending();
     throw e;
   }
-  if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
+  if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
   // Account creation marks exactly one session response for Git onboarding. Only
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
@@ -2136,7 +2138,7 @@ async function boot() {
 
 async function loadProjects() {
   S.projects = await api('/api/projects');
-  if (!S.projectId && S.projects[0]) S.projectId = S.projects[0].id;
+  if (!S.projectId) S.projectId = firstProjectForOrganization(S.organizationId)?.id || null;
   if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
 }
 
@@ -2160,8 +2162,13 @@ async function loadOrganizationRuntimeCatalog() {
 }
 
 async function loadOrganizations() {
-  S.organizations = await api('/api/organizations').catch(() => []);
-  if (!S.organizationId) S.organizationId = S.organizations[0]?.id || null;
+  const [organizations, preference] = await Promise.all([
+    api('/api/organizations'),
+    api('/api/user/default-organization'),
+  ]);
+  S.organizations = organizations;
+  S.defaultOrganizationId = preference?.organizationId || null;
+  if (!S.organizationId) S.organizationId = S.defaultOrganizationId;
 }
 
 async function loadCollaboration() {
@@ -2846,7 +2853,7 @@ function switchTab(tab) {
   if (tab === 'dashboard') return go(globalRoute('dashboard'));
   if (tab === 'global' || tab === 'organization') return go(globalRoute('organization'));
   if (tab === 'inbox') return go(globalRoute('inbox'));
-  const pid = S.projectId || S.projects[0]?.id;
+  const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
   return go(pid ? projectRoute(pid, tab) : globalRoute('dashboard'));
 }
 
@@ -12128,11 +12135,16 @@ function profileView() {
   // Every organization the user belongs to (owns or was added to), each linking
   // to its dashboard. Role comes from the membership loaded alongside the org.
   const orgList = orgs.length
-    ? orgs.map((o) => `<a class="profile-org" data-spa href="${globalRoute('dashboard', o)}">
-        <span class="profile-org-mark">◇</span>
-        <span class="profile-org-name">${esc(o.name)}</span>
-        ${o.kind === 'personal' ? '<span class="chip">personal</span>' : ''}
-      </a>`).join('')
+    ? orgs.map((o) => `<div class="profile-org">
+        <a class="profile-org-link" data-spa href="${globalRoute('dashboard', o)}">
+          <span class="profile-org-mark">◇</span>
+          <span class="profile-org-name">${esc(o.name)}</span>
+          ${o.kind === 'personal' ? '<span class="chip">personal</span>' : ''}
+        </a>
+        ${o.id === S.defaultOrganizationId
+          ? '<span class="chip success">Default</span>'
+          : `<button class="btn sm" type="button" data-default-organization="${esc(o.id)}">Set as default</button>`}
+      </div>`).join('')
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
@@ -12316,6 +12328,17 @@ function wireNotificationsCard() {
 function wireProfileView() {
   wireNotificationsCard();
   hydrateProfileGithub();
+  document.querySelectorAll('[data-default-organization]').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const preference = await api('/api/user/default-organization', {
+        method: 'PUT', body: JSON.stringify({ organizationId: button.dataset.defaultOrganization }),
+      });
+      S.defaultOrganizationId = preference.organizationId;
+      renderMain();
+      toast('Default organization updated');
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  }));
   const setProfileEditor = (kind) => {
     document.querySelectorAll('.profile-edit-panel').forEach((panel) => {
       panel.hidden = panel.id !== `profile-${kind}-panel`;

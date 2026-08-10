@@ -311,6 +311,9 @@ export class Store {
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (organizationId, userId)
       );
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        userId TEXT PRIMARY KEY, defaultOrganizationId TEXT
+      );
       CREATE TABLE IF NOT EXISTS organization_invitations (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, email TEXT NOT NULL,
         role TEXT NOT NULL, tokenHash TEXT NOT NULL UNIQUE, invitedBy TEXT NOT NULL,
@@ -1095,6 +1098,32 @@ export class Store {
     return (rows as any[]).map(rowToOrganization);
   }
 
+  /** The workspace a person's neutral `/` route opens. Existing users predate
+   * this preference, so initialize them lazily to the personal workspace they
+   * own; joining or creating another organization must never change it. */
+  defaultOrganization(userId: string): Organization | undefined {
+    const row = this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?').get(userId) as any;
+    const organizations = this.listOrganizations(userId);
+    const stored = organizations.find((organization) => organization.id === row?.defaultOrganizationId);
+    if (stored) return stored;
+    const fallback = organizations.find((organization) => organization.kind === 'personal'
+      && this.organizationMembership(organization.id, userId)?.role === 'owner')
+      ?? organizations.find((organization) => organization.kind === 'personal')
+      ?? organizations[0];
+    if (fallback) this.setDefaultOrganization(userId, fallback.id);
+    return fallback;
+  }
+
+  setDefaultOrganization(userId: string, organizationId: string): Organization {
+    const organization = this.getOrganization(organizationId);
+    if (!organization || !this.organizationMembership(organizationId, userId))
+      throw new Error('default organization must be one of your organizations');
+    this.db.prepare(`INSERT INTO user_preferences (userId, defaultOrganizationId) VALUES (?, ?)
+      ON CONFLICT(userId) DO UPDATE SET defaultOrganizationId=excluded.defaultOrganizationId`)
+      .run(userId, organizationId);
+    return organization;
+  }
+
   /** Complete, secret-redacted tenant export. The table-oriented envelope is
    * intentionally stable and lossless: future import/migration tools can retain
    * records they do not yet understand without flattening the task model. */
@@ -1307,6 +1336,7 @@ export class Store {
       format: 'karmax-user-export',
       version: 1,
       exportedAt: new Date().toISOString(),
+      preferences: { defaultOrganizationId: this.defaultOrganization(userId)?.id ?? null },
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles'],
@@ -1439,6 +1469,7 @@ export class Store {
       deleteRows(this.db, 'teams', 'id', teamIds);
       deleteRows(this.db, 'tasks', 'id', taskIds);
       deleteRows(this.db, 'projects', 'id', projectIds);
+      this.db.prepare('DELETE FROM user_preferences WHERE defaultOrganizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId);
       this.db.exec('COMMIT');
     } catch (error) {
@@ -1451,6 +1482,8 @@ export class Store {
   claimPersonalOrganization(userId: string, name?: string): Organization {
     const organization = this.getOrganization('org_personal')!;
     this.setOrganizationMembership(organization.id, userId, 'owner');
+    if (!this.db.prepare('SELECT 1 FROM user_preferences WHERE userId=?').get(userId))
+      this.setDefaultOrganization(userId, organization.id);
     if (name && organization.name === 'Personal') {
       const next = `${name.trim() || 'Personal'}'s workspace`;
       this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(next, organization.id);
@@ -1489,6 +1522,7 @@ export class Store {
       if (owners <= 1) throw new Error('an organization must retain at least one owner');
     }
     this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId);
+    this.db.prepare('DELETE FROM user_preferences WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId);
   }
 
   getOrganizationIdentityPolicy(organizationId: string): OrganizationIdentityPolicy {

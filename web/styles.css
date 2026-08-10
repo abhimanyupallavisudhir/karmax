@@ -968,9 +968,13 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .profile-org {
   display: flex; align-items: center; gap: 10px; padding: 10px 12px;
   border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
-  color: var(--ink-1); text-decoration: none;
+  color: var(--ink-1);
 }
 .profile-org:hover { border-color: var(--accent); background: var(--accent-weak); }
+.profile-org-link {
+  display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;
+  color: inherit; text-decoration: none;
+}
 .profile-org-mark { color: var(--ink-3); }
 .profile-org-name { font-weight: 600; flex: 1; }
 .github-mark { width: 16px; height: 16px; flex: none; }

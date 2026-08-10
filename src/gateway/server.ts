@@ -126,7 +126,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export') return 'none';
+  if (p === '/api/user/export' || p === '/api/user/default-organization') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -1265,6 +1265,20 @@ export class Gateway {
         if (bearer) this.sessions.delete(bearer);
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
+        const subject = requireInteractiveHuman(callerIdentity);
+        if (method === 'GET') {
+          const organization = store.defaultOrganization(subject.userId);
+          return this.json(res, 200, { organizationId: organization?.id ?? null });
+        }
+        const b = await this.body(req);
+        try {
+          const organization = store.setDefaultOrganization(subject.userId, String(b.organizationId ?? ''));
+          return this.json(res, 200, { organizationId: organization.id });
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       if (p === '/api/user/export' && method === 'GET') {
         // Broad task-agent capabilities never imply ownership of a human's
@@ -6018,6 +6032,7 @@ export class Gateway {
       const label = (name || '').trim();
       const organization = this.deps.store.createOrganization({
         name: label ? `${label}'s workspace` : 'Personal workspace', kind: 'personal', ownerUserId: userId });
+      this.deps.store.setDefaultOrganization(userId, organization.id);
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
       inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
       return true;

@@ -88,6 +88,8 @@ describe('gateway route capability binding', () => {
 
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
     expect(cap('GET', '/api/user/export')).toBe('none');
+    expect(cap('GET', '/api/user/default-organization')).toBe('none');
+    expect(cap('PUT', '/api/user/default-organization')).toBe('none');
     expect(cap('GET', '/api/user/git-profiles')).toBe('none');
     expect(cap('POST', '/api/user/git-profiles')).toBe('none');
     expect(cap('DELETE', '/api/user/git-profiles/main')).toBe('none');

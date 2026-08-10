@@ -123,6 +123,52 @@ describe('user data export', () => {
   });
 });
 
+describe('default organization preference', () => {
+  it('starts on the personal workspace and changes only when the user asks', async () => {
+    const { identity, store, base } = await boot();
+    const signup = await fetch(`${base}/api/setup`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Alice', email: 'alice@example.com', password: 'long-enough-password' }),
+    });
+    const cookie = signup.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
+    const user = identity.listUsers().find((candidate) => candidate.email === 'alice@example.com')!;
+    const personal = store.listOrganizations(user.id).find((organization) => organization.kind === 'personal')!;
+    const newest = store.createOrganization({ name: 'Newest team', ownerUserId: user.id });
+
+    const initial = await fetch(`${base}/api/user/default-organization`, { headers: { cookie } });
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toEqual({ organizationId: personal.id });
+
+    const changed = await fetch(`${base}/api/user/default-organization`, {
+      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ organizationId: newest.id }),
+    });
+    expect(changed.status).toBe(200);
+    expect(await changed.json()).toEqual({ organizationId: newest.id });
+    expect(store.defaultOrganization(user.id)?.id).toBe(newest.id);
+
+    const inaccessible = store.createOrganization({ name: 'Not mine', ownerUserId: 'someone-else' });
+    const rejected = await fetch(`${base}/api/user/default-organization`, {
+      method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ organizationId: inaccessible.id }),
+    });
+    expect(rejected.status).toBe(400);
+    expect(store.defaultOrganization(user.id)?.id).toBe(newest.id);
+  });
+
+  it('does not allow an agent bearer to read or change a user preference', async () => {
+    const { tokens, base } = await boot();
+    const token = tokens.mintPrincipal('user:alice', ['*']).token;
+    for (const method of ['GET', 'PUT']) {
+      const response = await fetch(`${base}/api/user/default-organization`, {
+        method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        ...(method === 'PUT' ? { body: JSON.stringify({ organizationId: 'org_personal' }) } : {}),
+      });
+      expect(response.status).toBe(401);
+    }
+  });
+});
+
 describe('GitHub sign-in when configured', () => {
   it('advertises itself and builds a shared GitHub App authorize URL', async () => {
     const { identity, base } = await boot({ github: { ...GITHUB, app: true } });

@@ -12,6 +12,23 @@ describe('organization and collaboration domain', () => {
     expect(project.organizationId).toBe(personal!.id);
   });
 
+  it('keeps a per-user default organization initialized to the owned personal workspace', () => {
+    const store = new Store(':memory:');
+    const personal = store.createOrganization({ name: "Alice's workspace", kind: 'personal', ownerUserId: 'alice' });
+    const team = store.createOrganization({ name: 'Newest team', ownerUserId: 'team-owner' });
+    store.setOrganizationMembership(team.id, 'alice', 'member');
+
+    expect(store.defaultOrganization('alice')?.id).toBe(personal.id);
+    expect(store.defaultOrganization('alice')?.id).toBe(personal.id); // joining a newer org does not update it
+    expect(() => store.setDefaultOrganization('alice', store.getOrganization('org_personal')!.id))
+      .toThrow(/one of your organizations/);
+
+    store.setDefaultOrganization('alice', team.id);
+    expect(store.defaultOrganization('alice')?.id).toBe(team.id);
+    store.removeOrganizationMembership(team.id, 'alice');
+    expect(store.defaultOrganization('alice')?.id).toBe(personal.id);
+  });
+
   it('keeps membership, teams, repositories, and project access inside one organization', () => {
     const store = new Store(':memory:');
     const acme = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
