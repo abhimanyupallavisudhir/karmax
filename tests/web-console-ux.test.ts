@@ -176,6 +176,15 @@ describe('destructive actions confirm first', () => {
   });
 });
 
+describe('manual PR opening', () => {
+  it('labels the human-only action clearly and confirms it before signaling', () => {
+    expect(app).toContain("? 'Manually Open PR'");
+    expect(app).toContain('Are you sure the agent\'s work here is complete? You could cancel and ask the agent to open the PR itself.');
+    expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act)) return;');
+    expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name)) return;');
+  });
+});
+
 describe('widget rendering', () => {
   it('escapes gauge data like every other branch', () => {
     const gauge = app.slice(app.indexOf("case 'gauge': {"), app.indexOf("case 'gauge': {") + 900);

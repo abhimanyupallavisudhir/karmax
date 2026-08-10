@@ -7575,7 +7575,9 @@ function taskActions(v) {
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
-    const label = a.name === 'confirm' && v.stage === 'merge' && v.waitingFor?.kind === 'human'
+    const label = a.name === 'openPr'
+      ? 'Manually Open PR'
+      : a.name === 'confirm' && v.stage === 'merge' && v.waitingFor?.kind === 'human'
       ? 'Authorize GitHub merge'
       : a.label;
     const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
@@ -7604,10 +7606,16 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
-  const standard = { confirm: 'confirm', openPr: 'open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const standard = { confirm: 'confirm', openPr: 'manually open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
   const done = { confirm: 'Confirmed', openPr: 'Opening PR', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
+}
+
+const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
+
+function confirmTaskAction(action) {
+  return action !== 'openPr' || confirm(MANUAL_OPEN_PR_CONFIRMATION);
 }
 
 function reflectAcceptedTaskAction(taskId, action) {
@@ -7622,6 +7630,7 @@ function wireActions(v) {
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
+      if (!confirmTaskAction(act)) return;
       const cancelling = act === 'cancel';
       const label = btn.innerHTML;
       if (cancelling) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
@@ -13119,6 +13128,7 @@ async function runDeclaredAction(a) {
   if (!S.selected) return;
   if (a.name === 'followUp') return focusFollowup();
   if (a.args && a.args.length) return openActionForm(a);
+  if (!confirmTaskAction(a.name)) return;
   const taskId = S.selected;
   try {
     await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
