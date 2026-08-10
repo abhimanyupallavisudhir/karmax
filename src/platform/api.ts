@@ -1490,6 +1490,31 @@ export class KarmaxApi {
         caller.caps,
         authorization,
       );
+    const authorizationScope = authorization as typeof authorization & {
+      scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
+    };
+    // Historical tasks (and tasks authorized before delegated subjects were
+    // introduced) may have a human creator + pinned GitHub identity but no
+    // durable delegation. An authorization update is itself carried by a
+    // verified bearer, so use that authority boundary to backfill provenance for
+    // the next turn. Never infer a subject from `principal`, and never replace a
+    // task's already-pinned account with the caller's currently-active account.
+    const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string'
+      ? task.params._githubAccountId : undefined;
+    const delegatedGithubAccountId = pinnedGithubAccountId
+      ?? (caller.kind === 'agent'
+        ? caller.externalIdentities?.githubAccountId
+        : caller.humanSubject
+          ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
+          : undefined);
+    const delegation = priorAuthorization?.delegationId ? undefined : this.deps.tokens.delegateHuman(token, {
+      taskId,
+      projectId: authorizationScope.scope ? undefined : task.projectId,
+      projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
+      organizationId: authorizationScope.scope === 'global' ? undefined
+        : (authorizationScope.organizationId ?? organizationId),
+      externalIdentities: delegatedGithubAccountId ? { githubAccountId: delegatedGithubAccountId } : undefined,
+    });
     if (!editInPlace) {
       // The workflow validator is the single source of truth for the in-flight
       // window; if it rejects (cancelled / past the point of no return / already
@@ -1508,7 +1533,10 @@ export class KarmaxApi {
     }
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...priorAuthorization, ...authorization, principal: caller.principal, credentialPolicies: policies },
+      _authorization: { ...priorAuthorization, ...authorization, principal: caller.principal, credentialPolicies: policies,
+        ...(delegation ? { delegationId: delegation.id } : {}) },
+      ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
+        ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
     });
     const updated = this.deps.store.getTask(taskId)!;
     this.persistTaskCredentialPolicies(updated);

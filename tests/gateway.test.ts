@@ -242,6 +242,78 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
   });
 
+  it('carries a verified pinned subject into the next token after an existing task is elevated', async () => {
+    const organization = h.store.createOrganization({ name: 'Authorization delegation repair', ownerUserId: 'delegator' });
+    const project = h.store.createProject('Authorization delegation project', {}, organization.id);
+    const legacy = h.store.createTask({
+      projectId: project.id, title: 'Existing repository task', workflow: 'software-dev', workflowVersion: '1.0.0',
+      createdBy: { kind: 'user', userId: 'delegator' },
+      params: { prompt: 'create the repository', draft: true, _githubAccountId: 'acct-42',
+        _authorization: { profileId: 'developer', capabilities: ['task:*'], principal: 'user:delegator' } } as any,
+    });
+    const human = h.tokens.mintPrincipal('user:delegator',
+      ['task:create', 'task:edit', 'repository:write'], project.id, 60_000, organization.id);
+    const elevatedResponse = await fetch(`${base}/api/tasks/${legacy.id}/authorization`, {
+      method: 'PATCH',
+      headers: { authorization: `Bearer ${human.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ profileId: 'maintainer' }),
+    });
+    expect(elevatedResponse.status).toBe(200);
+    const elevated: any = await elevatedResponse.json();
+    expect(elevated.params._authorization).toMatchObject({
+      capabilities: expect.arrayContaining(['repository:write']),
+      delegationId: expect.stringMatching(/^dlg_/),
+    });
+    expect(elevated.params._githubAccountId).toBe('acct-42');
+
+    // This is the same mint performed when Retry/Resume schedules the next agent
+    // turn: it reloads the updated grant + delegation from the durable task.
+    const resumed = h.tokens.mint({
+      taskId: legacy.id, profileId: 'do', role: 'do', principal: 'user:delegator',
+      projectId: project.id, organizationId: organization.id,
+      ceiling: ['repository:write'], grantorCaps: elevated.params._authorization.capabilities,
+      delegationId: elevated.params._authorization.delegationId,
+    });
+    expect(resumed.record.humanSubject).toMatchObject({
+      userId: 'delegator', presence: 'delegated', externalIdentities: { githubAccountId: 'acct-42' },
+    });
+    const passedSubjectGate = await fetch(`${base}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${resumed.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'must-not-be-created' }),
+    });
+    // No GitHub App is wired in this gateway. Reaching its availability check
+    // proves the repository route accepted the delegated human subject.
+    expect(passedSubjectGate.status).toBe(503);
+    expect(await passedSubjectGate.json()).toMatchObject({ error: expect.stringMatching(/GitHub App/i) });
+
+    const autonomousTask = h.store.createTask({
+      projectId: project.id, title: 'Autonomous repository task', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'create the repository', draft: true,
+        _authorization: { profileId: 'developer', capabilities: ['task:*'], principal: 'autonomous:scheduler' } } as any,
+    });
+    const autonomous = h.tokens.mintPrincipal('autonomous:scheduler',
+      ['task:create', 'task:edit', 'repository:write'], project.id, 60_000, organization.id);
+    const autonomousUpdate: any = await (await fetch(`${base}/api/tasks/${autonomousTask.id}/authorization`, {
+      method: 'PATCH',
+      headers: { authorization: `Bearer ${autonomous.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ profileId: 'maintainer' }),
+    })).json();
+    expect(autonomousUpdate.params._authorization.delegationId).toBeUndefined();
+    const autonomousRetry = h.tokens.mint({
+      taskId: autonomousTask.id, profileId: 'do', role: 'do', principal: 'autonomous:scheduler',
+      projectId: project.id, organizationId: organization.id,
+      ceiling: ['repository:write'], grantorCaps: autonomousUpdate.params._authorization.capabilities,
+    });
+    const rejected = await fetch(`${base}/api/organizations/${organization.id}/repositories/create`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${autonomousRetry.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'must-not-be-created' }),
+    });
+    expect(rejected.status).toBe(403);
+    expect(await rejected.json()).toMatchObject({ error: expect.stringMatching(/verified human subject/i) });
+  });
+
   it('creates and attaches a repository for a delegated task with its authority-pinned GitHub account', async () => {
     const organization = h.store.createOrganization({ name: 'Delegated repository creation' });
     const project = h.store.createProject('Delegated repository project', {}, organization.id);
