@@ -27,7 +27,7 @@ import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, valid
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
-import { repositoryBranchDefaults } from './branch-defaults.js';
+import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -807,6 +807,7 @@ export class KarmaxApi {
       params: {
         ...taskOverrides,
         prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
+        [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
         profiles: args.profiles,
         draft: !!args.draft,
         _authorization: { ...authorization, principal: caller.principal, credentialPolicies },
@@ -1223,6 +1224,13 @@ export class KarmaxApi {
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization,
       _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
+    // Drafts re-resolve at queue time. Stamp that the resulting common branch
+    // values already include repository fallback so provisioning must not apply
+    // the repository default again over a project/task override.
+    this.deps.store.updateTaskParams(task.id, {
+      ...task.params,
+      [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+    });
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
     // once prevents attempts queued days apart from inheriting different reviewers.
     const group = this.deps.store.attemptGroup(task.id);

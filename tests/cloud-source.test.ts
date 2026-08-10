@@ -49,7 +49,7 @@ describe('cloud repository source resolution', () => {
     });
     const task = store.createTask({
       projectId: project.id, title: 'Cloud work', workflow: 'software-dev',
-      workflowVersion: '1.0.0', params: { prompt: 'work' },
+      workflowVersion: '1.0.0', params: { prompt: 'work', _repositoryBranchesResolved: true },
     });
 
     const connection = store.upsertGitConnection({
@@ -59,8 +59,9 @@ describe('cloud repository source resolution', () => {
     const appRepository = store.upsertRepository({
       organizationId: project.organizationId!, provider: 'github', providerId: '7',
       owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
-      defaultBranch: 'main', private: true, gitConnectionId: connection.id,
+      defaultBranch: 'master', private: true, gitConnectionId: connection.id,
     });
+    store.attachProjectRepository({ projectId: project.id, repositoryId: appRepository.id });
 
     const wikiUrl = 'git@github.com:acme/project-wiki.git';
     const wiki = store.upsertRepository({
@@ -107,7 +108,7 @@ describe('cloud repository source resolution', () => {
 
     try {
       const handle = await core.createWorld({
-        taskId: task.id, repos: [app], base: 'main', target: 'main', kind: 'fake-cloud',
+        taskId: task.id, repos: [app], base: 'dev', target: 'dev', kind: 'fake-cloud',
       });
       expect(received.repos).toEqual(['git@github.com:acme/app.git', wikiUrl]);
       expect(received.copySources).toEqual([app, wikiRoot]);
@@ -119,8 +120,29 @@ describe('cloud repository source resolution', () => {
         'git@github.com:acme/app.git': 'origin',
         [wikiUrl]: 'origin',
       });
+      // The catalog's default branch is a fallback, not a hidden override of
+      // the task/project branch that the workflow already resolved.
+      expect(received.repositoryBranches['git@github.com:acme/app.git']).toBeUndefined();
+      expect(received.repositoryBranches[wikiUrl]).toEqual({ base: 'main', target: 'main' });
       expect(tokenRequests).toEqual([appRepository.id, wiki.id]);
       expect(handle.repos?.find((repo) => repo.name === 'app')?.localPath).toBe(app);
+
+      // An execution queued before branch resolution was centralized has no
+      // marker; retain the catalog fallback so its historical "main" input does
+      // not create or target a phantom branch.
+      const legacy = store.createTask({ projectId: project.id, title: 'Legacy cloud work',
+        workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'work' } });
+      await core.createWorld({ taskId: legacy.id, repos: [app], base: 'main', target: 'main', kind: 'fake-cloud' });
+      expect(received.repositoryBranches['git@github.com:acme/app.git'])
+        .toEqual({ base: 'master', target: 'master' });
+
+      // A deliberately configured per-repository policy is stronger than the
+      // common task/project policy.
+      store.attachProjectRepository({ projectId: project.id, repositoryId: appRepository.id,
+        baseBranch: 'trunk', targetBranch: 'production' });
+      await core.createWorld({ taskId: task.id, repos: [app], base: 'dev', target: 'dev', kind: 'fake-cloud' });
+      expect(received.repositoryBranches['git@github.com:acme/app.git'])
+        .toEqual({ base: 'trunk', target: 'production' });
     } finally {
       store.close();
     }

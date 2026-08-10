@@ -73,6 +73,7 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
+import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
@@ -972,11 +973,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const hasCatalogedLocalSource = worldSources.some((_source, index) =>
         Boolean(sourceResolutions[index]?.localPath)
         && organizationRepositories.some((candidate) => sameRepository(candidate.sshUrl, transportSources[index]!)));
+      const commonBranchesResolved = store.getTask(args.taskId)?.params[REPOSITORY_BRANCHES_RESOLVED_PARAM] === true;
       const repositoryBranches = Object.fromEntries(worldSources.flatMap((source, index) => {
         const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, transportSources[index]!));
         if (!candidate) return [];
-        const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
-        return [[source, { base, target: candidate.targetBranch ?? base }]];
+        // New task records have already resolved the common base/target through
+        // task → project → organization → repository fallback. Only an explicit
+        // per-repository policy may override those values. Records without the
+        // marker predate that resolver, so retain the old catalog fallback for
+        // already-queued/in-flight work whose input may still say "main".
+        if (commonBranchesResolved && !candidate.baseBranch && !candidate.targetBranch) return [];
+        const base = candidate.baseBranch ?? (commonBranchesResolved ? args.base : candidate.repository.defaultBranch);
+        const target = candidate.targetBranch
+          ?? (candidate.baseBranch ? base : commonBranchesResolved ? args.target ?? base : candidate.repository.defaultBranch);
+        return [[source, { base, target }]];
       }));
       const repositoryAuthorities: Record<string, 'origin'> = Object.fromEntries(worldSources.flatMap((source, index) =>
         githubIsAuthority && githubSlug(transportSources[index]!) ? [[source, 'origin' as const]] : []));

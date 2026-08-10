@@ -111,11 +111,12 @@ describe('repository selection validation', () => {
 
     api = new KarmaxApi({ store, client: { workflow: { start: async (...a: unknown[]) => { started.push(a); return {}; } } } as any,
       taskQueue: 'tq', tokens, hosted: true });
-    await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+    const inherited = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
 
     const input = (started[0]![1] as any).args[0];
     expect(input.base).toBe('master');
     expect(input.target).toBe('master');
+    expect(inherited.params._repositoryBranchesResolved).toBe(true);
 
     // A real task-level choice remains authoritative; repository metadata only
     // replaces the unsaved field fallback.
