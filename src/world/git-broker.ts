@@ -17,6 +17,151 @@ export interface GitBrokerPublishResult {
   errors?: Record<string, string>;
 }
 
+export interface GitBrokerEnrollmentSpec {
+  /** Enrolled SSH-shaped repository URL. Credentials are resolved only by the
+   * trusted broker and are never written into the task world. */
+  source: string;
+  /** Preferred checkout name. A deterministic suffix is added on collision. */
+  name?: string;
+  branch: string;
+  base: string;
+  target?: string;
+  targetPinned?: boolean;
+  identity?: WorldGitIdentity;
+}
+
+/**
+ * Add a newly attached repository to an already-running world.
+ *
+ * The authenticated clone and any initialization push happen in a disposable
+ * host directory. The world receives only a Git bundle and the public origin
+ * URL, preserving the same secret boundary as ordinary world provisioning.
+ * Empty repositories are initialized on their configured base branch before
+ * the task branch is materialized, so children and later PRs have a real base.
+ */
+export async function brokerEnrollRepository(
+  world: World,
+  spec: GitBrokerEnrollmentSpec,
+  auth: GitBrokerAuth,
+): Promise<WorldRepo> {
+  if (!/^(?:ssh:\/\/|git@)/.test(spec.source)) throw new Error('dynamic repository enrollment requires an SSH remote');
+  if (!safeBranch(spec.branch)) throw new Error(`invalid task branch "${spec.branch}"`);
+  if (!safeBranch(spec.base)) throw new Error(`invalid repository base branch "${spec.base}"`);
+  if (spec.target && !safeBranch(spec.target)) throw new Error(`invalid repository target branch "${spec.target}"`);
+
+  const enrolled = worldRepos(world.handle).find((repo) =>
+    canonicalRepositoryIdentity(worldRepoSource(repo)) === canonicalRepositoryIdentity(spec.source));
+  if (enrolled) return enrolled;
+  if (worldRepos(world.handle).some((repo) => repo.root === world.handle.root)) {
+    throw new Error('the running world uses a flat repository layout and cannot add another checkout; retry the task to provision the newly attached repository');
+  }
+  if (!world.writeFileBuffer) throw new Error('this world provider cannot receive brokered Git bundles; retry the task after attaching the repository');
+
+  const name = uniqueEnrollmentName(worldRepos(world.handle), spec.name ?? repositoryName(spec.source));
+  const root = path.posix.join(world.handle.root, name);
+  const exists = await world.exec('test', ['-e', root], { cwd: world.handle.root });
+  if (exists.code === 0) throw new Error(`checkout path "${name}" already exists but is not enrolled; move it aside or retry the task`);
+
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-enroll-'));
+  let createdWorldPath = false;
+  try {
+    const provisional: WorldRepo = {
+      name, repo: spec.source, root, branch: spec.branch, base: spec.base,
+      ...(spec.target ? { target: spec.target } : {}), targetPinned: spec.targetPinned ?? false,
+      sourceAuthority: 'origin',
+    };
+    const credential = await resolveCredential(auth, provisional);
+    const { env } = materializeGitCredential(temp, credential);
+    const clone = path.join(temp, 'repo');
+    const cloned = await git(temp, ['clone', '-q', '--no-checkout', spec.source, clone],
+      { env, timeoutMs: 10 * 60_000 });
+    if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
+
+    let baseSha = await firstCommit(clone, [
+      `refs/remotes/origin/${spec.branch}`,
+      `refs/remotes/origin/${spec.base}`,
+      'refs/remotes/origin/HEAD',
+    ]);
+    if (!baseSha) {
+      await ensureIdentity(clone);
+      const checkout = await git(clone, ['checkout', '-q', '--orphan', spec.base]);
+      if (checkout.code !== 0) throw new Error(`could not initialize empty repository base "${spec.base}": ${checkout.stderr || checkout.stdout}`);
+      const commit = await git(clone, [
+        ...identityArgs(spec.identity), 'commit', '--allow-empty', '-q', '-m', 'karmax: initialize repository',
+      ]);
+      if (commit.code !== 0) throw new Error(`could not initialize empty repository: ${commit.stderr || commit.stdout}`);
+      const pushed = await git(clone, ['push', 'origin', `refs/heads/${spec.base}:refs/heads/${spec.base}`], { env });
+      if (pushed.code !== 0) {
+        // A concurrent initializer may have won after our empty clone. Adopt its
+        // commit instead of treating the harmless race as a broken attachment.
+        const fetched = await git(clone, ['fetch', 'origin', spec.base], { env });
+        if (fetched.code !== 0) throw new Error(`could not publish repository base "${spec.base}": ${pushed.stderr || pushed.stdout}`);
+        baseSha = await firstCommit(clone, [`refs/remotes/origin/${spec.base}`]);
+      } else baseSha = (await git(clone, ['rev-parse', 'HEAD'])).stdout.trim();
+    }
+    if (!baseSha) throw new Error(`repository has no resolvable base commit after initializing "${spec.base}"`);
+
+    const bootstrapRef = 'refs/heads/karmax-enrollment-bootstrap';
+    const updated = await git(clone, ['update-ref', bootstrapRef, baseSha]);
+    if (updated.code !== 0) throw new Error(`could not prepare repository bootstrap: ${updated.stderr || updated.stdout}`);
+    const bundlePath = path.join(temp, 'bootstrap.bundle');
+    const bundled = await git(clone, ['bundle', 'create', bundlePath, bootstrapRef]);
+    if (bundled.code !== 0) throw new Error(`could not package repository bootstrap: ${bundled.stderr || bundled.stdout}`);
+    const data = fs.readFileSync(bundlePath);
+    const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
+    if (data.length > maxBytes) throw new Error(`repository bootstrap exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
+
+    const made = await world.exec('mkdir', ['-p', root], { cwd: world.handle.root });
+    if (made.code !== 0) throw new Error(`could not create checkout directory: ${made.stderr || made.stdout}`);
+    createdWorldPath = true;
+    const relativeRoot = path.posix.relative(world.handle.root, root);
+    const bundleRelative = `${relativeRoot}/.karmax-enrollment.bundle`;
+    await world.writeFileBuffer(bundleRelative, data);
+    await worldGitOrThrow(world, root, ['init', '-q']);
+    await worldGitOrThrow(world, root, ['config', 'user.name', spec.identity?.name ?? 'karmax']);
+    await worldGitOrThrow(world, root, ['config', 'user.email', spec.identity?.email ?? 'karmax@localhost']);
+    await worldGitOrThrow(world, root, ['remote', 'add', 'origin', spec.source]);
+    await worldGitOrThrow(world, root, ['fetch', '.karmax-enrollment.bundle',
+      `${bootstrapRef}:refs/heads/${spec.branch}`]);
+    await worldGitOrThrow(world, root, ['checkout', '-q', spec.branch]);
+    await world.exec('rm', ['-f', '.karmax-enrollment.bundle'], { cwd: root });
+
+    const added: WorldRepo = { ...provisional, baseSha };
+    world.handle = { ...world.handle, repos: [...worldRepos(world.handle), added] };
+    return added;
+  } catch (error) {
+    if (createdWorldPath) await world.exec('rm', ['-rf', root], { cwd: world.handle.root }).catch(() => undefined);
+    throw error;
+  } finally {
+    removeTemporaryDirectory(temp);
+  }
+}
+
+async function firstCommit(repo: string, refs: string[]): Promise<string | undefined> {
+  for (const ref of refs) {
+    const result = await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    if (result.code === 0 && /^[0-9a-f]{40,64}$/i.test(result.stdout.trim())) return result.stdout.trim();
+  }
+  return undefined;
+}
+
+async function worldGitOrThrow(world: World, cwd: string, args: string[]): Promise<void> {
+  const result = await world.exec('git', args, { cwd, timeoutMs: 10 * 60_000 });
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || `git ${args[0]} failed`);
+}
+
+function repositoryName(remote: string): string {
+  const raw = remote.replace(/\/$/, '').split(/[/:]/).pop()?.replace(/\.git$/, '') || 'repo';
+  const safe = raw.replace(/[^A-Za-z0-9._-]/g, '-');
+  return safe && !/^\.+$/.test(safe) ? safe : 'repo';
+}
+
+function uniqueEnrollmentName(repos: WorldRepo[], preferred: string): string {
+  const used = new Set(repos.map((repo) => repo.name));
+  if (!used.has(preferred)) return preferred;
+  for (let suffix = 2; ; suffix++) if (!used.has(`${preferred}-${suffix}`)) return `${preferred}-${suffix}`;
+}
+
 /** Recursive removal can transiently report ENOTEMPTY/EBUSY after a Git child
  * exits on busy CI filesystems. Node only retries those errors when maxRetries
  * is explicitly set. */

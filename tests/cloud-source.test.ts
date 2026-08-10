@@ -143,6 +143,17 @@ describe('cloud repository source resolution', () => {
       await core.createWorld({ taskId: task.id, repos: [app], base: 'dev', target: 'dev', kind: 'fake-cloud' });
       expect(received.repositoryBranches['git@github.com:acme/app.git'])
         .toEqual({ base: 'trunk', target: 'production' });
+
+      // A child stacks on the parent's task branch in every repository. The
+      // top-level per-repository policy must not detach this checkout back onto
+      // trunk and silently omit the parent's work.
+      const child = store.createTask({ projectId: project.id, title: 'Child cloud work',
+        workflow: 'software-dev', workflowVersion: '1.0.0', parentTaskId: task.id,
+        params: { prompt: 'continue parent work' } });
+      await core.createWorld({ taskId: child.id, repos: [app],
+        base: `karmax/${task.id}`, target: `karmax/${task.id}`, kind: 'fake-cloud' });
+      expect(received.repositoryBranches['git@github.com:acme/app.git'])
+        .toEqual({ base: `karmax/${task.id}`, target: `karmax/${task.id}` });
     } finally {
       store.close();
     }

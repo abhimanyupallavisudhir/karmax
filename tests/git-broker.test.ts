@@ -3,12 +3,71 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream } from '../src/world/git-broker.js';
+import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 
 describe('cloud Git broker', () => {
   const cleanups: string[] = [];
   afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('enrolls an attached empty private repo, publishes the parent, and bootstraps a child checkout/import without leaking credentials', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-enrollment-'));
+    cleanups.push(root);
+    const makeSource = async (name: string) => {
+      const source = path.join(root, name);
+      fs.mkdirSync(source);
+      await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(source);
+      fs.writeFileSync(path.join(source, 'README.md'), `# ${name}\n`);
+      await gitOrThrow(source, ['add', '-A']);
+      await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+      return source;
+    };
+    const [first, second] = [await makeSource('first'), await makeSource('second')];
+    const empty = path.join(root, 'empty.git');
+    await gitOrThrow(root, ['init', '-q', '--bare', empty]);
+    const sshRemote = 'git@example:empty.git';
+    const secret = 'private-installation-token-must-not-enter-world';
+    const env = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'git@example:',
+      KARMAX_TEST_INSTALLATION_TOKEN: secret,
+    };
+    const auth = vi.fn(async () => ({ env }));
+    const provider = new WorktreeProvider(path.join(root, 'worlds'));
+    const parent = await provider.create({ taskId: 'parent', repos: [first, second], base: 'main' });
+
+    const enrolled = await brokerEnrollRepository(parent, {
+      source: sshRemote, name: 'empty', branch: parent.handle.branch, base: 'main', target: 'main',
+      identity: { name: 'Karmax Test', email: 'karmax@example.com' },
+    }, auth);
+    expect(enrolled).toMatchObject({ name: 'empty', branch: 'karmax/parent', base: 'main', sourceAuthority: 'origin' });
+    expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/main'])).code).toBe(0);
+    expect((await git(enrolled.root, ['branch', '--show-current'])).stdout.trim()).toBe('karmax/parent');
+    expect((await git(enrolled.root, ['config', '--get', 'remote.origin.url'])).stdout.trim()).toBe(sshRemote);
+    expect(fs.readFileSync(path.join(enrolled.root, '.git', 'config'), 'utf8')).not.toContain(secret);
+
+    fs.writeFileSync(path.join(enrolled.root, 'parent.txt'), 'parent work\n');
+    await gitOrThrow(enrolled.root, ['add', '-A']);
+    await gitOrThrow(enrolled.root, ['commit', '-q', '-m', 'parent work']);
+    expect(await brokerPublishBranch(parent, auth)).toEqual({ pushed: ['first', 'second', 'empty'], skipped: [] });
+    expect((await git(empty, ['rev-parse', '--verify', 'refs/heads/karmax/parent'])).code).toBe(0);
+
+    const child = await provider.create({ taskId: 'child', repos: [first, second], base: 'main' });
+    const childRepo = await brokerEnrollRepository(child, {
+      source: sshRemote, name: 'empty', branch: child.handle.branch, base: parent.handle.branch, target: parent.handle.branch,
+      identity: { name: 'Karmax Test', email: 'karmax@example.com' },
+    }, auth);
+    expect((await git(childRepo.root, ['show', 'HEAD:parent.txt'])).stdout).toContain('parent work');
+    const imported = await brokerImportTaskBranch(child, parent.handle, 'parent', auth);
+    expect(imported).toEqual(expect.arrayContaining([
+      expect.objectContaining({ repo: 'empty', branch: 'karmax/parent', ref: 'refs/karmax/tasks/parent/empty' }),
+    ]));
+    expect((await git(childRepo.root, ['show', 'refs/karmax/tasks/parent/empty:parent.txt'])).stdout)
+      .toContain('parent work');
+    expect(auth).toHaveBeenCalled();
+  });
 
   it('transfers a cloud branch by bundle and lands it without exposing the SSH credential to the world', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-test-'));
