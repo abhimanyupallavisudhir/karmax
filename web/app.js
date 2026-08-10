@@ -4044,6 +4044,10 @@ function wireTasksView() {
     const mode = quickTaskSubmitMode(e);
     if (!mode) return;
     e.preventDefault();
+    // Ctrl/Cmd+Enter is also registered as a page-level command so it works
+    // after focus leaves this input. Do not let this local invocation bubble to
+    // that command and attempt the same submission a second time.
+    e.stopPropagation();
     if (mode === 'draft') add(true);
     else if (mode === 'add') add(false);
     else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
@@ -13055,6 +13059,7 @@ function allCommands() {
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
   const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
+  add({ id: 'list.quickAdd', title: 'Add quick task', keybinding: 'meta+Enter', group: 'List', palette: false, available: !!$('#add-task'), run: () => $('#add-task')?.click() });
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
   add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
   add({ id: 'list.next.arrow', title: 'Next task / row', keybinding: 'ArrowDown', group: 'List', palette: false, help: false, available: listy && !S.selected, run: () => moveCursor(1) });
@@ -13253,6 +13258,16 @@ function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
 // would land here between the two steps, match nothing, and reset the pending
 // `g` before `P` ever arrives.
 function isBareModifier(key) { return key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta'; }
+// Plain Enter belongs to the control that actually has focus. Native
+// controls already activate themselves; custom controls use tabindex/role and
+// need a synthetic click. Command-modified Enter is deliberately excluded so
+// page-level shortcuts such as Ctrl/Cmd+Enter remain global.
+function focusedEnterAction(e, target) {
+  if (e.key !== 'Enter' || e.metaKey || e.ctrlKey || e.altKey || !target?.closest) return null;
+  if (target.closest('button, a[href], summary')) return 'native';
+  if (target.closest('[role="button"], [tabindex="0"]')) return 'click';
+  return null;
+}
 function dispatchKey(e) {
   if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
@@ -13271,6 +13286,9 @@ function dispatchKey(e) {
 function bindKeys() {
   document.addEventListener('keydown', (e) => {
     const t = e.target;
+    // A component-level handler that prevented the event already owns it (for
+    // example a composite role=button with richer Enter/Space behavior).
+    if (e.defaultPrevented) return;
     // The check-in terminal is a focusable <pre> that behaves like a text field:
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
@@ -13279,6 +13297,15 @@ function bindKeys() {
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
+      return;
+    }
+    // Focus wins over global commands for plain Enter, including inside an
+    // overlay. Native controls need no help; custom tabindex/role controls do.
+    const focusedAction = focusedEnterAction(e, t);
+    if (focusedAction === 'native') return;
+    if (focusedAction === 'click') {
+      e.preventDefault();
+      t.closest('[role="button"], [tabindex="0"]').click();
       return;
     }
     if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
@@ -13290,15 +13317,7 @@ function bindKeys() {
       if (inRail()) return document.activeElement.blur(); // leave the rail, don't close panels
       return closeTopOverlay();
     }
-    // Enter on a focused button/link is native activation, not the list cursor.
-    if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
     if (dispatchKey(e)) return;
-    // Fallback: Enter activates whatever custom control has keyboard focus. A div
-    // made Tab-focusable with tabindex="0" (view chips, nav items, task rows, …)
-    // carries a click handler but has no native Enter activation — so synthesize the
-    // click. Native controls returned above; list/rail cursors have their own Enter
-    // commands, which dispatchKey matched first.
-    if (e.key === 'Enter' && t && t.matches && t.matches('[tabindex="0"]')) { e.preventDefault(); t.click(); }
   });
 }
 
