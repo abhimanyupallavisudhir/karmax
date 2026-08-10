@@ -31,6 +31,7 @@ vm.runInContext(
     extractFunction('pendingCancellationView'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
+    extractFunction('humanWaitDetail'),
     extractFunction('stageLabel'),
     extractFunction('runSubRow'),
     extractFunction('runPageRow'),
@@ -41,6 +42,7 @@ vm.runInContext(
 
 const stageLabel = context.stageLabel as (view: Record<string, any>) => string;
 const waitingText = context.waitingText as (wait: Record<string, any>) => string;
+const humanWaitDetail = context.humanWaitDetail as (view: Record<string, any>) => string;
 const runSubRow = context.runSubRow as (run: Record<string, any>) => string;
 const runPageRow = context.runPageRow as (run: Record<string, any>) => string;
 const conversationPresence = context.conversationPresence as (
@@ -105,6 +107,21 @@ describe('waiting labels in task summaries', () => {
       kind: 'human',
       detail: 'A long internal explanation of the decision needed',
     })).toBe('Waiting for input');
+  });
+
+  it('retains the concrete question for a targeted human hold', () => {
+    expect(humanWaitDetail({
+      status: 'waiting',
+      waitingFor: { kind: 'human', detail: '  Choose the release window.  ' },
+    })).toBe('Choose the release window.');
+    expect(humanWaitDetail({
+      status: 'waiting',
+      waitingFor: { kind: 'agentSlot', detail: 'Internal queue detail' },
+    })).toBe('');
+    expect(humanWaitDetail({
+      status: 'active',
+      waitingFor: { kind: 'human', detail: 'Stale question' },
+    })).toBe('');
   });
 
   it('keeps ordinary and legacy merge-stage labels intact', () => {

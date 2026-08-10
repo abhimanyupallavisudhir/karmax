@@ -170,10 +170,12 @@ eval(extractFn('setQuery'));
 (async () => {
   S.tab = 'tasks'; S.selected = null; S.projectId = 'P1'; S.search = '';
 
-  await setQuery('status:active tag:bug');
+  const settingQuery = setQuery('status:active tag:bug');
+  ok(rendered === 1, 'picking a filter paints pending feedback before search resolves');
+  await settingQuery;
   eq(currentPath(), '/acme/website-redesign?q=status:active+tag:bug', 'picking a filter puts the search in the address bar');
   eq(box.value, 'status:active tag:bug', 'and in the search box');
-  ok(searched === 1 && rendered === 1, 'the list is re-evaluated and repainted once');
+  ok(searched === 1 && rendered === 2, 'the list paints once pending and once with authoritative results');
   eq(nav, ['replace /acme/website-redesign?q=status:active+tag:bug'],
     'refining a search replaces the entry rather than burying the page behind one per keystroke');
 

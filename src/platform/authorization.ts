@@ -41,6 +41,7 @@ const viewer = [
   'task:read', 'task:conversation:read', 'task:event:read',
   'queue:read', 'workflow:read', 'profile:read',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:read',
+  'github:actions:read',
 ] satisfies Capability[];
 const developer = [
   ...DEVELOPER_WORKSPACE_CAPABILITIES,
@@ -52,6 +53,7 @@ const maintainer = [
   ...developer, 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
   'project:resource:shared-write',
   'workflow:install', 'workflow:edit', 'team:write', 'repository:write',
+  'github:actions:write',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
 // host. Global grants remain the explicit trust root for users, host processes,
@@ -65,6 +67,7 @@ const PROJECT_GRANT_CEILING: Capability[] = [
   'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
+  'github:actions:*',
 ];
 
 const ORGANIZATION_GRANT_CEILING: Capability[] = [
@@ -74,6 +77,7 @@ const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
   'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
+  'github:actions:*',
 ];
 
 /** The five canonical levels are deliberately job-shaped, not permission checklists. */
@@ -113,11 +117,11 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
 // complete historical capability set lets old untouched installs acquire new
 // platform primitives while preserving every genuinely customized profile.
 const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capability[][]>> = {
-  developer: [[
+  developer: [developer.filter((capability) => capability !== 'github:actions:read'), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [[
+  maintainer: [maintainer.filter((capability) => !capability.startsWith('github:actions:')), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',

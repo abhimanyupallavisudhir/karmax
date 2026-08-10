@@ -5,6 +5,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
 import { pullRequestWebhookEvent, type GithubPrWebhookEvent } from './github-pr.js';
+import { GithubActionsApi } from './github-actions.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -262,7 +263,10 @@ export class GitHubAppService {
       // Better Auth also reads the user's verified email addresses when linking
       // a GitHub sign-in to an existing Karmax account.
       default_permissions: {
-        checks: 'read', contents: 'write', email_addresses: 'read', metadata: 'read',
+        // Actions write includes read. The installation credential never enters
+        // an agent world: krmax exposes read by default and gates rerun/cancel/
+        // dispatch behind a distinct platform capability.
+        actions: 'write', checks: 'read', contents: 'write', email_addresses: 'read', metadata: 'read',
         pull_requests: 'write', statuses: 'read',
       },
     };
@@ -650,6 +654,21 @@ export class GitHubAppService {
     if (!connection) throw new Error('repository GitHub App connection is missing');
     const token = await this.installationToken(connection);
     return { httpsToken: token, env: { GH_TOKEN: token } };
+  }
+
+  /** Repository-bound Actions client. Tokens remain inside this service and a
+   * 401 forces the cached installation token to be minted again once. */
+  actions(repository: Repository): GithubActionsApi {
+    if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
+    const connection = this.store.getGitConnection(repository.gitConnectionId);
+    if (!connection) throw new Error('repository GitHub App connection is missing');
+    return new GithubActionsApi(async (options) => {
+      if (options?.forceRefresh) {
+        this.tokenCache.delete(connection.id);
+        this.tokenMints.delete(connection.id);
+      }
+      return this.installationToken(connection);
+    }, { apiBase: this.apiBase, fetch: this.fetcher });
   }
 
   /**

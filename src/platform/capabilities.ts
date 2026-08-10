@@ -26,6 +26,7 @@ export const CAPABILITIES = [
   'organization:read', 'organization:create', 'organization:edit',
   'organization:member:read', 'organization:member:write',
   'team:read', 'team:write', 'repository:read', 'repository:write',
+  'github:actions:read', 'github:actions:write',
   'inbox:read', 'inbox:write',
   'queue:read', 'queue:write', 'workflow:read', 'workflow:install', 'workflow:edit',
   'profile:read', 'profile:write', 'skill:write',
@@ -47,6 +48,7 @@ export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
   'project:read', 'project:settings:read', 'task:*',
   'queue:read', 'workflow:read', 'profile:read',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read',
+  'github:actions:read',
   'credential:read', 'vault:store', 'skill:write', 'use-card:*', 'inbox:*',
 ];
 
@@ -97,6 +99,8 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['team:write', 'Manage teams', 'Create teams and change their membership.'],
       ['repository:read', 'View repositories', 'View repositories imported into an organization.'],
       ['repository:write', 'Manage repositories', 'Connect GitHub installations and attach repositories to projects.'],
+      ['github:actions:read', 'Inspect GitHub Actions', 'List workflow runs and read bounded failure diagnostics for repositories attached to the calling task’s project.'],
+      ['github:actions:write', 'Operate GitHub Actions', 'Rerun or cancel workflow runs and dispatch workflows for repositories attached to the calling task’s project.'],
       ['inbox:read', 'View inbox', 'Read the signed-in user’s organization inbox.'],
       ['inbox:write', 'Manage inbox', 'Mark inbox items and set delivery preferences.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
@@ -240,6 +244,8 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   propose_project_resource: 'task:review:write', adopt_project_resource: 'task:review:execute',
   discard_project_resource: 'task:review:execute',
   list_events: 'task:event:read', diagnostics: 'diagnostic:read', list_processes: 'process:read', kill_process: 'process:kill',
+  list_github_actions_runs: 'github:actions:read', inspect_github_actions_run: 'github:actions:read',
+  manage_github_actions_run: 'github:actions:write', dispatch_github_actions_workflow: 'github:actions:write',
   execute_review_action: 'task:review:execute', stop_review_action: 'task:review:execute',
   list_credentials: 'credential:read', manage_credentials: 'credential:write',
   get_credential: 'credential:read', fill_credential: 'credential:read',

@@ -50,6 +50,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action',
         'escalate_to_human', 'request_permission',
         'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
+        'list_github_actions_runs', 'inspect_github_actions_run', 'manage_github_actions_run', 'dispatch_github_actions_workflow',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
       ]),
@@ -79,6 +80,34 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(result.isError).toBeFalsy();
     expect(seen).toEqual([{ source: { kind: 'path', path: 'downloads/model' }, name: 'Model', driver: 'volume@1',
       target: { kind: 'path', path: 'models/main' }, access: 'read', publish: undefined }]);
+  });
+
+  it('forwards brokered GitHub Actions reads and separately-declared mutations', async () => {
+    const seen: unknown[] = [];
+    const stub = {
+      listGithubActionsRuns: async (args: unknown) => { seen.push(['list', args]); return { runs: [] }; },
+      inspectGithubActionsRun: async (args: unknown) => { seen.push(['inspect', args]); return { failedJobs: [] }; },
+      manageGithubActionsRun: async (args: unknown) => { seen.push(['manage', args]); return { accepted: true }; },
+      dispatchGithubActionsWorkflow: async (args: unknown) => { seen.push(['dispatch', args]); return { accepted: true }; },
+    } as any;
+    const server = createPlatformMcpServer(stub);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair(); await server.connect(serverT);
+    const c = new Client({ name: 'github-actions-test', version: '1.0.0' }); await c.connect(clientT);
+    for (const [name, args] of [
+      ['list_github_actions_runs', { repository: 'acme/app', branch: 'main', status: 'failure', perPage: 10 }],
+      ['inspect_github_actions_run', { repository: 'acme/app', runId: 42 }],
+      ['manage_github_actions_run', { repository: 'acme/app', runId: 42, action: 'rerun-failed' }],
+      ['dispatch_github_actions_workflow', { repository: 'acme/app', workflow: 'deploy.yml', ref: 'main', inputs: { dry_run: false } }],
+    ] as const) {
+      const result: any = await c.callTool({ name, arguments: args as any });
+      expect(result.isError, result.content?.[0]?.text).toBeFalsy();
+    }
+    expect(seen).toEqual([
+      ['list', { repository: 'acme/app', branch: 'main', status: 'failure', perPage: 10 }],
+      ['inspect', { repository: 'acme/app', runId: 42 }],
+      ['manage', { repository: 'acme/app', runId: 42, action: 'rerun-failed' }],
+      ['dispatch', { repository: 'acme/app', workflow: 'deploy.yml', ref: 'main', inputs: { dry_run: false } }],
+    ]);
   });
 
   it('forwards a dedicated human escalation with its chosen audience and reason', async () => {

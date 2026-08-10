@@ -75,6 +75,7 @@ const S = {
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
+  searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
@@ -308,6 +309,18 @@ async function resolveProjectTaskKey(projectId, key) {
   return local ? local.id : key; // raw-id fallback
 }
 
+// Cross-project/organization navigation may genuinely need data that is not in
+// memory. It still owns the main cell synchronously, so the previous page never
+// masquerades as an ignored click while those requests run.
+function renderRouteLoadingPage(title, label = 'Loading…') {
+  const main = $('#main');
+  if (!main) return;
+  main.innerHTML = `<div class="route-loading" role="status" aria-busy="true">
+    <b>${esc(title || 'Opening')}</b>
+    <span class="global-search-loading">${esc(label)}</span>
+  </div>`;
+}
+
 async function applyRoute() {
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
@@ -342,6 +355,7 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        renderRouteLoadingPage(org.name, 'Switching organization…');
       }
       syncOrganizationSwitcher();
       if (organizationChanged) {
@@ -397,6 +411,13 @@ async function applyRoute() {
     return go(dest, { replace: true });
   }
   const pid = proj.id;
+  const sameProject = pid === S.projectId;
+  const selectedRecord = taskRecord(S.selected);
+  const selectedKey = selectedRecord && String(selectedRecord.num ?? selectedRecord.id);
+  if (r.taskKey && selectedKey !== String(r.taskKey))
+    renderRouteLoadingPage(`Task ${/^\d+$/.test(r.taskKey) ? `#${r.taskKey}` : ''}`.trim(), 'Loading task…');
+  else if (!r.taskKey && !sameProject)
+    renderRouteLoadingPage(proj.name, 'Loading project…');
   S.organizationId = proj.organizationId || S.organizationId;
   syncOrganizationSwitcher();
   if (S.organizationId !== previousOrganizationId) {
@@ -406,7 +427,7 @@ async function applyRoute() {
   await loadOrganizationRuntimeCatalog();
   if (!routeIsCurrent()) return;
   const tab = r.tab || 'tasks';
-  if (pid !== S.projectId) {
+  if (!sameProject) {
     // Switching projects: drop the previous project's per-project view state so
     // its query/roving-cursor/search-result can't bleed into the new project
     // (they'd otherwise re-run the old query against new data and highlight a
@@ -415,6 +436,7 @@ async function applyRoute() {
     S.projectId = pid;
     S.search = '';
     S.searchResult = null;
+    S.searchPending = false;
     S.cursorId = null;
     await loadTasks().catch(() => {});
     if (!routeIsCurrent()) return;
@@ -423,7 +445,34 @@ async function applyRoute() {
     await loadTasks().catch(() => {});
     if (!routeIsCurrent()) return;
   }
-  await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  // Same-project tabs are local navigation. Their complete last-painted inputs
+  // are already in memory, so reveal the destination before refreshing tags,
+  // views, fields, and (for the task list) the authoritative search result.
+  // A changed task-list query clears the previous server result and paints a
+  // labelled local preview instead of flashing unrelated rows.
+  const incomingListQuery = r.q || '';
+  const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
+  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  if (canPaintCachedProject) {
+    S.tab = tab;
+    closeTaskDom();
+    if (tab === 'tasks' && incomingListQuery !== S.search) {
+      S.search = incomingListQuery;
+      S.searchResult = null;
+      S.searchFailed = false;
+      S.searchPending = true;
+    }
+    renderRail();
+    renderMain();
+    if (tab === 'activity') seedActivity();
+    if (tab === 'queue') seedQueue();
+  }
+  const organizationRefresh = loadOrg().catch(() => false); // tags / saved views / field registry
+  // A task page can open entirely from the loaded task record and paints its own
+  // loading state below. Do not put the metadata refresh back in front of it.
+  // First visits/cross-project routes still wait so they never render foreign tags.
+  if (!r.taskKey || !projectOrganizationLoaded) await organizationRefresh;
+  else organizationRefresh.then(() => { if (routeIsCurrent()) renderRail(); });
   if (!routeIsCurrent()) return;
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
@@ -438,7 +487,7 @@ async function applyRoute() {
   if (tab === 'tasks' && !taskId) {
     // The list is query-driven and the URL owns the query: a pasted, bookmarked,
     // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
-    S.search = r.q || '';
+    S.search = incomingListQuery;
     await runSearch().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -2049,6 +2098,10 @@ async function boot() {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
     S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
+    // The boot catalog is already scoped to the selected project's organization.
+    // Mark it as such so the first route reconciliation does not immediately fetch
+    // the same schema + model catalog again before it can paint.
+    S.catalogOrganizationId = S.organizationId;
     if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
   connectWs();
@@ -2271,6 +2324,7 @@ async function runSearch() {
   if (!projectId) return false;
   const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
+  S.searchPending = true;
   try {
     const r = await api(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`);
     if (S.searchEpoch !== epoch || S.projectId !== projectId) return false;
@@ -2287,13 +2341,16 @@ async function runSearch() {
     // session tombstones as loadTasks so that late response cannot restore its row.
     S.searchResult = filterDeletedFromSearchResult(r);
     S.searchFailed = false;
+    S.searchPending = false;
     return true;
   } catch {
     // Distinguish "the server couldn't evaluate this" from "nothing matched".
     // Without the flag the view falls back to a client-side filter and shows
     // "No matching tasks", so a server outage reads as a bad query and the user
     // edits a perfectly good one.
-    if (S.searchEpoch === epoch && S.projectId === projectId) { S.searchResult = null; S.searchFailed = true; }
+    if (S.searchEpoch === epoch && S.projectId === projectId) {
+      S.searchResult = null; S.searchFailed = true; S.searchPending = false;
+    }
     return false;
   }
 }
@@ -2312,7 +2369,13 @@ function syncQueryUrl() {
 let searchDebounce = null;
 function scheduleSearch() {
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(async () => { syncQueryUrl(); await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+  searchDebounce = setTimeout(async () => {
+    syncQueryUrl();
+    const search = runSearch();
+    if (S.tab === 'tasks') renderMain();
+    await search;
+    if (S.tab === 'tasks') renderMain();
+  }, 180);
 }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
@@ -2323,7 +2386,9 @@ async function setQuery(q) {
   const box = $('#task-search');
   if (box) box.value = S.search;
   syncQueryUrl();
-  await runSearch();
+  const search = runSearch();
+  if (S.tab === 'tasks') renderMain();
+  await search;
   if (S.tab === 'tasks') renderMain();
 }
 
@@ -2880,6 +2945,9 @@ function scheduleTaskPageRender() {
 function renderMain() {
   const main = $('#main');
   if (!main) return;
+  // A preload begun on the task list must not survive a trip through settings,
+  // where the defaults it captured may have just been edited.
+  if (S.tab !== 'tasks') taskFormDefaultRequests.clear();
   // A task page owns #main while a task is open. Background list refreshes land
   // here (WS-driven refreshTasks) — repaint the page from the freshest state
   // instead of the list. S.view is null for a repeatable series (its config page
@@ -3151,11 +3219,12 @@ function tasksView() {
     </div>
     <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="organizer">
-      <div class="search-box">
+      <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
       </div>
       ${viewsBar()}
       ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
@@ -3934,6 +4003,14 @@ function wireTasksView() {
     const images = S.newTaskImages || [];
     if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
+    const composer = input.closest('.composer');
+    if (composer?.classList.contains('busy')) return;
+    const setBusy = (busy) => {
+      composer?.classList.toggle('busy', busy);
+      composer?.setAttribute('aria-busy', String(busy));
+      composer?.querySelectorAll('button,select').forEach((control) => { control.disabled = busy; });
+    };
+    setBusy(true);
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
@@ -3946,6 +4023,8 @@ function wireTasksView() {
       await refreshTasks();
     } catch (e) {
       toast(e.message, true);
+    } finally {
+      if (composer?.isConnected) setBusy(false);
     }
   };
   $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
@@ -3969,6 +4048,14 @@ function wireTasksView() {
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
+  // Hide the defaultBranch/settings round-trip behind the time the user spends
+  // reading or typing in the quick composer. Changing the workflow starts the
+  // corresponding one-shot preload as well.
+  const quickWorkflow = $('#new-wf');
+  if (quickWorkflow) {
+    requestTaskFormDefaults(S.projectId, quickWorkflow.value);
+    quickWorkflow.addEventListener('change', () => requestTaskFormDefaults(S.projectId, quickWorkflow.value));
+  }
   // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
   applyCursor();
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
@@ -4282,6 +4369,41 @@ function initialTaskFormSavedSignature(draft, seedText, signature) {
   return draft || !seedText ? signature : null;
 }
 
+// Resolving task defaults can invoke defaultBranch on the server (a git
+// subprocess), so begin it while the quick composer is merely visible. The map
+// holds only a one-shot request: opening the form consumes and removes it, which
+// avoids retaining stale settings after the user edits defaults elsewhere.
+const taskFormDefaultRequests = new Map();
+function taskFormDefaultsKey(projectId, workflow) { return `${projectId}\u0000${workflow}`; }
+function requestTaskFormDefaults(projectId, workflow) {
+  const key = taskFormDefaultsKey(projectId, workflow);
+  let request = taskFormDefaultRequests.get(key);
+  if (!request) {
+    request = api(`/api/defaults/${projectId}/${workflow}`)
+      .then((result) => result?.task?.inherited || {})
+      .catch(() => ({}));
+    taskFormDefaultRequests.set(key, request);
+  }
+  return request;
+}
+async function consumeTaskFormDefaults(projectId, workflow) {
+  const key = taskFormDefaultsKey(projectId, workflow);
+  const request = requestTaskFormDefaults(projectId, workflow);
+  try { return await request; }
+  finally { if (taskFormDefaultRequests.get(key) === request) taskFormDefaultRequests.delete(key); }
+}
+
+function taskFormLoadingPage(project, draft) {
+  return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
+    <div class="tf-head"><div class="tf-head-inner">
+      <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+      <h2>${draft ? 'Edit task' : 'New task'}</h2>
+      ${project ? `<span class="tf-crumb">in ${esc(project.name)}</span>` : ''}
+    </div></div>
+    <div class="tf-loading" role="status"><span class="global-search-loading">Loading task form…</span></div>
+  </div>`;
+}
+
 // Identity of the task form currently mounted in the overlay. Opening a new form
 // bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
 // tell it has been superseded and bail — otherwise its timer fires against the new
@@ -4310,8 +4432,17 @@ async function openTaskForm(workflow, draft, seedText) {
   if (seedText) {
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
-  let inherited = {};
-  try { inherited = (await api(`/api/defaults/${projectId}/${wf}`)).task.inherited; } catch {}
+  const root = $('#overlay-root');
+  const proj = S.projects.find((p) => p.id === projectId);
+  // A keypress must always have an immediate visible result, even if the VPS is
+  // currently slow. Usually the prefetched defaults below are already resolved
+  // and this loading page never reaches a paint; otherwise it provides instant
+  // feedback while keeping the not-yet-hydrated controls safely non-interactive.
+  root.innerHTML = taskFormLoadingPage(proj, draft);
+  $('#tf-close').addEventListener('click', () => {
+    if (activeFormToken === formToken) activeFormToken = null;
+    root.innerHTML = '';
+  });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
   const storedAuthorization = draft?.params?._authorization || {};
@@ -4323,16 +4454,21 @@ async function openTaskForm(workflow, draft, seedText) {
   // A draft can open directly from the list, without its task page having loaded
   // the intent. Fetch the group so the shared confirmer freezes after any sibling
   // queues, while remaining editable (and propagated) when every sibling is a draft.
-  let formAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
-  if (draft?.id && !formAttemptGroup) {
-    try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
-  }
-  const root = $('#overlay-root');
+  const cachedAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
+  const attemptGroupRequest = draft?.id && !cachedAttemptGroup
+    ? api(`/api/tasks/${draft.id}/attempts`).catch(() => null)
+    : Promise.resolve(cachedAttemptGroup);
+  const [inherited, formAttemptGroup] = await Promise.all([
+    consumeTaskFormDefaults(projectId, wf),
+    attemptGroupRequest,
+  ]);
+  // The user may have dismissed the loading page or navigated while either
+  // request was in flight. Never let a late response reopen the old form.
+  if (activeFormToken !== formToken) return;
   // Rendered as a full PAGE (GitHub-issue-creation style), not a dialog: the big
   // prompt editor + workflow parameters fill the main column; organization
   // metadata (priority/tags, authorization, attempts, notes) lives in a sidebar.
   // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
-  const proj = S.projects.find((p) => p.id === projectId);
   const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
   root.innerHTML = `
     <div class="task-form-page" id="tf-page" tabindex="-1">
@@ -4797,6 +4933,27 @@ function defaultTaskTab(v) {
   return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
 }
 
+// Task navigation owns the main cell immediately. The compact view normally
+// arrives quickly, but under host load the old list/task used to remain visible
+// with no acknowledgement that the click had landed.
+function renderTaskLoadingPage(rec, error) {
+  const main = $('#main');
+  if (!main) return;
+  const title = rec?.title || 'Task';
+  main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
+    <div class="tp-head"><div class="row1">
+      <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+      ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
+      <h2>${esc(title)}</h2>
+    </div></div>
+    <div class="tf-loading" role="status">${error
+      ? `<div class="task-load-error"><b>Couldn’t load this task</b><span>${esc(error)}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
+      : '<span class="global-search-loading">Loading task…</span>'}</div>
+  </div>`;
+  $('#tp-back')?.addEventListener('click', closeTask);
+  $('#task-load-retry')?.addEventListener('click', () => openTask(rec?.id || S.selected, S.taskTab, !!S.viewingAttempt));
+}
+
 // The config page for a repeatable series: edit its parameters + triggers, see
 // its runs, and Run again. Saved via the same in-place path as a waiting task
 // (updateArmedParams) — the series never runs its own workflow, so there is no
@@ -4805,9 +4962,10 @@ async function renderSeriesPage(rec) {
   const wf = rec.workflow;
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = { ...rec.params };
-  let inherited = {};
-  try { inherited = (await api(`/api/defaults/${rec.projectId}/${wf}`)).task.inherited; } catch {}
-  const runs = await api(`/api/tasks/${rec.id}/runs`).catch(() => []);
+  const [inherited, runs] = await Promise.all([
+    consumeTaskFormDefaults(rec.projectId, wf),
+    api(`/api/tasks/${rec.id}/runs`).catch(() => []),
+  ]);
   const main = $('#main');
   if (!main || S.selected !== rec.id) return; // navigated away while fetching
   main.innerHTML = `
@@ -4968,14 +5126,14 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // A repeatable series has no running workflow — open the config page instead
   // (edit its parameters + triggers, see its runs, run again).
   const rec = taskRecord(taskId);
+  S.selected = taskId;
+  S.viewingAttempt = explicitAttempt ? taskId : null;
+  S.view = null;
+  renderTaskLoadingPage(rec);
   if (rec?.params?.repeatable) {
-    S.selected = taskId;
-    S.view = null;
     await renderSeriesPage(rec);
     return;
   }
-  S.selected = taskId;
-  S.viewingAttempt = explicitAttempt ? taskId : null;
   S.taskEvents = [];
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
@@ -5040,7 +5198,11 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.approvalRequests = approvalRequests;
     S.permissionRequests = permissionRequests;
     S.approvalItems = approvalItems;
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    if (S.selected === taskId) renderTaskLoadingPage(rec, e.message);
+    return;
+  }
   renderTaskPage();
   // Param defaults only feed the Parameters tab, and resolving them costs a git
   // subprocess (defaultBranch) on the server — so they used to add that latency to
@@ -5900,6 +6062,7 @@ function wireReviewActions(v) {
     btn.addEventListener('click', async () => {
       const idx = Number(btn.getAttribute('data-idx'));
       const kind = btn.getAttribute('data-kind');
+      btn.disabled = true;
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         if (kind === 'open') { openArtifact(r.url, r.external); return; }
@@ -5932,6 +6095,7 @@ function wireReviewActions(v) {
           r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
         }
       } catch (e) { toast(e.message, true); }
+      finally { if (btn.isConnected) btn.disabled = false; }
     });
   });
 }
@@ -6261,8 +6425,9 @@ function overviewTab(v) {
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
+  const requestedInput = humanWaitDetail(v);
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
@@ -6395,6 +6560,10 @@ function conversationPane(v, t) {
   const presence = conversationPresence(v, t);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
+  const requestedInput = canFollowUp ? humanWaitDetail(v) : '';
+  const request = requestedInput
+    ? `<div class="msg system"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderMessageBody(requestedInput)}</div></div>`
+    : '';
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
@@ -6413,7 +6582,7 @@ function conversationPane(v, t) {
       <span style="flex:1"></span>
       ${copy}
     </div>
-    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
     ${fu}`;
 }
 
@@ -6714,10 +6883,20 @@ function wireCheckinSidebar(v) {
 
 async function openLocalCheckout(v) {
   if (hostLocal()) return materializeLocalCheckout(v);
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
+  </div></div>`;
+  const wireClose = () => {
+    host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
+    host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  };
+  wireClose();
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
-  catch (error) { return toast(error.message, true); }
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  catch (error) { host.remove(); return toast(error.message, true); }
+  if (!host.isConnected) return;
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
@@ -6729,8 +6908,7 @@ async function openLocalCheckout(v) {
     <p class="task-sub">krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
     <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
   </div></div>`;
-  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
-  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  wireClose();
   host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
     const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
   })));
@@ -6745,12 +6923,19 @@ async function openLocalCheckout(v) {
 }
 
 async function materializeLocalCheckout(v, session) {
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Materializing a local checkout…</span></div>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
   let checkout;
   try {
     checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
-  } catch (error) { toast(error.message, true); return null; }
+  } catch (error) { host.remove(); toast(error.message, true); return null; }
+  if (!host.isConnected) return null;
   const fork = session ? forkCommandFor(session, checkout.cwd) : '';
-  const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
     <p class="task-sub">krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
@@ -6928,6 +7113,15 @@ function waitingText(w) {
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
+}
+
+// A targeted human hold carries the actual question a person must answer. Keep
+// compact labels stable via waitingText(), but never hide this detail on the task
+// page—the agent may have used its final tool call to deliver the findings and
+// decision request, so omitting it makes a successful escalation look cut off.
+function humanWaitDetail(v) {
+  if (v?.status !== 'waiting' || v.waitingFor?.kind !== 'human') return '';
+  return typeof v.waitingFor.detail === 'string' ? v.waitingFor.detail.trim() : '';
 }
 
 // A CLI command to FORK this agent's session into the user's terminal — a branched
@@ -7464,6 +7658,9 @@ function wireFollowups(v) {
     const send = async () => {
       const text = ta.value.trim();
       if (!text && !store.length) return;
+      if (btn.disabled) return;
+      btn.disabled = true;
+      box.setAttribute('aria-busy', 'true');
       try {
         const result = await api(`/api/tasks/${v.taskId}/signal`, {
           method: 'POST',
@@ -7494,6 +7691,10 @@ function wireFollowups(v) {
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
+      finally {
+        if (btn.isConnected) btn.disabled = false;
+        if (box.isConnected) box.removeAttribute('aria-busy');
+      }
     };
     btn.addEventListener('click', send);
     // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances.
@@ -11814,14 +12015,14 @@ function playNotificationSound(urgency = 'normal') {
 async function openInboxItem(item) {
   if (!item?.task) return;
   if (item.unread) {
-    try {
-      await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) });
-      markInboxItemReadLocally(item);
-    } catch {}
+    // Reading the notification is bookkeeping, not a prerequisite for opening
+    // its task. Update the badge locally and let the PATCH finish behind the
+    // navigation; restore unread state if it fails.
+    markInboxItemReadLocally(item);
+    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
+      .catch(() => { item.unread = true; updateBell(); });
   }
   const project = projectById(item.task.projectId); if (!project) return;
-  S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
-  await loadTasks().catch(() => {});
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
   return go(`${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
