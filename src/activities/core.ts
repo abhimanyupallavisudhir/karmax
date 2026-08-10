@@ -3555,27 +3555,41 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return settled;
     },
 
-    /** Close the task's still-open PRs (cancellation). Best-effort: a task that
-     *  is going away must not be held up by GitHub being unreachable. */
-    async closePrs(handle: WorldHandle, prs: TaskPullRequest[], reason: string): Promise<void> {
+    /** Close the task's still-open PRs (cancellation), returning GitHub's live
+     *  state for the task view. Best-effort: a task that is going away must not
+     *  be held up by GitHub being unreachable. */
+    async closePrs(handle: WorldHandle, prs: TaskPullRequest[], reason: string): Promise<TaskPullRequest[]> {
       // Opening a PR can authorize a local checkout by matching its configured
       // GitHub origin against the organization repository catalog. Preserve the
       // same checkout context here; resolving only by project attachment made
       // cancellation unable to close exactly those otherwise-valid PRs.
       const world = await openWorld(handle).catch(() => undefined);
       const checkouts = world ? worldRepos(world.handle) : [];
+      const reconciled: TaskPullRequest[] = [];
       for (const ref of prs) {
         try {
           const checkout = checkouts.find((candidate) => candidate.name === ref.repo);
           const api = await prApiFor(handle, ref.slug, checkout);
-          if ((await api.get(ref.slug, ref.number)).state === 'closed') continue;
+          const live = await api.get(ref.slug, ref.number);
+          if (live.state === 'closed') {
+            const next = { ...ref, state: live.state, merged: live.merged,
+              ...(live.headSha ? { headSha: live.headSha } : {}) };
+            reconciled.push(next);
+            if (live.merged) record(handle.id, 'pr.merged', next);
+            continue;
+          }
           await api.comment(ref.slug, ref.number, reason);
-          await api.update(ref.slug, ref.number, { state: 'closed' });
-          record(handle.id, 'pr.closed', { ...ref, state: 'closed' as const, reason });
+          const closed = await api.update(ref.slug, ref.number, { state: 'closed' });
+          const next = { ...ref, state: closed.state, merged: closed.merged,
+            ...(closed.headSha ? { headSha: closed.headSha } : {}) };
+          reconciled.push(next);
+          record(handle.id, closed.merged ? 'pr.merged' : 'pr.closed', { ...next, reason });
         } catch (error) {
           record(handle.id, 'pr.close_failed', { ...ref, error: error instanceof Error ? error.message : String(error) });
+          reconciled.push(ref);
         }
       }
+      return reconciled;
     },
 
     /**

@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
-import { pullRequestWebhookEvent, type GithubPrWebhookEvent } from './github-pr.js';
+import { pullRequestWebhookEvent, reconcilePullRequestView, type GithubPrWebhookEvent } from './github-pr.js';
 import { GithubActionsApi } from './github-actions.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
@@ -586,6 +586,11 @@ export class GitHubAppService {
       // any repo would inject events into someone else's task.
       const prEvent = pullRequestWebhookEvent(event, payload);
       if (!prEvent || !this.ownsTask(connection.organizationId, prEvent.taskId)) return { accepted: true };
+      const view = this.store.getTask(prEvent.taskId)?.lastView;
+      if (view) {
+        const reconciled = reconcilePullRequestView(view, prEvent.payload);
+        if (reconciled !== view) this.store.saveView(prEvent.taskId, reconciled);
+      }
       return { accepted: true, events: [prEvent] };
     }
     if (['installation', 'installation_repositories', 'repository'].includes(event)) {
