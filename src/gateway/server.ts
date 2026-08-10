@@ -5484,7 +5484,7 @@ export class Gateway {
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
-      if ((f.type !== 'agent' && f.type !== 'confirmer') || !f.role) continue;
+      if ((f.type !== 'agent' && f.type !== 'confirmer' && f.type !== 'responder') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
@@ -5509,6 +5509,21 @@ export class Gateway {
             }),
             agentDefault: agent,
           }
+        : f.type === 'responder'
+          ? spec.kind === 'agent'
+            ? {
+                ...spec,
+                kind: 'agent',
+                provider: spec.provider ?? prof?.provider ?? defaultProvider().provider,
+                model: spec.model ?? prof?.model ?? defaultModel(spec.provider ?? prof?.provider ?? defaultProvider().provider),
+                effort: spec.effort ?? prof?.effort ?? defaultEffort(spec.provider ?? prof?.provider ?? defaultProvider().provider),
+                agentDefault: agent,
+              }
+            : {
+                kind: 'human',
+                audience: spec.audience?.length ? spec.audience : ['@creator'],
+                agentDefault: agent,
+              }
         : agent;
     }
     return out;

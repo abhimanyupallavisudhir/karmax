@@ -1261,13 +1261,25 @@ export class KarmaxApi {
   }
 
   private assertHumanRoutes(task: TaskRecord, manifest: WorkflowManifest, resolved: ValueMap): void {
-    const field = manifest.params.find((candidate) => candidate.type === 'confirmer');
-    if (!field) return;
-    const value = resolved[field.name];
-    if (!value || typeof value !== 'object') return;
-    for (const layer of confirmLayersOf(value as import('../domain/types.js').ConfirmConfig)) {
-      if (layer.kind !== 'human') continue;
-      const audience = layer.audience?.length ? layer.audience : ['@creator'];
+    const routes: { label: string; audience: string[] }[] = [];
+    const confirmer = manifest.params.find((candidate) => candidate.type === 'confirmer');
+    const confirmValue = confirmer && resolved[confirmer.name];
+    if (confirmValue && typeof confirmValue === 'object') {
+      for (const layer of confirmLayersOf(confirmValue as import('../domain/types.js').ConfirmConfig)) {
+        if (layer.kind === 'human') routes.push({
+          label: 'Review route', audience: layer.audience?.length ? layer.audience : ['@creator'],
+        });
+      }
+    }
+    const responder = manifest.params.find((candidate) => candidate.type === 'responder');
+    const responderValue = responder && resolved[responder.name];
+    if (responderValue && typeof responderValue === 'object'
+      && (responderValue as import('../domain/types.js').ResponderConfig).kind !== 'agent') {
+      const value = responderValue as import('../domain/types.js').ResponderConfig;
+      routes.push({ label: 'Responder', audience: value.audience?.length ? value.audience : ['@creator'] });
+    }
+    for (const route of routes) {
+      const audience = route.audience;
       if (!this.deps.store.humanAudience(task.id, audience).length) {
         const project = this.deps.store.getProject(task.projectId);
         // A pre-collaboration/local database can contain historical tasks before
@@ -1276,7 +1288,7 @@ export class KarmaxApi {
         // resolve before new work can run.
         if (project?.organizationId
           && this.deps.store.listOrganizationMemberships(project.organizationId).length === 0) continue;
-        throw new Error(`Review route ${audience.join(', ')} does not resolve to a human in this organization`);
+        throw new Error(`${route.label} ${audience.join(', ')} does not resolve to a human in this organization`);
       }
     }
   }

@@ -16,7 +16,7 @@ export type { TaskTrigger, TriggerState } from './triggers.js';
  */
 export type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
 
-export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
+export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | 'responder' | (string & {});
 
 // ─── Tenancy and collaboration ────────────────────────────────────────────────
 
@@ -1193,11 +1193,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator
@@ -1223,10 +1223,10 @@ export interface FieldSpec {
   placeholder?: string;
   scopes: FieldScope[];
   bind: FieldBind;
-  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures. */
+  /** For agent, confirmer, and responder fields — the role this configures. */
   role?: string;
-  /** For confirmer fields — the default Confirm-agent prompt template the form
-   *  pre-fills (and inherits back to on reset) when no override is stored. */
+  /** For confirmer/responder fields — the default auxiliary-agent prompt template
+   *  the form pre-fills (and inherits back to on reset) when none is stored. */
   promptDefault?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
@@ -1287,6 +1287,17 @@ export interface ConfirmConfig extends Partial<AgentSpec> {
   /** Legacy single-gate mode (pre-layers shape); read only when `layers` is absent. */
   mode?: ConfirmMode;
   /** Legacy: the single agent gate's review-request template. */
+  prompt?: string;
+}
+
+/** Who answers an ordinary "Waiting for input" pause. Unlike the Review route,
+ * this is exactly one step: a selected human audience or a response-agent turn.
+ * Agent responses are fed back to the working agent as the requested input. */
+export interface ResponderConfig extends Partial<AgentSpec> {
+  kind: 'human' | 'agent';
+  /** Human responder only. Uses the same stable audience selectors as Review. */
+  audience?: HumanAudience;
+  /** Agent responder only. Optional request template; empty uses the built-in. */
   prompt?: string;
 }
 
@@ -1389,7 +1400,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
@@ -1470,6 +1481,8 @@ export interface TaskInput {
    *  confirmation or a Confirm-agent turn; [] ⇒ auto-confirm. Absent ⇒ one human
    *  layer (or none when the legacy `autoConfirm` flag is set). */
   confirm?: ConfirmConfig;
+  /** Single human or agent route for ordinary Waiting-for-input pauses. */
+  responder?: ResponderConfig;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */

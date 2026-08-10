@@ -1,5 +1,6 @@
 import { FieldSpec } from '../domain/types.js';
 import { CONFIRM_PROMPT_DEFAULT } from '../domain/confirm-prompt.js';
+import { RESPOND_PROMPT_DEFAULT } from '../domain/respond-prompt.js';
 import { ResolveRuleDecl } from '../resolve/cases.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { DEVELOPER_WORKSPACE_CAPABILITIES } from '../platform/capabilities.js';
@@ -42,6 +43,15 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // The workflows re-read the layers at every gate iteration and replay the gate
 // from its first layer when the route changes under them.
 const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT, mutable: 'untilUsed' });
+// Ordinary input pauses have one responder, not a chain of approval gates. The
+// control intentionally mirrors one Review-route row (human audience or agent +
+// prompt) while forbidding zero/multiple steps: a question must have an owner.
+const responderField = (): FieldSpec => ({
+  name: 'responder', type: 'responder', label: 'Responder',
+  help: 'Who answers when the working agent pauses at Waiting for input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
+  scopes: ALL, bind: 'responder', role: 'responder',
+  default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
+});
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -294,6 +304,22 @@ Inspect the diff and the worktree (read files, run the build/tests) to judge whe
 
 Do not implement the task yourself. Decide, then call confirm_decision.`,
 };
+const RESPONDER_ROLE: WorkflowRole = {
+  name: 'responder',
+  label: 'Responder agent',
+  capabilities: ['signal-completion'],
+  defaults: { effort: 'low' },
+  promptTemplate: `{{toolsPreamble}}
+
+You are the RESPONDER for task "{{title}}". The working agent has paused and needs one decision or piece of information before it can continue. Answer that request; do not take over the task, edit its work, or review its finished proposal.
+
+Worktree (read-only context if needed): {{worldPath}} (branch {{branch}} off {{base}}).
+{{worldRepos}}
+
+{{instructions}}
+
+Your final response is sent back to the working agent as its input. Be concise and decisive. Do not call task lifecycle controls such as open_pr or confirm_decision.`,
+};
 
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).
 const SOFTWARE_DEV_STAGES: StageDef[] = [
@@ -373,7 +399,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.23.0',
+    version: '1.24.0',
     description: 'World → do/wait → review → optional per-PR provider/external landing or canonical Karmax fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -404,7 +430,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
-    roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
+    roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
     params: [
       promptField(),
@@ -421,6 +447,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       remoteField(),
       landingAuthorityField(),
       ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
+      responderField(),
       confirmerField(),
     ],
     onActivate: {
@@ -479,7 +506,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.23.0',
+    version: '1.24.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -487,9 +514,9 @@ export const MANIFESTS: WorkflowManifest[] = [
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
-    roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
+    roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',

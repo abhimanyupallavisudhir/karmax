@@ -22,6 +22,7 @@ import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
+import { renderRespondPrompt } from '../domain/respond-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
 import {
@@ -32,6 +33,7 @@ import {
   AgentSpec,
   ConfirmConfig,
   ConfirmLayer,
+  ResponderConfig,
   Message,
   ReviewInfo,
   DeclaredAction,
@@ -384,13 +386,18 @@ export async function softwareDevV1_23(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.23.0');
 }
 
+/** A configured single human/agent Responder owns ordinary input pauses. */
+export async function softwareDevV1_24(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.24.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -502,6 +509,7 @@ async function softwareDevImpl(
   const preservesHumanHoldContext = minor >= 22;
   const interlocksLandingTransitions = minor >= 22;
   const githubAuthoritativeCancellation = minor >= 23;
+  const routedInputResponder = minor >= 24;
   const configuredLandingAuthority = landingAuthorityOf(input.project);
   // The exact-candidate check belongs to the agent that authored and repaired
   // the proposal. Re-enter its Do conversation so it retains both context and
@@ -656,6 +664,7 @@ async function softwareDevImpl(
   const mergeMsgs: Message[] = recoveredTranscript('merge');
   const resolveMsgs: Message[] = recoveredTranscript('resolve');
   const confirmMsgs: Message[] = recoveredTranscript('confirm');
+  const responderMsgs: Message[] = recoveredTranscript('responder');
   // Who drives the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially at each Review — every layer must approve; [] ⇒ auto-confirm.
   // Legacy shapes ({mode} configs, the goal-task `autoConfirm` flag) normalize to
@@ -885,6 +894,7 @@ async function softwareDevImpl(
     if (!explicitPrCycle && mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
     if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
     if (confirmMsgs.length) t.push({ role: 'confirm', label: 'Confirm agent', messages: confirmMsgs });
+    if (responderMsgs.length) t.push({ role: 'responder', label: 'Responder agent', messages: responderMsgs });
     return t;
   }
 
@@ -1111,7 +1121,8 @@ async function softwareDevImpl(
   // ── handlers ──
   // Which conversation an addressed role reads/writes (Do is the default).
   const conversationFor = (role?: string): Message[] =>
-    role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs : msgs;
+    role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs
+      : role === 'responder' ? responderMsgs : msgs;
   setHandler(viewQuery, buildView);
   setHandler(agentTurnStateSignal, async (next) => {
     // Ignore a late state signal from an activity that was cancelled/retried after
@@ -1963,6 +1974,54 @@ async function softwareDevImpl(
     return ct?.confirmDecision;
   }
 
+  /** Ask the configured response agent for the one piece of input that unblocks
+   * Do. Its prose is returned to the caller and inserted as a user message in the
+   * working transcript; it never receives Review authority. */
+  async function responderTurn(route: ResponderConfig, question: string): Promise<string | undefined> {
+    const { kind: _kind, prompt: _prompt, audience: _audience, ...routeSpec } = route;
+    const { responder: _previous, ...otherAgents } = liveInput.agents ?? {};
+    liveInput.agents = routeSpec.provider
+      ? { ...otherAgents, responder: { ...routeSpec, provider: routeSpec.provider } }
+      : otherAgents;
+    const request = renderRespondPrompt(route.prompt, {
+      title: input.title,
+      prompt: input.prompt,
+      question,
+      transcript: lastOutputs(msgs),
+    });
+    responderMsgs.push({ id: `r-in-${responderMsgs.length}`, role: 'user', text: request, ts: responderMsgs.length });
+    const rt = await withResolve('responder', () =>
+      leasedTurn('responder', (
+        accountConfigHome,
+        accountApiKeyHandle,
+        agentTurnId,
+        accountCredentialKind,
+        accountCredentialProvider,
+        admission,
+      ) => agentTurns.runAgentTurn({
+        taskId,
+        role: 'responder',
+        worldHandle: world as any,
+        messages: responderMsgs,
+        task: liveInput,
+        bindings: { transcript: lastOutputs(msgs) },
+        accountConfigHome,
+        accountApiKeyHandle,
+        accountCredentialKind,
+        accountCredentialProvider,
+        ...(agentTurnId ? { agentTurnId } : {}),
+        ...admission,
+      })),
+    ).catch((e) => {
+      if (isCancellation(e)) throw e;
+      log.warn('responder agent turn failed; falling back to the task creator', { e: String(e) });
+      return undefined;
+    });
+    const output = rt?.output?.trim();
+    if (output) responderMsgs.push({ id: `r-out-${responderMsgs.length}`, role: 'agent', text: output, ts: responderMsgs.length });
+    return output || undefined;
+  }
+
   /** Validate the exact integration candidate without replaying human Review.
    * Human authorization is about task intent. v1.18 resumes the same Do agent
    * and conversation to inspect the CI-green proposal head; older pins retain
@@ -2603,15 +2662,39 @@ Inspect the complete current diff and specifically compare its delta from the re
         // agent, while Open PR advances this exact proposal without another turn.
         if (!prRequested) {
           status = 'waiting';
+          const question = turn.raise?.detail?.trim() || turn.output?.trim()
+            || 'The agent finished its turn. Send a follow-up, or open the PR if the work is truly complete.';
           if (input.parentTaskId) {
             waitingFor = { kind: 'parent', detail: 'Waiting for the managing agent to open the PR' };
             await notifyParent(turn.raise?.type ?? 'needs_confirmation',
               turn.raise?.detail ?? 'The Do turn ended. Open the PR only if the requested work is truly complete; otherwise send a comment.');
+          } else if (routedInputResponder && input.responder?.kind === 'agent') {
+            waitingFor = { kind: 'responder', detail: question };
+            await publish();
+            const answer = await responderTurn(input.responder, question);
+            waitingFor = undefined;
+            if (cancelled) return await abort();
+            if (answer) {
+              msgs.push({
+                id: `responder-${msgs.length}`,
+                role: 'user',
+                text: `Responder: ${answer}`,
+                ts: msgs.length,
+              });
+              stage = 'do';
+              status = 'active';
+              continue;
+            }
+            // A responder outage must not strand the task in an invisible loop.
+            // Fall back to its creator, like a failed Confirm-agent turn.
+            waitingFor = { kind: 'human', audience: ['@creator'], detail: question };
           } else {
             waitingFor = {
               kind: 'human',
-              audience: ['@creator'],
-              detail: turn.raise?.detail ?? 'The agent finished its turn. Send a follow-up, or open the PR if the work is truly complete.',
+              audience: routedInputResponder && input.responder?.kind === 'human' && input.responder.audience?.length
+                ? input.responder.audience
+                : ['@creator'],
+              detail: question,
             };
           }
           await publish();
