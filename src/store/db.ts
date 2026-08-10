@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { canonicalAccountName } from '../domain/account-names.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
@@ -122,6 +123,7 @@ export const isReviewRequestEvent = (type: string): boolean =>
  */
 export class Store {
   readonly db: DatabaseSyncType;
+  private userNames?: () => Array<{ id: string; name: string }>;
 
   constructor(dbPath = ':memory:') {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -307,6 +309,8 @@ export class Store {
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
         kind TEXT NOT NULL, createdAt INTEGER NOT NULL
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_name_nocase
+        ON organizations(name COLLATE NOCASE);
       CREATE TABLE IF NOT EXISTS organization_memberships (
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (organizationId, userId)
@@ -1063,11 +1067,38 @@ export class Store {
 
   // ─── Organizations, teams, and repository catalogue ───────────────────
 
+  /**
+   * Identity rows live in auth.db, while organizations live in karmax.db. The
+   * gateway connects the two stores after both have run their own schema
+   * migrations, giving every organization write the same cross-store guard.
+   */
+  connectUserNames(lookup: () => Array<{ id: string; name: string }>): void {
+    this.userNames = lookup;
+  }
+
+  private assertOrganizationNameAvailable(name: string, options: {
+    excludeOrganizationId?: string;
+    allowUserId?: string;
+  } = {}): string {
+    const value = name.trim();
+    if (!value) throw new Error('organization name is required');
+    const key = canonicalAccountName(value);
+    const organization = this.listOrganizations().find((candidate) =>
+      candidate.id !== options.excludeOrganizationId && canonicalAccountName(candidate.name) === key);
+    if (organization) throw new Error(`name "${value}" is already used by an organization`);
+    const user = this.userNames?.().find((candidate) =>
+      candidate.id !== options.allowUserId && canonicalAccountName(candidate.name) === key);
+    if (user) throw new Error(`name "${value}" is already used by a user`);
+    return value;
+  }
+
   createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string }): Organization {
     assertRoutableName('organization', input.name, input.slug);
+    const name = this.assertOrganizationNameAvailable(input.name,
+      input.kind === 'personal' ? { allowUserId: input.ownerUserId } : undefined);
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
-      id: newId('org'), name: input.name.trim() || 'Untitled organization', slug,
+      id: newId('org'), name, slug,
       kind: input.kind ?? 'team', createdAt: Date.now(),
     };
     this.db.prepare('INSERT INTO organizations (id, name, slug, kind, createdAt) VALUES (?, ?, ?, ?, ?)')
@@ -1084,8 +1115,11 @@ export class Store {
   renameOrganization(id: string, name: string): Organization {
     const existing = this.getOrganization(id);
     if (!existing) throw new Error(`no organization ${id}`);
-    const nextName = name.trim();
-    if (!nextName) throw new Error('organization name is required');
+    const personalOwner = existing.kind === 'personal'
+      ? this.listOrganizationMemberships(id).find((membership) => membership.role === 'owner')?.userId
+      : undefined;
+    const nextName = this.assertOrganizationNameAvailable(name,
+      { excludeOrganizationId: id, allowUserId: personalOwner });
     this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(nextName, id);
     return { ...existing, name: nextName };
   }
@@ -1096,6 +1130,12 @@ export class Store {
           ON m.organizationId=o.id WHERE m.userId=? ORDER BY o.createdAt`).all(userId)
       : this.db.prepare('SELECT * FROM organizations ORDER BY createdAt').all();
     return (rows as any[]).map(rowToOrganization);
+  }
+
+  /** The unclaimed migration placeholder is not a real namespace reservation. */
+  organizationNameReservations(): Organization[] {
+    return this.listOrganizations().filter((organization) => organization.id !== 'org_personal'
+      || this.listOrganizationMemberships(organization.id).length > 0);
   }
 
   /** The workspace a person's neutral `/` route opens. Existing users predate
@@ -1485,11 +1525,75 @@ export class Store {
     if (!this.db.prepare('SELECT 1 FROM user_preferences WHERE userId=?').get(userId))
       this.setDefaultOrganization(userId, organization.id);
     if (name && organization.name === 'Personal') {
-      const next = `${name.trim() || 'Personal'}'s workspace`;
+      const next = this.assertOrganizationNameAvailable(name,
+        { excludeOrganizationId: organization.id, allowUserId: userId });
       this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(next, organization.id);
       return { ...organization, name: next };
     }
     return organization;
+  }
+
+  /**
+   * Boot migration for personal tenants created by the old "Name's workspace"
+   * convention. Only recognizable generated labels are changed, so a person who
+   * deliberately renamed their personal organization keeps that choice. All
+   * updates are one transaction: a pre-existing namespace collision fails the
+   * candidate boot without leaving a half-migrated deployment database.
+   */
+  migratePersonalOrganizationNames(users: Array<{ id: string; name: string }>): number {
+    const names = new Map(users.map((user) => [user.id, user.name.trim()]));
+    const rows = this.db.prepare(`SELECT o.id, o.name, m.userId
+      FROM organizations o
+      JOIN organization_memberships m ON m.organizationId=o.id AND m.role='owner'
+      WHERE o.kind='personal'
+        AND m.userId = (SELECT firstOwner.userId FROM organization_memberships firstOwner
+          WHERE firstOwner.organizationId=o.id AND firstOwner.role='owner'
+          ORDER BY firstOwner.joinedAt, firstOwner.rowid LIMIT 1)
+      ORDER BY o.createdAt, m.joinedAt`).all() as Array<{ id: string; name: string; userId: string }>;
+    let changed = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        const userName = names.get(row.userId);
+        if (!userName || row.name === userName) continue;
+        if (!row.name.endsWith("'s workspace") && row.name !== 'Personal workspace') continue;
+        const next = this.assertOrganizationNameAvailable(userName,
+          { excludeOrganizationId: row.id, allowUserId: row.userId });
+        this.db.prepare('UPDATE organizations SET name=? WHERE id=?').run(next, row.id);
+        changed++;
+      }
+      this.validateAccountNameNamespace(users);
+      this.db.exec('COMMIT');
+      return changed;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private validateAccountNameNamespace(users: Array<{ id: string; name: string }>): void {
+    const seenUsers = new Map<string, string>();
+    for (const user of users) {
+      const key = canonicalAccountName(user.name);
+      const existing = seenUsers.get(key);
+      if (existing && existing !== user.id)
+        throw new Error(`user name "${user.name.trim()}" is already used by another user`);
+      seenUsers.set(key, user.id);
+    }
+    const seenOrganizations = new Map<string, string>();
+    for (const organization of this.listOrganizations()) {
+      const key = canonicalAccountName(organization.name);
+      const existing = seenOrganizations.get(key);
+      if (existing && existing !== organization.id)
+        throw new Error(`organization name "${organization.name}" is already used by another organization`);
+      seenOrganizations.set(key, organization.id);
+      const userId = seenUsers.get(key);
+      if (!userId) continue;
+      const isOwnersPersonalName = organization.kind === 'personal'
+        && this.organizationMembership(organization.id, userId)?.role === 'owner';
+      if (!isOwnersPersonalName)
+        throw new Error(`name "${organization.name}" is used by both a user and an organization`);
+    }
   }
 
   setOrganizationMembership(organizationId: string, userId: string, role: OrganizationMembership['role']): OrganizationMembership {

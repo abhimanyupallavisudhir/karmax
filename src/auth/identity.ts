@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { canonicalAccountName } from '../domain/account-names.js';
 
 export interface IdentityUser {
   id: string;
@@ -91,6 +92,7 @@ export interface IdentityOptions {
 export class IdentityService {
   readonly auth: any;
   private db: DatabaseSync;
+  private organizationNames?: () => Array<{ id: string; name: string }>;
 
   /** Installation-wide outbound email, injected after construction (main.ts wires
    *  it once the vault/broker exist). The Better Auth hooks below read it lazily,
@@ -166,10 +168,15 @@ export class IdentityService {
       // App uses its fine-grained account/repository permissions (OAuth scopes do
       // not apply) and its user grant is also adopted by the development profile.
       ...(trustedSocialProviders.length ? { socialProviders } : {}),
-      ...(opts.github?.onAuthorization ? { databaseHooks: { account: {
-        create: { after: adoptGithubAuthorization },
-        update: { after: adoptGithubAuthorization },
-      } } } : {}),
+      databaseHooks: {
+        user: { create: { before: async (user: Record<string, unknown>) => {
+          this.assertUserNameAvailable(String(user.name ?? ''));
+        } } },
+        ...(opts.github?.onAuthorization ? { account: {
+          create: { after: adoptGithubAuthorization },
+          update: { after: adoptGithubAuthorization },
+        } } : {}),
+      },
       // Account linking. A user who signed up with email+password and later uses
       // Google or GitHub on the same address should land in the SAME
       // account, not a duplicate. The merge key is the email address, so BOTH
@@ -270,6 +277,10 @@ export class IdentityService {
     const service = new IdentityService(dbFile, opts);
     const { runMigrations } = await getMigrations(service.auth.options);
     await runMigrations();
+    // Better Auth intentionally permits duplicate display names, but every
+    // karmax user owns a same-named personal organization. This index closes the
+    // concurrent-signup gap around the cross-store application check.
+    service.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_user_name_nocase ON user(name COLLATE NOCASE)');
     return service;
   }
 
@@ -280,6 +291,22 @@ export class IdentityService {
   listUsers(): IdentityUser[] {
     return (this.db.prepare('SELECT id, email, name, role, createdAt FROM user ORDER BY createdAt').all() as any[])
       .map((u) => ({ ...u, createdAt: new Date(u.createdAt) }));
+  }
+
+  /** Connect Better Auth's user lifecycle to the organization namespace. */
+  connectOrganizationNames(lookup: () => Array<{ id: string; name: string }>): void {
+    this.organizationNames = lookup;
+  }
+
+  assertUserNameAvailable(name: string): string {
+    const value = name.trim();
+    if (!value) throw new Error('user name is required');
+    const key = canonicalAccountName(value);
+    if (this.listUsers().some((user) => canonicalAccountName(user.name) === key))
+      throw new Error(`name "${value}" is already used by a user`);
+    if (this.organizationNames?.().some((organization) => canonicalAccountName(organization.name) === key))
+      throw new Error(`name "${value}" is already used by an organization`);
+    return value;
   }
 
   /** Public account data for a self-service portability export. Password hashes,
@@ -317,7 +344,7 @@ export class IdentityService {
    * authorization.
    */
   async signUp(input: { name: string; email: string; password: string }, headers?: Headers): Promise<Response> {
-    return this.auth.api.signUpEmail({ body: input, headers, asResponse: true });
+    return this.auth.api.signUpEmail({ body: { ...input, name: this.assertUserNameAvailable(input.name) }, headers, asResponse: true });
   }
 
   async signOut(headers: Headers): Promise<Response> {
@@ -352,7 +379,8 @@ export class IdentityService {
   /** First-account setup. The route calling this is available only while empty. */
   async bootstrap(input: { name: string; email: string; password: string }, headers?: Headers): Promise<{ response: Response; user: IdentityUser }> {
     if (this.hasUsers()) throw new Error('krmax has already been set up');
-    const response = await this.auth.api.signUpEmail({ body: input, headers, asResponse: true });
+    const response = await this.auth.api.signUpEmail({
+      body: { ...input, name: this.assertUserNameAvailable(input.name) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
     // Promote the account this call actually created, resolved by its own email —
     // NOT `listUsers()[0]`. `hasUsers()` above is a TOCTOU check, so two
@@ -370,7 +398,8 @@ export class IdentityService {
   }
 
   async createUser(input: { name: string; email: string; password: string }): Promise<IdentityUser> {
-    const result = await this.auth.api.createUser({ body: { ...input, role: 'user' } });
+    const result = await this.auth.api.createUser({
+      body: { ...input, name: this.assertUserNameAvailable(input.name), role: 'user' } });
     return (result?.user ?? result) as IdentityUser;
   }
 

@@ -485,6 +485,10 @@ export class Gateway {
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
 
   constructor(private deps: GatewayDeps) {
+    if (deps.identity) {
+      deps.identity.connectOrganizationNames(() => deps.store.organizationNameReservations());
+      deps.store.connectUserNames(() => deps.identity!.listUsers());
+    }
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
   }
@@ -6085,7 +6089,7 @@ export class Gateway {
       if (this.deps.store.listOrganizations(userId).length) return false; // already has one
       const label = (name || '').trim();
       const organization = this.deps.store.createOrganization({
-        name: label ? `${label}'s workspace` : 'Personal workspace', kind: 'personal', ownerUserId: userId });
+        name: label || 'Personal', kind: 'personal', ownerUserId: userId });
       this.deps.store.setDefaultOrganization(userId, organization.id);
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
       inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);

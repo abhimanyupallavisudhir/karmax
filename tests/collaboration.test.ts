@@ -12,6 +12,37 @@ describe('organization and collaboration domain', () => {
     expect(project.organizationId).toBe(personal!.id);
   });
 
+  it('migrates generated personal-workspace labels to registered user names atomically', () => {
+    const store = new Store(':memory:');
+    const users = [
+      { id: 'alice', name: 'Alice Example' },
+      { id: 'bob', name: 'Bob' },
+    ];
+    store.connectUserNames(() => users);
+    store.claimPersonalOrganization('alice');
+    store.renameOrganization('org_personal', "Alice Example's workspace");
+    const bob = store.createOrganization({ name: "Bob's workspace", kind: 'personal', ownerUserId: 'bob' });
+    const custom = store.createOrganization({ name: 'My quiet corner', kind: 'personal', ownerUserId: 'custom' });
+
+    expect(store.migratePersonalOrganizationNames(users)).toBe(2);
+    expect(store.getOrganization('org_personal')?.name).toBe('Alice Example');
+    expect(store.getOrganization(bob.id)?.name).toBe('Bob');
+    expect(store.getOrganization(custom.id)?.name).toBe('My quiet corner');
+    expect(store.migratePersonalOrganizationNames(users)).toBe(0);
+  });
+
+  it('rolls back all personal-workspace renames when the new namespace has a collision', () => {
+    const store = new Store(':memory:');
+    store.claimPersonalOrganization('alice');
+    store.renameOrganization('org_personal', "Alice's workspace");
+    store.createOrganization({ name: 'Alice' });
+    store.connectUserNames(() => [{ id: 'alice', name: 'Alice' }]);
+
+    expect(() => store.migratePersonalOrganizationNames([{ id: 'alice', name: 'Alice' }]))
+      .toThrow(/already used by an organization/i);
+    expect(store.getOrganization('org_personal')?.name).toBe("Alice's workspace");
+  });
+
   it('keeps a per-user default organization initialized to the owned personal workspace', () => {
     const store = new Store(':memory:');
     const personal = store.createOrganization({ name: "Alice's workspace", kind: 'personal', ownerUserId: 'alice' });
