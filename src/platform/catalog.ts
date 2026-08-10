@@ -17,7 +17,7 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
     ],
     interactiveHuman: [
-      'GET /api/user/export', 'POST /api/invitations/accept',
+      'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'POST /api/invitations/accept',
       'DELETE /api/organizations/:organizationId',
       'POST /api/users', 'DELETE /api/users/:userId',
       'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
@@ -51,6 +51,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/projects/:projectId/members/user|team|organization/:principalId',
   ],
   organizations: [
+    'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     'GET /api/settings/installation (global operator-only Installation page probe)',
     'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
