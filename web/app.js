@@ -5566,7 +5566,7 @@ function renderTaskFilePage(v, target) {
         <div class="${state?.status === 'ready' ? 'current' : ''}"><i>3</i><span>Editor</span></div>
       </div>
       <section class="fh-panel">${fileHandoffResultHtml(state, target)}</section>
-      <p class="fh-footnote">This permalink is scoped to this task. Krmax resolves the agent’s world path server-side and refuses paths outside the task repositories.</p>
+      <p class="fh-footnote">This permalink is scoped to this task. krmax resolves the agent’s world path server-side and refuses paths outside the task repositories.</p>
     </main></div>`;
   $('#fh-retry')?.addEventListener('click', () => { S.taskFileLoad = null; renderTaskFilePage(v, target); });
   main.querySelectorAll('.fh-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
