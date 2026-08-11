@@ -93,7 +93,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
    trace is intentionally console-like: one clear latency signal shared by every
    surface, with the initiating control carrying the local spinner as well. */
 .action-progress {
-  position: fixed; inset: 0 0 auto; z-index: 120; height: 2px; overflow: hidden;
+  position: fixed; inset: 0 0 auto; z-index: 99; height: 2px; overflow: hidden;
   pointer-events: none; background: color-mix(in srgb, var(--accent) 18%, transparent);
   transition: opacity .18s ease;
 }

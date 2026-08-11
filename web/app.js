@@ -12814,8 +12814,12 @@ function wireProfileView() {
       return toast('Enter a different email address.', true);
     const button = $('#profile-email-save');
     button.disabled = true;
+    const feedback = beginActionFeedback(button);
+    let actionSucceeded = false;
     try {
-      const response = await feedbackFetch('/api/auth/change-email', {
+      // Keep this direct Better Auth request visible in the account-control
+      // contract while the explicit ticket covers the entire follow-up refresh.
+      const response = await fetch('/api/auth/change-email', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ newEmail, callbackURL: `${location.origin}/?verified=1` }),
@@ -12829,12 +12833,15 @@ function wireProfileView() {
       if (session.user) S.user = session.user;
       renderShell();
       await applyRoute();
+      actionSucceeded = true;
       toast(wasUnverified
         ? `Email changed. Confirmation link sent to ${newEmail}.`
         : `Confirmation link sent to ${newEmail}. Your email will change after you confirm it.`);
     } catch (error) {
       toast(error.message || 'Couldn’t change the email address.', true);
       button.disabled = false;
+    } finally {
+      finishActionFeedback(feedback, actionSucceeded);
     }
   });
   $('#profile-password-form')?.addEventListener('submit', async (event) => {
@@ -12862,8 +12869,10 @@ function wireProfileView() {
     }
     const button = $('#profile-password-save');
     button.disabled = true;
+    const feedback = beginActionFeedback(button);
+    let actionSucceeded = false;
     try {
-      const response = await feedbackFetch('/api/auth/change-password', {
+      const response = await fetch('/api/auth/change-password', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ currentPassword, newPassword, revokeOtherSessions: true }),
@@ -12874,11 +12883,13 @@ function wireProfileView() {
       }
       form.reset();
       setProfileEditor(null);
+      actionSucceeded = true;
       toast('Password changed. Other signed-in sessions were closed.');
     } catch (cause) {
       error.textContent = cause.message || 'Couldn’t change the password.';
     } finally {
       button.disabled = false;
+      finishActionFeedback(feedback, actionSucceeded);
     }
   });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
