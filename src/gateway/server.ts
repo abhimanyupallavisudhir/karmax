@@ -251,7 +251,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p === '/api/agent/collaboration/request') return 'task:conversation:message';
-  if (/\/file$/.test(p)) return 'task:conversation:read';
+  if (/\/(?:file|open-command|file-checkout)$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
@@ -3285,6 +3285,20 @@ export class Gateway {
         if (line !== undefined && (!Number.isInteger(line) || line < 1))
           return this.json(res, 400, { error: 'line must be a positive integer' });
         try { return this.json(res, 200, await this.deps.handoffs.openFile(taskId, view, String(body.path ?? ''), line)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const fileCheckoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/file-checkout$/);
+      if (fileCheckoutMatch && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        const taskId = fileCheckoutMatch[1]!;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        const body = await this.body(req);
+        const line = body.line == null ? undefined : Number(body.line);
+        if (line !== undefined && (!Number.isInteger(line) || line < 1))
+          return this.json(res, 400, { error: 'line must be a positive integer' });
+        try { return this.json(res, 200,
+          this.deps.handoffs.fileCheckout(taskId, view, String(body.path ?? ''), line)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/git/publish' && method === 'POST') {

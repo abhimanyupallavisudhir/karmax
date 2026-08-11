@@ -88,6 +88,7 @@ ok((renderMarkdown('[s](https://x.com)', {}).match(/<a /g) || []).length === 1, 
 // target rides along in data-md-local so an in-app resolver can route it, while
 // the href stays inert. A scheme (javascript:/data:) is still neutralised above.
 ok(/<a href="#" data-md-local="guides\/e2e-runbook">run<\/a>/.test(renderMarkdown('[run](guides/e2e-runbook)', {})), 'relative wiki link kept as a local link');
+ok(/data-md-local="src\/app\.ts:42"/.test(renderMarkdown('[app](src/app.ts:42)', {})), 'relative file citations may carry an editor line suffix');
 ok(!renderMarkdown('[run](guides/e2e-runbook)', {}).includes('target="_blank"'), 'a local link does not open a new tab');
 ok(renderMarkdown('[x](data:text/html,x)', {}).includes('href="#"') && !renderMarkdown('[x](data:text/html,x)', {}).includes('data-md-local'), 'data: link neutralised, not treated as local');
 ok(renderMarkdown('[top](#section)', {}).includes('href="#section"'), 'in-page anchor link kept as-is');

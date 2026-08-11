@@ -66,6 +66,8 @@ const S = {
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
   taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
+  taskFile: null, // URL-owned agent citation handoff ({ path, line? }); null on the ordinary task page
+  taskFileLoad: null, // { key, status, result|error } for the current handoff page
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
   taskEvents: [],
   approvalRequests: [], // credential decisions for the selected task
@@ -199,7 +201,8 @@ const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'in
 // project route: a search is just a URL.
 function parseRoute(url) {
   const [pathname, search = ''] = String(url).split('?');
-  const q = new URLSearchParams(search).get('q') || '';
+  const query = new URLSearchParams(search);
+  const q = query.get('q') || '';
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
@@ -213,7 +216,8 @@ function parseRoute(url) {
     const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, q, legacy: true };
+    const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, q, legacy: true, ...(taskFile ? { taskFile } : {}) };
   }
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
@@ -227,7 +231,15 @@ function parseRoute(url) {
   const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q };
+  const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}) };
+}
+
+function fileRouteTarget(query) {
+  const path = query.get('path') || '';
+  const lineValue = query.get('line');
+  const line = lineValue && /^\d+$/.test(lineValue) && Number(lineValue) > 0 ? Number(lineValue) : undefined;
+  return { path, ...(line ? { line } : {}) };
 }
 
 // The `/<org>/<project>` prefix every project URL builds on ('' when unknown).
@@ -416,7 +428,9 @@ async function applyRoute() {
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
     const dest = r.taskKey
-      ? `${projectBase(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
+      ? r.taskFile
+        ? `${projectBase(proj.id)}/tasks/${r.taskKey}/file?${fileTargetQuery(r.taskFile)}`
+        : `${projectBase(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
       : projectRoute(proj.id, r.tab, r.q);
     return go(dest, { replace: true });
   }
@@ -503,10 +517,14 @@ async function applyRoute() {
   }
   renderRail();
   if (taskId) {
+    const nextTaskFile = r.taskFile || null;
+    if (JSON.stringify(S.taskFile) !== JSON.stringify(nextTaskFile)) S.taskFileLoad = null;
+    S.taskFile = nextTaskFile;
     if (S.selected !== taskId) return openTask(taskId, r.taskTab);
     if (r.taskTab) S.taskTab = r.taskTab;
     return renderTaskPage();
   }
+  S.taskFile = null;
   renderMain();
   if (tab === 'activity') seedActivity();
   if (tab === 'queue') seedQueue();
@@ -2005,15 +2023,15 @@ function mdInline(t) {
   };
   // Inline links [text](url "optional title") — safe schemes only; the title is
   // dropped. Runs before autolinking so a bare URL inside a link is left alone.
-  // A scheme-less relative target (no ":" — so `javascript:`/`data:` are
-  // neutralised) is kept as a local link: its target rides along in
+  // A target without a leading URI scheme (so `javascript:`/`data:` are
+  // neutralised, while an editor suffix like `file.ts:12` remains local) rides in
   // data-md-local so an in-app resolver (e.g. the wiki view) can route it to a
   // page, while it stays inert (href="#") everywhere else.
   x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
     if (/^(https?:|mailto:|\/)/i.test(href))
       return keepLink(`<a href="${href}" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
     if (href[0] === '#') return keepLink(`<a href="${href}">${format(txt)}</a>`);
-    if (!/:/.test(href)) return keepLink(`<a href="#" data-md-local="${href}">${format(txt)}</a>`);
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return keepLink(`<a href="#" data-md-local="${href}">${format(txt)}</a>`);
     return keepLink(`<a href="#" target="_blank" rel="noopener noreferrer">${format(txt)}</a>`);
   });
   // Autolink bare http(s) URLs (explicit links are opaque placeholders now).
@@ -5415,6 +5433,8 @@ function closeTaskDom() {
   S.view = null;
   S.attemptGroup = null;
   S.taskTab = null;
+  S.taskFile = null;
+  S.taskFileLoad = null;
   S.checkinSel = null;
   S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
@@ -5493,6 +5513,82 @@ function wireTaskOrg(v) {
   const rec = taskRecord(v.taskId);
   if (!rec) return;
   wireOrgEditor($('#main'), rec, { ensureId: async () => v.taskId, afterChange: renderTaskPage });
+}
+
+function taskFileKey(v, target) {
+  return `${v.taskId}\n${target.path}\n${target.line || ''}\n${hostLocal() ? 'host' : 'portable'}`;
+}
+
+function citedFileName(target) {
+  return String(target.path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'File';
+}
+
+function vscodeFileUrl(file, line) {
+  const normalized = String(file).replace(/\\/g, '/');
+  const encoded = normalized.split('/').map(encodeURIComponent).join('/');
+  return `vscode://file${encoded.startsWith('/') ? '' : '/'}${encoded}${line ? `:${line}` : ''}`;
+}
+
+function fileHandoffResultHtml(state, target) {
+  if (!state || state.status === 'loading') return `<div class="fh-status" role="status" aria-busy="true">
+    <span class="fh-pulse" aria-hidden="true"></span><div><b>${hostLocal() ? 'Preparing a local checkout' : 'Preparing checkout instructions'}</b>
+    <span>${hostLocal() ? 'The task branch is crossing the Git handoff boundary. Existing clean checkouts are reused.' : 'Resolving the cited world path to its repository and task branch.'}</span></div></div>`;
+  if (state.status === 'error') return `<div class="fh-status error" role="alert"><span class="fh-mark">!</span><div><b>Couldn’t prepare this file</b>
+    <span>${esc(state.error)}</span><button class="btn sm" id="fh-retry">Try again</button></div></div>`;
+  const result = state.result;
+  if (hostLocal()) return `<div class="fh-status ready"><span class="fh-mark">✓</span><div><b>${result.materialized ? 'Checkout materialized' : 'File found locally'}</b>
+      <span>The world remains isolated; this path is the host-side checkout.</span></div></div>
+    <div class="fh-command"><div><span>Local file</span><code>${esc(result.path)}${target.line ? `:${target.line}` : ''}</code></div>
+      <div class="fh-actions"><a class="btn sm primary" href="${esc(vscodeFileUrl(result.path, target.line))}">Open in VS Code</a>
+      <button class="btn sm fh-copy" data-value="${esc(result.command)}">${ICON.copy} Copy command</button></div></div>`;
+  return `<div class="fh-status ready"><span class="fh-mark">↧</span><div><b>Ready to materialize on your computer</b>
+      <span>Run this from the folder where you keep working copies. It clones once, fast-forwards a clean checkout thereafter, and opens the cited line.</span></div></div>
+    <div class="fh-command"><div><span>Checkout + open</span><code>${esc(result.workspace)}/${esc(result.file.repository)}/${esc(result.file.relativePath)}${target.line ? `:${target.line}` : ''}</code></div>
+      <button class="btn sm primary fh-copy" data-value="${esc(result.openScript)}">${ICON.copy} Copy checkout-and-open script</button></div>
+    <pre class="raw fh-script">${esc(result.openScript)}</pre>`;
+}
+
+function renderTaskFilePage(v, target) {
+  const main = $('#main');
+  if (!main) return;
+  const key = taskFileKey(v, target);
+  const state = S.taskFileLoad?.key === key ? S.taskFileLoad : null;
+  const back = `${taskUrl(v.taskId)}/checkin`;
+  main.innerHTML = `<div class="task-file-page">
+    <header class="fh-head"><a class="fh-back" data-spa href="${esc(back)}">← Conversation</a>
+      <span class="fh-kicker">Agent file handoff${v.num != null ? ` · Task #${v.num}` : ''}</span>
+      <h1>${esc(citedFileName(target))}</h1>
+      <p>${esc(target.path)}${target.line ? `<span>:${target.line}</span>` : ''}</p></header>
+    <main class="fh-body">
+      <div class="fh-rail" aria-label="File handoff progress">
+        <div class="done"><i>1</i><span>Task world</span></div><b></b>
+        <div class="${state?.status === 'ready' ? 'done' : 'current'}"><i>2</i><span>Local checkout</span></div><b></b>
+        <div class="${state?.status === 'ready' ? 'current' : ''}"><i>3</i><span>Editor</span></div>
+      </div>
+      <section class="fh-panel">${fileHandoffResultHtml(state, target)}</section>
+      <p class="fh-footnote">This permalink is scoped to this task. krmax resolves the agent’s world path server-side and refuses paths outside the task repositories.</p>
+    </main></div>`;
+  $('#fh-retry')?.addEventListener('click', () => { S.taskFileLoad = null; renderTaskFilePage(v, target); });
+  main.querySelectorAll('.fh-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.innerHTML; button.textContent = '✓ Copied'; setTimeout(() => { button.innerHTML = label; }, 1200);
+  })));
+  if (!state) hydrateTaskFilePage(v, target, key);
+}
+
+async function hydrateTaskFilePage(v, target, key) {
+  S.taskFileLoad = { key, status: 'loading' };
+  try {
+    const endpoint = hostLocal() ? 'open-command' : 'file-checkout';
+    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/${endpoint}`, {
+      method: 'POST', body: JSON.stringify(target),
+    });
+    if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
+    S.taskFileLoad = { key, status: 'ready', result };
+  } catch (error) {
+    if (taskFileKey(v, target) !== key || S.taskFileLoad?.key !== key) return;
+    S.taskFileLoad = { key, status: 'error', error: error.message };
+  }
+  if (S.selected === v.taskId && S.taskFile && taskFileKey(v, S.taskFile) === key) renderTaskFilePage(v, target);
 }
 
 // Type-to-add tag combobox: filter existing tags as you type; a non-matching entry
@@ -5575,6 +5671,7 @@ function renderTaskPage() {
   const v = S.view;
   const main = $('#main');
   if (!v || !main) return;
+  if (S.taskFile) return renderTaskFilePage(v, S.taskFile);
   if (!S.taskTab) S.taskTab = defaultTaskTab(v); // resolved once at open; never auto-switches under the user
   const tab = S.taskTab;
   // A background refresh (or a just-sent follow-up) re-renders the whole page,
@@ -5663,7 +5760,6 @@ function renderTaskPage() {
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
-    wireWorldFileLinks(v);
     wireExplainMessages(v);
   } else if (tab === 'approvals') {
     wireTaskApprovalRequests(v);
@@ -6859,9 +6955,9 @@ function conversationTimeHtml(ts) {
 }
 
 // Render the small Markdown-link subset agents use for file citations without
-// changing the stored transcript. File anchors keep their exact target in a
-// data attribute while their browser href stays inert; a click resolves the
-// host checkout and copies an editor command instead of navigating into krmax.
+// changing the stored transcript. Every citation becomes a real task-scoped URL
+// that can be copied, bookmarked, or opened in a new tab without sending a
+// sandbox filesystem path through ordinary browser navigation.
 function renderConversationText(text, role, v = S.view) {
   const source = String(text ?? '');
   if (role !== 'agent') return esc(source);
@@ -6871,9 +6967,9 @@ function renderConversationText(text, role, v = S.view) {
   for (const match of source.matchAll(link)) {
     html += esc(source.slice(at, match.index));
     const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
-    const worldFile = worldFileTarget(href, v?.worldPath, !!v?.worldAvailable && !v?.worldPath && hostLocal());
-    html += worldFile
-      ? `<a href="#" class="world-file-link" data-world-file="${esc(href)}" title="Copy a command to open this file locally">${esc(match[1])}</a>`
+    const fileUrl = worldFileHref(href, v);
+    html += fileUrl
+      ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">${esc(match[1])}</a>`
       : `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
@@ -6911,24 +7007,33 @@ function worldFileTarget(raw, worldPath, allowUnknownRoot = false) {
   return { path: value, line };
 }
 
-function fileLinksEnabled() {
-  const user = typeof S.user === 'object' ? S.user?.id : S.user;
-  return localStorage.getItem(`karmax-appearance:${user || 'local'}:world-file-links`) !== 'off';
+function fileTargetQuery(target) {
+  const query = new URLSearchParams({ path: target.path });
+  if (target.line) query.set('line', String(target.line));
+  return query.toString();
 }
 
-function setFileLinksEnabled(enabled) {
-  const user = typeof S.user === 'object' ? S.user?.id : S.user;
-  localStorage.setItem(`karmax-appearance:${user || 'local'}:world-file-links`, enabled ? 'on' : 'off');
+function worldFileHref(raw, v = S.view) {
+  const target = worldFileTarget(raw, v?.worldPath, !!v?.worldAvailable && !v?.worldPath);
+  return target && v?.taskId ? `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}` : null;
 }
 
-// Markdown mode renders anchors itself; mark the in-world ones afterwards so
-// the same click interception (wireWorldFileLinks) applies in both modes.
+function decodeMarkdownAttribute(value) {
+  return String(value).replace(/&(?:amp|quot|#39|lt|gt);/g, (entity) => ({
+    '&amp;': '&', '&quot;': '"', '&#39;': "'", '&lt;': '<', '&gt;': '>',
+  }[entity]));
+}
+
+// Markdown mode renders anchors itself; replace in-world targets afterwards.
+// Relative links ride in data-md-local, while absolute links retain their href.
 function annotateWorldFileLinks(html, v = S.view) {
-  const remote = !!v?.worldAvailable && !v?.worldPath && hostLocal();
-  return String(html).replace(/<a href="([^"]*)"/g, (anchor, href) =>
-    worldFileTarget(href, v?.worldPath, remote)
-      ? `<a href="#" class="world-file-link" data-world-file="${href}" title="Copy a command to open this file locally"`
-      : anchor);
+  return String(html).replace(/<a href="([^"]*)"([^>]*)>/g, (anchor, href, attrs) => {
+    const local = attrs.match(/\sdata-md-local="([^"]*)"/);
+    const fileUrl = worldFileHref(decodeMarkdownAttribute(local ? local[1] : href), v);
+    return fileUrl
+      ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">`
+      : anchor;
+  });
 }
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
@@ -6983,41 +7088,6 @@ function renderConversationEntry(entry, v = S.view) {
     <span class="activity-icon" aria-hidden="true">${icons[a.kind] || '·'}</span>
     <div class="activity-body"><div class="activity-head"><span class="activity-title">${esc(a.title)}</span><span class="activity-state">${esc(a.phase)}</span>${conversationTimeHtml(entry.ts)}</div>${detail}</div>
   </div>`;
-}
-
-async function openWorldFile(anchor, v) {
-  if (anchor.dataset.opening === '1') return;
-  const target = worldFileTarget(anchor.dataset.worldFile, v?.worldPath, !!v?.worldAvailable && !v?.worldPath && hostLocal());
-  if (!target) return;
-  anchor.dataset.opening = '1';
-  const materializing = !v?.worldPath;
-  if (materializing) {
-    anchor.classList.add('materializing');
-    anchor.setAttribute('aria-busy', 'true');
-    anchor.setAttribute('title', 'Materializing a local checkout…');
-  }
-  try {
-    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/open-command`, {
-      method: 'POST', body: JSON.stringify(target),
-    });
-    await copyToClipboard(result.command);
-    toast('open command copied');
-  } catch (e) {
-    toast(e.message, true);
-  } finally {
-    delete anchor.dataset.opening;
-    anchor.classList.remove('materializing');
-    anchor.removeAttribute('aria-busy');
-    anchor.setAttribute('title', 'Copy a command to open this file locally');
-  }
-}
-
-function wireWorldFileLinks(v) {
-  document.querySelectorAll('.world-file-link').forEach((anchor) => anchor.addEventListener('click', (event) => {
-    event.preventDefault();
-    if (!fileLinksEnabled()) return;
-    openWorldFile(anchor, v);
-  }));
 }
 
 async function runExplanation(v, role, sourceKey, settings) {
@@ -12560,7 +12630,6 @@ function profileView() {
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
       <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Copy local open commands from agent file links</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card data-export-card">
@@ -12761,7 +12830,6 @@ function wireProfileView() {
     if (S.taskTab === 'checkin') renderTaskPage();
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
-  $('#profile-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
   $('#export-user-data')?.addEventListener('click', () => location.assign('/api/user/export'));
   $('#profile-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}

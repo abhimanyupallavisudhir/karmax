@@ -16,7 +16,7 @@ function extractFn(name) {
   throw new Error(`unterminated ${name}`);
 }
 
-global.esc = (s) => String(s ?? '').replace(/</g, '&lt;');
+global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 global.renderMessageImages = () => '';
 // Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
 // these assertions stay about the timeline, not the message body renderer.
@@ -31,6 +31,7 @@ global.organizationById = () => ({ id: 'org-1' });
 global.currentOrg = () => ({ id: 'org-1' });
 global.globalRoute = () => '/org/settings';
 global.projectRoute = () => '/org/project/settings';
+global.taskUrl = (id) => `/acme/app/tasks/${id}`;
 const preferences = new Map();
 global.localStorage = {
   getItem: (key) => preferences.has(key) ? preferences.get(key) : null,
@@ -51,7 +52,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -104,22 +105,16 @@ liveEntries = conversationEntries(transcript);
 ok(liveEntries.filter((entry) => entry.message?.id === 'u-live').length === 1, 'event and stored transcript copies are de-duplicated');
 
 const linked = renderConversationText('See [app.js](/work/task-1/web/app.js:42) and [docs](https://example.com).', 'agent', S.view);
-ok(linked.includes('href="#"'), 'an agent file link has an inert browser href');
-ok(linked.includes('data-world-file="/work/task-1/web/app.js:42"'), 'an in-world file link is marked for click interception');
-ok(!linked.match(/data-world-file="https:/), 'external links are never treated as world files');
+ok(linked.includes('href="/acme/app/tasks/task-1/file?path=%2Fwork%2Ftask-1%2Fweb%2Fapp.js&amp;line=42"'), 'an agent file link gets a durable task-scoped handoff URL');
+ok(!linked.includes('/file?path=https'), 'external links are never treated as world files');
 ok(worldFileTarget('/work/task-1/web/app.js#L9', S.view.worldPath).line === 9, 'GitHub-style line fragments are parsed');
 ok(worldFileTarget('/other/task/app.js:3', S.view.worldPath) === null, 'absolute paths outside the task world are not intercepted');
 ok(worldFileTarget('/workspace/web/app.js:3', undefined, true).path === '/workspace/web/app.js', 'cloud-world file links are intercepted without leaking the remote root');
 const cloudLinked = renderConversationText('[app.js](/workspace/web/app.js:3)', 'agent', { taskId: 'task-cloud', worldAvailable: true });
-ok(cloudLinked.includes('data-world-file="/workspace/web/app.js:3"'), 'cloud-world file links are prepared for local materialization');
+ok(cloudLinked.includes('/acme/app/tasks/task-cloud/file?path=%2Fworkspace%2Fweb%2Fapp.js&amp;line=3'), 'cloud-world file links keep working when this browser is not on the gateway host');
 const markdownLinked = annotateWorldFileLinks('<p><a href="/work/task-1/web/app.js:42" target="_blank">app.js</a></p>', S.view);
-ok(markdownLinked.includes('href="#"') && markdownLinked.includes('data-world-file="/work/task-1/web/app.js:42"'), 'the default Markdown path also makes file hrefs inert and interceptable');
+ok(markdownLinked.includes('/acme/app/tasks/task-1/file?path=%2Fwork%2Ftask-1%2Fweb%2Fapp.js&amp;line=42'), 'the default Markdown path emits the same durable handoff URL');
 ok(renderConversationText('[app](/work/task-1/app.js)', 'user', S.view).includes('[app]('), 'user-authored Markdown remains literal');
-ok(fileLinksEnabled() === true, 'world file links default on');
-setFileLinksEnabled(false);
-ok(fileLinksEnabled() === false, 'the appearance preference disables world file opening');
-S.user = { id: 'user-2' };
-ok(fileLinksEnabled() === true, 'the appearance preference is scoped to the signed-in user');
 
 // Regression (Task 311): the workflow stamps agent/system replies with a per-array
 // sequence number while user messages carry real epoch-ms timestamps. A reply must

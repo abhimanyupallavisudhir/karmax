@@ -485,9 +485,60 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
    scroll container stops and the inner column unclamps to the full cell —
    tp-head/tp-content re-center their own 960px column against the full-bleed
    head/foot borders. */
-.main:has(.task-page) { overflow: hidden; }
-.main-inner:has(> .task-page) { max-width: none; padding: 0; height: 100%; }
+.main:has(.task-page), .main:has(.task-file-page) { overflow: hidden; }
+.main-inner:has(> .task-page), .main-inner:has(> .task-file-page) { max-width: none; padding: 0; height: 100%; }
 .task-page { display: flex; flex-direction: column; height: 100%; }
+
+/* Agent citations cross a real boundary: provider world → Git handoff → the
+   developer's editor. The rail encodes that transfer; everything else stays
+   deliberately quiet so this page feels like a utility, not a second product. */
+.task-file-page { min-height: 100%; overflow: auto; background: var(--surface); }
+.fh-head { padding: clamp(30px, 7vw, 76px) clamp(24px, 8vw, 104px) 30px; border-bottom: 1px solid var(--line); }
+.fh-back { display: inline-flex; margin-bottom: 42px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
+.fh-back:hover { color: var(--accent); }
+.fh-kicker { display: block; margin-bottom: 10px; color: var(--accent); font: 600 11px/1 var(--font-mono); letter-spacing: .09em; text-transform: uppercase; }
+.fh-head h1 { margin: 0; max-width: 900px; font-size: clamp(32px, 6vw, 68px); line-height: .98; letter-spacing: -.055em; overflow-wrap: anywhere; }
+.fh-head p { margin: 18px 0 0; max-width: 900px; color: var(--ink-2); font: 12px/1.6 var(--font-mono); overflow-wrap: anywhere; }
+.fh-head p span { color: var(--accent); }
+.fh-body { width: min(920px, calc(100% - 48px)); margin: 0 auto; padding: 42px 0 70px; }
+.fh-rail { display: grid; grid-template-columns: auto minmax(24px, 1fr) auto minmax(24px, 1fr) auto; align-items: start; margin-bottom: 30px; }
+.fh-rail > div { display: grid; justify-items: center; gap: 7px; color: var(--ink-3); font: 600 10px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; }
+.fh-rail i { display: grid; place-items: center; width: 27px; height: 27px; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface); font-style: normal; }
+.fh-rail b { height: 1px; margin-top: 13px; background: var(--line-strong); }
+.fh-rail .done, .fh-rail .current { color: var(--ink); }
+.fh-rail .done i { border-color: var(--merged); background: var(--merged); color: #fff; }
+.fh-rail .done + b { background: var(--merged); }
+.fh-rail .current i { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); }
+.fh-panel { border: 1px solid var(--line); border-radius: 14px; background: var(--surface-2); box-shadow: var(--shadow); overflow: hidden; }
+.fh-status { display: flex; gap: 14px; align-items: flex-start; padding: 22px; }
+.fh-status > div { display: grid; gap: 4px; }
+.fh-status span:not(.fh-pulse):not(.fh-mark) { color: var(--ink-2); font-size: 12px; }
+.fh-status .btn { justify-self: start; margin-top: 8px; }
+.fh-status.error { background: var(--danger-weak); }
+.fh-pulse, .fh-mark { flex: none; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-weak); color: var(--accent); font: 700 12px/1 var(--font-mono); }
+.fh-pulse::after { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.fh-status.ready .fh-mark { background: var(--merged-weak); color: var(--merged); }
+.fh-status.error .fh-mark { background: var(--danger); color: white; }
+.fh-command { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 18px 22px; border-top: 1px solid var(--line); background: var(--surface); }
+.fh-command > div:first-child { min-width: 0; display: grid; gap: 4px; }
+.fh-command span { color: var(--ink-3); font: 10px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
+.fh-command code { font: 12px/1.5 var(--font-mono); overflow-wrap: anywhere; }
+.fh-actions { display: flex; flex: none; gap: 8px; }
+.fh-copy { display: inline-flex; align-items: center; gap: 6px; }
+.fh-script { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; max-height: 300px; }
+.fh-footnote { margin: 15px 4px 0; color: var(--ink-3); font-size: 11px; }
+@media (prefers-reduced-motion: no-preference) {
+  .fh-pulse { animation: fh-breathe 1.4s ease-in-out infinite; }
+  @keyframes fh-breathe { 50% { box-shadow: 0 0 0 7px var(--accent-weak); } }
+}
+@media (max-width: 640px) {
+  .fh-head { padding: 24px 20px; }
+  .fh-back { margin-bottom: 30px; }
+  .fh-body { width: calc(100% - 28px); padding-top: 30px; }
+  .fh-rail > div span { font-size: 8px; }
+  .fh-command { align-items: stretch; flex-direction: column; }
+  .fh-actions { flex-wrap: wrap; }
+}
 /* Head, body content and foot all share ONE column: max-width 960 incl. 28px
    side padding, centered — so the title, meta, tabs, section content and the
    action buttons line up on the same left edge (the strips stay full-bleed). */
@@ -773,12 +824,6 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .msg-text.md .md-quote { margin: 0 0 8px; padding: 2px 0 2px 10px; border-left: 3px solid var(--line); opacity: .9; }
 .msg-text.md .md-hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 .msg-text.md a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
-.world-file-link.materializing { cursor: wait; text-decoration-style: dotted; }
-.world-file-link.materializing::after { content: "  Materializing…"; display: inline-block; color: var(--ink-3); font: 10px/1 var(--font-mono); text-decoration: none; }
-@media (prefers-reduced-motion: no-preference) {
-  .world-file-link.materializing::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 4px; border: 1px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: world-file-spin .75s linear infinite; }
-  @keyframes world-file-spin { to { transform: rotate(360deg); } }
-}
 .msg-text.md .md-inline { font-family: var(--font-mono); font-size: .9em; padding: 1px 4px; border-radius: 4px; background: rgba(127, 127, 127, .16); }
 .msg-text.md .md-code { margin: 0 0 8px; padding: 9px 11px; border-radius: 8px; overflow-x: auto; background: rgba(127, 127, 127, .14); }
 .msg-text.md .md-code code { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre; }
