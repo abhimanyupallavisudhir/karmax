@@ -36,7 +36,7 @@ import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabili
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
-import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
+import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -54,14 +54,16 @@ import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
-import { enumerateCredentials } from '../platform/credentials.js';
-import { gatherCredentialSources } from '../platform/credential-sources.js';
+import { enumerateCredentials, resolveCredentials } from '../platform/credentials.js';
+import { gatherCredentialSources, readPolicyLayers } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
   resolveCallerIdentity } from '../platform/identity.js';
+import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
+  requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -167,6 +169,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
+  if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return 'task:conversation:read';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
   if (p.startsWith('/api/authorization') || p.startsWith('/api/audit')) return read ? 'authorization:read' : 'authorization:write';
   if (p.startsWith('/api/accounts') || p.startsWith('/api/git-profiles')) return read ? 'credential:read' : 'credential:write';
@@ -222,6 +225,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/reorder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/explanation-settings$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
@@ -523,9 +527,59 @@ export class Gateway {
       title: task.title, projectId: task.projectId } };
   }
 
-  private emitTaskEvent(event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }): void {
+  private emitTaskEvent(event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }): number {
     const seq = this.deps.store.appendEvent(event);
     this.deps.bus.emit({ ...event, seq });
+    return seq;
+  }
+
+  private explanationSettings(projectId?: string, organizationId?: string): {
+    organizationId: string;
+    organizationOwn: Partial<ExplanationSettings>;
+    projectOwn: Partial<ExplanationSettings>;
+    inherited: ExplanationSettings;
+    effective: ExplanationSettings;
+  } {
+    const project = projectId ? this.deps.store.getProject(projectId) : undefined;
+    const orgId = project?.organizationId ?? organizationId ?? 'org_personal';
+    const organizationOwn = (this.deps.store.getSettings(`organization:${orgId}`, 'explanation')
+      ?? (orgId === 'org_personal' ? this.deps.store.getSettings('global', 'explanation') : undefined)
+      ?? {}) as Partial<ExplanationSettings>;
+    const projectOwn = ((projectId ? this.deps.store.getSettings(projectId, 'explanation') : undefined)
+      ?? {}) as Partial<ExplanationSettings>;
+    const inherited = normalizeExplanationSettings(organizationOwn, DEFAULT_EXPLANATION_SETTINGS);
+    const effective = normalizeExplanationSettings(projectOwn, inherited);
+    return { organizationId: orgId, organizationOwn, projectOwn, inherited, effective };
+  }
+
+  private explanationSettingsOwn(value: unknown, fallback: ExplanationSettings): Partial<ExplanationSettings> {
+    const body = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const own: Partial<ExplanationSettings> = {};
+    for (const key of ['endpoint', 'model', 'prompt'] as const) {
+      if (typeof body[key] === 'string' && body[key].trim()) own[key] = body[key].trim();
+    }
+    // Validate the partial overlay in its inherited context before persisting it.
+    normalizeExplanationSettings(own, fallback);
+    return own;
+  }
+
+  private explanationApiKey(provider: string, organizationId: string, projectId: string, taskId: string): string | undefined {
+    const aliases = credentialAliases(provider);
+    const keys = enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    })).filter((credential) => credential.kind === 'key');
+    const ordered = resolveCredentials(keys, readPolicyLayers(
+      (key) => this.deps.store.kvGet(key), { organizationId, projectId, taskId },
+    ));
+    const credential = ordered.find((candidate) => aliases.includes(candidate.provider));
+    if (!credential) return undefined;
+    if (credential.apiKeyHandle) {
+      if (!this.deps.broker) return undefined;
+      return this.deps.broker.resolve(credential.apiKeyHandle, { taskId, caps: ['use-credential:*'] });
+    }
+    return process.env[apiKeyEnv(credential.provider)];
   }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
@@ -3629,6 +3683,74 @@ export class Gateway {
       if (agentsMatch && method === 'GET') return this.json(res, 200, await api.listTaskAgents(token, agentsMatch[1]!));
       const conversationMatch = p.match(/^\/api\/tasks\/([^/]+)\/conversation$/);
       if (conversationMatch && method === 'GET') return this.json(res, 200, await api.taskConversation(token, conversationMatch[1]!, url.searchParams.get('role') ?? 'do'));
+      const explanationMatch = p.match(/^\/api\/tasks\/([^/]+)\/explanations$/);
+      if (explanationMatch) {
+        const taskId = explanationMatch[1]!;
+        const task = store.getTask(taskId);
+        if (!task) return this.json(res, 404, { error: 'task not found' });
+        if (method === 'GET') return this.json(res, 200, store.eventsOfType(taskId, 'conversation.explanation'));
+        if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        requireInteractiveHuman(callerIdentity);
+        const project = store.getProject(task.projectId);
+        if (!project) return this.json(res, 404, { error: 'task project not found' });
+        const body = await this.body(req);
+        const role = typeof body.role === 'string' && /^[a-z0-9_-]+$/i.test(body.role) ? body.role : 'do';
+        const sourceKey = typeof body.sourceKey === 'string' ? body.sourceKey.slice(0, 500) : '';
+        const conversation = await api.taskConversation(token, taskId, role);
+        let message: string | undefined;
+        let userContext: string[] = [];
+        if (sourceKey.startsWith('message:')) {
+          const id = sourceKey.slice('message:'.length);
+          const index = conversation.messages.findIndex((item) => item.id === id && item.role === 'agent');
+          if (index >= 0) {
+            message = conversation.messages[index]!.text;
+            userContext = conversation.messages.slice(0, index)
+              .filter((item) => item.role === 'user').map((item) => item.text);
+          }
+        } else if (sourceKey.startsWith('activity:')) {
+          const seq = Number(sourceKey.slice('activity:'.length));
+          const candidate = Number.isSafeInteger(seq) ? store.eventBySeq(taskId, seq) : undefined;
+          const event = candidate?.type === 'agent.activity' && candidate.payload?.role === role
+            && candidate.payload?.kind === 'message' ? candidate : undefined;
+          if (event) {
+            message = String(event.payload.title ?? '');
+            userContext = conversation.messages.filter((item) => item.role === 'user'
+              && (!Number(item.ts) || Number(item.ts) <= Number(event.ts))).map((item) => item.text);
+          }
+        }
+        if (!message?.trim()) return this.json(res, 404, { error: 'agent message not found' });
+        if (message.length > 500_000) return this.json(res, 400, { error: 'agent message is too long to explain' });
+        let totalContext = 0;
+        userContext = userContext.slice(-100).reverse().filter((text) => {
+          if (totalContext + text.length > 500_000) return false;
+          totalContext += text.length;
+          return true;
+        }).reverse();
+        let settings: ExplanationSettings;
+        try {
+          const defaults = this.explanationSettings(project.id).effective;
+          settings = normalizeExplanationSettings(body.settings, defaults);
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        const provider = explanationProvider(settings.endpoint);
+        const apiKey = this.explanationApiKey(provider, project.organizationId ?? 'org_personal', project.id, taskId);
+        if (!apiKey) return this.json(res, 400, {
+          error: `API key for ${provider} not found`,
+          code: 'explanation_api_key_missing',
+          provider,
+        });
+        try {
+          const explanation = await requestExplanation({ settings, apiKey, message, userContext });
+          const event = { taskId, type: 'conversation.explanation', ts: Date.now(), payload: {
+            role, sourceKey, text: explanation, provider, model: settings.model,
+          } };
+          const seq = this.emitTaskEvent(event);
+          return this.json(res, 200, { ...event, seq });
+        } catch (error) {
+          return this.json(res, 502, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const forkAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/fork-agent$/);
       if (forkAgentMatch && method === 'POST') {
         const b = await this.body(req);
@@ -5035,6 +5157,44 @@ export class Gateway {
         return this.json(res, 200, api.eventCatalog());
       }
 
+      // A small model call outside task workflows: explanations are presentation
+      // annotations, so their defaults inherit organization → project without
+      // becoming workflow params or agent-session input.
+      const organizationExplanation = p.match(/^\/api\/organizations\/([^/]+)\/explanation-settings$/);
+      if (organizationExplanation) {
+        const organizationId = organizationExplanation[1]!;
+        const settings = this.explanationSettings(undefined, organizationId);
+        if (method === 'GET') return this.json(res, 200, {
+          own: settings.organizationOwn,
+          inherited: DEFAULT_EXPLANATION_SETTINGS,
+          effective: settings.inherited,
+        });
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          const own = this.explanationSettingsOwn(body.values, DEFAULT_EXPLANATION_SETTINGS);
+          store.setSettings(`organization:${organizationId}`, 'explanation', own);
+          return this.json(res, 200, { own, effective: normalizeExplanationSettings(own) });
+        }
+      }
+      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
+      if (projectExplanation) {
+        const projectId = projectExplanation[1]!;
+        const project = store.getProject(projectId);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        const settings = this.explanationSettings(projectId);
+        if (method === 'GET') return this.json(res, 200, {
+          own: settings.projectOwn,
+          inherited: settings.inherited,
+          effective: settings.effective,
+        });
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          const own = this.explanationSettingsOwn(body.values, settings.inherited);
+          store.setSettings(projectId, 'explanation', own);
+          return this.json(res, 200, { own, effective: normalizeExplanationSettings(own, settings.inherited) });
+        }
+      }
+
       // resolved/inherited defaults per scope — drives form placeholders (SPEC §10.4)
       const defs = p.match(/^\/api\/defaults\/([^/]+)\/([^/]+)$/);
       if (defs && method === 'GET') {
@@ -5508,7 +5668,7 @@ export class Gateway {
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
-      if ((f.type !== 'agent' && f.type !== 'confirmer') || !f.role) continue;
+      if ((f.type !== 'agent' && f.type !== 'confirmer' && f.type !== 'responder') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
@@ -5533,6 +5693,21 @@ export class Gateway {
             }),
             agentDefault: agent,
           }
+        : f.type === 'responder'
+          ? spec.kind === 'agent'
+            ? {
+                ...spec,
+                kind: 'agent',
+                provider: spec.provider ?? prof?.provider ?? defaultProvider().provider,
+                model: spec.model ?? prof?.model ?? defaultModel(spec.provider ?? prof?.provider ?? defaultProvider().provider),
+                effort: spec.effort ?? prof?.effort ?? defaultEffort(spec.provider ?? prof?.provider ?? defaultProvider().provider),
+                agentDefault: agent,
+              }
+            : {
+                kind: 'human',
+                audience: spec.audience?.length ? spec.audience : ['@creator'],
+                agentDefault: agent,
+              }
         : agent;
     }
     return out;

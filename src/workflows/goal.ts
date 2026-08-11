@@ -23,6 +23,7 @@ import {
   softwareDevV1_21,
   softwareDevV1_22,
   softwareDevV1_23,
+  softwareDevV1_24,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -149,6 +150,11 @@ export async function goalV1_22(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** GitHub-authoritative PR state after cancellation and external changes. */
 export async function goalV1_23(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_23({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Configurable single-stage Responder for ordinary input pauses. */
+export async function goalV1_24(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_24({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

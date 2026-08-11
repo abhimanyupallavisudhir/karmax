@@ -13,6 +13,7 @@ export type {
   AgentRole,
   AgentSpec,
   ConfirmConfig,
+  ResponderConfig,
   ConfirmLayer,
   ConfirmMode,
   ConfirmDecision,

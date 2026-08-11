@@ -55,6 +55,7 @@ function extractConst(name) {
     subtask: 'Waiting for sub-tasks',
     collaboration: 'Waiting for collaborator',
     confirm: 'Waiting for review',
+    responder: 'Waiting for responder',
     human: 'Waiting for input',
   };
   for (const kind of Object.keys(concise)) {

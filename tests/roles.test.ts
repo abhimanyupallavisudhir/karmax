@@ -13,12 +13,14 @@ const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude',
 describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', () => {
   it('aggregates declared roles across the bundled workflows, tracking who uses each', () => {
     const roles = Object.fromEntries(allRoles().map((r) => [r.name, r]));
-    expect(Object.keys(roles).sort()).toEqual(['confirm', 'do']);
+    expect(Object.keys(roles).sort()).toEqual(['confirm', 'do', 'responder']);
     expect(roles.do!.label).toBe('Agent');
     expect(roles.do!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal', 'merge-only']));
     // every workflow with a Review gate declares the confirm role (agent confirm layers)
     expect(roles.confirm!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal', 'merge-only']));
     expect(roles.confirm!.capabilities).toContain('confirm-decision');
+    expect(roles.responder!.workflows).toEqual(expect.arrayContaining(['software-dev', 'goal']));
+    expect(roles.responder!.capabilities).not.toContain('confirm-decision');
   });
 
   it('exposes each role its declared prompt template + capability ceiling', () => {
@@ -45,7 +47,7 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
 
   it('seeds one default profile per declared role, with no copy of the role ceiling', () => {
     const profiles = makeDefaultProfiles('claude');
-    expect(profiles.map((p) => p.id).sort()).toEqual(['confirm-default', 'do-default']);
+    expect(profiles.map((p) => p.id).sort()).toEqual(['confirm-default', 'do-default', 'responder-default']);
     expect(profiles.find((p) => p.id === 'do-default')!.model).toBeTruthy(); // provider/model resolved at seed time
     // The ceiling is the role contract, resolved from the manifest at turn time —
     // seeding a copy is what let it go stale (and what the dead settings field edited).

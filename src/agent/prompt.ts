@@ -84,7 +84,12 @@ export function assemblePrompt(args: AssembleArgs): string {
     args.profile.promptTemplate ?? agentRoleDef(args.role)?.promptTemplate ?? agentRoleDef('do')?.promptTemplate ?? FALLBACK_TEMPLATE;
   const instructions = [args.globalInstructions, args.projectInstructions].filter(Boolean).join('\n\n');
   // A workflow may override the platform tools-preamble for its agents (SPEC §5.4).
-  const preamble = (args.task.workflow && manifest(args.task.workflow)?.promptPreamble) || TOOLS_PREAMBLE;
+  let preamble = (args.task.workflow && manifest(args.task.workflow)?.promptPreamble) || TOOLS_PREAMBLE;
+  if (args.role === 'do' && args.task.responder?.kind === 'agent') {
+    preamble += `
+
+Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; karmax will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only when the requested input is inherently human-only (for example an approval, secret, or irreversible personal decision).`;
+  }
   const values: Record<string, string> = {
     toolsPreamble: preamble,
     title: args.task.title,

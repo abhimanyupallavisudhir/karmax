@@ -143,6 +143,32 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
     expect(auto.confirm).toEqual({ layers: [] });
   });
 
+  it('carries the single human or agent Responder into workflow input', () => {
+    const human = assembleTaskInput(sd, {
+      prompt: 'build X', responder: { kind: 'human', audience: ['@team:leaders'] },
+    }, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    expect(human.responder).toEqual({ kind: 'human', audience: ['@team:leaders'] });
+
+    const agent = assembleTaskInput(sd, {
+      prompt: 'build X',
+      responder: { kind: 'agent', provider: 'mock', model: 'answerer', effort: 'low', prompt: 'Answer {{question}}' },
+    }, { taskId: 't2', projectId: 'p1', title: 'X', project: {} });
+    expect(agent.responder).toEqual({
+      kind: 'agent', provider: 'mock', model: 'answerer', effort: 'low', prompt: 'Answer {{question}}',
+    });
+  });
+
+  it('declares one inherited Responder on task, project, and global forms', () => {
+    for (const name of ['software-dev', 'goal']) {
+      const field = manifest(name)!.params.find((candidate) => candidate.name === 'responder');
+      expect(field).toMatchObject({
+        type: 'responder', bind: 'responder', role: 'responder',
+        scopes: ['task', 'project', 'global'],
+        default: { kind: 'human', audience: ['@creator'] },
+      });
+    }
+  });
+
   // The Review route is consumed by the gate it drives, not by queueing (SPEC §4.5/§5.5).
   // Its window has to reach the workflow, or the update validator has nothing to enforce.
   it('carries the Review route as an `untilUsed` window, on every workflow that has one', () => {

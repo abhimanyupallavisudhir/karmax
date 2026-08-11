@@ -90,6 +90,32 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(invalid.status).toBe(400);
   });
 
+  it('inherits explanation defaults from organization to project', async () => {
+    const project = h.store.createProject('Explanation defaults');
+    const organizationId = project.organizationId ?? 'org_personal';
+    const initial: any = await (await fetch(`${base}/api/projects/${project.id}/explanation-settings`, { headers: auth() })).json();
+    expect(initial.effective).toMatchObject({
+      endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'google/gemini-3.6-flash',
+    });
+
+    const organizationSave = await fetch(`${base}/api/organizations/${organizationId}/explanation-settings`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { model: 'google/gemini-custom' } }),
+    });
+    expect(organizationSave.status).toBe(200);
+    const inherited: any = await (await fetch(`${base}/api/projects/${project.id}/explanation-settings`, { headers: auth() })).json();
+    expect(inherited.own).toEqual({});
+    expect(inherited.effective.model).toBe('google/gemini-custom');
+
+    const projectSave = await fetch(`${base}/api/projects/${project.id}/explanation-settings`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { model: 'anthropic/claude-haiku' } }),
+    });
+    expect(projectSave.status).toBe(200);
+    const overridden: any = await projectSave.json();
+    expect(overridden.effective.model).toBe('anthropic/claude-haiku');
+    expect(overridden.effective.endpoint).toBe('https://openrouter.ai/api/v1/chat/completions');
+  });
+
   it('serves brand assets resolved against the instance-wide icon setting', async () => {
     const asset = (p: string) => fetch(`${base}${p}`); // deliberately unauthenticated: the sign-in screen needs these
     const bytes = async (p: string) => Buffer.from(await (await asset(p)).arrayBuffer());

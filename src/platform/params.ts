@@ -1,4 +1,4 @@
-import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ProjectConfig, Project } from '../domain/types.js';
+import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ResponderConfig, ProjectConfig, Project } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
@@ -184,6 +184,22 @@ export function assembleTaskInput(
               : { kind: l.kind, audience: l.audience?.length ? [...l.audience] : ['@creator'] },
           );
           input.confirm = { layers };
+        }
+        break;
+      }
+      case 'responder': {
+        if (v && typeof v === 'object') {
+          const route = v as ResponderConfig;
+          input.responder = route.kind === 'agent'
+            ? {
+                kind: 'agent',
+                ...(route.provider ? { provider: route.provider } : {}),
+                ...(route.model ? { model: route.model } : {}),
+                ...(route.effort ? { effort: route.effort } : {}),
+                ...(route.resumeFrom ? { resumeFrom: route.resumeFrom } : {}),
+                ...(route.prompt?.trim() ? { prompt: route.prompt } : {}),
+              }
+            : { kind: 'human', audience: route.audience?.length ? [...route.audience] : ['@creator'] };
         }
         break;
       }

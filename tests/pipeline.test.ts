@@ -603,6 +603,34 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:c.txt'])).stdout).toContain('custom');
   });
 
+  it('agent Responder answers an ordinary input pause and returns control to Do', async () => {
+    const repo = await h.makeRepo('responder-agent');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.24.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'AgentResponder', prompt: 'Start the work.\n@write response.txt :: resumed\n@incomplete' }),
+          responder: { kind: 'agent', provider: 'mock', prompt: 'Answer the working agent now.' },
+          confirm: { layers: [] },
+        },
+      ],
+    });
+
+    // No human follow-up: the responder's output becomes a user message for the
+    // existing Do conversation, which resumes and opens the proposal itself.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:response.txt'])).stdout).toContain('resumed');
+    const v = await view(handle);
+    const responder = v.transcripts?.find((transcript: any) => transcript.role === 'responder');
+    expect(responder?.messages.some((message: any) => message.role === 'user'
+      && message.text.includes('Answer the working agent now.'))).toBe(true);
+    expect(v.messages.some((message: any) => message.role === 'user'
+      && message.text.startsWith('Responder:'))).toBe(true);
+  });
+
   it('confirm layers: an agent review layer, then a final human confirmation (SPEC §5.2)', async () => {
     const repo = await h.makeRepo('confirm-layers');
     const taskId = newId('task');

@@ -25,6 +25,7 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize',
       'POST /api/organizations/:organizationId/payments/connect',
       'POST /api/vault/items/:itemId/reveal',
+      'POST /api/tasks/:taskId/explanations',
     ],
   },
   resources: ['GET /api/resource-drivers'],
@@ -67,6 +68,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/organizations/:organizationId/teams/:teamId/members/:userId',
     'GET|PUT /api/organizations/:organizationId/settings/:workflow',
     'GET|PUT /api/organizations/:organizationId/quick-settings/:workflow',
+    'GET|PUT /api/organizations/:organizationId/explanation-settings',
   ],
   sourceControl: [
     'GET|PUT /api/projects/:projectId/repository-sources',
@@ -114,6 +116,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
     'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
     'GET /api/tasks/:taskId/events?since=', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent)',
+    'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})',
   ],
   review: [
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
@@ -133,6 +136,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/profiles', 'DELETE /api/profiles/:id',
     'GET /api/models|schema|events/catalog|contributions', 'GET /api/defaults/:projectId/:workflow',
     'GET|PUT /api/settings/global/:workflow', 'GET|PUT /api/settings/project/:projectId/:workflow',
+    'GET|PUT /api/projects/:projectId/explanation-settings',
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
     'POST /api/skills', 'POST /api/safe-mode',
   ],
