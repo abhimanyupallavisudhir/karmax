@@ -768,6 +768,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
   }
 
+  /** Count task commits without assuming a cloud/restored checkout has a local
+   * copy of the protected branch. Restored worlds check out the task branch
+   * directly, so the target commonly exists only as origin/<target>. Keep the
+   * configured name for the GitHub PR; this fallback is only for local Git
+   * comparison. */
+  async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
+    const local = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+    if (local.code === 0 || base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
+    const remoteBase = `refs/remotes/origin/${base}`;
+    const remote = await world.exec('git', ['rev-list', '--count', `${remoteBase}..${repo.branch}`], { cwd: repo.root });
+    return remote.code === 0 ? remote : local;
+  }
+
   function brokerAuthFor(handle: WorldHandle, taskId?: string): GitBrokerAuth {
     const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
     const project = projectId ? store.getProject(projectId) : undefined;
@@ -2451,7 +2464,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const changedWithoutPr: string[] = [];
         for (const repo of repos.filter((candidate) => !githubCheckoutNames.has(candidate.name))) {
           const base = worldRepoTarget(repo, target);
-          const ahead = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+          const ahead = await commitsAheadOfPrBase(world, repo, base);
           if (ahead.code !== 0) {
             throw new Error(`could not verify non-GitHub checkout "${repo.name}" before opening the multi-repository proposal:`
               + ` ${ahead.stderr || ahead.stdout || 'git rev-list failed'}`);
@@ -2479,7 +2492,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // (PLAN-git-config.md §6 loops that back to the merge agent), so arriving
         // here with nothing committed is a state the design produces. GitHub
         // answers it with an opaque 422 — diagnose it ourselves instead.
-        const ahead = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
+        const ahead = await commitsAheadOfPrBase(world, repo, base);
         if (ahead.code !== 0) {
           throw new Error(`could not compare branch "${repo.branch}" of repo "${repo.name}" with "${base}":`
             + ` ${ahead.stderr || ahead.stdout || 'git rev-list failed'}`);
