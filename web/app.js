@@ -1728,8 +1728,9 @@ function wireMessageCopies(root = document) {
 // A compact, dependency-free Markdown renderer. It escapes first (untrusted
 // agent/user text), then applies a small, common subset: fenced + inline code,
 // headings, lists, blockquotes, rules, bold/italic/strike, links, and — when
-// math is on — $…$ / $$…$$ spans left intact for MathJax to typeset. Code and
-// math are stashed up front so inline formatting can't corrupt their contents;
+// math is on — $…$ / $$…$$ and \(…\) / \[…\] spans left intact for MathJax to
+// typeset. Code and math are stashed up front so inline formatting can't
+// corrupt their contents;
 // the single stash is restored once at the end (nested blocks recurse through
 // mdBlocks, never renderMarkdown, so indices never clash).
 function renderMarkdown(src, opts = {}) {
@@ -1743,8 +1744,10 @@ function renderMarkdown(src, opts = {}) {
   s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
     `\n${keep(`<pre class="md-code"><code>${esc(body.replace(/\n$/, ''))}</code></pre>`)}\n`);
   if (withMath) s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, body) => keep(`<span class="md-math">$$${esc(body)}$$</span>`));
+  if (withMath) s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_, body) => keep(`<span class="md-math">\\[${esc(body)}\\]</span>`));
   s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
   if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
+  if (withMath) s = s.replace(/\\\(([^\n]+?)\\\)/g, (_, body) => keep(`<span class="md-math">\\(${esc(body)}\\)</span>`));
   let html = mdBlocks(s, stash);
   html = html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
   return sanitizeMarkdownHtml(html, source);

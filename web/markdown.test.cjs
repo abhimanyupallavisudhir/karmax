@@ -136,6 +136,14 @@ const withMath = renderMarkdown('inline $a_b=c^2$ and $$x+y$$', { math: true });
 ok(withMath.includes('<span class="md-math">$a_b=c^2$</span>'), 'inline math span preserved raw');
 ok(withMath.includes('<span class="md-math">$$x+y$$</span>'), 'display math span preserved raw');
 ok(!withMath.includes('<em>'), 'underscores inside math are not italicised');
+const withTexDelimiters = renderMarkdown(
+  'Here \\(q_i\\) is reported.\n\n\\[\nV(q)=\\min_{r\\in\\operatorname{conv}(\\Omega)}\n\\sum_i D_{\\mathrm{KL}}\\!\\left(\\operatorname{Ber}(r_i)\\,\\middle\\|\\,\\operatorname{Ber}(q_i)\\right).\n\\]',
+  { math: true },
+);
+ok(withTexDelimiters.includes('<span class="md-math">\\(q_i\\)</span>'), 'TeX inline delimiters preserved raw');
+ok(withTexDelimiters.includes('<span class="md-math">\\[\nV(q)=\\min_'), 'TeX display delimiters preserved raw');
+ok(withTexDelimiters.includes('\\operatorname{conv}(\\Omega)') && withTexDelimiters.includes('\\middle\\|'), 'TeX commands survive Markdown rendering');
+ok(!withTexDelimiters.includes('<em>'), 'underscores inside TeX-delimited math are not italicised');
 const noMath = renderMarkdown('cost $5 and $10 today', { math: false });
 ok(noMath.includes('cost $5 and $10 today'), 'currency $ untouched when math is off');
 
