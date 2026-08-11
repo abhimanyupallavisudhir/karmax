@@ -123,7 +123,7 @@ describe('profile + account management settings backend', () => {
 
   it('exposes one shared Agent profile and retires the Merge profile API', async () => {
     const list = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
-    const operational = list.filter((p: any) => p.role !== 'confirm');
+    const operational = list.filter((p: any) => p.role !== 'confirm' && p.role !== 'responder');
     expect(operational).toHaveLength(1);
     expect(operational[0]).toMatchObject({ role: 'do', name: 'Agent' });
     expect(operational[0].roleWorkflows).toEqual(expect.arrayContaining(['software-dev', 'goal', 'merge-only']));

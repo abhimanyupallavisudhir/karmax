@@ -107,6 +107,10 @@ describe('waiting labels in task summaries', () => {
       kind: 'human',
       detail: 'A long internal explanation of the decision needed',
     })).toBe('Waiting for input');
+    expect(waitingText({
+      kind: 'responder',
+      detail: 'The response agent is answering the working agent',
+    })).toBe('Waiting for responder');
   });
 
   it('retains the concrete question for a targeted human hold', () => {

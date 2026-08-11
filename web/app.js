@@ -754,6 +754,7 @@ function renderField(f, own, inherited, withChips, alt) {
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}${altAttr}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
+  if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
     // The prompt field (withChips) also carries the wiki-reference affordance, so its
     // placeholder advertises both image paste and wiki tagging.
@@ -952,6 +953,62 @@ function readConfirmerLayers(box) {
   });
 }
 
+// The Responder uses the same human/agent row as Review, but it is deliberately
+// singular: every ordinary input question has exactly one route and no approval
+// chain or auto-pass state.
+function responderOf(v) {
+  if (v?.kind === 'agent') return v;
+  return { kind: 'human', audience: v?.audience?.length ? v.audience : ['@creator'] };
+}
+function normResponder(route) {
+  return route?.kind === 'agent'
+    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: route.prompt || '', resume: route.resumeFrom || null }
+    : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
+}
+function renderResponderField(f, own, inherited, alt) {
+  const inh = inherited || {};
+  const route = responderOf(own || inh);
+  const isAgent = route.kind === 'agent';
+  const agentDefault = inh.agentDefault || {};
+  const audience = (route.audience?.length ? route.audience : ['@creator']).join(', ');
+  const promptVal = (isAgent ? route.prompt ?? f.promptDefault : f.promptDefault) || '';
+  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
+  return `<div class="responder-field" data-responder="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+    <div class="cf-layer" data-kind="${esc(route.kind)}">
+      <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
+        <select class="cf-kind rf-kind"><option value="human" ${isAgent ? '' : 'selected'}>Human responds</option><option value="agent" ${isAgent ? 'selected' : ''}>Agent responds</option></select>
+      </div>
+      <div class="cf-human rf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
+        <label class="form-row">Who responds<input class="cf-audience rf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" /></label>
+        <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+        <div class="task-sub">Comma-separated. Any selected person may answer this single input step.</div>
+      </div>
+      <div class="cf-agent rf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? route : agentDefault, isAgent ? {} : agentDefault)}
+        <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Response prompt — sent whenever the task waits for input. Type [[ to add wiki context. Placeholders: {{title}}, {{prompt}}, {{question}}, {{transcript}}.</div>
+        <textarea class="cf-prompt rf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
+      </div>
+    </div>
+  </div>`;
+}
+function readResponder(box) {
+  if (box.querySelector('.rf-kind')?.value !== 'agent') {
+    const audience = (box.querySelector('.rf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
+    return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
+  }
+  const ab = box.querySelector('.agent-field');
+  const route = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
+  const model = ab.querySelector('.af-model').value.trim();
+  const effort = ab.querySelector('.af-effort').value;
+  if (model) route.model = model;
+  if (effort) route.effort = effort;
+  const resumeFrom = readResume(ab);
+  if (resumeFrom) route.resumeFrom = resumeFrom;
+  const prompt = box.querySelector('.rf-prompt')?.value ?? '';
+  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
+  if (prompt.trim() !== '' && prompt !== promptDefault) route.prompt = prompt;
+  return route;
+}
+
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
   const out = {};
@@ -979,6 +1036,14 @@ function collectForm(root, fields) {
       // Store only when the layer list differs from the inherited default (layers
       // are stored atomically — inherited prompts/specs are carried by value).
       if (f.required || !sameJson(normLayers(layers), normLayers(cfLayersOf(inh)))) out[f.name] = { layers };
+      continue;
+    }
+    if (f.type === 'responder') {
+      const box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+      const route = readResponder(box);
+      if (f.required || !sameJson(normResponder(route), normResponder(responderOf(inh)))) out[f.name] = route;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -1295,6 +1360,7 @@ function wireAgentBox(box) {
 function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach(wireAgentBox);
   root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
+  root.querySelectorAll('.responder-field').forEach(wireResponderField);
 }
 
 // Renumber the layer rows and toggle the "auto-confirm" empty state.
@@ -1368,6 +1434,19 @@ function wireConfirmerField(box) {
   cfSync(box);
 }
 
+function wireResponderField(box) {
+  box.querySelector('.rf-kind')?.addEventListener('change', (event) => {
+    const isAgent = event.target.value === 'agent';
+    const agent = box.querySelector('.rf-agent');
+    const human = box.querySelector('.rf-human');
+    if (agent) agent.style.display = isAgent ? '' : 'none';
+    if (human) human.style.display = isAgent ? 'none' : '';
+  });
+  if (typeof wireWikiMention === 'function') {
+    box.querySelectorAll('.rf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
+  }
+}
+
 // Wire per-field "Reset to default" buttons: show the button whenever the field
 // diverges from its inherited default, and on click restore the inherited value
 // so the field goes back to inheriting (collectForm then stores no override).
@@ -1382,6 +1461,7 @@ function wireFieldResets(root, fields) {
     let el = null;
     if (f.type === 'agent') box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
     else if (f.type === 'confirmer') box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+    else if (f.type === 'responder') box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
     else el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
     const target = box || el;
     if (!target) continue;
@@ -1394,6 +1474,7 @@ function wireFieldResets(root, fields) {
       btn.addEventListener('click', () => {
         if (f.type === 'agent') resetAgentField(box, attr);
         else if (f.type === 'confirmer') resetConfirmerField(box, attr);
+        else if (f.type === 'responder') resetResponderField(box, attr);
         else resetPlainField(el, f, attr);
         sync();
       });
@@ -1421,6 +1502,12 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     return !sameJson(normLayers(readConfirmerLayers(box)), normLayers(cfLayersOf(inh)));
+  }
+  if (f.type === 'responder') {
+    const box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
+    if (!box) return false;
+    const inh = JSON.parse(box.getAttribute(attr) || 'null');
+    return !sameJson(normResponder(readResponder(box)), normResponder(responderOf(inh)));
   }
   const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
   if (!el) return false;
@@ -1467,6 +1554,19 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   // This composite control is rebuilt rather than assigned through an input.
   // Emit the same event as a user edit so draft auto-save persists the reset;
   // otherwise the UI can show @creator while the last partial value remains saved.
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function resetResponderField(box, attr = 'data-inherit') {
+  const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
+  const f = { role: box.getAttribute('data-responder'), name: box.getAttribute('data-responder'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
+  const replacement = document.createElement('template');
+  replacement.innerHTML = renderResponderField(f, responderOf(inh), { ...inh, agentDefault });
+  const fresh = replacement.content.firstElementChild;
+  box.innerHTML = fresh.innerHTML;
+  box.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  wireResponderField(box);
   box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
@@ -3094,10 +3194,10 @@ function viewsBar() {
 
 // Workflow params are searchable/organizable too, via synthetic fields the server
 // resolves on demand (src/domain/search.ts — keep this list of skipped types in step
-// with what fieldByKey understands). Scalar params become `param.<name>`; agent/confirmer
+// with what fieldByKey understands). Scalar params become `param.<name>`; agent/confirmer/responder
 // params expand into three model sub-fields each — `agent_<role>.agent` (provider),
 // `.model`, `.effort` — so you can filter/group/sort by the model an agent ran on.
-const PARAM_SCALAR_SKIP = new Set(['agent', 'confirmer', 'prompt', 'list']);
+const PARAM_SCALAR_SKIP = new Set(['agent', 'confirmer', 'responder', 'prompt', 'list']);
 const PARAM_NAME_SKIP = new Set(['repos', 'prompt']);
 const AGENT_SUBFIELDS = [
   { sub: 'agent', label: 'agent' },
@@ -3109,7 +3209,7 @@ function paramMenuFields() {
   for (const s of S.schema || []) {
     for (const p of s.params || []) {
       if (PARAM_NAME_SKIP.has(p.name)) continue;
-      if (p.type === 'agent' || p.type === 'confirmer') {
+      if (p.type === 'agent' || p.type === 'confirmer' || p.type === 'responder') {
         for (const { sub, label } of AGENT_SUBFIELDS) {
           const key = `agent_${p.name}.${sub}`;
           if (!seen.has(key)) seen.set(key, { key, label: `${p.label || p.name} · ${label}`, type: 'text', param: true });
@@ -7113,6 +7213,7 @@ function waitingLabel(w) {
     case 'shell': return 'command';
     case 'parent': return 'parent';
     case 'confirm': return 'review';
+    case 'responder': return 'responder';
     default: return 'progress';
   }
 }
@@ -7499,6 +7600,12 @@ function displayParam(f, val) {
     const layers = cfLayersOf(val);
     if (!layers.length) return 'auto-confirm';
     return layers.map((l) => (l.kind === 'agent' ? `agent (${[l.provider, l.model].filter(Boolean).join(' · ') || 'default'})` : 'human')).join(' → ');
+  }
+  if (f.type === 'responder') {
+    const route = responderOf(val);
+    return route.kind === 'agent'
+      ? `agent (${[route.provider, route.model].filter(Boolean).join(' · ') || 'default'})`
+      : `human (${(route.audience || ['@creator']).join(', ')})`;
   }
   if (Array.isArray(val)) return val.join(', ') || '(none)';
   if (typeof val === 'boolean') return val ? 'on' : 'off';
@@ -8453,7 +8560,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the task agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -11616,8 +11723,8 @@ function profileRow(p, scope) {
 
 // Render + wire the shared operational Agent editor for an organization or
 // project. All coding workflows, including Merge-only, resolve this one profile.
-// The standing Confirm-agent profile is not shown: review agents are configured
-// per layer in the Review route, right below the agents they gate.
+// Standing Confirm/Responder profiles are not shown: those agents are configured
+// directly in their Review route / Responder controls.
 async function hydrateProfiles(scope, projectId, organizationId) {
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
@@ -11627,7 +11734,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
     : `?organizationId=${encodeURIComponent(organizationId)}`;
   try { profiles = await api(`/api/profiles${query}`); } catch {}
   if (!renderIsCurrent()) return;
-  profiles = profiles.filter((p) => p.role !== 'confirm');
+  profiles = profiles.filter((p) => p.role !== 'confirm' && p.role !== 'responder');
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
     : profiles.map((p) => profileRow(p, scope)).join('');
   list.querySelectorAll('[data-profile]').forEach((card) => {
