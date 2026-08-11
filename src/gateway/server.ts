@@ -1688,7 +1688,16 @@ export class Gateway {
       if (gitConnections) {
         const organizationId = gitConnections[1]!;
         const connectionId = gitConnections[2] ? decodeURIComponent(gitConnections[2]) : undefined;
-        if (method === 'GET' && !connectionId) return this.json(res, 200, store.listGitConnections(organizationId));
+        if (method === 'GET' && !connectionId) {
+          const connections = store.listGitConnections(organizationId);
+          if (!this.deps.githubApp) return this.json(res, 200, connections);
+          return this.json(res, 200, await Promise.all(connections.map(async (connection) => ({
+            ...connection,
+            workflowPermission: await this.deps.githubApp!.workflowPermissionStatus(connection)
+              .catch((error) => ({ ready: false, unavailable: true,
+                error: error instanceof Error ? error.message : String(error) })),
+          }))));
+        }
         if (method === 'POST' && !connectionId) {
           const b = await this.body(req);
           if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
@@ -1727,7 +1736,15 @@ export class Gateway {
       const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
       if (githubAppSetup) {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
-        if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(callerIdentity.humanSubject?.userId));
+        if (method === 'GET') {
+          const status = this.deps.githubApp.status(callerIdentity.humanSubject?.userId);
+          const workflowPermission = status.configured
+            ? await this.deps.githubApp.workflowPermissionStatus()
+              .catch((error) => ({ ready: false, unavailable: true,
+                error: error instanceof Error ? error.message : String(error) }))
+            : undefined;
+          return this.json(res, 200, { ...status, ...(workflowPermission ? { workflowPermission } : {}) });
+        }
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'settings:write').ok)
             return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });

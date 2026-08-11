@@ -74,3 +74,15 @@ describe('GitHub merge authorization UX', () => {
     expect(gatewaySource).toContain("github-merge-eligibility");
   });
 });
+
+describe('GitHub workflow-file permission UX', () => {
+  it('separates App-owner configuration from installation-owner approval', () => {
+    expect(source).toContain('Workflow-file access required');
+    expect(source).toContain('Add permission on GitHub');
+    expect(source).toContain('Add workflow access');
+    expect(source).toContain('Approve permission');
+    expect(source).toContain('workflow access required');
+    expect(gatewaySource).toContain('workflowPermissionStatus(connection)');
+    expect(gatewaySource).toContain('workflowPermissionStatus()');
+  });
+});

@@ -1348,6 +1348,18 @@ async function softwareDevImpl(
           return await fn();
         } catch (err) {
           if (cancelled || isCancellation(err)) throw err; // mid-turn cancel: don't resolve/retry
+          // Repository/App permission changes are genuine human decisions. A
+          // Resolve agent cannot grant them and retrying the same Git push only
+          // repeats GitHub's rejection. New histories therefore park directly
+          // with the activity's actionable settings/approval links. The patch
+          // marker preserves command order for executions that already handled
+          // this failure through the historical Resolve path.
+          if (failureHasType(err, 'github-workflows-permission')
+            && patched('software-dev-human-github-workflow-permission-v1')) {
+            lastError = describeError(err);
+            error = lastError;
+            break;
+          }
           // A credential wall (all logins/keys need a human) won't fix on retry —
           // escalate straight to a human (#5).
           if (err instanceof CredentialDenied) {
@@ -3650,4 +3662,13 @@ function describeError(err: any): string {
     e = e.cause;
   }
   return parts.join(' → ') || String(err);
+}
+
+function failureHasType(err: unknown, type: string): boolean {
+  let value: any = err;
+  for (let depth = 0; value && depth < 8; depth++) {
+    if (value.type === type) return true;
+    value = value.cause;
+  }
+  return false;
 }

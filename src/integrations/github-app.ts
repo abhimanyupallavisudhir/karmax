@@ -21,6 +21,15 @@ const githubUserTokenHandle = (userId: string, accountId: string) =>
 const githubUserAccountsKey = (userId: string) => `github-app:user:${userId}:accounts`;
 const githubUserActiveAccountKey = (userId: string) => `github-app:user:${userId}:active-account`;
 
+function permissionLevel(value: unknown): 'write' | 'read' | 'none' {
+  return value === 'write' ? 'write' : value === 'read' ? 'read' : 'none';
+}
+
+export function isGithubWorkflowPermissionRejection(value: unknown): boolean {
+  return /refusing to allow a GitHub App to create or update workflow [`'"]?\.github\/workflows\//i
+    .test(String(value ?? ''));
+}
+
 function publicWebhookOrigin(url: URL): boolean {
   if (url.protocol !== 'https:') return false;
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
@@ -53,6 +62,22 @@ interface GitHubInstallationPayload {
   id: number | string;
   account: { login: string; type?: 'User' | 'Organization' };
   suspended_at?: string | null;
+  permissions?: Record<string, string>;
+  html_url?: string;
+}
+
+interface GitHubAppPayload {
+  slug?: string;
+  owner?: { login?: string; type?: 'User' | 'Organization' };
+  permissions?: Record<string, string>;
+}
+
+export interface GitHubWorkflowPermissionStatus {
+  app: 'write' | 'read' | 'none';
+  installation?: 'write' | 'read' | 'none';
+  ready: boolean;
+  appSettingsUrl: string;
+  installationSettingsUrl?: string;
 }
 
 export interface GitHubUserIdentity {
@@ -287,6 +312,11 @@ export class GitHubAppService {
         // dispatch behind a distinct platform capability.
         actions: 'write', checks: 'read', contents: 'write', email_addresses: 'read', metadata: 'read',
         pull_requests: 'write', statuses: 'read',
+        // GitHub deliberately treats `.github/workflows/**` as a more sensitive
+        // namespace than ordinary repository contents. Contents(write) can push
+        // every other file, but Git rejects a ref update containing a workflow
+        // unless the App also has this separate permission.
+        workflows: 'write',
       },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
@@ -490,6 +520,57 @@ export class GitHubAppService {
     const url = new URL(`https://github.com/apps/${slug}/installations/new`);
     url.searchParams.set('state', state);
     return url.toString();
+  }
+
+  /** Observe both permission layers GitHub applies to workflow-file pushes.
+   * The App owner first adds Workflows(write) to the App registration; every
+   * account that already installed the App must then approve that expansion.
+   * Keeping the two states separate makes the required human action explicit. */
+  async workflowPermissionStatus(connection?: GitConnection): Promise<GitHubWorkflowPermissionStatus> {
+    if (!this.configured()) throw new Error('GitHub App is not configured');
+    const app = await this.appRequest<GitHubAppPayload>('/app');
+    const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
+    if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
+    const owner = String(app.owner?.login ?? '').trim();
+    const appSettingsUrl = app.owner?.type === 'Organization' && owner
+      ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
+      : `https://github.com/settings/apps/${encodeURIComponent(slug)}/permissions`;
+    const appPermission = permissionLevel(app.permissions?.workflows);
+    if (!connection) return { app: appPermission, ready: appPermission === 'write', appSettingsUrl };
+    const installation = await this.appRequest<GitHubInstallationPayload>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}`,
+    );
+    const installationPermission = permissionLevel(installation.permissions?.workflows);
+    const installationSettingsUrl = installation.html_url?.startsWith('https://github.com/')
+      ? installation.html_url
+      : connection.accountType === 'Organization'
+        ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
+        : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`;
+    return {
+      app: appPermission,
+      installation: installationPermission,
+      ready: appPermission === 'write' && installationPermission === 'write',
+      appSettingsUrl,
+      installationSettingsUrl,
+    };
+  }
+
+  /** Human-readable recovery for Git's remote-rejection message. */
+  async workflowPermissionGuidance(repository: Repository): Promise<string> {
+    const connection = repository.gitConnectionId
+      ? this.store.getGitConnection(repository.gitConnectionId)
+      : undefined;
+    if (!connection) return 'Reconnect this repository through the GitHub App, then retry the task.';
+    const observed = await this.workflowPermissionStatus(connection);
+    if (observed.app !== 'write') {
+      return `The installation operator must grant the krmax GitHub App Workflows: read and write at ${observed.appSettingsUrl}. `
+        + `Then the owner of ${connection.accountLogin} must approve the updated App permission at ${observed.installationSettingsUrl}. Retry the task after both steps.`;
+    }
+    if (observed.installation !== 'write') {
+      return `The krmax GitHub App now requests Workflows: read and write, but ${connection.accountLogin} has not approved it. `
+        + `Approve the updated App permission at ${observed.installationSettingsUrl}, then retry the task.`;
+    }
+    return 'GitHub reports Workflows: read and write as approved. Refresh the GitHub connection in organization settings and retry the task; if GitHub still rejects it, review the App installation on GitHub.';
   }
 
   verifyWebhook(raw: Buffer, signature: string | undefined): boolean {

@@ -49,7 +49,7 @@ import {
   type GithubActionsApi,
   type GithubActionsFailureDecision,
 } from '../integrations/github-actions.js';
-import type { GitHubRepositoryPermission } from '../integrations/github-app.js';
+import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
@@ -2473,8 +2473,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const opened: TaskPullRequest[] = [];
       for (const { repo, slug, api, base } of changed) {
         if (!pushed.pushed.includes(repo.name)) {
+          const pushError = pushed.errors?.[repo.name] ?? '';
+          if (isGithubWorkflowPermissionRejection(pushError)) {
+            const repository = await enrolledRepositoryForCheckout(handle, repo);
+            const guidance = repository && deps.githubApp
+              ? await deps.githubApp.workflowPermissionGuidance(repository).catch(() =>
+                'Grant the krmax GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.')
+              : 'Grant the krmax GitHub App Workflows: read and write, approve the updated installation permission, then retry the task.';
+            throw ApplicationFailure.create({
+              message: `GitHub App workflow permission required for ${slug}. ${guidance}`,
+              type: 'github-workflows-permission',
+              nonRetryable: true,
+            });
+          }
           throw new Error(`could not push branch "${repo.branch}" of repo "${repo.name}" to origin`
-            + `${pushed.errors?.[repo.name] ? `: ${pushed.errors[repo.name]}` : ''}`);
+            + `${pushError ? `: ${pushError}` : ''}`);
         }
         const { pr, created } = await api.openOrUpdate(slug, {
           head: repo.branch, base,
