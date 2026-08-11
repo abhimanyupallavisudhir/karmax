@@ -24,6 +24,13 @@ global.markdownEnabled = () => false;
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
 global.hostLocal = () => true;
+global.ICON = { more: '<svg></svg>' };
+global.taskRecord = () => ({ projectId: 'project-1' });
+global.projectById = () => ({ id: 'project-1', organizationId: 'org-1' });
+global.organizationById = () => ({ id: 'org-1' });
+global.currentOrg = () => ({ id: 'org-1' });
+global.globalRoute = () => '/org/settings';
+global.projectRoute = () => '/org/project/settings';
 const preferences = new Map();
 global.localStorage = {
   getItem: (key) => preferences.has(key) ? preferences.get(key) : null,
@@ -38,9 +45,13 @@ global.S = {
     { seq: 3, ts: 1710000003000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'cmd', kind: 'command', phase: 'completed', title: 'npm test', detail: '12 passed' } },
     { seq: 4, ts: 1710000004000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'reply', kind: 'message', phase: 'completed', title: 'All done' } },
   ],
+  explanationSettings: { model: 'google/gemini-3.6-flash' },
+  explanationPending: {},
+  explanationErrors: {},
 };
 
-for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderConversationEntry']) eval(extractFn(fn));
+global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
+for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -62,6 +73,21 @@ ok(html.includes('You') && html.includes('Please run the tests'), 'user message 
 ok(html.includes('npm test') && html.includes('completed'), 'agent action and its state are visible');
 ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
+ok(html.includes('Explain this with gemini-3.6-flash'), 'agent messages offer the effective explanation model');
+S.explanationErrors['activity:4'] = { code: 'explanation_api_key_missing', provider: 'openrouter' };
+const missingKey = renderConversationEntry(entries.find((entry) => entry.sourceKey === 'activity:4'));
+ok(missingKey.includes('API key for openrouter not found') && missingKey.includes('#settings-agents') && missingKey.includes('#project-explanation'), 'missing-key guidance links to agent logins and the project explanation default');
+delete S.explanationErrors['activity:4'];
+
+// Explanations are durable annotations attached immediately beneath their source,
+// not workflow messages that get replayed to the coding agent.
+S.taskEvents.push({ seq: 7, ts: 1710000006000, type: 'conversation.explanation', payload: {
+  role: 'do', sourceKey: 'activity:4', text: 'The work is complete.', provider: 'openrouter', model: 'google/gemini-3.6-flash',
+} });
+const explained = conversationEntries(transcript);
+const sourceIndex = explained.findIndex((entry) => entry.sourceKey === 'activity:4');
+ok(explained[sourceIndex + 1]?.type === 'explanation', 'a durable explanation renders directly after its source message');
+ok(renderConversationEntry(explained[sourceIndex + 1]).includes('Explanation'), 'the annotation is visibly labelled Explanation');
 
 // A follow-up accepted while the agent is still running is journaled before the
 // workflow republishes its transcript, so it must appear from the event alone.

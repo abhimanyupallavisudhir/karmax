@@ -3697,6 +3697,18 @@ export class Store {
       .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
+  /** Sparse durable annotations should not disappear merely because a task has
+   *  more live activity rows than the UI's bounded event window. */
+  eventsOfType(taskId: string, type: string): (KarmaxEvent & { seq: number })[] {
+    return (this.db.prepare('SELECT * FROM events WHERE taskId = ? AND type = ? ORDER BY seq').all(taskId, type) as any[])
+      .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
+  eventBySeq(taskId: string, seq: number): (KarmaxEvent & { seq: number }) | undefined {
+    const row = this.db.prepare('SELECT * FROM events WHERE taskId = ? AND seq = ?').get(taskId, seq) as any;
+    return row ? { seq: row.seq, type: row.type, taskId: row.taskId, ts: row.ts, payload: JSON.parse(row.payload) } : undefined;
+  }
+
   /** Current durable event cursor without materializing or parsing the event log. */
   latestEventSeq(): number {
     return Number((this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as any)?.seq ?? 0);

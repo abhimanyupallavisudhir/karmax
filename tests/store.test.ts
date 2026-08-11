@@ -634,9 +634,12 @@ describe('Store', () => {
     const s3 = store.appendEvent({ type: 'do.output', taskId: t.id, ts: 3, payload: { text: 'c' } });
     expect(store.eventsSince(t.id, 0)).toHaveLength(3);
     expect(store.eventsSince(t.id, s2 - 1).map((e) => e.payload.text)).toEqual(['b', 'c']);
+    expect(store.eventBySeq(t.id, s2)?.payload.text).toBe('b');
     expect(store.eventsSince(t.id, 0, 2).map((e) => e.payload.text)).toEqual(['b', 'c']);
     expect(store.latestEventSeq()).toBe(s3);
     expect(store.nextEventsSince(0, 2).map((e) => e.payload.text)).toEqual(['a', 'b']);
+    store.appendEvent({ type: 'conversation.explanation', taskId: t.id, ts: 4, payload: { text: 'plain language' } });
+    expect(store.eventsOfType(t.id, 'conversation.explanation').map((e) => e.payload.text)).toEqual(['plain language']);
   });
 
   it('reads list summaries without materializing conversation history', () => {
