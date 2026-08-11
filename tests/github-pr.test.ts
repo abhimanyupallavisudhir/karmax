@@ -1385,6 +1385,30 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  it('compares against origin when a restored checkout lacks a local PR target branch', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('restored-target');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_restored_target', repo, base: 'main', target: 'main', kind: 'worktree',
+    });
+    const checkout = handle.repos![0]!;
+    await gitOrThrow(checkout.root, ['update-ref', 'refs/remotes/origin/release', 'main']);
+    expect((await git(checkout.root, ['rev-parse', '--verify', 'release'])).code).not.toBe(0);
+    expect((await git(checkout.root, ['rev-parse', '--verify', 'refs/remotes/origin/release'])).code).toBe(0);
+
+    await expect(core.openPr(handle, 'release', { title: 'Unchanged restored target' })).resolves.toEqual([]);
+    expect(gh.prs).toHaveLength(0);
+
+    await fs.promises.writeFile(path.join(checkout.root, 'restored.txt'), 'changed');
+    await git(checkout.root, ['add', '-A']);
+    await git(checkout.root, ['commit', '-q', '-m', 'restored world work']);
+
+    await expect(core.openPr(handle, 'release', { title: 'Restored target' })).resolves.toHaveLength(1);
+    expect(gh.prs[0].base.ref).toBe('release');
+    await core.destroyWorld(handle);
+  });
+
   it('uses one connected GitHub account for user-attributed PRs and App-authenticated pushes', async () => {
     const gh = fakeGithub();
     const repo = await repoWithGithubOrigin('connected');
