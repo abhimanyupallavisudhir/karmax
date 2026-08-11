@@ -7822,9 +7822,22 @@ function wireParams(v) {
   });
 }
 
+function hasOpenPullRequest(v) {
+  const prs = Array.isArray(v?.prs) && v.prs.length ? v.prs : v?.pr ? [v.pr] : [];
+  return prs.some((pr) => pr?.state === 'open' && !pr.merged);
+}
+
+function taskActionLabel(v, action) {
+  if (action.name === 'openPr')
+    return hasOpenPullRequest(v) ? 'Return to Review' : 'Manually Open PR';
+  if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
+    return 'Authorize GitHub merge';
+  return action.label || action.name;
+}
+
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions.
-// This is the footer bar that stays visible on every task-page tab, so
-// Open PR / Confirm PR / Cancel are always one click (or one digit) away.
+// This is the footer bar that stays visible on every task-page tab, so the
+// proposal / confirmation / cancellation controls are always one click away.
 function taskActions(v) {
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
@@ -7832,11 +7845,7 @@ function taskActions(v) {
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
-    const label = a.name === 'openPr'
-      ? 'Manually Open PR'
-      : a.name === 'confirm' && v.stage === 'merge' && v.waitingFor?.kind === 'human'
-      ? 'Authorize GitHub merge'
-      : a.label;
+    const label = taskActionLabel(v, a);
     const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
     // `data-label` carries the bare label because the keyboard digit renders
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
@@ -7866,13 +7875,17 @@ function actionToast(signal, label) {
   const standard = { confirm: 'confirm', openPr: 'manually open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
   const done = { confirm: 'Confirmed', openPr: 'Opening PR', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
+  if (signal === 'openPr' && text.toLowerCase() === 'return to review') return 'Returning to Review';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 
 const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
+const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? Karmax will first verify that the current proposal is clean and committed.';
 
-function confirmTaskAction(action) {
-  return action !== 'openPr' || confirm(MANUAL_OPEN_PR_CONFIRMATION);
+function confirmTaskAction(action, v = S.view) {
+  return action !== 'openPr' || confirm(hasOpenPullRequest(v)
+    ? RETURN_TO_REVIEW_CONFIRMATION
+    : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
 function reflectAcceptedTaskAction(taskId, action) {
@@ -7887,7 +7900,7 @@ function wireActions(v) {
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
-      if (!confirmTaskAction(act)) return;
+      if (!confirmTaskAction(act, v)) return;
       const cancelling = act === 'cancel';
       const label = btn.innerHTML;
       if (cancelling) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
@@ -13423,7 +13436,7 @@ function allCommands() {
     covered.add(`${c.workflow}:${name}`);
     const action = S.view && S.view.workflow === c.workflow ? (S.view.actions || []).find((a) => a.name === name) : null;
     add({
-      id: c.id, title: c.title, keybinding: c.keybinding, group: 'Task', workflow: c.workflow,
+      id: c.id, title: action ? taskActionLabel(S.view, action) : c.title, keybinding: c.keybinding, group: 'Task', workflow: c.workflow,
       available: !!(S.selected && action && action.enabled), danger: action?.danger,
       run: () => action && runDeclaredAction(action),
     });
@@ -13433,7 +13446,7 @@ function allCommands() {
   if (S.selected && S.view) {
     for (const a of S.view.actions || []) {
       if (covered.has(`${S.view.workflow}:${a.name}`)) continue;
-      add({ id: `task.action.${a.name}`, title: a.label || a.name, group: 'Task', workflow: S.view.workflow, available: !!a.enabled, danger: a.danger, run: () => runDeclaredAction(a) });
+      add({ id: `task.action.${a.name}`, title: taskActionLabel(S.view, a), group: 'Task', workflow: S.view.workflow, available: !!a.enabled, danger: a.danger, run: () => runDeclaredAction(a) });
     }
     // digits 1–9 press the Nth enabled action button in the task page's footer
     const btns = [...document.querySelectorAll('#tp-foot [data-act]:not([disabled])')].slice(0, 9);
@@ -13449,12 +13462,12 @@ async function runDeclaredAction(a) {
   if (!S.selected) return;
   if (a.name === 'followUp') return focusFollowup();
   if (a.args && a.args.length) return openActionForm(a);
-  if (!confirmTaskAction(a.name)) return;
+  if (!confirmTaskAction(a.name, S.view)) return;
   const taskId = S.selected;
   try {
     await api(`/api/tasks/${taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
     reflectAcceptedTaskAction(taskId, a.name);
-    toast(actionToast(a.name, a.label || a.name));
+    toast(actionToast(a.name, taskActionLabel(S.view, a)));
     setTimeout(refreshTask, 250);
     setTimeout(refreshTasks, 400);
   } catch (e) { toast(e.message, true); }

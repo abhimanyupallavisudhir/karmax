@@ -177,11 +177,26 @@ describe('destructive actions confirm first', () => {
 });
 
 describe('manual PR opening', () => {
-  it('labels the human-only action clearly and confirms it before signaling', () => {
-    expect(app).toContain("? 'Manually Open PR'");
+  it('distinguishes opening a new PR from returning an existing PR to Review', () => {
+    const start = app.indexOf('function hasOpenPullRequest(');
+    const end = app.indexOf('// the generic auto-render floor', start);
+    const helpers = new Function(`${app.slice(start, end)}; return { hasOpenPullRequest, taskActionLabel };`)() as {
+      hasOpenPullRequest: (view: any) => boolean;
+      taskActionLabel: (view: any, action: any) => string;
+    };
+    const action = { name: 'openPr', label: 'Open PR' };
+
+    expect(helpers.taskActionLabel({}, action)).toBe('Manually Open PR');
+    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Return to Review');
+    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually Open PR');
+    expect(helpers.hasOpenPullRequest({ prs: [{ state: 'open', merged: true }] })).toBe(false);
+  });
+
+  it('confirms the context-specific action before signaling it', () => {
     expect(app).toContain('Are you sure the agent\'s work here is complete? You could cancel and ask the agent to open the PR itself.');
-    expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act)) return;');
-    expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name)) return;');
+    expect(app).toContain('Return this pull request to Review? Karmax will first verify that the current proposal is clean and committed.');
+    expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act, v)) return;');
+    expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name, S.view)) return;');
   });
 });
 
