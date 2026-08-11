@@ -2932,6 +2932,7 @@ function refreshBrandAssets() {
 }
 
 function renderShell() {
+  document.body.classList.remove('landing-auth-open');
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
@@ -14171,21 +14172,165 @@ function wireSocialBtn(id, provider, errSelector) {
   });
 }
 
-function renderLogin() {
-  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
+function landingAuthShell(content, open = false) {
+  return `<div class="landing-page">
+    <header class="landing-nav">
+      <a class="landing-brand brand" href="#top" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
+      <nav aria-label="Landing page">
+        <a href="#how-it-works">How it works</a>
+        <a href="#why-krmax">Why krmax</a>
+      </nav>
+      <button class="landing-nav-signin" id="landing-signin" type="button">Sign in <span aria-hidden="true">↗</span></button>
+    </header>
+
+    <main id="top">
+      <section class="landing-hero" aria-labelledby="landing-title">
+        <div class="landing-hero-copy">
+          <p class="landing-kicker"><span></span> Work, with somewhere to go</p>
+          <h1 id="landing-title">Put the work<br>on a list.<br><em>Let it move.</em></h1>
+          <p class="landing-lede">krmax turns outcomes into durable tasks, gives people and agents one place to work, and brings you in when judgment matters.</p>
+          <div class="landing-hero-actions">
+            <button class="landing-primary" id="landing-start" type="button">Start a workspace <span aria-hidden="true">↗</span></button>
+            <a href="#how-it-works">Follow a task <span aria-hidden="true">↓</span></a>
+          </div>
+        </div>
+
+        <div class="landing-workbench" aria-label="A task moving from brief to review">
+          <div class="landing-workbench-head">
+            <span class="landing-mono">TASK #148</span>
+            <span class="landing-live"><i></i> in progress</span>
+          </div>
+          <h2>Make onboarding feel effortless</h2>
+          <p class="landing-workbench-note">A clear outcome, not a pile of instructions.</p>
+          <div class="landing-route" aria-hidden="true">
+            <span class="complete">Brief</span><b></b><span class="active">Build</span><b></b><span>Review</span><b></b><span>Done</span>
+          </div>
+          <div class="landing-task-log">
+            <div class="landing-log-row complete">
+              <span class="landing-log-mark">✓</span>
+              <span><strong>World prepared</strong><small>Branch and tools ready</small></span>
+              <time>09:41</time>
+            </div>
+            <div class="landing-log-row working">
+              <span class="landing-agent-mark">K</span>
+              <span><strong>Agent is building</strong><small>Editing the signed-in experience</small></span>
+              <span class="landing-working-dots"><i></i><i></i><i></i></span>
+            </div>
+            <div class="landing-log-row queued">
+              <span class="landing-log-mark">⌁</span>
+              <span><strong>Checks run next</strong><small>Tests, typecheck, visual review</small></span>
+              <span class="landing-mono">AUTO</span>
+            </div>
+          </div>
+          <div class="landing-review-gate">
+            <span class="landing-gate-mark">⌘</span>
+            <span><small>YOUR NEXT DECISION</small><strong>Review the finished change</strong></span>
+            <span aria-hidden="true">→</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-manifesto" id="why-krmax" aria-labelledby="manifesto-title">
+        <p class="landing-section-label">The idea</p>
+        <h2 id="manifesto-title">The todo list is still the best interface for work. It just needed better workers.</h2>
+        <div class="landing-principles">
+          <article><span>□</span><h3>One list, no shadow systems</h3><p>Code changes, research, operations, and human follow-ups live together as work you can assign and understand.</p></article>
+          <article><span>◌</span><h3>Progress that survives</h3><p>Every handoff, check, and decision stays attached to the task. Close the tab; the work keeps its place.</p></article>
+          <article><span>◇</span><h3>Attention by exception</h3><p>Agents handle the mechanical steps. krmax calls for you at review gates, real choices, and irreversible actions.</p></article>
+        </div>
+      </section>
+
+      <section class="landing-how" id="how-it-works" aria-labelledby="how-title">
+        <div class="landing-how-copy">
+          <p class="landing-section-label">How work moves</p>
+          <h2 id="how-title">Write the outcome.<br>The system keeps the thread.</h2>
+          <p>You describe what finished looks like. krmax gives the task a workspace, the right agent, bounded access, and a workflow that remembers where it is.</p>
+          <button class="landing-text-action" id="landing-how-start" type="button">Create your first task <span aria-hidden="true">→</span></button>
+        </div>
+        <ol class="landing-sequence">
+          <li><span>Brief</span><div><strong>Name the outcome</strong><p>Use plain language. Attach the context, credentials, and budget the work is allowed to use.</p></div></li>
+          <li><span>Run</span><div><strong>Let agents carry the routine</strong><p>Work happens in an isolated world with live progress, durable retries, and every action on the record.</p></div></li>
+          <li><span>Decide</span><div><strong>Step in at the consequential moment</strong><p>Review the exact result, answer a real question, or approve a boundary—then let the workflow continue.</p></div></li>
+        </ol>
+      </section>
+
+      <section class="landing-final" aria-labelledby="final-title">
+        <p class="landing-mono">HUMAN ATTENTION: RESERVED</p>
+        <h2 id="final-title">A calmer place for<br>ambitious work.</h2>
+        <button class="landing-primary landing-primary-light" id="landing-final-start" type="button">Start a workspace <span aria-hidden="true">↗</span></button>
+      </section>
+    </main>
+
+    <footer class="landing-footer">
+      <div class="landing-brand brand">${brandMark()}<span>krmax</span></div>
+      <p>One list for people and agents.</p>
+      <button id="landing-footer-signin" type="button">Sign in</button>
+    </footer>
+
+    <div class="landing-auth-scrim" id="landing-auth-scrim" ${open ? '' : 'hidden'}>
+      <section class="login-card landing-auth-card" role="dialog" aria-modal="true" aria-labelledby="landing-auth-title" tabindex="-1">
+        <button class="landing-auth-close" id="landing-auth-close" type="button" aria-label="Close sign in">×</button>
+        ${content}
+      </section>
+    </div>
+  </div>`;
+}
+
+function wireLandingChrome(open = false, mode = 'signin') {
+  const scrim = $('#landing-auth-scrim');
+  const card = scrim?.querySelector('.landing-auth-card');
+  const showSignIn = () => {
+    scrim.hidden = false;
+    document.body.classList.add('landing-auth-open');
+    card?.focus();
+  };
+  const close = () => {
+    scrim.hidden = true;
+    document.body.classList.remove('landing-auth-open');
+    $('#landing-signin')?.focus();
+  };
+  const signIn = mode === 'signup' ? () => renderLogin(true) : showSignIn;
+  $('#landing-signin')?.addEventListener('click', signIn);
+  $('#landing-footer-signin')?.addEventListener('click', signIn);
+  $('#landing-start')?.addEventListener('click', renderSignup);
+  $('#landing-how-start')?.addEventListener('click', renderSignup);
+  $('#landing-final-start')?.addEventListener('click', renderSignup);
+  $('#landing-auth-close')?.addEventListener('click', close);
+  scrim?.addEventListener('click', (event) => { if (event.target === scrim) close(); });
+  scrim?.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') return close();
+    if (event.key !== 'Tab') return;
+    const focusable = [...card.querySelectorAll('button:not([disabled]), input:not([disabled]), a[href]')];
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  });
+  document.body.classList.toggle('landing-auth-open', open);
+  if (open) card?.focus();
+}
+
+function renderLogin(forceOpen = false) {
+  const open = forceOpen === true || !!(S.justVerified || S.pendingInvite || S.signInError);
+  const auth = `<div class="landing-auth-heading">
+      <p class="landing-mono">WELCOME BACK</p>
+      <h2 id="landing-auth-title">Sign in to krmax</h2>
+      <p>Pick up the work where you left it.</p>
+    </div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a krmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
-    <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
+    <div class="form-row"><label>Password</label><input type="password" id="pw" autocomplete="current-password" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${googleBtn('google-btn')}
     ${githubBtn('github-btn')}
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
-    <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
-  </div></div>`;
+    <div id="login-err" role="status" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>`;
+  $('#app').innerHTML = landingAuthShell(auth, open);
+  wireLandingChrome(open);
   const go = async () => {
     const email = $('#email').value.trim();
     const password = $('#pw').value;
@@ -14220,6 +14365,7 @@ function renderLogin() {
 // (renderResetPassword); the response is intentionally uniform so we never reveal
 // whether an address has an account.
 function renderForgotPassword() {
+  document.body.classList.remove('landing-auth-open');
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Reset password</div>
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
@@ -14253,6 +14399,7 @@ function renderForgotPassword() {
 // Landing page for the emailed reset link (/reset-password?token=…). Sets a new
 // password via Better Auth, then returns to sign in.
 function renderResetPassword(token) {
+  document.body.classList.remove('landing-auth-open');
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Choose a new password</div>
     ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
@@ -14286,8 +14433,11 @@ function renderResetPassword(token) {
 }
 
 function renderSignup() {
-  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
+  const auth = `<div class="landing-auth-heading">
+      <p class="landing-mono">A PLACE FOR THE WORK</p>
+      <h2 id="landing-auth-title">Create your workspace</h2>
+      <p>Start with one project. Invite people when you're ready.</p>
+    </div>
     ${S.pendingInvite
       ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
       : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
@@ -14298,8 +14448,9 @@ function renderSignup() {
     ${googleBtn('signup-google-btn')}
     ${githubBtn('signup-github-btn')}
     <button class="btn" id="signup-back" style="width:100%;margin-top:8px">Back to sign in</button>
-    <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
-  </div></div>`;
+    <div id="signup-err" role="status" style="color:var(--danger);font-size:12px;margin-top:8px"></div>`;
+  $('#app').innerHTML = landingAuthShell(auth, true);
+  wireLandingChrome(true, 'signup');
   const go = async () => {
     const name = $('#signup-name').value.trim();
     const email = $('#signup-email').value.trim();
@@ -14337,11 +14488,12 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err');
   wireSocialBtn('signup-github-btn', 'github', '#signup-err');
-  $('#signup-back').addEventListener('click', renderLogin);
+  $('#signup-back').addEventListener('click', () => renderLogin(true));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
 function renderAccessPending() {
+  document.body.classList.remove('landing-auth-open');
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <!-- Reached on ANY 403 from /api/projects, not only just after signing up: an
          existing user removed from their last project lands here too, and telling
@@ -14372,6 +14524,7 @@ function renderAccessPending() {
 }
 
 function renderSetup() {
+  document.body.classList.remove('landing-auth-open');
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Set up krmax</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
