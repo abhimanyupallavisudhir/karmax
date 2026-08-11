@@ -769,16 +769,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   /** Count task commits without assuming a cloud/restored checkout has a local
-   * copy of the protected branch. Restored worlds check out the task branch
-   * directly, so the target commonly exists only as origin/<target>. Keep the
-   * configured name for the GitHub PR; this fallback is only for local Git
-   * comparison. */
+   * copy of the protected branch. Restored worlds may hold it only as
+   * origin/<target>; dynamically enrolled checkouts intentionally receive no
+   * target ref at all, only the immutable starting commit in `baseSha`. Keep
+   * the configured name for the GitHub PR; these fallbacks are only for local
+   * Git comparison. */
   async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
     const local = await world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
     if (local.code === 0 || base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return local;
     const remoteBase = `refs/remotes/origin/${base}`;
     const remote = await world.exec('git', ['rev-list', '--count', `${remoteBase}..${repo.branch}`], { cwd: repo.root });
-    return remote.code === 0 ? remote : local;
+    if (remote.code === 0) return remote;
+    if (repo.baseSha) {
+      const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, repo.branch], { cwd: repo.root });
+      if (ancestor.code === 0) {
+        const recorded = await world.exec('git', ['rev-list', '--count', `${repo.baseSha}..${repo.branch}`], { cwd: repo.root });
+        if (recorded.code === 0) return recorded;
+      }
+    }
+    return local;
   }
 
   function brokerAuthFor(handle: WorldHandle, taskId?: string): GitBrokerAuth {

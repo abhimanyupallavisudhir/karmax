@@ -1409,6 +1409,30 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  it('compares against the recorded base when a dynamically enrolled checkout has no target refs', async () => {
+    const gh = fakeGithub();
+    const core = await coreFor(gh);
+    const repo = await repoWithGithubOrigin('bundle-only-target');
+    const handle = await core.createWorld({
+      taskId: 'task_pr_bundle_only_target', repo, base: 'main', target: 'main', kind: 'worktree',
+    });
+    const checkout = handle.repos![0]!;
+    checkout.baseSha = (await gitOrThrow(checkout.root, ['rev-parse', 'main'])).trim();
+    expect((await git(checkout.root, ['rev-parse', '--verify', 'release'])).code).not.toBe(0);
+    expect((await git(checkout.root, ['rev-parse', '--verify', 'refs/remotes/origin/release'])).code).not.toBe(0);
+
+    await expect(core.openPr(handle, 'release', { title: 'Unchanged bundle checkout' })).resolves.toEqual([]);
+    expect(gh.prs).toHaveLength(0);
+
+    await fs.promises.writeFile(path.join(checkout.root, 'bundle.txt'), 'changed');
+    await git(checkout.root, ['add', '-A']);
+    await git(checkout.root, ['commit', '-q', '-m', 'bundle-only world work']);
+
+    await expect(core.openPr(handle, 'release', { title: 'Bundle-only target' })).resolves.toHaveLength(1);
+    expect(gh.prs[0].base.ref).toBe('release');
+    await core.destroyWorld(handle);
+  });
+
   it('uses one connected GitHub account for user-attributed PRs and App-authenticated pushes', async () => {
     const gh = fakeGithub();
     const repo = await repoWithGithubOrigin('connected');
