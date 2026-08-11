@@ -44,6 +44,46 @@ describe('profile + account management settings backend', () => {
     expect(JSON.stringify(accounts)).not.toContain('sk-super-secret'); // secret never returned
   });
 
+  it('edits and deletes API keys while preserving credential policy', async () => {
+    await fetch(`${base}/api/accounts`, {
+      method: 'POST', headers: auth(),
+      body: JSON.stringify({ provider: 'openrouter', account: 'explain-old', apiKey: 'old-secret' }),
+    });
+    const oldKey = 'key:handle:openrouter:explain-old';
+    const nextKey = 'key:handle:openrouter:explain-new';
+    await fetch(`${base}/api/credentials/policy`, {
+      method: 'POST', headers: auth(),
+      body: JSON.stringify({ scope: 'global', policy: { order: [oldKey], explainerOnly: [oldKey] } }),
+    });
+
+    const editedResponse = await fetch(`${base}/api/accounts/keys/openrouter/explain-old`, {
+      method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ account: 'explain-new', apiKey: 'new-secret' }),
+    });
+    expect(editedResponse.status).toBe(200);
+    expect(JSON.stringify(await editedResponse.json())).not.toContain('new-secret');
+    const edited = await fetch(`${base}/api/accounts`, { headers: auth() }).then(J);
+    expect(edited.handles).toContain('openrouter:explain-new');
+    expect(edited.handles).not.toContain('openrouter:explain-old');
+    expect(h.broker.resolve('openrouter:explain-new', { caps: ['use-credential:*'] })).toBe('new-secret');
+    expect(JSON.parse(h.store.kvGet('credpolicy:organization:org_personal')!)).toMatchObject({
+      order: [nextKey], explainerOnly: [nextKey],
+    });
+    const credentials = await fetch(`${base}/api/credentials`, { headers: auth() }).then(J);
+    expect(credentials.credentials.find((credential: any) => credential.key === nextKey)).toMatchObject({
+      provider: 'openrouter', account: 'explain-new', kind: 'key',
+    });
+    expect(credentials.global.modes[nextKey]).toBe('explainer-only');
+    expect(credentials.global.enabled).not.toContain(nextKey);
+
+    const deleted = await fetch(`${base}/api/accounts/keys/openrouter/explain-new`, { method: 'DELETE', headers: auth() });
+    expect(deleted.status).toBe(200);
+    expect(h.broker.hasHandle('openrouter:explain-new')).toBe(false);
+    expect(JSON.parse(h.store.kvGet('credpolicy:organization:org_personal')!)).toMatchObject({
+      order: [], explainerOnly: [],
+    });
+  });
+
   it('does not list or reuse agent credentials across organizations', async () => {
     const acme = h.store.createOrganization({ name: 'Acme' });
     const beta = h.store.createOrganization({ name: 'Beta' });

@@ -105,6 +105,26 @@ export function parsePolicy(raw: string | undefined): CredPolicy | undefined {
   }
 }
 
+/** Rename or remove a credential id without leaving stale policy entries behind.
+ * Lists are deduplicated because a renamed key may already be present. */
+export function remapCredentialPolicy(
+  policy: CredPolicy,
+  from: string,
+  to?: string,
+): CredPolicy {
+  const remap = (values: string[] | undefined) => {
+    if (!Array.isArray(values)) return undefined;
+    return [...new Set(values.flatMap((value) => typeof value !== 'string' ? [] : value === from ? (to ? [to] : []) : [value]))];
+  };
+  return {
+    ...policy,
+    ...(policy.order ? { order: remap(policy.order) } : {}),
+    ...(policy.on ? { on: remap(policy.on) } : {}),
+    ...(policy.off ? { off: remap(policy.off) } : {}),
+    ...(policy.explainerOnly ? { explainerOnly: remap(policy.explainerOnly) } : {}),
+  };
+}
+
 /** Read the resolved policy layers for a task from a kv getter. */
 export function readPolicyLayers(
   get: (k: string) => string | undefined,
