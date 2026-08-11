@@ -88,6 +88,43 @@ body {
 }
 .mobile-menu, .rail-scrim { display: none; }
 button, input, textarea, select { font: inherit; color: inherit; }
+
+/* A request starts here on the same frame as its click/change. The two-pixel
+   trace is intentionally console-like: one clear latency signal shared by every
+   surface, with the initiating control carrying the local spinner as well. */
+.action-progress {
+  position: fixed; inset: 0 0 auto; z-index: 99; height: 2px; overflow: hidden;
+  pointer-events: none; background: color-mix(in srgb, var(--accent) 18%, transparent);
+  transition: opacity .18s ease;
+}
+.action-progress[hidden] { display: none; }
+.action-progress > span {
+  display: block; width: 38%; height: 100%; background: var(--accent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 65%, transparent);
+  animation: action-trace 1s cubic-bezier(.45, 0, .2, 1) infinite;
+}
+.action-progress[data-outcome="success"] > span { width: 100%; animation: none; background: var(--merged, var(--accent)); }
+.action-progress[data-outcome="error"] > span { width: 100%; animation: none; background: var(--danger); }
+@keyframes action-trace { from { transform: translateX(-115%); } to { transform: translateX(300%); } }
+
+.action-pending { cursor: progress !important; }
+button.action-pending, [role="button"].action-pending, a.action-pending {
+  position: relative; opacity: .72;
+}
+.btn.action-pending:disabled { opacity: .72; }
+button.action-pending::after, [role="button"].action-pending::after, a.action-pending::after {
+  content: ''; flex: 0 0 auto; width: .72em; height: .72em; border-radius: 50%;
+  border: 1.5px solid currentColor; border-right-color: transparent;
+  animation: action-spin .65s linear infinite;
+}
+.icon-btn.action-pending::after, .msg-copy.action-pending::after {
+  position: absolute; inset: 0; margin: auto; background: var(--surface);
+}
+.action-succeeded { animation: action-ok .55s ease; }
+.action-failed { animation: action-error .45s ease; }
+@keyframes action-spin { to { transform: rotate(360deg); } }
+@keyframes action-ok { 45% { box-shadow: 0 0 0 2px var(--merged, var(--accent)); } }
+@keyframes action-error { 40% { box-shadow: 0 0 0 2px var(--danger); } }
 a { color: var(--accent); text-decoration: none; }
 .mono { font-family: var(--font-mono); font-feature-settings: "ss01"; }
 

@@ -106,6 +106,124 @@ const S = {
   installationInfo: null,
 };
 
+// ── immediate action feedback ───────────────────────────────────────────────
+// Every server-backed interaction should acknowledge the user's gesture before
+// the network has a chance to answer. Event listeners do not expose their async
+// Promise to the browser, so remember the control that originated the current
+// event; feedbackFetch() can then bind the request to that control without every
+// one of the console's mutation handlers reinventing a spinner/disabled state.
+// The origin deliberately expires at the next microtask: background refreshes
+// and auto-save requests must not make an unrelated, previously-clicked button
+// look busy.
+let interactionOrigin = null;
+let interactionOriginEpoch = 0;
+let actionProgressCount = 0;
+const actionFeedbackStates = new WeakMap();
+
+function actionableControl(target, event) {
+  if (!target?.closest) return null;
+  if (event?.type === 'submit')
+    return event.submitter || target.querySelector?.('button[type="submit"],input[type="submit"]') || target;
+  return target.closest('button,input,select,textarea,[role="button"],a[data-spa],.task-row');
+}
+
+function rememberInteractionOrigin(event) {
+  const control = actionableControl(event.target, event);
+  if (!control) return;
+  // Keep the original control as the event target (pointer-events:none can send
+  // a repeat click through to a clickable row underneath). Swallow repeats at
+  // capture time while the first request is visibly pending.
+  if (control.classList?.contains('action-pending')) {
+    event.preventDefault?.();
+    event.stopImmediatePropagation?.();
+    return;
+  }
+  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+  const epoch = ++interactionOriginEpoch;
+  interactionOrigin = control;
+  queueMicrotask(() => {
+    if (interactionOriginEpoch === epoch) {
+      interactionOrigin = null;
+    }
+  });
+}
+
+if (typeof document !== 'undefined') {
+  ['pointerdown', 'click', 'change', 'submit', 'paste', 'drop'].forEach((type) =>
+    document.addEventListener(type, rememberInteractionOrigin, true));
+  document.addEventListener('keydown', rememberInteractionOrigin, true);
+}
+
+function actionLabel(control) {
+  return String(control?.getAttribute?.('aria-label') || control?.title || control?.textContent || 'Action')
+    .replace(/\s+/g, ' ').trim().slice(0, 80) || 'Action';
+}
+
+function beginActionFeedback(control = interactionOrigin) {
+  const progress = typeof document !== 'undefined' ? document.getElementById('action-progress') : null;
+  actionProgressCount++;
+  if (progress) {
+    progress.hidden = false;
+    progress.dataset.outcome = '';
+    progress.setAttribute('aria-label', `${actionLabel(control)} in progress`);
+  }
+  if (!control || !control.isConnected) return { control: null, startedAt: Date.now() };
+
+  const state = actionFeedbackStates.get(control) || {
+    count: 0,
+    ariaBusy: control.getAttribute?.('aria-busy'),
+    ariaDisabled: control.getAttribute?.('aria-disabled'),
+  };
+  state.count++;
+  actionFeedbackStates.set(control, state);
+  control.classList?.remove('action-succeeded', 'action-failed');
+  control.classList?.add('action-pending');
+  control.setAttribute?.('aria-busy', 'true');
+  control.setAttribute?.('aria-disabled', 'true');
+  return { control, startedAt: Date.now() };
+}
+
+function finishActionFeedback(ticket, ok) {
+  const elapsed = Date.now() - ticket.startedAt;
+  // Keep very fast responses perceptible instead of flashing for a single frame.
+  setTimeout(() => {
+    actionProgressCount = Math.max(0, actionProgressCount - 1);
+    const progress = typeof document !== 'undefined' ? document.getElementById('action-progress') : null;
+    if (progress && actionProgressCount === 0) {
+      progress.dataset.outcome = ok ? 'success' : 'error';
+      setTimeout(() => {
+        if (actionProgressCount === 0) {
+          progress.hidden = true;
+          progress.dataset.outcome = '';
+          progress.setAttribute('aria-label', 'Action in progress');
+        }
+      }, 420);
+    }
+
+    const { control } = ticket;
+    const state = control && actionFeedbackStates.get(control);
+    if (!control || !state) return;
+    state.count = Math.max(0, state.count - 1);
+    if (state.count) return;
+    actionFeedbackStates.delete(control);
+    control.classList?.remove('action-pending');
+    control.classList?.add(ok ? 'action-succeeded' : 'action-failed');
+    if (state.ariaBusy == null) control.removeAttribute?.('aria-busy');
+    else control.setAttribute?.('aria-busy', state.ariaBusy);
+    if (state.ariaDisabled == null) control.removeAttribute?.('aria-disabled');
+    else control.setAttribute?.('aria-disabled', state.ariaDisabled);
+    setTimeout(() => control.classList?.remove('action-succeeded', 'action-failed'), 700);
+  }, Math.max(0, 180 - elapsed));
+}
+
+function feedbackFetch(input, opts = {}) {
+  const ticket = interactionOrigin ? beginActionFeedback(interactionOrigin) : null;
+  return fetch(input, opts).then(
+    (response) => { if (ticket) finishActionFeedback(ticket, response.ok); return response; },
+    (error) => { if (ticket) finishActionFeedback(ticket, false); throw error; },
+  );
+}
+
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
 function taskRecord(id) {
@@ -1598,7 +1716,7 @@ function resetResponderField(box, attr = 'data-inherit') {
 
 // ── api ──────────────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
+  const res = await feedbackFetch(path, {
     ...opts,
     headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}), ...(opts.headers || {}) },
   });
@@ -1624,7 +1742,7 @@ async function api(path, opts = {}) {
 // reference. Thumbnails are served back via /api/attachments/:id?token=… (an
 // <img> can't send a Bearer header, so the session token rides in the query).
 async function uploadImage(file) {
-  const res = await fetch(`/api/attachments?projectId=${encodeURIComponent(S.projectId)}`, {
+  const res = await feedbackFetch(`/api/attachments?projectId=${encodeURIComponent(S.projectId)}`, {
     method: 'POST',
     headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
     body: file,
@@ -1738,7 +1856,7 @@ function wireMessageCopies(root = document) {
       copyToClipboard(btn.dataset.copyMsg || '').then(() => {
         btn.classList.add('copied');
         setTimeout(() => btn.classList.remove('copied'), 1200);
-      });
+      }).catch(() => toast('Couldn’t copy the message. Select it and copy it manually.', true));
     });
   });
 }
@@ -2172,7 +2290,7 @@ async function boot() {
     clean.searchParams.delete('auth_provider');
     history.replaceState({ kx: 1 }, '', `${clean.pathname}${clean.search}${clean.hash}`);
   }
-  const session = await (await fetch('/api/session')).json();
+  const session = await (await feedbackFetch('/api/session')).json();
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -2776,7 +2894,7 @@ const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misco
 async function resendConfirmationEmail(button) {
   button.disabled = true;
   try {
-    const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
+    const res = await feedbackFetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
     toast(res.ok ? 'Confirmation email sent — check your inbox.' : EMAIL_SEND_FAILED, !res.ok);
   } catch { toast(EMAIL_SEND_FAILED, true); }
@@ -4912,6 +5030,10 @@ async function openTaskForm(workflow, draft, seedText) {
     saveChain = saveChain.then(async () => {
       if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
       if (sig === lastSaved) return; // no change since the last write landed
+      if (activeFormToken === formToken) {
+        const ss = $('#tf-savestate');
+        if (ss) ss.textContent = 'Saving draft…';
+      }
       try {
         if (!draftId) {
           const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true }) });
@@ -4927,7 +5049,15 @@ async function openTaskForm(workflow, draft, seedText) {
         // chain link can land after a NEWER form instance has mounted its own head.
         if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = 'Draft saved'; }
         refreshTasks();
-      } catch { /* keep the form open; a later save or explicit button will retry */ }
+      } catch {
+        // Auto-save used to fail silently, leaving the form looking saved while
+        // the latest edit existed only in this tab. Keep the form open and the
+        // dirty signature retryable, but tell the user the durable write missed.
+        if (activeFormToken === formToken) {
+          const ss = $('#tf-savestate');
+          if (ss) ss.textContent = 'Draft not saved — keep editing to retry';
+        }
+      }
     });
     return saveChain;
   }
@@ -4936,7 +5066,7 @@ async function openTaskForm(workflow, draft, seedText) {
   let saveTimer = null;
   function autoSaveSoon() {
     const ss = $('#tf-savestate');
-    if (ss) ss.textContent = ''; // edits in flight — clear "Draft saved" until it lands
+    if (ss) ss.textContent = 'Unsaved changes';
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800);
   }
@@ -6261,7 +6391,7 @@ async function openArtifact(url, external) {
   if (external) { window.open(url, '_blank', 'noopener'); return; }
   // Artifact endpoints need the auth header, so fetch as a blob then open it.
   try {
-    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
     if (!res.ok) { toast('could not open artifact', true); return; }
     const obj = URL.createObjectURL(await res.blob());
     window.open(obj, '_blank', 'noopener');
@@ -7631,7 +7761,7 @@ function wireCopyButtons() {
         const prev = btn.innerHTML;
         btn.textContent = btn.dataset.copyIcon === '1' ? '✓' : '✓ copied';
         setTimeout(() => { btn.innerHTML = prev; }, 1200);
-      });
+      }).catch(() => toast('Couldn’t copy the command. Select it and copy it manually.', true));
     });
   });
 }
@@ -11044,7 +11174,8 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
       const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — krmax only mirrors the figure.');
-      if (!amt || !Number(amt)) return;
+      if (amt == null) return;
+      if (!Number(amt) || Number(amt) < 0) return toast('Enter an amount greater than zero.', true);
       try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
     list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
@@ -12765,7 +12896,11 @@ function wireProfileView() {
       return toast('Enter a different email address.', true);
     const button = $('#profile-email-save');
     button.disabled = true;
+    const feedback = beginActionFeedback(button);
+    let actionSucceeded = false;
     try {
+      // Keep this direct Better Auth request visible in the account-control
+      // contract while the explicit ticket covers the entire follow-up refresh.
       const response = await fetch('/api/auth/change-email', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -12776,16 +12911,19 @@ function wireProfileView() {
         throw new Error(body.message || body.error || 'Couldn’t change the email address.');
       }
       const wasUnverified = S.user?.emailVerified === false;
-      const session = await fetch('/api/session').then((result) => result.json());
+      const session = await feedbackFetch('/api/session').then((result) => result.json());
       if (session.user) S.user = session.user;
       renderShell();
       await applyRoute();
+      actionSucceeded = true;
       toast(wasUnverified
         ? `Email changed. Confirmation link sent to ${newEmail}.`
         : `Confirmation link sent to ${newEmail}. Your email will change after you confirm it.`);
     } catch (error) {
       toast(error.message || 'Couldn’t change the email address.', true);
       button.disabled = false;
+    } finally {
+      finishActionFeedback(feedback, actionSucceeded);
     }
   });
   $('#profile-password-form')?.addEventListener('submit', async (event) => {
@@ -12813,6 +12951,8 @@ function wireProfileView() {
     }
     const button = $('#profile-password-save');
     button.disabled = true;
+    const feedback = beginActionFeedback(button);
+    let actionSucceeded = false;
     try {
       const response = await fetch('/api/auth/change-password', {
         method: 'POST',
@@ -12825,11 +12965,13 @@ function wireProfileView() {
       }
       form.reset();
       setProfileEditor(null);
+      actionSucceeded = true;
       toast('Password changed. Other signed-in sessions were closed.');
     } catch (cause) {
       error.textContent = cause.message || 'Couldn’t change the password.';
     } finally {
       button.disabled = false;
+      finishActionFeedback(feedback, actionSucceeded);
     }
   });
   $('#profile-theme')?.addEventListener('click', toggleTheme);
@@ -14019,7 +14161,7 @@ function wireSocialBtn(id, provider, errSelector) {
       back.searchParams.delete('auth_provider');
       const errorBack = new URL(back);
       errorBack.searchParams.set('auth_provider', provider);
-      const response = await fetch('/api/auth/sign-in/social', { method: 'POST', headers: { 'content-type': 'application/json' },
+      const response = await feedbackFetch('/api/auth/sign-in/social', { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ provider, callbackURL: back.href, errorCallbackURL: errorBack.href }) });
       const result = await response.json();
       const label = provider === 'github' ? 'GitHub' : 'Google';
@@ -14045,8 +14187,16 @@ function renderLogin() {
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
   </div></div>`;
   const go = async () => {
+    const email = $('#email').value.trim();
+    const password = $('#pw').value;
+    if (!email || !password) {
+      $('#login-err').textContent = 'Enter your email and password.';
+      (!email ? $('#email') : $('#pw')).focus();
+      return;
+    }
+    $('#login-err').textContent = '';
     try {
-      const res = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: $('#email').value, password: $('#pw').value }) });
+      const res = await feedbackFetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password }) });
       if (res.ok) boot(); else $('#login-err').textContent = 'Invalid email or password';
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
@@ -14055,7 +14205,7 @@ function renderLogin() {
   wireSocialBtn('github-btn', 'github', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
     try {
-      const response = await fetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
+      const response = await feedbackFetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
       const result = await response.json();
       if (!response.ok || !result.url) throw new Error(result.error || 'SSO unavailable');
       location.href = result.url;
@@ -14080,10 +14230,15 @@ function renderForgotPassword() {
   </div></div>`;
   const go = async () => {
     const email = $('#forgot-email').value.trim();
-    if (!email) return;
+    if (!email || !$('#forgot-email').checkValidity()) {
+      $('#forgot-msg').style.color = 'var(--danger)';
+      $('#forgot-msg').textContent = 'Enter a valid email address.';
+      $('#forgot-email').focus();
+      return;
+    }
     $('#forgot-btn').disabled = true;
     try {
-      await fetch('/api/auth/request-password-reset', { method: 'POST', headers: { 'content-type': 'application/json' },
+      await feedbackFetch('/api/auth/request-password-reset', { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ email, redirectTo: `${location.origin}/reset-password` }) });
     } catch {}
     $('#forgot-msg').style.color = 'var(--ink-2)';
@@ -14111,7 +14266,7 @@ function renderResetPassword(token) {
     if (!newPassword || newPassword.length < 10) { $('#reset-msg').style.color = 'var(--danger)'; $('#reset-msg').textContent = 'Password must be at least 10 characters.'; return; }
     $('#reset-btn').disabled = true;
     try {
-      const res = await fetch('/api/auth/reset-password', { method: 'POST', headers: { 'content-type': 'application/json' },
+      const res = await feedbackFetch('/api/auth/reset-password', { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ newPassword, token }) });
       if (res.ok) {
         $('#reset-msg').style.color = 'var(--ink-2)';
@@ -14146,20 +14301,37 @@ function renderSignup() {
     <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
-    const res = await fetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      name: $('#signup-name').value, email: $('#signup-email').value, password: $('#signup-pw').value,
-    }) });
-    if (res.ok) return boot();
-    const body = await res.json().catch(() => ({}));
-    // Surface the real reason (Better Auth returns `.message`, e.g. "User already
-    // exists") rather than a blanket "Could not create account".
-    const reason = body.error || body.message || 'Could not create account';
-    const el = $('#signup-err');
-    if (/already exists/i.test(reason)) {
-      el.innerHTML = `An account with that email already exists. <a href="#" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
-      $('#signup-to-login')?.addEventListener('click', (e) => { e.preventDefault(); renderLogin(); });
-    } else {
-      el.textContent = reason;
+    const name = $('#signup-name').value.trim();
+    const email = $('#signup-email').value.trim();
+    const password = $('#signup-pw').value;
+    const invalidEmail = !email || !$('#signup-email').checkValidity();
+    const validationError = !name ? 'Enter your name.'
+      : invalidEmail ? 'Enter a valid email address.'
+        : password.length < 10 ? 'Password must be at least 10 characters.' : '';
+    if (validationError) {
+      $('#signup-err').textContent = validationError;
+      (!name ? $('#signup-name') : invalidEmail ? $('#signup-email') : $('#signup-pw')).focus();
+      return;
+    }
+    $('#signup-err').textContent = '';
+    try {
+      const res = await feedbackFetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, email, password,
+      }) });
+      if (res.ok) return boot();
+      const body = await res.json().catch(() => ({}));
+      // Surface the real reason (Better Auth returns `.message`, e.g. "User already
+      // exists") rather than a blanket "Could not create account".
+      const reason = body.error || body.message || 'Could not create account';
+      const el = $('#signup-err');
+      if (/already exists/i.test(reason)) {
+        el.innerHTML = `An account with that email already exists. <a href="#" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
+        $('#signup-to-login')?.addEventListener('click', (e) => { e.preventDefault(); renderLogin(); });
+      } else {
+        el.textContent = reason;
+      }
+    } catch {
+      $('#signup-err').textContent = 'Could not create account. Check your connection and try again.';
     }
   };
   $('#signup-btn').addEventListener('click', go);
@@ -14194,7 +14366,7 @@ function renderAccessPending() {
     } catch (error) { toast(error.message, true); }
   });
   $('#pending-logout').addEventListener('click', async () => {
-    await fetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
+    await feedbackFetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
     location.reload();
   });
 }
@@ -14210,10 +14382,28 @@ function renderSetup() {
     <div id="setup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
-    const res = await fetch('/api/setup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      name: $('#setup-name').value, email: $('#setup-email').value, password: $('#setup-pw').value,
-    }) });
-    if (res.ok) boot(); else $('#setup-err').textContent = (await res.json().catch(() => ({}))).error || 'Setup failed';
+    const name = $('#setup-name').value.trim();
+    const email = $('#setup-email').value.trim();
+    const password = $('#setup-pw').value;
+    const invalidEmail = !email || !$('#setup-email').checkValidity();
+    const validationError = !name ? 'Enter your name.'
+      : invalidEmail ? 'Enter a valid email address.'
+        : password.length < 10 ? 'Password must be at least 10 characters.' : '';
+    if (validationError) {
+      $('#setup-err').textContent = validationError;
+      (!name ? $('#setup-name') : invalidEmail ? $('#setup-email') : $('#setup-pw')).focus();
+      return;
+    }
+    $('#setup-err').textContent = '';
+    try {
+      const res = await feedbackFetch('/api/setup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, email, password,
+      }) });
+      if (res.ok) boot();
+      else $('#setup-err').textContent = (await res.json().catch(() => ({}))).error || 'Setup failed';
+    } catch {
+      $('#setup-err').textContent = 'Setup failed. Check your connection and try again.';
+    }
   };
   $('#setup-btn').addEventListener('click', go);
   $('#setup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
