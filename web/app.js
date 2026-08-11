@@ -7880,7 +7880,7 @@ function actionToast(signal, label) {
 }
 
 const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
-const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? Karmax will first verify that the current proposal is clean and committed.';
+const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.';
 
 function confirmTaskAction(action, v = S.view) {
   return action !== 'openPr' || confirm(hasOpenPullRequest(v)
