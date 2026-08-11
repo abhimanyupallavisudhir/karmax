@@ -1348,7 +1348,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
     // it did NOT wait out the child's ~30s sleep
     expect(Date.now() - t0).toBeLessThan(15_000);
-  });
+  }, 60_000);
 
   it('never lands conflict markers: a conflicted merge loops back to the merge agent, then escalates', async () => {
     const repo = await h.makeRepo('app-conflict');

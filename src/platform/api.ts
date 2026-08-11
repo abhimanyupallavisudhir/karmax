@@ -46,6 +46,7 @@ import type { WorldHandle } from '../world/types.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
+import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import type { WorldAccessService } from '../world/access.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { itemHandle } from '../autonomy/vault-items.js';
@@ -308,6 +309,64 @@ export class KarmaxApi {
     };
   }
 
+  /** Reconcile a live world against the project's current repository
+   * attachments. Project metadata is deliberately live while a workflow input
+   * is a replay-safe snapshot, so collaboration operations must close that gap
+   * before they can truthfully claim every checkout was published/imported. */
+  private async enrollProjectRepositories(task: TaskRecord, world: import('../world/types.js').World): Promise<string[]> {
+    const linked = this.deps.store.listProjectRepositories(task.projectId);
+    const added = await enrollWorldRepositories(world, linked, this.gitBrokerAuth(task.projectId), async (enrolled) => {
+      const current = (this.deps.store.currentWorld(task.id) ?? world.handle) as WorldHandle;
+      const durable = this.deps.store.updateWorldCheckouts(current, world.handle.repos!);
+      world.handle = durable as WorldHandle;
+      const event = { taskId: task.id, type: 'world.repository-enrolled', ts: Date.now(), payload: {
+        repo: enrolled.name, source: worldRepoSource(enrolled), branch: enrolled.branch,
+      } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+    });
+    return added.map((repo) => repo.name);
+  }
+
+  /** Attach a repository and, for a live task-agent caller, atomically enroll
+   * it into that task's already-provisioned world. A failed enrollment restores
+   * the previous project metadata instead of leaving a checkout the task can
+   * see but neither use nor publish. */
+  async attachProjectRepository(token: string, input: {
+    projectId: string; repositoryId: string; baseBranch?: string; targetBranch?: string; order?: number;
+  }) {
+    const project = this.deps.store.getProject(input.projectId);
+    if (!project) throw new NotFoundError('project not found');
+    const caller = this.require(token, 'repository:write', {
+      projectId: input.projectId, organizationId: project.organizationId,
+    });
+    const previous = this.deps.store.listProjectRepositories(input.projectId)
+      .find((candidate) => candidate.repositoryId === input.repositoryId);
+    const attached = this.deps.store.attachProjectRepository(input);
+    const task = caller.actor.kind === 'task-agent' ? this.deps.store.getTask(caller.actor.taskId) : undefined;
+    const handle = task?.projectId === input.projectId
+      ? this.deps.store.currentWorld(task.id) as WorldHandle | undefined
+      : undefined;
+    if (!task || !handle) return attached;
+    try {
+      const access = await this.openCollaborationWorld(task.id, handle);
+      try {
+        const enrolled = await this.enrollProjectRepositories(task, access.world);
+        return { ...attached, ...(enrolled.length ? { enrollment: { taskId: task.id, checkouts: enrolled } } : {}) };
+      } finally { await access.release(); }
+    } catch (error) {
+      if (previous) this.deps.store.attachProjectRepository({
+        projectId: previous.projectId,
+        repositoryId: previous.repositoryId,
+        baseBranch: previous.baseBranch,
+        targetBranch: previous.targetBranch,
+        order: previous.order,
+      });
+      else this.deps.store.detachProjectRepository(input.projectId, input.repositoryId);
+      throw new Error(`repository attachment was rolled back because the running task checkout could not be enrolled: ${unwrapCause(error)}. Retry the task after fixing the repository or world configuration.`);
+    }
+  }
+
   private async openCollaborationWorld(taskId: string, handle: WorldHandle) {
     if (this.deps.worldAccess) return this.deps.worldAccess.open(taskId, handle);
     if (!this.deps.worlds) throw new Error('world access is unavailable');
@@ -415,6 +474,7 @@ export class KarmaxApi {
     const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
+      await this.enrollProjectRepositories(task, access.world);
       for (const repo of worldRepos(access.world.handle)) {
         const dirty = await access.world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
         if (dirty.code !== 0) throw new Error(`could not inspect ${repo.name}: ${dirty.stderr || dirty.stdout}`);
@@ -526,11 +586,24 @@ export class KarmaxApi {
     if (!source || source.projectId !== task.projectId) throw new Error('source task must belong to the same project');
     const sourceHandle = (this.deps.store.currentWorld(sourceTaskId) ?? source.lastView?.world) as WorldHandle | undefined;
     if (!sourceHandle) throw new Error('source task has no published world branch');
-    const published = this.deps.store.eventsSince(sourceTaskId, 0).some((event) => event.type === 'push.branch'
-      && (event.payload as { branch?: string } | undefined)?.branch === sourceHandle.branch);
+    const requiredSourceRepos = this.deps.store.listProjectRepositories(task.projectId).flatMap((attachment) => {
+      const checkout = worldRepos(sourceHandle).find((repo) => sameRepository(worldRepoSource(repo), attachment.repository.sshUrl));
+      return checkout ? [checkout.name] : [];
+    });
+    const sourceMissing = this.deps.store.listProjectRepositories(task.projectId)
+      .filter((attachment) => !worldRepos(sourceHandle)
+        .some((repo) => sameRepository(worldRepoSource(repo), attachment.repository.sshUrl)));
+    if (sourceMissing.length) throw new Error(`source task is missing newly attached checkout(s): ${sourceMissing.map((entry) => entry.repository.name).join(', ')}; ask its agent to call publish_task_branch to enroll and publish them`);
+    const published = this.deps.store.eventsSince(sourceTaskId, 0).some((event) => {
+      if (event.type !== 'push.branch') return false;
+      const payload = event.payload as { branch?: string; repos?: string[] } | undefined;
+      return payload?.branch === sourceHandle.branch
+        && requiredSourceRepos.every((repo) => payload.repos?.includes(repo));
+    });
     if (!published) throw new Error('source branch is not published yet; message its agent and ask it to commit and call publish_task_branch');
     const access = await this.openCollaborationWorld(task.id, handle);
     try {
+      await this.enrollProjectRepositories(task, access.world);
       const refs = await brokerImportTaskBranch(access.world, sourceHandle, sourceTaskId,
         this.gitBrokerAuth(task.projectId));
       return { sourceTaskId, refs };

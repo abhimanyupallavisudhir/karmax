@@ -32,6 +32,7 @@ import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
+import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 import {
   GithubApiError,
@@ -794,6 +795,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return gitEnvFor(handle, taskId);
   }
 
+  /** A workflow's project config is a deterministic creation-time snapshot,
+   * while repository attachment is intentionally live platform state. Reconcile
+   * those two views inside the trusted activity before any operation that must
+   * cover every checkout. */
+  async function enrollLiveProjectRepositories(world: World, taskId: string): Promise<string[]> {
+    const task = store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    const linked = store.listProjectRepositories(task.projectId);
+    const added = await enrollWorldRepositories(world, linked, brokerAuthFor(world.handle, taskId), async (enrolled) => {
+      const current = (store.currentWorld(taskId) ?? world.handle) as WorldHandle;
+      const durable = store.updateWorldCheckouts(current, world.handle.repos!);
+      world.handle = durable as WorldHandle;
+      record(taskId, 'world.repository-enrolled', {
+        repo: enrolled.name, source: worldRepoSource(enrolled), branch: enrolled.branch,
+      });
+    });
+    return added.map((repo) => repo.name);
+  }
+
   async function ensureRunnerLease(handleInput: WorldHandle, taskId: string): Promise<WorldHandle> {
     const handle = (store.currentWorld(handleInput.id) ?? handleInput) as WorldHandle;
     if (!isRemote(handle.kind) || !deps.runners) return handle;
@@ -973,10 +993,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const hasCatalogedLocalSource = worldSources.some((_source, index) =>
         Boolean(sourceResolutions[index]?.localPath)
         && organizationRepositories.some((candidate) => sameRepository(candidate.sshUrl, transportSources[index]!)));
-      const commonBranchesResolved = store.getTask(args.taskId)?.params[REPOSITORY_BRANCHES_RESOLVED_PARAM] === true;
+      const taskRecord = store.getTask(args.taskId);
+      const commonBranchesResolved = taskRecord?.params[REPOSITORY_BRANCHES_RESOLVED_PARAM] === true;
+      // A child is a stack on the parent's task branch in EVERY repository.
+      // Project-level per-repository bases describe top-level task policy; they
+      // must not detach one child checkout from the parent proposal it is meant
+      // to merge back into. prepareChildTask publishes this parent ref before
+      // provisioning, including repositories attached after the parent started.
+      const childStack = Boolean(taskRecord?.parentTaskId && args.base);
       const repositoryBranches = Object.fromEntries(worldSources.flatMap((source, index) => {
         const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, transportSources[index]!));
         if (!candidate) return [];
+        if (childStack) return [[source, { base: args.base, target: args.target ?? args.base }]];
         // New task records have already resolved the common base/target through
         // task → project → organization → repository fallback. Only an explicit
         // per-repository policy may override those values. Records without the
@@ -2319,7 +2347,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async publishTaskBranch(handle: WorldHandle): Promise<{ pushed: string[] }> {
       if (!isRemote(handle.kind)) return { pushed: [] };
       const world = await openWorld(handle);
-      const result = await brokerPublishBranch(world, brokerAuthFor(handle, handle.id));
+      await enrollLiveProjectRepositories(world, handle.id);
+      const result = await brokerPublishBranch(world, brokerAuthFor(world.handle, handle.id));
       if (!result.pushed.length || result.skipped.length) {
         throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${describePublishFailures(result)}` : ' because it has no remote repository'}`);
       }
@@ -3835,13 +3864,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               try {
                 // The branch is the portable checkpoint's committed layer. Push
                 // it through the trusted broker before capturing the dirty delta.
-                if (isRemote(waitingWorld.kind) && worldRepos(waitingWorld).length) {
+                if (isRemote(waitingWorld.kind)) {
                   const remoteWorld = await openWorld(waitingWorld, taskId);
-                  const projectId = String(waitingWorld.meta?.projectId ?? '');
+                  const projectId = String(remoteWorld.handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
                   if (store.listProjectRepositories(projectId).length) {
-                    const pushed = await brokerPublishBranch(remoteWorld, brokerAuthFor(waitingWorld, taskId));
+                    await enrollLiveProjectRepositories(remoteWorld, taskId);
+                    const pushed = await brokerPublishBranch(remoteWorld, brokerAuthFor(remoteWorld.handle, taskId));
                     if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
-                    record(taskId, 'push.branch', { branch: waitingWorld.branch, repos: pushed.pushed, reason: 'checkpoint' });
+                    record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' });
                   }
                 }
                 const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
@@ -3877,6 +3907,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async prepareChildTask(args: PrepareChildArgs): Promise<TaskInput> {
       const parent = store.getTask(args.parentTaskId);
+      const currentProject = store.getProject(args.projectId);
+      const project = currentProject ? store.effectiveProjectConfig(currentProject) : args.project;
+      const parentHandle = store.currentWorld(args.parentTaskId) as WorldHandle | undefined;
+      if (parentHandle && isRemote(parentHandle.kind)) {
+        const parentWorld = await openWorld(parentHandle);
+        await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
+        const persisted = await brokerPublishBranch(parentWorld, brokerAuthFor(parentWorld.handle, args.parentTaskId));
+        if (!persisted.pushed.length || persisted.skipped.length)
+          throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
+        record(args.parentTaskId, 'push.branch', {
+          branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
+        });
+      }
       let child = store.createTask({
         projectId: args.projectId,
         listId: parent?.listId,
@@ -3928,7 +3971,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         base: args.base,
         target: args.target,
         parentTaskId: args.parentTaskId,
-        project: args.project,
+        project,
         profiles: args.profiles,
         resolveAgentEnabled: args.resolveAgentEnabled,
         grant,

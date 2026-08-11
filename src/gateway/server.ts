@@ -1841,7 +1841,7 @@ export class Gateway {
             return this.json(res, 403, { error: 'the delegated task has no pinned GitHub account' });
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
-              private: b.private !== false }, { accountId: githubAccountId }));
+              private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
@@ -2729,13 +2729,20 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjectRepositories(projectId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const attached = store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
-            baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
-            targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
-            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined });
-          const project = store.getProject(projectId);
-          if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-          return this.json(res, 200, attached);
+          try {
+            const attached = await api.attachProjectRepository(token, {
+              projectId, repositoryId: String(b.repositoryId),
+              baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
+              targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
+              order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined,
+            });
+            const project = store.getProject(projectId);
+            if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
+            return this.json(res, 200, attached);
+          } catch (error) {
+            return this.json(res, Number((error as any)?.status ?? 409),
+              { error: error instanceof Error ? error.message : String(error) });
+          }
         }
       }
       const githubMergeEligibility = p.match(/^\/api\/projects\/([^/]+)\/github-merge-eligibility$/);
