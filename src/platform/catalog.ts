@@ -92,6 +92,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/tasks/:taskId/escalate (body {audience, message}; pauses at the current stage and notifies the selected humans)',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
     'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local', 'POST /api/tasks/:taskId/open-command',
+    'POST /api/tasks/:taskId/file-checkout',
     'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
     'GET|POST /api/tasks/:taskId/attempts (mutually-exclusive alternates)',
     'PATCH /api/tasks/:taskId/workflow (retarget an unstarted task)',

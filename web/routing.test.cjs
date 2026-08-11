@@ -63,6 +63,7 @@ eval(extractFn('organizationBySlug'));
 eval(extractFn('currentOrg'));
 eval(extractFn('syncOrganizationSwitcher'));
 eval(extractFn('orgBase'));
+eval(extractFn('fileRouteTarget'));
 eval(extractFn('parseRoute'));
 eval(extractFn('projectBase'));
 eval(extractFn('projectRoute'));
@@ -128,6 +129,10 @@ eq(parseRoute('/acme/website-redesign/activity'),
 eq(parseRoute('/acme/website-redesign/tasks/42'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '' },
   'parse a task permalink');
+eq(parseRoute('/acme/website-redesign/tasks/42/file?path=%2Fworkspace%2Fapp%2Fmain.ts&line=17'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: '',
+    taskFile: { path: '/workspace/app/main.ts', line: 17 } },
+  'parse a task-scoped file handoff permalink');
 eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: '' },
   'parse a task permalink pinned to a tab');

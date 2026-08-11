@@ -45,6 +45,13 @@ export interface LocalFileOpen {
   materialized: boolean;
 }
 
+export interface PortableFileCheckout extends LocalCheckoutPlan {
+  file: { repository: string; relativePath: string; line?: number };
+  /** One idempotent script: reuse a clean checkout when present, otherwise
+   * clone it, then open the cited file in VS Code. */
+  openScript: string;
+}
+
 interface LocalMaterializationRecord {
   version: 1;
   source: string;
@@ -69,11 +76,7 @@ export class WorldHandoffService {
     const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no recoverable world');
     const repositories = worldRepos(handle);
-    const requested = requestedPath.trim();
-    if (!requested) throw new Error('file path is required');
-    const absolute = path.resolve(path.isAbsolute(requested)
-      ? requested
-      : path.join(worldWorkingDirectory(handle), requested));
+    const { absolute, repoIndex, relative } = resolveWorldFile(handle, requestedPath);
     const remote = Boolean(this.worlds.get(handle.kind).capabilities?.remote);
     // Script and just-do worlds may intentionally have no Git repository. A
     // local one is already openable in place; a remote one has no durable Git
@@ -84,9 +87,7 @@ export class WorldHandoffService {
       if (!fs.existsSync(absolute)) throw new Error('file is not present in the task world');
       return localFileOpen(absolute, line, false);
     }
-    const repoIndex = repositories.findIndex((repo) => pathInside(repo.root, absolute));
     if (repoIndex < 0) throw new Error('file path is outside the task repositories');
-    const relative = path.relative(path.resolve(repositories[repoIndex]!.root), absolute);
     const checkout = remote ? await this.materialize(taskId, view) : this.existingLocal(handle);
     const localRepo = checkout.repositories[repoIndex];
     if (!localRepo) throw new Error('local checkout does not contain the requested repository');
@@ -94,6 +95,41 @@ export class WorldHandoffService {
     if (!pathInside(localRepo.path, localPath) || !fs.existsSync(localPath))
       throw new Error('file is not present in the local checkout');
     return localFileOpen(localPath, line, remote);
+  }
+
+  /** Build the laptop-side equivalent of openFile without pretending the hosted
+   * gateway can write to a browser user's filesystem. The returned shell script
+   * crosses the same published Git boundary and is safe to run repeatedly: it
+   * only fast-forwards a clean checkout. */
+  fileCheckout(taskId: string, view: TaskView, requestedPath: string, line?: number): PortableFileCheckout {
+    if (view.agentTurn || view.status === 'active')
+      throw new Error('wait for the agent to reach a checkpoint before materializing its branch locally');
+    const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!handle) throw new Error('task has no recoverable world');
+    const repositories = worldRepos(handle);
+    const { repoIndex, relative } = resolveWorldFile(handle, requestedPath);
+    if (!repositories.length) throw new Error('task world has no Git repository to check out');
+    if (repoIndex < 0) throw new Error('file path is outside the task repositories');
+    const plan = this.checkout(taskId);
+    const sourceRepo = repositories[repoIndex]!;
+    const destinationRepo = plan.repositories.find((repo) => repo.name === sourceRepo.name);
+    if (!destinationRepo) throw new Error('local checkout does not contain the requested repository');
+    const location = path.posix.join(destinationRepo.name, relative.split(path.sep).join('/'))
+      + (Number.isInteger(line) && Number(line) > 0 ? `:${line}` : '');
+    const script = ['set -eu', `mkdir -p ${sh(plan.workspace)}`, `cd ${sh(plan.workspace)}`];
+    for (const repository of plan.repositories) {
+      script.push(`if [ -d ${sh(`${repository.name}/.git`)} ]; then`,
+        `  test -z "$(git -C ${sh(repository.name)} status --porcelain)" || { echo ${sh(`Checkout ${repository.name} has uncommitted changes; move or commit them first.`)} >&2; exit 1; }`,
+        `  git -C ${sh(repository.name)} fetch origin ${sh(repository.branch)}`,
+        `  git -C ${sh(repository.name)} switch ${sh(repository.branch)}`,
+        `  git -C ${sh(repository.name)} merge --ff-only ${sh(`origin/${repository.branch}`)}`,
+        'else',
+        `  git clone --branch ${sh(repository.branch)} --single-branch ${sh(repository.sshUrl)} ${sh(repository.name)}`,
+        'fi');
+    }
+    script.push(`code --goto ${sh(location)}`);
+    return { ...plan, file: { repository: destinationRepo.name, relativePath: relative, ...(line ? { line } : {}) },
+      openScript: script.join('\n') };
   }
 
   /** Publish the exact committed cloud branch through the trusted broker, then
@@ -305,6 +341,25 @@ function safeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]
 function pathInside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function resolveWorldFile(handle: WorldHandle, requestedPath: string): {
+  absolute: string; repoIndex: number; relative: string;
+} {
+  const requested = requestedPath.trim();
+  if (!requested) throw new Error('file path is required');
+  const absolute = path.resolve(path.isAbsolute(requested)
+    ? requested
+    : path.join(worldWorkingDirectory(handle), requested));
+  const repositories = worldRepos(handle);
+  if (!repositories.length) {
+    if (!pathInside(handle.root, absolute)) throw new Error('file path is outside the task world');
+    return { absolute, repoIndex: -1, relative: path.relative(path.resolve(handle.root), absolute) };
+  }
+  const repoIndex = repositories.findIndex((repo) => pathInside(repo.root, absolute));
+  if (repoIndex < 0) throw new Error('file path is outside the task repositories');
+  return { absolute, repoIndex,
+    relative: path.relative(path.resolve(repositories[repoIndex]!.root), absolute) };
 }
 
 function localFileOpen(localPath: string, line: number | undefined, materialized: boolean): LocalFileOpen {

@@ -182,6 +182,17 @@ describe('hosted/local Git handoff', () => {
     expect(fs.readFileSync(result.path, 'utf8')).toBe('from E2B\n');
     expect(store.eventsSince(task.id, 0).some((event) => event.type === 'push.branch')).toBe(true);
 
+    const portable = new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .fileCheckout(task.id, view, `${cloud}/cloud.txt`, 7);
+    expect(portable.file).toEqual({ repository: 'app', relativePath: 'cloud.txt', line: 7 });
+    expect(portable.openScript).toContain(`if [ -d 'app/.git' ]; then`);
+    expect(portable.openScript).toContain(`git -C 'app' merge --ff-only 'origin/${branch}'`);
+    expect(portable.openScript).toContain(`code --goto 'app/cloud.txt:7'`);
+    expect(() => new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .fileCheckout(task.id, { ...view, status: 'active' }, `${cloud}/cloud.txt`, 7)).toThrow(/reach a checkpoint/);
+    expect(() => new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .fileCheckout(task.id, view, '/etc/passwd')).toThrow(/outside the task repositories/);
+
     const materialized = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
       .materialize(task.id, view);
     expect(materialized.cwd).toBe(path.join(localRoot, task.id, 'app'));
