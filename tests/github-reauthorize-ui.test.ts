@@ -75,14 +75,14 @@ describe('GitHub merge authorization UX', () => {
   });
 });
 
-describe('GitHub workflow-file permission UX', () => {
-  it('separates App-owner configuration from installation-owner approval', () => {
-    expect(source).toContain('Workflow-file access required');
-    expect(source).toContain('Add permission on GitHub');
-    expect(source).toContain('Add workflow access');
-    expect(source).toContain('Approve permission');
-    expect(source).toContain('workflow access required');
-    expect(gatewaySource).toContain('workflowPermissionStatus(connection)');
-    expect(gatewaySource).toContain('workflowPermissionStatus()');
+describe('GitHub App permission UX', () => {
+  it('reports the complete App envelope separately from installation-owner approval', () => {
+    expect(source).toContain('GitHub App permissions need updating');
+    expect(source).toContain('Update permissions on GitHub');
+    expect(source).toContain('Update App permissions');
+    expect(source).toContain('Approve permissions');
+    expect(source).toContain('GitHub access update required');
+    expect(gatewaySource).toContain('permissionStatus(connection)');
+    expect(gatewaySource).toContain('permissionStatus()');
   });
 });

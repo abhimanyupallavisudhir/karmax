@@ -382,6 +382,27 @@ export interface PrepareChildArgs {
   parentGrant?: string[];
 }
 
+/** Recover the exact remote heads this task last observed. Integration repair
+ * may replace the in-memory view while retaining the durable PR history; a
+ * force-with-lease must use that history rather than fall back to an unsafe
+ * ordinary push that can never publish a rebased task-owned branch. */
+export function expectedTaskRemoteHeads(store: Store, taskId: string): Record<string, string> {
+  const expected: Record<string, string> = {};
+  const observations = [
+    ...store.eventsOfType(taskId, 'pr.opened'),
+    ...store.eventsOfType(taskId, 'pr.updated'),
+  ].sort((a, b) => a.seq - b.seq);
+  for (const event of observations) {
+    const repo = typeof event.payload?.repo === 'string' ? event.payload.repo : '';
+    const headSha = typeof event.payload?.headSha === 'string' ? event.payload.headSha : '';
+    if (repo && /^[0-9a-f]{40}$/i.test(headSha)) expected[repo] = headSha;
+  }
+  for (const candidate of store.getTask(taskId)?.lastView?.prs ?? []) {
+    if (candidate.headSha && !expected[candidate.repo]) expected[candidate.repo] = candidate.headSha;
+  }
+  return expected;
+}
+
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
@@ -734,10 +755,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     env: Record<string, string>,
     repos: ReturnType<typeof worldRepos>,
   ) {
-    const priorPrs = store.getTask(handle.id)?.lastView?.prs ?? [];
-    const expectedRemoteHeads = Object.fromEntries(priorPrs
-      .filter((candidate) => candidate.headSha)
-      .map((candidate) => [candidate.repo, candidate.headSha!]));
+    const expectedRemoteHeads = expectedTaskRemoteHeads(store, handle.id);
     if (isRemote(handle.kind))
       return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos, expectedRemoteHeads);
     const pushed: string[] = [];
@@ -2747,7 +2765,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         readiness: GithubPullRequestReadiness,
         current: TaskPullRequest[],
         inspection: ReturnType<typeof inspectionFor>,
-      ): Promise<GitHubMergeAuthorization> => {
+      ): Promise<GitHubMergeAuthorization | undefined> => {
         const summary = ciFailureDetail(ref, readiness);
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
@@ -2786,6 +2804,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return repeated;
         };
         const decisions: Array<ReturnType<typeof terminalObservation>> = [];
+        const inspectionFailures: Array<{ runId: number; error: unknown }> = [];
         if (inspection.actions) {
           for (const runId of runIds.slice(0, 4)) {
             try {
@@ -2803,6 +2822,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 .map((check) => `${check.name}: ${check.state}\n${check.detail ?? ''}`).join('\n');
               decisions.push(terminalObservation(classifyGithubActionsFailure(inspected, { additionalContext: checkContext })));
             } catch (error) {
+              inspectionFailures.push({ runId, error });
               record(handle.id, 'github.ci.inspection-failed', {
                 ...ref, runId, detail: error instanceof Error ? error.message : String(error),
               });
@@ -2811,9 +2831,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!decisions.length) {
           const providerFailure = classifyGithubActionsDiagnostic(summary);
+          const permissionFailure = inspectionFailures.find(({ error }) =>
+            error instanceof GithubActionsApiError && [401, 403].includes(error.status));
+          if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `${summary}\n\nKrmax cannot inspect the replacement workflow run. Grant the GitHub App Actions: read and write permission and approve the updated installation permissions, then retry.`,
+            eligibleUserIds: [actorUserId],
+          };
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\nGitHub did not expose an Actions run id that krmax can safely rerun. Resolve the provider/account condition on GitHub, then retry.`,
+            detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure === 'superseded') {
@@ -2867,33 +2894,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               fingerprint: revision.key } } : {}),
           };
         }
-        const superseded = decisions.find(({ decision }) => decision.disposition === 'superseded');
-        if (superseded && inspection.actions) {
-          const run = superseded.decision.inspection.run;
-          try {
-            const listed = await inspection.actions.listRuns(ref.slug, { event: run.event, perPage: 100 });
-            const newer = listed.runs.filter((candidate) => candidate.id !== run.id
-              && candidate.workflowId === run.workflowId
-              && (candidate.runNumber > run.runNumber
-                || Date.parse(candidate.createdAt) > Date.parse(run.createdAt)))
-              .filter((candidate) => !run.branch || !candidate.branch || candidate.branch === run.branch)
-              .sort((a, b) => b.runNumber - a.runNumber || b.attempt - a.attempt)[0];
-            if (newer) {
-              const state = String(newer.conclusion ?? newer.status).toLowerCase();
-              if (state === 'success') return externalWait(`${superseded.key}:superseded-by:${newer.id}:${newer.attempt}`,
-                `${detail}\n\nSuperseding GitHub Actions run ${newer.id} (attempt ${newer.attempt}) succeeded. Waiting for GitHub to refresh the pull-request readiness rollup; no proposal revision or admission slot is needed.`);
-              if (!['failure', 'cancelled', 'stale', 'startup_failure', 'timed_out', 'action_required'].includes(state))
-                return externalWait(`${superseded.key}:superseded-by:${newer.id}:${newer.attempt}`,
-                  `${detail}\n\nWaiting for superseding GitHub Actions run ${newer.id} (attempt ${newer.attempt}), currently ${state}. The task owns no admission slot.`);
-            }
-          } catch (error) {
-            record(handle.id, 'github.ci.superseding-inspection-failed', {
-              ...ref, runId: run.id, detail: error instanceof Error ? error.message : String(error),
-            });
-          }
-          return externalWait(superseded.key,
-            `${detail}\n\nThis run was superseded by GitHub concurrency or queue ordering. Waiting for the newer request instead of rerunning or reopening the unchanged proposal; the task owns no admission slot.`);
-        }
         const retry = decisions.find(({ decision }) => decision.disposition === 'retry');
         if (retry && inspection.actions) {
           const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
@@ -2925,6 +2925,48 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           return { status: 'waiting', prs: current, actorUserId, detail: 'Waiting for CI' };
+        }
+        const superseded = decisions.filter(({ decision }) => decision.disposition === 'superseded');
+        if (superseded.length && inspection.actions) {
+          let replacementsReady = true;
+          for (const observed of superseded) {
+            const decision = observed.decision;
+            let replacement;
+            try {
+              const listed = await inspection.actions.listRuns(ref.slug, {
+                workflow: decision.inspection.run.workflowId,
+                ...(decision.inspection.run.branch ? { branch: decision.inspection.run.branch } : {}),
+                perPage: 100,
+              });
+              replacement = listed.runs
+                .filter((run) => run.id > decision.inspection.run.id
+                  && run.headSha === decision.inspection.run.headSha
+                  && run.workflowId === decision.inspection.run.workflowId)
+                .sort((a, b) => b.id - a.id)
+                .find((run) => run.status === 'completed' && run.conclusion === 'success');
+            } catch (error) {
+              const blocked = error instanceof GithubActionsApiError && [401, 403].includes(error.status);
+              return {
+                status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
+                detail: `${detail}\n\nKrmax could not inspect the replacement workflow run: ${error instanceof Error ? error.message : String(error)}`,
+                ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
+              };
+            }
+            if (!replacement) {
+              replacementsReady = false;
+              continue;
+            }
+            record(handle.id, 'github.ci.superseded', {
+              ...ref,
+              runId: decision.inspection.run.id,
+              supersedingRunId: replacement.id,
+              workflowId: replacement.workflowId,
+              headSha: replacement.headSha,
+            });
+          }
+          if (replacementsReady && superseded.length === decisions.length) return undefined;
+          if (superseded.length === decisions.length) return externalWait(superseded[0]!.key,
+            `${detail}\n\nGitHub superseded a cancelled workflow run; waiting for the higher-priority replacement on the same exact revision without reopening the proposal.`);
         }
         return {
           status: 'needs-revision', prs: current, actorUserId, detail,
@@ -3047,7 +3089,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           if (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR') {
-            return ciFailureDecision(ref, readiness, current, inspection);
+            const failure = await ciFailureDecision(ref, readiness, current, inspection);
+            if (failure) return failure;
+            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: [] };
           }
           if (readiness?.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
@@ -3239,8 +3283,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           } catch (error) {
             return errorDecision(error, current);
           }
-          if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR')
-            return ciFailureDecision(ref, readiness, current, inspection);
+          if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR') {
+            const failure = await ciFailureDecision(ref, readiness, current, inspection);
+            if (failure) return failure;
+            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: [] };
+          }
           if (readiness.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
               record(handle.id, 'github.merge.authorization-revoked', { ...ref, reason: 'changes-requested' });
