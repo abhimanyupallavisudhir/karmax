@@ -310,7 +310,10 @@ export class GitProfiles {
     const env: Record<string, string> = {};
     if (profile.sshKey) {
       const key = this.materializeKey(profile.name, 'ssh', ctx);
-      env.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes`;
+      // A fresh hosted container has no known_hosts file. `accept-new` permits
+      // that first connection without weakening protection against a changed
+      // host key on subsequent operations.
+      env.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
     }
     if (profile.githubToken) {
       env.GH_TOKEN = this.resolveSecret(profile.name, 'token', ctx);

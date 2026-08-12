@@ -202,7 +202,7 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
   it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', () => {
     profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', sshKey: 'FAKE-KEY-MATERIAL', githubToken: 'tok' });
     const env = profiles.env(profiles.get('p')!, {});
-    expect(env.GIT_SSH_COMMAND).toMatch(/^ssh -i .* -o IdentitiesOnly=yes$/);
+    expect(env.GIT_SSH_COMMAND).toMatch(/^ssh -i .* -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new$/);
     const keyPath = env.GIT_SSH_COMMAND!.match(/^ssh -i (\S+)/)![1]!;
     expect(fs.readFileSync(keyPath, 'utf8')).toBe('FAKE-KEY-MATERIAL\n');
     expect(fs.statSync(keyPath).mode & 0o777).toBe(0o600);
