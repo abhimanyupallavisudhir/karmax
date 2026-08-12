@@ -1493,7 +1493,7 @@ function wireAgentBox(box) {
   box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
     openTaskPicker({
       title: 'Fork a previous agent',
-      hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
+      hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
       onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
@@ -4049,12 +4049,21 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       return close();
     }
     if (mode === 'task') { onPick(task); return close(); }
-    // agent mode: a task row toggles its session list (fetched once, then cached)
+    // Agent mode: fetch on the first click. A task with one resumable agent is
+    // unambiguous, so pick it immediately; only zero/multiple-agent tasks need
+    // the expanded detail list.
     if (expanded.has(tid)) { expanded.delete(tid); return paintList(); }
     expanded.add(tid);
     if (!sessions.has(tid)) {
       paintList(); // shows "Loading…" while the fetch is in flight
       sessions.set(tid, await api(`/api/tasks/${tid}/sessions`).catch(() => ({})));
+    }
+    const sourceSessions = sessions.get(tid) || {};
+    const roles = Object.keys(sourceSessions);
+    if (roles.length === 1) {
+      const role = roles[0];
+      onPick({ task, role, session: sourceSessions[role] });
+      return close();
     }
     paintList();
   };
