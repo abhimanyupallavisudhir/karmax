@@ -141,6 +141,13 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
     'POST /api/skills', 'POST /api/safe-mode',
   ],
+  connectors: [
+    'GET|POST /api/organizations/:organizationId/external-sources (list or create webhook, Slack, and Discord event sources)',
+    'PATCH|DELETE /api/organizations/:organizationId/external-sources/:sourceId',
+    'POST /api/organizations/:organizationId/external-sources/:sourceId/test',
+    'GET /api/organizations/:organizationId/external-events?limit= (delivery log and dead letters)',
+    'POST /api/organizations/:organizationId/external-events/:eventId/replay',
+  ],
   installation: [
     'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
     'GET /api/email', 'POST /api/email/connect|test',

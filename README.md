@@ -94,6 +94,7 @@ merged into your target branch.
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |
 | Immutable defaults + overlay resolution + **global safe mode** + per-workflow fallback | ✅ |
 | Hosted control plane: organizations/teams/RBAC, GitHub App onboarding, runner pools, isolated previews, backup/restore, one-command VPS stack | ✅ |
+| Durable external connectors: GitHub issues, Slack, Discord, generic signed webhooks, idempotent mapped runs, retries/dead letters | ✅ — [guide](docs/connectors.md) |
 
 ## Architecture
 

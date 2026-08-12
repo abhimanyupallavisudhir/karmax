@@ -7,6 +7,7 @@ import type { GitConnection, Repository } from '../domain/types.js';
 import { pullRequestWebhookEvent, reconcilePullRequestView, type GithubPrWebhookEvent } from './github-pr.js';
 import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
+import type { ExternalEventEnvelope } from '../domain/external-events.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -120,6 +121,8 @@ export interface GithubProjectWebhookEvent {
     originatingTaskId?: string;
   };
 }
+
+export type GithubExternalWebhookEvent = Omit<ExternalEventEnvelope, 'schema' | 'id' | 'receivedAt'>;
 
 export interface GitHubAppOptions {
   appId?: string;
@@ -311,7 +314,7 @@ export class GitHubAppService {
         // an agent world: krmax exposes read by default and gates rerun/cancel/
         // dispatch behind a distinct platform capability.
         actions: 'write', checks: 'read', contents: 'write', email_addresses: 'read', metadata: 'read',
-        pull_requests: 'write', statuses: 'read',
+        pull_requests: 'write', issues: 'read', statuses: 'read',
         // GitHub deliberately treats `.github/workflows/**` as a more sensitive
         // namespace than ordinary repository contents. Contents(write) can push
         // every other file, but Git rejects a ref update containing a workflow
@@ -328,7 +331,7 @@ export class GitHubAppService {
       manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
       // PR/check/merge-group lifecycle turns provider progress for a Karmax task
       // into durable events and wakes its reconciliation loop (SPEC §5.4).
-      manifest.default_events = ['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run'];
+      manifest.default_events = ['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run', 'issues'];
     }
     return {
       action: 'https://github.com/settings/apps/new',
@@ -629,7 +632,8 @@ export class GitHubAppService {
   }
 
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
-  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[]; projectEvents?: GithubProjectWebhookEvent[] }> {
+  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[];
+    projectEvents?: GithubProjectWebhookEvent[]; externalEvents?: GithubExternalWebhookEvent[] }> {
     if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
     // The delivery id is CLAIMED here (so two concurrent copies of one delivery
     // cannot both reconcile) but the claim is provisional: `dispatchWebhook` does
@@ -637,26 +641,64 @@ export class GitHubAppService {
     // used to be permanent — the exception became a gateway error, GitHub
     // redelivered, and the redelivery short-circuited as a duplicate, losing the
     // reconcile forever.
-    if (!this.store.recordGithubDelivery(deliveryId, event)) return { accepted: false };
+    // External issue events are deduplicated by the durable external inbox. Do
+    // not pre-claim them here: a process crash between normalization and inbox
+    // insertion would otherwise make GitHub's redelivery look complete and lose
+    // the event. Legacy PR/reconcile paths retain their existing delivery claim.
+    const usesExternalInbox = event === 'issues';
+    if (!usesExternalInbox && !this.store.recordGithubDelivery(deliveryId, event)) return { accepted: false };
     try {
       // Bounded retry budget: this call is inside GitHub's ~10 s delivery
       // timeout, so a long backoff must fail fast and let GitHub redeliver
       // rather than hold the response open (see WEBHOOK_RETRY_BUDGET_MS).
-      return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw));
+      return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw, deliveryId));
     } catch (error) {
-      this.store.releaseGithubDelivery(deliveryId);
+      if (!usesExternalInbox) this.store.releaseGithubDelivery(deliveryId);
       throw error;
     }
   }
 
-  private async dispatchWebhook(event: string, raw: Buffer):
-  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[]; projectEvents?: GithubProjectWebhookEvent[] }> {
+  private async dispatchWebhook(event: string, raw: Buffer, deliveryId: string):
+  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[];
+    projectEvents?: GithubProjectWebhookEvent[]; externalEvents?: GithubExternalWebhookEvent[] }> {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
     const connection = this.store.db.prepare('SELECT * FROM git_connections WHERE provider=? AND installationId=?')
       .get('github', installationId) as any;
     if (!connection) return { accepted: true };
+    if (event === 'issues' && payload.action === 'labeled') {
+      const repositoryPayload = payload.repository;
+      const repository = this.store.listRepositories(connection.organizationId).find((candidate) =>
+        (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
+        || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
+      if (!repository) return { accepted: true };
+      const issue = payload.issue ?? {};
+      const label = payload.label ?? {};
+      const sender = payload.sender ?? {};
+      return { accepted: true, externalEvents: [{
+        organizationId: connection.organizationId,
+        sourceId: `github:${repository.id}`,
+        connectionId: connection.id,
+        provider: 'github',
+        type: 'github.issue.label-added',
+        deliveryKey: deliveryId,
+        occurredAt: Date.parse(String(issue.updated_at ?? '')) || Date.now(),
+        actor: { externalId: sender.id == null ? undefined : String(sender.id), display: String(sender.login ?? '') || undefined },
+        subject: { externalId: `${repository.owner}/${repository.name}#${issue.number}`,
+          url: String(issue.html_url ?? '') || undefined },
+        data: {
+          action: 'labeled',
+          repository: { id: repository.id, providerId: repository.providerId,
+            owner: repository.owner, name: repository.name, full_name: `${repository.owner}/${repository.name}` },
+          issue: { id: issue.id == null ? undefined : String(issue.id), number: Number(issue.number),
+            title: String(issue.title ?? ''), body: String(issue.body ?? ''), url: String(issue.html_url ?? ''),
+            state: String(issue.state ?? ''), labels: Array.isArray(issue.labels) ? issue.labels.map((item: any) => String(item?.name ?? '')) : [] },
+          label: { id: label.id == null ? undefined : String(label.id), name: String(label.name ?? ''), color: String(label.color ?? '') },
+          sender: { id: sender.id == null ? undefined : String(sender.id), login: String(sender.login ?? '') },
+        },
+      }] };
+    }
     if (event === 'installation' && (payload.action === 'deleted' || payload.action === 'suspend')) {
       const saved = this.store.upsertGitConnection({ organizationId: connection.organizationId, provider: 'github', installationId,
         accountLogin: connection.accountLogin, accountType: connection.accountType ?? undefined, suspendedAt: Date.now() });

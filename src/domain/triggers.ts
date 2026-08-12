@@ -25,6 +25,8 @@
  */
 
 import type { KarmaxEvent } from './types.js';
+import { externalTriggerValidationErrors, type ExternalTrigger } from './external-events.js';
+export type { ExternalTrigger } from './external-events.js';
 
 // ─── Trigger shapes ──────────────────────────────────────────────────────────
 
@@ -67,7 +69,7 @@ export interface EventTrigger {
   recurring?: boolean;
 }
 
-export type TaskTrigger = DependencyTrigger | ScheduleTrigger | EventTrigger;
+export type TaskTrigger = DependencyTrigger | ScheduleTrigger | EventTrigger | ExternalTrigger;
 
 /** Lifecycle marker stored on a triggered task's params. */
 export type TriggerState = 'armed' | 'fired';
@@ -87,7 +89,7 @@ export function normalizeTriggers(params: unknown): TaskTrigger[] {
 export function isTrigger(t: unknown): t is TaskTrigger {
   if (!t || typeof t !== 'object') return false;
   const k = (t as TaskTrigger).kind;
-  return k === 'dependency' || k === 'schedule' || k === 'event';
+  return k === 'dependency' || k === 'schedule' || k === 'event' || k === 'external';
 }
 
 /** Does this task want to be gated behind a trigger (vs starting immediately)? */
@@ -144,6 +146,8 @@ export function validateTriggers(triggers: TaskTrigger[], ctx: TriggerValidation
         errs.push(`cron expression never occurs: "${t.cron}"`);
     } else if (t.kind === 'event') {
       if (!t.type) errs.push('event trigger needs an event `type`');
+    } else if (t.kind === 'external') {
+      errs.push(...externalTriggerValidationErrors(t));
     }
   }
   return errs;
@@ -230,6 +234,7 @@ export function dependencyMet(t: DependencyTrigger, satisfied: ReadonlySet<strin
 export function isRecurring(t: TaskTrigger): boolean {
   if (t.kind === 'schedule') return t.at === undefined ? t.recurring !== false : t.recurring === true;
   if (t.kind === 'event') return t.recurring === true;
+  if (t.kind === 'external') return true;
   return false; // dependency triggers are one-shot
 }
 

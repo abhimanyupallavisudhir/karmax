@@ -148,7 +148,8 @@ describe('GitHub App integration', () => {
       ], default_permissions: { email_addresses: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
-    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run']);
+    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run', 'issues']);
+    expect(manifest.manifest).toHaveProperty('default_permissions.issues', 'read');
     expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'read');
     expect(manifest.manifest).toHaveProperty('default_permissions.actions', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.workflows', 'write');
@@ -502,6 +503,37 @@ describe('GitHub App integration', () => {
     expect((await deliver('pull_request', 'pr-1', pull(`karmax/${task.id}`))).accepted).toBe(false);
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('normalizes a planned issue label delivery into a provider-neutral external event', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-issue-hook-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret');
+    const organization = store.createOrganization({ name: 'Issue Hooks', ownerUserId: 'owner' });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github',
+      providerId: '99', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git',
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    const service = new GitHubAppService(store, broker, { appId: '123' });
+    const raw = Buffer.from(JSON.stringify({
+      installation: { id: 42 }, action: 'labeled',
+      repository: { id: 99, full_name: 'acme/app' }, label: { id: 7, name: 'planned', color: '0e8a16' },
+      issue: { id: 123, number: 17, title: 'Build connectors', body: 'Details', state: 'open',
+        html_url: 'https://github.com/acme/app/issues/17', updated_at: '2026-08-12T12:00:00Z',
+        labels: [{ name: 'planned' }] }, sender: { id: 5, login: 'octocat' },
+    }));
+    const result = await service.handleWebhook('issues', 'issue-delivery-1', raw,
+      `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
+    expect(result.externalEvents).toEqual([expect.objectContaining({
+      organizationId: organization.id, sourceId: `github:${repository.id}`, connectionId: connection.id,
+      provider: 'github', type: 'github.issue.label-added', deliveryKey: 'issue-delivery-1',
+      subject: { externalId: 'acme/app#17', url: 'https://github.com/acme/app/issues/17' },
+      data: expect.objectContaining({ label: expect.objectContaining({ name: 'planned' }),
+        issue: expect.objectContaining({ number: 17, title: 'Build connectors', body: 'Details' }) }),
+    })]);
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('removes deploy keys left by an older karmax version during reconciliation', async () => {

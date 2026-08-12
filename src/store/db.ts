@@ -56,6 +56,7 @@ import {
   normalizeUrgency,
   urgencyRank,
 } from '../domain/types.js';
+import type { ExternalEventEnvelope, ExternalSource, StoredExternalEvent } from '../domain/external-events.js';
 import { resourceDriver } from '../domain/resource-drivers.js';
 import { newId } from '../util/id.js';
 
@@ -537,6 +538,28 @@ export class Store {
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS external_sources (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
+        name TEXT NOT NULL, config TEXT NOT NULL, enabled INTEGER NOT NULL,
+        secretHandle TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS external_events (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, sourceId TEXT NOT NULL,
+        connectionId TEXT, provider TEXT NOT NULL, type TEXT NOT NULL,
+        deliveryKey TEXT NOT NULL, occurredAt INTEGER NOT NULL, receivedAt INTEGER NOT NULL,
+        actor TEXT, subject TEXT, data TEXT NOT NULL, state TEXT NOT NULL,
+        attempts INTEGER NOT NULL, nextAttemptAt INTEGER NOT NULL, claimedAt INTEGER,
+        lastError TEXT, taskIds TEXT NOT NULL, UNIQUE(sourceId, deliveryKey)
+      );
+      CREATE TABLE IF NOT EXISTS external_trigger_runs (
+        eventId TEXT NOT NULL, templateId TEXT NOT NULL, taskId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, PRIMARY KEY(eventId, templateId), UNIQUE(taskId)
+      );
+      CREATE TABLE IF NOT EXISTS idempotent_task_requests (
+        principalId TEXT NOT NULL, projectId TEXT NOT NULL, requestKey TEXT NOT NULL,
+        bodyHash TEXT NOT NULL, taskId TEXT, createdAt INTEGER NOT NULL,
+        PRIMARY KEY(principalId, projectId, requestKey)
+      );
       CREATE TABLE IF NOT EXISTS collaboration_requests (
         id TEXT PRIMARY KEY, requesterTaskId TEXT NOT NULL, targetTaskId TEXT NOT NULL,
         targetRole TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL,
@@ -655,6 +678,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
+      CREATE INDEX IF NOT EXISTS idx_external_sources_org ON external_sources(organizationId, provider);
+      CREATE INDEX IF NOT EXISTS idx_external_events_pending ON external_events(state, nextAttemptAt);
+      CREATE INDEX IF NOT EXISTS idx_external_events_org ON external_events(organizationId, receivedAt DESC);
       CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
@@ -1028,6 +1054,9 @@ export class Store {
       deleteRows(this.db, 'task_tags', 'taskId', taskIds);
       deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
       deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
+      deleteRows(this.db, 'external_trigger_runs', 'templateId', taskIds);
+      deleteRows(this.db, 'external_trigger_runs', 'taskId', taskIds);
+      this.db.prepare('DELETE FROM idempotent_task_requests WHERE projectId=?').run(id);
       deleteRows(this.db, 'events', 'taskId', taskIds);
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
@@ -1213,6 +1242,13 @@ export class Store {
         ].map((row) => [String(row.id), row])).values(),
       ],
       events: rowsFor(this.db, 'events', 'taskId', taskIds),
+      external_sources: selectRows(this.db, 'external_sources', 'organizationId=?', [organizationId])
+        .map(({ secretHandle: _secret, ...row }) => ({ ...row, secretHandle: null })),
+      external_events: selectRows(this.db, 'external_events', 'organizationId=?', [organizationId]),
+      external_trigger_runs: rowsFor(this.db, 'external_trigger_runs', 'eventId',
+        (this.db.prepare('SELECT id FROM external_events WHERE organizationId=?').all(organizationId) as any[])
+          .map((row) => String(row.id))),
+      idempotent_task_requests: rowsFor(this.db, 'idempotent_task_requests', 'projectId', projectIds),
       tags: rowsFor(this.db, 'tags', 'projectId', projectIds),
       task_tags: rowsFor(this.db, 'task_tags', 'taskId', taskIds),
       saved_views: rowsFor(this.db, 'saved_views', 'projectId', projectIds),
@@ -1461,6 +1497,14 @@ export class Store {
       deleteRows(this.db, 'task_tags', 'taskId', taskIds);
       deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
       deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
+      deleteRows(this.db, 'external_trigger_runs', 'templateId', taskIds);
+      deleteRows(this.db, 'external_trigger_runs', 'taskId', taskIds);
+      const externalEventIds = (this.db.prepare('SELECT id FROM external_events WHERE organizationId=?')
+        .all(organizationId) as any[]).map((row) => String(row.id));
+      deleteRows(this.db, 'external_trigger_runs', 'eventId', externalEventIds);
+      this.db.prepare('DELETE FROM external_events WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM external_sources WHERE organizationId=?').run(organizationId);
+      deleteRows(this.db, 'idempotent_task_requests', 'projectId', projectIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
@@ -2280,6 +2324,8 @@ export class Store {
   // ─── Tasks ──────────────────────────────────────────────────────────────────
 
   createTask(input: {
+    /** Fixed id for durable external-delivery claims. Ordinary callers omit it. */
+    id?: string;
     projectId: string;
     listId?: string;
     title: string;
@@ -2302,7 +2348,7 @@ export class Store {
       (this.db
         .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM tasks WHERE listId = ?')
         .get(listId) as any).m + 1;
-    const id = newId('task');
+    const id = input.id ?? newId('task');
     const intentId = input.intentId ?? id;
     const attemptNumber = input.intentId
       ? Number((this.db.prepare('SELECT COALESCE(MAX(attemptNumber), 0) AS n FROM tasks WHERE intentId = ?').get(intentId) as any).n) + 1
@@ -2513,6 +2559,170 @@ export class Store {
       .map(rowToTask);
   }
 
+  // ─── External event ingress ────────────────────────────────────────────────
+
+  createExternalSource(input: {
+    organizationId: string; provider: string; name: string;
+    config?: Record<string, unknown>; secretHandle?: string;
+  }): ExternalSource {
+    const now = Date.now();
+    const source: ExternalSource = {
+      id: newId('src'), organizationId: input.organizationId, provider: input.provider,
+      name: input.name, config: input.config ?? {}, enabled: true,
+      secretHandle: input.secretHandle, createdAt: now, updatedAt: now,
+    };
+    this.db.prepare(`INSERT INTO external_sources
+      (id, organizationId, provider, name, config, enabled, secretHandle, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`).run(source.id, source.organizationId, source.provider,
+      source.name, JSON.stringify(source.config), source.secretHandle ?? null, now, now);
+    return source;
+  }
+
+  getExternalSource(id: string): ExternalSource | undefined {
+    const row = this.db.prepare('SELECT * FROM external_sources WHERE id=?').get(id) as any;
+    return row ? rowToExternalSource(row) : undefined;
+  }
+
+  listExternalSources(organizationId: string): ExternalSource[] {
+    return (this.db.prepare('SELECT * FROM external_sources WHERE organizationId=? ORDER BY createdAt')
+      .all(organizationId) as any[]).map(rowToExternalSource);
+  }
+
+  setExternalSourceEnabled(id: string, enabled: boolean): ExternalSource | undefined {
+    this.db.prepare('UPDATE external_sources SET enabled=?, updatedAt=? WHERE id=?')
+      .run(enabled ? 1 : 0, Date.now(), id);
+    return this.getExternalSource(id);
+  }
+
+  deleteExternalSource(id: string): void {
+    this.db.prepare('DELETE FROM external_sources WHERE id=?').run(id);
+  }
+
+  /** Insert an at-least-once delivery. Returns the existing event on redelivery. */
+  insertExternalEvent(input: Omit<ExternalEventEnvelope, 'id' | 'receivedAt'> & {
+    id?: string; receivedAt?: number;
+  }): { event: StoredExternalEvent; inserted: boolean } {
+    const id = input.id ?? newId('evt');
+    const receivedAt = input.receivedAt ?? Date.now();
+    const info = this.db.prepare(`INSERT OR IGNORE INTO external_events
+      (id, organizationId, sourceId, connectionId, provider, type, deliveryKey,
+       occurredAt, receivedAt, actor, subject, data, state, attempts, nextAttemptAt,
+       claimedAt, lastError, taskIds)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, '[]')`)
+      .run(id, input.organizationId, input.sourceId, input.connectionId ?? null, input.provider,
+        input.type, input.deliveryKey, input.occurredAt, receivedAt,
+        input.actor ? JSON.stringify(input.actor) : null,
+        input.subject ? JSON.stringify(input.subject) : null,
+        JSON.stringify(input.data), receivedAt);
+    const row = Number(info.changes) === 1
+      ? this.db.prepare('SELECT * FROM external_events WHERE id=?').get(id)
+      : this.db.prepare('SELECT * FROM external_events WHERE sourceId=? AND deliveryKey=?')
+        .get(input.sourceId, input.deliveryKey);
+    return { event: rowToExternalEvent(row as any), inserted: Number(info.changes) === 1 };
+  }
+
+  getExternalEvent(id: string): StoredExternalEvent | undefined {
+    const row = this.db.prepare('SELECT * FROM external_events WHERE id=?').get(id) as any;
+    return row ? rowToExternalEvent(row) : undefined;
+  }
+
+  getExternalEventByDelivery(sourceId: string, deliveryKey: string): StoredExternalEvent | undefined {
+    const row = this.db.prepare('SELECT * FROM external_events WHERE sourceId=? AND deliveryKey=?')
+      .get(sourceId, deliveryKey) as any;
+    return row ? rowToExternalEvent(row) : undefined;
+  }
+
+  listExternalEvents(organizationId: string, limit = 100): StoredExternalEvent[] {
+    return (this.db.prepare('SELECT * FROM external_events WHERE organizationId=? ORDER BY receivedAt DESC LIMIT ?')
+      .all(organizationId, Math.max(1, Math.min(500, limit))) as any[]).map(rowToExternalEvent);
+  }
+
+  externalEventCountSince(sourceId: string, since: number): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS count FROM external_events WHERE sourceId=? AND receivedAt>=?')
+      .get(sourceId, since) as { count: number } | undefined;
+    return Number(row?.count ?? 0);
+  }
+
+  claimPendingExternalEvents(now = Date.now(), limit = 25): StoredExternalEvent[] {
+    // A process that died while processing is reclaimable after ten minutes.
+    const stale = now - 10 * 60_000;
+    const rows = this.db.prepare(`SELECT id FROM external_events
+      WHERE (state='pending' OR state='failed' OR (state='processing' AND claimedAt<?))
+        AND nextAttemptAt<=? ORDER BY receivedAt LIMIT ?`).all(stale, now, limit) as Array<{ id: string }>;
+    const claimed: StoredExternalEvent[] = [];
+    for (const { id } of rows) {
+      const info = this.db.prepare(`UPDATE external_events SET state='processing', claimedAt=?, attempts=attempts+1
+        WHERE id=? AND (state='pending' OR state='failed' OR (state='processing' AND claimedAt<?))`)
+        .run(now, id, stale);
+      if (Number(info.changes) === 1) claimed.push(this.getExternalEvent(id)!);
+    }
+    return claimed;
+  }
+
+  completeExternalEvent(id: string, taskIds: string[]): void {
+    this.db.prepare(`UPDATE external_events SET state='delivered', claimedAt=NULL, lastError=NULL,
+      taskIds=? WHERE id=?`).run(JSON.stringify([...new Set(taskIds)]), id);
+  }
+
+  failExternalEvent(id: string, error: string, nextAttemptAt: number): void {
+    const row = this.db.prepare('SELECT attempts FROM external_events WHERE id=?').get(id) as
+      { attempts: number } | undefined;
+    const state = Number(row?.attempts ?? 0) >= 10 ? 'dead-letter' : 'failed';
+    this.db.prepare(`UPDATE external_events SET state=?, claimedAt=NULL,
+      lastError=?, nextAttemptAt=? WHERE id=?`).run(state, error.slice(0, 2_000), nextAttemptAt, id);
+  }
+
+  deferExternalEvent(id: string, reason: string, nextAttemptAt: number): void {
+    this.db.prepare(`UPDATE external_events SET state='pending', claimedAt=NULL,
+      attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END, lastError=?, nextAttemptAt=? WHERE id=?`)
+      .run(reason.slice(0, 2_000), nextAttemptAt, id);
+  }
+
+  replayExternalEvent(id: string): StoredExternalEvent | undefined {
+    this.db.prepare(`UPDATE external_events SET state='pending', claimedAt=NULL,
+      attempts=0, lastError=NULL, nextAttemptAt=? WHERE id=?`).run(Date.now(), id);
+    return this.getExternalEvent(id);
+  }
+
+  externalTriggerRun(eventId: string, templateId: string): { taskId: string } | undefined {
+    return this.db.prepare('SELECT taskId FROM external_trigger_runs WHERE eventId=? AND templateId=?')
+      .get(eventId, templateId) as { taskId: string } | undefined;
+  }
+
+  claimExternalTriggerRun(eventId: string, templateId: string): { taskId: string; inserted: boolean } {
+    const taskId = newId('task');
+    const info = this.db.prepare(`INSERT OR IGNORE INTO external_trigger_runs
+      (eventId, templateId, taskId, createdAt) VALUES (?, ?, ?, ?)`)
+      .run(eventId, templateId, taskId, Date.now());
+    const row = this.externalTriggerRun(eventId, templateId)!;
+    return { taskId: row.taskId, inserted: Number(info.changes) === 1 };
+  }
+
+  claimIdempotentTaskRequest(input: {
+    principalId: string; projectId: string; requestKey: string; bodyHash: string;
+  }): { state: 'claimed' | 'pending' | 'complete'; taskId?: string } {
+    const info = this.db.prepare(`INSERT OR IGNORE INTO idempotent_task_requests
+      (principalId, projectId, requestKey, bodyHash, taskId, createdAt) VALUES (?, ?, ?, ?, NULL, ?)`)
+      .run(input.principalId, input.projectId, input.requestKey, input.bodyHash, Date.now());
+    if (Number(info.changes) === 1) return { state: 'claimed' };
+    const row = this.db.prepare(`SELECT bodyHash, taskId FROM idempotent_task_requests
+      WHERE principalId=? AND projectId=? AND requestKey=?`)
+      .get(input.principalId, input.projectId, input.requestKey) as any;
+    if (row?.bodyHash !== input.bodyHash) throw new Error('idempotency key was already used with a different request body');
+    return row?.taskId ? { state: 'complete', taskId: String(row.taskId) } : { state: 'pending' };
+  }
+
+  completeIdempotentTaskRequest(principalId: string, projectId: string, requestKey: string, taskId: string): void {
+    this.db.prepare(`UPDATE idempotent_task_requests SET taskId=?
+      WHERE principalId=? AND projectId=? AND requestKey=?`).run(taskId, principalId, projectId, requestKey);
+  }
+
+  releaseIdempotentTaskRequest(principalId: string, projectId: string, requestKey: string): void {
+    this.db.prepare(`DELETE FROM idempotent_task_requests
+      WHERE principalId=? AND projectId=? AND requestKey=? AND taskId IS NULL`)
+      .run(principalId, projectId, requestKey);
+  }
+
   /** Runs spawned from a series (repeatable template), newest first.
    *  Filtered in SQL — this is reachable unpaginated from an HTTP request, so the
    *  old whole-table scan + JS filter was a per-request full transcript hydration. */
@@ -2713,6 +2923,7 @@ export class Store {
       this.db.prepare('DELETE FROM task_confirmation WHERE taskId = ?').run(taskId);
       this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId);
       this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId);
+      this.db.prepare('DELETE FROM external_trigger_runs WHERE templateId = ? OR taskId = ?').run(taskId, taskId);
       this.db.prepare('DELETE FROM world_instances WHERE worldId = ?').run(taskId);
       this.deletePermissionRequestKv(
         prior ? this.getProject(prior.projectId)?.organizationId : undefined,
@@ -4904,11 +5115,23 @@ export class Store {
    * SEAM: the app boot (`src/main.ts`) is what must schedule this — e.g.
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
-  retentionSweep(now = Date.now()): { scopedTokens: number; humanDelegations: number; githubDeliveries: number } {
+  retentionSweep(now = Date.now()): { scopedTokens: number; humanDelegations: number; githubDeliveries: number;
+    externalEvents: number; idempotentTaskRequests: number } {
+    const externalCutoff = now - 30 * 24 * 60 * 60_000;
+    const expiredExternal = (this.db.prepare(`SELECT id FROM external_events
+      WHERE state='delivered' AND receivedAt<=?`).all(externalCutoff) as Array<{ id: string }>).map((row) => row.id);
+    let externalEvents = 0;
+    for (const id of expiredExternal) {
+      this.db.prepare('DELETE FROM external_trigger_runs WHERE eventId=?').run(id);
+      externalEvents += Number(this.db.prepare('DELETE FROM external_events WHERE id=?').run(id).changes);
+    }
     return {
       scopedTokens: this.purgeScopedTokens(now),
       humanDelegations: this.purgeHumanDelegations(now),
       githubDeliveries: this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now),
+      externalEvents,
+      idempotentTaskRequests: Number(this.db.prepare('DELETE FROM idempotent_task_requests WHERE createdAt<=?')
+        .run(now - 7 * 24 * 60 * 60_000).changes),
     };
   }
 
@@ -5228,6 +5451,28 @@ function rowToRepository(r: any): Repository {
     owner: r.owner, name: r.name, sshUrl: r.sshUrl, defaultBranch: r.defaultBranch,
     private: Boolean(r.private), gitConnectionId: r.gitConnectionId ?? undefined,
     createdAt: r.createdAt, updatedAt: r.updatedAt };
+}
+
+function rowToExternalSource(r: any): ExternalSource {
+  return {
+    id: String(r.id), organizationId: String(r.organizationId), provider: String(r.provider),
+    name: String(r.name), config: JSON.parse(r.config || '{}'), enabled: Boolean(r.enabled),
+    secretHandle: r.secretHandle ?? undefined, createdAt: Number(r.createdAt), updatedAt: Number(r.updatedAt),
+  };
+}
+
+function rowToExternalEvent(r: any): StoredExternalEvent {
+  return {
+    schema: 'karmax.external-event/1', id: String(r.id), organizationId: String(r.organizationId),
+    sourceId: String(r.sourceId), connectionId: r.connectionId ?? undefined,
+    provider: String(r.provider), type: String(r.type), deliveryKey: String(r.deliveryKey),
+    occurredAt: Number(r.occurredAt), receivedAt: Number(r.receivedAt),
+    actor: r.actor ? JSON.parse(r.actor) : undefined,
+    subject: r.subject ? JSON.parse(r.subject) : undefined,
+    data: JSON.parse(r.data || '{}'), state: r.state, attempts: Number(r.attempts),
+    nextAttemptAt: Number(r.nextAttemptAt), claimedAt: r.claimedAt == null ? undefined : Number(r.claimedAt),
+    lastError: r.lastError ?? undefined, taskIds: JSON.parse(r.taskIds || '[]'),
+  };
 }
 
 function rowToInbox(r: any): InboxItem {

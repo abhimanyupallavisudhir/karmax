@@ -86,6 +86,15 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/projects/p1/repositories')).toBe('repository:read');
   });
 
+  it('keeps connector ingress signature-authenticated and connector administration tenant-scoped', () => {
+    expect(cap('POST', '/api/integrations/webhooks/src_1')).toBe('none');
+    expect(cap('POST', '/api/integrations/slack/src_1')).toBe('none');
+    expect(cap('POST', '/api/integrations/discord/src_1')).toBe('none');
+    expect(cap('GET', '/api/organizations/o1/external-sources')).toBe('organization:read');
+    expect(cap('POST', '/api/organizations/o1/external-sources')).toBe('organization:edit');
+    expect(cap('POST', '/api/organizations/o1/external-events/evt_1/replay')).toBe('organization:edit');
+  });
+
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
     expect(cap('GET', '/api/user/export')).toBe('none');
     expect(cap('GET', '/api/user/default-organization')).toBe('none');

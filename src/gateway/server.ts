@@ -64,6 +64,8 @@ import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireIntera
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
+import { GENERIC_WEBHOOK_SECRET_HANDLE, verifyDiscordSignature, verifyGenericWebhookSignature, verifySlackSignature,
+  type ExternalEventDispatcher } from '../integrations/external-events.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -88,6 +90,7 @@ export interface GatewayDeps {
   authorization?: AuthorizationService;
   worlds: WorldRegistry;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
+  externalEvents?: ExternalEventDispatcher;
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
   workflows?: import('../packages/manager.js').WorkflowManager;
   handoffs?: import('../world/handoff.js').WorldHandoffService;
@@ -193,6 +196,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  if (/^\/api\/integrations\/(?:webhooks|slack|discord)\/[^/]+$/.test(p)) return 'none';
+  if (/^\/api\/organizations\/[^/]+\/external-(?:sources|events)(?:\/|$)/.test(p))
+    return read ? 'organization:read' : 'organization:edit';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
@@ -990,6 +996,113 @@ export class Gateway {
         return this.sendWebResponse(res, await this.deps.identity.beginSso(String(b.callbackURL ?? '/'), requestHeaders(req.headers)));
       } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
     }
+    const slackWebhook = p.match(/^\/api\/integrations\/slack\/([^/]+)$/);
+    if (slackWebhook && method === 'POST' && this.deps.externalEvents && this.deps.broker) {
+      try {
+        const source = this.deps.store.getExternalSource(decodeURIComponent(slackWebhook[1]!));
+        if (!source || source.provider !== 'slack' || !source.enabled || !source.secretHandle)
+          return this.json(res, 404, { error: 'Slack source not found' });
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const secret = this.deps.broker.resolve(source.secretHandle, { caps: [`use-credential:${source.secretHandle}`] });
+        if (!verifySlackSignature(secret,
+          typeof req.headers['x-slack-request-timestamp'] === 'string' ? req.headers['x-slack-request-timestamp'] : undefined,
+          typeof req.headers['x-slack-signature'] === 'string' ? req.headers['x-slack-signature'] : undefined, raw))
+          return this.json(res, 401, { error: 'invalid or expired Slack signature' });
+        const body = JSON.parse(raw.toString('utf8')) as any;
+        if (body.type === 'url_verification') return this.json(res, 200, { challenge: body.challenge });
+        const event = body.event ?? {};
+        if (body.type !== 'event_callback' || !['app_mention', 'message'].includes(String(event.type))
+          || (event.type === 'message' && event.channel_type !== 'im') || event.bot_id || event.subtype)
+          return this.json(res, 200, { accepted: false });
+        const channels = Array.isArray(source.config.channelIds) ? source.config.channelIds.map(String) : [];
+        const users = Array.isArray(source.config.userIds) ? source.config.userIds.map(String) : [];
+        if ((channels.length && !channels.includes(String(event.channel))) || (users.length && !users.includes(String(event.user))))
+          return this.json(res, 200, { accepted: false, filtered: true });
+        const result = this.deps.externalEvents.ingest({ organizationId: source.organizationId,
+          sourceId: source.id, provider: 'slack', type: 'slack.message.received',
+          deliveryKey: String(body.event_id ?? `${event.channel}:${event.ts}`),
+          occurredAt: Math.floor(Number(event.event_ts ?? event.ts) * 1000) || Date.now(),
+          actor: { externalId: String(event.user ?? ''), display: String(event.username ?? '') || undefined },
+          subject: { externalId: `${event.channel}:${event.ts}` },
+          data: { teamId: body.team_id, channelId: event.channel, userId: event.user,
+            text: String(event.text ?? ''), timestamp: event.ts, threadTimestamp: event.thread_ts,
+            eventType: event.type },
+        });
+        return this.json(res, 200, { accepted: true, duplicate: !result.inserted, eventId: result.event.id });
+      } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    const discordWebhook = p.match(/^\/api\/integrations\/discord\/([^/]+)$/);
+    if (discordWebhook && method === 'POST' && this.deps.externalEvents) {
+      try {
+        const source = this.deps.store.getExternalSource(decodeURIComponent(discordWebhook[1]!));
+        if (!source || source.provider !== 'discord' || !source.enabled)
+          return this.json(res, 404, { error: 'Discord source not found' });
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        if (!verifyDiscordSignature(String(source.config.publicKey ?? ''),
+          typeof req.headers['x-signature-timestamp'] === 'string' ? req.headers['x-signature-timestamp'] : undefined,
+          typeof req.headers['x-signature-ed25519'] === 'string' ? req.headers['x-signature-ed25519'] : undefined, raw))
+          return this.json(res, 401, { error: 'invalid Discord signature' });
+        const body = JSON.parse(raw.toString('utf8')) as any;
+        if (body.type === 1) return this.json(res, 200, { type: 1 });
+        if (![2, 3].includes(Number(body.type))) return this.json(res, 200, { type: 4, data: { content: 'Unsupported interaction', flags: 64 } });
+        const guilds = Array.isArray(source.config.guildIds) ? source.config.guildIds.map(String) : [];
+        const channels = Array.isArray(source.config.channelIds) ? source.config.channelIds.map(String) : [];
+        const commands = Array.isArray(source.config.commandNames) ? source.config.commandNames.map(String) : [];
+        if ((guilds.length && !guilds.includes(String(body.guild_id)))
+          || (channels.length && !channels.includes(String(body.channel_id)))
+          || (commands.length && !commands.includes(String(body.data?.name))))
+          return this.json(res, 200, { type: 4, data: { content: 'This command is not enabled here.', flags: 64 } });
+        this.deps.externalEvents.ingest({ organizationId: source.organizationId, sourceId: source.id,
+          provider: 'discord', type: 'discord.command.received', deliveryKey: String(body.id),
+          occurredAt: Date.now(), actor: { externalId: String(body.member?.user?.id ?? body.user?.id ?? ''),
+            display: String(body.member?.user?.username ?? body.user?.username ?? '') || undefined },
+          subject: { externalId: `${body.guild_id ?? 'dm'}:${body.channel_id ?? ''}:${body.id}` },
+          data: { applicationId: body.application_id, guildId: body.guild_id, channelId: body.channel_id,
+            command: body.data?.name, options: body.data?.options ?? [], resolved: body.data?.resolved ?? {},
+            userId: body.member?.user?.id ?? body.user?.id },
+        });
+        return this.json(res, 200, { type: 4, data: { content: 'Request accepted by Karmax.', flags: 64 } });
+      } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    const genericWebhook = p.match(/^\/api\/integrations\/webhooks\/([^/]+)$/);
+    if (genericWebhook && method === 'POST' && this.deps.externalEvents && this.deps.broker) {
+      try {
+        const sourceId = decodeURIComponent(genericWebhook[1]!);
+        const source = this.deps.store.getExternalSource(sourceId);
+        if (!source || source.provider !== 'webhook' || !source.enabled) return this.json(res, 404, { error: 'external source not found' });
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const secret = this.deps.broker.resolve(source.secretHandle ?? GENERIC_WEBHOOK_SECRET_HANDLE(source.id),
+          { caps: [`use-credential:${source.secretHandle ?? GENERIC_WEBHOOK_SECRET_HANDLE(source.id)}`] });
+        const timestamp = typeof req.headers['x-karmax-timestamp'] === 'string' ? req.headers['x-karmax-timestamp'] : undefined;
+        const signature = typeof req.headers['x-karmax-signature'] === 'string' ? req.headers['x-karmax-signature'] : undefined;
+        if (!verifyGenericWebhookSignature(secret, timestamp, signature, raw))
+          return this.json(res, 401, { error: 'invalid or expired external webhook signature' });
+        const body = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+        const type = String(body.type ?? '').trim();
+        if (!type || type.length > 200) return this.json(res, 400, { error: 'external event type is required' });
+        const data = body.data;
+        if (!data || typeof data !== 'object' || Array.isArray(data))
+          return this.json(res, 400, { error: 'external event data must be an object' });
+        const hops = Number((data as Record<string, any>)._karmax?.hops ?? 0);
+        if (Number.isFinite(hops) && hops >= 8)
+          return this.json(res, 409, { error: 'external event hop limit exceeded' });
+        const deliveryKey = String(req.headers['x-karmax-delivery'] ?? body.deliveryKey
+          ?? crypto.createHash('sha256').update(raw).digest('hex')).slice(0, 500);
+        const occurredAt = typeof body.occurredAt === 'number' ? body.occurredAt
+          : Date.parse(String(body.occurredAt ?? '')) || Date.now();
+        const result = this.deps.externalEvents.ingest({
+          organizationId: source.organizationId, sourceId: source.id, provider: source.provider,
+          type, deliveryKey, occurredAt, data: data as Record<string, unknown>,
+          actor: body.actor && typeof body.actor === 'object' && !Array.isArray(body.actor)
+            ? body.actor as any : undefined,
+          subject: body.subject && typeof body.subject === 'object' && !Array.isArray(body.subject)
+            ? body.subject as any : undefined,
+        });
+        return this.json(res, 202, { accepted: true, duplicate: !result.inserted, eventId: result.event.id });
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     if (p === '/api/github/webhook' && method === 'POST' && this.deps.githubApp) {
       try {
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
@@ -1002,7 +1115,8 @@ export class Gateway {
         // timeline and `event` triggers see it like any other happening (SPEC §5.4).
         // The service already resolved each event to a task of the installing
         // organization, so dispatch is unconditional here.
-        const { events, projectEvents, ...body } = result;
+        const { events, projectEvents, externalEvents, ...body } = result;
+        for (const event of externalEvents ?? []) this.deps.externalEvents?.ingest(event);
         for (const event of events ?? []) {
           this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
           const task = this.deps.store.getTask(event.taskId);
@@ -1062,6 +1176,7 @@ export class Gateway {
         }
         return this.json(res, 200, { ...body,
           ...(events?.length ? { dispatched: events.length } : {}),
+          ...(externalEvents?.length ? { externalDispatched: externalEvents.length } : {}),
           ...(recoveries ? { recoveries } : {}),
         });
       } catch (error) {
@@ -1392,6 +1507,88 @@ export class Gateway {
     }
 
     try {
+      const externalSources = p.match(/^\/api\/organizations\/([^/]+)\/external-sources(?:\/([^/]+))?(?:\/(test))?$/);
+      if (externalSources) {
+        const organizationId = externalSources[1]!;
+        const sourceId = externalSources[2] ? decodeURIComponent(externalSources[2]) : undefined;
+        if (method === 'GET' && !sourceId) {
+          const generic = store.listExternalSources(organizationId).map(({ secretHandle: _secret, ...source }) => source);
+          const github = store.listRepositories(organizationId).map((repository) => ({
+            id: `github:${repository.id}`, organizationId, provider: 'github',
+            name: `GitHub · ${repository.owner}/${repository.name}`,
+            config: { repositoryId: repository.id, repository: `${repository.owner}/${repository.name}` },
+            enabled: true, native: true,
+          }));
+          return this.json(res, 200, [...github, ...generic]);
+        }
+        if (method === 'POST' && !sourceId) {
+          if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
+          const b = await this.body(req);
+          const provider = String(b.provider ?? 'webhook');
+          if (!['webhook', 'slack', 'discord'].includes(provider))
+            return this.json(res, 400, { error: 'provider must be webhook, slack, or discord' });
+          const config = b.config && typeof b.config === 'object' && !Array.isArray(b.config)
+            ? b.config as Record<string, unknown> : {};
+          if (provider === 'discord' && !/^[a-f0-9]{64}$/i.test(String(config.publicKey ?? '')))
+            return this.json(res, 400, { error: 'Discord source needs its 64-character application public key' });
+          if (provider === 'slack' && !String(b.signingSecret ?? '').trim())
+            return this.json(res, 400, { error: 'Slack source needs its app signing secret' });
+          const generatedSecret = provider === 'webhook' ? crypto.randomBytes(32).toString('base64url') : undefined;
+          const storedSecret = generatedSecret ?? (provider === 'slack' ? String(b.signingSecret) : undefined);
+          const handle = storedSecret ? `external-source:${newId('secret')}:${provider}-secret` : undefined;
+          if (handle && storedSecret) this.deps.broker.registerHandle(handle, storedSecret);
+          try {
+            const source = store.createExternalSource({ organizationId, provider,
+              name: String(b.name ?? provider).trim().slice(0, 200) || provider,
+              config,
+              secretHandle: handle });
+            const endpointKind = provider === 'webhook' ? 'webhooks' : provider;
+            return this.json(res, 201, { ...source, secretHandle: undefined,
+              ...(generatedSecret ? { secret: generatedSecret } : {}),
+              endpoint: `/api/integrations/${endpointKind}/${encodeURIComponent(source.id)}`,
+              ...(provider === 'webhook' ? { signing: 'HMAC-SHA256 over `${x-karmax-timestamp}.${rawBody}`' } : {}) });
+          } catch (error) {
+            if (handle) this.deps.broker.deleteHandle(handle);
+            throw error;
+          }
+        }
+        const source = sourceId ? store.getExternalSource(sourceId) : undefined;
+        if (!source || source.organizationId !== organizationId)
+          return this.json(res, 404, { error: 'external source not found' });
+        if (method === 'DELETE' && sourceId) {
+          store.setExternalSourceEnabled(sourceId, false);
+          if (source.secretHandle) this.deps.broker?.deleteHandle(source.secretHandle);
+          store.deleteExternalSource(sourceId);
+          return this.json(res, 200, { ok: true });
+        }
+        if (method === 'PATCH' && sourceId) {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setExternalSourceEnabled(sourceId, b.enabled !== false));
+        }
+        if (method === 'POST' && sourceId && externalSources[3] === 'test' && this.deps.externalEvents) {
+          const b = await this.body(req);
+          const type = String(b.type ?? '').trim();
+          if (!type) return this.json(res, 400, { error: 'event type is required' });
+          const event = this.deps.externalEvents.ingest({ organizationId, sourceId, provider: source.provider,
+            type, deliveryKey: `test:${newId('delivery')}`, occurredAt: Date.now(),
+            data: b.data && typeof b.data === 'object' && !Array.isArray(b.data) ? b.data : {},
+            subject: b.subject && typeof b.subject === 'object' && !Array.isArray(b.subject) ? b.subject : undefined });
+          return this.json(res, 202, { accepted: true, eventId: event.event.id });
+        }
+      }
+      const externalEventList = p.match(/^\/api\/organizations\/([^/]+)\/external-events$/);
+      if (externalEventList && method === 'GET') {
+        return this.json(res, 200, store.listExternalEvents(externalEventList[1]!, Number(url.searchParams.get('limit') ?? 100)));
+      }
+      const replayExternalEvent = p.match(/^\/api\/organizations\/([^/]+)\/external-events\/([^/]+)\/replay$/);
+      if (replayExternalEvent && method === 'POST') {
+        const event = store.getExternalEvent(decodeURIComponent(replayExternalEvent[2]!));
+        if (!event || event.organizationId !== replayExternalEvent[1])
+          return this.json(res, 404, { error: 'external event not found' });
+        const replayed = store.replayExternalEvent(event.id)!;
+        void this.deps.externalEvents?.processNow();
+        return this.json(res, 202, replayed);
+      }
       if (p === '/api/logout' && method === 'POST') {
         const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
         if (bearer) this.sessions.delete(bearer);
@@ -1627,6 +1824,8 @@ export class Gateway {
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
           this.deps.broker?.deleteHandle(handle);
+        for (const source of store.listExternalSources(organizationId))
+          if (source.secretHandle) this.deps.broker?.deleteHandle(source.secretHandle);
         this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
         store.deleteOrganization(organizationId);
@@ -2925,8 +3124,30 @@ export class Gateway {
           const b = await this.body(req);
           const project = store.getProject(projectId);
           if (project) await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-          const task = await api.createTask(token, { projectId, ...b });
-          return this.json(res, 200, task);
+          const requestKey = typeof req.headers['idempotency-key'] === 'string'
+            ? req.headers['idempotency-key'].trim() : '';
+          if (requestKey && (requestKey.length > 200 || /[^\x20-\x7e]/.test(requestKey)))
+            return this.json(res, 400, { error: 'Idempotency-Key must be at most 200 printable ASCII characters' });
+          const principalId = actorPrincipal(callerIdentity.actor);
+          const bodyHash = crypto.createHash('sha256').update(JSON.stringify(b)).digest('hex');
+          if (requestKey) {
+            const claim = store.claimIdempotentTaskRequest({ principalId, projectId, requestKey, bodyHash });
+            if (claim.state === 'complete') {
+              const existing = store.getTask(claim.taskId!);
+              if (existing) return this.json(res, 200, existing);
+              return this.json(res, 409, { error: 'the idempotent task record no longer exists' });
+            }
+            if (claim.state === 'pending')
+              return this.json(res, 409, { error: 'an identical idempotent task request is still being processed' });
+          }
+          try {
+            const task = await api.createTask(token, { projectId, ...b });
+            if (requestKey) store.completeIdempotentTaskRequest(principalId, projectId, requestKey, task.id);
+            return this.json(res, 200, task);
+          } catch (error) {
+            if (requestKey) store.releaseIdempotentTaskRequest(principalId, projectId, requestKey);
+            throw error;
+          }
         }
       }
 

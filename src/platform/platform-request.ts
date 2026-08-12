@@ -86,6 +86,7 @@ export const PLATFORM_REQUEST_EXCLUDED_PATHS = [
   '/api/session',
   '/api/sso/start',
   '/api/agent-mail/ingest', // inbound mail webhook, authenticated by a minted secret
+  '/api/integrations/', // external webhooks, authenticated by provider signature or source secret
   '/api/payments/stripe/', // Stripe OAuth callback + signature-verified webhook
   '/api/github/webhook', // GitHub webhook, HMAC-authenticated
   '/api/github/callback',

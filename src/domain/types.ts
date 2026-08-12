@@ -7,6 +7,7 @@
 
 import type { TaskTrigger, TriggerState } from './triggers.js';
 export type { TaskTrigger, TriggerState } from './triggers.js';
+export type { ExternalEventEnvelope, ExternalSource, StoredExternalEvent } from './external-events.js';
 
 /**
  * The coding harness that executes a turn. OpenCode is driven through stable

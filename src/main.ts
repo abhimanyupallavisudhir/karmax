@@ -345,8 +345,8 @@ async function main() {
   // once at boot so a long-stopped install catches up immediately.
   const sweepRetention = () => {
     const swept = store.retentionSweep();
-    if (swept.scopedTokens || swept.githubDeliveries)
-      console.log(`  • Purged ${swept.scopedTokens} expired token(s) and ${swept.githubDeliveries} aged webhook delivery id(s)`);
+    if (swept.scopedTokens || swept.githubDeliveries || swept.externalEvents || swept.idempotentTaskRequests)
+      console.log(`  • Purged ${swept.scopedTokens} expired token(s), ${swept.githubDeliveries} aged webhook delivery id(s), ${swept.externalEvents} external event(s), and ${swept.idempotentTaskRequests} idempotency key(s)`);
   };
   sweepRetention();
   const retentionTimer = setInterval(sweepRetention, 3600_000);
@@ -445,6 +445,27 @@ async function main() {
   });
   api.setTriggerArmer(triggerScheduler);
   triggerScheduler.start();
+  const { ExternalEventDispatcher } = await import('./integrations/external-events.js');
+  const externalToken = tokens.mintPrincipal('system:external-events', ['*']).token;
+  const externalEvents = new ExternalEventDispatcher({
+    store,
+    bus,
+    spawn: async ({ templateId, taskId, title, params, event }) => api.spawnRunWithInput(
+      externalToken,
+      templateId,
+      {
+        taskId,
+        title,
+        params,
+        externalEvent: {
+          id: event.id, provider: event.provider, type: event.type, sourceId: event.sourceId,
+          subject: event.subject, occurredAt: event.occurredAt,
+        },
+      },
+    ),
+    log: (m) => console.warn('  • ' + m),
+  });
+  externalEvents.start();
   worldLifecycle.start();
   delivery.start();
 
@@ -542,6 +563,7 @@ async function main() {
     authorization,
     worlds,
     githubApp,
+    externalEvents,
     providerConnections,
     workflows,
     handoffs,
@@ -613,6 +635,7 @@ async function main() {
     clearInterval(reconcileSweep);
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
+    externalEvents.stop();
     mailPoller.stop();
     worldLifecycle.stop();
     delivery.stop();

@@ -54,6 +54,7 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
 import type { GithubActionsStatus } from '../integrations/github-actions.js';
+import { externalMappedFieldAllowed } from '../domain/external-events.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -1295,7 +1296,7 @@ export class KarmaxApi {
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization,
-      _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
+      _discardProgress, _workflowRunId, _externalEvent, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     // Drafts re-resolve at queue time. Stamp that the resulting common branch
     // values already include repository fallback so provisioning must not apply
@@ -1660,26 +1661,56 @@ export class KarmaxApi {
    * each trigger fire of a repeatable series, and by "Run again".
    */
   async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
+    return this.spawnRunWithInput(token, seriesId);
+  }
+
+  /** Spawn a repeatable run with trusted, dispatcher-produced input binding.
+   * External payloads can change only workflow fields/title selected by the
+   * template mapping; authority and lifecycle metadata always come from the
+   * series. A fixed id closes the crash window between delivery claim and task
+   * creation. */
+  async spawnRunWithInput(token: string, seriesId: string, options: {
+    taskId?: string;
+    title?: string;
+    params?: Record<string, unknown>;
+    externalEvent?: {
+      id: string; provider: string; type: string; sourceId: string;
+      subject?: { externalId?: string; url?: string }; occurredAt: number;
+    };
+  } = {}): Promise<TaskRecord> {
     const series = this.deps.store.getTask(seriesId);
     // Scope the check to the series' own project (the run inherits it), so a
     // project-scoped token cannot spawn a run from another project's series.
     const caller = this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId });
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
-    let run = this.deps.store.createTask({
+    const existing = options.taskId ? this.deps.store.getTask(options.taskId) : undefined;
+    if (existing && (existing.projectId !== series.projectId || existing.params.runOf !== seriesId))
+      throw new ValidationError('fixed run id already belongs to another task');
+    const mappedParams = Object.fromEntries(Object.entries(options.params ?? {})
+      .filter(([field]) => externalMappedFieldAllowed(field)));
+    let run = existing ?? this.deps.store.createTask({
+      id: options.taskId,
       projectId: series.projectId,
       listId: series.listId,
-      title: series.title,
+      title: options.title?.trim().slice(0, 500) || series.title,
       workflow: series.workflow,
       workflowVersion: series.workflowVersion,
-      params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
+      params: {
+        ...cloneParamsWithoutTriggers(series.params),
+        ...mappedParams,
+        runOf: seriesId,
+        ...(options.externalEvent ? { _externalEvent: options.externalEvent } : {}),
+      },
       parentTaskId: series.parentTaskId,
       createdBy: principalRefOf(caller.principal) ?? series.createdBy,
       assignee: series.assignee,
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     });
-    run = this.inheritTaskDelegation(series, run);
-    this.persistTaskCredentialPolicies(run);
+    if (!existing) {
+      run = this.inheritTaskDelegation(series, run);
+      this.persistTaskCredentialPolicies(run);
+    }
     const { startType, input } = await this.buildStart(run);
     try {
       await withTimeout(
@@ -1687,13 +1718,14 @@ export class KarmaxApi {
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.deleteTask(run.id); // no orphan run row on a wedged engine
+      if (e instanceof WorkflowExecutionAlreadyStartedError) return this.deps.store.getTask(run.id)!;
+      if (!existing) this.deps.store.deleteTask(run.id); // no orphan run row on a wedged engine
       throw e;
     }
     const started = this.resolveStart(run.workflow, run.workflowVersion,
       this.deps.store.getProject(run.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(run.id, started.manifest, input);
-    return run;
+    return this.deps.store.getTask(run.id) ?? run;
   }
 
   /** "Run again": spawn a fresh run from a series on demand. */
