@@ -187,7 +187,8 @@ cmd_backup() {
   dc exec -T app npm run backup -- --allow-running "$temporary"
   dc cp "app:$temporary" "$destination/control-plane"
   dc exec -T app rm -rf "$temporary"
-  note 'Dumping Temporal history…'
+  note 'Dumping Karmax and Temporal PostgreSQL data…'
+  dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$destination/karmax.dump"
   dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$destination/temporal.dump"
   dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$destination/temporal-visibility.dump"
   cp -R "$SECRETS_DIR" "$destination/deployment-secrets"
@@ -220,7 +221,15 @@ cmd_backup_candidate() {
     return 1
   fi
   if ! dc exec -T app rm -rf "$temporary"; then rm -rf "$destination"; return 1; fi
-  note 'Dumping Temporal history…'
+  note 'Dumping PostgreSQL data…'
+  # The first deployment of PostgreSQL support still has all authoritative
+  # application state in the SQLite files captured above; its karmax database
+  # does not exist until the new schema job runs. Every later update must dump it.
+  if dc exec -T postgresql psql -U temporal -d postgres -Atqc "SELECT 1 FROM pg_database WHERE datname='karmax'" | grep -q 1; then
+    if ! dc exec -T postgresql pg_dump -U temporal -Fc karmax > "$destination/karmax.dump"; then
+      rm -rf "$destination"; return 1
+    fi
+  fi
   if ! dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$destination/temporal.dump"; then
     rm -rf "$destination"; return 1
   fi
@@ -258,10 +267,13 @@ cmd_restore() {
   until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
     attempt=$((attempt + 1)); [ "$attempt" -lt 60 ] || die 'PostgreSQL did not become ready'; sleep 2
   done
-  for database in temporal temporal_visibility; do
+  for database in karmax temporal temporal_visibility; do
     dc exec -T postgresql dropdb --if-exists -U temporal --force "$database"
     dc exec -T postgresql createdb -U temporal "$database"
   done
+  if [ -f "$source/karmax.dump" ]; then
+    dc exec -T postgresql pg_restore -U temporal -d karmax < "$source/karmax.dump"
+  fi
   dc exec -T postgresql pg_restore -U temporal -d temporal < "$source/temporal.dump"
   dc exec -T postgresql pg_restore -U temporal -d temporal_visibility < "$source/temporal-visibility.dump"
   dc build app

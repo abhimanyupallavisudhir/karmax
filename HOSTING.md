@@ -28,7 +28,7 @@ file an operator setting lives only as long as the shell that exported it, and
 |---|---|---|
 | `KARMAX_HOME`, `KARMAX_HOST`, `KARMAX_PORT`, `KARMAX_PUBLIC_URL`, `KARMAX_PREVIEW_ORIGIN` | operator | Infrastructure and origins. |
 | `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
-| `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires a real Temporal address; managed multi-node requires S3. |
+| `KARMAX_DATABASE_URL`, `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires PostgreSQL and a real Temporal address; managed cells require S3. |
 | `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Hard physical snapshot-byte allowance per organization. Hosted defaults to 5 GiB; `0` means unlimited and is unsuitable for open registration. |
 | `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). |
 | `KARMAX_GOOGLE_CLIENT_ID`, `KARMAX_GOOGLE_CLIENT_SECRET` | operator | Optional "Continue with Google". Separate from `KARMAX_OIDC_*` deliberately: that slot holds exactly one provider, so an install pointed at its company IdP would otherwise have to choose between the two. Set both or neither — the button appears only when both are non-empty. Register `https://<your-karmax-origin>/api/auth/callback/google` as the authorized redirect URI in the Google Cloud console; Better Auth serves that path itself, so it must match `KARMAX_PUBLIC_URL` exactly. Only the default `openid`/`email`/`profile` scopes are requested and no refresh token is asked for: karmax wants an identity, not access to the user's Google data, and an unused refresh token is only a long-lived secret to leak. A Google login on an address that already has a **verified** email+password account links into it rather than creating a duplicate; on an *unverified* one it is refused (the sign-in card explains why), because karmax's signup never proved that account owns the address. Read the comment in `src/auth/identity.ts` before relaxing either half of that. |
@@ -45,8 +45,15 @@ file an operator setting lives only as long as the shell that exported it, and
 `KARMAX_DEPLOYMENT=hosted` (set in both compose files) is not a hint — it is a
 fail-closed switch. `validateDeployment()` in `src/config/deployment.ts` refuses
 to boot unless the public and preview origins are **separate** HTTPS origins,
-the stable keys exist, Temporal is durable, and the object store fits the
+the stable keys exist, the application database is PostgreSQL, Temporal is durable, and the object store fits the
 profile. On top of that:
+
+- **SQLite is imported once, never mutated or deleted.** The first PostgreSQL
+  boot takes a database-wide advisory lock, creates the current schema, imports
+  both `state/karmax.db` and `state/auth.db` in transactions, validates every
+  table count, advances generated sequences, and records durable markers. A
+  validation failure rolls back and aborts startup. The old files remain an
+  operator-controlled rollback artifact; later boots skip the import.
 
 - **Host-machine affordances are withdrawn, not hidden.** `hostLocal()` returns
   false, so importing from the host's `pass` store, typing a host filesystem

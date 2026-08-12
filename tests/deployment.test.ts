@@ -12,6 +12,7 @@ describe('deployment profiles', () => {
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
     expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBeTruthy();
     expect(pkg.dependencies['@openai/codex']).toBe('0.144.5');
+    expect(pkg.dependencies.pg).toBeTruthy();
     expect(dockerfile).toContain('npm ci --omit=dev');
   });
 
@@ -30,6 +31,7 @@ describe('deployment profiles', () => {
       KARMAX_DEPLOYMENT: 'hosted', KARMAX_CELL_ID: 'eu-1', KARMAX_PUBLIC_URL: 'https://karmax.example',
       KARMAX_PREVIEW_ORIGIN: 'https://preview.karmax.example',
       KARMAX_AUTH_SECRET: secret, KARMAX_VAULT_KEY: secret, KARMAX_WORLD_REF_KEY: secret,
+      KARMAX_DATABASE_URL: 'postgres://karmax.example/karmax',
       KARMAX_TEMPORAL_ADDRESS: 'temporal.example:7233', KARMAX_OBJECT_STORE: 's3',
       KARMAX_S3_ENDPOINT: 'https://objects.example', KARMAX_S3_BUCKET: 'karmax',
       KARMAX_S3_ACCESS_KEY_ID: 'key', KARMAX_S3_SECRET_ACCESS_KEY: secret,
@@ -47,11 +49,22 @@ describe('deployment profiles', () => {
     const env = {
       KARMAX_DEPLOYMENT: 'hosted', KARMAX_SINGLE_NODE: '1', KARMAX_PUBLIC_URL: 'https://karmax.example',
       KARMAX_PREVIEW_ORIGIN: 'https://preview.karmax.example', KARMAX_AUTH_SECRET: secret,
-      KARMAX_VAULT_KEY: secret, KARMAX_WORLD_REF_KEY: secret, KARMAX_TEMPORAL_ADDRESS: 'temporal:7233',
+      KARMAX_VAULT_KEY: secret, KARMAX_WORLD_REF_KEY: secret,
+      KARMAX_DATABASE_URL: 'postgres://postgresql/karmax', KARMAX_TEMPORAL_ADDRESS: 'temporal:7233',
       KARMAX_OBJECT_STORE: 'local', KARMAX_CLOUD_WORLD_PROVIDER: 'daytona',
     };
     expect(validateDeployment(env)).toEqual({ hosted: true, singleNode: true, cellId: 'cell-1', hostLocal: false,
       cloudWorldProvider: 'daytona' });
+  });
+
+  it('never lets a hosted cell fall back to node-local SQLite', () => {
+    const secret = 'x'.repeat(32);
+    expect(() => validateDeployment({
+      KARMAX_DEPLOYMENT: 'hosted', KARMAX_SINGLE_NODE: '1', KARMAX_PUBLIC_URL: 'https://karmax.example',
+      KARMAX_PREVIEW_ORIGIN: 'https://preview.karmax.example', KARMAX_AUTH_SECRET: secret,
+      KARMAX_VAULT_KEY: secret, KARMAX_WORLD_REF_KEY: secret, KARMAX_TEMPORAL_ADDRESS: 'temporal:7233',
+      KARMAX_OBJECT_STORE: 'local', KARMAX_CLOUD_WORLD_PROVIDER: 'e2b',
+    })).toThrow(/KARMAX_DATABASE_URL must point at PostgreSQL/);
   });
 
   it('does not let a managed multi-node cell silently use node-local objects', () => {
@@ -69,6 +82,7 @@ describe('deployment profiles', () => {
     const base = {
       KARMAX_DEPLOYMENT: 'hosted', KARMAX_PUBLIC_URL: 'https://karmax.example',
       KARMAX_AUTH_SECRET: secret, KARMAX_VAULT_KEY: secret, KARMAX_WORLD_REF_KEY: secret,
+      KARMAX_DATABASE_URL: 'postgres://karmax.example/karmax',
       KARMAX_TEMPORAL_ADDRESS: 'temporal.example:7233', KARMAX_OBJECT_STORE: 's3',
       KARMAX_S3_ENDPOINT: 'https://objects.example', KARMAX_S3_BUCKET: 'karmax',
       KARMAX_S3_ACCESS_KEY_ID: 'key', KARMAX_S3_SECRET_ACCESS_KEY: secret,
@@ -105,10 +119,11 @@ describe('deployment profiles', () => {
   });
 
   it('loads file-backed secrets without replacing explicit values', () => {
-    const env: NodeJS.ProcessEnv = { KARMAX_AUTH_SECRET_FILE: '/auth', KARMAX_VAULT_KEY: 'explicit',
+    const env: NodeJS.ProcessEnv = { KARMAX_AUTH_SECRET_FILE: '/auth', KARMAX_DATABASE_URL_FILE: '/database', KARMAX_VAULT_KEY: 'explicit',
       KARMAX_VAULT_KEY_FILE: '/vault', KARMAX_GITHUB_OAUTH_CLIENT_SECRET_FILE: '/github-oauth' };
     hydrateSecretFiles(env, (filename) => `${filename}-value\n`);
     expect(env.KARMAX_AUTH_SECRET).toBe('/auth-value');
+    expect(env.KARMAX_DATABASE_URL).toBe('/database-value');
     expect(env.KARMAX_VAULT_KEY).toBe('explicit');
     expect(env.KARMAX_GITHUB_OAUTH_CLIENT_SECRET).toBe('/github-oauth-value');
   });

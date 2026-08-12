@@ -8,7 +8,7 @@ import { WorkerManager } from './temporal/worker-pool.js';
 import { TASK_QUEUE } from './temporal/config.js';
 import { WorkflowManager, reloadSpecForWorkflowEdit, proposerMayInstall } from './packages/manager.js';
 import { WorkflowRepoLoader } from './packages/repo.js';
-import { Store } from './store/db.js';
+import { openStore } from './store/db.js';
 import { WorldRegistry } from './world/registry.js';
 import { WorktreeProvider } from './world/worktree.js';
 import { buildAdapters, defaultProvider } from './agent/adapters.js';
@@ -120,7 +120,14 @@ async function main() {
   const { client, close: closeClient } = await makeClient(conn);
 
   // ── Core services ──
-  const store = new Store(path.join(p.state, 'karmax.db'));
+  const openedStore = openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL);
+  const store = openedStore.store;
+  if (process.env.KARMAX_DATABASE_URL) {
+    const migrated = openedStore.migration?.imported
+      ? `; imported ${openedStore.migration.rows} rows from SQLite`
+      : '';
+    console.log(`  • PostgreSQL application database${migrated}`);
+  }
   const authorization = new AuthorizationService(store);
   const broker = new CredentialBroker(new Vault(p.vault));
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
@@ -166,6 +173,7 @@ async function main() {
       .map((h) => `${isLoopbackHost(h) ? 'http' : 'https'}://${h}:*`),
   ])];
   const identity = await IdentityService.open(path.join(p.state, 'auth.db'), {
+    ...(process.env.KARMAX_DATABASE_URL ? { databaseUrl: process.env.KARMAX_DATABASE_URL } : {}),
     secret: process.env.KARMAX_AUTH_SECRET,
     baseURL: {
       allowedHosts: authHosts,
@@ -188,6 +196,8 @@ async function main() {
         inheritPersonalGithubProfile(store, broker, authorization.userId);
       } } } : legacyGithubOauth ? { github: legacyGithubOauth } : {}),
   });
+  if (identity.migration?.imported)
+    console.log(`  • Imported ${identity.migration.rows} identity rows from SQLite`);
   identity.connectOrganizationNames(() => store.organizationNameReservations());
   store.connectUserNames(() => identity.listUsers());
   const installationOwner = identity.listUsers()[0];
@@ -609,6 +619,8 @@ async function main() {
     await step(closeGateway());
     await step(workerManager.stop());
     await step(closeClient());
+    await step(identity.close());
+    store.close();
     if (server) {
       await step(server.stop()); // no-op for the shared server — it persists for a fast restart
       console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');

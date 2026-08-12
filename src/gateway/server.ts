@@ -6522,7 +6522,7 @@ function prometheusMetrics(snapshot: Record<string, unknown>): string {
   scalar('karmax_organizations', 'Organizations in this cell.', snapshot.organizations);
   scalar('karmax_projects', 'Projects in this cell.', snapshot.projects);
   scalar('karmax_event_cursor', 'Latest durable gateway event sequence.', snapshot.eventCursor);
-  scalar('karmax_database_bytes', 'SQLite control-plane database bytes.', snapshot.databaseBytes);
+  scalar('karmax_database_bytes', 'Control-plane database bytes.', snapshot.databaseBytes);
   const grouped = (metric: string, help: string, values: unknown) => {
     lines.push(`# HELP ${metric} ${help}`, `# TYPE ${metric} gauge`);
     for (const [state, count] of Object.entries((values ?? {}) as Record<string, unknown>))

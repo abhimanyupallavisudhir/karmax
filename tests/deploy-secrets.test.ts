@@ -63,6 +63,12 @@ describe('turnkey update deploys an exact validated revision', () => {
     expect(update).toContain('cmd_backup_candidate');
     expect(script).toContain('dc run --rm --no-deps app npm run backup');
   });
+
+  it('backs up and restores the PostgreSQL application database', () => {
+    expect(script).toContain('pg_dump -U temporal -Fc karmax');
+    expect(script).toContain('pg_restore -U temporal -d karmax');
+    expect(script).toContain('for database in karmax temporal temporal_visibility');
+  });
 });
 
 describe('turnkey deployment secrets', () => {

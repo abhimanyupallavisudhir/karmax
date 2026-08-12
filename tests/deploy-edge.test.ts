@@ -148,6 +148,19 @@ describe('compose forwards optional identity providers', () => {
   }
 });
 
+describe('compose provisions the PostgreSQL application database', () => {
+  it('turnkey creates and connects the separate karmax database', () => {
+    expect(read('temporal/setup-postgres.sh')).toContain('--db karmax create');
+    expect(read('compose.turnkey.yml')).toMatch(/KARMAX_DATABASE_URL:\s+postgres:\/\/[^\n]+\/karmax/);
+  });
+
+  it('managed hosting mounts the database URL as a secret', () => {
+    const compose = read('compose.hosted.yml');
+    expect(compose).toContain('KARMAX_DATABASE_URL_FILE: /run/secrets/database_url');
+    expect(compose).toContain('database_url: { file: ./.secrets/database_url }');
+  });
+});
+
 // `./deploy/karmax up` is documented as "Configure or start", so operators re-run
 // it — and it regenerates .turnkey.env from scratch. Anything it does not know to
 // carry over is deleted, which is how a working social sign-in disappears at the
