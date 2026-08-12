@@ -760,11 +760,15 @@ export interface GitHubMergeAuthorization {
   detail?: string;
   /** Project members whose live GitHub role currently permits a merge request. */
   eligibleUserIds?: string[];
+  /** Stable identity of the provider observation that produced this decision.
+   * The same evidence must not start the same recovery action twice. */
+  evidenceKey?: string;
   /** Why landing returned to Do, and whether the already-recorded intent
    * authorization survives an automated repair. */
   repair?: {
     kind: 'conflict' | 'base-moved' | 'ci' | 'changes-requested' | 'head-changed';
     preserveAuthorization: boolean;
+    evidenceKey?: string;
   };
   /** Provider-owned durable queue state. Used by replay-pinned v1.16 landing;
    * v1.17 keeps the karmax target lease through exact-candidate validation and

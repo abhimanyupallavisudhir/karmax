@@ -223,7 +223,8 @@ const MAX_SHELL_NUDGES = 3;
 const MAX_GITHUB_ERROR_POLLS = 3;
 /** Landing repairs are automatic, but after this many consecutive failures a
  * person is asked for guidance instead of spending agent turns—and, from v1.17,
- * blocking the front landing slot—forever. */
+ * blocking the front landing slot—forever. CI repair evidence is deduplicated by
+ * the activity before it reaches this counter, so these are distinct failures. */
 const MAX_AUTOMATED_LANDING_REPAIRS = 5;
 
 /**
@@ -3352,6 +3353,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             detail: decision.detail,
           };
           if (preservesIntent && attempts >= MAX_AUTOMATED_LANDING_REPAIRS) {
+            const evidenceBoundRepairMessages = patched('software-dev-evidence-bound-repair-messages-v1');
             if (frontHeldLanding) await releaseRetainedLandingDomains();
             confirmed = false;
             status = 'waiting';
@@ -3363,9 +3365,13 @@ Inspect the complete current diff and specifically compare its delta from the re
                 ...(decision.actorUserId ? [`user:${decision.actorUserId}`] : []),
                 '@creator',
               ])],
-              detail: frontHeldLanding
-                ? `This task exhausted ${attempts} front-held automated landing repairs. Its landing slot has been released so human input blocks nothing. Confirm to authorize another queued repair attempt, or send guidance to the Do agent.`
-                : `This pull request was ejected ${attempts} times while the target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
+              detail: evidenceBoundRepairMessages
+                ? frontHeldLanding
+                  ? `This task encountered ${attempts} distinct repair-required landing outcomes. Its landing slot has been released so human input blocks nothing. Confirm to authorize another queued repair attempt, or send guidance to the Do agent.`
+                  : `This pull request encountered ${attempts} distinct repair-required landing outcomes. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`
+                : frontHeldLanding
+                  ? `This task exhausted ${attempts} front-held automated landing repairs. Its landing slot has been released so human input blocks nothing. Confirm to authorize another queued repair attempt, or send guidance to the Do agent.`
+                  : `This pull request was ejected ${attempts} times while the target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
             };
             await publish();
             await condition(() => confirmed || cancelled || msgs.length > waitSeen);
@@ -3560,13 +3566,16 @@ Inspect the complete current diff and specifically compare its delta from the re
           detail: result.note ?? detail,
         };
         if (attempts >= MAX_AUTOMATED_LANDING_REPAIRS) {
+          const evidenceBoundRepairMessages = patched('software-dev-local-evidence-bound-repair-messages-v1');
           confirmed = false;
           status = 'waiting';
           const waitSeen = msgs.length;
           waitingFor = {
             kind: 'human',
             audience: ['@creator'],
-            detail: `This proposal was ejected ${attempts} times while its target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
+            detail: evidenceBoundRepairMessages
+              ? `This proposal encountered ${attempts} distinct repair-required landing outcomes. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`
+              : `This proposal was ejected ${attempts} times while its target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
           };
           await publish();
           await condition(() => confirmed || cancelled || msgs.length > waitSeen);

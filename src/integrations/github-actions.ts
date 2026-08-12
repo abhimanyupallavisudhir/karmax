@@ -6,6 +6,7 @@
  * redirect without forwarding Authorization and are size/output bounded before
  * they can enter an agent conversation.
  */
+import crypto from 'node:crypto';
 import net from 'node:net';
 
 export type GithubActionsStatus =
@@ -81,6 +82,25 @@ export interface GithubActionsFailureDecision {
   inspection: GithubActionsFailureInspection;
 }
 
+/** A landing assessment separates provider observation from workflow action.
+ * Only `proposal-defect` authorizes a Do turn; ambiguity is represented
+ * explicitly instead of silently becoming a source-code repair. */
+export type GithubActionsAssessmentKind =
+  | 'proposal-defect'
+  | 'provider-interruption'
+  | 'external-block'
+  | 'unknown'
+  | 'deployment';
+
+export interface GithubActionsFailureAssessment {
+  kind: GithubActionsAssessmentKind;
+  reason: string;
+  /** Stable identity for the exact provider evidence. Re-observing this key
+   * cannot justify another proposal mutation. */
+  evidenceKey: string;
+  inspection: GithubActionsFailureInspection;
+}
+
 export type GithubActionsTokenProvider =
   (options?: { forceRefresh?: boolean }) => Promise<string>;
 
@@ -115,6 +135,37 @@ const DEFAULT_MAX_JOB_LOGS = 8;
 const MAX_JOB_PAGES = 10;
 const HUMAN_CONFIGURATION_FAILURE = /(?:billing|payment|spending limit|budget|prepaid|quota for (?:actions|minutes)|included minutes|actions (?:is|are) disabled|workflow(?:s)? (?:is|are) disabled|no hosted runners?|not permitted to use (?:actions|this action)|resource not accessible by integration|requires? approval|approve and run|action required)/i;
 const TRANSIENT_RUNNER_FAILURE = /(?:the hosted runner|runner (?:has|was|is) (?:lost|disconnected|offline)|failed to (?:acquire|start|create|provision) (?:a )?runner|no runner matching|service unavailable|internal server error|gateway timeout|connection (?:reset|timed out)|network (?:error|failure)|temporary failure|try again later|job was cancelled because|received a shutdown signal|lost communication with the server|the operation was canceled)/i;
+
+const evidenceHash = (parts: unknown[]) => `github-actions:${crypto.createHash('sha256')
+  .update(JSON.stringify(parts)).digest('hex')}`;
+
+/** Identity for an exact run attempt, independent of how much diagnostic text
+ * GitHub happened to expose to a particular token. */
+export function githubActionsFailureEvidenceKey(inspection: GithubActionsFailureInspection): string {
+  return evidenceHash([
+    inspection.run.id,
+    inspection.run.attempt,
+    inspection.run.headSha,
+    inspection.run.status,
+    inspection.run.conclusion ?? '',
+  ]);
+}
+
+/** Identity used when Actions inspection is unavailable. Check URLs generally
+ * contain the immutable run/job ids; the name/state fallback also works for
+ * external status providers. Details are deliberately excluded because later
+ * permission-sensitive enrichment must not make old evidence look new. */
+export function githubCheckEvidenceKey(input: {
+  slug: string;
+  number: number;
+  headSha?: string;
+  checks?: Array<{ name: string; state: string; url?: string }>;
+}): string {
+  const checks = [...(input.checks ?? [])]
+    .map((check) => [check.name, check.state.toUpperCase(), check.url ?? ''])
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  return evidenceHash([input.slug.toLowerCase(), input.number, input.headSha ?? '', checks]);
+}
 
 export class GithubActionsApi {
   private fetcher: typeof fetch;
@@ -296,39 +347,69 @@ export class GithubActionsApi {
  * Pull-request code failures return to the proposal; provider/configuration
  * failures go to a human; clearly transient runner failures get a bounded
  * rerun; failures after merge belong to a separate deployment recovery task. */
-export function classifyGithubActionsFailure(
+export function assessGithubActionsFailure(
   inspection: GithubActionsFailureInspection,
   options: { postMerge?: boolean; additionalContext?: string } = {},
-): GithubActionsFailureDecision {
+): GithubActionsFailureAssessment {
+  const evidenceKey = githubActionsFailureEvidenceKey(inspection);
   if (options.postMerge) return {
-    disposition: 'deployment',
+    kind: 'deployment', evidenceKey,
     reason: 'The failing workflow ran after the revision was merged; repairing it must not reopen or mutate the completed proposal.',
     inspection,
   };
   const corpus = `${githubActionsFailureCorpus(inspection)}\n${options.additionalContext ?? ''}`;
   const conclusion = String(inspection.run.conclusion ?? '').toLowerCase();
   if (HUMAN_CONFIGURATION_FAILURE.test(corpus) || conclusion === 'action_required') return {
-    disposition: 'human',
+    kind: 'external-block', evidenceKey,
     reason: 'GitHub reported an account, billing, permission, approval, runner-availability, or repository configuration problem that changing the proposal cannot fix.',
     inspection,
   };
   if (['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(conclusion)
     || inspection.failedJobs.some((job) => ['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(String(job.conclusion ?? '').toLowerCase()))
     || TRANSIENT_RUNNER_FAILURE.test(corpus)) return {
-    disposition: 'retry',
+    kind: 'provider-interruption', evidenceKey,
     reason: 'GitHub reported a transient or interrupted runner failure; rerun the exact revision before asking an agent to change code.',
     inspection,
   };
+  // A terminal FAILURE plus a concrete failed job is affirmative evidence that
+  // the exact proposal executed and failed. Without the job-level observation,
+  // ownership is unknown (provider outage and policy failures often collapse to
+  // the same aggregate FAILURE state).
+  if (['failure', 'error'].includes(conclusion) && inspection.failedJobs.length) return {
+    kind: 'proposal-defect', evidenceKey,
+    reason: 'A completed job failed on the exact proposal without a provider-level cause, so the proposal may need repair.',
+    inspection,
+  };
   return {
-    disposition: 'revision',
-    reason: 'The completed check failed without a provider-level cause, so the exact proposal should be repaired and reviewed again.',
+    kind: 'unknown', evidenceKey,
+    reason: 'GitHub reported a terminal result without enough job-level evidence to determine whether changing the proposal would help.',
     inspection,
   };
 }
 
+/** Back-compatible rendering used by the public Actions inspection surface.
+ * Landing itself consumes the richer assessment above. */
+export function classifyGithubActionsFailure(
+  inspection: GithubActionsFailureInspection,
+  options: { postMerge?: boolean; additionalContext?: string } = {},
+): GithubActionsFailureDecision {
+  const assessment = assessGithubActionsFailure(inspection, options);
+  const disposition: GithubActionsFailureDisposition = assessment.kind === 'deployment'
+    ? 'deployment'
+    : assessment.kind === 'external-block'
+      ? 'human'
+      : assessment.kind === 'provider-interruption'
+        ? 'retry'
+        : assessment.kind === 'proposal-defect'
+          ? 'revision'
+          : 'human';
+  return { disposition, reason: assessment.reason, inspection };
+}
+
 /** Classify a provider diagnostic even when GitHub rejected the workflow before
  * allocating a run/job whose logs can be downloaded. `undefined` means the
- * text contains no safe provider-level signal and should remain a code failure. */
+ * text contains no safe ownership signal and landing must preserve it as an
+ * unknown outcome rather than infer a proposal defect. */
 export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry' | undefined {
   if (HUMAN_CONFIGURATION_FAILURE.test(input)) return 'human';
   if (TRANSIENT_RUNNER_FAILURE.test(input)) return 'retry';
@@ -339,15 +420,16 @@ export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry
  * GitHub exposed. The inspection API already strips signed log URLs and caps
  * each downloaded log; this adds a total event/prompt boundary. */
 export function renderGithubActionsFailure(
-  decision: GithubActionsFailureDecision,
+  decision: GithubActionsFailureDecision | GithubActionsFailureAssessment,
   maxChars = 96 * 1024,
 ): string {
   const { run, failedJobs, notices } = decision.inspection;
+  const classification = 'kind' in decision ? decision.kind : decision.disposition;
   const lines = [
     `GitHub Actions run ${run.name} #${run.runNumber} (attempt ${run.attempt}) concluded ${run.conclusion ?? run.status}.`,
     `Revision: ${run.headSha || 'unknown'}`,
     ...(run.url ? [`Run: ${run.url}`] : []),
-    `Classification: ${decision.disposition} — ${decision.reason}`,
+    `Classification: ${classification} — ${decision.reason}`,
   ];
   if (!failedJobs.length) lines.push('GitHub exposed no terminally failing job output.');
   for (const job of failedJobs) {

@@ -7,6 +7,7 @@ import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent, reconcilePullRequestView } from '../src/integrations/github-pr.js';
+import { GithubActionsApi } from '../src/integrations/github-actions.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 
@@ -735,7 +736,19 @@ describe('GitHub-authoritative merge activity', () => {
       { __typename: 'CheckRun', name: 'unit tests', conclusion: 'FAILURE', detailsUrl: 'https://github.test/checks/21' },
     ] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
-      status: 'needs-revision', detail: expect.stringMatching(/unit tests.*checks\/21/is),
+      status: 'needs-human',
+      detail: expect.stringMatching(/unit tests.*checks\/21.*cannot determine.*No Do turn/is),
+    });
+
+    readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
+      { __typename: 'CheckRun', name: 'unit tests', conclusion: 'CANCELLED',
+        detailsUrl: 'https://github.test/actions/runs/21/job/22' },
+      { __typename: 'CheckRun', name: 'deploy artifacts', conclusion: 'CANCELLED',
+        detailsUrl: 'https://github.test/actions/runs/21/job/23' },
+    ] } } };
+    await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
+      status: 'retryable-error',
+      detail: expect.stringMatching(/CI was interrupted.*proposal will not be changed/is),
     });
 
     readiness = { reviewDecision: 'CHANGES_REQUESTED' };
@@ -765,6 +778,81 @@ describe('GitHub-authoritative merge activity', () => {
     readiness = { mergeStateStatus: 'BLOCKED', statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({ status: 'waiting', detail: expect.stringMatching(/merge must not be attempted/i) });
     expect(methods).toContain('PUT');
+  });
+
+  it('starts at most one repair for the same exact CI evidence', async () => {
+    const runId = 900;
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      if (method === 'GET' && url.pathname.endsWith('/pulls/77')) return Response.json({
+        number: 77, node_id: 'PR_evidence', html_url: 'https://github.test/acme/widgets/pull/77', state: 'open',
+        merged: false, head: { ref: 'karmax/task_evidence', sha: 'reviewed-head' }, base: { ref: 'main' },
+      });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_evidence', url: 'https://github.test/acme/widgets/pull/77', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: 'reviewed-head', mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+          statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+            __typename: 'CheckRun', databaseId: 700, name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+            detailsUrl: `https://github.com/${SLUG}/actions/runs/${runId}/job/901`,
+          }] } }, viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+        } } } });
+      if (url.pathname.endsWith('/check-runs/700')) return Response.json({ output: { summary: 'AssertionError in unit tests' } });
+      if (url.pathname.endsWith('/check-runs/700/annotations')) return Response.json([]);
+      if (url.pathname.endsWith(`/actions/runs/${runId}`)) return Response.json({
+        id: runId, name: 'CI', workflow_id: 1, run_number: 5, run_attempt: 1, event: 'pull_request',
+        status: 'completed', conclusion: 'failure', head_sha: 'reviewed-head', html_url: `https://github.test/runs/${runId}`,
+        created_at: '2026-08-12T00:00:00Z', updated_at: '2026-08-12T00:01:00Z',
+      });
+      if (url.pathname.endsWith(`/actions/runs/${runId}/jobs`)) return Response.json({ jobs: [{
+        id: 901, name: 'unit tests', status: 'completed', conclusion: 'failure', html_url: 'https://github.test/jobs/901',
+        steps: [{ number: 1, name: 'Run tests', status: 'completed', conclusion: 'failure' }],
+      }] });
+      if (url.pathname.endsWith(`/actions/runs/${runId}/artifacts`)) return Response.json({ artifacts: [] });
+      if (url.pathname.endsWith('/actions/jobs/901/logs')) return new Response('AssertionError: expected true to be false\n');
+      return Response.json({ message: `unexpected ${method} ${url.pathname}` }, { status: 500 });
+    }) as typeof fetch;
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+      installationToken: async () => 'installation-token',
+      actions: () => new GithubActionsApi('installation-token', { apiBase: 'https://api.github.test', fetch: fetcher }),
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Evidence-bound repairs');
+    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'evidence-installation', accountLogin: 'acme', accountType: 'Organization' });
+    const repository = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'widgets', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
+      gitConnectionId: connection.id });
+    core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+    const task = core.store.createTask({ projectId: project.id, title: 'Deduplicate CI', workflow: 'software-dev',
+      workflowVersion: '1.24.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'owner', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 77, headSha: 'reviewed-head' }],
+    } });
+    const handle = { id: task.id } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 77, nodeId: 'PR_evidence',
+      url: 'https://github.test/acme/widgets/pull/77', state: 'open', headSha: 'reviewed-head' }];
+
+    const first = await core.mergeGithubPrs(handle, refs);
+    expect(first).toMatchObject({
+      status: 'needs-revision', evidenceKey: expect.stringMatching(/^github-actions:/),
+      repair: { kind: 'ci', preserveAuthorization: true, evidenceKey: expect.any(String) },
+    });
+    const repeated = await core.mergeGithubPrs(handle, refs);
+    expect(repeated).toMatchObject({
+      status: 'needs-human', evidenceKey: first.evidenceKey,
+      detail: expect.stringMatching(/already returned this exact head and run attempt.*suppressed/is),
+    });
+    expect(core.store.eventsSince(task.id, 0)
+      .filter((event) => event.type === 'github.ci.proposal-defect')).toHaveLength(1);
   });
 
   it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
@@ -910,7 +998,8 @@ describe('GitHub-authoritative merge activity', () => {
 
     readiness = { mergeStateStatus: 'UNSTABLE', statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [] } } };
     await expect(core.mergeGithubPrs(handle, refs)).resolves.toMatchObject({
-      status: 'needs-revision', repair: { kind: 'ci', preserveAuthorization: true },
+      status: 'needs-human',
+      detail: expect.stringMatching(/cannot determine.*No Do turn/is),
     });
 
     readiness = { mergeStateStatus: 'CLEAN', reviewDecision: 'CHANGES_REQUESTED' };
@@ -1100,7 +1189,7 @@ describe('GitHub-authoritative merge activity', () => {
       }] } } };
     const failed = await core.mergeGithubPrs(handle, updated.prs, { mode: 'submit', authority: 'auto' });
     expect(failed).toMatchObject({
-      status: 'needs-revision', repair: { kind: 'ci', preserveAuthorization: true },
+      status: 'needs-human', detail: expect.stringMatching(/cannot determine.*No Do turn/is),
     });
     expect(failed).not.toHaveProperty('landingOwner');
 
@@ -1226,7 +1315,9 @@ describe('GitHub-authoritative merge activity', () => {
     } });
 
     const failed = await core.mergeGithubPrs({ id: task.id } as any, refs, { mode: 'preflight', authority: 'auto' });
-    expect(failed).toMatchObject({ status: 'needs-revision', repair: { kind: 'ci' } });
+    expect(failed).toMatchObject({
+      status: 'needs-human', detail: expect.stringMatching(/cannot determine.*No Do turn/is),
+    });
     expect(mutations).toEqual([]);
 
     secondFails = false;

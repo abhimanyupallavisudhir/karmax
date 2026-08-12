@@ -3,8 +3,11 @@ import {
   GithubActionsApi,
   GithubActionsApiError,
   actionLogExcerpt,
+  assessGithubActionsFailure,
   classifyGithubActionsFailure,
   classifyGithubActionsDiagnostic,
+  githubActionsFailureEvidenceKey,
+  githubCheckEvidenceKey,
   githubActionsRunIdFromUrl,
   renderGithubActionsFailure,
   type GithubActionsFailureInspection,
@@ -45,6 +48,40 @@ describe('GitHub Actions API', () => {
     expect(renderGithubActionsFailure(deployment)).toContain('backup contains a symbolic link');
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/actions/runs/123/job/456')).toBe(123);
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/pull/1')).toBeUndefined();
+  });
+
+  it('requires affirmative job evidence before assigning a failure to the proposal', () => {
+    const aggregateOnly = inspection('', { conclusion: 'failure' });
+    aggregateOnly.failedJobs = [];
+    aggregateOnly.jobs = [];
+    expect(assessGithubActionsFailure(aggregateOnly)).toMatchObject({
+      kind: 'unknown',
+      reason: expect.stringMatching(/without enough job-level evidence/i),
+    });
+
+    expect(assessGithubActionsFailure(inspection('AssertionError: expected 2 to equal 3'))).toMatchObject({
+      kind: 'proposal-defect',
+      evidenceKey: expect.stringMatching(/^github-actions:/),
+    });
+    expect(assessGithubActionsFailure(inspection('cancelled before execution', {
+      conclusion: 'cancelled',
+    }))).toMatchObject({ kind: 'provider-interruption' });
+  });
+
+  it('fingerprints immutable evidence rather than permission-sensitive diagnostic enrichment', () => {
+    const first = inspection('short output');
+    const enriched = inspection('much more detailed output that arrived later');
+    expect(githubActionsFailureEvidenceKey(first)).toBe(githubActionsFailureEvidenceKey(enriched));
+
+    const summary = {
+      slug: 'Acme/App', number: 42, headSha: 'abc123',
+      checks: [{ name: 'test', state: 'CANCELLED', url: 'https://github.test/actions/runs/7/job/8' }],
+    };
+    const enrichedSummary = {
+      ...summary,
+      checks: [{ ...summary.checks[0]!, detail: 'new annotation' }],
+    };
+    expect(githubCheckEvidenceKey(summary)).toBe(githubCheckEvidenceKey(enrichedSummary));
   });
 
   it('lists normalized runs with bounded provider filters', async () => {

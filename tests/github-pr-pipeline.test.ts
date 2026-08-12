@@ -74,20 +74,28 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   const body = init.body ? JSON.parse(String(init.body)) : {};
   const json = (status: number, value: unknown) =>
     new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
-  if (u.pathname === `/repos/${SLUG}/actions/runs/42` && method === 'GET') return json(200, {
-    id: 42, name: 'CI', workflow_id: 7, run_number: 1, run_attempt: actionsRunAttempt,
+  const actionsRun = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs\/(42|43)$/);
+  if (actionsRun && method === 'GET') return json(200, {
+    id: Number(actionsRun[2]), name: 'CI', workflow_id: 7, run_number: 1, run_attempt: actionsRunAttempt,
     event: 'pull_request', status: 'completed', conclusion: 'failure', head_branch: prs[0]?.head?.ref,
-    head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/42`,
+    head_sha: prs.find((candidate) => candidate.repo === actionsRun[1])?.head?.sha ?? prs[0]?.head?.sha,
+    html_url: `https://github.com/${actionsRun[1]}/actions/runs/${actionsRun[2]}`,
     created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
   });
-  if (u.pathname === `/repos/${SLUG}/actions/runs/42/jobs` && method === 'GET') return json(200, { jobs: [{
-    id: 99, name: 'unit tests', status: 'completed', conclusion: 'timed_out',
-    html_url: `https://github.com/${SLUG}/actions/runs/42/job/99`,
-    steps: [{ number: 1, name: 'Run tests', status: 'completed', conclusion: 'timed_out' }],
+  const actionsJobs = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs\/(42|43)\/jobs$/);
+  if (actionsJobs && method === 'GET') return json(200, { jobs: [{
+    id: actionsJobs[2] === '42' ? 99 : 100, name: 'unit tests', status: 'completed',
+    conclusion: actionsJobs[2] === '42' ? 'timed_out' : 'failure',
+    html_url: `https://github.com/${actionsJobs[1]}/actions/runs/${actionsJobs[2]}/job/${actionsJobs[2] === '42' ? 99 : 100}`,
+    steps: [{ number: 1, name: 'Run tests', status: 'completed',
+      conclusion: actionsJobs[2] === '42' ? 'timed_out' : 'failure' }],
   }] });
-  if (u.pathname === `/repos/${SLUG}/actions/runs/42/artifacts` && method === 'GET') return json(200, { artifacts: [] });
-  if (u.pathname === `/repos/${SLUG}/actions/jobs/99/logs` && method === 'GET')
+  if (/^\/repos\/[^/]+\/[^/]+\/actions\/runs\/(42|43)\/artifacts$/.test(u.pathname) && method === 'GET')
+    return json(200, { artifacts: [] });
+  if (/\/actions\/jobs\/99\/logs$/.test(u.pathname) && method === 'GET')
     return new Response('Error: The hosted runner lost communication with the server\n');
+  if (/\/actions\/jobs\/100\/logs$/.test(u.pathname) && method === 'GET')
+    return new Response('AssertionError: expected the exact proposal to pass\n');
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/rerun-failed-jobs` && method === 'POST') {
     actionsReruns++;
     return new Response(null, { status: 201 });
@@ -561,7 +569,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/ci-repair',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/43/job/100`,
       }] } },
     };
     await handle.signal('confirm');
@@ -569,10 +577,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect.poll(async () => {
       const current = await view(handle);
       const context = current.messages.map((message: any) => message.text).join('\n');
-      // CheckRun output text requires an additional GitHub App permission and
-      // is deliberately not part of readiness. The actionable, permission-safe
-      // packet is the terminal classification plus check name and details URL.
-      return `${current.stage}/${/terminally failing CI.*unit tests.*ci-repair/is.test(context)}`;
+      return `${current.stage}/${/proposal-defect.*unit tests.*AssertionError/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
     githubReadiness = {};
     await handle.signal('confirm');
@@ -644,7 +649,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/intent-repair',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/43/job/100`,
       }] } },
     };
     await handle.signal('confirm');
@@ -717,7 +722,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/front-held',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/43/job/100`,
       }] } },
     };
     blockFrontHeldRepair = true;
@@ -795,7 +800,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/fair',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/43/job/100`,
       }] } },
     };
     await handle.signal('confirm');
@@ -933,7 +938,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadinessBySlug.set(slugB, {
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
-        __typename: 'StatusContext', context: 'integration', state: 'FAILURE', description: 'cross-repo contract failed',
+        __typename: 'CheckRun', name: 'integration', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${slugB}/actions/runs/43/job/100`,
       }] } },
     });
     await handle.signal('providerChanged');
@@ -942,7 +948,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const repairing = await view(handle);
     expect(repairing.state.mergeDomains).toBeUndefined();
     expect(repairing.landing.participants['acme/withdraw-a#1']).toMatchObject({ owner: 'unowned', state: 'ready' });
-    expect(repairing.messages.map((message: any) => message.text).join('\n')).toMatch(/cross-repo contract failed/i);
+    expect(repairing.messages.map((message: any) => message.text).join('\n'))
+      .toMatch(/AssertionError: expected the exact proposal to pass/i);
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);

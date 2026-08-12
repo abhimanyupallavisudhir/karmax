@@ -43,12 +43,13 @@ import {
 } from '../integrations/github-pr.js';
 import {
   GithubActionsApiError,
+  assessGithubActionsFailure,
   classifyGithubActionsDiagnostic,
-  classifyGithubActionsFailure,
+  githubCheckEvidenceKey,
   githubActionsRunIdFromUrl,
   renderGithubActionsFailure,
   type GithubActionsApi,
-  type GithubActionsFailureDecision,
+  type GithubActionsFailureAssessment,
 } from '../integrations/github-actions.js';
 import { isGithubWorkflowPermissionRejection, type GitHubRepositoryPermission } from '../integrations/github-app.js';
 import { cloudGitSource, type CloudGitSource } from '../world/cloud-source.js';
@@ -2748,9 +2749,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         inspection: ReturnType<typeof inspectionFor>,
       ): Promise<GitHubMergeAuthorization> => {
         const summary = ciFailureDetail(ref, readiness);
+        const fallbackEvidenceKey = githubCheckEvidenceKey({
+          slug: ref.slug, number: ref.number, headSha: ref.headSha,
+          checks: readiness.failedChecks,
+        });
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
-        const decisions: GithubActionsFailureDecision[] = [];
+        const decisions: GithubActionsFailureAssessment[] = [];
+        const inspectionErrors: string[] = [];
         if (inspection.actions) {
           for (const runId of runIds.slice(0, 4)) {
             try {
@@ -2761,38 +2767,75 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               const checkContext = (readiness.failedChecks ?? [])
                 .filter((check) => githubActionsRunIdFromUrl(check.url) === runId)
                 .map((check) => `${check.name}: ${check.state}\n${check.detail ?? ''}`).join('\n');
-              decisions.push(classifyGithubActionsFailure(inspected, { additionalContext: checkContext }));
+              decisions.push(assessGithubActionsFailure(inspected, { additionalContext: checkContext }));
             } catch (error) {
+              inspectionErrors.push(error instanceof Error ? error.message : String(error));
               record(handle.id, 'github.ci.inspection-failed', {
                 ...ref, runId, detail: error instanceof Error ? error.message : String(error),
               });
             }
           }
         }
+        const repairOnce = (assessment: GithubActionsFailureAssessment): GitHubMergeAuthorization => {
+          const evidenceKey = assessment.evidenceKey;
+          const repeated = events.some((event) => event.type === 'github.ci.proposal-defect'
+            && event.payload?.evidenceKey === evidenceKey);
+          const detail = renderGithubActionsFailure(assessment);
+          if (repeated) return {
+            status: 'needs-human', prs: current, actorUserId, evidenceKey,
+            detail: `${detail}\n\nKrmax already returned this exact head and run attempt to Do. GitHub has supplied no new defect evidence, so another automated proposal mutation was suppressed. Inspect the provider state or send explicit guidance before continuing.`,
+            eligibleUserIds: [actorUserId],
+          };
+          record(handle.id, 'github.ci.proposal-defect', {
+            ...ref, evidenceKey, runId: assessment.inspection.run.id,
+            runAttempt: assessment.inspection.run.attempt,
+          });
+          return {
+            status: 'needs-revision', prs: current, actorUserId, evidenceKey, detail,
+            ...(intentAuthorizedLanding
+              ? { repair: { kind: 'ci' as const, preserveAuthorization: true, evidenceKey } }
+              : {}),
+          };
+        };
         if (!decisions.length) {
           const providerFailure = classifyGithubActionsDiagnostic(summary);
-          if (providerFailure) return {
+          const states = (readiness.failedChecks ?? []).map((check) => check.state.toUpperCase());
+          const interrupted = states.length > 0
+            && states.every((state) => ['CANCELLED', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state));
+          const unavailable = inspectionErrors.length
+            ? ` Actions inspection failed: ${[...new Set(inspectionErrors)].join('; ').slice(0, 2_000)}`
+            : '';
+          if (interrupted || providerFailure === 'retry') return {
+            status: 'retryable-error', prs: current, actorUserId, evidenceKey: fallbackEvidenceKey,
+            detail: `${summary}\n\nCI was interrupted before Krmax obtained affirmative proposal-defect evidence. The proposal will not be changed.${unavailable}`,
+          };
+          if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\nGitHub did not expose an Actions run id that krmax can safely rerun. Resolve the provider/account condition on GitHub, then retry.`,
+            evidenceKey: fallbackEvidenceKey,
+            detail: `${summary}\n\nGitHub reported an account or repository condition that changing the proposal cannot fix.${unavailable}`,
             eligibleUserIds: [actorUserId],
           };
           return {
-            status: 'needs-revision', prs: current, actorUserId, detail: summary,
-            ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+            status: 'needs-human', prs: current, actorUserId, evidenceKey: fallbackEvidenceKey,
+            detail: `${summary}\n\nKrmax cannot determine whether this is a proposal defect because GitHub did not expose an inspectable completed run. No Do turn or proposal mutation was started.${unavailable}`,
+            eligibleUserIds: [actorUserId],
           };
         }
         const detail = decisions.map((decision) => renderGithubActionsFailure(decision)).join('\n\n').slice(0, 128_000);
-        const human = decisions.find((decision) => decision.disposition === 'human');
+        const human = decisions.find((decision) => decision.kind === 'external-block');
         if (human) return {
-          status: 'needs-human', prs: current, actorUserId, detail,
+          status: 'needs-human', prs: current, actorUserId, evidenceKey: human.evidenceKey, detail,
           eligibleUserIds: [actorUserId],
         };
-        const revision = decisions.find((decision) => decision.disposition === 'revision');
-        if (revision) return {
-          status: 'needs-revision', prs: current, actorUserId, detail,
-          ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+        const revision = decisions.find((decision) => decision.kind === 'proposal-defect');
+        if (revision) return repairOnce(revision);
+        const unknown = decisions.find((decision) => decision.kind === 'unknown');
+        if (unknown) return {
+          status: 'needs-human', prs: current, actorUserId, evidenceKey: unknown.evidenceKey,
+          detail: `${detail}\n\nKrmax has no affirmative evidence that changing the proposal would help. No Do turn or proposal mutation was started.`,
+          eligibleUserIds: [actorUserId],
         };
-        const retry = decisions.find((decision) => decision.disposition === 'retry');
+        const retry = decisions.find((decision) => decision.kind === 'provider-interruption');
         if (retry && inspection.actions) {
           const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
             && event.payload?.slug === ref.slug && Number(event.payload?.number) === ref.number
@@ -2825,8 +2868,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return { status: 'waiting', prs: current, actorUserId, detail: 'Waiting for CI' };
         }
         return {
-          status: 'needs-revision', prs: current, actorUserId, detail,
-          ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+          status: 'needs-human', prs: current, actorUserId,
+          detail: `${detail}\n\nKrmax could not establish an actionable owner for this CI outcome. No proposal mutation was started.`,
+          eligibleUserIds: [actorUserId],
         };
       };
       for (let ref of prs) {
