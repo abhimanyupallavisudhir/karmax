@@ -103,3 +103,12 @@ describe('turnkey deployment secrets', () => {
     expect(dockerfile).toMatch(/^USER\s+(?!root)\S+/m);
   });
 });
+
+describe('hosted credential connector runtime', () => {
+  const dockerfile = fs.readFileSync(path.join(deployDir, 'Dockerfile'), 'utf8');
+
+  it('installs GnuPG so Git-backed unix pass entries can be decrypted', () => {
+    const runtime = dockerfile.split('FROM node:22-bookworm-slim').at(-1) ?? '';
+    expect(runtime).toMatch(/apt-get install[^\n]*\bgnupg\b/);
+  });
+});
