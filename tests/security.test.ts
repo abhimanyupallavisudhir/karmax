@@ -123,4 +123,12 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
     broker.registerHandle('new-acct', 'pw-xyz');
     expect(broker.resolve('new-acct', { caps: ['use-credential:*'] })).toBe('pw-xyz');
   });
+
+  it('renames and rotates a handle without leaving the old credential behind', () => {
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle('openrouter:old', 'old-secret');
+    broker.updateHandle('openrouter:old', 'openrouter:new', 'new-secret');
+    expect(broker.hasHandle('openrouter:old')).toBe(false);
+    expect(broker.resolve('openrouter:new', { caps: ['use-credential:*'] })).toBe('new-secret');
+  });
 });

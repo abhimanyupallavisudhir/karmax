@@ -54,8 +54,8 @@ import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
-import { enumerateCredentials, resolveCredentials } from '../platform/credentials.js';
-import { gatherCredentialSources, readPolicyLayers } from '../platform/credential-sources.js';
+import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
+import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
@@ -565,14 +565,14 @@ export class Gateway {
 
   private explanationApiKey(provider: string, organizationId: string, projectId: string, taskId: string): string | undefined {
     const aliases = credentialAliases(provider);
-    const keys = enumerateCredentials(gatherCredentialSources({
+    const credentials = enumerateCredentials(gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
-    })).filter((credential) => credential.kind === 'key');
-    const ordered = resolveCredentials(keys, readPolicyLayers(
+    }));
+    const ordered = resolveExplanationCredentials(credentials, readPolicyLayers(
       (key) => this.deps.store.kvGet(key), { organizationId, projectId, taskId },
-    ));
+    )).filter((credential) => credential.kind === 'key');
     const credential = ordered.find((candidate) => aliases.includes(candidate.provider));
     if (!credential) return undefined;
     if (credential.apiKeyHandle) {
@@ -580,6 +580,26 @@ export class Gateway {
       return this.deps.broker.resolve(credential.apiKeyHandle, { taskId, caps: ['use-credential:*'] });
     }
     return process.env[apiKeyEnv(credential.provider)];
+  }
+
+  private remapCredentialPolicies(organizationId: string, from: string, to?: string): void {
+    const keys = [credPolicyKey.organization(organizationId)];
+    if (organizationId === 'org_personal') keys.push(credPolicyKey.global());
+    for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === organizationId)) {
+      keys.push(credPolicyKey.project(project.id));
+      for (const task of this.deps.store.listTasks(project.id)) keys.push(credPolicyKey.task(task.id));
+    }
+    for (const key of keys) {
+      const policy = parsePolicy(this.deps.store.kvGet(key));
+      if (policy) this.deps.store.kvSet(key, JSON.stringify(remapCredentialPolicy(policy, from, to)));
+    }
+    // These caches/settings share the stable credential id. Carry them across a
+    // rename and remove them on delete so a future key cannot inherit stale state.
+    for (const prefix of ['concurrency:', 'usage:']) {
+      const value = this.deps.store.kvGet(`${prefix}${from}`);
+      if (value !== undefined && to) this.deps.store.kvSet(`${prefix}${to}`, value);
+      this.deps.store.kvDelete(`${prefix}${from}`);
+    }
   }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
@@ -4822,6 +4842,41 @@ export class Gateway {
         await this.refreshLoginPool();
         return this.json(res, 200, { handle }); // never echoes the secret
       }
+      // Edit (rename and/or rotate) and delete a write-only API-key handle. The
+      // provider stays in the URL because changing vendors is a new credential.
+      const apiKeyMatch = resourcePath.match(/^\/api\/accounts\/keys\/([^/]+)\/([^/]+)$/);
+      if (apiKeyMatch && (method === 'DELETE' || method === 'PATCH')) {
+        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+        const provider = decodeURIComponent(apiKeyMatch[1]!);
+        const account = decodeURIComponent(apiKeyMatch[2]!);
+        const simpleId = /^[a-z0-9][a-z0-9._-]*$/i;
+        if (!simpleId.test(provider) || !simpleId.test(account))
+          return this.json(res, 400, { error: 'provider and account must be simple ids' });
+        const handleFor = (name: string) => resourceOrganizationId === 'org_personal'
+          ? `${provider}:${name}`
+          : `${provider}:${resourceOrganizationId}:${name}`;
+        const handle = handleFor(account);
+        if (!this.deps.broker.hasHandle(handle)) return this.json(res, 404, { error: 'API key not found' });
+        const credentialKey = `key:handle:${handle}`;
+        if (method === 'DELETE') {
+          this.deps.broker.deleteHandle(handle);
+          this.remapCredentialPolicies(resourceOrganizationId, credentialKey);
+          await this.refreshLoginPool();
+          return this.json(res, 200, { ok: true });
+        }
+        const b = await this.body(req);
+        const nextAccount = b.account === undefined ? account : String(b.account);
+        if (!simpleId.test(nextAccount)) return this.json(res, 400, { error: 'account must be a simple id' });
+        const nextHandle = handleFor(nextAccount);
+        if (nextHandle !== handle && this.deps.broker.hasHandle(nextHandle))
+          return this.json(res, 409, { error: `API key ${provider}:${nextAccount} already exists` });
+        const replacement = b.apiKey === undefined || b.apiKey === '' ? undefined : String(b.apiKey);
+        this.deps.broker.updateHandle(handle, nextHandle, replacement);
+        if (nextHandle !== handle)
+          this.remapCredentialPolicies(resourceOrganizationId, credentialKey, `key:handle:${nextHandle}`);
+        await this.refreshLoginPool();
+        return this.json(res, 200, { ok: true, handle: nextHandle });
+      }
       // connect an account login: mint a config home + launch the provider's own
       // OAuth, return the device URL for the user to complete (we never type creds).
       if (resourcePath === '/api/accounts/connect/code' && method === 'POST') {
@@ -5109,8 +5164,6 @@ export class Gateway {
       // enablement per scope (global→project→task), and set a scope's ordering /
       // enable-disable overrides.
       if (resourcePath === '/api/credentials' && method === 'GET') {
-        const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
-        const { gatherCredentialSources, parsePolicy, credPolicyKey } = await import('../platform/credential-sources.js');
         const projectId = url.searchParams.get('projectId') ?? undefined;
         const taskId = url.searchParams.get('taskId') ?? undefined;
         const scopedProjectId = projectId ?? (taskId ? store.getTask(taskId)?.projectId : undefined);
@@ -5128,13 +5181,28 @@ export class Gateway {
           ?? (scopedOrganizationId === 'org_personal' ? parsePolicy(store.kvGet(credPolicyKey.global())) : undefined);
         const pr = projectId ? parsePolicy(store.kvGet(credPolicyKey.project(projectId))) : undefined;
         const tk = taskId ? parsePolicy(store.kvGet(credPolicyKey.task(taskId))) : undefined;
-        const enabledKeys = (layers: { global?: unknown; project?: unknown; task?: unknown }) =>
-          resolveCredentials(creds, layers as any).map((c) => c.key);
+        const resolved = (layers: { global?: unknown; project?: unknown; task?: unknown }) => {
+          const enabled = resolveCredentials(creds, layers as any).map((c) => c.key);
+          const explanationEnabled = new Set(resolveExplanationCredentials(creds, layers as any)
+            .filter((credential) => credential.kind === 'key')
+            .map((credential) => credential.key));
+          return {
+            enabled,
+            modes: Object.fromEntries(creds.map((credential) => [credential.key,
+              enabled.includes(credential.key) ? 'on'
+                : credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
+                  : 'off',
+            ])),
+          };
+        };
+        const global = resolved({ global: g });
+        const project = projectId ? resolved({ global: g, project: pr }) : undefined;
+        const task = taskId ? resolved({ global: g, project: pr, task: tk }) : undefined;
         return this.json(res, 200, {
-          credentials: creds.map((c) => ({ key: c.key, label: c.label, provider: c.provider, kind: c.kind })),
-          global: { own: g ?? {}, enabled: enabledKeys({ global: g }) },
-          ...(projectId ? { project: { own: pr ?? {}, enabled: enabledKeys({ global: g, project: pr }) } } : {}),
-          ...(taskId ? { task: { own: tk ?? {}, enabled: enabledKeys({ global: g, project: pr, task: tk }) } } : {}),
+          credentials: creds.map((c) => ({ key: c.key, label: c.label, provider: c.provider, kind: c.kind, account: c.account })),
+          global: { own: g ?? {}, ...global },
+          ...(projectId && project ? { project: { own: pr ?? {}, ...project } } : {}),
+          ...(taskId && task ? { task: { own: tk ?? {}, ...task } } : {}),
         });
       }
       if (resourcePath === '/api/credentials/policy' && method === 'POST') {

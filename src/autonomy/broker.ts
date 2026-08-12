@@ -41,6 +41,15 @@ export class CredentialBroker {
     this.vault.delete(handle);
   }
 
+  /** Rename and/or rotate a handle without revealing its current secret to the
+   * gateway. Supplying no replacement keeps the existing secret. */
+  updateHandle(handle: string, nextHandle: string, replacement?: string) {
+    const secret = replacement ?? this.vault.reveal(handle);
+    if (secret === undefined) throw new Error(`credential broker: no secret for handle ${handle}`);
+    this.vault.put(nextHandle, secret);
+    if (nextHandle !== handle) this.vault.delete(handle);
+  }
+
   listHandles(): string[] {
     return this.vault.list();
   }

@@ -1389,7 +1389,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* Unified credential manager (logins + ambient + API keys): compact inline chips —
-   drag to set precedence, toggle On/Off to enable/disable. Global / project / task. */
+   drag to set precedence, choose where keys may be used. Global / project / task. */
 .cred-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .cred-row {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1407,8 +1407,16 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 .cred-toggle.on { background: var(--accent); color: #fff; border-color: transparent; }
 .cred-toggle.off { background: transparent; color: var(--ink-3); }
-.cred-rename, .cred-del { cursor: pointer; color: var(--ink-3); font-size: 11px; }
-.cred-rename:hover, .cred-del:hover { color: var(--accent); }
+.cred-mode {
+  max-width: 108px; height: 22px; padding: 0 20px 0 7px; border: 1px solid var(--line);
+  border-radius: 999px; background: var(--surface); color: var(--ink-2);
+  font: 700 10px/1 var(--font-ui); text-transform: uppercase; cursor: pointer;
+}
+.cred-mode.on { background: var(--accent); color: #fff; border-color: transparent; }
+.cred-mode.explainer-only { background: var(--accent-weak); color: var(--accent-ink); border-color: transparent; }
+.cred-rename, .cred-del, .cred-key-edit, .cred-key-del { cursor: pointer; color: var(--ink-3); font-size: 11px; }
+.cred-rename:hover, .cred-del:hover, .cred-key-edit:hover, .cred-key-del:hover { color: var(--accent); }
+.api-key-edit-form { width: min(440px, calc(100vw - 32px)); }
 
 /* ── Trigger dependency chip-input (task form) ────────────────────────────── */
 .chip-input {

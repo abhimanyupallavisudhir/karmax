@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest';
 import {
   enumerateCredentials,
   resolveCredentials,
+  resolveExplanationCredentials,
   credentialsForProvider,
   defaultEnabled,
   isEnabled,
+  isExplanationEnabled,
 } from '../src/platform/credentials.js';
-import { agentAccountHandles, credPolicyKey, gatherCredentialSources, readPolicyLayers } from '../src/platform/credential-sources.js';
+import { agentAccountHandles, credPolicyKey, gatherCredentialSources, readPolicyLayers, remapCredentialPolicy } from '../src/platform/credential-sources.js';
 
 const sources = {
   logins: [
@@ -105,6 +107,7 @@ describe('default policy: logins/ambient ON, API keys OFF (opt-in)', () => {
     expect(r).toEqual(['login:claude:manyu', 'login:claude:mats', 'login:codex:work', 'ambient:claude', 'ambient:codex']);
     expect(r).not.toContain('key:codex');
     expect(r).not.toContain('key:handle:claude:broker1');
+    expect(keys(resolveExplanationCredentials(all, {}))).not.toContain('key:handle:claude:broker1');
   });
   it('defaultEnabled: subscriptions on; a key is off when a subscription exists, on when it is the only option', () => {
     expect(defaultEnabled(all.find((c) => c.kind === 'login')!, all)).toBe(true);
@@ -141,6 +144,18 @@ describe('enable / disable across scopes (task → project → global)', () => {
   it('a project "on" opts in an API key that the global default leaves off', () => {
     expect(keys(resolveCredentials(all, { project: { on: ['key:handle:claude:broker1'] } }))).toContain('key:handle:claude:broker1');
   });
+  it('an explainer-only key is excluded from agents but available to explanations', () => {
+    const layers = { global: { explainerOnly: ['key:handle:claude:broker1'] } };
+    expect(keys(resolveCredentials(all, layers))).not.toContain('key:handle:claude:broker1');
+    expect(keys(resolveExplanationCredentials(all, layers))).toContain('key:handle:claude:broker1');
+    expect(isEnabled('key:handle:claude:broker1', layers, true)).toBe(false);
+    expect(isExplanationEnabled('key:handle:claude:broker1', layers, false)).toBe(true);
+  });
+  it('a lower scope can override explainer-only in either direction', () => {
+    const key = 'key:handle:claude:broker1';
+    expect(keys(resolveCredentials(all, { global: { explainerOnly: [key] }, task: { on: [key] } }))).toContain(key);
+    expect(keys(resolveExplanationCredentials(all, { global: { explainerOnly: [key] }, task: { off: [key] } }))).not.toContain(key);
+  });
 });
 
 describe('precedence ordering', () => {
@@ -157,6 +172,18 @@ describe('precedence ordering', () => {
   it('credentialsForProvider filters to one provider', () => {
     expect(credentialsForProvider(all, 'codex', {}).every((c) => c.provider === 'codex')).toBe(true);
     expect(keys(credentialsForProvider(all, 'codex', {}))).toEqual(['login:codex:work', 'ambient:codex']);
+  });
+});
+
+describe('credential policy references', () => {
+  it('renames or removes a key from every policy list without duplicates', () => {
+    const oldKey = 'key:handle:openrouter:old';
+    const newKey = 'key:handle:openrouter:new';
+    const renamed = remapCredentialPolicy({
+      order: [oldKey, newKey], on: [oldKey], off: [], explainerOnly: [oldKey],
+    }, oldKey, newKey);
+    expect(renamed).toEqual({ order: [newKey], on: [newKey], off: [], explainerOnly: [newKey] });
+    expect(remapCredentialPolicy(renamed, newKey)).toEqual({ order: [], on: [], off: [], explainerOnly: [] });
   });
 });
 

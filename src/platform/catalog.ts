@@ -153,6 +153,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/user/git-profiles/default', 'POST /api/user/git-profiles/signing-key',
     'GET|POST /api/organizations/:organizationId/accounts',
     'POST /api/organizations/:organizationId/accounts/connect|connect/code',
+    'PATCH|DELETE /api/organizations/:organizationId/accounts/keys/:provider/:account',
     'PATCH|DELETE /api/organizations/:organizationId/accounts/logins/:provider/:account',
     'POST /api/organizations/:organizationId/accounts/availability|concurrency|usage/recheck',
     'GET /api/organizations/:organizationId/accounts/usage',

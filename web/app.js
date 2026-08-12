@@ -4962,7 +4962,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // The id of the draft this form is editing. Starts as the passed-in draft; a
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
-  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
+  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
   // Prompt image attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
   const formState = () => {
@@ -7634,13 +7634,15 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     const base = data[opts.projectId ? 'project' : 'global'] || { enabled: [] };
     const baseEnabled = new Set(base.enabled || []);
     const pol = opts.policy || {};
-    const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []);
-    const isOn = (k) => (onSet.has(k) ? true : offSet.has(k) ? false : baseEnabled.has(k));
+    const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []), explainerSet = new Set(pol.explainerOnly || []);
+    const modeOf = (k) => onSet.has(k) ? 'on' : offSet.has(k) ? 'off' : explainerSet.has(k) ? 'explainer-only'
+      : base.modes?.[k] || (baseEnabled.has(k) ? 'on' : 'off');
     const seen = new Set(), eff = [];
     for (const k of [...(pol.order || []), ...(base.enabled || []), ...(data.credentials || []).map((c) => c.key)]) {
-      if (!seen.has(k) && isOn(k) && !eff.includes(k)) eff.push(k);
+      if (!seen.has(k) && modeOf(k) === 'on' && !eff.includes(k)) eff.push(k);
+      seen.add(k);
     }
-    sd = { own: pol, enabled: eff };
+    sd = { own: pol, enabled: eff, modes: Object.fromEntries((data.credentials || []).map((c) => [c.key, modeOf(c.key)])) };
   } else {
     sd = data[scope] || { own: {}, enabled: [] };
   }
@@ -7657,19 +7659,29 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     .map((key) => {
       const c = byKey[key];
       const isOn = enabled.has(key);
+      const mode = c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
       const login = loginByKey[key];
       const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
-      const acct = canManage && c.kind === 'login';
+      const loginActions = canManage && c.kind === 'login';
+      const keyActions = canManage && c.kind === 'key' && c.key.startsWith('key:handle:') && c.account;
       // Compact inline chip: the kind is obvious from the label (a login is
       // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
       const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
       const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
-      return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
+      const stateControl = c.kind === 'key'
+        ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
+            <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
+            <option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
+            <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>
+          </select>`
+        : `<button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'on' : 'off'}</button>`;
+      return `<div class="cred-row ${esc(mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
-        <button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'on' : 'off'}</button>
+        ${stateControl}
         <span class="cred-label mono">${icon}${esc(label)}${warn}</span>
-        ${acct ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
+        ${loginActions ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
+        ${keyActions ? '<span class="cred-key-edit" title="Edit API key">✎</span><span class="cred-key-del" title="Delete API key">✕</span>' : ''}
       </div>`;
     })
     .join('')}</div>`;
@@ -7684,12 +7696,21 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   };
   el.querySelectorAll('.cred-row').forEach((row) => {
     const key = row.dataset.key;
-    row.querySelector('.cred-toggle').addEventListener('click', () => {
+    row.querySelector('.cred-toggle')?.addEventListener('click', () => {
       const on = new Set(own.on || []), off = new Set(own.off || []);
       if (!enabled.has(key)) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
       save({ ...own, on: [...on], off: [...off] });
     });
+    row.querySelector('.cred-mode')?.addEventListener('change', (event) => {
+      const on = new Set(own.on || []), off = new Set(own.off || []), explainerOnly = new Set(own.explainerOnly || []);
+      on.delete(key); off.delete(key); explainerOnly.delete(key);
+      if (event.target.value === 'on') on.add(key);
+      else if (event.target.value === 'off') off.add(key);
+      else explainerOnly.add(key);
+      save({ ...own, on: [...on], off: [...off], explainerOnly: [...explainerOnly] });
+    });
     const login = loginByKey[key];
+    const credential = byKey[key];
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = prompt(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
@@ -7701,9 +7722,51 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
     });
+    row.querySelector('.cred-key-edit')?.addEventListener('click', () => openApiKeyEditor({
+      organizationBase,
+      credential,
+      onSaved: () => renderCredentialEditor(el, scope, opts),
+    }));
+    row.querySelector('.cred-key-del')?.addEventListener('click', async () => {
+      if (!confirm(`Delete API key ${credential.provider}:${credential.account}? The stored key is removed.`)) return;
+      try {
+        await api(`${organizationBase}/accounts/keys/${encodeURIComponent(credential.provider)}/${encodeURIComponent(credential.account)}`, { method: 'DELETE' });
+        toast('API key deleted'); renderCredentialEditor(el, scope, opts);
+      } catch (e) { toast(e.message, true); }
+    });
   });
   // Drag-to-reorder → precedence order for this scope.
   wireCredDrag(el.querySelector('.cred-list'), (order) => save({ ...own, order }));
+}
+
+function openApiKeyEditor({ organizationBase, credential, onSaved }) {
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card api-key-edit-form" role="dialog" aria-modal="true" aria-label="Edit API key">
+    <div class="modal-head"><b>Edit ${esc(credential.provider)} API key</b><button class="icon-btn api-key-edit-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Account name</span><input class="api-key-edit-account" value="${esc(credential.account)}" required pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label>
+    <label class="form-row"><span>New API key <span class="task-sub">optional</span></span><input class="api-key-edit-secret" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved key"></label>
+    <div class="modal-actions"><button class="btn api-key-edit-cancel" type="button">Cancel</button><button class="btn primary">Save</button></div>
+  </form></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); host.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.api-key-edit-close').addEventListener('click', close);
+  host.querySelector('.api-key-edit-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = event.submitter; if (button) button.disabled = true;
+    try {
+      await api(`${organizationBase}/accounts/keys/${encodeURIComponent(credential.provider)}/${encodeURIComponent(credential.account)}`, {
+        method: 'PATCH', body: JSON.stringify({
+          account: host.querySelector('.api-key-edit-account').value.trim(),
+          apiKey: host.querySelector('.api-key-edit-secret').value || undefined,
+        }),
+      });
+      close(); toast('API key updated'); onSaved?.();
+    } catch (error) { toast(error.message, true); if (button) button.disabled = false; }
+  });
+  $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
+  host.querySelector('.api-key-edit-account').focus();
 }
 
 // HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[]) on drop.
