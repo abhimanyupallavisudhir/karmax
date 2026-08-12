@@ -1767,7 +1767,7 @@ export class Gateway {
           if (!this.deps.githubApp) return this.json(res, 200, connections);
           return this.json(res, 200, await Promise.all(connections.map(async (connection) => ({
             ...connection,
-            workflowPermission: await this.deps.githubApp!.workflowPermissionStatus(connection)
+            permissionStatus: await this.deps.githubApp!.permissionStatus(connection)
               .catch((error) => ({ ready: false, unavailable: true,
                 error: error instanceof Error ? error.message : String(error) })),
           }))));
@@ -1812,12 +1812,12 @@ export class Gateway {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (method === 'GET') {
           const status = this.deps.githubApp.status(callerIdentity.humanSubject?.userId);
-          const workflowPermission = status.configured
-            ? await this.deps.githubApp.workflowPermissionStatus()
+          const permissionStatus = status.configured
+            ? await this.deps.githubApp.permissionStatus()
               .catch((error) => ({ ready: false, unavailable: true,
                 error: error instanceof Error ? error.message : String(error) }))
             : undefined;
-          return this.json(res, 200, { ...status, ...(workflowPermission ? { workflowPermission } : {}) });
+          return this.json(res, 200, { ...status, ...(permissionStatus ? { permissionStatus } : {}) });
         }
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'settings:write').ok)

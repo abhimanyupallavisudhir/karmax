@@ -7,7 +7,7 @@ import { Store } from '../src/store/db.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE, GITHUB_APP_CLIENT_SECRET_HANDLE,
-  isGithubWorkflowPermissionRejection } from '../src/integrations/github-app.js';
+  GITHUB_APP_PERMISSIONS, isGithubWorkflowPermissionRejection } from '../src/integrations/github-app.js';
 
 describe('GitHub App integration', () => {
   it('distinguishes an App permission update from installation-owner approval', async () => {
@@ -17,14 +17,14 @@ describe('GitHub App integration', () => {
     const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
       privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
     broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
-    let appWorkflows: string | undefined;
-    let installationWorkflows: string | undefined;
+    let appPermissions: Record<string, string> = { contents: 'write' };
+    let installationPermissions: Record<string, string> = { contents: 'write' };
     const fakeFetch = async (input: string | URL | Request) => {
       const url = new URL(String(input));
       if (url.pathname === '/app') return Response.json({ slug: 'krmax-hosted',
-        owner: { login: 'acme', type: 'Organization' }, permissions: { contents: 'write', workflows: appWorkflows } });
+        owner: { login: 'acme', type: 'Organization' }, permissions: appPermissions });
       if (url.pathname === '/app/installations/42') return Response.json({ id: 42,
-        account: { login: 'acme', type: 'Organization' }, permissions: { contents: 'write', workflows: installationWorkflows },
+        account: { login: 'acme', type: 'Organization' }, permissions: installationPermissions,
         html_url: 'https://github.com/organizations/acme/settings/installations/42' });
       return new Response('not found', { status: 404 });
     };
@@ -41,10 +41,24 @@ describe('GitHub App integration', () => {
       appSettingsUrl: 'https://github.com/organizations/acme/settings/apps/krmax-hosted/permissions',
     });
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/installation operator must grant/i);
-    appWorkflows = 'write';
+    appPermissions.workflows = 'write';
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/has not approved/i);
-    installationWorkflows = 'write';
+    installationPermissions.workflows = 'write';
     await expect(service.workflowPermissionStatus(connection)).resolves.toMatchObject({ app: 'write', installation: 'write', ready: true });
+    await expect(service.permissionStatus(connection)).resolves.toMatchObject({
+      ready: false,
+      missingApp: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
+      missingInstallation: expect.arrayContaining(['Actions', 'Repository administration', 'Merge queues']),
+    });
+    appPermissions = { ...GITHUB_APP_PERMISSIONS };
+    installationPermissions = { ...GITHUB_APP_PERMISSIONS };
+    await expect(service.permissionStatus(connection)).resolves.toMatchObject({
+      ready: true, missingApp: [], missingInstallation: [],
+      permissions: expect.arrayContaining([
+        expect.objectContaining({ key: 'actions', required: 'write', app: 'write', installation: 'write', ready: true }),
+        expect.objectContaining({ key: 'members', required: 'read', app: 'read', installation: 'read', ready: true }),
+      ]),
+    });
     expect(isGithubWorkflowPermissionRejection(
       'refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission',
     )).toBe(true);
@@ -149,11 +163,14 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
     expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run']);
-    expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'read');
+    expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.actions', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.workflows', 'write');
-    expect(manifest.manifest).toHaveProperty('default_permissions.statuses', 'read');
-    expect(manifest.manifest).not.toHaveProperty('default_permissions.administration');
+    expect(manifest.manifest).toHaveProperty('default_permissions.statuses', 'write');
+    expect(manifest.manifest).toHaveProperty('default_permissions.administration', 'write');
+    expect(manifest.manifest).toHaveProperty('default_permissions.merge_queues', 'write');
+    expect(manifest.manifest).toHaveProperty('default_permissions.secrets', 'write');
+    expect(manifest.manifest).toHaveProperty('default_permissions.code_scanning_alerts', 'read');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
     expect(service.oauthCredentials()).toEqual({ clientId: 'Iv1.client', clientSecret: 'client-secret' });

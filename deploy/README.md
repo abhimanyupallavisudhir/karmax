@@ -94,9 +94,13 @@ the shared App is configured, its vaulted credentials take precedence.
 
 Apps created by an older Karmax release need a one-time edit in GitHub App
 settings: add `https://karmax.example.com/api/auth/callback/github` as a callback
-URL and grant read-only **Email addresses** account permission. GitHub does not
-expose registration settings through its App API, so this upgrade cannot be
-applied by Karmax itself.
+URL and apply the permission envelope shown under **Installation → GitHub**.
+Karmax uses a broad repository-scoped App grant for transport, CI, review,
+landing, deployment, and repository automation; Karmax capabilities remain the
+per-agent authorization boundary. After the App owner changes the registration,
+every existing installation owner must approve the added permissions. GitHub
+does not expose registration settings through its App API, so Karmax links to
+both approval pages and verifies every permission at both layers.
 
 `KARMAX_OIDC_*` (enterprise SSO) is another separate slot, so an installation
 can offer Google, GitHub, and company SSO together. Every provider button appears

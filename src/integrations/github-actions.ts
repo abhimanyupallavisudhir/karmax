@@ -73,7 +73,7 @@ export interface GithubActionsFailureInspection {
   notices: string[];
 }
 
-export type GithubActionsFailureDisposition = 'revision' | 'retry' | 'human' | 'deployment';
+export type GithubActionsFailureDisposition = 'revision' | 'retry' | 'superseded' | 'human' | 'deployment';
 
 export interface GithubActionsFailureDecision {
   disposition: GithubActionsFailureDisposition;
@@ -115,6 +115,7 @@ const DEFAULT_MAX_JOB_LOGS = 8;
 const MAX_JOB_PAGES = 10;
 const HUMAN_CONFIGURATION_FAILURE = /(?:billing|payment|spending limit|budget|prepaid|quota for (?:actions|minutes)|included minutes|actions (?:is|are) disabled|workflow(?:s)? (?:is|are) disabled|no hosted runners?|not permitted to use (?:actions|this action)|resource not accessible by integration|requires? approval|approve and run|action required)/i;
 const TRANSIENT_RUNNER_FAILURE = /(?:the hosted runner|runner (?:has|was|is) (?:lost|disconnected|offline)|failed to (?:acquire|start|create|provision) (?:a )?runner|no runner matching|service unavailable|internal server error|gateway timeout|connection (?:reset|timed out)|network (?:error|failure)|temporary failure|try again later|job was cancelled because|received a shutdown signal|lost communication with the server|the operation was canceled)/i;
+const SUPERSEDED_RUN = /(?:cancel(?:ing|led)|supersed(?:e|ed|ing)).{0,240}(?:higher priority|newer|replacement|waiting request)|higher priority waiting request.{0,240}(?:exists|queued)/is;
 
 export class GithubActionsApi {
   private fetcher: typeof fetch;
@@ -312,6 +313,11 @@ export function classifyGithubActionsFailure(
     reason: 'GitHub reported an account, billing, permission, approval, runner-availability, or repository configuration problem that changing the proposal cannot fix.',
     inspection,
   };
+  if (SUPERSEDED_RUN.test(corpus)) return {
+    disposition: 'superseded',
+    reason: 'GitHub cancelled this run because a newer or higher-priority request replaced it; the proposal must not be sent back for code repair.',
+    inspection,
+  };
   if (['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(conclusion)
     || inspection.failedJobs.some((job) => ['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(String(job.conclusion ?? '').toLowerCase()))
     || TRANSIENT_RUNNER_FAILURE.test(corpus)) return {
@@ -329,8 +335,9 @@ export function classifyGithubActionsFailure(
 /** Classify a provider diagnostic even when GitHub rejected the workflow before
  * allocating a run/job whose logs can be downloaded. `undefined` means the
  * text contains no safe provider-level signal and should remain a code failure. */
-export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry' | undefined {
+export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry' | 'superseded' | undefined {
   if (HUMAN_CONFIGURATION_FAILURE.test(input)) return 'human';
+  if (SUPERSEDED_RUN.test(input)) return 'superseded';
   if (TRANSIENT_RUNNER_FAILURE.test(input)) return 'retry';
   return undefined;
 }

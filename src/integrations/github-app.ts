@@ -25,6 +25,80 @@ function permissionLevel(value: unknown): 'write' | 'read' | 'none' {
   return value === 'write' ? 'write' : value === 'read' ? 'read' : 'none';
 }
 
+function permissionSatisfies(actual: 'write' | 'read' | 'none', required: GitHubAppPermissionLevel): boolean {
+  return actual === 'write' || (required === 'read' && actual === 'read');
+}
+
+export type GitHubAppPermissionLevel = 'write' | 'read';
+
+/**
+ * The GitHub App is krmax's repository-scoped transport principal. Agent and
+ * task capabilities decide which operations may be invoked; the App grant must
+ * be broad enough that a permitted operation does not fail later with an opaque
+ * provider 403. Installation owners still choose the repositories in scope and
+ * explicitly approve every expansion of this envelope on GitHub.
+ */
+export const GITHUB_APP_PERMISSIONS = {
+  actions: 'write',
+  administration: 'write',
+  attestations: 'write',
+  checks: 'write',
+  code_scanning_alerts: 'read',
+  contents: 'write',
+  dependabot_alerts: 'read',
+  deployments: 'write',
+  discussions: 'write',
+  email_addresses: 'read',
+  environments: 'write',
+  issues: 'write',
+  members: 'read',
+  merge_queues: 'write',
+  metadata: 'read',
+  packages: 'write',
+  pages: 'write',
+  pull_requests: 'write',
+  repository_hooks: 'write',
+  secret_scanning_alerts: 'read',
+  secrets: 'write',
+  security_events: 'read',
+  statuses: 'write',
+  variables: 'write',
+  vulnerability_alerts: 'read',
+  workflows: 'write',
+} as const satisfies Record<string, GitHubAppPermissionLevel>;
+
+const GITHUB_APP_PERMISSION_LABELS: Record<keyof typeof GITHUB_APP_PERMISSIONS, string> = {
+  actions: 'Actions',
+  administration: 'Repository administration',
+  attestations: 'Attestations',
+  checks: 'Checks',
+  code_scanning_alerts: 'Code scanning alerts',
+  contents: 'Contents',
+  dependabot_alerts: 'Dependabot alerts',
+  deployments: 'Deployments',
+  discussions: 'Discussions',
+  email_addresses: 'Email addresses',
+  environments: 'Environments',
+  issues: 'Issues',
+  members: 'Members',
+  merge_queues: 'Merge queues',
+  metadata: 'Metadata',
+  packages: 'Packages',
+  pages: 'Pages',
+  pull_requests: 'Pull requests',
+  repository_hooks: 'Repository hooks',
+  secret_scanning_alerts: 'Secret scanning alerts',
+  secrets: 'Actions secrets',
+  security_events: 'Security events',
+  statuses: 'Commit statuses',
+  variables: 'Actions variables',
+  vulnerability_alerts: 'Dependabot vulnerability alerts',
+  workflows: 'Workflows',
+};
+
+const GITHUB_APP_ACCOUNT_PERMISSIONS = new Set<keyof typeof GITHUB_APP_PERMISSIONS>(['email_addresses']);
+const GITHUB_APP_ORGANIZATION_PERMISSIONS = new Set<keyof typeof GITHUB_APP_PERMISSIONS>(['members']);
+
 export function isGithubWorkflowPermissionRejection(value: unknown): boolean {
   return /refusing to allow a GitHub App to create or update workflow [`'"]?\.github\/workflows\//i
     .test(String(value ?? ''));
@@ -78,6 +152,22 @@ export interface GitHubWorkflowPermissionStatus {
   ready: boolean;
   appSettingsUrl: string;
   installationSettingsUrl?: string;
+}
+
+export interface GitHubAppPermissionStatus {
+  ready: boolean;
+  appSettingsUrl: string;
+  installationSettingsUrl?: string;
+  permissions: Array<{
+    key: keyof typeof GITHUB_APP_PERMISSIONS;
+    label: string;
+    required: GitHubAppPermissionLevel;
+    app: 'write' | 'read' | 'none';
+    installation?: 'write' | 'read' | 'none';
+    ready: boolean;
+  }>;
+  missingApp: string[];
+  missingInstallation: string[];
 }
 
 export interface GitHubUserIdentity {
@@ -300,24 +390,12 @@ export class GitHubAppService {
       setup_url: `${origin}/api/github/callback`,
       setup_on_update: true,
       callback_urls: [`${origin}/api/github/oauth/callback`, `${origin}/api/auth/callback/github`],
-      // Landing certifies the exact PR head only after GitHub's combined check
-      // rollup is successful. `checks` covers CheckRun contexts (including
-      // Actions); `statuses` covers legacy commit-status contexts. Both are
-      // read-only and are required to distinguish pending CI from failed CI.
-      // Better Auth also reads the user's verified email addresses when linking
-      // a GitHub sign-in to an existing Karmax account.
-      default_permissions: {
-        // Actions write includes read. The installation credential never enters
-        // an agent world: krmax exposes read by default and gates rerun/cancel/
-        // dispatch behind a distinct platform capability.
-        actions: 'write', checks: 'read', contents: 'write', email_addresses: 'read', metadata: 'read',
-        pull_requests: 'write', statuses: 'read',
-        // GitHub deliberately treats `.github/workflows/**` as a more sensitive
-        // namespace than ordinary repository contents. Contents(write) can push
-        // every other file, but Git rejects a ref update containing a workflow
-        // unless the App also has this separate permission.
-        workflows: 'write',
-      },
+      // The App is a broad repository transport principal. Its installation is
+      // still repository-scoped, its credentials remain in trusted services,
+      // and every mutation exposed to an agent is independently gated by a
+      // krmax capability. This avoids treating provider permissions as a second,
+      // incomplete authorization system that fails only after work is ready.
+      default_permissions: { ...GITHUB_APP_PERMISSIONS },
     };
     // GitHub rejects loopback/private webhook URLs because its delivery service
     // cannot reach them. Local Karmax instances reconcile installations on
@@ -552,6 +630,60 @@ export class GitHubAppService {
       ready: appPermission === 'write' && installationPermission === 'write',
       appSettingsUrl,
       installationSettingsUrl,
+    };
+  }
+
+  /** Observe the complete operational permission envelope at both GitHub
+   * approval layers. The App owner changes the registration first; every
+   * existing installation owner must then approve that expansion separately. */
+  async permissionStatus(connection?: GitConnection): Promise<GitHubAppPermissionStatus> {
+    if (!this.configured()) throw new Error('GitHub App is not configured');
+    const app = await this.appRequest<GitHubAppPayload>('/app');
+    const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
+    if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
+    const owner = String(app.owner?.login ?? '').trim();
+    const appSettingsUrl = app.owner?.type === 'Organization' && owner
+      ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
+      : `https://github.com/settings/apps/${encodeURIComponent(slug)}/permissions`;
+    let installation: GitHubInstallationPayload | undefined;
+    if (connection) installation = await this.appRequest<GitHubInstallationPayload>(
+      `/app/installations/${encodeURIComponent(connection.installationId)}`,
+    );
+    const installationSettingsUrl = installation?.html_url?.startsWith('https://github.com/')
+      ? installation.html_url
+      : connection
+        ? connection.accountType === 'Organization'
+          ? `https://github.com/organizations/${encodeURIComponent(connection.accountLogin)}/settings/installations/${encodeURIComponent(connection.installationId)}`
+          : `https://github.com/settings/installations/${encodeURIComponent(connection.installationId)}`
+        : undefined;
+    const permissions = (Object.entries(GITHUB_APP_PERMISSIONS) as Array<
+      [keyof typeof GITHUB_APP_PERMISSIONS, GitHubAppPermissionLevel]
+    >).map(([key, required]) => {
+      const appLevel = permissionLevel(app.permissions?.[key]);
+      const installationApplies = Boolean(connection)
+        && !GITHUB_APP_ACCOUNT_PERMISSIONS.has(key)
+        && (!GITHUB_APP_ORGANIZATION_PERMISSIONS.has(key) || connection?.accountType === 'Organization');
+      const installationLevel = installationApplies ? permissionLevel(installation?.permissions?.[key]) : undefined;
+      const appReady = permissionSatisfies(appLevel, required);
+      const installationReady = !installationApplies || permissionSatisfies(installationLevel ?? 'none', required);
+      return {
+        key, label: GITHUB_APP_PERMISSION_LABELS[key], required, app: appLevel,
+        ...(installationLevel ? { installation: installationLevel } : {}),
+        ready: appReady && installationReady,
+      };
+    });
+    return {
+      ready: permissions.every((permission) => permission.ready),
+      appSettingsUrl,
+      ...(installationSettingsUrl ? { installationSettingsUrl } : {}),
+      permissions,
+      missingApp: permissions.filter((permission) => !permissionSatisfies(permission.app, permission.required))
+        .map((permission) => permission.label),
+      missingInstallation: connection
+        ? permissions.filter((permission) => permission.installation !== undefined
+          && !permissionSatisfies(permission.installation, permission.required))
+          .map((permission) => permission.label)
+        : [],
     };
   }
 

@@ -13149,14 +13149,15 @@ async function wireInstallationGithubCard() {
     });
     return;
   }
-  const workflowPermission = status.workflowPermission;
-  const workflowPermissionReady = workflowPermission?.ready === true;
-  const workflowPermissionCard = workflowPermission?.unavailable
-    ? `<div class="card" style="padding:10px;border-color:var(--warn)"><b>Could not verify workflow access</b><div class="task-sub">${esc(workflowPermission.error || 'GitHub did not return the App permissions.')}</div></div>`
-    : workflowPermissionReady ? ''
-      : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>Workflow-file access required</b><div class="task-sub" style="margin:4px 0 8px">Add <b>Workflows: read and write</b> to this App. GitHub requires every existing installation owner to approve the added permission afterwards.</div>${workflowPermission?.appSettingsUrl ? `<a class="btn sm primary" href="${esc(workflowPermission.appSettingsUrl)}" target="_blank" rel="noopener noreferrer">Add permission on GitHub</a>` : ''}</div>`;
-  box.innerHTML = `<div class="section-h">GitHub App <span class="chip" style="color:${workflowPermissionReady ? 'var(--ok,#4ec9a3)' : 'var(--warn)'}">${workflowPermissionReady ? 'ready' : 'action required'}</span></div>
-    <p class="task-sub">Shared by every organization for repository transport and personal GitHub authorization.</p>${workflowPermissionCard}
+  const permissionStatus = status.permissionStatus;
+  const permissionReady = permissionStatus?.ready === true;
+  const missingApp = permissionStatus?.missingApp || [];
+  const permissionCard = permissionStatus?.unavailable
+    ? `<div class="card" style="padding:10px;border-color:var(--warn)"><b>Could not verify GitHub access</b><div class="task-sub">${esc(permissionStatus.error || 'GitHub did not return the App permissions.')}</div></div>`
+    : permissionReady ? ''
+      : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub App permissions need updating</b><div class="task-sub" style="margin:4px 0 8px">krmax uses a broad repository-scoped App grant, while its own capabilities decide which operations an agent may invoke. Add the missing permissions${missingApp.length ? `: <b>${esc(missingApp.join(', '))}</b>` : ''}. GitHub requires every existing installation owner to approve the expansion afterwards.</div>${permissionStatus?.appSettingsUrl ? `<a class="btn sm primary" href="${esc(permissionStatus.appSettingsUrl)}" target="_blank" rel="noopener noreferrer">Update permissions on GitHub</a>` : ''}</div>`;
+  box.innerHTML = `<div class="section-h">GitHub App <span class="chip" style="color:${permissionReady ? 'var(--ok,#4ec9a3)' : 'var(--warn)'}">${permissionReady ? 'ready' : 'action required'}</span></div>
+    <p class="task-sub">Shared by every organization for repository transport and personal GitHub authorization. krmax capabilities remain the per-agent authorization boundary.</p>${permissionCard}
     <div class="settings-grid">
       <label class="form-row">App slug<input value="${esc(status.appSlug || '')}" readonly /></label>
       <label class="form-row">App ID<input value="${esc(status.appId || '')}" readonly /></label>
@@ -13300,14 +13301,14 @@ async function hydrateOrganizationView() {
       : '<span class="task-sub">The installation operator must set up the shared GitHub App before this organization can connect repositories.</span>')
     : `<button class="btn ${gitConnections.length ? '' : 'primary'}" id="connect-github" type="button">${githubMark()}${gitConnections.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>${gitConnections.length ? '<button class="btn" id="org-github-custom" type="button">Custom automation identity</button>' : ''}`;
   $('#org-github').innerHTML = `<div class="github-account-list">${gitConnections.map((connection) => {
-    const permission = connection.workflowPermission;
+    const permission = connection.permissionStatus;
     const permissionAction = permission?.ready ? '' : permission?.unavailable
       ? '<span class="chip" style="color:var(--warn)">access unknown</span>'
-      : permission?.app !== 'write'
-        ? `<a class="btn sm primary" href="${esc(permission?.appSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Add workflow access</a>`
-        : `<a class="btn sm primary" href="${esc(permission?.installationSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Approve permission</a>`;
+      : permission?.missingApp?.length
+        ? `<a class="btn sm primary" href="${esc(permission?.appSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Update App permissions</a>`
+        : `<a class="btn sm primary" href="${esc(permission?.installationSettingsUrl || githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Approve permissions</a>`;
     return `<div class="github-account-row" data-connection="${esc(connection.id)}">
-    <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">workflow access required</span>'}</span>
+    <span class="github-account-label">${githubMark()}<b>${esc(connection.accountLogin)}</b>${permission?.ready ? '' : '<span class="chip" style="color:var(--warn)">GitHub access update required</span>'}</span>
     <span class="github-account-actions">${permissionAction}<a class="btn sm" href="${esc(githubManageUrl(connection))}" target="_blank" rel="noopener noreferrer">Manage</a><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub connection">${trashIcon()}</button></span>
   </div>`; }).join('')}</div>
   <div class="github-org-actions">${githubSetup}</div>`;

@@ -2746,11 +2746,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         readiness: GithubPullRequestReadiness,
         current: TaskPullRequest[],
         inspection: ReturnType<typeof inspectionFor>,
-      ): Promise<GitHubMergeAuthorization> => {
+      ): Promise<GitHubMergeAuthorization | undefined> => {
         const summary = ciFailureDetail(ref, readiness);
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
         const decisions: GithubActionsFailureDecision[] = [];
+        const inspectionFailures: Array<{ runId: number; error: unknown }> = [];
         if (inspection.actions) {
           for (const runId of runIds.slice(0, 4)) {
             try {
@@ -2763,6 +2764,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 .map((check) => `${check.name}: ${check.state}\n${check.detail ?? ''}`).join('\n');
               decisions.push(classifyGithubActionsFailure(inspected, { additionalContext: checkContext }));
             } catch (error) {
+              inspectionFailures.push({ runId, error });
               record(handle.id, 'github.ci.inspection-failed', {
                 ...ref, runId, detail: error instanceof Error ? error.message : String(error),
               });
@@ -2771,10 +2773,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!decisions.length) {
           const providerFailure = classifyGithubActionsDiagnostic(summary);
-          if (providerFailure) return {
+          const permissionFailure = inspectionFailures.find(({ error }) =>
+            error instanceof GithubActionsApiError && [401, 403].includes(error.status));
+          if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\nGitHub did not expose an Actions run id that krmax can safely rerun. Resolve the provider/account condition on GitHub, then retry.`,
+            detail: `${summary}\n\nKrmax cannot inspect the replacement workflow run. Grant the GitHub App Actions: read and write permission and approve the updated installation permissions, then retry.`,
             eligibleUserIds: [actorUserId],
+          };
+          if (providerFailure === 'human') return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
+            eligibleUserIds: [actorUserId],
+          };
+          if (providerFailure === 'superseded' || providerFailure === 'retry') return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: providerFailure === 'superseded'
+              ? 'GitHub superseded the cancelled workflow run; waiting for its higher-priority replacement instead of reopening the proposal.'
+              : 'GitHub reported a transient CI interruption; waiting for provider recovery instead of reopening the proposal.',
           };
           return {
             status: 'needs-revision', prs: current, actorUserId, detail: summary,
@@ -2823,6 +2838,49 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           return { status: 'waiting', prs: current, actorUserId, detail: 'Waiting for CI' };
+        }
+        const superseded = decisions.filter((decision) => decision.disposition === 'superseded');
+        if (superseded.length && inspection.actions) {
+          let replacementsReady = true;
+          for (const decision of superseded) {
+            let replacement;
+            try {
+              const listed = await inspection.actions.listRuns(ref.slug, {
+                workflow: decision.inspection.run.workflowId,
+                ...(decision.inspection.run.branch ? { branch: decision.inspection.run.branch } : {}),
+                perPage: 100,
+              });
+              replacement = listed.runs
+                .filter((run) => run.id > decision.inspection.run.id
+                  && run.headSha === decision.inspection.run.headSha
+                  && run.workflowId === decision.inspection.run.workflowId)
+                .sort((a, b) => b.id - a.id)
+                .find((run) => run.status === 'completed' && run.conclusion === 'success');
+            } catch (error) {
+              const blocked = error instanceof GithubActionsApiError && [401, 403].includes(error.status);
+              return {
+                status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
+                detail: `${detail}\n\nKrmax could not inspect the replacement workflow run: ${error instanceof Error ? error.message : String(error)}`,
+                ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
+              };
+            }
+            if (!replacement) {
+              replacementsReady = false;
+              continue;
+            }
+            record(handle.id, 'github.ci.superseded', {
+              ...ref,
+              runId: decision.inspection.run.id,
+              supersedingRunId: replacement.id,
+              workflowId: replacement.workflowId,
+              headSha: replacement.headSha,
+            });
+          }
+          if (replacementsReady && superseded.length === decisions.length) return undefined;
+          if (superseded.length === decisions.length) return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: 'GitHub superseded a cancelled workflow run; waiting for the higher-priority replacement on the same exact revision.',
+          };
         }
         return {
           status: 'needs-revision', prs: current, actorUserId, detail,
@@ -2942,7 +3000,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           if (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR') {
-            return ciFailureDecision(ref, readiness, current, inspection);
+            const failure = await ciFailureDecision(ref, readiness, current, inspection);
+            if (failure) return failure;
+            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: [] };
           }
           if (readiness?.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
@@ -3096,8 +3156,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           } catch (error) {
             return errorDecision(error, current);
           }
-          if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR')
-            return ciFailureDecision(ref, readiness, current, inspection);
+          if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR') {
+            const failure = await ciFailureDecision(ref, readiness, current, inspection);
+            if (failure) return failure;
+            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: [] };
+          }
           if (readiness.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
               record(handle.id, 'github.merge.authorization-revoked', { ...ref, reason: 'changes-requested' });
