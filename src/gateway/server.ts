@@ -4291,7 +4291,7 @@ export class Gateway {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
               propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId,
-                { hostLocal: this.hostLocal, hosted: this.deps.hosted })
+                { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -4389,7 +4389,7 @@ export class Gateway {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
               propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId,
-                { hostLocal: this.hostLocal, hosted: this.deps.hosted })
+                { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
                 .propagate(saved.id, Object.keys(b.secrets) as any);
             } catch (e) {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
@@ -4403,7 +4403,7 @@ export class Gateway {
           if (!prior) {
             const { defaultConnectors } = await import('../autonomy/connectors.js');
             writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId,
-              { hostLocal: this.hostLocal, hosted: this.deps.hosted }).writeBackCreated(saved.id);
+              { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp }).writeBackCreated(saved.id);
             for (const result of writeBack) {
               store.appendAudit({ principalId: callerTaskId ? `task:${callerTaskId}` : principal,
                 action: result.error ? 'vault.write_back.failed' : 'vault.write_back',
@@ -4531,7 +4531,7 @@ export class Gateway {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
           const { defaultConnectors } = await import('../autonomy/connectors.js');
           const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId,
-            { hostLocal: this.hostLocal, hosted: this.deps.hosted });
+            { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp });
           if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
           const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
           if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });

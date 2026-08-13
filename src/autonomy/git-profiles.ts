@@ -310,10 +310,11 @@ export class GitProfiles {
     const env: Record<string, string> = {};
     if (profile.sshKey) {
       const key = this.materializeKey(profile.name, 'ssh', ctx);
+      const knownHosts = this.materializeKnownHosts(profile.name);
       // A fresh hosted container has no known_hosts file. `accept-new` permits
       // that first connection without weakening protection against a changed
       // host key on subsequent operations.
-      env.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+      env.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes -o UserKnownHostsFile=${knownHosts} -o StrictHostKeyChecking=accept-new`;
     }
     if (profile.githubToken) {
       env.GH_TOKEN = this.resolveSecret(profile.name, 'token', ctx);
@@ -407,6 +408,17 @@ export class GitProfiles {
     if (!fs.existsSync(file)) {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
       fs.writeFileSync(file, '#!/bin/sh\necho "$GH_TOKEN"\n', { mode: 0o700 });
+    }
+    return file;
+  }
+
+  /** A profile-private trust-on-first-use file, durable across container
+   * restarts through KARMAX_HOME and never shared across tenant profiles. */
+  private materializeKnownHosts(profile: string): string {
+    const file = path.join(this.keyDir(profile), 'known_hosts');
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(file, '', { mode: 0o600 });
     }
     return file;
   }

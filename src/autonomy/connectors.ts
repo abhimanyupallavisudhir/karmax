@@ -6,7 +6,9 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { hostLocal } from '../config/deployment.js';
 import { paths } from '../config/paths.js';
+import type { Repository } from '../domain/types.js';
 import { git, gitOrThrow, isolatedGitEnvironment } from '../world/git.js';
+import { materializeGitCredential, type GitCredential } from '../world/git-credential.js';
 import { CredentialBroker } from './broker.js';
 import { GitProfiles } from './git-profiles.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
@@ -627,6 +629,8 @@ interface GitPassConnection {
 interface GitPassOptions {
   /** Tests may use a local bare remote; production accepts remote URLs only. */
   allowLocalRepository?: boolean;
+  /** Prefer an organization-owned repository attachment over profile/host Git. */
+  repositoryCredential?: (repositoryUrl: string) => Promise<GitCredential | undefined>;
 }
 
 const gitPassQueues = new Map<string, Promise<void>>();
@@ -697,12 +701,12 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   async list(): Promise<ExternalItem[]> {
-    return this.inRepository(async (_connection, _checkout, store) =>
+    return this.inRepository(async (_connection, _checkout, store, _env) =>
       this.entries(store).map((entry) => this.metadata(store, entry)));
   }
 
   async pull(externalIds: string[]): Promise<PullResult> {
-    return this.inRepository(async (connection, _checkout, store) => {
+    return this.inRepository(async (connection, _checkout, store, _env) => {
       const available = new Set(this.entries(store));
       return this.withGpg(connection, async (gpgHome) => {
         const items: ExternalSecretItem[] = [];
@@ -727,7 +731,7 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
-    await this.inRepository(async (connection, checkout, store) => {
+    await this.inRepository(async (connection, checkout, store, env) => {
       if (!this.entries(store).includes(externalId)) throw new Error(`pass entry "${externalId}" was not found`);
       await this.withGpg(connection, async (gpgHome) => {
         const file = this.entryFile(store, externalId);
@@ -744,13 +748,13 @@ export class GitPassConnector implements CredentialConnector {
         }
         await this.encrypt(gpgHome, file, lines.join('\n') + '\n', this.recipients(store, path.dirname(file)));
       });
-      await this.commitAndPush(connection, checkout, fileRelativeTo(checkout, this.entryFile(store, externalId)),
-        `Update pass entry ${externalId}`);
+      await this.commitAndPush(checkout, fileRelativeTo(checkout, this.entryFile(store, externalId)),
+        `Update pass entry ${externalId}`, env);
     });
   }
 
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
-    return this.inRepository(async (connection, checkout, store) => {
+    return this.inRepository(async (connection, checkout, store, env) => {
       if (item.type !== 'login' || item.secrets.password === undefined) {
         throw new Error('Git-backed pass write-back supports login items with a password');
       }
@@ -766,7 +770,7 @@ export class GitPassConnector implements CredentialConnector {
       await this.withGpg(connection, async (gpgHome) => {
         await this.encrypt(gpgHome, file, body, this.recipients(store, path.dirname(file)));
       });
-      await this.commitAndPush(connection, checkout, fileRelativeTo(checkout, file), `Add pass entry ${externalId}`);
+      await this.commitAndPush(checkout, fileRelativeTo(checkout, file), `Add pass entry ${externalId}`, env);
       return { externalId };
     });
   }
@@ -808,13 +812,25 @@ export class GitPassConnector implements CredentialConnector {
     };
   }
 
-  private async inRepository<T>(work: (connection: GitPassConnection, checkout: string, store: string) => Promise<T>): Promise<T> {
+  private async inRepository<T>(work: (connection: GitPassConnection, checkout: string, store: string,
+    env: Record<string, string>) => Promise<T>): Promise<T> {
     const connection = this.connection();
     const checkout = this.checkoutFor(connection.repositoryUrl);
     return serializeGitPass(checkout, async () => {
-      await this.refresh(connection, checkout);
-      const store = this.findStore(checkout, connection.storePath);
-      return work(connection, checkout, store);
+      fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+      const credentialDir = fs.mkdtempSync(path.join(this.root, '.git-auth-'));
+      try {
+        const repositoryCredential = await this.options.repositoryCredential?.(connection.repositoryUrl);
+        const { env } = materializeGitCredential(credentialDir, {
+          ...(repositoryCredential ?? {}),
+          env: { ...this.gitEnv(connection), ...(repositoryCredential?.env ?? {}) },
+        });
+        await this.refresh(connection, checkout, env);
+        const store = this.findStore(checkout, connection.storePath);
+        return work(connection, checkout, store, env);
+      } finally {
+        fs.rmSync(credentialDir, { recursive: true, force: true });
+      }
     });
   }
 
@@ -827,8 +843,7 @@ export class GitPassConnector implements CredentialConnector {
     return { ...isolatedGitEnvironment(), ...this.gitEnvironment(connection.gitProfile) };
   }
 
-  private async refresh(connection: GitPassConnection, checkout: string): Promise<void> {
-    const env = this.gitEnv(connection);
+  private async refresh(connection: GitPassConnection, checkout: string, env: Record<string, string>): Promise<void> {
     const parent = path.dirname(checkout);
     fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
     if (fs.existsSync(path.join(checkout, '.git'))) {
@@ -970,8 +985,8 @@ export class GitPassConnector implements CredentialConnector {
     }
   }
 
-  private async commitAndPush(connection: GitPassConnection, checkout: string, relative: string, message: string): Promise<void> {
-    const env = this.gitEnv(connection);
+  private async commitAndPush(checkout: string, relative: string, message: string,
+    env: Record<string, string>): Promise<void> {
     await gitOrThrow(checkout, ['add', '--', relative], { env });
     await gitOrThrow(checkout, ['-c', 'user.name=karmax', '-c', 'user.email=karmax@localhost', 'commit', '-m', message], { env });
     const pushed = await git(checkout, ['push', 'origin', 'HEAD'], { env });
@@ -1067,6 +1082,19 @@ export interface SyncResult {
 export interface ConnectorStore {
   kvGet(k: string): string | undefined;
   kvSet(k: string, v: string): void;
+  findRepositoryBySshUrl?(organizationId: string, sshUrl: string): Repository | undefined;
+}
+
+export interface ConnectorGithubApp {
+  brokerCredentials(repository: Repository): Promise<GitCredential>;
+}
+
+/** Resolve only an exact repository attachment owned by this organization.
+ * Never substitutes a user/profile credential based on availability. */
+export async function attachedRepositoryCredential(store: ConnectorStore, githubApp: ConnectorGithubApp | undefined,
+  organizationId: string, repositoryUrl: string): Promise<GitCredential | undefined> {
+  const repository = store.findRepositoryBySshUrl?.(organizationId, repositoryUrl);
+  return repository && githubApp ? githubApp.brokerCredentials(repository) : undefined;
 }
 
 export class Connectors {
@@ -1336,7 +1364,7 @@ export class Connectors {
  *  session key and local `pass` both depend on tenant-owned host state, so they
  *  remain host-local. Git-backed pass is isolated and works in every mode. */
 export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined,
-  organizationId: string, opts: { hostLocal?: boolean; hosted?: boolean } = {}): Connectors {
+  organizationId: string, opts: { hostLocal?: boolean; hosted?: boolean; githubApp?: ConnectorGithubApp } = {}): Connectors {
   const connectors = new Connectors(store, items, broker, organizationId);
   if (opts.hosted) {
     connectors.register(new OnePasswordSdkConnector(() => connectors.secretFor('1password')));
@@ -1358,6 +1386,9 @@ export function defaultConnectors(store: ConnectorStore, items: VaultItems, brok
       if (!profile) throw new Error(`unknown Git profile "${profileName}"`);
       return profiles.env(profile, {});
     },
+    undefined,
+    { repositoryCredential: (repositoryUrl) =>
+      attachedRepositoryCredential(store, opts.githubApp, organizationId, repositoryUrl) },
   ));
   return connectors;
 }
