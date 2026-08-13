@@ -22,6 +22,23 @@ export interface AvailableModel {
 
 export type ModelCatalog = Record<Provider, AvailableModel[]>;
 
+/** Stable Claude selections that remain valid even when the account-aware SDK
+ * picker returns a partial list. `supportedModels()` is live metadata, but it is
+ * not an exhaustive registry: gated and special-context models can be absent
+ * even though Claude Code accepts their exact ids. Keep discovery additive so
+ * a successful partial response cannot hide a known selectable model. */
+export const CLAUDE_MODEL_PRESETS: AvailableModel[] = [
+  { id: 'default' },
+  { id: 'opus[1m]' },
+  { id: 'claude-fable-5[1m]', displayName: 'Fable 5' },
+  { id: 'sonnet' },
+  { id: 'haiku' },
+];
+
+export function claudeModelCatalog(discovered: AvailableModel[]): AvailableModel[] {
+  return mergeModels([discovered, CLAUDE_MODEL_PRESETS]);
+}
+
 /** A credential-safe reason for provider-discovery logs. Provider exceptions can
  * contain response bodies, paths, or auth headers, none of which belong in logs. */
 export function modelDiscoveryFailureReason(error: unknown): string {

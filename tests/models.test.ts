@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { claudeApiModels, claudeModels, mergeModels, modelDiscoveryFailureReason } from '../src/agent/models.js';
+import { claudeApiModels, claudeModelCatalog, claudeModels, mergeModels, modelDiscoveryFailureReason } from '../src/agent/models.js';
 
 describe('provider model discovery', () => {
   it('unions account-specific catalogs without duplicating model ids', () => {
@@ -14,6 +14,18 @@ describe('provider model discovery', () => {
       { id: 'account-a' },
       { id: 'account-b' },
     ]);
+  });
+
+  it('keeps Fable in a successful but partial Claude SDK catalog', () => {
+    const catalog = claudeModelCatalog([
+      { id: 'default', displayName: 'Default (recommended)' },
+      { id: 'sonnet', displayName: 'Sonnet' },
+      { id: 'opus', displayName: 'Opus' },
+      { id: 'haiku', displayName: 'Haiku' },
+    ]);
+
+    expect(catalog.find((model) => model.id === 'default')?.displayName).toBe('Default (recommended)');
+    expect(catalog).toContainEqual({ id: 'claude-fable-5[1m]', displayName: 'Fable 5' });
   });
 
   it('classifies model-discovery failures without logging provider secrets', () => {

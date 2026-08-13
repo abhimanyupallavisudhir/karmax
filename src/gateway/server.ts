@@ -28,7 +28,7 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels,
+import { acpModels, claudeModelCatalog, claudeModels, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { AuthorizationService } from '../platform/authorization.js';
@@ -5645,9 +5645,9 @@ export class Gateway {
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
-      claude: claude.length ? claude : [
-        { id: 'default' }, { id: 'opus[1m]' }, { id: 'claude-fable-5[1m]' }, { id: 'sonnet' }, { id: 'haiku' },
-      ],
+      // The SDK picker is account-aware but intentionally partial. Treat it as
+      // metadata to add to the stable selections, not an exhaustive allowlist.
+      claude: claudeModelCatalog(claude),
       codex: codex.length ? codex : [
         { id: 'gpt-5.6-sol', isDefault: true },
         { id: 'gpt-5.6-terra' },
