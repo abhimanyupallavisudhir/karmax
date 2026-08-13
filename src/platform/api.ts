@@ -3614,15 +3614,28 @@ export class KarmaxApi {
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>): Promise<{ applied: string[] }> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
-    // A Review-route edit is the one field whose validity the deterministic sandbox
-    // cannot judge: "does @qa resolve to a human here?" is a store question. Assert it
-    // up front so a re-route can never park the gate on an audience nobody can see.
+    // Human routes are the fields whose validity the deterministic sandbox cannot
+    // judge: "does @qa resolve to a human here?" is a store question. Assert them
+    // up front so a re-route can never park a gate or input pause invisibly.
     const confirmer = task && this.confirmerFieldOf(task);
     if (confirmer && patch[confirmer.field.name] !== undefined)
       this.assertHumanRoutes(task!, confirmer.manifest, { [confirmer.field.name]: patch[confirmer.field.name] } as ValueMap);
+    const responder = task && this.responderFieldOf(task);
+    if (responder && patch[responder.field.name] !== undefined)
+      this.assertHumanRoutes(task!, responder.manifest, { [responder.field.name]: patch[responder.field.name] } as ValueMap);
     try {
       const result = (await this.workflowHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
+      // Unlike target (published in the live view) and agents (kept in their
+      // effective snapshot), the Responder has no separate projection. Persist an
+      // accepted route so refreshes and later edits show the route actually in play.
+      if (responder && result.applied.includes(responder.field.name)) {
+        const current = this.deps.store.getTask(taskId);
+        if (current) this.deps.store.updateTaskParams(taskId, {
+          ...current.params,
+          [responder.field.name]: patch[responder.field.name],
+        });
+      }
       if (confirmer && result.applied.includes(confirmer.field.name))
         await this.shareConfirmerAcrossAttempts(task!, confirmer.field.name, patch[confirmer.field.name]);
       return result;
@@ -3636,6 +3649,14 @@ export class KarmaxApi {
     const organizationId = this.deps.store.getProject(task.projectId)?.organizationId;
     const start = this.resolveStart(task.workflow, task.workflowVersion, organizationId);
     const field = start?.manifest.params.find((f) => f.type === 'confirmer');
+    return start && field ? { field, manifest: start.manifest } : undefined;
+  }
+
+  /** The task's ordinary-input route, resolved from its pinned workflow package. */
+  private responderFieldOf(task: TaskRecord): { field: FieldSpec; manifest: WorkflowManifest } | undefined {
+    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId;
+    const start = this.resolveStart(task.workflow, task.workflowVersion, organizationId);
+    const field = start?.manifest.params.find((f) => f.type === 'responder');
     return start && field ? { field, manifest: start.manifest } : undefined;
   }
 

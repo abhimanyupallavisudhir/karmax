@@ -8064,6 +8064,12 @@ function collectParamEdits(root, fields) {
       out[f.name] = { layers: readConfirmerLayers(box) };
       continue;
     }
+    if (f.type === 'responder') {
+      const box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = readResponder(box);
+      continue;
+    }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
     if (!el) continue;
     let val;
