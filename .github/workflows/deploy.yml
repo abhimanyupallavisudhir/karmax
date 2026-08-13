@@ -25,12 +25,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
-    # Retain every validated candidate. The remote updater independently refuses
-    # to move backwards if GitHub starts waiting jobs out of dispatch order.
+    # GitHub retains the running deployment and coalesces pending requests to the
+    # newest validated master SHA. That is sufficient because every newer SHA
+    # contains its ancestors; the remote updater also refuses to move backwards.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
-      queue: max
     env:
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
     steps:
