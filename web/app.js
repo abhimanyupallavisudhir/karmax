@@ -7618,6 +7618,15 @@ function beginAsyncElementRender(element) {
   asyncElementRenderEpoch.set(element, epoch);
   return () => asyncElementRenderEpoch.get(element) === epoch;
 }
+
+// Explanation-only is an account/settings concern. A task chooses only whether
+// its coding agents may use a credential, so both inherited Off and inherited
+// Explainer-only render as the same binary Off state there.
+function credentialEditorMode(scope, credential, modes, isOn) {
+  if (scope === 'task') return isOn ? 'on' : 'off';
+  return credential.kind === 'key' ? (modes?.[credential.key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
+}
+
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
   const renderIsCurrent = beginAsyncElementRender(el);
@@ -7675,7 +7684,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     .map((key) => {
       const c = byKey[key];
       const isOn = enabled.has(key);
-      const mode = c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
+      const mode = credentialEditorMode(scope, c, sd.modes, isOn);
       const login = loginByKey[key];
       const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
       const loginActions = canManage && c.kind === 'login';
@@ -7685,13 +7694,13 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
       const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
-      const stateControl = c.kind === 'key'
+      const stateControl = c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
             <option value="on"${mode === 'on' ? ' selected' : ''}>On</option>
             <option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
             <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option>
           </select>`
-        : `<button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'on' : 'off'}</button>`;
+        : `<button class="cred-toggle ${mode}" title="${mode === 'on' ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${mode}</button>`;
       return `<div class="cred-row ${esc(mode)}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
         ${stateControl}
@@ -7713,9 +7722,10 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   el.querySelectorAll('.cred-row').forEach((row) => {
     const key = row.dataset.key;
     row.querySelector('.cred-toggle')?.addEventListener('click', () => {
-      const on = new Set(own.on || []), off = new Set(own.off || []);
+      const on = new Set(own.on || []), off = new Set(own.off || []), explainerOnly = new Set(own.explainerOnly || []);
+      explainerOnly.delete(key);
       if (!enabled.has(key)) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
-      save({ ...own, on: [...on], off: [...off] });
+      save({ ...own, on: [...on], off: [...off], explainerOnly: [...explainerOnly] });
     });
     row.querySelector('.cred-mode')?.addEventListener('change', (event) => {
       const on = new Set(own.on || []), off = new Set(own.off || []), explainerOnly = new Set(own.explainerOnly || []);

@@ -1389,7 +1389,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* Unified credential manager (logins + ambient + API keys): compact inline chips —
-   drag to set precedence, choose where keys may be used. Global / project / task. */
+   settings choose where keys may be used; Task forms stay binary On/Off. */
 .cred-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .cred-row {
   display: inline-flex; align-items: center; gap: 6px;
