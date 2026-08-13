@@ -13,6 +13,7 @@ import {
   OnePasswordSdkConnector,
   PassConnector,
   GitPassConnector,
+  attachedRepositoryCredential,
   parsePassFiles,
   type Exec,
 } from '../src/autonomy/connectors.js';
@@ -326,6 +327,33 @@ describe('the default registry follows where karmax is served', () => {
     // service-account SDK there; Bitwarden's session key only unlocks local
     // CLI state, so advertising it would be both broken and cross-tenant-prone.
     expect(await names({ hostLocal: false, hosted: true })).toEqual(['1password', 'pass-git']);
+  });
+});
+
+describe('Git-backed pass repository authentication', () => {
+  it('uses only the exact organization repository attachment', async () => {
+    const repository = { id: 'repo_attached', organizationId: 'org_a',
+      sshUrl: 'git@github.com:acme/passwords.git' } as any;
+    const calls: string[] = [];
+    const store = {
+      ...memStore(),
+      findRepositoryBySshUrl: (organizationId: string, sshUrl: string) =>
+        organizationId === repository.organizationId && sshUrl === repository.sshUrl ? repository : undefined,
+    };
+    const githubApp = {
+      brokerCredentials: async (matched: any) => {
+        calls.push(matched.id);
+        return { httpsToken: 'installation-token', env: { GH_TOKEN: 'installation-token' } };
+      },
+    };
+
+    await expect(attachedRepositoryCredential(store, githubApp, 'org_a', repository.sshUrl))
+      .resolves.toMatchObject({ httpsToken: 'installation-token' });
+    await expect(attachedRepositoryCredential(store, githubApp, 'org_b', repository.sshUrl))
+      .resolves.toBeUndefined();
+    await expect(attachedRepositoryCredential(store, githubApp, 'org_a', 'git@github.com:other/passwords.git'))
+      .resolves.toBeUndefined();
+    expect(calls).toEqual(['repo_attached']);
   });
 });
 
