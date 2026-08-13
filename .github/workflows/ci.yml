@@ -44,8 +44,37 @@ jobs:
       KARMAX_SKIP_DOCKER: '1'
       TEMPORAL_CLI_VERSION: '1.7.2'
       KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
+      ACTIONLINT_VERSION: '1.7.12'
+      ACTIONLINT_LINUX_AMD64_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
     steps:
       - uses: actions/checkout@v7
+
+      # This lives in the existing required check, so branch protection needs no
+      # new check name. Pin both the release and archive digest.
+      - name: Install actionlint
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" -o "$archive"
+          echo "${ACTIONLINT_LINUX_AMD64_SHA256}  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+
+      - name: Validate every repository workflow
+        run: "$RUNNER_TEMP/actionlint"
+
+      # Guard the exact outage class: YAML parsers accept this shape, but GitHub
+      # rejects the unsupported key before it creates any workflow run.
+      - name: Prove unsupported workflow keys fail the gate
+        run: |
+          invalid="$RUNNER_TEMP/invalid-workflow.yml"
+          cp .github/workflows/deploy.yml "$invalid"
+          sed -i '/cancel-in-progress: false/a\      queue: max' "$invalid"
+          if "$RUNNER_TEMP/actionlint" "$invalid" >"$RUNNER_TEMP/actionlint-negative.log" 2>&1; then
+            echo 'actionlint accepted the unsupported concurrency.queue regression fixture' >&2
+            exit 1
+          fi
+          grep -F 'unexpected key "queue"' "$RUNNER_TEMP/actionlint-negative.log"
+
       - uses: actions/setup-node@v7
         with:
           node-version: '22'

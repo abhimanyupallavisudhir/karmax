@@ -25,12 +25,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
-    # Retain every validated candidate. The remote updater independently refuses
-    # to move backwards if GitHub starts waiting jobs out of dispatch order.
+    # Serialize production changes. GitHub retains at most one pending member of
+    # a concurrency group; the remote updater independently refuses to move
+    # backwards if waiting jobs start out of dispatch order.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
-      queue: max
     env:
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
     steps:
