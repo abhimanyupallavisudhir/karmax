@@ -1094,6 +1094,14 @@ export interface Message {
   ts: number;
   /** User-attached images (references, never inline bytes). Absent ⇒ text-only. */
   images?: ImageRef[];
+  /**
+   * The provider timeline item which already renders this agent reply. Agent
+   * output is kept in `Message[]` so a resumed model receives its conversation,
+   * while the same output is also kept as an `AgentActivity` for the live UI.
+   * Linking the two lets presentation de-duplicate by identity instead of
+   * comparing prose (which is brittle across line-ending/format normalization).
+   */
+  sourceActivity?: { turnId: string; id: string; attempt: number };
 }
 
 /**

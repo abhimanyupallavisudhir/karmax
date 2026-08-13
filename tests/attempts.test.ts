@@ -110,6 +110,7 @@ describe('multiple task attempts', () => {
         maxActive = Math.max(maxActive, active);
         seen.push(input.messages.filter((m: any) => m.role === 'user').map((m: any) => m.text));
         await new Promise((r) => setTimeout(r, 15));
+        ctx.emitActivity({ id: `final-${seen.length}`, kind: 'message', phase: 'completed', title: `reviewed ${seen.length}` });
         ctx.confirmDecision({ action: 'confirm' });
         active--;
         return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: `reviewed ${seen.length}` };
@@ -117,12 +118,16 @@ describe('multiple task attempts', () => {
     };
     const core = makeCoreActivities({ store, worlds, adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });
     const task = { intentId: 'intent-1', projectId: 'p', title: 'X', prompt: 'x', project: {}, workflow: 'software-dev' } as any;
-    await Promise.all([
-      core.runAgentTurn({ taskId: 'attempt-a', role: 'confirm', worldHandle: world.handle, messages: [{ id: 'c-in-0', role: 'user', text: 'review A', ts: 0 }], task }),
-      core.runAgentTurn({ taskId: 'attempt-b', role: 'confirm', worldHandle: world.handle, messages: [{ id: 'c-in-0', role: 'user', text: 'review B', ts: 0 }], task }),
+    const results = await Promise.all([
+      core.runAgentTurn({ taskId: 'attempt-a', role: 'confirm', agentTurnId: 'attempt-a#0', worldHandle: world.handle, messages: [{ id: 'c-in-0', role: 'user', text: 'review A', ts: 0 }], task }),
+      core.runAgentTurn({ taskId: 'attempt-b', role: 'confirm', agentTurnId: 'attempt-b#0', worldHandle: world.handle, messages: [{ id: 'c-in-0', role: 'user', text: 'review B', ts: 0 }], task }),
     ]);
     expect(maxActive).toBe(1);
     expect(seen).toEqual([['review A'], ['review A', 'review B']]);
+    expect(results.map((result) => result.finalActivity)).toEqual([
+      { turnId: 'attempt-a#0', id: 'final-1', attempt: 1 },
+      { turnId: 'attempt-b#0', id: 'final-2', attempt: 1 },
+    ]);
     expect(JSON.parse(store.kvGet('confirm-transcript:intent-1')!)).toHaveLength(6); // request/output/verdict × 2
     await world.destroy();
   });
