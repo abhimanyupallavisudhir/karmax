@@ -785,7 +785,7 @@ const NODES = [
 // `mock` is a hermetic test adapter, not a user-selectable agent.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
+  claude: ['default', 'opus[1m]', { id: 'claude-fable-5[1m]', displayName: 'Fable 5' }, 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
@@ -798,7 +798,14 @@ function modelOptions(provider) {
   // Keep the provider metadata intact: Claude's stable selectable id can be an
   // alias such as `opus[1m]`, while its description is what identifies the
   // concrete model currently behind that alias (for example Opus 5).
-  return live?.length ? live : (MODELS[provider] || MODELS.claude);
+  const presets = MODELS[provider] || MODELS.claude;
+  if (!live?.length) return presets;
+  if (provider !== 'claude') return live;
+  // Claude's account-aware SDK list is additive, not exhaustive. In particular,
+  // it may omit gated or special-context models such as Fable even when their
+  // exact ids are selectable. Preserve live labels first, then fill known gaps.
+  const liveIds = new Set(live.map((model) => typeof model === 'string' ? model : model.id));
+  return [...live, ...presets.filter((model) => !liveIds.has(typeof model === 'string' ? model : model.id))];
 }
 // Which reasoning-effort levels a given model actually accepts (mirrors the
 // server's src/agent/effort.ts gating). Empty = the model has no effort control.

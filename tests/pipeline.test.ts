@@ -1360,10 +1360,13 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
       .toBe(1);
     const childId = (await view(handle)).subTasks![0] as string;
     const child = h.client.workflow.getHandle(childId);
-    // the child's agent turn is actually running (in its ~30s sleep)
+    // `stage: do` is published before host admission and activity startup, so it
+    // is not proof that the child's ~30s provider turn is in flight. Synchronize
+    // on the cancellation-aware activity state to exercise the intended case and
+    // avoid racing cancellation against startup on a loaded CI runner.
     await expect
-      .poll(async () => (await (child.query('view') as Promise<any>)).stage, { timeout: 15_000 })
-      .toBe('do');
+      .poll(async () => (await (child.query('view') as Promise<any>)).agentTurn?.state, { timeout: 20_000 })
+      .toBe('running');
 
     const t0 = Date.now();
     await handle.signal('cancel');
