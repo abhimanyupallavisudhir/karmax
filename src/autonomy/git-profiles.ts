@@ -279,23 +279,6 @@ export class GitProfiles {
     return name ? this.get(name) : undefined;
   }
 
-  /** Resolve credentials for a standalone remote operation such as a connector.
-   * A connector predating Git-profile selection may have no saved override. If
-   * there is exactly one profile, it is unambiguous and is safer to use than an
-   * anonymous clone; multiple profiles still require an explicit/default choice. */
-  resolveForRemote(name?: string): GitProfile | undefined {
-    const selected = name?.trim() || this.defaultProfile();
-    if (selected) {
-      const profile = this.get(selected);
-      if (!profile) throw new Error(`unknown Git profile "${selected}"`);
-      return profile;
-    }
-    const profiles = this.list();
-    if (profiles.length === 1) return profiles[0];
-    if (profiles.length > 1) throw new Error('select a Git profile (no organization default is configured)');
-    return undefined;
-  }
-
   /**
    * The identity to write worktree-scoped at world creation (§4A). Materializes
    * the signing key to a 0600 file under the state dir (per profile, refreshed

@@ -71,16 +71,6 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(profiles.resolve({})).toBeUndefined();
   });
 
-  it('uses a sole profile for standalone remotes but rejects an ambiguous implicit choice', () => {
-    profiles.save({ name: 'only', userName: 'Jane', userEmail: 'jane@example.com' });
-    expect(profiles.defaultProfile()).toBeUndefined();
-    expect(profiles.resolveForRemote()?.name).toBe('only');
-
-    profiles.save({ name: 'other', userName: 'Jane W', userEmail: 'jane@work.example' });
-    expect(() => profiles.resolveForRemote()).toThrow(/select a Git profile/i);
-    expect(profiles.resolveForRemote('other')?.name).toBe('other');
-  });
-
   it('re-saving with a blank secret keeps the stored one; a new value replaces it', () => {
     profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', githubToken: 'tok-1' });
     profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com' }); // no token supplied
