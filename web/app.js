@@ -7619,14 +7619,6 @@ function beginAsyncElementRender(element) {
   return () => asyncElementRenderEpoch.get(element) === epoch;
 }
 
-// Explanation-only is an account/settings concern. A task chooses only whether
-// its coding agents may use a credential, so both inherited Off and inherited
-// Explainer-only render as the same binary Off state there.
-function credentialEditorMode(scope, credential, modes, isOn) {
-  if (scope === 'task') return isOn ? 'on' : 'off';
-  return credential.kind === 'key' ? (modes?.[credential.key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
-}
-
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
   const renderIsCurrent = beginAsyncElementRender(el);
@@ -7684,7 +7676,11 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     .map((key) => {
       const c = byKey[key];
       const isOn = enabled.has(key);
-      const mode = credentialEditorMode(scope, c, sd.modes, isOn);
+      // Explanation-only is an account/settings concern. A task chooses only
+      // whether its coding agents may use a credential, so both inherited Off
+      // and inherited Explainer-only render as the same binary Off state there.
+      const mode = scope === 'task' ? (isOn ? 'on' : 'off')
+        : c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off')) : (isOn ? 'on' : 'off');
       const login = loginByKey[key];
       const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
       const loginActions = canManage && c.kind === 'login';
