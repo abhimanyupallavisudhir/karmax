@@ -71,6 +71,16 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(profiles.resolve({})).toBeUndefined();
   });
 
+  it('uses a sole profile for standalone remotes but rejects an ambiguous implicit choice', () => {
+    profiles.save({ name: 'only', userName: 'Jane', userEmail: 'jane@example.com' });
+    expect(profiles.defaultProfile()).toBeUndefined();
+    expect(profiles.resolveForRemote()?.name).toBe('only');
+
+    profiles.save({ name: 'other', userName: 'Jane W', userEmail: 'jane@work.example' });
+    expect(() => profiles.resolveForRemote()).toThrow(/select a Git profile/i);
+    expect(profiles.resolveForRemote('other')?.name).toBe('other');
+  });
+
   it('re-saving with a blank secret keeps the stored one; a new value replaces it', () => {
     profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', githubToken: 'tok-1' });
     profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com' }); // no token supplied
@@ -202,10 +212,13 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
   it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', () => {
     profiles.save({ name: 'p', userName: 'J', userEmail: 'j@x.com', sshKey: 'FAKE-KEY-MATERIAL', githubToken: 'tok' });
     const env = profiles.env(profiles.get('p')!, {});
-    expect(env.GIT_SSH_COMMAND).toMatch(/^ssh -i .* -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new$/);
+    expect(env.GIT_SSH_COMMAND).toMatch(/^ssh -i .* -o IdentitiesOnly=yes -o UserKnownHostsFile=.* -o StrictHostKeyChecking=accept-new$/);
     const keyPath = env.GIT_SSH_COMMAND!.match(/^ssh -i (\S+)/)![1]!;
+    const knownHostsPath = env.GIT_SSH_COMMAND!.match(/UserKnownHostsFile=(\S+)/)![1]!;
     expect(fs.readFileSync(keyPath, 'utf8')).toBe('FAKE-KEY-MATERIAL\n');
     expect(fs.statSync(keyPath).mode & 0o777).toBe(0o600);
+    expect(fs.readFileSync(knownHostsPath, 'utf8')).toBe('');
+    expect(fs.statSync(knownHostsPath).mode & 0o777).toBe(0o600);
     expect(env.GH_TOKEN).toBe('tok');
     expect(fs.statSync(env.GIT_ASKPASS!).mode & 0o777).toBe(0o700);
     // the askpass script answers with the env token, holding no secret itself

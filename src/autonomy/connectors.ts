@@ -1352,10 +1352,8 @@ export function defaultConnectors(store: ConnectorStore, items: VaultItems, brok
     () => connectors.secretFor('pass-git'),
     organizationId,
     (requested) => {
-      const profileName = requested || profiles.defaultProfile();
-      if (!profileName) return {};
-      const profile = profiles.get(profileName);
-      if (!profile) throw new Error(`unknown Git profile "${profileName}"`);
+      const profile = profiles.resolveForRemote(requested);
+      if (!profile) return {};
       return profiles.env(profile, {});
     },
   ));
