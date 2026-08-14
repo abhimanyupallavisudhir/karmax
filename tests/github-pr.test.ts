@@ -767,8 +767,116 @@ describe('GitHub-authoritative merge activity', () => {
     expect(methods).toContain('PUT');
   });
 
+  it('parks one superseded merge-ref run once and follows a newer successful run without reopening the PR', async () => {
+    const cancellation = 'Canceling since a higher priority waiting request for CI-refs/pull/113/merge exists.';
+    let newerSucceeded = false;
+    let actionsAvailable = true;
+    let readiness: any = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', databaseId: 501, name: 'CI', status: 'COMPLETED', conclusion: 'CANCELLED',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/31737743200/job/501`,
+      }] } } };
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/pulls/113')) return Response.json({
+        number: 113, node_id: 'PR_preempted', html_url: 'https://github.test/acme/widgets/pull/113', state: 'open',
+        merged: false, head: { ref: 'karmax/task_preempted', sha: 'pr-head' }, base: { ref: 'main' },
+      });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_preempted', url: 'https://github.test/acme/widgets/pull/113', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: 'pr-head', baseRefOid: 'base-head', viewerCanEnableAutoMerge: false,
+          viewerCanMergeAsAdmin: false, ...readiness,
+        } } } });
+      if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/check-runs/501'))
+        return Response.json({ output: { title: 'Concurrency cancellation', summary: cancellation } });
+      return Response.json({ message: `unexpected ${init.method ?? 'GET'} ${url.pathname}` }, { status: 500 });
+    }) as typeof fetch;
+    let reruns = 0;
+    const actions = {
+      inspectFailure: async () => ({
+        run: { id: 31737743200, name: 'CI', workflowId: 9, runNumber: 100, attempt: 1,
+          event: 'pull_request', status: 'completed', conclusion: 'cancelled', branch: 'karmax/task_preempted',
+          // GitHub's pull_request run is attached to refs/pull/113/merge, not the PR head.
+          headSha: 'synthetic-merge-ref-sha', url: 'https://github.test/run/31737743200',
+          createdAt: '2026-08-14T00:00:00Z', updatedAt: '2026-08-14T00:01:00Z' },
+        jobs: [], failedJobs: [{ id: 501, name: 'CI', status: 'completed', conclusion: 'cancelled', url: '',
+          steps: [], log: { excerpt: cancellation, downloadedBytes: cancellation.length, truncated: false } }],
+        artifacts: [], notices: [],
+      }),
+      listRuns: async () => ({ total: newerSucceeded ? 2 : 1, page: 1, perPage: 100, runs: newerSucceeded ? [{
+        id: 31737743300, name: 'CI', workflowId: 9, runNumber: 101, attempt: 1,
+        event: 'pull_request', status: 'completed', conclusion: 'success', branch: 'karmax/task_preempted',
+        headSha: 'newer-synthetic-merge-ref-sha', url: 'https://github.test/run/31737743300',
+        createdAt: '2026-08-14T00:02:00Z', updatedAt: '2026-08-14T00:03:00Z',
+      }] : [] }),
+      rerun: async () => { reruns++; return { accepted: true as const, action: 'rerun-failed' as const }; },
+    };
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+      installationToken: async () => 'installation-token',
+      actions: () => actionsAvailable ? actions : undefined,
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    core.store.claimPersonalOrganization('owner');
+    const project = core.store.createProject('Superseded PR CI', { landingAuthority: 'auto' });
+    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'preempted', accountLogin: 'acme', accountType: 'Organization' });
+    const repository = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'preempted-repo', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id });
+    core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+    const task = core.store.createTask({ projectId: project.id, title: 'Do not reopen', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } });
+    core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
+      userId: 'owner', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+      githubPrHeads: [{ slug: SLUG, number: 113, headSha: 'pr-head' }],
+    } });
+    const handle = { id: task.id, kind: 'worktree', branch: 'karmax/task_preempted', base: 'main', repo: tmp, root: tmp } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 113, nodeId: 'PR_preempted',
+      url: 'https://github.test/acme/widgets/pull/113', state: 'open', headSha: 'pr-head' }];
+
+    const first = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    const repeated = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(first).toMatchObject({ status: 'waiting', releaseAdmission: true,
+      detail: expect.stringMatching(/superseded.*no admission slot/is) });
+    expect(repeated).toMatchObject({ status: 'waiting', releaseAdmission: true });
+    expect(core.store.eventsSince(task.id, 0)
+      .filter((event) => event.type === 'github.ci.terminal-observed')).toHaveLength(1);
+    expect(reruns).toBe(0);
+
+    newerSucceeded = true;
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
+      status: 'waiting', releaseAdmission: true, detail: expect.stringMatching(/superseding.*succeeded.*refresh/is),
+    });
+
+    // The no-Actions fallback consumes the same classifier and also parks the
+    // unchanged proposal instead of treating the diagnostic as a code failure.
+    actionsAvailable = false;
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'StatusContext', context: 'CI', state: 'FAILURE',
+        targetUrl: `https://github.com/${SLUG}/actions/runs/44`, description: cancellation,
+      }] } } };
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
+      status: 'waiting', releaseAdmission: true, detail: expect.stringMatching(/higher-priority CI request.*waiting/is),
+    });
+    let stuck: any;
+    for (let observation = 2; observation <= 20; observation++)
+      stuck = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(stuck).toMatchObject({
+      status: 'needs-human', releaseAdmission: true,
+      detail: expect.stringMatching(/20 bounded observations.*concurrency\/runner configuration.*no admission slot/is),
+    });
+  });
+
   it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
-    const { githubWaitNeedsProposalRevision } = await import('../src/workflows/software-dev.js');
+    const { githubWaitNeedsProposalRevision, landingRepairProgress, landingRepairExhaustionDetail } =
+      await import('../src/workflows/software-dev.js');
 
     expect(githubWaitNeedsProposalRevision({
       status: 'waiting',
@@ -786,6 +894,31 @@ describe('GitHub-authoritative merge activity', () => {
       status: 'queued',
       detail: 'Pull Request has merge conflicts',
     })).toBe(false);
+
+    const unchanged = landingRepairProgress({
+      authorization: 'authorized', validation: 'failed', provider: 'ejected',
+      repairAttempts: 1, lastRepairFingerprint: 'ci:head-a:run-42:attempt-1',
+    }, { kind: 'ci', preserveAuthorization: true, fingerprint: 'ci:head-a:run-42:attempt-1' });
+    expect(unchanged).toMatchObject({ attempts: 1, duplicate: true });
+
+    let landing: any = { authorization: 'authorized', validation: 'failed', provider: 'ejected', repairAttempts: 0 };
+    for (let base = 1; base <= 5; base++) {
+      const progress = landingRepairProgress(landing, {
+        kind: 'conflict', preserveAuthorization: true, fingerprint: `conflict:head-${base}:base-${base}`,
+      });
+      expect(progress.duplicate).toBe(false);
+      landing = { ...landing, repairAttempts: progress.attempts,
+        lastRepairFingerprint: progress.lastRepairFingerprint };
+    }
+    expect(landing.repairAttempts).toBe(5);
+    expect(landingRepairExhaustionDetail(landing.repairAttempts, {
+      kind: 'conflict', preserveAuthorization: true,
+    }, 'The target rejected the fifth distinct repaired head.', false)).toMatch(
+      /exhausted 5 substantive.*Last cause: conflict.*fifth distinct repaired head.*outside every queue/is,
+    );
+    expect(landingRepairExhaustionDetail(5, {
+      kind: 'conflict', preserveAuthorization: true,
+    }, 'conflict', false)).not.toMatch(/target kept moving/i);
   });
 
   it('returns an explicit merge-conflict refusal to Do for legacy pinned tasks and does not repeat impossible self-approval', async () => {
@@ -1118,6 +1251,15 @@ describe('GitHub-authoritative merge activity', () => {
       detail: expect.stringMatching(/Required status check failed.*merge-group-failure.*speculative CI.*A \+ B is incompatible.*src\/prefix\.ts:7/is),
     });
     expect(ejected).not.toHaveProperty('landingOwner');
+
+    readiness = { ...readiness, timelineItems: { nodes: [{ createdAt: new Date(enqueuedAt + 2_000).toISOString(),
+      reason: 'Canceling since a higher priority waiting request for CI-refs/pull/40/merge exists.',
+      beforeCommit: { oid: 'merge-group-failure' } }] } };
+    await expect(core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' }))
+      .resolves.toMatchObject({
+        status: 'waiting', releaseAdmission: true,
+        detail: expect.stringMatching(/higher priority waiting request.*superseded.*no admission slot/is),
+      });
   });
 
   it('v1.20 observes an explicitly external landing authority without shadow mutations', async () => {

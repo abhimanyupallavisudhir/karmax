@@ -422,6 +422,36 @@ export function githubWaitNeedsProposalRevision(
       .test(decision.detail ?? '');
 }
 
+/** One terminal provider observation may authorize at most one automated
+ * repair. Republishing the identical candidate is an external wait, not a new
+ * repair attempt. */
+export function landingRepairProgress(
+  landing: TaskLandingState,
+  repair: NonNullable<GitHubMergeAuthorization['repair']>,
+): { attempts: number; duplicate: boolean; lastRepairFingerprint?: string } {
+  const current = landing.repairAttempts ?? 0;
+  const duplicate = Boolean(repair.preserveAuthorization && repair.fingerprint
+    && repair.fingerprint === landing.lastRepairFingerprint);
+  return {
+    attempts: repair.preserveAuthorization && !duplicate ? current + 1 : current,
+    duplicate,
+    ...(repair.fingerprint ? { lastRepairFingerprint: repair.fingerprint }
+      : landing.lastRepairFingerprint ? { lastRepairFingerprint: landing.lastRepairFingerprint } : {}),
+  };
+}
+
+export function landingRepairExhaustionDetail(
+  attempts: number,
+  repair: NonNullable<GitHubMergeAuthorization['repair']>,
+  detail: string | undefined,
+  frontHeld: boolean,
+): string {
+  const cause = detail?.slice(0, 2_000) ?? 'GitHub did not provide more detail';
+  return `This ${frontHeld ? 'task' : 'pull request'} exhausted ${attempts} substantive automated landing repairs. Last cause: ${repair.kind} — ${cause}. ${frontHeld
+    ? 'Its landing slot has been released so human input blocks nothing. Confirm to authorize another queued repair attempt, or send guidance to the Do agent.'
+    : 'It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.'}`;
+}
+
 /**
  * Open PR may reuse the proposal produced by the completed Do turn only when no
  * newer conversation input is waiting. Otherwise the synthetic completed turn
@@ -3253,13 +3283,14 @@ Inspect the complete current diff and specifically compare its delta from the re
         }
       }
       if (frontHeldLanding && githubResult) {
-        retainFront = githubResult.status === 'waiting'
+        retainFront = githubResult.releaseAdmission !== true && (githubResult.status === 'waiting'
           || githubResult.status === 'retryable-error'
           || (githubResult.status === 'needs-revision'
-            && githubResult.repair?.preserveAuthorization === true);
+            && githubResult.repair?.preserveAuthorization === true));
       }
       if (fairLanding && githubResult) {
-        retainFront = githubResult.landingOwner === 'karmax'
+        retainFront = githubResult.releaseAdmission !== true
+          && githubResult.landingOwner === 'karmax'
           && (githubResult.status === 'waiting' || githubResult.status === 'queued');
       }
     } finally {
@@ -3335,11 +3366,31 @@ Inspect the complete current diff and specifically compare its delta from the re
       // `waiting`; the patch marker reaches that decision only at the live edge
       // without changing its recorded timer history.
       const repairsLegacyConflictWait = patched('software-dev-github-conflict-wait-recovery-v1');
+      const repairProgress = decision.repair
+        ? landingRepairProgress(landing, decision.repair)
+        : undefined;
+      if (intentAuthorizedLanding && decision.status === 'needs-revision'
+        && decision.repair?.preserveAuthorization === true && repairProgress?.duplicate) {
+        if (frontHeldLanding) await releaseRetainedLandingDomains();
+        providerQueueAccepted = false;
+        landing = {
+          ...landing, provider: 'ejected', validation: 'failed',
+          detail: `${decision.detail ?? 'GitHub repeated the same landing failure'} The candidate and terminal observation are unchanged, so no additional automated repair was charged and Do was not reopened.`,
+        };
+        status = 'waiting';
+        waitingFor = { kind: 'github', detail: `${landing.detail} The task is outside every admission queue while waiting for a new run, candidate head, or target state.` };
+        await publish();
+        const providerSeen = providerChangeEpoch;
+        await condition(() => cancelled || (fairLanding && providerChangeEpoch > providerSeen), input.githubPollMs ?? MERGE_POLL);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        continue;
+      }
       if (decision.status === 'needs-revision' || decision.status === 'stale-review'
         || (repairsLegacyConflictWait && githubWaitNeedsProposalRevision(decision))) {
         if (intentAuthorizedLanding) {
           const preservesIntent = decision.repair?.preserveAuthorization === true;
-          const attempts = preservesIntent ? (landing.repairAttempts ?? 0) + 1 : 0;
+          const attempts = preservesIntent ? (repairProgress?.attempts ?? (landing.repairAttempts ?? 0) + 1) : 0;
           providerQueueAccepted = false;
           repairValidationPending = preservesIntent;
           if (frontHeldLanding && !preservesIntent) forceHumanRepairReview = true;
@@ -3349,6 +3400,8 @@ Inspect the complete current diff and specifically compare its delta from the re
             validation: 'failed',
             provider: 'ejected',
             repairAttempts: attempts,
+            ...(repairProgress?.lastRepairFingerprint
+              ? { lastRepairFingerprint: repairProgress.lastRepairFingerprint } : {}),
             detail: decision.detail,
           };
           if (preservesIntent && attempts >= MAX_AUTOMATED_LANDING_REPAIRS) {
@@ -3363,9 +3416,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                 ...(decision.actorUserId ? [`user:${decision.actorUserId}`] : []),
                 '@creator',
               ])],
-              detail: frontHeldLanding
-                ? `This task exhausted ${attempts} front-held automated landing repairs. Its landing slot has been released so human input blocks nothing. Confirm to authorize another queued repair attempt, or send guidance to the Do agent.`
-                : `This pull request was ejected ${attempts} times while the target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
+              detail: landingRepairExhaustionDetail(attempts, decision.repair!, decision.detail, frontHeldLanding),
             };
             await publish();
             await condition(() => confirmed || cancelled || msgs.length > waitSeen);
@@ -3380,7 +3431,7 @@ Inspect the complete current diff and specifically compare its delta from the re
               });
             }
             confirmed = false;
-            landing = { ...landing, repairAttempts: 0 };
+            landing = { ...landing, repairAttempts: 0, lastRepairFingerprint: undefined };
           }
         }
         msgs.push({
@@ -3566,7 +3617,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           waitingFor = {
             kind: 'human',
             audience: ['@creator'],
-            detail: `This proposal was ejected ${attempts} times while its target kept moving. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
+            detail: `This proposal exhausted ${attempts} substantive merge-conflict or dirty-worktree repairs. Last refusal: ${result.note ?? detail}. It is outside every queue and blocks nothing. Confirm to authorize another automated repair attempt, or send guidance to the Do agent.`,
           };
           await publish();
           await condition(() => confirmed || cancelled || msgs.length > waitSeen);
@@ -3581,7 +3632,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             });
           }
           confirmed = false;
-          landing = { ...landing, repairAttempts: 0 };
+          landing = { ...landing, repairAttempts: 0, lastRepairFingerprint: undefined };
         }
       }
       msgs.push({

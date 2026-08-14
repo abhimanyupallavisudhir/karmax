@@ -47,6 +47,17 @@ describe('GitHub Actions API', () => {
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/pull/1')).toBeUndefined();
   });
 
+  it('classifies GitHub concurrency preemption as superseded in inspected and fallback diagnostics', () => {
+    const message = 'Canceling since a higher priority waiting request for CI-refs/pull/113/merge exists.';
+    const decision = classifyGithubActionsFailure(inspection(message, { conclusion: 'cancelled' }));
+    expect(decision).toMatchObject({
+      disposition: 'superseded',
+      reason: expect.stringMatching(/newer or higher-priority run.*wait/i),
+    });
+    expect(classifyGithubActionsDiagnostic(message)).toBe('superseded');
+    expect(classifyGithubActionsDiagnostic('Pull request check\n- CI: CANCELLED')).toBe('retry');
+  });
+
   it('lists normalized runs with bounded provider filters', async () => {
     let requested = '';
     const api = new GithubActionsApi('installation-token', { apiBase: 'https://api.github.test',

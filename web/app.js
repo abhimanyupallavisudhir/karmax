@@ -752,6 +752,12 @@ function numLabel(taskId) {
   return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
 }
 
+// The task's human-facing identity wherever its title is shown compactly.
+function numberedTaskTitle(task) {
+  const title = task?.title || task?.id || '';
+  return task?.num != null ? `#${task.num} ${title}` : title;
+}
+
 function principalLabel(principal) {
   if (!principal) return 'Unassigned';
   if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
@@ -4486,6 +4492,10 @@ function collectTriggers(existing) {
   return trigs;
 }
 
+function dependencyChipHtml(task) {
+  return `<span class="dep-chip" data-depid="${esc(task.id)}">${esc(numberedTaskTitle(task))}<button type="button" class="dep-x" data-depx="${esc(task.id)}" title="Remove">✕</button></span>`;
+}
+
 // Wire the dependency chips: ✕ removes; "＋ Add a task…" opens the full task-picker
 // overlay (the task list's search surface). Seeded from an existing dependency trigger.
 function wireDepPicker(values, selfId) {
@@ -4494,9 +4504,8 @@ function wireDepPicker(values, selfId) {
   if (!box || !btn) return;
   const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
   const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
-  const chip = (t) => `<span class="dep-chip" data-depid="${t.id}">${esc(t.title)}<button type="button" class="dep-x" data-depx="${t.id}" title="Remove">✕</button></span>`;
   const paint = (ids, changed) => {
-    box.innerHTML = ids.map((id) => chip(taskById(id))).join('');
+    box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id))).join('');
     box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
     if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
