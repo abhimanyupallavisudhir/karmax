@@ -585,6 +585,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'cancel_agent_action',
+    description: 'Withdraw one pending background collaboration requested by this task. This releases the Do-stage wait without cancelling the target task.',
+    parameters: {
+      type: 'object',
+      properties: { request_id: { type: 'string' } },
+      required: ['request_id'],
+    },
+  },
+  {
     name: 'escalate_to_human',
     description:
       'Pause your current task at its exact stage and ask selected people or teams for input. ' +
@@ -1160,6 +1169,10 @@ export function platformToolHandlers(
         action: String(args?.action ?? ''),
         message: args?.message ? String(args.message) : undefined,
       }));
+    },
+    async cancel_agent_action(args) {
+      const requestId = encodeURIComponent(String(args?.request_id ?? ''));
+      return JSON.stringify(await platformRequest('POST', `/api/agent/collaboration/${requestId}/cancel`, {}));
     },
     async escalate_to_human(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/escalate', {

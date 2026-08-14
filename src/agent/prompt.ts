@@ -40,6 +40,7 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - read_wiki(scope, id, path?) and search_wiki(scope, id, query): navigate and grep the organization/project wikis (skills, memories, prompts). Your instructions include each wiki's table of contents and scope ids; read_wiki with a section path expands any [more…] fold. These run host-side, so they work from every world, including cloud sandboxes.
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(...): discover work by its human #number and robustly inspect or continue another task agent without mutating its original session.
 - request_agent_action(taskId, "publish_branch", message?): ask a collaborator to publish in the background. It returns a durable request id immediately; continue other useful work and never poll. Karmax injects completion or failure into this conversation and keeps the task in Do while a request remains outstanding.
+- cancel_agent_action(requestId): withdraw one of your pending collaboration requests when its target is blocked or its result is no longer needed. This releases your Do-stage wait without cancelling the target task.
 - publish_task_branch(): publish your clean committed branch for collaborators.
 - import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
 - refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.

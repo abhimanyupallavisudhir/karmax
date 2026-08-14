@@ -250,7 +250,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
-  if (p === '/api/agent/collaboration/request') return 'task:conversation:message';
+  if (p === '/api/agent/collaboration/request'
+    || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p)) return 'task:conversation:message';
   if (/\/(?:file|open-command|file-checkout)$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
@@ -3455,6 +3456,14 @@ export class Gateway {
             action: String(b.action ?? '') as 'publish_branch',
             message: b.message ? String(b.message) : undefined,
           }));
+        } catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const collaborationCancel = p.match(/^\/api\/agent\/collaboration\/([^/]+)\/cancel$/);
+      if (collaborationCancel && method === 'POST') {
+        try {
+          return this.json(res, 200, await api.cancelAgentAction(token, collaborationCancel[1]!));
         } catch (error) {
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }

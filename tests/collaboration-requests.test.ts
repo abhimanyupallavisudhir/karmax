@@ -47,7 +47,7 @@ function fixture() {
   } as any;
   const bus = new KarmaxBus();
   const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, bus });
-  return { store, project, requester, target, token, signals, bus, api };
+  return { store, project, requester, target, token, tokens, signals, bus, api };
 }
 
 describe('durable background collaboration requests', () => {
@@ -126,6 +126,51 @@ describe('durable background collaboration requests', () => {
       return call!;
     });
     expect((settled[2] as any).text).toContain('target task became failed');
+  });
+
+  it('lets the requester withdraw a blocked collaboration without cancelling the target', async () => {
+    const f = fixture();
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+
+    const cancelled = await f.api.cancelAgentAction(f.token, request.id);
+
+    expect(cancelled).toMatchObject({ id: request.id, status: 'failed' });
+    expect(cancelled.result?.reason).toMatch(/withdrawn/);
+    expect(f.store.getTask(f.target.id)?.lastView?.status).not.toBe('cancelled');
+    await vi.waitFor(() => {
+      const call = (f.signals.get(f.requester.id) ?? [])
+        .find((item) => item[0] === 'collaborationSettled' && item[1] === request.id);
+      expect(call).toBeTruthy();
+    });
+  });
+
+  it('does not let another task withdraw a collaboration it does not own', async () => {
+    const f = fixture();
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+    const other = f.store.createTask({
+      projectId: f.project.id,
+      title: 'Other requester',
+      prompt: 'Other',
+      workflow: 'software-dev',
+      params: {},
+    });
+    const token = f.tokens.mint({
+      taskId: other.id,
+      projectId: f.project.id,
+      organizationId: f.project.organizationId,
+      profileId: 'do',
+      principal: `task-agent:${other.id}:do`,
+      ceiling: ['task:conversation:message'],
+      grantorCaps: ['task:conversation:message'],
+    }).token;
+    await expect(f.api.cancelAgentAction(token, request.id)).rejects.toThrow(/not found/);
+    expect(f.store.getCollaborationRequest(request.id)?.status).toBe('pending');
   });
 
   it('removes collaboration records with their project', () => {
