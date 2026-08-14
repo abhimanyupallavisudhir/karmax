@@ -6983,8 +6983,37 @@ function conversationPane(v, t) {
 // replace in place, so a command is one row that moves running → completed rather
 // than two noisy rows.
 function conversationEntries(t) {
-  const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
+  // Fetch/WS races can merge an older durable window with newer events in either
+  // array order. Fold provider updates in their durable order so a stale
+  // "started" update can never replace a later "completed" one. Explanations
+  // also carry their source event: it keeps an explained message present after
+  // that message ages out of the ordinary bounded event window.
+  const sourceEvents = (S.taskEvents || [])
+    .filter((event) => event.type === 'conversation.explanation' && event.payload?.role === t.role)
+    .map((event) => event.payload?.sourceEvent)
+    .filter((event) => event?.type === 'agent.activity');
+  const seenEvents = new Set();
+  const orderedEvents = [...(S.taskEvents || []), ...sourceEvents]
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => {
+      const key = event.seq != null ? `seq:${event.seq}` : `${event.type}/${event.ts}/${JSON.stringify(event.payload)}`;
+      if (seenEvents.has(key)) return false;
+      seenEvents.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      const aSeq = Number(a.event.seq);
+      const bSeq = Number(b.event.seq);
+      const aDurable = a.event.seq != null && Number.isSafeInteger(aSeq);
+      const bDurable = b.event.seq != null && Number.isSafeInteger(bSeq);
+      if (aDurable && bDurable) return aSeq - bSeq;
+      if (aDurable !== bDurable) return aDurable ? -1 : 1;
+      return (Number(a.event.ts || 0) - Number(b.event.ts || 0)) || (a.index - b.index);
+    })
+    .map(({ event }) => event);
+  const updates = orderedEvents.filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
+  const activityRefsBySource = new Map();
   // Provider streams and workflow snapshots may normalize line endings
   // differently even though the browser renders the same prose.
   const messageTextKey = (value) => String(value || '').replace(/\r\n?/g, '\n').trim();
@@ -7013,6 +7042,7 @@ function conversationEntries(t) {
       retry = generation > 1;
     }
     const key = `${base}/${attempt}`;
+    activityRefsBySource.set(`activity:${event.seq ?? event.ts}`, key);
     const prior = activities.get(key);
     const displayed = retry && activity.kind === 'turn' && activity.phase === 'started'
       ? { ...activity, title: 'Agent retry started', detail: undefined }
@@ -7026,6 +7056,7 @@ function conversationEntries(t) {
       // Point at the latest durable update: for a streaming provider message the
       // completed text, not its earlier partial title, is what gets explained.
       sourceKey: `activity:${event.seq ?? event.ts}`,
+      activityRef: key,
       conversationRole: t.role,
       activityGroup: `${turn}/${attempt}`,
     });
@@ -7070,8 +7101,11 @@ function conversationEntries(t) {
     .map((message, index) => {
       const real = Number(message.ts) > 100000000000;
       if (real) carriedTs = Number(message.ts);
+      const source = message.sourceActivity;
       return { type: 'message', message, ts: message.ts, sortTs: real ? Number(message.ts) : carriedTs, order: index,
-        sourceKey: `message:${message.id}`, conversationRole: t.role };
+        sourceKey: `message:${message.id}`,
+        activityRef: source ? `${source.turnId}/${source.id}/${source.attempt}` : undefined,
+        conversationRole: t.role };
     });
   // Follow-ups are journaled as soon as Temporal accepts their signal, while the
   // workflow's cached transcript may not be republished until the turn ends.
@@ -7080,7 +7114,7 @@ function conversationEntries(t) {
   // show the same user message twice.
   const storedIds = new Set((t.messages || []).map((message) => message.id));
   const posted = new Map();
-  for (const event of (S.taskEvents || [])) {
+  for (const event of orderedEvents) {
     if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
     const message = event.payload?.message;
     if (!message?.id || storedIds.has(message.id)) continue;
@@ -7090,29 +7124,41 @@ function conversationEntries(t) {
   const combined = [...messages, ...posted.values(), ...visibleActivities];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
   const explanations = new Map();
-  for (const event of (S.taskEvents || [])) {
+  for (const event of orderedEvents) {
     if (event.type !== 'conversation.explanation' || event.payload?.role !== t.role || !event.payload?.sourceKey) continue;
     const key = event.seq ?? `${event.payload.sourceKey}/${event.ts}/${event.payload.text}`;
     explanations.set(key, { type: 'explanation', explanation: event.payload, ts: event.ts,
-      sortTs: Number(event.ts), order: event.seq ?? event.ts, conversationRole: t.role });
+      sortTs: Number(event.ts), order: event.seq ?? event.ts, conversationRole: t.role,
+      activityRef: activityRefsBySource.get(event.payload.sourceKey) });
   }
-  const bySource = new Map();
+  const targetByKey = new Map();
+  for (let index = 0; index < combined.length; index++) {
+    const entry = combined[index];
+    if (entry.sourceKey) targetByKey.set(entry.sourceKey, index);
+    if (entry.activityRef) targetByKey.set(`activity-ref:${entry.activityRef}`, index);
+  }
+  const byTarget = new Map();
+  const orphaned = [];
   for (const explanation of explanations.values()) {
-    const list = bySource.get(explanation.explanation.sourceKey) || [];
+    const target = targetByKey.get(explanation.explanation.sourceKey)
+      ?? (explanation.activityRef ? targetByKey.get(`activity-ref:${explanation.activityRef}`) : undefined);
+    if (target == null) { orphaned.push(explanation); continue; }
+    const list = byTarget.get(target) || [];
     list.push(explanation);
-    bySource.set(explanation.explanation.sourceKey, list);
+    byTarget.set(target, list);
   }
   const out = [];
-  for (const entry of combined) {
+  for (let index = 0; index < combined.length; index++) {
+    const entry = combined[index];
     out.push(entry);
-    const attached = bySource.get(entry.sourceKey) || [];
+    const attached = byTarget.get(index) || [];
     attached.sort((a, b) => Number(a.order) - Number(b.order));
     out.push(...attached);
-    bySource.delete(entry.sourceKey);
   }
-  // If a bounded event window no longer contains an old provider message, retain
-  // its durable annotation at the end instead of silently hiding it.
-  for (const orphaned of bySource.values()) out.push(...orphaned);
+  // Malformed legacy annotations may lack any resolvable source. Preserve them
+  // rather than losing durable data; valid activity annotations always have the
+  // recovered source event above and therefore never take this fallback.
+  out.push(...orphaned);
   return out;
 }
 
