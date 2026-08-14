@@ -97,12 +97,13 @@ async function repoWithGithubOrigin(name: string, slug = SLUG): Promise<string> 
   return repo;
 }
 
-async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } }, githubApp?: Record<string, unknown>) {
+async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } },
+  githubApp?: Record<string, unknown>, dbPath = ':memory:') {
   const { Store } = await import('../src/store/db.js');
   const { WorldRegistry } = await import('../src/world/registry.js');
   const { ProfileResolver } = await import('../src/agent/profiles.js');
   const { makeCoreActivities } = await import('../src/activities/core.js');
-  const store = new Store(':memory:');
+  const store = new Store(dbPath);
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(path.join(tmp, 'worlds')));
   const core = makeCoreActivities({ store, worlds, adapters: new Map(),
@@ -769,7 +770,11 @@ describe('GitHub-authoritative merge activity', () => {
 
   it('parks one superseded merge-ref run once and follows a newer successful run without reopening the PR', async () => {
     const cancellation = 'Canceling since a higher priority waiting request for CI-refs/pull/113/merge exists.';
+    let checkSummary = cancellation;
+    let inspectionLog = cancellation;
+    let cancelledAttempt = 1;
     let newerSucceeded = false;
+    let newerActive = false;
     let actionsAvailable = true;
     let readiness: any = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
@@ -790,26 +795,29 @@ describe('GitHub-authoritative merge activity', () => {
           viewerCanMergeAsAdmin: false, ...readiness,
         } } } });
       if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/check-runs/501'))
-        return Response.json({ output: { title: 'Concurrency cancellation', summary: cancellation } });
+        return Response.json({ output: { title: 'Concurrency cancellation', summary: checkSummary } });
       return Response.json({ message: `unexpected ${init.method ?? 'GET'} ${url.pathname}` }, { status: 500 });
     }) as typeof fetch;
     let reruns = 0;
     const actions = {
       inspectFailure: async () => ({
-        run: { id: 31737743200, name: 'CI', workflowId: 9, runNumber: 100, attempt: 1,
+        run: { id: 31737743200, name: 'CI', workflowId: 9, runNumber: 100, attempt: cancelledAttempt,
           event: 'pull_request', status: 'completed', conclusion: 'cancelled', branch: 'karmax/task_preempted',
           // GitHub's pull_request run is attached to refs/pull/113/merge, not the PR head.
           headSha: 'synthetic-merge-ref-sha', url: 'https://github.test/run/31737743200',
           createdAt: '2026-08-14T00:00:00Z', updatedAt: '2026-08-14T00:01:00Z' },
         jobs: [], failedJobs: [{ id: 501, name: 'CI', status: 'completed', conclusion: 'cancelled', url: '',
-          steps: [], log: { excerpt: cancellation, downloadedBytes: cancellation.length, truncated: false } }],
+          steps: [], log: { excerpt: inspectionLog, downloadedBytes: inspectionLog.length, truncated: false } }],
         artifacts: [], notices: [],
       }),
-      listRuns: async () => ({ total: newerSucceeded ? 2 : 1, page: 1, perPage: 100, runs: newerSucceeded ? [{
+      listRuns: async () => ({ total: newerSucceeded || newerActive ? 2 : 1, page: 1, perPage: 100,
+        runs: newerSucceeded || newerActive ? [{
         id: 31737743300, name: 'CI', workflowId: 9, runNumber: 101, attempt: 1,
-        event: 'pull_request', status: 'completed', conclusion: 'success', branch: 'karmax/task_preempted',
+        event: 'pull_request', status: newerSucceeded ? 'completed' : 'in_progress',
+        ...(newerSucceeded ? { conclusion: 'success' } : {}), branch: 'karmax/task_preempted',
         headSha: 'newer-synthetic-merge-ref-sha', url: 'https://github.test/run/31737743300',
         createdAt: '2026-08-14T00:02:00Z', updatedAt: '2026-08-14T00:03:00Z',
+        pullRequests: [{ number: 113, headSha: 'pr-head' }],
       }] : [] }),
       rerun: async () => { reruns++; return { accepted: true as const, action: 'rerun-failed' as const }; },
     };
@@ -820,7 +828,8 @@ describe('GitHub-authoritative merge activity', () => {
       installationToken: async () => 'installation-token',
       actions: () => actionsAvailable ? actions : undefined,
     };
-    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    const dbPath = path.join(tmp, 'restart-safe.sqlite');
+    let core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, dbPath);
     core.store.claimPersonalOrganization('owner');
     const project = core.store.createProject('Superseded PR CI', { landingAuthority: 'auto' });
     const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -830,7 +839,7 @@ describe('GitHub-authoritative merge activity', () => {
       private: true, gitConnectionId: connection.id });
     core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
     const task = core.store.createTask({ projectId: project.id, title: 'Do not reopen', workflow: 'software-dev',
-      workflowVersion: '1.20.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
       createdBy: { kind: 'user', userId: 'owner' } });
     core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1, payload: {
       userId: 'owner', satisfied: true, githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
@@ -842,17 +851,48 @@ describe('GitHub-authoritative merge activity', () => {
 
     const first = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
     const repeated = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(first).toMatchObject({ status: 'waiting', releaseAdmission: true,
-      detail: expect.stringMatching(/superseded.*no admission slot/is) });
-    expect(repeated).toMatchObject({ status: 'waiting', releaseAdmission: true });
+    expect(first).toMatchObject({ status: 'waiting',
+      detail: expect.stringMatching(/bounded exact-head reconciliation/is) });
+    expect(first).not.toHaveProperty('releaseAdmission');
+    expect(repeated).toMatchObject({ status: 'waiting',
+      detail: expect.stringMatching(/supersession.*keep polling/is) });
+    expect(repeated).not.toHaveProperty('releaseAdmission');
     expect(core.store.eventsSince(task.id, 0)
       .filter((event) => event.type === 'github.ci.terminal-observed')).toHaveLength(1);
     expect(reruns).toBe(0);
 
+    newerActive = true;
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
+      status: 'waiting', detail: expect.stringMatching(/equivalent same-head.*31737743300.*in_progress/is),
+    });
+    expect(reruns).toBe(0);
+
     newerSucceeded = true;
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
-      status: 'waiting', releaseAdmission: true, detail: expect.stringMatching(/superseding.*succeeded.*refresh/is),
+      status: 'planned', detail: expect.stringMatching(/passed.*preflight/is),
     });
+
+    // A genuinely current cancellation receives bounded reconciliation, then
+    // one retry when no same-head replacement exists. Persisted observations
+    // survive each fresh activity invocation and duplicate polls do not create
+    // duplicate rerun requests. Billing fixture strings in the cancelled job's
+    // log are not direct GitHub account evidence.
+    newerActive = false;
+    newerSucceeded = false;
+    cancelledAttempt = 2;
+    checkSummary = 'The operation was canceled.';
+    inspectionLog = "passing fixture: You're out of usage credits. Your prepaid balance has now been fully consumed.\nThe operation was canceled.";
+    const bounded = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(bounded).toMatchObject({ status: 'waiting', detail: expect.stringMatching(/bounded exact-head reconciliation/i) });
+    expect(reruns).toBe(0);
+    core.store.close();
+    core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, dbPath);
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
+      status: 'waiting', detail: 'Waiting for CI',
+    });
+    expect(reruns).toBe(1);
+    await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(reruns).toBe(1);
 
     // The no-Actions fallback consumes the same classifier and also parks the
     // unchanged proposal instead of treating the diagnostic as a code failure.
@@ -863,15 +903,12 @@ describe('GitHub-authoritative merge activity', () => {
         targetUrl: `https://github.com/${SLUG}/actions/runs/44`, description: cancellation,
       }] } } };
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
-      status: 'waiting', releaseAdmission: true, detail: expect.stringMatching(/higher-priority CI request.*waiting/is),
+      status: 'waiting', detail: expect.stringMatching(/equivalent CI request.*waiting.*releasing its landing position/is),
     });
-    let stuck: any;
-    for (let observation = 2; observation <= 20; observation++)
-      stuck = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(stuck).toMatchObject({
-      status: 'needs-human', releaseAdmission: true,
-      detail: expect.stringMatching(/20 bounded observations.*concurrency\/runner configuration.*no admission slot/is),
-    });
+    const duplicateFallback = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(duplicateFallback).toMatchObject({ status: 'waiting',
+      detail: expect.stringMatching(/instead of.*releasing its landing position.*asking a human/is) });
+    expect(duplicateFallback).not.toHaveProperty('releaseAdmission');
   });
 
   it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
@@ -1255,11 +1292,12 @@ describe('GitHub-authoritative merge activity', () => {
     readiness = { ...readiness, timelineItems: { nodes: [{ createdAt: new Date(enqueuedAt + 2_000).toISOString(),
       reason: 'Canceling since a higher priority waiting request for CI-refs/pull/40/merge exists.',
       beforeCommit: { oid: 'merge-group-failure' } }] } };
-    await expect(core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' }))
-      .resolves.toMatchObject({
-        status: 'waiting', releaseAdmission: true,
-        detail: expect.stringMatching(/higher priority waiting request.*superseded.*no admission slot/is),
-      });
+    const superseded = await core.mergeGithubPrs(handle, updated.prs, { mode: 'observe', authority: 'auto' });
+    expect(superseded).toMatchObject({
+      status: 'waiting',
+      detail: expect.stringMatching(/higher priority waiting request.*superseded.*without.*releasing its landing position.*requesting human input/is),
+    });
+    expect(superseded).not.toHaveProperty('releaseAdmission');
   });
 
   it('v1.20 observes an explicitly external landing authority without shadow mutations', async () => {

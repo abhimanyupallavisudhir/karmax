@@ -30,6 +30,30 @@ export interface GithubActionsRun {
   updatedAt: string;
   actor?: string;
   triggeringActor?: string;
+  /** Pull-request heads attached by GitHub to this run. `headSha` is the
+   * workflow execution SHA (often a synthetic merge ref for pull_request), so
+   * this is the authoritative exact proposal revision when it is present. */
+  pullRequests?: Array<{ number: number; headSha: string; headRef?: string }>;
+}
+
+/** Durable identity of one required-check validation. Runs and attempts are
+ * observations of this identity, not part of it: GitHub may create or rerun
+ * several equivalent executions for one exact proposal revision. */
+export interface GithubRequiredCheckIdentity {
+  repository: string;
+  pullRequest: number;
+  headSha: string;
+  workflowId: number;
+  check: string;
+}
+
+export interface GithubActionsRunReconciliation {
+  identity: GithubRequiredCheckIdentity;
+  key: string;
+  runs: GithubActionsRun[];
+  current: GithubActionsRun;
+  replacement?: GithubActionsRun;
+  successful?: GithubActionsRun;
 }
 
 export interface GithubActionsStep {
@@ -308,8 +332,17 @@ export function classifyGithubActionsFailure(
     inspection,
   };
   const corpus = `${githubActionsFailureCorpus(inspection)}\n${options.additionalContext ?? ''}`;
+  // Cancellation is an execution outcome, not evidence that arbitrary strings
+  // printed before cancellation describe the provider account. Negative-path
+  // tests routinely print realistic billing/permission fixtures. For an
+  // interrupted run, human routing therefore requires direct GitHub metadata,
+  // check output/annotations supplied by the caller, or action_required—not a
+  // keyword found only in the cancelled job log.
+  const providerCorpus = `${githubActionsProviderCorpus(inspection)}\n${options.additionalContext ?? ''}`;
   const conclusion = String(inspection.run.conclusion ?? '').toLowerCase();
-  if (HUMAN_CONFIGURATION_FAILURE.test(corpus) || conclusion === 'action_required') return {
+  const interrupted = ['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(conclusion);
+  if ((interrupted ? HUMAN_CONFIGURATION_FAILURE.test(providerCorpus) : HUMAN_CONFIGURATION_FAILURE.test(corpus))
+    || conclusion === 'action_required') return {
     disposition: 'human',
     reason: 'GitHub reported an account, billing, permission, approval, runner-availability, or repository configuration problem that changing the proposal cannot fix.',
     inspection,
@@ -377,6 +410,74 @@ export function githubActionsRunIdFromUrl(value: string | undefined): number | u
   return Number.isSafeInteger(id) && id > 0 ? id : undefined;
 }
 
+/** Stable, restart-safe key for one repository/PR/revision/check validation. */
+export function githubRequiredCheckKey(identity: GithubRequiredCheckIdentity): string {
+  const repository = identity.repository.trim().toLowerCase();
+  const headSha = identity.headSha.trim().toLowerCase();
+  const check = identity.check.trim().toLowerCase().replace(/\s+/g, ' ');
+  return `${repository}#${identity.pullRequest}:${headSha}:workflow:${identity.workflowId}:check:${check}`;
+}
+
+/** Reconcile every same-workflow run GitHub exposes for one exact PR head.
+ * A successful equivalent satisfies the validation. Otherwise an active
+ * equivalent becomes current, so an older cancellation cannot trigger a rerun
+ * that would cancel its healthy replacement. */
+export function reconcileGithubActionsRuns(
+  identity: GithubRequiredCheckIdentity,
+  observed: GithubActionsRun,
+  listed: GithubActionsRun[],
+): GithubActionsRunReconciliation {
+  const equivalent = new Map<number, GithubActionsRun>();
+  const add = (run: GithubActionsRun) => {
+    if (identity.workflowId > 0 && run.workflowId !== identity.workflowId) return;
+    if (run.id !== observed.id && !githubActionsRunMatchesRevision(run, identity)) return;
+    const previous = equivalent.get(run.id);
+    if (!previous || compareGithubActionsRuns(run, previous) > 0) equivalent.set(run.id, run);
+  };
+  add(observed);
+  for (const run of listed) add(run);
+  const runs = [...equivalent.values()].sort((a, b) => compareGithubActionsRuns(b, a));
+  const successful = runs.find((run) => githubActionsRunState(run) === 'success');
+  const active = runs.find((run) => ACTIVE_RUN_STATES.has(githubActionsRunState(run)));
+  const terminalFailure = runs.find((run) => {
+    const state = githubActionsRunState(run);
+    return state !== 'success' && state !== 'cancelled' && !ACTIVE_RUN_STATES.has(state);
+  });
+  let current = terminalFailure && (!successful || compareGithubActionsRuns(terminalFailure, successful) > 0)
+    ? terminalFailure
+    : successful ?? runs[0] ?? observed;
+  if (active && compareGithubActionsRuns(active, current) > 0) current = active;
+  const satisfied = githubActionsRunState(current) === 'success' ? current : undefined;
+  return {
+    identity,
+    key: githubRequiredCheckKey(identity),
+    runs,
+    current,
+    ...(current.id !== observed.id || current.attempt !== observed.attempt ? { replacement: current } : {}),
+    ...(satisfied ? { successful: satisfied } : {}),
+  };
+}
+
+function githubActionsRunMatchesRevision(run: GithubActionsRun, identity: GithubRequiredCheckIdentity): boolean {
+  if (run.headSha.toLowerCase() === identity.headSha.toLowerCase()) return true;
+  return Boolean(run.pullRequests?.some((pr) => pr.number === identity.pullRequest
+    && pr.headSha.toLowerCase() === identity.headSha.toLowerCase()));
+}
+
+const ACTIVE_RUN_STATES = new Set(['requested', 'queued', 'pending', 'waiting', 'in_progress']);
+
+function githubActionsRunState(run: GithubActionsRun): string {
+  return String(run.conclusion ?? run.status).toLowerCase();
+}
+
+function compareGithubActionsRuns(a: GithubActionsRun, b: GithubActionsRun): number {
+  const aTime = Date.parse(a.updatedAt || a.createdAt);
+  const bTime = Date.parse(b.updatedAt || b.createdAt);
+  return (Number.isFinite(aTime) ? aTime : 0) - (Number.isFinite(bTime) ? bTime : 0)
+    || a.runNumber - b.runNumber || a.attempt - b.attempt
+    || a.id - b.id;
+}
+
 function githubActionsFailureCorpus(inspection: GithubActionsFailureInspection): string {
   return [
     inspection.run.name,
@@ -385,6 +486,19 @@ function githubActionsFailureCorpus(inspection: GithubActionsFailureInspection):
     ...inspection.notices,
     ...inspection.failedJobs.flatMap((job) => [
       job.name, job.conclusion, job.log?.excerpt,
+      ...job.steps.flatMap((step) => [step.name, step.conclusion]),
+    ]),
+  ].filter(Boolean).join('\n');
+}
+
+function githubActionsProviderCorpus(inspection: GithubActionsFailureInspection): string {
+  return [
+    inspection.run.name,
+    inspection.run.displayTitle,
+    inspection.run.conclusion,
+    ...inspection.notices,
+    ...inspection.failedJobs.flatMap((job) => [
+      job.name, job.conclusion,
       ...job.steps.flatMap((step) => [step.name, step.conclusion]),
     ]),
   ].filter(Boolean).join('\n');
@@ -409,6 +523,12 @@ function normalizeRun(raw: any): GithubActionsRun {
     updatedAt: String(raw?.updated_at ?? ''),
     ...(raw?.actor?.login ? { actor: String(raw.actor.login) } : {}),
     ...(raw?.triggering_actor?.login ? { triggeringActor: String(raw.triggering_actor.login) } : {}),
+    ...(Array.isArray(raw?.pull_requests) ? { pullRequests: raw.pull_requests.flatMap((pr: any) => {
+      const number = Number(pr?.number);
+      const headSha = String(pr?.head?.sha ?? '');
+      if (!Number.isSafeInteger(number) || number <= 0 || !headSha) return [];
+      return [{ number, headSha, ...(pr?.head?.ref ? { headRef: String(pr.head.ref) } : {}) }];
+    }) } : {}),
   };
 }
 

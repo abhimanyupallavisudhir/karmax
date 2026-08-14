@@ -450,7 +450,7 @@ describe('GitHub App integration', () => {
     const pull = (branch: string, over: Record<string, unknown> = {}) => ({
       installation: { id: 42 }, action: 'closed', repository: { full_name: 'acme/app' },
       pull_request: { number: 3, html_url: 'https://github.com/acme/app/pull/3', state: 'closed', merged: true,
-        title: 'Work', head: { ref: branch }, base: { ref: 'main' }, ...over },
+        title: 'Work', head: { ref: branch, sha: 'head-1' }, base: { ref: 'main' }, ...over },
     });
 
     const taskPr = { repo: 'app', slug: 'acme/app', number: 3, url: 'https://github.com/acme/app/pull/3',
@@ -468,10 +468,28 @@ describe('GitHub App integration', () => {
     expect(store.getTask(task.id)?.lastView?.checkouts?.[0]?.pr).toMatchObject({ state: 'closed', merged: true });
     const check = await deliver('check_run', 'check-1', {
       installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
-      check_run: { name: 'CI', status: 'completed', conclusion: 'failure',
-        check_suite: { head_branch: `karmax/${task.id}` } },
+      check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
+        check_suite: { head_branch: `karmax/${task.id}`, head_sha: 'head-1' },
+        pull_requests: [{ number: 3 }] },
     });
     expect(check.events).toEqual([expect.objectContaining({ taskId: task.id, type: 'github.check.completed' })]);
+    const duplicateCheck = await deliver('check_run', 'check-duplicate-delivery', {
+      installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
+      check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
+        check_suite: { head_branch: `karmax/${task.id}`, head_sha: 'head-1' },
+        pull_requests: [{ number: 3 }] },
+    });
+    expect(duplicateCheck.events).toBeUndefined();
+
+    const synchronize = pull(`karmax/${task.id}`, { state: 'open', merged: false,
+      head: { ref: `karmax/${task.id}`, sha: 'head-2' } });
+    synchronize.action = 'synchronize';
+    expect((await deliver('pull_request', 'sync-1', synchronize)).events).toHaveLength(1);
+    expect((await deliver('pull_request', 'sync-2', synchronize)).events).toBeUndefined();
+    const nextSynchronize = pull(`karmax/${task.id}`, { state: 'open', merged: false,
+      head: { ref: `karmax/${task.id}`, sha: 'head-3' } });
+    nextSynchronize.action = 'synchronize';
+    expect((await deliver('pull_request', 'sync-3', nextSynchronize)).events).toHaveLength(1);
     const failedWorkflow = await deliver('workflow_run', 'workflow-1', {
       installation: { id: 42 }, action: 'completed',
       repository: { id: 99, full_name: 'acme/app' },

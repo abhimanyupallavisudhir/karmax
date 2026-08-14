@@ -564,6 +564,22 @@ export interface GithubPrWebhookEvent {
   payload: Record<string, unknown>;
 }
 
+/** Semantic idempotency key for webhook observations GitHub commonly delivers
+ * more than once under different delivery ids. Only head-bound synchronize and
+ * completed-check observations are coalesced; lifecycle transitions remain an
+ * ordered event stream. */
+export function githubPrWebhookObservationKey(event: GithubPrWebhookEvent): string | undefined {
+  const payload = event.payload;
+  const repo = String(payload.repo ?? '').toLowerCase();
+  const headSha = String(payload.headSha ?? '').toLowerCase();
+  if (!repo || !headSha) return undefined;
+  if (event.type === 'github.pr.synchronize')
+    return `${event.taskId}:${repo}#${Number(payload.number)}:${headSha}:synchronize`;
+  if (event.type === 'github.check.completed')
+    return `${event.taskId}:${repo}#${Number(payload.number ?? 0)}:${headSha}:check-run:${Number(payload.checkId ?? 0)}:${String(payload.name ?? '').toLowerCase()}:${String(payload.url ?? '')}:${String(payload.conclusion ?? '').toLowerCase()}`;
+  return undefined;
+}
+
 /**
  * Apply GitHub's latest PR state to every projection of that PR in a task view.
  * Workflow snapshots are otherwise frozen once an execution ends, even though
@@ -612,9 +628,12 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
     const run = payload.check_run;
     return { taskId, type: 'github.check.completed', payload: {
       name: String(run.name ?? 'GitHub check'),
+      ...(run.id ? { checkId: Number(run.id) } : {}),
       conclusion: String(run.conclusion ?? ''),
       status: String(run.status ?? ''),
       branch: String(run.check_suite.head_branch),
+      ...(run.check_suite?.head_sha ? { headSha: String(run.check_suite.head_sha) } : {}),
+      ...(run.pull_requests?.[0]?.number ? { number: Number(run.pull_requests[0].number) } : {}),
       ...(run.details_url ? { url: String(run.details_url) } : {}),
       ...(payload?.repository?.full_name ? { repo: String(payload.repository.full_name) } : {}),
     } };
@@ -630,6 +649,7 @@ export function pullRequestWebhookEvent(event: string, payload: any): GithubPrWe
     target: String(pr.base?.ref ?? ''),
     state: pr.state === 'closed' ? 'closed' : 'open',
     merged: Boolean(pr.merged ?? pr.merged_at),
+    ...(pr.head?.sha ? { headSha: String(pr.head.sha) } : {}),
     ...(pr.title ? { title: String(pr.title) } : {}),
   };
   if (event === 'pull_request') {
