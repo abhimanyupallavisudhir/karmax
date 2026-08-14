@@ -1504,7 +1504,8 @@ async function softwareDevImpl(
               error = lastError;
               break;
             }
-            if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length });
+            if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length,
+              ...(r.finalActivity ? { sourceActivity: r.finalActivity } : {}) });
             // Consume the agent's structured verdict (SPEC §5.2, RESOLVE-PLAN §3.2)
             // instead of blindly retrying. This is the fix for "the resolve agent's
             // decision is ignored".
@@ -1871,7 +1872,8 @@ async function softwareDevImpl(
     // any follow-up that arrived after the last poll. This keeps the transcript honest
     // and leaves that follow-up AFTER `seen`, so the NEXT turn delivers it.
     if (turn.output?.trim()) {
-      msgs.splice(delivered, 0, { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered });
+      msgs.splice(delivered, 0, { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
+        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) });
       seen = delivered + 1;
     } else {
       seen = delivered;
@@ -1935,7 +1937,8 @@ async function softwareDevImpl(
       return undefined;
     });
     if (mt?.output?.trim()) {
-      mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length });
+      mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length,
+        ...(mt.finalActivity ? { sourceActivity: mt.finalActivity } : {}) });
     }
     return mt;
   }
@@ -2006,7 +2009,8 @@ async function softwareDevImpl(
       log.warn('confirm agent turn failed; falling back to the human gate', { e: String(e) });
       return undefined;
     });
-    if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: confirmMsgs.length });
+    if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: confirmMsgs.length,
+      ...(ct.finalActivity ? { sourceActivity: ct.finalActivity } : {}) });
     // Record the verdict itself in the transcript (the agent's prose may not state
     // it). System role: shown to humans, stripped by adapters on later rounds.
     if (ct?.confirmDecision) {
@@ -2060,7 +2064,8 @@ async function softwareDevImpl(
       return undefined;
     });
     const output = rt?.output?.trim();
-    if (output) responderMsgs.push({ id: `r-out-${responderMsgs.length}`, role: 'agent', text: output, ts: responderMsgs.length });
+    if (output) responderMsgs.push({ id: `r-out-${responderMsgs.length}`, role: 'agent', text: output, ts: responderMsgs.length,
+      ...(rt?.finalActivity ? { sourceActivity: rt.finalActivity } : {}) });
     return output || undefined;
   }
 

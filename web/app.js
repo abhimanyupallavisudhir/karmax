@@ -6985,6 +6985,9 @@ function conversationPane(v, t) {
 function conversationEntries(t) {
   const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
+  // Provider streams and workflow snapshots may normalize line endings
+  // differently even though the browser renders the same prose.
+  const messageTextKey = (value) => String(value || '').replace(/\r\n?/g, '\n').trim();
   // A Temporal activity retry continues the same logical turn, so provider item
   // ids (especially the synthetic `turn` id) repeat. Keep attempts distinct:
   // otherwise the resumed `started` event overwrites the prior `failed` event
@@ -7024,16 +7027,31 @@ function conversationEntries(t) {
       // completed text, not its earlier partial title, is what gets explained.
       sourceKey: `activity:${event.seq ?? event.ts}`,
       conversationRole: t.role,
+      activityGroup: `${turn}/${attempt}`,
     });
   }
 
   // The workflow stores the final assistant reply for provider resume. The same
-  // reply also arrives as a structured provider message; suppress that exact
-  // duplicate while retaining intermediate assistant messages around tool calls.
+  // reply also arrives as a structured provider message. New transcript entries
+  // identify that provider item explicitly; older histories fall back to text
+  // comparison. In either case keep the provider item (its real timestamp and
+  // explanation annotations belong to it) and suppress only the transcript copy.
+  const providerActivityRefs = new Set(activities.keys());
+  // Some provider rails have emitted the same completed assistant item twice
+  // under different item ids. Keep the last copy in that turn (the activity
+  // layer's finalActivity link also points to the last assistant item).
+  const lastProviderMessage = new Map();
+  for (const entry of activities.values()) {
+    if (entry.activity.kind !== 'message') continue;
+    lastProviderMessage.set(`${entry.activityGroup}/${messageTextKey(entry.activity.title)}`, entry);
+  }
+  const visibleActivities = [...activities.values()].filter((entry) =>
+    entry.activity.kind !== 'message'
+      || lastProviderMessage.get(`${entry.activityGroup}/${messageTextKey(entry.activity.title)}`) === entry);
   const providerTexts = new Set(
-    [...activities.values()]
+    visibleActivities
       .filter((entry) => entry.activity.kind === 'message')
-      .map((entry) => String(entry.activity.title || '').trim()),
+      .map((entry) => messageTextKey(entry.activity.title)),
   );
   // User messages carry real epoch-ms timestamps; agent/system replies are stamped
   // by the deterministic workflow with a per-array sequence number (it has no wall
@@ -7042,7 +7060,13 @@ function conversationEntries(t) {
   // timeline by its tiny `ts`.
   let carriedTs = 0;
   const messages = (t.messages || [])
-    .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
+    .filter((message) => {
+      if (message.role !== 'agent') return true;
+      const source = message.sourceActivity;
+      if (source) return !providerActivityRefs.has(`${source.turnId}/${source.id}/${source.attempt}`);
+      // Replay/back-compat for messages recorded before sourceActivity existed.
+      return !providerTexts.has(messageTextKey(message.text));
+    })
     .map((message, index) => {
       const real = Number(message.ts) > 100000000000;
       if (real) carriedTs = Number(message.ts);
@@ -7063,7 +7087,7 @@ function conversationEntries(t) {
     posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts,
       sourceKey: `message:${message.id}`, conversationRole: t.role });
   }
-  const combined = [...messages, ...posted.values(), ...activities.values()];
+  const combined = [...messages, ...posted.values(), ...visibleActivities];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
   const explanations = new Map();
   for (const event of (S.taskEvents || [])) {

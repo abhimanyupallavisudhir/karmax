@@ -44,7 +44,7 @@ global.S = {
     { seq: 1, ts: 1710000001000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' } },
     { seq: 2, ts: 1710000002000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'cmd', kind: 'command', phase: 'started', title: 'npm test' } },
     { seq: 3, ts: 1710000003000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'cmd', kind: 'command', phase: 'completed', title: 'npm test', detail: '12 passed' } },
-    { seq: 4, ts: 1710000004000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'reply', kind: 'message', phase: 'completed', title: 'All done' } },
+    { seq: 4, ts: 1710000004000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', attempt: 1, id: 'reply', kind: 'message', phase: 'completed', title: 'All done' } },
   ],
   explanationSettings: { model: 'google/gemini-3.6-flash' },
   explanationPending: {},
@@ -61,7 +61,8 @@ const transcript = {
   role: 'do',
   messages: [
     { id: 'u1', role: 'user', text: 'Please run the tests', ts: 1710000000000 },
-    { id: 'a1', role: 'agent', text: 'All done', ts: 2 },
+    { id: 'a1', role: 'agent', text: 'The workflow copy need not text-match', ts: 2,
+      sourceActivity: { turnId: 'turn-1', id: 'reply', attempt: 1 } },
   ],
 };
 const entries = conversationEntries(transcript);
@@ -74,7 +75,31 @@ ok(html.includes('You') && html.includes('Please run the tests'), 'user message 
 ok(html.includes('npm test') && html.includes('completed'), 'agent action and its state are visible');
 ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
+ok(!html.includes('need not text-match'), 'the linked workflow transcript copy is suppressed by provider identity');
 ok(html.includes('Explain this with gemini-3.6-flash'), 'agent messages offer the effective explanation model');
+const legacyEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'legacy-a1', role: 'agent', text: 'All done', ts: 2 },
+] });
+ok(legacyEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.text === 'All done').length === 1,
+  'historical transcript copies still de-duplicate by exact text');
+const agedOutEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'new-a1', role: 'agent', text: 'Archived final', ts: 2,
+    sourceActivity: { turnId: 'turn-outside-event-window', id: 'reply', attempt: 1 } },
+] });
+ok(agedOutEntries.some((entry) => entry.message?.text === 'Archived final'),
+  'a linked transcript remains visible after its provider event ages out of the bounded window');
+S.taskEvents.push({ seq: 8, ts: 1710000007000, type: 'agent.activity', payload: {
+  role: 'do', turnId: 'turn-1', attempt: 1, id: 'reply-again', kind: 'message', phase: 'completed', title: 'All done',
+} });
+const repeatedProviderEntries = conversationEntries(transcript);
+ok(repeatedProviderEntries.filter((entry) => entry.activity?.title === 'All done').length === 1,
+  'duplicate provider message items in one turn collapse to the last copy');
+S.taskEvents.pop();
+const legacyLineEndingEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'legacy-crlf', role: 'agent', text: 'All done\r\n', ts: 2 },
+] });
+ok(legacyLineEndingEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.id === 'legacy-crlf').length === 1,
+  'historical provider/transcript copies de-duplicate across line-ending normalization');
 S.explanationErrors['activity:4'] = { code: 'explanation_api_key_missing', provider: 'openrouter' };
 const missingKey = renderConversationEntry(entries.find((entry) => entry.sourceKey === 'activity:4'));
 ok(missingKey.includes('API key for openrouter not found') && missingKey.includes('#settings-agents') && missingKey.includes('#project-explanation'), 'missing-key guidance links to agent logins and the project explanation default');

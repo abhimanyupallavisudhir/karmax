@@ -1794,6 +1794,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let releaseSlot: () => void | Promise<void> = () => {};
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
+      let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
       let result;
       try {
         const signalTurnState = async (
@@ -1919,6 +1920,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             record(args.taskId, 'agent.output', { text: t });
           },
           onActivity: (activity) => {
+            const turnId = args.agentTurnId ?? legacyAgentTurnId;
+            if (activity.kind === 'message' && turnId) {
+              finalActivity = { turnId, id: activity.id, attempt: activityAttempt };
+            }
             record(args.taskId, 'agent.activity', {
               ...activity,
               role: args.role,
@@ -2046,6 +2051,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // a normal Temporal activity result once shutdown/cancellation is visible.
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
+        }
+        if (result.output?.trim() && finalActivity) {
+          result.finalActivity = finalActivity;
         }
         if (confirmTranscript) {
           if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
