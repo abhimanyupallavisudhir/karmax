@@ -4,7 +4,7 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
 
-function fixture() {
+function fixture(onSignal?: (taskId: string, args: unknown[]) => void | Promise<void>) {
   const store = new Store(':memory:');
   const project = store.createProject('Parallel collaboration');
   const requester = store.createTask({
@@ -40,6 +40,7 @@ function fixture() {
             const calls = signals.get(taskId) ?? [];
             calls.push(args);
             signals.set(taskId, calls);
+            await onSignal?.(taskId, args);
           }),
         };
       },
@@ -47,7 +48,7 @@ function fixture() {
   } as any;
   const bus = new KarmaxBus();
   const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, bus });
-  return { store, project, requester, target, token, signals, bus, api };
+  return { store, project, requester, target, token, signals, bus, client, tokens, api };
 }
 
 describe('durable background collaboration requests', () => {
@@ -126,6 +127,117 @@ describe('durable background collaboration requests', () => {
       return call!;
     });
     expect((settled[2] as any).text).toContain('target task became failed');
+  });
+
+  it('reports a target escalation as failed instead of parking the requester forever', async () => {
+    const f = fixture();
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+    const event = {
+      taskId: f.target.id,
+      type: 'view.updated',
+      ts: Date.now(),
+      payload: { stage: 'escalated', status: 'blocked' },
+    };
+    const seq = f.store.appendEvent(event);
+    f.bus.emit({ ...event, seq });
+
+    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.status).toBe('failed');
+    const settled = await vi.waitFor(() => {
+      const call = (f.signals.get(f.requester.id) ?? []).find((item) => item[0] === 'collaborationSettled');
+      expect(call).toBeTruthy();
+      return call!;
+    });
+    expect((settled[2] as any).text).toContain('became blocked before publishing');
+  });
+
+  it('allows an accepted request to cross PR while waiting for its branch publication', async () => {
+    const f = fixture();
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+    const prEvent = {
+      taskId: f.target.id,
+      type: 'view.updated',
+      ts: Date.now(),
+      payload: { stage: 'pr', status: 'active' },
+    };
+    const prSeq = f.store.appendEvent(prEvent);
+    f.bus.emit({ ...prEvent, seq: prSeq });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(f.store.getCollaborationRequest(request.id)?.status).toBe('pending');
+
+    const pushEvent = {
+      taskId: f.target.id,
+      type: 'push.branch',
+      ts: Date.now(),
+      payload: { branch: `karmax/${f.target.id}`, repos: ['app'] },
+    };
+    const pushSeq = f.store.appendEvent(pushEvent);
+    f.bus.emit({ ...pushEvent, seq: pushSeq });
+    await expect.poll(() => f.store.getCollaborationRequest(request.id)?.status).toBe('completed');
+  });
+
+  it('refuses a request when the target is already escalated', async () => {
+    const f = fixture();
+    const view = f.store.getTask(f.target.id)!.lastView!;
+    f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' });
+
+    await expect(f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    })).rejects.toThrow(/blocked and cannot run its Do agent/);
+    expect(f.store.listCollaborationRequests()).toEqual([]);
+  });
+
+  it('settles a delivery race when the target blocks while the request signal is in flight', async () => {
+    let f: ReturnType<typeof fixture>;
+    f = fixture((taskId, args) => {
+      if (taskId !== f.target.id || args[0] !== 'followUp') return;
+      const view = f.store.getTask(f.target.id)!.lastView!;
+      f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' });
+    });
+
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+
+    expect(request.status).toBe('failed');
+    expect(request.result?.reason).toContain('became blocked before publishing');
+    expect(request.notifiedAt).toEqual(expect.any(Number));
+  });
+
+  it('repairs a pending request whose target was already blocked before startup', async () => {
+    const f = fixture();
+    const request = f.store.createCollaborationRequest({
+      requesterTaskId: f.requester.id,
+      targetTaskId: f.target.id,
+      action: 'publish_branch',
+    });
+    const view = f.store.getTask(f.target.id)!.lastView!;
+    f.store.saveView(f.target.id, { ...view, stage: 'escalated', status: 'blocked' });
+
+    // A fresh service instance reconciles durable requests before handling new
+    // traffic, which is how an upgrade repairs rows orphaned by the old code.
+    new KarmaxApi({
+      store: f.store,
+      client: f.client,
+      taskQueue: 'test',
+      tokens: f.tokens,
+      bus: f.bus,
+    });
+
+    await expect.poll(() => f.store.getCollaborationRequest(request.id)).toMatchObject({
+      status: 'failed',
+      result: { reason: 'target task became blocked before publishing its branch' },
+      notifiedAt: expect.any(Number),
+    });
+    expect((f.signals.get(f.requester.id) ?? []).some((call) =>
+      call[0] === 'collaborationSettled' && call[1] === request.id)).toBe(true);
   });
 
   it('removes collaboration records with their project', () => {
