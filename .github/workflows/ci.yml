@@ -60,7 +60,8 @@ jobs:
           "$RUNNER_TEMP/actionlint" -version
 
       - name: Validate every repository workflow
-        run: "$RUNNER_TEMP/actionlint"
+        run: |
+          "$RUNNER_TEMP/actionlint"
 
       # Guard the exact outage class: YAML parsers accept this shape, but GitHub
       # rejects the unsupported key before it creates any workflow run.
