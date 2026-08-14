@@ -333,4 +333,46 @@ describe('gateway request scope for bare-id routes', () => {
     expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
     webhookProjectEvents = [];
   });
+
+  it('routes a missing deployment run through the same idempotent recovery rail', async () => {
+    webhookProjectEvents = [{
+      projectId: mine,
+      type: 'github.workflow.failed',
+      payload: {
+        repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Deploy', runId: 701,
+        attempt: 1, conclusion: 'missing', headSha: 'def456', branch: 'main',
+        url: 'https://github.com/acme/app/actions/runs/701', source: 'deployment_monitor',
+        incidentKey: 'missing:def456:.github/workflows/deploy.yml',
+        evidence: {
+          kind: 'missing_deployment_run',
+          workflowFile: { status: 'present', bytes: 100 },
+          actionsQuery: { status: 'ok', runsChecked: 0 },
+        },
+      },
+    }];
+    const deliver = (delivery: string) => fetch(`${base}/api/github/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json',
+        'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
+      body: JSON.stringify({ action: 'completed' }),
+    });
+
+    expect(await (await deliver('missing-recovery-1')).json()).toMatchObject({ recoveries: 1 });
+    const recovery = store.listTasks(mine)
+      .find((task) => task.title === 'Repair missing GitHub workflow: Deploy');
+    expect(recovery?.params.prompt).toContain('was not created');
+    expect(recovery?.params.prompt).toContain('Durable monitor evidence');
+    expect(recovery?.params.prompt).toContain('workflow schema/registration');
+
+    await deliver('missing-recovery-2');
+    expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
+    // Simulate a restart after createTask persisted but before the pending claim
+    // was acknowledged with the task id. The stale claim adopts that task.
+    const recoveryKey = 'github:workflow-recovery:' + mine
+      + ':repo-1:missing:def456:.github/workflows/deploy.yml';
+    store.kvSet(recoveryKey, `pending:${Date.now() - 11 * 60_000}`);
+    await deliver('missing-recovery-after-restart');
+    expect(store.listTasks(mine).filter((task) => task.title === recovery!.title)).toHaveLength(1);
+    expect(store.kvGet(recoveryKey)).toBe(recovery!.id);
+    webhookProjectEvents = [];
+  });
 });

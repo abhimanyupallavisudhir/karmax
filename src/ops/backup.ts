@@ -109,10 +109,16 @@ export async function createBackup(options: {
     }
 
     // Copy non-database state such as the local auth secret, but never transient
-    // live-instance records or SQLite WAL/SHM files.
+    // live-instance records, the Git-backed pass checkout cache, or SQLite
+    // WAL/SHM files. The pass repository is authoritative remotely and every
+    // successful write is pushed before returning; backing up its local clone is
+    // redundant, and repository-owned symlinks are incompatible with the backup
+    // format's deliberate no-symlink invariant.
+    const passGitCache = path.join('connectors', 'pass-git');
     copyTree(p.state, path.join(payload, 'state'), (file) => {
       const relative = path.relative(p.state, file);
       return relative !== 'instances' && !relative.startsWith(`instances${path.sep}`)
+        && relative !== passGitCache && !relative.startsWith(`${passGitCache}${path.sep}`)
         && !/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(relative);
     });
     await backupSqlite(path.join(p.state, 'karmax.db'), path.join(payload, 'state', 'karmax.db'));

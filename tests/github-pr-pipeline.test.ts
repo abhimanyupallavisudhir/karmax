@@ -87,6 +87,14 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/42`,
     created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
   });
+  if (u.pathname === `/repos/${SLUG}/actions/workflows/7/runs` && method === 'GET') return json(200, {
+    total_count: 1, workflow_runs: [{
+      id: 42, name: 'CI', workflow_id: 7, run_number: 1, run_attempt: actionsRunAttempt,
+      event: 'pull_request', status: 'completed', conclusion: 'failure', head_branch: prs[0]?.head?.ref,
+      head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/42`,
+      created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
+    }],
+  });
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/jobs` && method === 'GET') return json(200, { jobs: [{
     id: 99, name: 'unit tests', status: 'completed', conclusion: actionsJobConclusion,
     html_url: `https://github.com/${SLUG}/actions/runs/42/job/99`,

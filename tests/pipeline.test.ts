@@ -117,6 +117,11 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // @review sets the terse caption; the git-derived summary/changedFiles are added automatically.
     expect(review.reviewInfo?.caption).toContain('factorial');
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+    expect(review.messages.find((message: any) => message.role === 'agent')?.sourceActivity).toMatchObject({
+      turnId: `${taskId}#0`,
+      id: 'message-1',
+      attempt: 1,
+    });
     // The agent called signal_completion (mock default), so the gate marks it as an
     // asserted finish rather than a silent stall.
     expect(review.reviewInfo?.completion).toBe('signalled');

@@ -51,6 +51,10 @@ const responderField = (): FieldSpec => ({
   help: 'Who answers when the working agent pauses at Waiting for input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
   scopes: ALL, bind: 'responder', role: 'responder',
   default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
+  // A task can ask for ordinary input more than once, so there is no first-use
+  // point after which this route becomes load-bearing forever. Keep it live until
+  // the workflow's point of no return; an edit also reroutes a pause already open.
+  mutable: 'always',
 });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
@@ -399,7 +403,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.24.0',
+    version: '1.25.0',
     description: 'World → do/wait → review → optional per-PR provider/external landing or canonical Karmax fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -506,7 +510,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.24.0',
+    version: '1.25.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -615,6 +619,7 @@ export function manifest(name: string): WorkflowManifest | undefined {
 const GITHUB_PR_FIELDS = {
   number: 'number', url: 'string', repo: 'owner/name on GitHub', branch: 'the task branch the PR heads',
   target: 'the branch the PR merges into', state: 'open | closed', merged: 'boolean', title: 'string',
+  headSha: 'exact pull-request head revision',
 } as const;
 /** …plus the delivery's action, on the events minted from `pull_request` itself. */
 const GITHUB_PR_ACTION_FIELDS = {
@@ -638,7 +643,7 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'github.pr.closed', description: "A task's pull request was closed without merging.", fields: GITHUB_PR_ACTION_FIELDS },
   { type: 'github.pr.synchronize', description: "New commits were pushed to a task's pull request.", fields: GITHUB_PR_ACTION_FIELDS },
   { type: 'github.pr.review', description: "A review was submitted on a task's pull request.", fields: { ...GITHUB_PR_FIELDS, review: 'approved | changes_requested | commented | dismissed', reviewer: 'GitHub login' } },
-  { type: 'github.check.completed', description: "A check completed on a task's pull-request branch.", fields: { name: 'check name', conclusion: 'success | failure | cancelled | …', status: 'completed', branch: 'task branch', url: 'details URL', repo: 'owner/name on GitHub' } },
+  { type: 'github.check.completed', description: "A check completed on a task's pull-request branch.", fields: { checkId: 'GitHub check-run id', name: 'check name', conclusion: 'success | failure | cancelled | …', status: 'completed', branch: 'task branch', headSha: 'exact checked revision', number: 'pull-request number when GitHub supplies it', url: 'details URL', repo: 'owner/name on GitHub' } },
   { type: 'github.workflow.failed', description: 'A default-branch GitHub workflow failed and created this recovery task.', fields: { repository: 'owner/name on GitHub', workflow: 'workflow name', runId: 'GitHub Actions run id', attempt: 'run attempt', conclusion: 'failure | timed_out | startup_failure | …', headSha: 'exact failed revision', branch: 'default branch', url: 'run URL', source: 'workflow_run | check_run', originatingTaskId: 'task id when GitHub supplied one' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },

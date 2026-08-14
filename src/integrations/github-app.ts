@@ -4,9 +4,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
-import { pullRequestWebhookEvent, reconcilePullRequestView, type GithubPrWebhookEvent } from './github-pr.js';
+import { githubPrWebhookObservationKey, pullRequestWebhookEvent, reconcilePullRequestView,
+  type GithubPrWebhookEvent } from './github-pr.js';
 import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
+import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -202,10 +204,17 @@ export interface GithubProjectWebhookEvent {
     headSha: string;
     branch: string;
     url: string;
-    source: 'workflow_run' | 'check_run';
+    source: 'workflow_run' | 'check_run' | 'deployment_monitor';
     originatingTaskId?: string;
+    incidentKey?: string;
+    evidence?: Record<string, unknown>;
   };
 }
+
+export type GitHubRepositoryFileStatus =
+  | { status: 'present'; bytes: number }
+  | { status: 'missing' }
+  | { status: 'unreadable'; error: string };
 
 export interface GitHubAppOptions {
   appId?: string;
@@ -807,7 +816,14 @@ export class GitHubAppService {
       return { accepted: true, reconciled: repositories.length };
     }
     const projectEvents = this.failedDefaultBranchWorkflowEvents(event, payload, connection.organizationId);
-    if (event === 'workflow_run') return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
+    if (event === 'workflow_run') {
+      const repositoryPayload = payload.repository;
+      const repository = this.store.listRepositories(connection.organizationId).find((candidate) =>
+        (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
+        || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
+      if (repository) observeDeploymentWorkflowRun(this.store, repository, payload.workflow_run);
+      return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
+    }
     if (event === 'pull_request' || event === 'pull_request_review' || event === 'check_run') {
       // The PR lifecycle karmax itself started: correlated back to its task so
       // the timeline shows it and `event` triggers can fire on it. Correlation is
@@ -821,6 +837,12 @@ export class GitHubAppService {
       if (view) {
         const reconciled = reconcilePullRequestView(view, prEvent.payload);
         if (reconciled !== view) this.store.saveView(prEvent.taskId, reconciled);
+      }
+      const observation = githubPrWebhookObservationKey(prEvent);
+      if (observation) {
+        const digest = crypto.createHash('sha256').update(observation).digest('hex');
+        if (!this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId))
+          return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       }
       return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
     }
@@ -1139,17 +1161,37 @@ export class GitHubAppService {
 
   /** Small tracked-file inspection path used by hosted onboarding proposals. */
   async fileContents(repository: Repository, filePath: string): Promise<string | undefined> {
+    const result = await this.repositoryFile(repository, filePath);
+    return result.status === 'present' ? result.content : undefined;
+  }
+
+  /** File presence with diagnostic fidelity for deployment monitoring. A raw
+   * 404 means absent; permissions, suspension, and API faults must not be
+   * flattened into the same answer. */
+  async repositoryFileStatus(repository: Repository, filePath: string): Promise<GitHubRepositoryFileStatus> {
+    const result = await this.repositoryFile(repository, filePath);
+    return result.status === 'present' ? { status: 'present', bytes: Buffer.byteLength(result.content) } : result;
+  }
+
+  private async repositoryFile(repository: Repository, filePath: string): Promise<
+    | { status: 'present'; content: string }
+    | { status: 'missing' }
+    | { status: 'unreadable'; error: string }> {
     try {
-      if (!repository.gitConnectionId) return undefined;
+      if (!repository.gitConnectionId) return { status: 'unreadable', error: 'repository has no GitHub App connection' };
       const connection = this.store.getGitConnection(repository.gitConnectionId);
-      if (!connection) return undefined;
+      if (!connection) return { status: 'unreadable', error: 'repository GitHub App connection is missing' };
       const token = await this.installationToken(connection);
       const value = await this.request<{ content?: string; encoding?: string }>(
         `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/contents/`
         + filePath.split('/').map(encodeURIComponent).join('/'), token);
-      if (!value.content) return undefined;
-      return Buffer.from(value.content, (value.encoding as BufferEncoding) ?? 'base64').toString('utf8');
-    } catch { return undefined; }
+      if (!value.content) return { status: 'unreadable', error: 'GitHub returned the file without content' };
+      return { status: 'present', content: Buffer.from(value.content,
+        (value.encoding as BufferEncoding) ?? 'base64').toString('utf8') };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return /GitHub API 404\b/.test(message) ? { status: 'missing' } : { status: 'unreadable', error: message };
+    }
   }
 
   private appJwt(): string {

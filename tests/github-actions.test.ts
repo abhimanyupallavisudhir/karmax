@@ -6,6 +6,8 @@ import {
   classifyGithubActionsFailure,
   classifyGithubActionsDiagnostic,
   githubActionsRunIdFromUrl,
+  githubRequiredCheckKey,
+  reconcileGithubActionsRuns,
   renderGithubActionsFailure,
   type GithubActionsFailureInspection,
 } from '../src/integrations/github-actions.js';
@@ -63,6 +65,61 @@ describe('GitHub Actions API', () => {
     });
     expect(classifyGithubActionsDiagnostic(message)).toBe('superseded');
     expect(classifyGithubActionsDiagnostic('Pull request check\n- CI: CANCELLED')).toBe('retry');
+  });
+
+  it('does not route a cancelled run from billing/quota fixture text printed by tests', () => {
+    const fixture = [
+      "expected classification fixture: You're out of usage credits",
+      'Your prepaid balance has now been fully consumed.',
+      'all negative-path classifier assertions passed',
+      'The operation was canceled.',
+    ].join('\n');
+    expect(classifyGithubActionsFailure(inspection(fixture, {
+      conclusion: 'cancelled', status: 'completed',
+    })).disposition).toBe('retry');
+    // Direct GitHub check evidence still routes a genuine provider/account
+    // block accurately even when the execution itself was cancelled.
+    expect(classifyGithubActionsFailure(inspection('The operation was canceled.', {
+      conclusion: 'cancelled', status: 'completed',
+    }), { additionalContext: 'GitHub annotation: Actions is disabled for this repository' }).disposition).toBe('human');
+  });
+
+  it('reconciles duplicate run observations by canonical exact-head validation identity', () => {
+    const identity = { repository: 'Acme/App', pullRequest: 118, headSha: 'c19ce3c', workflowId: 7, check: 'CI' };
+    const cancelled = inspection('The operation was canceled.', {
+      id: 365, workflowId: 7, runNumber: 365, attempt: 1, conclusion: 'cancelled',
+      headSha: 'synthetic-merge-1',
+      pullRequests: [{ number: 118, headSha: 'c19ce3c' }],
+    }).run;
+    const active = { ...cancelled, id: 366, runNumber: 366, status: 'in_progress', conclusion: undefined,
+      headSha: 'synthetic-merge-2' };
+    const key = githubRequiredCheckKey(identity);
+    expect(key).toBe('acme/app#118:c19ce3c:workflow:7:check:ci');
+    expect(reconcileGithubActionsRuns(identity, cancelled, [cancelled, active])).toMatchObject({
+      key, current: { id: 366, attempt: 1 }, replacement: { id: 366 },
+    });
+    expect(reconcileGithubActionsRuns(identity, cancelled, [cancelled, active]).successful).toBeUndefined();
+
+    const successful = { ...active, status: 'completed', conclusion: 'success' };
+    expect(reconcileGithubActionsRuns(identity, cancelled, [cancelled, successful])).toMatchObject({
+      current: { id: 366 }, replacement: { id: 366 }, successful: { id: 366 },
+    });
+    const laterFailure = { ...successful, id: 368, runNumber: 368, conclusion: 'failure' };
+    const failedCurrent = reconcileGithubActionsRuns(identity, cancelled, [successful, laterFailure]);
+    expect(failedCurrent).toMatchObject({ current: { id: 368 }, replacement: { id: 368 } });
+    expect(failedCurrent.successful).toBeUndefined();
+    const duplicateCancelled = { ...cancelled, id: 366, runNumber: 366,
+      updatedAt: '2026-08-14T00:03:00Z' };
+    const survivingRerun = { ...cancelled, id: 365, runNumber: 365, attempt: 2,
+      status: 'completed', conclusion: 'success', updatedAt: '2026-08-14T00:15:00Z' };
+    expect(reconcileGithubActionsRuns(identity, duplicateCancelled,
+      [duplicateCancelled, survivingRerun])).toMatchObject({
+      current: { id: 365, attempt: 2 }, successful: { id: 365, attempt: 2 },
+    });
+    // A run for another revision or workflow never becomes a replacement.
+    const foreign = { ...active, id: 367, workflowId: 8,
+      pullRequests: [{ number: 118, headSha: 'different-head' }] };
+    expect(reconcileGithubActionsRuns(identity, cancelled, [foreign]).current.id).toBe(365);
   });
 
   it('lists normalized runs with bounded provider filters', async () => {

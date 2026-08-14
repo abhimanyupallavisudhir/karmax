@@ -46,6 +46,8 @@ import {
   classifyGithubActionsDiagnostic,
   classifyGithubActionsFailure,
   githubActionsRunIdFromUrl,
+  githubRequiredCheckKey,
+  reconcileGithubActionsRuns,
   renderGithubActionsFailure,
   type GithubActionsApi,
   type GithubActionsFailureDecision,
@@ -187,6 +189,7 @@ class AgentAdmissionInfrastructureError extends Error {
  */
 const pexec = promisify(execFile);
 const MAX_SUPERSEDED_CI_POLLS = 20;
+const CANCELLED_RUN_RECONCILIATIONS = 2;
 
 function signalKillMessage(raw: string): string {
   const h = hostStats();
@@ -1812,6 +1815,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let releaseSlot: () => void | Promise<void> = () => {};
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
+      let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
       let result;
       try {
         const signalTurnState = async (
@@ -1937,6 +1941,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             record(args.taskId, 'agent.output', { text: t });
           },
           onActivity: (activity) => {
+            const turnId = args.agentTurnId ?? legacyAgentTurnId;
+            if (activity.kind === 'message' && turnId) {
+              finalActivity = { turnId, id: activity.id, attempt: activityAttempt };
+            }
             record(args.taskId, 'agent.activity', {
               ...activity,
               role: args.role,
@@ -2064,6 +2072,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // a normal Temporal activity result once shutdown/cancellation is visible.
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
+        }
+        if (result.output?.trim() && finalActivity) {
+          result.finalActivity = finalActivity;
         }
         if (confirmTranscript) {
           if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
@@ -2765,22 +2776,42 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         readiness: GithubPullRequestReadiness,
         current: TaskPullRequest[],
         inspection: ReturnType<typeof inspectionFor>,
-      ): Promise<GitHubMergeAuthorization | undefined> => {
+      ): Promise<GitHubMergeAuthorization | { status: 'checks-satisfied' }> => {
         const summary = ciFailureDetail(ref, readiness);
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
-        const observationKey = (runId: number, attempt: number) =>
-          `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${runId}:${attempt}`;
-        const terminalObservation = (decision: GithubActionsFailureDecision) => {
-          const key = observationKey(decision.inspection.run.id, decision.inspection.run.attempt);
-          const observed = events.some((event) => event.type === 'github.ci.terminal-observed'
-            && event.payload?.key === key);
-          if (!observed) record(handle.id, 'github.ci.terminal-observed', {
-            key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
-            runId: decision.inspection.run.id, attempt: decision.inspection.run.attempt,
-            disposition: decision.disposition,
-          });
+        const fallbackIdentityKey = githubRequiredCheckKey({
+          repository: ref.slug, pullRequest: ref.number, headSha: ref.headSha ?? 'unknown', workflowId: 0,
+          check: (readiness.failedChecks ?? []).map((check) => check.name).sort().join('|') || 'unknown',
+        });
+        const recordedObservations = new Set(events
+          .filter((event) => event.type === 'github.ci.terminal-observed')
+          .map((event) => String(event.payload?.observationKey ?? event.payload?.key ?? '')));
+        const recordedCurrents = new Set(events
+          .filter((event) => event.type === 'github.ci.validation-current')
+          .map((event) => `${event.payload?.key}:${event.payload?.runId}:${event.payload?.attempt}:${event.payload?.state}`));
+        const terminalObservation = (decision: GithubActionsFailureDecision, key: string) => {
+          const run = decision.inspection.run;
+          const state = String(run.conclusion ?? run.status).toLowerCase();
+          const observationKey = `${key}:run:${run.id}:attempt:${run.attempt}:state:${state}`;
+          if (!recordedObservations.has(observationKey)) {
+            record(handle.id, 'github.ci.terminal-observed', {
+              key, observationKey, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+              runId: run.id, attempt: run.attempt, state, disposition: decision.disposition,
+            });
+            recordedObservations.add(observationKey);
+          }
           return { decision, key };
+        };
+        const currentObservation = (key: string, run: { id: number; attempt: number; status: string; conclusion?: string }) => {
+          const state = String(run.conclusion ?? run.status).toLowerCase();
+          const observation = `${key}:${run.id}:${run.attempt}:${state}`;
+          if (recordedCurrents.has(observation)) return;
+          record(handle.id, 'github.ci.validation-current', {
+            key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+            runId: run.id, attempt: run.attempt, state,
+          });
+          recordedCurrents.add(observation);
         };
         const externalWait = (key: string, detail: string): GitHubMergeAuthorization => {
           const previous = events.filter((event) => event.type === 'github.ci.external-wait'
@@ -2795,20 +2826,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };
         };
         const fallbackObservation = (key: string, disposition: string) => {
-          const repeated = events.some((event) => event.type === 'github.ci.terminal-observed'
-            && event.payload?.key === key);
-          if (!repeated) record(handle.id, 'github.ci.terminal-observed', {
-            key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
-            runId: runIds[0] ?? 0, attempt: 0, disposition, inspectionUnavailable: true,
-          });
+          const observationKey = `${key}:run:${runIds[0] ?? 0}:attempt:0:state:${disposition}`;
+          const repeated = recordedObservations.has(observationKey);
+          if (!repeated) {
+            record(handle.id, 'github.ci.terminal-observed', {
+              key, observationKey, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+              runId: runIds[0] ?? 0, attempt: 0, disposition, inspectionUnavailable: true,
+            });
+            recordedObservations.add(observationKey);
+          }
           return repeated;
         };
         const decisions: Array<ReturnType<typeof terminalObservation>> = [];
         const inspectionFailures: Array<{ runId: number; error: unknown }> = [];
+        const followed: Array<{ key: string; run: { id: number; attempt: number; status: string; conclusion?: string } }> = [];
+        const satisfied: Array<{ key: string; run: { id: number; attempt: number; status: string; conclusion?: string } }> = [];
+        const satisfiedRunIds = new Set<number>();
+        const reconciling: string[] = [];
+        let actionReconciliationFailed = false;
+        const listedRuns = new Map<number, Awaited<ReturnType<GithubActionsApi['listRuns']>>>();
         if (inspection.actions) {
           for (const runId of runIds.slice(0, 4)) {
             try {
-              const inspected = await inspection.actions.inspectFailure(ref.slug, runId);
+              let inspected = await inspection.actions.inspectFailure(ref.slug, runId);
               // A stale check URL must never cause a rerun or repair of a
               // different revision than the proposal whose landing is held.
               // pull_request Actions run against refs/pull/N/merge, however,
@@ -2817,12 +2857,75 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               // so that event remains safely correlated to this candidate.
               if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha
                 && inspected.run.event !== 'pull_request') continue;
-              const checkContext = (readiness.failedChecks ?? [])
-                .filter((check) => githubActionsRunIdFromUrl(check.url) === runId)
-                .map((check) => `${check.name}: ${check.state}\n${check.detail ?? ''}`).join('\n');
-              decisions.push(terminalObservation(classifyGithubActionsFailure(inspected, { additionalContext: checkContext })));
+              const check = (readiness.failedChecks ?? [])
+                .find((candidate) => githubActionsRunIdFromUrl(candidate.url) === runId);
+              const identity = {
+                repository: ref.slug,
+                pullRequest: ref.number,
+                headSha: ref.headSha ?? inspected.run.headSha ?? 'unknown',
+                workflowId: inspected.run.workflowId,
+                check: check?.name ?? inspected.run.name,
+              };
+              let listed = listedRuns.get(inspected.run.workflowId);
+              if (!listed) {
+                const options = {
+                  workflow: inspected.run.workflowId || undefined,
+                  event: inspected.run.event || undefined,
+                  perPage: 100,
+                };
+                listed = await inspection.actions.listRuns(ref.slug, options);
+                // Reconciliation is bounded but not first-page-only. Duplicate
+                // deliveries can push the relevant same-head run off page one
+                // in a busy repository.
+                for (let page = 2; page <= 5 && listed.runs.length < listed.total; page++) {
+                  const next = await inspection.actions.listRuns(ref.slug, { ...options, page });
+                  listed = { ...listed, runs: [...listed.runs, ...next.runs] };
+                  if (!next.runs.length) break;
+                }
+                listedRuns.set(inspected.run.workflowId, listed);
+              }
+              const reconciliation = reconcileGithubActionsRuns(identity, inspected.run, listed.runs);
+              currentObservation(reconciliation.key, reconciliation.current);
+              if (reconciliation.successful) {
+                satisfied.push({ key: reconciliation.key, run: reconciliation.successful });
+                satisfiedRunIds.add(runId);
+                continue;
+              }
+              const currentState = String(reconciliation.current.conclusion
+                ?? reconciliation.current.status).toLowerCase();
+              if (['requested', 'queued', 'pending', 'waiting', 'in_progress'].includes(currentState)) {
+                followed.push({ key: reconciliation.key, run: reconciliation.current });
+                continue;
+              }
+              // A newer terminal duplicate, rather than the stale check URL,
+              // owns classification for this validation identity.
+              if (reconciliation.current.id !== inspected.run.id
+                || reconciliation.current.attempt !== inspected.run.attempt)
+                inspected = await inspection.actions.inspectFailure(ref.slug, reconciliation.current.id);
+              const conclusion = String(inspected.run.conclusion ?? '').toLowerCase();
+              if (conclusion === 'cancelled') {
+                const prior = events.filter((event) => event.type === 'github.ci.cancelled-reconciled'
+                  && event.payload?.key === reconciliation.key
+                  && Number(event.payload?.runId) === inspected.run.id
+                  && Number(event.payload?.attempt) === inspected.run.attempt).length;
+                if (prior + 1 < CANCELLED_RUN_RECONCILIATIONS) {
+                  record(handle.id, 'github.ci.cancelled-reconciled', {
+                    key: reconciliation.key, slug: ref.slug, number: ref.number,
+                    candidateHead: ref.headSha, runId: inspected.run.id,
+                    attempt: inspected.run.attempt, observation: prior + 1,
+                  });
+                  reconciling.push(reconciliation.key);
+                  continue;
+                }
+              }
+              const checkContext = check ? `${check.name}: ${check.state}\n${check.detail ?? ''}` : '';
+              decisions.push(terminalObservation(
+                classifyGithubActionsFailure(inspected, { additionalContext: checkContext }),
+                reconciliation.key,
+              ));
             } catch (error) {
               inspectionFailures.push({ runId, error });
+              actionReconciliationFailed = true;
               record(handle.id, 'github.ci.inspection-failed', {
                 ...ref, runId, detail: error instanceof Error ? error.message : String(error),
               });
@@ -2830,7 +2933,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
         if (!decisions.length) {
-          const providerFailure = classifyGithubActionsDiagnostic(summary);
+          const everyFailedCheckSatisfied = Boolean(readiness.failedChecks?.length)
+            && readiness.failedChecks!.every((check) => {
+              const id = githubActionsRunIdFromUrl(check.url);
+              return Boolean(id && satisfiedRunIds.has(id));
+            });
+          if (satisfied.length && everyFailedCheckSatisfied) return { status: 'checks-satisfied' };
+          if (followed.length) {
+            const replacement = followed[0]!;
+            const state = String(replacement.run.conclusion ?? replacement.run.status).toLowerCase();
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: `Following equivalent same-head GitHub Actions run ${replacement.run.id} (attempt ${replacement.run.attempt}), currently ${state}. The older cancellation is informational; no rerun, proposal change, or human action is needed.`,
+            };
+          }
+          if (reconciling.length) return {
+            status: 'waiting', prs: current, actorUserId,
+            detail: 'A current GitHub Actions run was cancelled with no replacement yet visible. Karmax is performing bounded exact-head reconciliation before classification or rerun.',
+          };
           const permissionFailure = inspectionFailures.find(({ error }) =>
             error instanceof GithubActionsApiError && [401, 403].includes(error.status));
           if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
@@ -2838,25 +2958,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             detail: `${summary}\n\nKrmax cannot inspect the replacement workflow run. Grant the GitHub App Actions: read and write permission and approve the updated installation permissions, then retry.`,
             eligibleUserIds: [actorUserId],
           };
+          if (actionReconciliationFailed && runIds.length) return {
+            status: 'retryable-error', prs: current, actorUserId,
+            detail: `${summary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
+          };
+          const providerFailure = classifyGithubActionsDiagnostic(summary);
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
             detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure === 'superseded') {
-            const key = observationKey(runIds[0] ?? 0, 0);
+            const key = fallbackIdentityKey;
             fallbackObservation(key, providerFailure);
-            return externalWait(key,
-              `${summary}\n\nGitHub reports that a newer or higher-priority CI request superseded this result. Waiting for that request instead of reopening the unchanged pull request.`);
+            return {
+              status: 'waiting', prs: current, actorUserId,
+              detail: `${summary}\n\nGitHub reports that an equivalent CI request superseded this result. Waiting for exact-head reconciliation instead of reopening the unchanged pull request, releasing its landing position, rerunning it, or asking a human.`,
+            };
           }
           if (providerFailure === 'retry') {
-            fallbackObservation(observationKey(runIds[0] ?? 0, 0), providerFailure);
+            fallbackObservation(fallbackIdentityKey, providerFailure);
             return {
               status: 'retryable-error', prs: current, actorUserId, releaseAdmission: true,
               detail: `${summary}\n\nGitHub reported a transient Actions failure, but run inspection is unavailable so krmax cannot safely rerun it. Retrying inspection without reopening the proposal.`,
             };
           }
-          const fallbackKey = observationKey(runIds[0] ?? 0, 0);
+          const fallbackKey = fallbackIdentityKey;
           fallbackObservation(fallbackKey, 'revision');
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === fallbackKey);
@@ -2894,18 +3021,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               fingerprint: revision.key } } : {}),
           };
         }
+        const superseded = decisions.find(({ decision }) => decision.disposition === 'superseded');
+        if (superseded) return {
+          status: 'waiting', prs: current, actorUserId,
+          detail: `${detail}\n\nGitHub identifies this cancellation as concurrency supersession. Exact-head reconciliation found no current replacement yet, so Karmax will keep polling without rerunning, reopening, releasing landing admission, or requesting human input.`,
+        };
         const retry = decisions.find(({ decision }) => decision.disposition === 'retry');
         if (retry && inspection.actions) {
           const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
-            && event.payload?.slug === ref.slug && Number(event.payload?.number) === ref.number
-            && Number(event.payload?.runId) === retry.decision.inspection.run.id);
+            && event.payload?.key === retry.key);
           const alreadyRequested = reruns.some((event) =>
-            Number(event.payload?.observedAttempt) === retry.decision.inspection.run.attempt);
+            Number(event.payload?.runId) === retry.decision.inspection.run.id
+            && Number(event.payload?.observedAttempt) === retry.decision.inspection.run.attempt);
           if (!alreadyRequested && reruns.length < 2) {
             try {
               await inspection.actions.rerun(ref.slug, retry.decision.inspection.run.id, true);
               record(handle.id, 'github.ci.rerun-requested', {
-                ...ref, runId: retry.decision.inspection.run.id,
+                ...ref, key: retry.key, runId: retry.decision.inspection.run.id,
                 observedAttempt: retry.decision.inspection.run.attempt,
                 rerunNumber: reruns.length + 1,
               });
@@ -2925,48 +3057,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           return { status: 'waiting', prs: current, actorUserId, detail: 'Waiting for CI' };
-        }
-        const superseded = decisions.filter(({ decision }) => decision.disposition === 'superseded');
-        if (superseded.length && inspection.actions) {
-          let replacementsReady = true;
-          for (const observed of superseded) {
-            const decision = observed.decision;
-            let replacement;
-            try {
-              const listed = await inspection.actions.listRuns(ref.slug, {
-                workflow: decision.inspection.run.workflowId,
-                ...(decision.inspection.run.branch ? { branch: decision.inspection.run.branch } : {}),
-                perPage: 100,
-              });
-              replacement = listed.runs
-                .filter((run) => run.id > decision.inspection.run.id
-                  && run.headSha === decision.inspection.run.headSha
-                  && run.workflowId === decision.inspection.run.workflowId)
-                .sort((a, b) => b.id - a.id)
-                .find((run) => run.status === 'completed' && run.conclusion === 'success');
-            } catch (error) {
-              const blocked = error instanceof GithubActionsApiError && [401, 403].includes(error.status);
-              return {
-                status: blocked ? 'needs-human' : 'retryable-error', prs: current, actorUserId,
-                detail: `${detail}\n\nKrmax could not inspect the replacement workflow run: ${error instanceof Error ? error.message : String(error)}`,
-                ...(blocked ? { eligibleUserIds: [actorUserId] } : {}),
-              };
-            }
-            if (!replacement) {
-              replacementsReady = false;
-              continue;
-            }
-            record(handle.id, 'github.ci.superseded', {
-              ...ref,
-              runId: decision.inspection.run.id,
-              supersedingRunId: replacement.id,
-              workflowId: replacement.workflowId,
-              headSha: replacement.headSha,
-            });
-          }
-          if (replacementsReady && superseded.length === decisions.length) return undefined;
-          if (superseded.length === decisions.length) return externalWait(superseded[0]!.key,
-            `${detail}\n\nGitHub superseded a cancelled workflow run; waiting for the higher-priority replacement on the same exact revision without reopening the proposal.`);
         }
         return {
           status: 'needs-revision', prs: current, actorUserId, detail,
@@ -3089,9 +3179,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           if (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR') {
-            const failure = await ciFailureDecision(ref, readiness, current, inspection);
-            if (failure) return failure;
-            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: [] };
+            const checkDecision = await ciFailureDecision(ref, readiness, current, inspection);
+            if (checkDecision.status !== 'checks-satisfied') return checkDecision;
+            // GitHub's rollup can briefly retain an older cancelled duplicate
+            // after an equivalent run on this exact head succeeds. The
+            // canonical validation is green even though that stale projection
+            // still says FAILURE/UNSTABLE.
+            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: undefined,
+              ...(readiness.mergeStateStatus === 'UNSTABLE' ? { mergeStateStatus: 'CLEAN' as const } : {}) };
           }
           if (readiness?.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)
@@ -3145,7 +3240,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ].join('\n').slice(0, 64_000);
             // A deliberate human dequeue is an external decision: never undo
             // it by entering fallback or re-enqueueing. Automated ejections go
-            // to Do without a held admission slot, carrying the exact failure.
+            // to Do with the exact failure, except concurrency supersession:
+            // that remains an informational same-head reconciliation wait.
             if (/\buser\b|manual|request(?:ed|ing)? (?:a )?remov|dequeue/i.test(reason)) {
               return {
                 status: 'needs-human', prs: current, actorUserId, detail,
@@ -3158,11 +3254,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               if (providerFailure) {
                 const runId = failedChecks.map((check) => githubActionsRunIdFromUrl(check.url))
                   .find((id): id is number => Boolean(id)) ?? 0;
-                const key = `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${runId}:0`;
+                const key = githubRequiredCheckKey({
+                  repository: ref.slug, pullRequest: ref.number, headSha: ref.headSha ?? 'unknown',
+                  workflowId: 0, check: failedChecks.map((check) => check.name).sort().join('|') || 'merge-group',
+                });
+                const observationKey = `${key}:run:${runId}:attempt:0:state:${providerFailure}`;
                 const observed = events.some((event) => event.type === 'github.ci.terminal-observed'
-                  && event.payload?.key === key);
+                  && (event.payload?.observationKey === observationKey || event.payload?.key === key));
                 if (!observed) record(handle.id, 'github.ci.terminal-observed', {
-                  key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+                  key, observationKey, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
                   runId, attempt: 0, disposition: providerFailure, inspectionUnavailable: true,
                 });
                 if (providerFailure === 'human') return {
@@ -3173,18 +3273,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   status: 'retryable-error', prs: current, actorUserId, detail: `${detail}\n\nThe speculative queue check failed transiently. Retrying GitHub inspection without reopening the proposal.`,
                   releaseAdmission: true,
                 };
-                const previous = events.filter((event) => event.type === 'github.ci.external-wait'
-                  && event.payload?.key === key).length;
-                record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
-                  candidateHead: ref.headSha, poll: previous + 1 });
-                if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
-                  status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
-                  detail: `${detail}\n\nGitHub still exposes this superseded speculative check after ${MAX_SUPERSEDED_CI_POLLS} bounded observations. Inspect repository concurrency/runner configuration, then retry. The task owns no admission slot.`,
-                  eligibleUserIds: [actorUserId],
-                };
                 return {
-                  status: 'waiting', prs: current, actorUserId, releaseAdmission: true,
-                  detail: `${detail}\n\nThe speculative check was superseded. Waiting for the newer request without reopening the proposal; the task owns no admission slot.`,
+                  status: 'waiting', prs: current, actorUserId,
+                  detail: `${detail}\n\nThe speculative check was superseded. Waiting for equivalent same-head reconciliation without reopening the proposal, releasing its landing position, or requesting human input.`,
                 };
               }
             }
@@ -3284,9 +3375,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return errorDecision(error, current);
           }
           if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR') {
-            const failure = await ciFailureDecision(ref, readiness, current, inspection);
-            if (failure) return failure;
-            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: [] };
+            const checkDecision = await ciFailureDecision(ref, readiness, current, inspection);
+            if (checkDecision.status !== 'checks-satisfied') return checkDecision;
+            readiness = { ...readiness, checks: 'SUCCESS', failedChecks: undefined,
+              ...(readiness.mergeStateStatus === 'UNSTABLE' ? { mergeStateStatus: 'CLEAN' as const } : {}) };
           }
           if (readiness.reviewDecision === 'CHANGES_REQUESTED') {
             if (intentAuthorizedLanding)

@@ -30,4 +30,12 @@ describe('single-stage Responder form behavior', () => {
     expect(reset, 'resetResponderField() should exist').toBeTruthy();
     expect(reset).toMatch(/dispatchEvent\(new Event\('change', \{ bubbles: true \}\)\)/);
   });
+
+  it('collects the composite Responder from the live parameters form', () => {
+    const app = readFileSync(fileURLToPath(new URL('../web/app.js', import.meta.url)), 'utf8');
+    const collect = app.match(/function collectParamEdits\([\s\S]*?\n}/)?.[0];
+    expect(collect, 'collectParamEdits() should exist').toBeTruthy();
+    expect(collect).toMatch(/f\.type === 'responder'/);
+    expect(collect).toMatch(/out\[f\.name\] = readResponder\(box\)/);
+  });
 });

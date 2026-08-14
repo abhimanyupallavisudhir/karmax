@@ -140,6 +140,48 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     expect((await handle.result()).stage).toBe('done');
   });
 
+  it('reroutes an already-open ordinary input pause through the editable Responder', async () => {
+    const repo = await h.makeRepo('paramedit-responder');
+    const token = h.tokens.mint({
+      taskId: 't-responder',
+      profileId: 'do',
+      principal: 'user:a',
+      ceiling: ['create-task', 'edit-task', 'read-task', 'signal-task'],
+      grantorCaps: ['create-task', 'edit-task', 'read-task', 'signal-task'],
+    }).token;
+    const project = h.store.createProject('Responder edits', {
+      repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false,
+    });
+    const task = await h.api.createTask(token, {
+      projectId: project.id,
+      workflow: 'software-dev',
+      prompt: '@write answer.txt :: rerouted\n@incomplete',
+      params: {
+        responder: { kind: 'human', audience: ['user:a'] },
+        confirm: { layers: [] },
+      },
+    });
+    const handle = h.client.workflow.getHandle(task.id);
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 15_000 }).toMatchObject({
+      kind: 'human', audience: ['user:a'],
+    });
+    expect((await view(handle)).editableParams).toContain('responder');
+
+    const applied = await h.api.updateParams(token, task.id, {
+      responder: { kind: 'agent', provider: 'mock', prompt: 'Answer this open question now.' },
+    });
+    expect(applied).toEqual({ applied: ['responder'] });
+    expect(h.store.getTask(task.id)?.params.responder).toMatchObject({ kind: 'agent', provider: 'mock' });
+
+    // The edit wakes the existing pause. No human follow-up is sent: the newly
+    // selected response agent answers it, and the Do conversation resumes.
+    expect((await handle.result()).stage).toBe('done');
+    const final = await view(handle);
+    const responder = final.transcripts.find((transcript: any) => transcript.role === 'responder');
+    expect(responder?.messages.some((message: any) => message.text.includes('Answer this open question now.'))).toBe(true);
+    expect((await git(repo, ['show', 'main:answer.txt'])).stdout).toContain('rerouted');
+  });
+
   // ── the Review route (SPEC §5.2) ──
   // It is consumed by the gate it drives, not by queueing, so it stays editable while
   // the task runs — including while the gate is already parked on someone.

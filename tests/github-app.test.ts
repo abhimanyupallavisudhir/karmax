@@ -467,7 +467,7 @@ describe('GitHub App integration', () => {
     const pull = (branch: string, over: Record<string, unknown> = {}) => ({
       installation: { id: 42 }, action: 'closed', repository: { full_name: 'acme/app' },
       pull_request: { number: 3, html_url: 'https://github.com/acme/app/pull/3', state: 'closed', merged: true,
-        title: 'Work', head: { ref: branch }, base: { ref: 'main' }, ...over },
+        title: 'Work', head: { ref: branch, sha: 'head-1' }, base: { ref: 'main' }, ...over },
     });
 
     const taskPr = { repo: 'app', slug: 'acme/app', number: 3, url: 'https://github.com/acme/app/pull/3',
@@ -485,10 +485,28 @@ describe('GitHub App integration', () => {
     expect(store.getTask(task.id)?.lastView?.checkouts?.[0]?.pr).toMatchObject({ state: 'closed', merged: true });
     const check = await deliver('check_run', 'check-1', {
       installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
-      check_run: { name: 'CI', status: 'completed', conclusion: 'failure',
-        check_suite: { head_branch: `karmax/${task.id}` } },
+      check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
+        check_suite: { head_branch: `karmax/${task.id}`, head_sha: 'head-1' },
+        pull_requests: [{ number: 3 }] },
     });
     expect(check.events).toEqual([expect.objectContaining({ taskId: task.id, type: 'github.check.completed' })]);
+    const duplicateCheck = await deliver('check_run', 'check-duplicate-delivery', {
+      installation: { id: 42 }, action: 'completed', repository: { full_name: 'acme/app' },
+      check_run: { id: 501, name: 'CI', status: 'completed', conclusion: 'failure',
+        check_suite: { head_branch: `karmax/${task.id}`, head_sha: 'head-1' },
+        pull_requests: [{ number: 3 }] },
+    });
+    expect(duplicateCheck.events).toBeUndefined();
+
+    const synchronize = pull(`karmax/${task.id}`, { state: 'open', merged: false,
+      head: { ref: `karmax/${task.id}`, sha: 'head-2' } });
+    synchronize.action = 'synchronize';
+    expect((await deliver('pull_request', 'sync-1', synchronize)).events).toHaveLength(1);
+    expect((await deliver('pull_request', 'sync-2', synchronize)).events).toBeUndefined();
+    const nextSynchronize = pull(`karmax/${task.id}`, { state: 'open', merged: false,
+      head: { ref: `karmax/${task.id}`, sha: 'head-3' } });
+    nextSynchronize.action = 'synchronize';
+    expect((await deliver('pull_request', 'sync-3', nextSynchronize)).events).toHaveLength(1);
     const failedWorkflow = await deliver('workflow_run', 'workflow-1', {
       installation: { id: 42 }, action: 'completed',
       repository: { id: 99, full_name: 'acme/app' },
@@ -503,6 +521,21 @@ describe('GitHub App integration', () => {
         branch: 'main', headSha: 'merged-sha', originatingTaskId: task.id,
       }),
     })]);
+    const successfulCi = await deliver('workflow_run', 'workflow-ci-success', {
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+      workflow_run: { id: 702, name: 'CI', status: 'completed', conclusion: 'success',
+        head_branch: 'main', head_sha: 'validated-sha', html_url: 'https://github.com/acme/app/actions/runs/702' },
+    });
+    expect(successfulCi).toMatchObject({ accepted: true });
+    expect(store.kvEntries('github:deployment-expectation:')).toHaveLength(1);
+    // Presence, not completion, satisfies the expectation. A protected
+    // environment can leave a perfectly real deployment waiting for approval.
+    await deliver('workflow_run', 'workflow-deploy-waiting', {
+      installation: { id: 42 }, action: 'requested', repository: { id: 99, full_name: 'acme/app' },
+      workflow_run: { id: 703, name: 'Deploy', status: 'waiting', conclusion: null,
+        head_branch: 'main', head_sha: 'validated-sha' },
+    });
+    expect(store.kvEntries('github:deployment-expectation:')).toEqual([]);
     const featureFailure = await deliver('workflow_run', 'workflow-2', {
       installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
       workflow_run: { id: 701, name: 'CI', conclusion: 'failure', head_branch: 'feature', head_sha: 'x' },

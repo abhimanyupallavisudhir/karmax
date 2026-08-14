@@ -180,6 +180,8 @@ export interface TurnResult {
   /** The Do agent explicitly requested the PR/Review cycle. */
   openPrRequested?: boolean;
   output: string;
+  /** Provider timeline item carrying `output`, when the adapter emitted one. */
+  finalActivity?: NonNullable<Message['sourceActivity']>;
   reviewInfo?: ReviewInfo;
   subTasks?: { title: string; prompt: string }[];
   /** Parent-agent responses to child raises this turn (SPEC §5.3). */

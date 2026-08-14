@@ -752,6 +752,12 @@ function numLabel(taskId) {
   return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
 }
 
+// The task's human-facing identity wherever its title is shown compactly.
+function numberedTaskTitle(task) {
+  const title = task?.title || task?.id || '';
+  return task?.num != null ? `#${task.num} ${title}` : title;
+}
+
 function principalLabel(principal) {
   if (!principal) return 'Unassigned';
   if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
@@ -4486,6 +4492,10 @@ function collectTriggers(existing) {
   return trigs;
 }
 
+function dependencyChipHtml(task) {
+  return `<span class="dep-chip" data-depid="${esc(task.id)}">${esc(numberedTaskTitle(task))}<button type="button" class="dep-x" data-depx="${esc(task.id)}" title="Remove">✕</button></span>`;
+}
+
 // Wire the dependency chips: ✕ removes; "＋ Add a task…" opens the full task-picker
 // overlay (the task list's search surface). Seeded from an existing dependency trigger.
 function wireDepPicker(values, selfId) {
@@ -4494,9 +4504,8 @@ function wireDepPicker(values, selfId) {
   if (!box || !btn) return;
   const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
   const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
-  const chip = (t) => `<span class="dep-chip" data-depid="${t.id}">${esc(t.title)}<button type="button" class="dep-x" data-depx="${t.id}" title="Remove">✕</button></span>`;
   const paint = (ids, changed) => {
-    box.innerHTML = ids.map((id) => chip(taskById(id))).join('');
+    box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id))).join('');
     box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
     if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -6974,8 +6983,40 @@ function conversationPane(v, t) {
 // replace in place, so a command is one row that moves running → completed rather
 // than two noisy rows.
 function conversationEntries(t) {
-  const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
+  // Fetch/WS races can merge an older durable window with newer events in either
+  // array order. Fold provider updates in their durable order so a stale
+  // "started" update can never replace a later "completed" one. Explanations
+  // also carry their source event: it keeps an explained message present after
+  // that message ages out of the ordinary bounded event window.
+  const sourceEvents = (S.taskEvents || [])
+    .filter((event) => event.type === 'conversation.explanation' && event.payload?.role === t.role)
+    .map((event) => event.payload?.sourceEvent)
+    .filter((event) => event?.type === 'agent.activity');
+  const seenEvents = new Set();
+  const orderedEvents = [...(S.taskEvents || []), ...sourceEvents]
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => {
+      const key = event.seq != null ? `seq:${event.seq}` : `${event.type}/${event.ts}/${JSON.stringify(event.payload)}`;
+      if (seenEvents.has(key)) return false;
+      seenEvents.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      const aSeq = Number(a.event.seq);
+      const bSeq = Number(b.event.seq);
+      const aDurable = a.event.seq != null && Number.isSafeInteger(aSeq);
+      const bDurable = b.event.seq != null && Number.isSafeInteger(bSeq);
+      if (aDurable && bDurable) return aSeq - bSeq;
+      if (aDurable !== bDurable) return aDurable ? -1 : 1;
+      return (Number(a.event.ts || 0) - Number(b.event.ts || 0)) || (a.index - b.index);
+    })
+    .map(({ event }) => event);
+  const updates = orderedEvents.filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
+  const activityRefsBySource = new Map();
+  // Provider streams and workflow snapshots may normalize line endings
+  // differently even though the browser renders the same prose.
+  const messageTextKey = (value) => String(value || '').replace(/\r\n?/g, '\n').trim();
   // A Temporal activity retry continues the same logical turn, so provider item
   // ids (especially the synthetic `turn` id) repeat. Keep attempts distinct:
   // otherwise the resumed `started` event overwrites the prior `failed` event
@@ -7001,6 +7042,7 @@ function conversationEntries(t) {
       retry = generation > 1;
     }
     const key = `${base}/${attempt}`;
+    activityRefsBySource.set(`activity:${event.seq ?? event.ts}`, key);
     const prior = activities.get(key);
     const displayed = retry && activity.kind === 'turn' && activity.phase === 'started'
       ? { ...activity, title: 'Agent retry started', detail: undefined }
@@ -7014,17 +7056,33 @@ function conversationEntries(t) {
       // Point at the latest durable update: for a streaming provider message the
       // completed text, not its earlier partial title, is what gets explained.
       sourceKey: `activity:${event.seq ?? event.ts}`,
+      activityRef: key,
       conversationRole: t.role,
+      activityGroup: `${turn}/${attempt}`,
     });
   }
 
   // The workflow stores the final assistant reply for provider resume. The same
-  // reply also arrives as a structured provider message; suppress that exact
-  // duplicate while retaining intermediate assistant messages around tool calls.
+  // reply also arrives as a structured provider message. New transcript entries
+  // identify that provider item explicitly; older histories fall back to text
+  // comparison. In either case keep the provider item (its real timestamp and
+  // explanation annotations belong to it) and suppress only the transcript copy.
+  const providerActivityRefs = new Set(activities.keys());
+  // Some provider rails have emitted the same completed assistant item twice
+  // under different item ids. Keep the last copy in that turn (the activity
+  // layer's finalActivity link also points to the last assistant item).
+  const lastProviderMessage = new Map();
+  for (const entry of activities.values()) {
+    if (entry.activity.kind !== 'message') continue;
+    lastProviderMessage.set(`${entry.activityGroup}/${messageTextKey(entry.activity.title)}`, entry);
+  }
+  const visibleActivities = [...activities.values()].filter((entry) =>
+    entry.activity.kind !== 'message'
+      || lastProviderMessage.get(`${entry.activityGroup}/${messageTextKey(entry.activity.title)}`) === entry);
   const providerTexts = new Set(
-    [...activities.values()]
+    visibleActivities
       .filter((entry) => entry.activity.kind === 'message')
-      .map((entry) => String(entry.activity.title || '').trim()),
+      .map((entry) => messageTextKey(entry.activity.title)),
   );
   // User messages carry real epoch-ms timestamps; agent/system replies are stamped
   // by the deterministic workflow with a per-array sequence number (it has no wall
@@ -7033,12 +7091,21 @@ function conversationEntries(t) {
   // timeline by its tiny `ts`.
   let carriedTs = 0;
   const messages = (t.messages || [])
-    .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
+    .filter((message) => {
+      if (message.role !== 'agent') return true;
+      const source = message.sourceActivity;
+      if (source) return !providerActivityRefs.has(`${source.turnId}/${source.id}/${source.attempt}`);
+      // Replay/back-compat for messages recorded before sourceActivity existed.
+      return !providerTexts.has(messageTextKey(message.text));
+    })
     .map((message, index) => {
       const real = Number(message.ts) > 100000000000;
       if (real) carriedTs = Number(message.ts);
+      const source = message.sourceActivity;
       return { type: 'message', message, ts: message.ts, sortTs: real ? Number(message.ts) : carriedTs, order: index,
-        sourceKey: `message:${message.id}`, conversationRole: t.role };
+        sourceKey: `message:${message.id}`,
+        activityRef: source ? `${source.turnId}/${source.id}/${source.attempt}` : undefined,
+        conversationRole: t.role };
     });
   // Follow-ups are journaled as soon as Temporal accepts their signal, while the
   // workflow's cached transcript may not be republished until the turn ends.
@@ -7047,39 +7114,51 @@ function conversationEntries(t) {
   // show the same user message twice.
   const storedIds = new Set((t.messages || []).map((message) => message.id));
   const posted = new Map();
-  for (const event of (S.taskEvents || [])) {
+  for (const event of orderedEvents) {
     if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
     const message = event.payload?.message;
     if (!message?.id || storedIds.has(message.id)) continue;
     posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, sortTs: Number(message.ts ?? event.ts), order: event.seq ?? event.ts,
       sourceKey: `message:${message.id}`, conversationRole: t.role });
   }
-  const combined = [...messages, ...posted.values(), ...activities.values()];
+  const combined = [...messages, ...posted.values(), ...visibleActivities];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));
   const explanations = new Map();
-  for (const event of (S.taskEvents || [])) {
+  for (const event of orderedEvents) {
     if (event.type !== 'conversation.explanation' || event.payload?.role !== t.role || !event.payload?.sourceKey) continue;
     const key = event.seq ?? `${event.payload.sourceKey}/${event.ts}/${event.payload.text}`;
     explanations.set(key, { type: 'explanation', explanation: event.payload, ts: event.ts,
-      sortTs: Number(event.ts), order: event.seq ?? event.ts, conversationRole: t.role });
+      sortTs: Number(event.ts), order: event.seq ?? event.ts, conversationRole: t.role,
+      activityRef: activityRefsBySource.get(event.payload.sourceKey) });
   }
-  const bySource = new Map();
+  const targetByKey = new Map();
+  for (let index = 0; index < combined.length; index++) {
+    const entry = combined[index];
+    if (entry.sourceKey) targetByKey.set(entry.sourceKey, index);
+    if (entry.activityRef) targetByKey.set(`activity-ref:${entry.activityRef}`, index);
+  }
+  const byTarget = new Map();
+  const orphaned = [];
   for (const explanation of explanations.values()) {
-    const list = bySource.get(explanation.explanation.sourceKey) || [];
+    const target = targetByKey.get(explanation.explanation.sourceKey)
+      ?? (explanation.activityRef ? targetByKey.get(`activity-ref:${explanation.activityRef}`) : undefined);
+    if (target == null) { orphaned.push(explanation); continue; }
+    const list = byTarget.get(target) || [];
     list.push(explanation);
-    bySource.set(explanation.explanation.sourceKey, list);
+    byTarget.set(target, list);
   }
   const out = [];
-  for (const entry of combined) {
+  for (let index = 0; index < combined.length; index++) {
+    const entry = combined[index];
     out.push(entry);
-    const attached = bySource.get(entry.sourceKey) || [];
+    const attached = byTarget.get(index) || [];
     attached.sort((a, b) => Number(a.order) - Number(b.order));
     out.push(...attached);
-    bySource.delete(entry.sourceKey);
   }
-  // If a bounded event window no longer contains an old provider message, retain
-  // its durable annotation at the end instead of silently hiding it.
-  for (const orphaned of bySource.values()) out.push(...orphaned);
+  // Malformed legacy annotations may lack any resolvable source. Preserve them
+  // rather than losing durable data; valid activity annotations always have the
+  // recovered source event above and therefore never take this fallback.
+  out.push(...orphaned);
   return out;
 }
 
@@ -8062,6 +8141,12 @@ function collectParamEdits(root, fields) {
       const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       out[f.name] = { layers: readConfirmerLayers(box) };
+      continue;
+    }
+    if (f.type === 'responder') {
+      const box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = readResponder(box);
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
