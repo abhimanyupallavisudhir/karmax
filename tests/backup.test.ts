@@ -68,6 +68,25 @@ describe('control-plane backup', () => {
     expect(fs.existsSync(path.join(home, 'vault', 'link'))).toBe(false);
   });
 
+  it('excludes organization-scoped Git-backed pass checkout caches', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-pass-git-cache-'));
+    const home = path.join(root, 'home');
+    roots.push(root);
+    const state = path.join(home, 'state');
+    const checkout = path.join(state, 'connectors', 'pass-git', 'org_personal', 'repository-hash', 'repo');
+    fs.mkdirSync(path.join(checkout, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(state, 'durable-state'), 'keep me');
+    fs.writeFileSync(path.join(checkout, '.gpg-id'), 'remote repository cache');
+    fs.symlinkSync('/app/provider/codex', path.join(checkout, 'bin', 'codex-monitor'));
+
+    const destination = path.join(root, 'snapshot');
+    const result = await createBackup({ home, destination, externalTemporal: true });
+
+    expect(fs.readFileSync(path.join(destination, 'payload', 'state', 'durable-state'), 'utf8')).toBe('keep me');
+    expect(fs.existsSync(path.join(destination, 'payload', 'state', 'connectors', 'pass-git'))).toBe(false);
+    expect(result.manifest.files.some((entry) => entry.path.startsWith('state/connectors/pass-git/'))).toBe(false);
+  });
+
   it('excludes Codex runtime temp symlinks but still rejects symlinks in durable config-home data', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-backup-codex-tmp-'));
     const home = path.join(root, 'home');
