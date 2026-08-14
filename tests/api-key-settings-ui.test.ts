@@ -14,6 +14,15 @@ describe('API key settings UI', () => {
     expect(editor).toContain('explainerOnly: [...explainerOnly]');
   });
 
+  it('keeps API keys binary on Task forms and renders inherited explainer-only as Off', () => {
+    expect(editor).toContain("const mode = scope === 'task' ? (isOn ? 'on' : 'off')");
+    expect(editor).toContain("c.kind === 'key' ? (sd.modes?.[key] || (isOn ? 'on' : 'off'))");
+    expect(editor).toContain("c.kind === 'key' && scope !== 'task'");
+    expect(editor).toContain('<button class="cred-toggle ${mode}"');
+    expect(editor).toContain('<div class="cred-row ${esc(mode)}"');
+    expect(editor).toContain('explainerOnly.delete(key)');
+  });
+
   it('offers write-only edit and delete controls for saved API keys', () => {
     expect(editor).toContain('class="cred-key-edit"');
     expect(editor).toContain('class="cred-key-del"');

@@ -82,6 +82,21 @@ function ok(condition, message) {
   await initialHydration;
   ok(element.innerHTML.includes('claude:work'), 'an older hydration cannot erase the newly connected login');
 
+  // The regression harness evaluates renderCredentialEditor in isolation. Keep
+  // its Task-form key behavior self-contained too: inherited Explainer-only is
+  // a binary, muted Off control here (the three-state select is settings-only).
+  const apiKey = 'key:handle:openrouter:explain';
+  let taskRequest = 0;
+  global.api = () => ++taskRequest === 1
+    ? Promise.resolve({
+      credentials: [{ key: apiKey, kind: 'key', provider: 'openrouter', label: 'API key: openrouter:explain' }],
+      task: { own: {}, enabled: [], modes: { [apiKey]: 'explainer-only' } },
+    })
+    : Promise.resolve({ logins: [] });
+  await renderCredentialEditor(element, 'task', { organizationId: 'org', taskId: 'task' });
+  ok(element.innerHTML.includes('cred-toggle off'), 'Task forms render inherited Explainer-only API keys as Off');
+  ok(!element.innerHTML.includes('cred-mode'), 'Task forms keep API key controls binary');
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })();
