@@ -39,10 +39,12 @@ describe('post-push deployment to the public instance', () => {
     expect(operator.split('cmd_update() {')[1]?.split('\n}')[0]).not.toContain('pull --ff-only');
   });
 
-  it('serialises deploys using only GitHub-supported concurrency keys', () => {
+  it('serialises deploys using only GitHub-supported concurrency fields', () => {
     expect(deploy.concurrency.group).toBe('deploy-production');
     expect(deploy.concurrency['cancel-in-progress']).toBe(false);
-    expect(deploy.concurrency.queue).toBeUndefined();
+    // An unknown key invalidates the whole workflow before any run is created.
+    // GitHub's concurrency schema supports exactly these two fields.
+    expect(Object.keys(deploy.concurrency).sort()).toEqual(['cancel-in-progress', 'group']);
   });
 
   // Trust-on-first-use here would let anyone who can answer on port 22 collect

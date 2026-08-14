@@ -25,9 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
-    # Serialize production changes. GitHub retains at most one pending member of
-    # a concurrency group; the remote updater independently refuses to move
-    # backwards if waiting jobs start out of dispatch order.
+    # GitHub retains the running deployment and coalesces pending requests to the
+    # newest validated master SHA. That is sufficient because every newer SHA
+    # contains its ancestors; the remote updater also refuses to move backwards.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
