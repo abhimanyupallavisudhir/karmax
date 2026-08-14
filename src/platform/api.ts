@@ -216,6 +216,63 @@ const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
 const GOAL_RESUME_MESSAGE =
   'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.';
 
+type CollaborationTargetIssue = {
+  admission: string;
+  result: string;
+};
+
+/**
+ * Whether a target can still satisfy a background agent action. Keep this
+ * classification shared by admission, live event routing, and startup repair:
+ * otherwise one path can accept a request that another path will never settle.
+ *
+ * PR/Merge are admission-only failures. A request accepted while the target was
+ * still in Do may legitimately observe PR before the platform emits the
+ * succeeding push.branch event, so an in-flight request waits for that push or
+ * a genuinely terminal/blocked state.
+ */
+function collaborationTargetIssue(
+  view: Pick<TaskView, 'stage' | 'status' | 'pointOfNoReturnPassed'> | undefined,
+  phase: 'admission' | 'pending',
+): CollaborationTargetIssue | undefined {
+  if (!view) return undefined;
+  if (view.status === 'done' || view.stage === 'done') return {
+    admission: 'target task is already done',
+    result: 'target task completed without publishing its branch',
+  };
+  if (view.status === 'cancelled' || view.stage === 'cancelled') return {
+    admission: 'target task is already cancelled',
+    result: 'target task became cancelled',
+  };
+  if (view.status === 'failed' || view.stage === 'failed') return {
+    admission: 'target task is already failed',
+    result: 'target task became failed',
+  };
+  if (view.status === 'blocked' || view.stage === 'escalated') return {
+    admission: 'target task is blocked and cannot run its Do agent; resume it before requesting collaboration',
+    result: 'target task became blocked before publishing its branch',
+  };
+  if (phase === 'admission'
+    && (view.pointOfNoReturnPassed || view.stage === 'pr' || view.stage === 'merge')) return {
+      admission: 'target task has passed its agent-work stage and can no longer publish on request',
+      result: 'target task passed its agent-work stage without publishing its branch',
+    };
+  return undefined;
+}
+
+function collaborationTargetIssueFromViewEvent(
+  payload: unknown,
+  current?: TaskView,
+): CollaborationTargetIssue | undefined {
+  const event = (payload ?? {}) as { stage?: unknown; status?: unknown };
+  if (!current && (typeof event.stage !== 'string' || typeof event.status !== 'string')) return undefined;
+  return collaborationTargetIssue({
+    stage: typeof event.stage === 'string' ? event.stage as Stage : current!.stage,
+    status: typeof event.status === 'string' ? event.status as TaskView['status'] : current!.status,
+    pointOfNoReturnPassed: current?.pointOfNoReturnPassed,
+  }, 'pending');
+}
+
 export interface KarmaxApiDeps {
   store: Store;
   client: Client;
@@ -399,10 +456,8 @@ export class KarmaxApi {
       throw new Error('target task must belong to the same project');
     if (target.id === requester.id) throw new Error('a task cannot request collaboration from itself');
     if (input.action !== 'publish_branch') throw new Error(`unsupported agent action: ${input.action}`);
-    if (['done', 'cancelled', 'failed'].includes(target.lastView?.status ?? ''))
-      throw new Error(`target task is already ${target.lastView?.status}`);
-    if (target.lastView?.pointOfNoReturnPassed || ['pr', 'merge'].includes(target.lastView?.stage ?? ''))
-      throw new Error('target task has passed its agent-work stage and can no longer publish on request');
+    const unavailable = collaborationTargetIssue(target.lastView, 'admission');
+    if (unavailable) throw new Error(unavailable.admission);
 
     const request = this.deps.store.createCollaborationRequest({
       requesterTaskId: requester.id,
@@ -437,6 +492,20 @@ export class KarmaxApi {
       });
       if (failed) await this.notifyCollaborationRequest(failed);
       return this.deps.store.getCollaborationRequest(request.id) ?? request;
+    }
+    // The target can cross into a blocked/terminal state between the admission
+    // check and signal delivery. Re-read the durable view after delivery so that
+    // race cannot strand the requester waiting for an event that already fired.
+    const raced = collaborationTargetIssue(
+      this.deps.store.getTask(target.id)?.lastView,
+      'pending',
+    );
+    if (raced) {
+      const failed = this.deps.store.settleCollaborationRequest(request.id, 'failed', {
+        requestId: request.id,
+        reason: raced.result,
+      });
+      if (failed) await this.notifyCollaborationRequest(failed);
     }
     return this.deps.store.getCollaborationRequest(request.id) ?? request;
   }
@@ -3503,12 +3572,11 @@ export class KarmaxApi {
         eventSeq: event.seq,
       }, event.seq);
     } else if (event.type === 'view.updated') {
-      const status = String((event.payload as { status?: unknown } | undefined)?.status ?? '');
-      if (status === 'failed' || status === 'cancelled' || status === 'done') {
+      const current = this.deps.store.getTask(event.taskId)?.lastView;
+      const issue = collaborationTargetIssueFromViewEvent(event.payload, current);
+      if (issue) {
         settled = this.deps.store.settleCollaborationRequests(event.taskId, 'failed', {
-          reason: status === 'done'
-            ? 'target task completed without publishing its branch'
-            : `target task became ${status}`,
+          reason: issue.result,
           eventSeq: event.seq,
         }, event.seq);
       }
@@ -3573,17 +3641,18 @@ export class KarmaxApi {
       const relevant = this.deps.store.eventsSince(request.targetTaskId, request.afterSeq)
         .find((event) => event.type === 'push.branch'
           || (event.type === 'view.updated'
-            && ['done', 'cancelled', 'failed'].includes(String((event.payload as any)?.status ?? ''))));
+            && collaborationTargetIssueFromViewEvent(event.payload)));
       if (relevant) {
         await this.routeCollaborationEvent(relevant);
         continue;
       }
-      const status = this.deps.store.getTask(request.targetTaskId)?.lastView?.status;
-      if (status && ['done', 'cancelled', 'failed'].includes(status)) {
+      const issue = collaborationTargetIssue(
+        this.deps.store.getTask(request.targetTaskId)?.lastView,
+        'pending',
+      );
+      if (issue) {
         const settled = this.deps.store.settleCollaborationRequests(request.targetTaskId, 'failed', {
-          reason: status === 'done'
-            ? 'target task completed without publishing its branch'
-            : `target task became ${status}`,
+          reason: issue.result,
         });
         for (const item of settled) await this.notifyCollaborationRequest(item);
       }
