@@ -765,7 +765,13 @@ export interface GitHubMergeAuthorization {
   repair?: {
     kind: 'conflict' | 'base-moved' | 'ci' | 'changes-requested' | 'head-changed';
     preserveAuthorization: boolean;
+    /** Stable identity for one substantive failure observation. Reobserving it
+     * cannot consume another automated repair or wake Do again. */
+    fingerprint?: string;
   };
+  /** This wait depends on GitHub changing externally and must own no Karmax
+   * admission lease while it is parked. */
+  releaseAdmission?: boolean;
   /** Provider-owned durable queue state. Used by replay-pinned v1.16 landing;
    * v1.17 keeps the karmax target lease through exact-candidate validation and
    * automated repair instead. */
@@ -791,6 +797,7 @@ export interface TaskLandingState {
   /** PR identity -> head that received the most recent full Review. */
   authorizedHeads?: Record<string, string>;
   repairAttempts?: number;
+  lastRepairFingerprint?: string;
   detail?: string;
 }
 

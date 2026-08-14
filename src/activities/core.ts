@@ -186,6 +186,7 @@ class AgentAdmissionInfrastructureError extends Error {
  * Either way the raw signal string is appended (truncated) for diagnostics.
  */
 const pexec = promisify(execFile);
+const MAX_SUPERSEDED_CI_POLLS = 20;
 
 function signalKillMessage(raw: string): string {
   const h = hostStats();
@@ -2750,18 +2751,57 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const summary = ciFailureDetail(ref, readiness);
         const runIds = [...new Set((readiness.failedChecks ?? [])
           .map((check) => githubActionsRunIdFromUrl(check.url)).filter((id): id is number => Boolean(id)))];
-        const decisions: GithubActionsFailureDecision[] = [];
+        const observationKey = (runId: number, attempt: number) =>
+          `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${runId}:${attempt}`;
+        const terminalObservation = (decision: GithubActionsFailureDecision) => {
+          const key = observationKey(decision.inspection.run.id, decision.inspection.run.attempt);
+          const observed = events.some((event) => event.type === 'github.ci.terminal-observed'
+            && event.payload?.key === key);
+          if (!observed) record(handle.id, 'github.ci.terminal-observed', {
+            key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+            runId: decision.inspection.run.id, attempt: decision.inspection.run.attempt,
+            disposition: decision.disposition,
+          });
+          return { decision, key };
+        };
+        const externalWait = (key: string, detail: string): GitHubMergeAuthorization => {
+          const previous = events.filter((event) => event.type === 'github.ci.external-wait'
+            && event.payload?.key === key).length;
+          record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
+            candidateHead: ref.headSha, poll: previous + 1 });
+          if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
+            status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
+            detail: `${detail}\n\nGitHub still exposes the same externally blocked CI state after ${MAX_SUPERSEDED_CI_POLLS} bounded observations and no newer terminal result. Inspect the repository concurrency/runner configuration, then retry. The task owns no admission slot while parked.`,
+            eligibleUserIds: [actorUserId],
+          };
+          return { status: 'waiting', prs: current, actorUserId, releaseAdmission: true, detail };
+        };
+        const fallbackObservation = (key: string, disposition: string) => {
+          const repeated = events.some((event) => event.type === 'github.ci.terminal-observed'
+            && event.payload?.key === key);
+          if (!repeated) record(handle.id, 'github.ci.terminal-observed', {
+            key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+            runId: runIds[0] ?? 0, attempt: 0, disposition, inspectionUnavailable: true,
+          });
+          return repeated;
+        };
+        const decisions: Array<ReturnType<typeof terminalObservation>> = [];
         if (inspection.actions) {
           for (const runId of runIds.slice(0, 4)) {
             try {
               const inspected = await inspection.actions.inspectFailure(ref.slug, runId);
               // A stale check URL must never cause a rerun or repair of a
               // different revision than the proposal whose landing is held.
-              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha) continue;
+              // pull_request Actions run against refs/pull/N/merge, however,
+              // legitimately carries the synthetic merge SHA rather than the
+              // PR head. The URL came from this current PR's readiness packet,
+              // so that event remains safely correlated to this candidate.
+              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha
+                && inspected.run.event !== 'pull_request') continue;
               const checkContext = (readiness.failedChecks ?? [])
                 .filter((check) => githubActionsRunIdFromUrl(check.url) === runId)
                 .map((check) => `${check.name}: ${check.state}\n${check.detail ?? ''}`).join('\n');
-              decisions.push(classifyGithubActionsFailure(inspected, { additionalContext: checkContext }));
+              decisions.push(terminalObservation(classifyGithubActionsFailure(inspected, { additionalContext: checkContext })));
             } catch (error) {
               record(handle.id, 'github.ci.inspection-failed', {
                 ...ref, runId, detail: error instanceof Error ? error.message : String(error),
@@ -2771,40 +2811,102 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (!decisions.length) {
           const providerFailure = classifyGithubActionsDiagnostic(summary);
-          if (providerFailure) return {
+          if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
             detail: `${summary}\n\nGitHub did not expose an Actions run id that krmax can safely rerun. Resolve the provider/account condition on GitHub, then retry.`,
             eligibleUserIds: [actorUserId],
           };
+          if (providerFailure === 'superseded') {
+            const key = observationKey(runIds[0] ?? 0, 0);
+            fallbackObservation(key, providerFailure);
+            return externalWait(key,
+              `${summary}\n\nGitHub reports that a newer or higher-priority CI request superseded this result. Waiting for that request instead of reopening the unchanged pull request.`);
+          }
+          if (providerFailure === 'retry') {
+            fallbackObservation(observationKey(runIds[0] ?? 0, 0), providerFailure);
+            return {
+              status: 'retryable-error', prs: current, actorUserId, releaseAdmission: true,
+              detail: `${summary}\n\nGitHub reported a transient Actions failure, but run inspection is unavailable so krmax cannot safely rerun it. Retrying inspection without reopening the proposal.`,
+            };
+          }
+          const fallbackKey = observationKey(runIds[0] ?? 0, 0);
+          fallbackObservation(fallbackKey, 'revision');
+          const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
+            && event.payload?.key === fallbackKey);
+          if (repairRequested) return externalWait(fallbackKey,
+            `${summary}\n\nThis exact terminal CI result was already sent for repair, but the pull-request candidate is unchanged. Waiting for a new run or candidate instead of waking Do again.`);
+          record(handle.id, 'github.ci.repair-requested', {
+            key: fallbackKey, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+            runId: runIds[0] ?? 0, attempt: 0,
+          });
           return {
             status: 'needs-revision', prs: current, actorUserId, detail: summary,
-            ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
+            ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true,
+              fingerprint: fallbackKey } } : {}),
           };
         }
-        const detail = decisions.map((decision) => renderGithubActionsFailure(decision)).join('\n\n').slice(0, 128_000);
-        const human = decisions.find((decision) => decision.disposition === 'human');
+        const detail = decisions.map(({ decision }) => renderGithubActionsFailure(decision)).join('\n\n').slice(0, 128_000);
+        const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
           status: 'needs-human', prs: current, actorUserId, detail,
           eligibleUserIds: [actorUserId],
         };
-        const revision = decisions.find((decision) => decision.disposition === 'revision');
-        if (revision) return {
-          status: 'needs-revision', prs: current, actorUserId, detail,
-          ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true } } : {}),
-        };
-        const retry = decisions.find((decision) => decision.disposition === 'retry');
+        const revision = decisions.find(({ decision }) => decision.disposition === 'revision');
+        if (revision) {
+          const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
+            && event.payload?.key === revision.key);
+          if (repairRequested) return externalWait(revision.key,
+            `${detail}\n\nThis exact terminal run was already sent for repair, but the repository, pull request, candidate head, run, and attempt are unchanged. Waiting for a substantive external change instead of reopening the proposal.`);
+          record(handle.id, 'github.ci.repair-requested', {
+            key: revision.key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+            runId: revision.decision.inspection.run.id, attempt: revision.decision.inspection.run.attempt,
+          });
+          return {
+            status: 'needs-revision', prs: current, actorUserId, detail,
+            ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true,
+              fingerprint: revision.key } } : {}),
+          };
+        }
+        const superseded = decisions.find(({ decision }) => decision.disposition === 'superseded');
+        if (superseded && inspection.actions) {
+          const run = superseded.decision.inspection.run;
+          try {
+            const listed = await inspection.actions.listRuns(ref.slug, { event: run.event, perPage: 100 });
+            const newer = listed.runs.filter((candidate) => candidate.id !== run.id
+              && candidate.workflowId === run.workflowId
+              && (candidate.runNumber > run.runNumber
+                || Date.parse(candidate.createdAt) > Date.parse(run.createdAt)))
+              .filter((candidate) => !run.branch || !candidate.branch || candidate.branch === run.branch)
+              .sort((a, b) => b.runNumber - a.runNumber || b.attempt - a.attempt)[0];
+            if (newer) {
+              const state = String(newer.conclusion ?? newer.status).toLowerCase();
+              if (state === 'success') return externalWait(`${superseded.key}:superseded-by:${newer.id}:${newer.attempt}`,
+                `${detail}\n\nSuperseding GitHub Actions run ${newer.id} (attempt ${newer.attempt}) succeeded. Waiting for GitHub to refresh the pull-request readiness rollup; no proposal revision or admission slot is needed.`);
+              if (!['failure', 'cancelled', 'stale', 'startup_failure', 'timed_out', 'action_required'].includes(state))
+                return externalWait(`${superseded.key}:superseded-by:${newer.id}:${newer.attempt}`,
+                  `${detail}\n\nWaiting for superseding GitHub Actions run ${newer.id} (attempt ${newer.attempt}), currently ${state}. The task owns no admission slot.`);
+            }
+          } catch (error) {
+            record(handle.id, 'github.ci.superseding-inspection-failed', {
+              ...ref, runId: run.id, detail: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return externalWait(superseded.key,
+            `${detail}\n\nThis run was superseded by GitHub concurrency or queue ordering. Waiting for the newer request instead of rerunning or reopening the unchanged proposal; the task owns no admission slot.`);
+        }
+        const retry = decisions.find(({ decision }) => decision.disposition === 'retry');
         if (retry && inspection.actions) {
           const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
             && event.payload?.slug === ref.slug && Number(event.payload?.number) === ref.number
-            && Number(event.payload?.runId) === retry.inspection.run.id);
+            && Number(event.payload?.runId) === retry.decision.inspection.run.id);
           const alreadyRequested = reruns.some((event) =>
-            Number(event.payload?.observedAttempt) === retry.inspection.run.attempt);
+            Number(event.payload?.observedAttempt) === retry.decision.inspection.run.attempt);
           if (!alreadyRequested && reruns.length < 2) {
             try {
-              await inspection.actions.rerun(ref.slug, retry.inspection.run.id, true);
+              await inspection.actions.rerun(ref.slug, retry.decision.inspection.run.id, true);
               record(handle.id, 'github.ci.rerun-requested', {
-                ...ref, runId: retry.inspection.run.id,
-                observedAttempt: retry.inspection.run.attempt,
+                ...ref, runId: retry.decision.inspection.run.id,
+                observedAttempt: retry.decision.inspection.run.attempt,
                 rerunNumber: reruns.length + 1,
               });
             } catch (error) {
@@ -2914,6 +3016,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let readinessError: unknown;
         const inspection = inspectionFor(ref.slug);
         const inspectionApi = inspection.api;
+        const repairFingerprint = (kind: 'conflict' | 'base-moved', suffix?: string) =>
+          readiness?.baseSha ? `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${readiness.baseSha}:${kind}${suffix ? `:${suffix}` : ''}` : undefined;
         if (live.nodeId) {
           try {
             readiness = await inspectionApi.readiness(ref.slug, ref.number);
@@ -2932,7 +3036,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   ? `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or landing candidate. It has no Karmax admission slot; resolve it against the newest target, verify it, and request landing again.`
                   : `Pull request ${ref.slug}#${ref.number} conflicts with the latest target or merge group. GitHub has ejected this entry; resolve it against the newest target and reopen it for automated integration review.`
                 : `Pull request ${ref.slug}#${ref.number} conflicts with its target. Resolve it in the task branch, reopen the proposal, and review the new head.`,
-              ...(intentAuthorizedLanding ? { repair: { kind: 'conflict' as const, preserveAuthorization: true } } : {}),
+              ...(intentAuthorizedLanding ? { repair: { kind: 'conflict' as const, preserveAuthorization: true,
+                ...(repairFingerprint('conflict') ? { fingerprint: repairFingerprint('conflict') } : {}) } } : {}),
             };
           }
           if (readiness?.draft) {
@@ -3004,9 +3109,47 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               };
             }
             const conflict = /conflict/i.test(reason);
+            if (!conflict) {
+              const providerFailure = classifyGithubActionsDiagnostic(detail);
+              if (providerFailure) {
+                const runId = failedChecks.map((check) => githubActionsRunIdFromUrl(check.url))
+                  .find((id): id is number => Boolean(id)) ?? 0;
+                const key = `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${runId}:0`;
+                const observed = events.some((event) => event.type === 'github.ci.terminal-observed'
+                  && event.payload?.key === key);
+                if (!observed) record(handle.id, 'github.ci.terminal-observed', {
+                  key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+                  runId, attempt: 0, disposition: providerFailure, inspectionUnavailable: true,
+                });
+                if (providerFailure === 'human') return {
+                  status: 'needs-human', prs: current, actorUserId, detail, releaseAdmission: true,
+                  eligibleUserIds: [actorUserId],
+                };
+                if (providerFailure === 'retry') return {
+                  status: 'retryable-error', prs: current, actorUserId, detail: `${detail}\n\nThe speculative queue check failed transiently. Retrying GitHub inspection without reopening the proposal.`,
+                  releaseAdmission: true,
+                };
+                const previous = events.filter((event) => event.type === 'github.ci.external-wait'
+                  && event.payload?.key === key).length;
+                record(handle.id, 'github.ci.external-wait', { key, slug: ref.slug, number: ref.number,
+                  candidateHead: ref.headSha, poll: previous + 1 });
+                if (previous + 1 >= MAX_SUPERSEDED_CI_POLLS) return {
+                  status: 'needs-human', prs: current, actorUserId, releaseAdmission: true,
+                  detail: `${detail}\n\nGitHub still exposes this superseded speculative check after ${MAX_SUPERSEDED_CI_POLLS} bounded observations. Inspect repository concurrency/runner configuration, then retry. The task owns no admission slot.`,
+                  eligibleUserIds: [actorUserId],
+                };
+                return {
+                  status: 'waiting', prs: current, actorUserId, releaseAdmission: true,
+                  detail: `${detail}\n\nThe speculative check was superseded. Waiting for the newer request without reopening the proposal; the task owns no admission slot.`,
+                };
+              }
+            }
             return {
               status: 'needs-revision', prs: current, actorUserId, detail,
-              repair: { kind: conflict ? 'conflict' : 'ci', preserveAuthorization: true },
+              repair: { kind: conflict ? 'conflict' : 'ci', preserveAuthorization: true,
+                ...(conflict && removal.beforeCommitSha
+                  ? { fingerprint: `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha ?? 'unknown'}:${removal.beforeCommitSha}:conflict` }
+                  : {}) },
             };
           }
         }
@@ -3151,7 +3294,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `Pull request ${ref.slug}#${ref.number} is behind its target. While this task retains the front landing slot, update the task branch from the target, resolve any conflicts, and rebuild the exact candidate.`,
-              repair: { kind: 'base-moved', preserveAuthorization: true },
+              repair: { kind: 'base-moved', preserveAuthorization: true,
+                ...(repairFingerprint('base-moved') ? { fingerprint: repairFingerprint('base-moved') } : {}) },
             };
           }
           if (['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')) {
@@ -3212,7 +3356,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `The target moved outside karmax's landing coordinator before exact head ${ref.headSha} could land for ${ref.slug}#${ref.number}: ${advanced.message}. Repair against that live target while retaining the front slot.`,
-              repair: { kind: 'base-moved', preserveAuthorization: true },
+              repair: { kind: 'base-moved', preserveAuthorization: true,
+                ...(repairFingerprint('base-moved', advanced.message) ? { fingerprint: repairFingerprint('base-moved', advanced.message) } : {}) },
             };
           }
           return {
@@ -3316,7 +3461,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               return {
                 status: 'needs-revision', prs: current, actorUserId,
                 detail: `GitHub could not mechanically update ${ref.slug}#${ref.number} from its target: ${update.message}. Resolve the actual conflict in Do; this task has already released fallback admission.`,
-                repair: { kind: 'conflict', preserveAuthorization: true },
+                repair: { kind: 'conflict', preserveAuthorization: true,
+                  ...(repairFingerprint('conflict', update.message) ? { fingerprint: repairFingerprint('conflict', update.message) } : {}) },
               };
             }
             const refreshed = update.headSha ? { ...next, headSha: update.headSha } : next;
@@ -3396,7 +3542,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (/conflict|not mergeable/i.test(refusal)) return {
             status: 'needs-revision', prs: current, actorUserId,
             detail: `GitHub reports an actual conflict for ${ref.slug}#${ref.number}: ${refusal}`,
-            repair: { kind: 'conflict', preserveAuthorization: true },
+            repair: { kind: 'conflict', preserveAuthorization: true,
+              ...(repairFingerprint('conflict', refusal) ? { fingerprint: repairFingerprint('conflict', refusal) } : {}) },
           };
           if (/checks?|pending|expected|behind|update.*branch/i.test(refusal)) return {
             status: 'waiting', prs: current, actorUserId,
@@ -3438,7 +3585,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `Pull request ${ref.slug}#${ref.number} is behind its target and this repository did not accept it into a native merge queue. Repair the branch against the newest target and revalidate the exact resulting head.`,
-              repair: { kind: 'base-moved', preserveAuthorization: true },
+              repair: { kind: 'base-moved', preserveAuthorization: true,
+                ...(repairFingerprint('base-moved') ? { fingerprint: repairFingerprint('base-moved') } : {}) },
             };
           }
           if (readiness && ['PENDING', 'EXPECTED'].includes(readiness.checks ?? '')) {
@@ -3485,7 +3633,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return {
               status: 'needs-revision', prs: current, actorUserId,
               detail: `The target moved before GitHub could land exact head ${ref.headSha} for ${ref.slug}#${ref.number}: ${advanced.message}`,
-              repair: { kind: 'base-moved', preserveAuthorization: true },
+              repair: { kind: 'base-moved', preserveAuthorization: true,
+                ...(repairFingerprint('base-moved', advanced.message) ? { fingerprint: repairFingerprint('base-moved', advanced.message) } : {}) },
             };
           }
           return {
