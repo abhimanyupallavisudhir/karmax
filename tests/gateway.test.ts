@@ -116,6 +116,33 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(overridden.effective.endpoint).toBe('https://openrouter.ai/api/v1/chat/completions');
   });
 
+  it('returns an explanation source that aged out of the bounded conversation window', async () => {
+    const project = h.store.createProject('Explanation source recovery');
+    const task = h.store.createTask({
+      projectId: project.id,
+      title: 'Long-running conversation',
+      workflow: 'software-dev',
+      workflowVersion: '1.0.0',
+      params: { prompt: 'Explain the old response', draft: true },
+    });
+    const sourceSeq = h.store.appendEvent({ taskId: task.id, type: 'agent.activity', ts: 10, payload: {
+      role: 'do', turnId: 'turn-old', attempt: 1, id: 'reply-old', kind: 'message', phase: 'completed', title: 'Old response',
+    } });
+    h.store.appendEvent({ taskId: task.id, type: 'conversation.explanation', ts: 20, payload: {
+      role: 'do', sourceKey: `activity:${sourceSeq}`, text: 'Plain-language version',
+    } });
+
+    const response = await fetch(`${base}/api/tasks/${task.id}/explanations`, { headers: auth() });
+    expect(response.status).toBe(200);
+    const explanations = await response.json() as any[];
+    expect(explanations[0]).toMatchObject({
+      payload: {
+        sourceKey: `activity:${sourceSeq}`,
+        sourceEvent: { seq: sourceSeq, type: 'agent.activity', payload: { id: 'reply-old', title: 'Old response' } },
+      },
+    });
+  });
+
   it('serves brand assets resolved against the instance-wide icon setting', async () => {
     const asset = (p: string) => fetch(`${base}${p}`); // deliberately unauthenticated: the sign-in screen needs these
     const bytes = async (p: string) => Buffer.from(await (await asset(p)).arrayBuffer());

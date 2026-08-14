@@ -77,6 +77,13 @@ ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
 ok(!html.includes('need not text-match'), 'the linked workflow transcript copy is suppressed by provider identity');
 ok(html.includes('Explain this with gemini-3.6-flash'), 'agent messages offer the effective explanation model');
+const eventOrder = S.taskEvents;
+S.taskEvents = [...eventOrder].reverse();
+const shuffled = conversationEntries(transcript);
+ok(shuffled.filter((entry) => entry.activity?.id === 'cmd').length === 1
+  && shuffled.find((entry) => entry.activity?.id === 'cmd')?.activity.phase === 'completed',
+  'provider updates fold by durable sequence even when fetch and websocket events arrive out of array order');
+S.taskEvents = eventOrder;
 const legacyEntries = conversationEntries({ role: 'do', messages: [
   { id: 'legacy-a1', role: 'agent', text: 'All done', ts: 2 },
 ] });
@@ -114,6 +121,30 @@ const explained = conversationEntries(transcript);
 const sourceIndex = explained.findIndex((entry) => entry.sourceKey === 'activity:4');
 ok(explained[sourceIndex + 1]?.type === 'explanation', 'a durable explanation renders directly after its source message');
 ok(renderConversationEntry(explained[sourceIndex + 1]).includes('Explanation'), 'the annotation is visibly labelled Explanation');
+
+// Explanations are loaded independently from the bounded activity window. The
+// API includes the old source event so its annotation does not fall to the end
+// of a long conversation after that provider item ages out.
+const fullEvents = S.taskEvents;
+const sourceEvent = fullEvents.find((event) => event.seq === 4);
+S.taskEvents = [{ seq: 9, ts: 1710000009000, type: 'conversation.explanation', payload: {
+  role: 'do', sourceKey: 'activity:4', text: 'Recovered explanation', sourceEvent,
+} }];
+const bounded = conversationEntries(transcript);
+const recoveredSource = bounded.findIndex((entry) => entry.activity?.id === 'reply');
+ok(recoveredSource >= 0 && bounded[recoveredSource + 1]?.explanation?.text === 'Recovered explanation',
+  'an explanation stays beneath a source activity recovered from outside the bounded event window');
+
+// A provider can publish another update for the same message after Explain was
+// clicked. Match by provider identity as well as the old event sequence.
+S.taskEvents.unshift({ seq: 8, ts: 1710000008000, type: 'agent.activity', payload: {
+  role: 'do', turnId: 'turn-1', attempt: 1, id: 'reply', kind: 'message', phase: 'completed', title: 'All done (final)',
+} });
+const updated = conversationEntries(transcript);
+const updatedSource = updated.findIndex((entry) => entry.activity?.id === 'reply');
+ok(updatedSource >= 0 && updated[updatedSource + 1]?.type === 'explanation',
+  'an explanation remains attached when its provider message receives a later update');
+S.taskEvents = fullEvents;
 
 // A follow-up accepted while the agent is still running is journaled before the
 // workflow republishes its transcript, so it must appear from the event alone.

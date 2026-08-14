@@ -3756,7 +3756,21 @@ export class Gateway {
         const taskId = explanationMatch[1]!;
         const task = store.getTask(taskId);
         if (!task) return this.json(res, 404, { error: 'task not found' });
-        if (method === 'GET') return this.json(res, 200, store.eventsOfType(taskId, 'conversation.explanation'));
+        if (method === 'GET') {
+          // Explanations are sparse and loaded outside the task page's bounded
+          // event window. Recover the original provider message with each older
+          // annotation so the browser can still place it directly beneath its
+          // source instead of treating it as an orphan at the end of the thread.
+          const explanations = store.eventsOfType(taskId, 'conversation.explanation').map((event) => {
+            if (event.payload?.sourceEvent || !String(event.payload?.sourceKey ?? '').startsWith('activity:')) return event;
+            const seq = Number(String(event.payload.sourceKey).slice('activity:'.length));
+            const sourceEvent = Number.isSafeInteger(seq) ? store.eventBySeq(taskId, seq) : undefined;
+            if (sourceEvent?.type !== 'agent.activity' || sourceEvent.payload?.role !== event.payload?.role
+              || sourceEvent.payload?.kind !== 'message') return event;
+            return { ...event, payload: { ...event.payload, sourceEvent } };
+          });
+          return this.json(res, 200, explanations);
+        }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
         requireInteractiveHuman(callerIdentity);
         const project = store.getProject(task.projectId);
@@ -3766,6 +3780,7 @@ export class Gateway {
         const sourceKey = typeof body.sourceKey === 'string' ? body.sourceKey.slice(0, 500) : '';
         const conversation = await api.taskConversation(token, taskId, role);
         let message: string | undefined;
+        let sourceEvent: ReturnType<typeof store.eventBySeq>;
         let userContext: string[] = [];
         if (sourceKey.startsWith('message:')) {
           const id = sourceKey.slice('message:'.length);
@@ -3781,6 +3796,7 @@ export class Gateway {
           const event = candidate?.type === 'agent.activity' && candidate.payload?.role === role
             && candidate.payload?.kind === 'message' ? candidate : undefined;
           if (event) {
+            sourceEvent = event;
             message = String(event.payload.title ?? '');
             userContext = conversation.messages.filter((item) => item.role === 'user'
               && (!Number(item.ts) || Number(item.ts) <= Number(event.ts))).map((item) => item.text);
@@ -3812,6 +3828,7 @@ export class Gateway {
           const explanation = await requestExplanation({ settings, apiKey, message, userContext });
           const event = { taskId, type: 'conversation.explanation', ts: Date.now(), payload: {
             role, sourceKey, text: explanation, provider, model: settings.model,
+            ...(sourceEvent ? { sourceEvent } : {}),
           } };
           const seq = this.emitTaskEvent(event);
           return this.json(res, 200, { ...event, seq });
