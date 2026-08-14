@@ -486,6 +486,21 @@ describe('GitHub App integration', () => {
         branch: 'main', headSha: 'merged-sha', originatingTaskId: task.id,
       }),
     })]);
+    const successfulCi = await deliver('workflow_run', 'workflow-ci-success', {
+      installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
+      workflow_run: { id: 702, name: 'CI', status: 'completed', conclusion: 'success',
+        head_branch: 'main', head_sha: 'validated-sha', html_url: 'https://github.com/acme/app/actions/runs/702' },
+    });
+    expect(successfulCi).toMatchObject({ accepted: true });
+    expect(store.kvEntries('github:deployment-expectation:')).toHaveLength(1);
+    // Presence, not completion, satisfies the expectation. A protected
+    // environment can leave a perfectly real deployment waiting for approval.
+    await deliver('workflow_run', 'workflow-deploy-waiting', {
+      installation: { id: 42 }, action: 'requested', repository: { id: 99, full_name: 'acme/app' },
+      workflow_run: { id: 703, name: 'Deploy', status: 'waiting', conclusion: null,
+        head_branch: 'main', head_sha: 'validated-sha' },
+    });
+    expect(store.kvEntries('github:deployment-expectation:')).toEqual([]);
     const featureFailure = await deliver('workflow_run', 'workflow-2', {
       installation: { id: 42 }, action: 'completed', repository: { id: 99, full_name: 'acme/app' },
       workflow_run: { id: 701, name: 'CI', conclusion: 'failure', head_branch: 'feature', head_sha: 'x' },

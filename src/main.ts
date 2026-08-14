@@ -30,6 +30,7 @@ import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
+import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
 import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
 import { StorageLocationService } from './store/storage-locations.js';
 import { WorldCheckpointService } from './world/checkpoint.js';
@@ -564,6 +565,7 @@ async function main() {
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
   const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
   gatewayPort = port;
+
   // Activities read this lazily when an agent invokes the complete platform API.
   // Keep service-to-service agent/MCP traffic on the control plane's loopback,
   // even when browsers use a public TLS URL through a reverse proxy.
@@ -573,6 +575,31 @@ async function main() {
   // receive transport/auth/browser-fill fixes without reconnecting or losing
   // user-defined MCP servers.
   configHomes.refreshManagedMcp(internalUrl);
+
+  // A successful CI webhook creates a durable CI→Deploy expectation. Polling is
+  // intentionally independent of webhook delivery: if GitHub rejects deploy.yml
+  // before creating a run, no deployment webhook exists to wake us. One sweep at
+  // boot makes crash/restart recovery immediate; the KV expectation and gateway
+  // incident claim make every repeat safe.
+  const deploymentMonitor = new GitHubDeploymentMonitor(store, githubApp);
+  let deploymentSweepRunning = false;
+  const reconcileDeployments = async () => {
+    if (deploymentSweepRunning) return;
+    deploymentSweepRunning = true;
+    try {
+      for (const finding of await deploymentMonitor.reconcile()) {
+        await gateway.dispatchGithubRecoveryEvents(finding.events);
+        deploymentMonitor.markReported(finding);
+      }
+    } catch (error) {
+      console.warn('  • GitHub deployment monitor failed:', error instanceof Error ? error.message : error);
+    } finally {
+      deploymentSweepRunning = false;
+    }
+  };
+  void reconcileDeployments();
+  const deploymentSweep = setInterval(() => { void reconcileDeployments(); }, RECONCILE_INTERVAL_MS);
+  deploymentSweep.unref();
 
   console.log(`\n  ✓ krmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
@@ -611,6 +638,7 @@ async function main() {
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     clearInterval(orphanSweep);
     clearInterval(reconcileSweep);
+    clearInterval(deploymentSweep);
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();

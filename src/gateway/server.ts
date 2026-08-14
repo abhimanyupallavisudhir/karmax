@@ -47,7 +47,7 @@ import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
-import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
+import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
@@ -618,6 +618,80 @@ export class Gateway {
     return { sid, session };
   }
 
+  /** Route both terminal GitHub runs and "no run was created" incidents through
+   * the same post-merge recovery-task rail. The durable incident claim is what
+   * makes webhook duplicates, monitor polls, and crash retries converge. */
+  async dispatchGithubRecoveryEvents(events: GithubProjectWebhookEvent[]): Promise<number> {
+    let recoveries = 0;
+    for (const event of events) {
+      // Preserve the historical run-id key exactly so an upgrade cannot turn a
+      // GitHub redelivery for an already-recovered run into a second task.
+      const incident = event.payload.incidentKey ?? String(event.payload.runId);
+      const key = `github:workflow-recovery:${event.projectId}:${event.payload.repositoryId}:${incident}`;
+      const incidentLine = `Recovery incident: ${key}`;
+      const previous = this.deps.store.kvGet(key);
+      if (previous?.startsWith('task_')) continue;
+      // A process may have died after the claim but before task creation.
+      // Reclaim an abandoned marker; fresh markers serialize concurrent
+      // workflow_run/check_run deliveries and monitor sweeps.
+      if (previous?.startsWith('pending:')) {
+        const claimedAt = Number(previous.slice('pending:'.length));
+        if (Number.isFinite(claimedAt) && Date.now() - claimedAt < 10 * 60_000) continue;
+        // createTask persists before starting the workflow. If the process died
+        // after that insert but before replacing `pending`, adopt the task by its
+        // durable incident line instead of creating a second recovery on restart.
+        const existing = this.deps.store.listTasks(event.projectId).find((task) =>
+          String(task.params?.prompt ?? '').includes(incidentLine));
+        if (existing) { this.deps.store.kvSet(key, existing.id); continue; }
+        this.deps.store.kvDelete(key);
+      }
+      if (!this.deps.store.kvClaim(key, `pending:${Date.now()}`)) continue;
+      try {
+        const project = this.deps.store.getProject(event.projectId);
+        if (!project) { this.deps.store.kvDelete(key); continue; }
+        const origin = event.payload.originatingTaskId
+          ? `\nOriginating task: ${event.payload.originatingTaskId}` : '';
+        const missing = event.payload.source === 'deployment_monitor';
+        const evidence = event.payload.evidence
+          ? `\n\nDurable monitor evidence:\n${JSON.stringify(event.payload.evidence, null, 2)}` : '';
+        const token = this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
+          event.projectId, 10 * 60_000, project.organizationId).token;
+        const task = await this.deps.api.createTask(token, {
+          projectId: event.projectId,
+          title: `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`,
+          prompt: [
+            missing
+              ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
+              : `A post-merge GitHub workflow failed for ${event.payload.repository}.`,
+            `Workflow: ${event.payload.workflow}`,
+            `Conclusion: ${event.payload.conclusion}`,
+            `Exact revision: ${event.payload.headSha || 'not reported'}`,
+            missing
+              ? `Successful prerequisite run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`
+              : `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`,
+            incidentLine,
+            evidence,
+            '',
+            'Inspect the complete GitHub evidence and classify it before changing code. For a missing run, check workflow schema/registration and triggers first; the evidence distinguishes direct API absence from webhook delay and records file/API permission failures. If a run exists, distinguish queued/waiting environment approval from a terminal failure. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
+          ].join('\n'),
+        });
+        this.deps.store.kvSet(key, task.id);
+        this.emitTaskEvent({ taskId: task.id, type: event.type, ts: Date.now(), payload: event.payload });
+        recoveries++;
+      } catch (error) {
+        // The API compensates ordinary start failures, but if it threw after the
+        // durable task insert survived, retain/adopt that task just like the
+        // restart path above instead of deleting the only idempotency record.
+        const existing = this.deps.store.listTasks(event.projectId).find((task) =>
+          String(task.params?.prompt ?? '').includes(incidentLine));
+        if (existing) { this.deps.store.kvSet(key, existing.id); continue; }
+        this.deps.store.kvDelete(key);
+        throw error;
+      }
+    }
+    return recoveries;
+  }
+
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
@@ -1012,47 +1086,7 @@ export class Gateway {
         }
         let recoveries = 0;
         try {
-          for (const event of projectEvents ?? []) {
-            const key = `github:workflow-recovery:${event.projectId}:${event.payload.repositoryId}:${event.payload.runId}`;
-            const previous = this.deps.store.kvGet(key);
-            if (previous?.startsWith('task_')) continue;
-            // A process may have died after the claim but before task creation.
-            // Reclaim an abandoned marker; fresh markers still serialize a
-            // concurrent workflow_run/check_run pair for the same Actions run.
-            if (previous?.startsWith('pending:')) {
-              const claimedAt = Number(previous.slice('pending:'.length));
-              if (Number.isFinite(claimedAt) && Date.now() - claimedAt < 10 * 60_000) continue;
-              this.deps.store.kvDelete(key);
-            }
-            if (!this.deps.store.kvClaim(key, `pending:${Date.now()}`)) continue;
-            try {
-              const project = this.deps.store.getProject(event.projectId);
-              if (!project) { this.deps.store.kvDelete(key); continue; }
-              const source = event.payload.originatingTaskId
-                ? `\nOriginating task: ${event.payload.originatingTaskId}` : '';
-              const token = this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
-                event.projectId, 10 * 60_000, project.organizationId).token;
-              const task = await this.deps.api.createTask(token, {
-                projectId: event.projectId,
-                title: `Repair failed GitHub workflow: ${event.payload.workflow}`,
-                prompt: [
-                  `A post-merge GitHub workflow failed for ${event.payload.repository}.`,
-                  `Workflow: ${event.payload.workflow}`,
-                  `Conclusion: ${event.payload.conclusion}`,
-                  `Exact revision: ${event.payload.headSha || 'not reported'}`,
-                  `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${source}`,
-                  '',
-                  'Inspect the complete failed run and classify it before changing code. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
-                ].join('\n'),
-              });
-              this.deps.store.kvSet(key, task.id);
-              this.emitTaskEvent({ taskId: task.id, type: event.type, ts: Date.now(), payload: event.payload });
-              recoveries++;
-            } catch (error) {
-              this.deps.store.kvDelete(key);
-              throw error;
-            }
-          }
+          recoveries = await this.dispatchGithubRecoveryEvents(projectEvents ?? []);
         } catch (error) {
           // handleWebhook already claimed this delivery. Release it when the
           // downstream task dispatch fails so GitHub's redelivery can finish

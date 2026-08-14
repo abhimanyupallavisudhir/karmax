@@ -6,12 +6,20 @@ import { parse } from 'yaml';
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
+const ciSource = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
 const workflow = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'deploy.yml'), 'utf8'));
 const deploy = workflow.jobs.deploy;
 const script: string = JSON.stringify(deploy.steps);
 const operator = fs.readFileSync(path.join(repoRoot, 'deploy', 'karmax'), 'utf8');
 
 describe('post-push deployment to the public instance', () => {
+  it('schema-validates every workflow with a version-and-checksum-pinned actionlint', () => {
+    expect(ciSource).toContain("ACTIONLINT_VERSION: '1.7.12'");
+    expect(ciSource).toContain('ACTIONLINT_LINUX_AMD64_SHA256');
+    expect(ciSource).toContain('Validate every repository workflow');
+    expect(ciSource).toContain('unexpected key "queue"');
+  });
+
   it('exists, so a landed commit reaches the VPS without anyone SSHing in by hand', () => {
     expect(deploy).toBeDefined();
     expect(script).toContain('deploy/.karmax-update update');
