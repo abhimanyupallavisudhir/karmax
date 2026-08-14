@@ -47,7 +47,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       expect.arrayContaining([
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
-        'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action',
+        'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent', 'request_agent_action', 'cancel_agent_action',
         'escalate_to_human', 'request_permission',
         'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource', 'describe_platform', 'platform_request', 'list_world_providers',
         'list_github_actions_runs', 'inspect_github_actions_run', 'manage_github_actions_run', 'dispatch_github_actions_workflow',

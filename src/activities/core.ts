@@ -385,6 +385,27 @@ export interface PrepareChildArgs {
   parentGrant?: string[];
 }
 
+/** Recover the exact remote heads this task last observed. Integration repair
+ * may replace the in-memory view while retaining the durable PR history; a
+ * force-with-lease must use that history rather than fall back to an unsafe
+ * ordinary push that can never publish a rebased task-owned branch. */
+export function expectedTaskRemoteHeads(store: Store, taskId: string): Record<string, string> {
+  const expected: Record<string, string> = {};
+  const observations = [
+    ...store.eventsOfType(taskId, 'pr.opened'),
+    ...store.eventsOfType(taskId, 'pr.updated'),
+  ].sort((a, b) => a.seq - b.seq);
+  for (const event of observations) {
+    const repo = typeof event.payload?.repo === 'string' ? event.payload.repo : '';
+    const headSha = typeof event.payload?.headSha === 'string' ? event.payload.headSha : '';
+    if (repo && /^[0-9a-f]{40}$/i.test(headSha)) expected[repo] = headSha;
+  }
+  for (const candidate of store.getTask(taskId)?.lastView?.prs ?? []) {
+    if (candidate.headSha && !expected[candidate.repo]) expected[candidate.repo] = candidate.headSha;
+  }
+  return expected;
+}
+
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
@@ -737,10 +758,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     env: Record<string, string>,
     repos: ReturnType<typeof worldRepos>,
   ) {
-    const priorPrs = store.getTask(handle.id)?.lastView?.prs ?? [];
-    const expectedRemoteHeads = Object.fromEntries(priorPrs
-      .filter((candidate) => candidate.headSha)
-      .map((candidate) => [candidate.repo, candidate.headSha!]));
+    const expectedRemoteHeads = expectedTaskRemoteHeads(store, handle.id);
     if (isRemote(handle.kind))
       return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos, expectedRemoteHeads);
     const pushed: string[] = [];
@@ -2820,6 +2838,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           return repeated;
         };
         const decisions: Array<ReturnType<typeof terminalObservation>> = [];
+        const inspectionFailures: Array<{ runId: number; error: unknown }> = [];
         const followed: Array<{ key: string; run: { id: number; attempt: number; status: string; conclusion?: string } }> = [];
         const satisfied: Array<{ key: string; run: { id: number; attempt: number; status: string; conclusion?: string } }> = [];
         const satisfiedRunIds = new Set<number>();
@@ -2905,6 +2924,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 reconciliation.key,
               ));
             } catch (error) {
+              inspectionFailures.push({ runId, error });
               actionReconciliationFailed = true;
               record(handle.id, 'github.ci.inspection-failed', {
                 ...ref, runId, detail: error instanceof Error ? error.message : String(error),
@@ -2931,6 +2951,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             status: 'waiting', prs: current, actorUserId,
             detail: 'A current GitHub Actions run was cancelled with no replacement yet visible. Karmax is performing bounded exact-head reconciliation before classification or rerun.',
           };
+          const permissionFailure = inspectionFailures.find(({ error }) =>
+            error instanceof GithubActionsApiError && [401, 403].includes(error.status));
+          if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `${summary}\n\nKrmax cannot inspect the replacement workflow run. Grant the GitHub App Actions: read and write permission and approve the updated installation permissions, then retry.`,
+            eligibleUserIds: [actorUserId],
+          };
           if (actionReconciliationFailed && runIds.length) return {
             status: 'retryable-error', prs: current, actorUserId,
             detail: `${summary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
@@ -2938,7 +2965,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const providerFailure = classifyGithubActionsDiagnostic(summary);
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\nGitHub did not expose an Actions run id that krmax can safely rerun. Resolve the provider/account condition on GitHub, then retry.`,
+            detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure === 'superseded') {

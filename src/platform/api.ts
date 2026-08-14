@@ -510,6 +510,25 @@ export class KarmaxApi {
     return this.deps.store.getCollaborationRequest(request.id) ?? request;
   }
 
+  /** Withdraw one background collaboration owned by the calling task. A
+   * requester must be able to abandon work that can no longer complete (for
+   * example, when the target is escalated), otherwise its Do-stage join is a
+   * permanent circular dependency. */
+  async cancelAgentAction(token: string, requestId: string): Promise<CollaborationRequest> {
+    const requester = this.collaborationCaller(token);
+    const request = this.deps.store.getCollaborationRequest(requestId);
+    if (!request || request.requesterTaskId !== requester.id)
+      throw new Error('collaboration request not found for the calling task');
+    if (request.status !== 'pending') return request;
+
+    const settled = this.deps.store.settleCollaborationRequest(request.id, 'failed', {
+      reason: 'request withdrawn by the requesting task',
+    });
+    if (!settled) return this.deps.store.getCollaborationRequest(request.id) ?? request;
+    await this.notifyCollaborationRequest(settled);
+    return this.deps.store.getCollaborationRequest(request.id) ?? settled;
+  }
+
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
     const message: Message = { id: `u${now}`, role: 'user', text, ts: now };

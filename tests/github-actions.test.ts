@@ -37,8 +37,15 @@ describe('GitHub Actions API', () => {
   it('classifies code, transient, account/configuration, and post-merge failures by owner', () => {
     expect(classifyGithubActionsFailure(inspection('AssertionError: expected 2 to equal 3')).disposition).toBe('revision');
     expect(classifyGithubActionsFailure(inspection('The hosted runner lost communication with the server')).disposition).toBe('retry');
+    expect(classifyGithubActionsFailure(inspection(
+      'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
+      { conclusion: 'cancelled' },
+    )).disposition).toBe('superseded');
     expect(classifyGithubActionsFailure(inspection('The job was not started because recent account payments have failed or your spending limit needs to be increased')).disposition).toBe('human');
     expect(classifyGithubActionsDiagnostic('Workflow did not start because your spending limit needs to be increased')).toBe('human');
+    expect(classifyGithubActionsDiagnostic(
+      'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
+    )).toBe('superseded');
     expect(classifyGithubActionsDiagnostic('AssertionError: expected 2 to equal 3')).toBeUndefined();
     const deployment = classifyGithubActionsFailure(inspection('backup contains a symbolic link', {
       name: 'Deploy', event: 'workflow_run', branch: 'master',

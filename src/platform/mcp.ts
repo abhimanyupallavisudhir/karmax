@@ -48,6 +48,7 @@ export interface PlatformOps {
   escalateToHuman(a: { audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
+  cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
   readWiki(scope: 'organization' | 'project', id: string, path?: string): Promise<unknown>;
@@ -115,6 +116,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
     requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
+    cancelAgentAction: (requestId) => api.cancelAgentAction(getToken(), requestId),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
     readWiki: async (scope, id, path) => api.readWikiResolved(getToken(), scope, id, path ?? ''),
@@ -205,6 +207,9 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
     requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
+    cancelAgentAction: (requestId) => req(`/api/agent/collaboration/${encodeURIComponent(requestId)}/cancel`, {
+      method: 'POST', body: '{}',
+    }),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
     readWiki: (scope, id, path) => req(`/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/wiki?path=${encodeURIComponent(path ?? '')}`),
@@ -466,6 +471,14 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       },
     },
     async (a) => wrap(() => ops.requestAgentAction(a)),
+  );
+  server.registerTool(
+    'cancel_agent_action',
+    {
+      description: 'Withdraw one pending background collaboration requested by this task. Use this when the target is blocked or its result is no longer needed; the target task itself is not cancelled.',
+      inputSchema: { requestId: z.string() },
+    },
+    async (a) => wrap(() => ops.cancelAgentAction(a.requestId)),
   );
   server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
   server.registerTool('list_github_actions_runs', {

@@ -240,6 +240,51 @@ describe('durable background collaboration requests', () => {
       call[0] === 'collaborationSettled' && call[1] === request.id)).toBe(true);
   });
 
+  it('lets the requester withdraw a collaboration without cancelling the target', async () => {
+    const f = fixture();
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+
+    const cancelled = await f.api.cancelAgentAction(f.token, request.id);
+
+    expect(cancelled).toMatchObject({ id: request.id, status: 'failed' });
+    expect(cancelled.result?.reason).toMatch(/withdrawn/);
+    expect(f.store.getTask(f.target.id)?.lastView?.status).not.toBe('cancelled');
+    await vi.waitFor(() => {
+      const call = (f.signals.get(f.requester.id) ?? [])
+        .find((item) => item[0] === 'collaborationSettled' && item[1] === request.id);
+      expect(call).toBeTruthy();
+    });
+  });
+
+  it('does not let another task withdraw a collaboration it does not own', async () => {
+    const f = fixture();
+    const request = await f.api.requestAgentAction(f.token, {
+      taskId: f.target.id,
+      action: 'publish_branch',
+    });
+    const other = f.store.createTask({
+      projectId: f.project.id,
+      title: 'Other requester',
+      workflow: 'software-dev',
+      workflowVersion: '1.3.0',
+      params: { prompt: 'Other' },
+    });
+    const token = f.tokens.mint({
+      taskId: other.id,
+      projectId: f.project.id,
+      organizationId: f.project.organizationId,
+      profileId: 'do',
+      principal: `task-agent:${other.id}:do`,
+      ceiling: ['task:conversation:message'],
+      grantorCaps: ['task:conversation:message'],
+    }).token;
+    await expect(f.api.cancelAgentAction(token, request.id)).rejects.toThrow(/not found/);
+    expect(f.store.getCollaborationRequest(request.id)?.status).toBe('pending');
+  });
+
   it('removes collaboration records with their project', () => {
     const f = fixture();
     f.store.createCollaborationRequest({
