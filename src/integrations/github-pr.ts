@@ -75,6 +75,9 @@ export interface GithubPullRequestReadiness {
   draft: boolean;
   merged: boolean;
   headSha: string;
+  /** Current target commit used to distinguish a repeated observation from a
+   * genuinely newer integration conflict. */
+  baseSha?: string;
   mergeable: GithubPullRequestMergeable;
   mergeStateStatus: GithubPullRequestMergeState;
   reviewDecision?: GithubPullRequestReviewDecision;
@@ -309,7 +312,7 @@ export class GithubPrApi {
     const query = (checkLevel: 'details' | 'aggregate' | 'none') => `query PullRequestReadiness($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          id url state isDraft merged headRefOid mergeable mergeStateStatus reviewDecision
+          id url state isDraft merged headRefOid baseRefOid mergeable mergeStateStatus reviewDecision
           ${checkLevel === 'none' ? '' : `statusCheckRollup {
             state
             ${checkLevel === 'details' ? `contexts(first: 50) {
@@ -400,6 +403,7 @@ export class GithubPrApi {
       draft: Boolean(raw.isDraft),
       merged: Boolean(raw.merged),
       headSha: String(raw.headRefOid),
+      ...(raw.baseRefOid ? { baseSha: String(raw.baseRefOid) } : {}),
       mergeable: raw.mergeable as GithubPullRequestMergeable,
       mergeStateStatus: raw.mergeStateStatus as GithubPullRequestMergeState,
       ...(raw.reviewDecision ? { reviewDecision: raw.reviewDecision as GithubPullRequestReviewDecision } : {}),
