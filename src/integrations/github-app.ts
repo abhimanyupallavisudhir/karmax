@@ -4,7 +4,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { Store } from '../store/db.js';
 import type { GitConnection, Repository } from '../domain/types.js';
-import { pullRequestWebhookEvent, reconcilePullRequestView, type GithubPrWebhookEvent } from './github-pr.js';
+import { githubPrWebhookObservationKey, pullRequestWebhookEvent, reconcilePullRequestView,
+  type GithubPrWebhookEvent } from './github-pr.js';
 import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
 import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
@@ -708,6 +709,12 @@ export class GitHubAppService {
       if (view) {
         const reconciled = reconcilePullRequestView(view, prEvent.payload);
         if (reconciled !== view) this.store.saveView(prEvent.taskId, reconciled);
+      }
+      const observation = githubPrWebhookObservationKey(prEvent);
+      if (observation) {
+        const digest = crypto.createHash('sha256').update(observation).digest('hex');
+        if (!this.store.kvClaim(`github:pr-observation:v1:${digest}`, prEvent.taskId))
+          return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       }
       return { accepted: true, events: [prEvent], ...(projectEvents.length ? { projectEvents } : {}) };
     }
