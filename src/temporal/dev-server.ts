@@ -66,6 +66,11 @@ interface PortTriple {
 }
 
 const HEALTH_TIMEOUT_MS = 6000;
+// Temporal CLI 1.7.2 can very occasionally lose an internal listener while a
+// test server is booting and panic before its gRPC port opens. A fresh
+// ephemeral server has no state to preserve, so retry that narrow startup-exit
+// case instead of failing an otherwise unrelated CI suite.
+const EPHEMERAL_START_ATTEMPTS = 3;
 
 const recordFile = (dbFilename: string) => path.join(path.dirname(dbFilename), 'dev-server.json');
 const logFilePath = (dbFilename: string) => path.join(path.dirname(dbFilename), 'dev-server.log');
@@ -386,7 +391,20 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
   }
 
   reapOrphanedEphemeralServers();
-  return spawnEphemeral(opts, namespace);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= EPHEMERAL_START_ATTEMPTS; attempt++) {
+    try {
+      return await spawnEphemeral(opts, namespace);
+    } catch (error) {
+      lastError = error;
+      // Do not hide configuration, spawn, or readiness-timeout failures. The
+      // retry is solely for a child that actually exited during startup.
+      if (!String(error).includes('temporal dev server exited')
+        || attempt === EPHEMERAL_START_ATTEMPTS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  throw lastError;
 }
 
 /**
