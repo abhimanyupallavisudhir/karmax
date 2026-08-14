@@ -1221,7 +1221,8 @@ export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | '
  * - `untilUsed`— editable in-flight until the workflow *consumes* it: the target
  *                branch until a PR opens / the merge enqueue; an auxiliary agent
  *                until that role's turn runs. Consumption points are workflow-specific.
- * - `always`   — editable at any time (reserved; unused in v1).
+ * - `always`   — editable until the point of no return (for values consulted
+ *                repeatedly, such as agent tuning and ordinary-input routing).
  * An `untilUsed`/`always` field is only truly live if the workflow actually
  * re-reads it at consumption time; declaring it without re-reading it is a bug.
  */

@@ -24,6 +24,7 @@ import {
   softwareDevV1_22,
   softwareDevV1_23,
   softwareDevV1_24,
+  softwareDevV1_25,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -155,6 +156,11 @@ export async function goalV1_23(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** Configurable single-stage Responder for ordinary input pauses. */
 export async function goalV1_24(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_24({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Live ordinary-input rerouting through the task's reversible lifetime. */
+export async function goalV1_25(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_25({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

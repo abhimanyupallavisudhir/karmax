@@ -165,6 +165,7 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
         type: 'responder', bind: 'responder', role: 'responder',
         scopes: ['task', 'project', 'global'],
         default: { kind: 'human', audience: ['@creator'] },
+        mutable: 'always',
       });
     }
   });

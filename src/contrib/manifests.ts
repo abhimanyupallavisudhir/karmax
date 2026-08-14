@@ -51,6 +51,10 @@ const responderField = (): FieldSpec => ({
   help: 'Who answers when the working agent pauses at Waiting for input. Choose a person/team or an agent. Review and protected authorization gates keep their own routes.',
   scopes: ALL, bind: 'responder', role: 'responder',
   default: { kind: 'human', audience: ['@creator'] }, promptDefault: RESPOND_PROMPT_DEFAULT,
+  // A task can ask for ordinary input more than once, so there is no first-use
+  // point after which this route becomes load-bearing forever. Keep it live until
+  // the workflow's point of no return; an edit also reroutes a pause already open.
+  mutable: 'always',
 });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
@@ -399,7 +403,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.24.0',
+    version: '1.25.0',
     description: 'World → do/wait → review → optional per-PR provider/external landing or canonical Karmax fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -506,7 +510,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.24.0',
+    version: '1.25.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],

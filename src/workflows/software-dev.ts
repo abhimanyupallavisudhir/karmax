@@ -391,13 +391,18 @@ export async function softwareDevV1_24(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.24.0');
 }
 
+/** The Responder remains editable and can reroute an already-open input pause. */
+export async function softwareDevV1_25(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.25.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -540,6 +545,7 @@ async function softwareDevImpl(
   const interlocksLandingTransitions = minor >= 22;
   const githubAuthoritativeCancellation = minor >= 23;
   const routedInputResponder = minor >= 24;
+  const mutableInputResponder = minor >= 25;
   const configuredLandingAuthority = landingAuthorityOf(input.project);
   // The exact-candidate check belongs to the agent that authored and repaired
   // the proposal. Re-enter its Do conversation so it retains both context and
@@ -711,6 +717,11 @@ async function softwareDevImpl(
   // gate replays from its first layer rather than crediting layers approved under
   // the old route.
   let confirmEpoch = 0;
+  // Unlike Review, ordinary input can recur after the route has already been
+  // used. The current route is therefore live for the whole reversible lifetime.
+  // The epoch wakes a human pause so an accepted edit reroutes that same question.
+  let liveResponder = input.responder;
+  let responderEpoch = 0;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, {
     accountId: string;
@@ -827,6 +838,11 @@ async function softwareDevImpl(
       // asserts that (assertHumanRoutes) before it sends the update.
       if (name === 'confirm' && (!patch.confirm || typeof patch.confirm !== 'object'))
         throw ApplicationFailure.nonRetryable('the Review route must be a confirm config', 'ParamLocked', name);
+      if (name === 'responder') {
+        const route = patch.responder as ResponderConfig | undefined;
+        if (!route || typeof route !== 'object' || (route.kind !== 'human' && route.kind !== 'agent'))
+          throw ApplicationFailure.nonRetryable('the Responder must be a human or agent route', 'ParamLocked', name);
+      }
     }
   }
   /** Apply an already-validated patch to live state. `target` is re-read at PR/merge;
@@ -842,6 +858,11 @@ async function softwareDevImpl(
       softwareDevConfirmLayers = confirmLayersOf(patch.confirm as ConfirmConfig);
       confirmEpoch++;
       applied.push('confirm');
+    }
+    if (mutableInputResponder && patch.responder && typeof patch.responder === 'object') {
+      liveResponder = patch.responder as ResponderConfig;
+      responderEpoch++;
+      applied.push('responder');
     }
     for (const name of Object.keys(patch)) {
       const role = agentRoleOf(name);
@@ -2715,37 +2736,60 @@ Inspect the complete current diff and specifically compare its delta from the re
             waitingFor = { kind: 'parent', detail: 'Waiting for the managing agent to open the PR' };
             await notifyParent(turn.raise?.type ?? 'needs_confirmation',
               turn.raise?.detail ?? 'The Do turn ended. Open the PR only if the requested work is truly complete; otherwise send a comment.');
-          } else if (routedInputResponder && input.responder?.kind === 'agent') {
-            waitingFor = { kind: 'responder', detail: question };
             await publish();
-            const answer = await responderTurn(input.responder, question);
-            waitingFor = undefined;
-            if (cancelled) return await abort();
-            if (answer) {
-              msgs.push({
-                id: `responder-${msgs.length}`,
-                role: 'user',
-                text: `Responder: ${answer}`,
-                ts: msgs.length,
-              });
+            await condition(() => prRequested || cancelled || msgs.length > seen);
+          } else {
+            let answered = false;
+            // An accepted Responder edit invalidates the route currently parked
+            // on this question. Replay only this routing decision—not the Do turn—
+            // so switching human ↔ agent (or changing audience) takes effect now.
+            while (!prRequested && !cancelled && msgs.length <= seen) {
+              const routeEpoch = responderEpoch;
+              const route = liveResponder;
+              if (routedInputResponder && route?.kind === 'agent') {
+                waitingFor = { kind: 'responder', detail: question };
+                await publish();
+                const answer = await responderTurn(route, question);
+                waitingFor = undefined;
+                if (cancelled) return await abort();
+                // An edit may land while the responder's model turn is running.
+                // Its stale answer must not win over the newly selected route.
+                if (mutableInputResponder && responderEpoch !== routeEpoch) continue;
+                if (answer) {
+                  msgs.push({
+                    id: `responder-${msgs.length}`,
+                    role: 'user',
+                    text: `Responder: ${answer}`,
+                    ts: msgs.length,
+                  });
+                  answered = true;
+                  break;
+                }
+                // A responder outage must not strand the task in an invisible loop.
+                // Fall back to its creator, like a failed Confirm-agent turn.
+                waitingFor = { kind: 'human', audience: ['@creator'], detail: question };
+              } else {
+                waitingFor = {
+                  kind: 'human',
+                  audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
+                    ? route.audience
+                    : ['@creator'],
+                  detail: question,
+                };
+              }
+              await publish();
+              await condition(() => prRequested || cancelled || msgs.length > seen
+                || (mutableInputResponder && responderEpoch !== routeEpoch));
+              waitingFor = undefined;
+              if (mutableInputResponder && responderEpoch !== routeEpoch) continue;
+              break;
+            }
+            if (answered) {
               stage = 'do';
               status = 'active';
               continue;
             }
-            // A responder outage must not strand the task in an invisible loop.
-            // Fall back to its creator, like a failed Confirm-agent turn.
-            waitingFor = { kind: 'human', audience: ['@creator'], detail: question };
-          } else {
-            waitingFor = {
-              kind: 'human',
-              audience: routedInputResponder && input.responder?.kind === 'human' && input.responder.audience?.length
-                ? input.responder.audience
-                : ['@creator'],
-              detail: question,
-            };
           }
-          await publish();
-          await condition(() => prRequested || cancelled || msgs.length > seen);
           waitingFor = undefined;
           if (cancelled) return await abort();
           if (!prRequested) {
