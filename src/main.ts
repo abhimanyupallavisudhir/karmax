@@ -284,6 +284,12 @@ async function main() {
   // own issuer. Registered before Stripe Issuing, which needs a business account.
   paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
+  // Hosted-plan billing is deliberately a different provider and ledger from
+  // the agent card registry above. Self-hosted installs construct the service so
+  // status calls can report "unmetered", but it never contacts Stripe there.
+  const { StripeSubscriptionProvider, SubscriptionBillingService } = await import('./billing/subscriptions.js');
+  const subscriptionBilling = new SubscriptionBillingService(store,
+    new StripeSubscriptionProvider(process.env, fetch), deployment.hosted);
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
   const configHomes = new ConfigHomeManager();
@@ -354,6 +360,32 @@ async function main() {
   sweepRetention();
   const retentionTimer = setInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
+
+  // Re-derive effective plans from the last signed provider state at boot and
+  // throughout the process lifetime. In particular, this closes past-due grace
+  // even when Stripe sends no later event.
+  const reconcileSubscriptionEntitlements = () => {
+    try { subscriptionBilling.reconcileEntitlements(); }
+    catch (error) {
+      console.warn('  • Subscription entitlement reconciliation failed:',
+        error instanceof Error ? error.message : String(error));
+    }
+  };
+  reconcileSubscriptionEntitlements();
+  const subscriptionEntitlementTimer = setInterval(reconcileSubscriptionEntitlements, 60_000);
+  subscriptionEntitlementTimer.unref();
+
+  // Membership hooks submit seat changes immediately; this bounded sweep makes
+  // provider quantity reconciliation eventual after an outage or process crash.
+  const syncSubscriptionSeats = () => {
+    for (const organization of store.listOrganizations())
+      void subscriptionBilling.syncSeats(organization.id).catch((error) =>
+        console.warn(`  • Subscription seat sync failed for ${organization.id}:`,
+          error instanceof Error ? error.message : String(error)));
+  };
+  syncSubscriptionSeats();
+  const subscriptionSeatTimer = setInterval(syncSubscriptionSeats, 5 * 60_000);
+  subscriptionSeatTimer.unref();
 
   // Repair coordinator singletons whose history this build can no longer replay.
   // Runs before task reconciliation so a merge queue that self-heals here is
@@ -564,6 +596,7 @@ async function main() {
     worldAccess,
     objects: objectStore,
     resources,
+    subscriptions: subscriptionBilling,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,

@@ -208,6 +208,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/projects/:projectId/wiki/refs (filterable branch/task views; pass taskId= or branch= to reads)',
   ],
   payments: [
+    'GET /api/organizations/:organizationId/subscription/status (hosted SaaS plan and verified seat/payment state; self-hosted reports unmetered)',
+    'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (hosted SaaS billing; mutation calls require Idempotency-Key)',
     'GET /api/organizations/:organizationId/payments/providers',
     'POST /api/organizations/:organizationId/payments/connect',
     'DELETE /api/organizations/:organizationId/payments/connections/:provider',
