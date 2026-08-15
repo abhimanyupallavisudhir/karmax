@@ -47,6 +47,7 @@ import {
   GithubActionsApiError,
   classifyGithubActionsDiagnostic,
   classifyGithubActionsFailure,
+  githubActionsHumanWaitReason,
   githubActionsRunIdFromUrl,
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
@@ -1822,6 +1823,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           status: next.status,
           waitingFor: next.waitingFor?.kind ?? null,
           waitingDetail: next.waitingFor?.detail ?? null,
+          waitingSummary: next.waitingFor?.summary ?? null,
           waitingProvider: next.waitingFor?.provider ?? null,
           waitingResetAt: next.waitingFor?.earliestResetAt ?? null,
           agentTurn: next.agentTurn?.state ?? null,
@@ -2957,7 +2959,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
               const checkContext = check ? `${check.name}: ${check.state}\n${check.detail ?? ''}` : '';
               decisions.push(terminalObservation(
-                classifyGithubActionsFailure(inspected, { additionalContext: checkContext }),
+                classifyGithubActionsFailure(inspected, { providerContext: checkContext }),
                 reconciliation.key,
               ));
             } catch (error) {
@@ -2992,6 +2994,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
             detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
+            waitReason: githubActionsHumanWaitReason(summary),
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure === 'superseded') {
@@ -3039,6 +3042,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
           status: 'needs-human', prs: current, actorUserId, detail,
+          waitReason: human.decision.waitReason,
           eligibleUserIds: [actorUserId],
         };
         const revision = decisions.find(({ decision }) => decision.disposition === 'revision');
@@ -4185,6 +4189,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         status: view.status,
         waitingFor: view.waitingFor?.kind ?? null,
         waitingDetail: view.waitingFor?.detail ?? null,
+        waitingSummary: view.waitingFor?.summary ?? null,
         waitingProvider: view.waitingFor?.provider ?? null,
         waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
         agentTurn: view.agentTurn?.state ?? null,

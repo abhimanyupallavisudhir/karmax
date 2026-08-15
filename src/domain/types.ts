@@ -799,6 +799,9 @@ export interface GitHubMergeAuthorization {
   actorUserId?: string;
   sha?: string;
   detail?: string;
+  /** Concise provider-owned wait reason for task summaries. Detailed evidence
+   * remains in `detail`. */
+  waitReason?: string;
   /** Project members whose live GitHub role currently permits a merge request. */
   eligibleUserIds?: string[];
   /** Why landing returned to Do, and whether the already-recorded intent
@@ -1464,7 +1467,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;

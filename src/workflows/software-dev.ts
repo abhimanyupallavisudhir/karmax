@@ -3570,6 +3570,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           : '';
         waitingFor = {
           kind: 'human', audience,
+          ...(decision.waitReason ? { summary: decision.waitReason } : {}),
           detail: `${decision.detail ?? (decision.status === 'needs-authorizer'
             ? 'A connected human with GitHub merge access must confirm this merge.'
             : 'The pull request needs human attention on GitHub.')}${exhausted}`,
