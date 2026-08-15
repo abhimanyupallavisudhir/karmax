@@ -96,6 +96,7 @@ export interface GatewayDeps {
   worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
   resources?: import('../world/resources.js').ProjectResourceService;
+  subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -143,6 +144,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/usage-policy/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats)$/.test(p))
+    return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -197,6 +201,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
+  if (p === '/api/subscriptions/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
@@ -1054,6 +1059,20 @@ export class Gateway {
         return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
     }
+    // SaaS subscription billing has its own secret, provider, and ledger. Keep
+    // this pre-auth raw-body route separate from the Stripe Issuing webhook
+    // above so customer subscription events can never authorize agent spend.
+    if (p === '/api/subscriptions/webhook' && method === 'POST') {
+      try {
+        if (!this.deps.subscriptions) return this.json(res, 503, { error: 'subscription billing is unavailable' });
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const result = this.deps.subscriptions.handleWebhook(raw,
+          typeof req.headers['stripe-signature'] === 'string' ? req.headers['stripe-signature'] : undefined);
+        return this.json(res, 200, { received: true, ...result });
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     if (p === '/api/payments/stripe/callback' && method === 'GET') {
       const code = url.searchParams.get('code') ?? '';
       const state = url.searchParams.get('state') ?? '';
@@ -1556,9 +1575,13 @@ export class Gateway {
         if (!session.email) return this.json(res, 400, { error: 'a verified account is required' });
         const b = await this.body(req);
         try {
-          const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), subject.userId, session.email);
+          const invitationToken = String(b.token ?? '');
+          const invited = store.organizationInvitationForToken(invitationToken);
+          const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, session.email);
           this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
+          void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
+            console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
           return this.json(res, 200, membership);
         } catch (e) {
           // Expired / already-used / wrong-email are user-facing, not 500s.
@@ -1593,6 +1616,53 @@ export class Gateway {
           activeAgentRuns,
           queuedAgentRuns,
         });
+      }
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats)$/);
+      if (subscription) {
+        const organizationId = subscription[1]!;
+        const action = subscription[2]!;
+        if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
+        const billing = this.deps.subscriptions;
+        if (!billing) return this.json(res, 503, { error: 'subscription billing is unavailable' });
+        if (action === 'status') {
+          if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+          const interactiveUserId = callerIdentity.actor.kind === 'interactive-human'
+            ? callerIdentity.humanSubject?.userId : undefined;
+          const canManage = Boolean(interactiveUserId
+            && store.organizationMembership(organizationId, interactiveUserId)?.role === 'owner');
+          return this.json(res, 200, { ...billing.current(organizationId), canManage });
+        }
+        if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        // Agent-card administration is delegable through payment:write. Paying
+        // for the SaaS itself is not: require live browser presence and the
+        // durable owner membership even after the ordinary capability gate.
+        const billingSubject = requireInteractiveHuman(callerIdentity);
+        if (store.organizationMembership(organizationId, billingSubject.userId)?.role !== 'owner')
+          return this.json(res, 403, { error: 'organization owner access is required to administer its subscription' });
+        const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+        const settingsBase = `${this.publicUrl(req)}${organizationSettingsPath(store, organizationId)}`;
+        const settingsUrl = `${settingsBase}#settings-billing`;
+        try {
+          if (action === 'checkout') {
+            const body = await this.body(req);
+            const plan = String(body.plan ?? '');
+            const result = await billing.checkout(organizationId, plan,
+              { success: `${settingsBase}?billing=success#settings-billing`,
+                cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
+            return this.json(res, 200, result);
+          }
+          if (action === 'portal') return this.json(res, 200, await billing.portal(organizationId, settingsUrl, idempotencyKey));
+          if (action === 'change') {
+            const body = await this.body(req);
+            return this.json(res, 202, await billing.changePlan(organizationId,
+              String(body.plan ?? ''), idempotencyKey));
+          }
+          if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
+          await billing.syncSeats(organizationId);
+          return this.json(res, 202, { syncing: true });
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const organizationStorage = p.match(/^\/api\/organizations\/([^/]+)\/storage(?:\/([^/]+))?(?:\/(test|default))?$/);
       if (organizationStorage) {
@@ -1680,6 +1750,10 @@ export class Gateway {
         const b = await this.body(req);
         if (String(b.confirmSlug ?? '') !== organization.slug)
           return this.json(res, 400, { error: `type the organization slug (${organization.slug}) to confirm deletion` });
+        try { this.deps.subscriptions?.assertOrganizationDeletionAllowed(organizationId); }
+        catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
 
         // External resources go first. These operations are idempotent, so an
         // outage never commits a deceptively successful partial deletion.
@@ -1745,6 +1819,8 @@ export class Gateway {
           this.deps.authorization?.replacePrincipalAuthorization(actorPrincipal(callerIdentity.actor),
             `user:${membership.userId}`, organizationId, authorization,
             authRecord?.kind === 'human' ? undefined : authRecord?.caps);
+          void this.deps.subscriptions?.syncSeats(organizationId).catch((error) =>
+            console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
           return this.json(res, 200, { ...membership, authorization });
         }
       }
@@ -1752,6 +1828,8 @@ export class Gateway {
       if (organizationMember && method === 'DELETE') {
         store.deprovisionOrganizationUser(organizationMember[1]!, organizationMember[2]!);
         this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`);
+        void this.deps.subscriptions?.syncSeats(organizationMember[1]!).catch((error) =>
+          console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
         return this.json(res, 200, { ok: true });
       }
       const invitations = p.match(/^\/api\/organizations\/([^/]+)\/invitations$/);
@@ -6261,6 +6339,7 @@ export class Gateway {
           this.deps.authorization?.grant('system:scim', { principalId: `user:${user.id}`,
             scopeKey: `organization:${organizationId}`, profileId: 'developer',
             capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] });
+          void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           return this.scimJson(res, 201, scimUser(user));
         }
         if ((method === 'PATCH' || method === 'PUT') && id) {
@@ -6269,13 +6348,17 @@ export class Gateway {
           if (!active) {
             this.deps.store.deprovisionOrganizationUser(organizationId, id);
             this.deps.identity.revokeUserSessions(id);
-          } else if (!this.deps.store.organizationMembership(organizationId, id)) this.deps.store.setOrganizationMembership(organizationId, id, 'member');
+          } else if (!this.deps.store.organizationMembership(organizationId, id)) {
+            this.deps.store.setOrganizationMembership(organizationId, id, 'member');
+          }
+          void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
           return this.scimJson(res, 200, user ? scimUser(user, active) : { id, active });
         }
         if (method === 'DELETE' && id) {
           this.deps.store.deprovisionOrganizationUser(organizationId, id);
           this.deps.identity.revokeUserSessions(id);
+          void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           res.writeHead(204); return void res.end();
         }
       }

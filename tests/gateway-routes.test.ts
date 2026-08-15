@@ -84,6 +84,14 @@ describe('gateway route capability binding', () => {
     expect(cap('POST', '/api/organizations/o1/github/install-url')).toBe('repository:write');
   });
 
+  it('separates hosted subscription billing from agent payment cards', () => {
+    expect(cap('GET', '/api/organizations/o1/subscription/status')).toBe('organization:read');
+    expect(cap('POST', '/api/organizations/o1/subscription/checkout')).toBe('payment:write');
+    expect(cap('POST', '/api/organizations/o1/subscription/cancel')).toBe('payment:write');
+    expect(cap('POST', '/api/subscriptions/webhook')).toBe('none');
+    expect(cap('POST', '/api/payments/stripe/webhook')).toBe('none');
+  });
+
   it('requires repository writes for both delegated creation and project attachment', () => {
     expect(cap('POST', '/api/organizations/o1/repositories/create')).toBe('repository:write');
     expect(cap('POST', '/api/projects/p1/repositories')).toBe('repository:write');
