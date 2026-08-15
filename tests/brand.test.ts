@@ -159,7 +159,8 @@ describe('branding — operator-facing output', () => {
 
   it('brands the process-manager and runner labels', () => {
     expect(read('src/util/processes.ts')).toContain(`${brand} (gateway + worker)`);
-    expect(read('src/world/runners.ts')).toContain(`${BRAND} managed`);
+    expect(read('src/world/runners.ts')).toContain('organization BYOK');
+    expect(read('src/world/runners.ts')).not.toContain(`${BRAND} managed`);
   });
 
   it('brands the backup/restore command output', () => {

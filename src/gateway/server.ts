@@ -141,6 +141,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/usage-policy/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
@@ -1566,6 +1567,7 @@ export class Gateway {
             slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id);
+        this.deps.resources?.storageLocationService()?.ensureManaged(organization.id);
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
@@ -2094,9 +2096,12 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listRunnerPools(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
+          if (b.mode === 'managed') return this.json(res, 400, {
+            error: 'centrally funded remote runner pools require a separate installation authorization boundary; organization BYOK is the supported default',
+          });
           return this.json(res, 200, store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
             provider: String(b.provider ?? 'e2b'), region: b.region ? String(b.region) : undefined,
-            mode: b.mode === 'customer' ? 'customer' : 'managed', enabled: b.enabled !== false,
+            mode: b.mode === 'managed' ? 'managed' : 'customer', enabled: b.enabled !== false,
             capacity: { activeWorlds: Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
               cpu: Math.max(1, Number(b.capacity?.cpu ?? 40)), memoryMb: Math.max(128, Number(b.capacity?.memoryMb ?? 81920)),
               gpu: Math.max(0, Number(b.capacity?.gpu ?? 0)) } }));
@@ -2169,6 +2174,35 @@ export class Gateway {
           catch { return { provider: connection.provider, status: 'pending' }; }
         });
         return this.json(res, 200, { ...store.usageSummary(usage[1]!, from, to), from, to, sync });
+      }
+      const usagePolicy = p.match(/^\/api\/organizations\/([^/]+)\/usage-policy$/);
+      if (usagePolicy) {
+        const organizationId = usagePolicy[1]!;
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationUsagePolicy(organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
+          const currentPolicy = store.getOrganizationUsagePolicy(organizationId);
+          const normalizedManagedProviders = (value: unknown): string[] | undefined => Array.isArray(value)
+            ? [...new Set(value.map((provider) => String(provider).trim()).filter(Boolean))].sort()
+            : undefined;
+          const requestedManagedProviders = normalizedManagedProviders((policy as any).managedModelProviders);
+          const managedProvidersChanged = Object.prototype.hasOwnProperty.call(policy, 'managedModelProviders')
+            && (requestedManagedProviders == null || JSON.stringify(requestedManagedProviders)
+              !== JSON.stringify(normalizedManagedProviders(currentPolicy.managedModelProviders)));
+          const ownerOnlyChange = ([
+            ['managedSpendCapMicros', currentPolicy.managedSpendCapMicros ?? null],
+            ['maxActiveAgentTurns', currentPolicy.maxActiveAgentTurns ?? null],
+          ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
+            && (policy as any)[key] !== current) || managedProvidersChanged;
+          if (ownerOnlyChange) {
+            const subject = requireInteractiveHuman(callerIdentity);
+            if (store.organizationMembership(organizationId, subject.userId)?.role !== 'owner')
+              return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
+          }
+          try { return this.json(res, 200, store.setOrganizationUsagePolicy(organizationId, policy)); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
       }
 
       if (p === '/api/inbox' && method === 'GET') {
@@ -3753,11 +3787,25 @@ export class Gateway {
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
           const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
           const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
-          await this.deps.objects.put(objectKey, data, mediaType);
+          const managedStorage = store.listStorageLocations(project.organizationId).find((location) => location.kind === 'managed');
+          if (managedStorage) store.reserveStorageUpload(`artifact:${id}`, project.organizationId, managedStorage.id,
+            data.length, Date.now() + 60 * 60_000);
+          try { await this.deps.objects.put(objectKey, data, mediaType); }
+          catch (error) { if (managedStorage) store.releaseStorageUpload(`artifact:${id}`); throw error; }
           const ttlMs = b.ttlMs == null ? undefined : Math.max(60_000, Math.min(Number(b.ttlMs), 365 * 24 * 60 * 60 * 1000));
-          const artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
-            taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
-            mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+          let artifact: ReturnType<Store['savePromotedArtifact']>;
+          try {
+            artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
+              taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
+              mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+            store.recordUsage({ id: `usage:artifact:${id}`, organizationId: project.organizationId,
+              projectId: project.id, taskId, worldId: handle.id, provider: 'managed-object-store',
+              kind: 'resource.storage', quantity: data.length, unit: 'byte', costMicros: 0, fundingSource: 'managed',
+              startedAt: artifact.createdAt, endedAt: artifact.createdAt, metadata: { artifactId: id, mediaType } });
+          } catch (error) {
+            await this.deps.objects.delete(objectKey).catch(() => undefined);
+            throw error;
+          } finally { if (managedStorage) store.releaseStorageUpload(`artifact:${id}`); }
           return this.json(res, 200, artifact);
         } finally { await access?.release(); }
       }
@@ -6555,6 +6603,7 @@ export class Gateway {
         name: label || 'Personal', kind: 'personal', ownerUserId: userId });
       this.deps.store.setDefaultOrganization(userId, organization.id);
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
+      this.deps.resources?.storageLocationService()?.ensureManaged(organization.id);
       inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
       return true;
     } catch (e) {

@@ -30,6 +30,8 @@ file an operator setting lives only as long as the shell that exported it, and
 | `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
 | `KARMAX_DATABASE_URL`, `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires PostgreSQL and a real Temporal address; managed cells require S3. |
 | `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Hard physical snapshot-byte allowance per organization. Hosted defaults to 5 GiB; `0` means unlimited and is unsuitable for open registration. |
+| `KARMAX_MANAGED_MODEL_REQUEST_CEILINGS` | operator | Optional JSON map of `provider/model` (or `provider/*`) to a conservative per-request micro-dollar ceiling. Empty means BYOK-only. It authorizes bounded admission, not provider credits. |
+| `KARMAX_MANAGED_MODEL_PRICING` | operator | Optional JSON map using the same keys and `{inputMicrosPerMillionTokens, outputMicrosPerMillionTokens, cacheReadMicrosPerMillionTokens, cacheWriteMicrosPerMillionTokens}`. Complete provider-reported counters become incurred cost; otherwise the request ceiling is retained and shown explicitly as an estimate. |
 | `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). |
 | `KARMAX_GOOGLE_CLIENT_ID`, `KARMAX_GOOGLE_CLIENT_SECRET` | operator | Optional "Continue with Google". Separate from `KARMAX_OIDC_*` deliberately: that slot holds exactly one provider, so an install pointed at its company IdP would otherwise have to choose between the two. Set both or neither — the button appears only when both are non-empty. Register `https://<your-karmax-origin>/api/auth/callback/google` as the authorized redirect URI in the Google Cloud console; Better Auth serves that path itself, so it must match `KARMAX_PUBLIC_URL` exactly. Only the default `openid`/`email`/`profile` scopes are requested and no refresh token is asked for: karmax wants an identity, not access to the user's Google data, and an unused refresh token is only a long-lived secret to leak. A Google login on an address that already has a **verified** email+password account links into it rather than creating a duplicate; on an *unverified* one it is refused (the sign-in card explains why), because karmax's signup never proved that account owns the address. Read the comment in `src/auth/identity.ts` before relaxing either half of that. |
 | `KARMAX_MAX_WFT` / `_ACT` / `_CACHED_WORKFLOWS`, `KARMAX_AGENT_*` | operator | Worker and host-admission capacity. |
@@ -133,6 +135,14 @@ knowing:
   accounting. The hosted default is 5 GiB per organization. Wiki/metadata growth
   remains small-row database traffic and should still be covered by deployment
   disk monitoring and abuse controls.
+- **Platform-funded model use is opt-in, never a balance.** A hosted organization
+  cannot use an installation model credential until an owner sets a monthly
+  managed-spend cap and explicitly enables that model provider, and the operator
+  has configured a worst-case request debit for that model. The cap is a hard
+  admission guard over incurred/estimated ledger cost plus active reservations;
+  reservations are never displayed as incurred provider cost. The cap is not presented as OpenAI,
+  Anthropic, E2B, or transferable "credits". Organization API keys and subscription
+  logins remain BYOK and are reported separately from managed usage.
 - **Email addresses are unverified.** `emailVerification.sendOnSignUp` is on, but
   `requireEmailVerification` is not set, so an account is usable immediately and
   the address may be junk. Turning it on is a one-line change in
@@ -240,7 +250,28 @@ with `KARMAX_DEPLOYMENT=hosted`. The automated suite does not use the CLI,
 network, or paid calls: `FakeSubscriptionProvider` drives signed-event-equivalent
 fixtures against an in-memory database.
 
-## Agent payment rails
+## Organization usage admission
+
+Organization settings exposes current-month incurred cost, explicitly estimated
+cost, active reservations, and provider-reported token or request quantities,
+split into managed and BYOK funding, plus active model turns,
+remote worlds, and commands. Provider/model allowlists, per-minute model and
+sandbox start limits, and concurrent turn/world limits are enforced immediately
+before the trusted provider boundary. Hosted concurrency defaults to the central
+Free/Individual/Team entitlement (1/5/10 shared active agent runs); the usage
+policy can only supply an owner-selected tighter cap. Admission rows use the durable agent-turn
+id, and provider lifecycle rows use provider execution ids, so activity retries
+and reconciliation/webhook duplication cannot reserve or count the same work
+twice.
+
+Remote E2B and Daytona launch remains organization BYOK. Runner pools control
+capacity; they do not confer provider balance. The organization API refuses a
+centrally funded remote pool, and the execution boundary rejects legacy managed
+remote pools on hosted deployments. Centrally resold E2B would require a separate
+installation authorization and billing boundary that this deployment does not
+implement.
+
+## Payment rails
 
 Karmax has three rails, in increasing order of setup cost. **Only the first two
 move real money, and only the first works everywhere.**
