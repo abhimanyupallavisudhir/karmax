@@ -1218,6 +1218,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       accountCredentialKind?: 'login' | 'ambient' | 'key';
       accountCredentialProvider?: string;
     }): Promise<boolean> {
+      // Hosted plans cap every active agent run, including subscription CLIs
+      // executing inside a remote world. The coordinator activity resolves this
+      // request to an organization-scoped entitlement queue; private installs
+      // retain the host-resource-only behavior below.
+      if (store.hosted) return true;
       if (!isRemote(args.worldHandle.kind)) return true;
       if (args.accountCredentialKind === 'key') return true;
       if (args.accountCredentialKind === 'login' || args.accountCredentialKind === 'ambient') return false;

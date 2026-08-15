@@ -46,7 +46,7 @@ describe('gateway request scope for bare-id routes', () => {
 
   beforeAll(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-scope-'));
-    store = new Store(':memory:');
+    store = new Store(':memory:', { hosted: true });
     tokens = new TokenAuthority();
     const acme = store.createOrganization({ name: 'Acme', ownerUserId: 'a' });
     const other = store.createOrganization({ name: 'Other', ownerUserId: 'b' });
@@ -142,6 +142,27 @@ describe('gateway request scope for bare-id routes', () => {
 
     const foreign = await fetch(`${base}/api/settings/access?projectId=${theirs}`, { headers: auth() });
     expect(foreign.status).toBe(403);
+  });
+
+  it('exposes a hosted over-member downgrade as an explicit blocked entitlement state', async () => {
+    store.setOrganizationPlan(acmeId, 'team');
+    store.setOrganizationMembership(acmeId, 'extra-1', 'member');
+    store.setOrganizationMembership(acmeId, 'extra-2', 'member');
+    store.setOrganizationPlan(acmeId, 'free');
+    const organizationReader = tokens.mintPrincipal('user:a', ['organization:read'], undefined, 60_000, acmeId).token;
+
+    const response = await fetch(`${base}/api/organizations/${acmeId}/entitlements`, {
+      headers: { authorization: `Bearer ${organizationReader}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      deployment: 'hosted', plan: 'free', currentMemberCount: 3, maxMembers: 1,
+      overMemberLimit: true, memberAdmissionAllowed: false, agentRunAdmissionAllowed: false,
+    });
+
+    store.removeOrganizationMembership(acmeId, 'extra-1');
+    store.removeOrganizationMembership(acmeId, 'extra-2');
+    store.setOrganizationPlan(acmeId, 'team');
   });
 
   it('renames only with edit authority in the matching project or organization', async () => {

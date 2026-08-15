@@ -57,6 +57,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/settings/installation (global operator-only Installation page probe)',
     'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
     'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
+    'GET /api/organizations/:organizationId/entitlements (current hosted plan, limits, and live usage; private installs are unlimited)',
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',

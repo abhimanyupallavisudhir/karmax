@@ -13328,8 +13328,11 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
+
+    <div class="settings-section-title" id="settings-plan"><div>Plan<small>Current organization limits</small></div></div>
+    <div class="card" id="org-plan">Loading…</div>
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
@@ -13365,6 +13368,28 @@ function pendingInvitationRow(invitation, projects) {
   return `<div class="member-row" data-invitation="${esc(invitation.id)}"><span>${esc(invitation.email)}</span><span class="chip">${esc(authorizationSummary(authorization, projects))}</span></div>`;
 }
 
+function organizationPlanMarkup(entitlements) {
+  if (!entitlements) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
+  if (entitlements.deployment === 'private') return `<div class="section-h">Private installation</div>
+    <p class="task-sub">Hosted plan restrictions are not applied. Users, projects, and active agent runs are limited only by this installation’s own capacity settings.</p>`;
+  const memberCount = Number(entitlements.currentMemberCount ?? entitlements.activeUsers ?? 0);
+  const users = entitlements.maxMembers == null
+    ? `${memberCount} active user${memberCount === 1 ? '' : 's'} · unlimited`
+    : `${memberCount} of ${entitlements.maxMembers} user${entitlements.maxMembers === 1 ? '' : 's'}${entitlements.overMemberLimit ? ' · over limit' : ''}`;
+  const projects = entitlements.unlimitedProjects ? 'Unlimited projects' : `${entitlements.maxProjects} projects`;
+  const runs = `${entitlements.maxActiveAgentRuns} active agent run${entitlements.maxActiveAgentRuns === 1 ? '' : 's'}`;
+  const monthly = Number(entitlements.currentMonthlyPriceCents || 0) / 100;
+  const price = monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
+  const usage = `${entitlements.activeAgentRuns || 0} active · ${entitlements.queuedAgentRuns || 0} queued`;
+  const memberWarning = entitlements.overMemberLimit
+    ? `<div class="card" style="padding:10px;border-color:var(--warn);margin:10px 0"><b>Agent runs are paused</b><div class="task-sub">${esc(entitlements.planName)} allows ${esc(entitlements.maxMembers)} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${esc(memberCount)}. Remove ${esc(memberCount - entitlements.maxMembers)} extra member${memberCount - entitlements.maxMembers === 1 ? '' : 's'} in <a href="#settings-people">People &amp; authorization</a>, or restore Team. Running agents may finish; no new agent run will start until this is resolved.</div></div>`
+    : '';
+  return `<div class="section-h">${esc(entitlements.planName)} <span class="chip">${esc(price)}</span></div>
+    ${memberWarning}
+    <div class="settings-grid"><label class="form-row">People<input value="${esc(users)}" readonly></label><label class="form-row">Projects<input value="${esc(projects)}" readonly></label><label class="form-row">Agent concurrency<input value="${esc(runs)}" readonly></label><label class="form-row">Current agent usage<input value="${esc(usage)}" readonly></label></div>
+    <p class="task-sub">Concurrency is a shared maximum for this organization. Work above the limit waits in queue; it is not reserved capacity.</p>`;
+}
+
 function appendPendingInvitation(invitation, projects) {
   const box = $('#pending-invitations');
   if (!box || !invitation) return;
@@ -13394,7 +13419,8 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
-  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
+  const [entitlements, gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
+    api(`/api/organizations/${organizationId}/entitlements`).catch(() => null),
     api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
     api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
@@ -13408,6 +13434,7 @@ async function hydrateOrganizationView() {
     api(`/api/organizations/${organizationId}/storage`).catch(() => []),
   ]);
   if (!renderIsCurrent()) return;
+  $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
   const pendingInvitations = invitations.filter((invitation) => !invitation.acceptedAt);
   $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');

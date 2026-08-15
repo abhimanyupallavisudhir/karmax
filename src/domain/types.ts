@@ -6,6 +6,7 @@
 // ─── Identity ────────────────────────────────────────────────────────────────
 
 import type { TaskTrigger, TriggerState } from './triggers.js';
+import type { HostedPlanId } from './entitlements.js';
 export type { TaskTrigger, TriggerState } from './triggers.js';
 
 /**
@@ -42,6 +43,8 @@ export interface Organization {
   name: string;
   slug: string;
   kind: 'personal' | 'team';
+  /** Hosted billing selection. Private installations ignore monetization plans. */
+  plan: HostedPlanId;
   createdAt: number;
 }
 
