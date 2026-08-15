@@ -228,6 +228,7 @@ const principalValue = (principal: TaskRecord['assignee']): string | undefined =
   switch (principal.kind) {
     case 'user': return `user:${principal.userId}`;
     case 'team': return `team:${principal.teamId}`;
+    case 'avatar': return `avatar:${principal.avatarId}`;
     case 'task-agent': return `task-agent:${principal.taskId}:${principal.role}`;
   }
 };

@@ -303,6 +303,7 @@ async function main() {
     bus,
     client,
     tokens,
+    authorization,
     broker,
     githubApp,
     checkpoints,

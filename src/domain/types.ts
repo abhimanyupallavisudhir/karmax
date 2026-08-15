@@ -24,6 +24,7 @@ export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | 'responder' | (
 export type PrincipalRef =
   | { kind: 'user'; userId: string }
   | { kind: 'team'; teamId: string }
+  | { kind: 'avatar'; avatarId: string }
   | { kind: 'task-agent'; taskId: string; role: string };
 
 /** Project access may also target the entire containing organization. This is
@@ -56,6 +57,46 @@ export interface AuthorizationSelection {
   level: string;
   scope: 'projects' | 'organization' | 'global';
   projectIds?: string[];
+}
+
+/** A durable, user-authored autonomous principal. Avatars are project-owned for
+ * discovery/routing, while their authority is an explicit delegation captured
+ * at creation or edit time. `roles=[]` means every workflow role; callableBy
+ * uses the same stable user/team selectors as task routing plus `@project`. */
+export interface Avatar {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  ownerUserId: string;
+  name: string;
+  purpose?: string;
+  prompt: string;
+  promptVersion: number;
+  enabled: boolean;
+  authorityMode: 'full' | 'restricted';
+  authorization: AuthorizationSelection & {
+    profileId: string;
+    capabilities: string[];
+    organizationId?: string;
+  };
+  credentialPolicies?: Record<string, { use?: 'auto' | 'ask' | 'never'; reveal?: 'auto' | 'ask' | 'never' }>;
+  githubAccountId?: string;
+  callableBy: string[];
+  roles: string[];
+  runtime: {
+    provider: Provider;
+    model?: string;
+    effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  };
+  createdAt: number;
+  updatedAt: number;
+  deletedAt?: number;
+}
+
+export interface AvatarAvailability {
+  organization: boolean;
+  project: 'inherit' | 'enabled' | 'disabled';
+  effective: boolean;
 }
 
 export interface OrganizationInvitation {
@@ -1251,6 +1292,13 @@ export interface FieldSpec {
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
   provider: Provider;
+  /** Select a durable Avatar. Provider/model remain snapshotted for replay and
+   * display, but current turns resolve the owner-controlled prompt + authority
+   * from this id and refuse execution when it has been disabled. */
+  avatarId?: string;
+  /** Internal invocation purpose when an Avatar is answering an authorization
+   * or response request rather than filling the workflow role itself. */
+  avatarPurpose?: 'authorize' | 'respond';
   /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
   modelProvider?: string;
   model?: string;
