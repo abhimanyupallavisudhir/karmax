@@ -602,6 +602,25 @@ export class Store {
         type TEXT NOT NULL, decision TEXT, createdAt INTEGER NOT NULL,
         PRIMARY KEY (provider, eventId)
       );
+      -- Hosted SaaS subscriptions are a separate ledger from agent spending
+      -- cards/payment_connections above. Only verified provider events update
+      -- plan, status, and seat quantities in this table.
+      CREATE TABLE IF NOT EXISTS subscription_billing_accounts (
+        organizationId TEXT PRIMARY KEY, provider TEXT NOT NULL, customerId TEXT UNIQUE,
+        subscriptionId TEXT UNIQUE, plan TEXT NOT NULL, status TEXT NOT NULL,
+        seats INTEGER NOT NULL, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
+        cancelAtPeriodEnd INTEGER NOT NULL, lastEventAt INTEGER NOT NULL,
+        verifiedAt INTEGER, lastError TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS subscription_billing_events (
+        provider TEXT NOT NULL, eventId TEXT NOT NULL, type TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, processedAt INTEGER,
+        PRIMARY KEY (provider, eventId)
+      );
+      CREATE TABLE IF NOT EXISTS subscription_billing_requests (
+        requestKey TEXT PRIMARY KEY, organizationId TEXT NOT NULL, operation TEXT NOT NULL,
+        requestHash TEXT NOT NULL, responseJson TEXT, createdAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS tags (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
         parentId TEXT, color TEXT, kind TEXT, description TEXT, createdAt INTEGER NOT NULL
@@ -672,6 +691,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_payment_requests_task_status ON payment_spend_requests(taskId, status, createdAt);
       CREATE INDEX IF NOT EXISTS idx_payment_requests_org_status ON payment_spend_requests(organizationId, status, createdAt);
       CREATE INDEX IF NOT EXISTS idx_payment_transactions_org_time ON payment_transactions(organizationId, createdAt DESC);
+      CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
+        ON subscription_billing_requests(organizationId, createdAt);
     `);
     // Free-form human notes, added after the initial schema. Guarded so existing
     // installs pick it up without a re-create.
@@ -1315,6 +1336,7 @@ export class Store {
       payment_spend_requests: selectRows(this.db, 'payment_spend_requests', 'organizationId=?', [organizationId]),
       payment_transactions: selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId]),
       payment_events: selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId]),
+      subscription_billing_accounts: selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId]),
       authorization_profiles: rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       principal_grants: rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       audit_log: rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
@@ -1539,6 +1561,8 @@ export class Store {
       this.db.prepare('DELETE FROM payment_spend_requests WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM payment_oauth_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM payment_connections WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM subscription_billing_requests WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId);
       deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
@@ -1803,6 +1827,15 @@ export class Store {
     this.db.prepare('UPDATE organization_invitations SET acceptedAt=? WHERE id=?').run(Date.now(), r.id);
     return { ...membership, profileId: r.profileId ?? 'developer',
       authorization: r.authorizationJson ? JSON.parse(r.authorizationJson) : undefined };
+  }
+
+  /** Server-only seat preflight. The raw invitation token is hashed before the
+   * lookup and never returned by list APIs. */
+  organizationInvitationForToken(token: string): { organizationId: string; acceptedAt?: number; expiresAt: number } | undefined {
+    const row = this.db.prepare('SELECT organizationId, acceptedAt, expiresAt FROM organization_invitations WHERE tokenHash=?')
+      .get(sha256(token)) as any;
+    return row ? { organizationId: row.organizationId, acceptedAt: row.acceptedAt ?? undefined,
+      expiresAt: Number(row.expiresAt) } : undefined;
   }
 
   listOrganizationInvitations(organizationId: string): OrganizationInvitation[] {
@@ -4976,11 +5009,14 @@ export class Store {
    * SEAM: the app boot (`src/main.ts`) is what must schedule this — e.g.
    * Scheduled hourly (and once at boot) by `src/main.ts`, next to the orphan sweep.
    */
-  retentionSweep(now = Date.now()): { scopedTokens: number; humanDelegations: number; githubDeliveries: number } {
+  retentionSweep(now = Date.now()): { scopedTokens: number; humanDelegations: number; githubDeliveries: number;
+    subscriptionRequests: number } {
     return {
       scopedTokens: this.purgeScopedTokens(now),
       humanDelegations: this.purgeHumanDelegations(now),
       githubDeliveries: this.purgeGithubDeliveries(Store.GITHUB_DELIVERY_RETENTION_MS, now),
+      subscriptionRequests: Number(this.db.prepare(`DELETE FROM subscription_billing_requests
+        WHERE createdAt<? AND responseJson IS NOT NULL`).run(now - 30 * 24 * 60 * 60 * 1000).changes),
     };
   }
 
