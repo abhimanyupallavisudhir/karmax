@@ -105,6 +105,7 @@ const S = {
   inviteNotice: null,
   installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
   installationInfo: null,
+  onboarding: null, // hosted-only, server-derived setup progress for the selected organization
 };
 
 // ── immediate action feedback ───────────────────────────────────────────────
@@ -496,6 +497,8 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        renderOnboarding();
+        refreshOnboarding();
         renderRouteLoadingPage(org.name, 'Switching organization…');
       }
       syncOrganizationSwitcher();
@@ -564,6 +567,8 @@ async function applyRoute() {
   S.organizationId = proj.organizationId || S.organizationId;
   syncOrganizationSwitcher();
   if (S.organizationId !== previousOrganizationId) {
+    renderOnboarding();
+    refreshOnboarding();
     await loadCollaboration().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -1747,6 +1752,11 @@ async function api(path, opts = {}) {
     if (body && typeof body === 'object') Object.assign(error, body);
     throw error;
   }
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET' && S.meta?.hosted && (
+    /^\/api\/organizations\/[^/]+\/(?:accounts|world-providers|git-connections|github|projects)(?:[/?]|$)/.test(path)
+    || /^\/api\/(?:vault|cards)(?:[/?]|$)/.test(path)
+  )) queueMicrotask(() => refreshOnboarding());
   return body;
 }
 
@@ -2379,6 +2389,7 @@ async function boot() {
     S.catalogOrganizationId = S.organizationId;
     if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
+  await refreshOnboarding();
   connectWs();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
@@ -2947,6 +2958,94 @@ function brandMark() {
   return `<img class="mark" src="/brand/icon-192.png${brandVersion ? `?v=${brandVersion}` : ''}" alt="" />`;
 }
 
+async function refreshOnboarding() {
+  const organizationId = S.organizationId;
+  if (!S.meta?.hosted || !organizationId || !S.user) {
+    S.onboarding = null;
+    renderOnboarding();
+    return;
+  }
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
+  try {
+    const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
+    S.onboarding = status;
+  } catch {
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
+    S.onboarding = null;
+  }
+  renderOnboarding();
+}
+
+async function setOnboardingDisplay(display) {
+  if (!S.organizationId) return;
+  try {
+    S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
+      method: 'PUT', body: JSON.stringify({ display }),
+    });
+    renderOnboarding();
+  } catch (error) { toast(error.message, true); }
+}
+
+function onboardingStep(number, key, title, detail, action) {
+  const step = S.onboarding?.steps?.[key] || {};
+  return `<li class="onboarding-step ${step.complete ? 'complete' : ''}">
+    <span class="onboarding-check" aria-hidden="true">${step.complete ? '✓' : number}</span>
+    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
+      <p>${detail}</p>${action}</div>
+  </li>`;
+}
+
+function pollOnboarding() {
+  clearTimeout(S.onboardingTimer);
+  S.onboardingTimer = setTimeout(() => {
+    if (document.hidden) return pollOnboarding();
+    refreshOnboarding();
+  }, 4_000);
+}
+
+function renderOnboarding() {
+  const host = $('#hosted-onboarding');
+  if (!host) return;
+  const state = S.onboarding;
+  if (!state?.visible || state.organizationId !== S.organizationId) {
+    clearTimeout(S.onboardingTimer);
+    S.onboardingTimer = null;
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+  host.hidden = false;
+  pollOnboarding();
+  if (state.display === 'minimized') {
+    host.innerHTML = `<button class="onboarding-minimized" id="onboarding-expand" type="button" aria-label="Open setup guide">
+      <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
+      <span><b>Finish setup</b><small>${state.completedRequired} of ${state.totalRequired} required steps</small></span>
+    </button>`;
+    $('#onboarding-expand')?.addEventListener('click', () => setOnboardingDisplay('expanded'));
+    return;
+  }
+  const settings = globalRoute('organization');
+  const optional = state.steps.optional || {};
+  host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
+    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get krmax ready</h2></div>
+      <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
+    <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
+    <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
+    <ol class="onboarding-list">
+      ${onboardingStep(1, 'github', 'Connect GitHub', 'Import repositories and let krmax work through reviewed pull requests.', `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
+      ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Add an E2B API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-compute">${state.steps.e2b.complete ? 'Manage E2B' : 'Set up E2B'}</a>`)}
+      ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
+      ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
+    </ol>
+    <div class="onboarding-foot"><span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+  </section>`;
+  $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
+  $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
+  $('#onboarding-new-project')?.addEventListener('click', newProject);
+}
+
 /** Re-point the favicon and every on-screen mark so a switch shows up at once,
  * without a reload — the URLs are unchanged, so only the cache needs busting. */
 function refreshBrandAssets() {
@@ -2982,7 +3081,8 @@ function renderShell() {
       <div class="rail" id="rail"></div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
-    </div>`;
+    </div>
+    <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   // Project-scoped query/filtering lives in the task list. The topbar finder is
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
@@ -3010,6 +3110,7 @@ function renderShell() {
     const route = organizationLandingRoute(e.target.value);
     return route ? go(route) : syncOrganizationSwitcher();
   });
+  renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }

@@ -64,6 +64,8 @@ import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireIntera
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
+import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
+  type HostedOnboardingDisplay } from './hosted-onboarding.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -128,7 +130,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export' || p === '/api/user/default-organization') return 'none';
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/onboarding') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -1273,6 +1275,7 @@ export class Gateway {
         this.deps.authorization?.bootstrapAdministrator(user.id);
         this.deps.store.claimPersonalOrganization(user.id, user.name);
         this.deps.store.kvSet(`git:onboarding:${user.id}`, 'pending');
+        if (this.deps.hosted) this.enableHostedOnboarding(user.id, 'org_personal');
         for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
           this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user.id }, 'owner');
         }
@@ -1457,6 +1460,58 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
+        const subject = requireInteractiveHuman(callerIdentity);
+        const organizationId = String(url.searchParams.get('organizationId')
+          ?? store.defaultOrganization(subject.userId)?.id ?? '');
+        if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
+          return this.json(res, 404, { error: 'organization not found' });
+        const key = hostedOnboardingKey(subject.userId, organizationId);
+        let record = parseHostedOnboardingRecord(store.kvGet(key));
+        if (method === 'PUT') {
+          if (!this.deps.hosted || !record)
+            return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
+          const b = await this.body(req);
+          const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
+          record = { ...record, display };
+          store.kvSet(key, JSON.stringify(record));
+        }
+        const credentials = enumerateCredentials(gatherCredentialSources({
+          configHomes: this.deps.configHomes,
+          broker: this.deps.broker,
+          organizationId,
+        })).filter((credential) => !this.deps.hosted
+          || credential.kind === 'login' || Boolean(credential.apiKeyHandle));
+        const enabledCredentials = resolveCredentials(credentials, {
+          global: parsePolicy(store.kvGet(credPolicyKey.organization(organizationId))),
+        });
+        const e2b = store.getWorldProviderConnection(organizationId, 'e2b');
+        const facts = {
+          github: Boolean(this.deps.identity?.providersForUser(subject.userId).includes('github')
+            || this.deps.githubApp?.status(subject.userId).userAuthorized
+            || store.listGitConnections(organizationId).some((connection) => !connection.suspendedAt)),
+          agentLogin: enabledCredentials.length > 0,
+          e2b: Boolean(e2b?.enabled && this.deps.broker?.hasHandle(e2b.credentialHandle)),
+          vault: new VaultItems(store, this.deps.broker, undefined, organizationId).list().length > 0,
+          card: store.listOrganizationCards(organizationId).length > 0,
+          project: store.listProjects().some((project) => project.organizationId === organizationId),
+        };
+        let status = hostedOnboardingStatus({
+          hosted: this.deps.hosted === true,
+          organizationId,
+          record,
+          facts,
+        });
+        // Completion is sticky. Once all required live facts have been observed,
+        // removing a provider later is maintenance, not a reason to onboard an
+        // established account again.
+        if (status.complete && record && !record.completedAt) {
+          record = { ...record, completedAt: Date.now() };
+          store.kvSet(key, JSON.stringify(record));
+          status = hostedOnboardingStatus({ hosted: true, organizationId, record, facts });
+        }
+        return this.json(res, 200, status);
       }
       if (p === '/api/user/export' && method === 'GET') {
         // Broad task-agent capabilities never imply ownership of a human's
@@ -6445,11 +6500,18 @@ export class Gateway {
       this.deps.store.setDefaultOrganization(userId, organization.id);
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
       inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
+      if (this.deps.hosted) this.enableHostedOnboarding(userId, organization.id);
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);
       return false;
     }
+  }
+
+  private enableHostedOnboarding(userId: string, organizationId: string): void {
+    const key = hostedOnboardingKey(userId, organizationId);
+    if (!this.deps.store.kvGet(key))
+      this.deps.store.kvSet(key, JSON.stringify({ display: 'expanded' }));
   }
 
   /** Installation-wide outbound email config (single row; operator-managed). */
