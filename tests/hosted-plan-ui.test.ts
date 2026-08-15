@@ -85,7 +85,23 @@ describe('hosted plan organization UI', () => {
     expect(subscription).toContain('monthlyAdditionalActiveUserPriceCents');
     expect(subscription).toContain('state.canManage');
     expect(subscription).toContain('Only an organization owner can administer this subscription');
+    expect(subscription).toContain("policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')");
+    expect(subscription).toContain('acceptedPolicies: acceptance.accepted');
+    expect(subscription).toContain('policyVersions: acceptance.versions');
+    expect(subscription).toContain('Cancel online at period end');
     expect(subscription).not.toContain('$9 / month');
     expect(subscription).not.toContain('$19 / month');
+  });
+
+  it('renders the public three-plan page from the central launch catalog', () => {
+    const pricing = extractFunction('renderPricing');
+    expect(pricing).toContain('S.launch?.pricingCatalog');
+    expect(pricing).toContain('Free, Individual, and Team');
+    expect(pricing).toContain('Unlimited projects');
+    expect(pricing).toContain('maxActiveAgentRuns');
+    expect(pricing).toContain('monthlyAdditionalActiveUserPriceCents');
+    expect(pricing).toContain('Cancel online from Organization settings');
+    expect(pricing).not.toContain('Simple subscription');
+    expect(pricing).not.toContain('S.launch?.subscription');
   });
 });

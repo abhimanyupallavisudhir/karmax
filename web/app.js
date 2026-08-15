@@ -106,6 +106,7 @@ const S = {
   installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
   installationInfo: null,
   onboarding: null, // hosted-only, server-derived setup progress for the selected organization
+  launch: null,
 };
 
 // ── immediate action feedback ───────────────────────────────────────────────
@@ -2291,6 +2292,11 @@ function showTaskError(error, projectId) {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  S.launch = S.launch || await (await feedbackFetch('/api/launch')).json();
+  const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
+  if (legalSlug) return renderLegalPage(legalSlug);
+  if (location.pathname === '/legal') return renderLegalIndex();
+  if (location.pathname === '/pricing') return renderPricing();
   // The emailed password-reset link lands here unauthenticated; handle it before
   // any session/setup gating so a signed-out user can actually reset.
   if (location.pathname === '/reset-password') {
@@ -2319,6 +2325,7 @@ async function boot() {
   S.google = session.google || false;
   S.github = session.github || false;
   if (session.setupRequired) return renderSetup();
+  if (session.policyAcceptanceRequired) return renderPolicyCompletion();
   // An invite link opened while signed out: keep the token in the URL (boot
   // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
   // card that a pending invitation is waiting, so a brand-new invitee knows to
@@ -13069,6 +13076,12 @@ function profileView() {
       </div>
       <button class="btn" id="export-user-data" type="button">Export your data</button>
     </div>
+    <div class="card" id="data-account">
+      <div class="section-h">Data &amp; account</div>
+      <p class="task-sub">Request account deletion online. We’ll verify ownership and any organization or resource transfer, then confirm what will be removed or retained and why.</p>
+      <p class="data-export-note">Cancel an active subscription first. Urgent compromise: ${S.launch?.contacts?.incident ? `<a href="mailto:${esc(S.launch.contacts.incident)}">${esc(S.launch.contacts.incident)}</a>` : '<a href="/legal/security">security contact</a>'}.</p>
+      <button class="btn danger" id="request-account-deletion" type="button">Request account deletion</button>
+    </div>
     <div class="card">
       <div class="section-h">Session</div>
       <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
@@ -13167,6 +13180,13 @@ function wireProfileView() {
   }));
   document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
   $('#profile-resend-confirmation')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
+  $('#request-account-deletion')?.addEventListener('click', async () => {
+    if (!confirm('Request deletion of this krmax account? Cancel any active subscription first. We will verify organization and resource ownership before irreversible deletion.')) return;
+    try {
+      const result = await api('/api/user/account-deletion-request', { method: 'POST', body: '{}' });
+      toast(`Deletion request recorded${result.privacyContact ? `. Questions: ${result.privacyContact}` : '.'}`);
+    } catch (error) { toast(error.message, true); }
+  });
 
   $('#profile-email-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -13452,9 +13472,17 @@ async function hydrateOrganizationSubscription(organizationId) {
   const individual = catalog.individual || {};
   const team = catalog.team || {};
   const ownerDisabled = state.canManage ? '' : 'disabled title="Only an organization owner can administer this subscription"';
-  const planCards = !hasSubscription ? `<div class="settings-grid" style="margin-top:14px">
-      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${state.providerConfigured ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
-      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month.</p><button class="btn sm primary billing-checkout" data-plan="team" ${state.providerConfigured ? ownerDisabled : 'disabled'}>Choose Team</button></div>
+  const checkoutReady = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
+  const teamTotal = Number(team.monthlyBasePriceCents || 0)
+    + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
+      * Number(team.monthlyAdditionalActiveUserPriceCents || 0);
+  const disclosures = S.launch?.checkoutDisclosures || {};
+  const planCards = !hasSubscription ? `<div class="billing-commercial-terms">
+      <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
+      ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
+    <div class="settings-grid" style="margin-top:14px">
+      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
+      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month. Unlimited projects · ${esc(team.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
       <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
   const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
     ? 'disabled title="Remove additional active users first"' : '');
@@ -13465,14 +13493,17 @@ async function hydrateOrganizationSubscription(organizationId) {
   const effective = state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
   box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[billedPlan] || billedPlan)} <span class="chip">${esc(statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.canManage ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
-    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
-    <p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Plan and seat access changes only after a signed billing event is reconciled.</p>`;
+    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
+    <p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Plan and seat access changes only after a signed billing event is reconciled. ${policyLinks(['billing'])}</p>`;
   box.querySelectorAll('.billing-checkout').forEach((button) => button.addEventListener('click', async () => {
     button.disabled = true;
     try {
+      const acceptance = readPolicyAcceptance('checkout');
       const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/checkout`, {
-        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan: button.dataset.plan }),
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({
+          plan: button.dataset.plan, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
+        }),
       });
       location.assign(result.url);
     } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -14590,9 +14621,15 @@ function socialSignInError(params) {
   return SOCIAL_SIGN_IN_ERRORS[code] ?? `${provider} sign-in failed (${code}).`;
 }
 
-function wireSocialBtn(id, provider, errSelector) {
+function wireSocialBtn(id, provider, errSelector, requireAcceptance = false) {
   $(`#${id}`)?.addEventListener('click', async () => {
     try {
+      if (requireAcceptance) {
+        const acceptance = readPolicyAcceptance('signup');
+        const accepted = await feedbackFetch('/api/legal/preaccept', { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(acceptance) });
+        if (!accepted.ok) throw new Error((await accepted.json().catch(() => ({}))).error || 'Accept the current policies to create an account.');
+      }
       // errorCallbackURL keeps a rejected sign-in on karmax's own card: Better
       // Auth appends `?error=<code>`, which boot() reads back on the way in.
       const back = new URL(location.href);
@@ -14612,6 +14649,95 @@ function wireSocialBtn(id, provider, errSelector) {
 
 // ── public landing ──────────────────────────────────────────────────────────
 
+function policyLinks(slugs) {
+  const bySlug = new Map((S.launch?.policies || []).map((policy) => [policy.slug, policy]));
+  return slugs.map((slug) => {
+    const policy = bySlug.get(slug);
+    return `<a href="/legal/${slug}" target="_blank" rel="noopener">${esc(policy?.title || slug)} <span class="mono">v${esc(policy?.version || S.launch?.policyVersion || '')}</span></a>`;
+  }).join(', ');
+}
+
+function policyAcceptanceMarkup(context, id) {
+  const slugs = Object.keys(S.launch?.acceptance?.[context] || {});
+  return `<label class="policy-acceptance" for="${id}"><input type="checkbox" id="${id}" />
+    <span>I agree to the current ${policyLinks(slugs)}.</span></label>`;
+}
+
+function readPolicyAcceptance(context) {
+  const box = $(`#${context}-policy-acceptance`);
+  if (!box?.checked) throw new Error('Accept the current policies to continue.');
+  return { accepted: true, versions: S.launch?.acceptance?.[context] || {} };
+}
+
+function legalFooter() {
+  return `<footer class="legal-footer"><a href="/">krmax</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
+    <a href="/legal/security">Security</a><a href="/legal/dpa">DPA requests</a></footer>`;
+}
+
+async function renderLegalPage(slug) {
+  document.body.classList.remove('landing-active');
+  const response = await feedbackFetch(`/api/legal/${encodeURIComponent(slug)}`);
+  if (!response.ok) { history.replaceState({}, '', '/legal'); return renderLegalIndex(); }
+  const policy = await response.json();
+  document.title = `${policy.title} · krmax`;
+  const contactRows = Object.entries(policy.contacts || {}).filter(([, email]) => email)
+    .map(([kind, email]) => `<a href="mailto:${esc(email)}">${esc(kind)}: ${esc(email)}</a>`).join('');
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/legal">All policies</a></header>
+    <main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
+    <h1>${esc(policy.title)}</h1><p class="legal-summary">${esc(policy.summary)}</p>
+    <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>
+    ${policy.operator ? `<p class="legal-operator"><b>Configured operator:</b> ${esc(policy.operator.name)}${policy.operator.country ? ` · ${esc(policy.operator.country)}` : ''}${policy.operator.governingLaw ? `<br><b>Governing law:</b> ${esc(policy.operator.governingLaw)}` : ''}${policy.operator.legalNoticeAddress ? `<br><b>Legal notices:</b> ${esc(policy.operator.legalNoticeAddress)}` : ''}</p>`
+      : '<p class="legal-unresolved"><b>Launch configuration incomplete:</b> the contracting entity and jurisdiction fields are intentionally not represented.</p>'}
+    ${policy.sections.map((section) => `<section><h2>${esc(section.heading)}</h2>${section.paragraphs.map((text) => `<p>${esc(text)}</p>`).join('')}
+      ${section.bullets?.length ? `<ul>${section.bullets.map((text) => `<li>${esc(text)}</li>`).join('')}</ul>` : ''}</section>`).join('')}
+    ${contactRows ? `<div class="legal-contacts">${contactRows}</div>` : ''}</main>${legalFooter()}</div>`;
+  window.onpopstate = () => boot();
+}
+
+function renderLegalIndex() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Policies · krmax';
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/pricing">Pricing</a></header>
+    <main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
+    <p class="legal-summary">Versioned product, billing, privacy, and operational disclosures for the initial paid launch.</p>
+    <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch?.draftNotice)}</span></div>
+    <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}"><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
+    </main>${legalFooter()}</div>`;
+  window.onpopstate = () => boot();
+}
+
+function formatCatalogPrice(cents, currency = 'usd') {
+  return new Intl.NumberFormat(undefined, { style: 'currency', currency: currency.toUpperCase(),
+    minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(Number(cents || 0) / 100);
+}
+
+function renderPricing() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Pricing · krmax';
+  const catalog = S.launch?.pricingCatalog || [];
+  const checkoutReady = S.launch?.paidLaunch && S.launch?.ready;
+  const team = catalog.find((plan) => plan.id === 'team');
+  const cards = catalog.map((plan) => {
+    const price = formatCatalogPrice(plan.monthlyBasePriceCents, plan.currency);
+    const users = plan.id === 'team'
+      ? `First active user included, then ${formatCatalogPrice(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per additional active user per month`
+      : `${plan.maxMembers} user`;
+    const priceLine = plan.id === 'free' ? price : `${price}<small> / month</small>`;
+    return `<article class="price-card" data-plan="${esc(plan.id)}"><div class="price-name">${esc(plan.name)}</div>
+      <div class="price-value">${priceLine}</div><p>${esc(users)}</p><ul><li>Unlimited projects</li>
+      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ' shared across the organization' : ''}</li></ul>
+      ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
+  }).join('');
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/login">Sign in</a></header>
+    <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
+      <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
+      <div class="pricing-grid">${cards}</div>
+      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Payments are non-refundable except where law requires or checkout expressly states otherwise.</p>
+      ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
+      <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>${legalFooter()}</div>`;
+  window.onpopstate = () => boot();
+}
+
 function openPublicAuth(path, render) {
   history.pushState({ kx: 1 }, '', path);
   render();
@@ -14625,6 +14751,7 @@ function renderLanding() {
     <header class="landing-nav" aria-label="Primary navigation">
       <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
       <div class="landing-nav-actions">
+        <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
         <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
@@ -14733,7 +14860,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
@@ -14874,6 +15001,7 @@ function renderSignup() {
     <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
+    ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
     ${googleBtn('signup-google-btn')}
     ${githubBtn('signup-github-btn')}
@@ -14884,6 +15012,7 @@ function renderSignup() {
     const name = $('#signup-name').value.trim();
     const email = $('#signup-email').value.trim();
     const password = $('#signup-pw').value;
+    let acceptance;
     const invalidEmail = !email || !$('#signup-email').checkValidity();
     const validationError = !name ? 'Enter your name.'
       : invalidEmail ? 'Enter a valid email address.'
@@ -14893,10 +15022,12 @@ function renderSignup() {
       (!name ? $('#signup-name') : invalidEmail ? $('#signup-email') : $('#signup-pw')).focus();
       return;
     }
+    try { acceptance = readPolicyAcceptance('signup'); }
+    catch (error) { $('#signup-err').textContent = error.message; $('#signup-policy-acceptance').focus(); return; }
     $('#signup-err').textContent = '';
     try {
       const res = await feedbackFetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-        name, email, password,
+        name, email, password, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
       }) });
       if (res.ok) return boot();
       const body = await res.json().catch(() => ({}));
@@ -14915,10 +15046,31 @@ function renderSignup() {
     }
   };
   $('#signup-btn').addEventListener('click', go);
-  wireSocialBtn('signup-google-btn', 'google', '#signup-err');
-  wireSocialBtn('signup-github-btn', 'github', '#signup-err');
+  wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
+  wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
   $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+function renderPolicyCompletion() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Review policies · krmax';
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Finish account setup</div>
+    <p class="task-sub">Review and accept the current launch policies before using this paid service.</p>
+    ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
+    <button class="btn primary" id="complete-policy-acceptance" style="width:100%">Accept and continue</button>
+    <div id="policy-completion-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  $('#complete-policy-acceptance').addEventListener('click', async () => {
+    try {
+      const acceptance = readPolicyAcceptance('signup');
+      const response = await feedbackFetch('/api/legal/complete-signup', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(acceptance) });
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Could not record acceptance.');
+      await boot();
+    } catch (error) { $('#policy-completion-err').textContent = error.message; }
+  });
 }
 
 function renderAccessPending() {

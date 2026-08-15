@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
+import { launchConfig } from '../launch/legal.js';
 
 export interface DeploymentConfig {
   hosted: boolean;
@@ -48,6 +49,7 @@ const SECRET_FILE_ENV = [
   'KARMAX_TEMPORAL_API_KEY', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY',
   'KARMAX_S3_SESSION_TOKEN', 'KARMAX_OIDC_CLIENT_SECRET', 'KARMAX_GOOGLE_CLIENT_SECRET',
   'KARMAX_GITHUB_OAUTH_CLIENT_SECRET',
+  'KARMAX_SUBSCRIPTION_STRIPE_SECRET_KEY', 'KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET',
   'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
   'KARMAX_GITHUB_APP_PRIVATE_KEY', 'KARMAX_GITHUB_WEBHOOK_SECRET',
   'KARMAX_GITHUB_CLIENT_SECRET',
@@ -133,6 +135,9 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
       if (!env[name]) failures.push(`${name} is required when KARMAX_OBJECT_STORE=s3`);
   }
   if (!['e2b', 'daytona'].includes(config.cloudWorldProvider!)) failures.push('KARMAX_CLOUD_WORLD_PROVIDER must be e2b or daytona');
+  const launch = launchConfig(env);
+  if (launch.paidLaunch && !launch.ready)
+    failures.push(`KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: ${launch.missing.join(', ')}`);
   if (failures.length) throw new Error(`hosted deployment is unsafe:\n- ${failures.join('\n- ')}`);
   return config;
 }

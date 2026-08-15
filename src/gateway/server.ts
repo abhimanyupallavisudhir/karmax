@@ -67,6 +67,8 @@ import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanation
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
   type HostedOnboardingDisplay } from './hosted-onboarding.js';
+import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
+  policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -132,7 +134,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/onboarding') return 'none';
+  if (p === '/api/user/export' || p === '/api/user/default-organization'
+    || p === '/api/user/onboarding' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -509,6 +512,7 @@ export class Gateway {
   private wikiRemoteRetryAfter = new Map<string, number>();
   /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
+  private pendingPolicyAcceptances = new Map<string, { versions: Record<string, string>; expiresAt: number }>();
 
   constructor(private deps: GatewayDeps) {
     if (deps.identity) {
@@ -996,6 +1000,13 @@ export class Gateway {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
         if (current) {
+          this.consumeSignupPolicyAcceptance(req, current.user.id, current.user.email);
+          if (publicLaunchInfo().paidLaunch && !this.deps.store.policyAcceptances(current.user.id)
+            .some((acceptance) => acceptance.context === 'signup')) {
+            return this.json(res, 200, { authRequired: true, authenticated: false, policyAcceptanceRequired: true,
+              user: current.user, sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+              google: this.deps.identity.googleEnabled, github: this.deps.identity.githubEnabled });
+          }
           const onboardingKey = `git:onboarding:${current.user.id}`;
           // Better Auth creates social-login users inside its callback route,
           // bypassing /api/signup. Complete the same karmax-side provisioning on
@@ -1030,7 +1041,49 @@ export class Gateway {
       }
       return this.json(res, 200, { authRequired: true });
     }
+    if (p === '/api/launch' && method === 'GET') return this.json(res, 200, publicLaunchInfo());
+    const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
+    if (legalMatch && method === 'GET') {
+      const document = policyDocument(legalMatch[1]!);
+      return document ? this.json(res, 200, document) : this.json(res, 404, { error: 'policy not found' });
+    }
+    if (p === '/api/legal/preaccept' && method === 'POST') {
+      try {
+        const body = await this.body(req);
+        const versions = assertPolicyAcceptance('signup', body.accepted, body.versions);
+        const token = crypto.randomBytes(32).toString('base64url');
+        const hash = crypto.createHash('sha256').update(token).digest('hex');
+        const now = Date.now();
+        for (const [key, pending] of this.pendingPolicyAcceptances) {
+          if (pending.expiresAt < now) this.pendingPolicyAcceptances.delete(key);
+        }
+        if (this.pendingPolicyAcceptances.size >= 10_000)
+          return this.json(res, 429, { error: 'too many pending signup attempts; try again shortly' });
+        this.pendingPolicyAcceptances.set(hash, { versions, expiresAt: now + 15 * 60_000 });
+        res.setHeader('set-cookie', `krmax_policy_acceptance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=900${this.deps.hosted ? '; Secure' : ''}`);
+        return this.json(res, 200, { ok: true, versions });
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (p === '/api/legal/complete-signup' && method === 'POST' && this.deps.identity) {
+      const current = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!current) return this.json(res, 401, { error: 'sign in before completing policy acceptance' });
+      try {
+        const body = await this.body(req);
+        const versions = assertPolicyAcceptance('signup', body.accepted, body.versions);
+        this.deps.store.recordPolicyAcceptance({ userId: current.user.id, email: current.user.email,
+          context: 'signup', versions });
+        return this.json(res, 200, { ok: true, versions });
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     if (p.startsWith('/api/auth/') && this.deps.identity) {
+      // Public account creation goes through /api/signup, where the immutable
+      // policy-version evidence is validated and recorded. Better Auth's direct
+      // sign-up route would otherwise be an undocumented acceptance bypass.
+      if (p === '/api/auth/sign-up/email') return this.json(res, 404, { error: 'use /api/signup to create an account' });
       const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim();
       const origin = process.env.KARMAX_PUBLIC_URL || `${forwardedProto || 'http'}://${req.headers.host || 'localhost'}`;
       const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, 2 * 1024 * 1024);
@@ -1312,6 +1365,7 @@ export class Gateway {
       if (!this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'set up the first administrator before signing up' });
       const b = await this.body(req);
       try {
+        const versions = assertPolicyAcceptance('signup', b.acceptedPolicies, b.policyVersions);
         const response = await this.deps.identity.signUp(
           { name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') },
           requestHeaders(req.headers),
@@ -1331,6 +1385,8 @@ export class Gateway {
         if (userId) {
           this.provisionPersonalWorkspace(userId, String(created?.user?.name ?? b.name ?? ''));
           this.deps.store.kvSet(`git:onboarding:${userId}`, 'pending');
+          this.deps.store.recordPolicyAcceptance({ userId, email: String(created?.user?.email ?? b.email ?? ''),
+            context: 'signup', versions });
         }
         return this.sendWebResponse(res, response);
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
@@ -1469,6 +1525,19 @@ export class Gateway {
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
       }
+      if (p === '/api/user/account-deletion-request' && method === 'POST') {
+        const subject = requireInteractiveHuman(callerIdentity);
+        const privacyContact = publicLaunchInfo().contacts.privacy;
+        const request = { requestedAt: Date.now(), userId: subject.userId, email: session.email };
+        store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request));
+        if (privacyContact && this.deps.email?.configured()) {
+          await this.deps.email.send({ to: privacyContact, subject: 'krmax account deletion request',
+            text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${session.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
+            .catch((error) => console.error('[privacy] deletion-request notification failed:', error instanceof Error ? error.message : error));
+        }
+        return this.json(res, 202, { ...request, privacyContact: privacyContact ?? null,
+          next: 'We will verify ownership and organization/resource transfer needs before irreversible deletion.' });
+      }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireInteractiveHuman(callerIdentity);
         if (method === 'GET') {
@@ -1555,6 +1624,7 @@ export class Gateway {
           authentication: identityData.authentication,
           git: { defaultProfile: gitProfiles.defaultProfile() ?? null, profiles: gitProfiles.list() },
           security,
+          policyAcceptances: store.policyAcceptances(subject.userId),
           ...linkedData,
         };
         const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
@@ -1703,9 +1773,22 @@ export class Gateway {
           if (action === 'checkout') {
             const body = await this.body(req);
             const plan = String(body.plan ?? '');
+            assertPaidLaunchReady();
+            const versions = assertPolicyAcceptance('checkout', body.acceptedPolicies, body.policyVersions);
             const result = await billing.checkout(organizationId, plan,
               { success: `${settingsBase}?billing=success#settings-billing`,
                 cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
+            store.recordPolicyAcceptance({
+              userId: billingSubject.userId,
+              email: session.email,
+              organizationId,
+              context: 'checkout',
+              versions,
+              checkoutRequestReference: result.checkoutRequestReference,
+              checkoutSessionReference: result.checkoutSessionReference,
+              commercialTerms: { ...result.commercialTerms, ...CHECKOUT_DISCLOSURES,
+                checkoutProvider: result.checkoutProvider },
+            });
             return this.json(res, 200, result);
           }
           if (action === 'portal') return this.json(res, 200, await billing.portal(organizationId, settingsUrl, idempotencyKey));
@@ -6613,6 +6696,8 @@ export class Gateway {
     if (!this.deps.identity) return undefined;
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
+    if (publicLaunchInfo().paidLaunch && !this.deps.store.policyAcceptances(identity.user.id)
+      .some((acceptance) => acceptance.context === 'signup')) return undefined;
     const principal = `user:${identity.user.id}`;
     const resolvedOrganizationId = organizationId ?? (projectId ? this.deps.store.getProject(projectId)?.organizationId : undefined);
     if (resolvedOrganizationId) {
@@ -6674,6 +6759,25 @@ export class Gateway {
     const key = hostedOnboardingKey(userId, organizationId);
     if (!this.deps.store.kvGet(key))
       this.deps.store.kvSet(key, JSON.stringify({ display: 'expanded' }));
+  }
+
+  /** Bind the pre-OAuth affirmative click to the identity returned by the social
+   * provider. The opaque, short-lived HttpOnly cookie contains no policy data or
+   * user identifier; the server consumes its hashed one-time record here. */
+  private consumeSignupPolicyAcceptance(req: http.IncomingMessage, userId: string, email: string): void {
+    const cookie = String(req.headers.cookie ?? '').split(';').map((part) => part.trim())
+      .find((part) => part.startsWith('krmax_policy_acceptance='));
+    const token = cookie?.slice(cookie.indexOf('=') + 1);
+    if (!token) return;
+    const hash = crypto.createHash('sha256').update(token).digest('hex');
+    const pending = this.pendingPolicyAcceptances.get(hash);
+    if (!pending) return;
+    this.pendingPolicyAcceptances.delete(hash);
+    try {
+      if (Number(pending.expiresAt) < Date.now()) return;
+      const versions = assertPolicyAcceptance('signup', true, pending.versions);
+      this.deps.store.recordPolicyAcceptance({ userId, email, context: 'signup', versions });
+    } catch { /* malformed/expired evidence is deliberately not recorded */ }
   }
 
   /** Installation-wide outbound email config (single row; operator-managed). */
