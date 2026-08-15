@@ -38,6 +38,10 @@ export interface OrganizationEntitlements {
   includedActiveUsers: number | null;
   monthlyAdditionalActiveUserPriceCents: number | null;
   maxMembers: number | null;
+  currentMemberCount: number;
+  overMemberLimit: boolean;
+  memberAdmissionAllowed: boolean;
+  agentRunAdmissionAllowed: boolean;
   maxActiveAgentRuns: number | null;
   unlimitedProjects: true;
 }
@@ -60,20 +64,29 @@ export function hostedMonthlyPriceCents(plan: HostedPlanId, activeUsers: number)
 }
 
 /** Private installations deliberately have no monetization limits. */
-export function organizationEntitlements(plan: HostedPlanId, hosted: boolean): OrganizationEntitlements {
+export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
+  currentMemberCount = 0): OrganizationEntitlements {
+  const members = Math.max(0, Math.floor(Number(currentMemberCount) || 0));
   if (!hosted) return {
     deployment: 'private', plan: null, planName: 'Private installation',
     monthlyBasePriceCents: null, includedActiveUsers: null,
     monthlyAdditionalActiveUserPriceCents: null, maxMembers: null,
+    currentMemberCount: members, overMemberLimit: false,
+    memberAdmissionAllowed: true, agentRunAdmissionAllowed: true,
     maxActiveAgentRuns: null, unlimitedProjects: true,
   };
   const definition = hostedPlan(plan);
+  const overMemberLimit = definition.maxMembers != null && members > definition.maxMembers;
   return {
     deployment: 'hosted', plan, planName: definition.name,
     monthlyBasePriceCents: definition.monthlyBasePriceCents,
     includedActiveUsers: definition.includedActiveUsers,
     monthlyAdditionalActiveUserPriceCents: definition.monthlyAdditionalActiveUserPriceCents,
     maxMembers: definition.maxMembers,
+    currentMemberCount: members,
+    overMemberLimit,
+    memberAdmissionAllowed: definition.maxMembers == null || members < definition.maxMembers,
+    agentRunAdmissionAllowed: !overMemberLimit,
     maxActiveAgentRuns: definition.maxActiveAgentRuns,
     unlimitedProjects: true,
   };

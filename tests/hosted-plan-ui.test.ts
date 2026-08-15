@@ -23,6 +23,7 @@ describe('hosted plan organization UI', () => {
     const free = markup({
       deployment: 'hosted', planName: 'Free', currentMonthlyPriceCents: 0,
       maxMembers: 1, unlimitedProjects: true, maxActiveAgentRuns: 1,
+      currentMemberCount: 1, overMemberLimit: false,
       activeAgentRuns: 1, queuedAgentRuns: 2,
     });
     expect(free).toContain('Free');
@@ -39,12 +40,28 @@ describe('hosted plan organization UI', () => {
     const team = markup({
       deployment: 'hosted', planName: 'Team', currentMonthlyPriceCents: 2_900,
       maxMembers: null, unlimitedProjects: true, maxActiveAgentRuns: 10,
+      currentMemberCount: 3, overMemberLimit: false,
       activeAgentRuns: 3, queuedAgentRuns: 0,
     });
     expect(team).toContain('Team');
     expect(team).toContain('$29/month');
-    expect(team).toContain('Unlimited users');
+    expect(team).toContain('3 active users · unlimited');
     expect(team).toContain('10 active agent runs');
+  });
+
+  it('shows an actionable paused state after an over-member downgrade', () => {
+    const overLimit = markup({
+      deployment: 'hosted', planName: 'Free', currentMonthlyPriceCents: 0,
+      currentMemberCount: 3, maxMembers: 1, overMemberLimit: true,
+      unlimitedProjects: true, maxActiveAgentRuns: 1, activeAgentRuns: 1, queuedAgentRuns: 2,
+    });
+    expect(overLimit).toContain('3 of 1 user · over limit');
+    expect(overLimit).toContain('Agent runs are paused');
+    expect(overLimit).toContain('Remove 2 extra members');
+    expect(overLimit).toContain('People &amp; authorization');
+    expect(overLimit).toContain('restore Team');
+    expect(overLimit).toContain('Running agents may finish');
+    expect(overLimit).toContain('no new agent run will start');
   });
 
   it('makes private-install behavior explicit instead of showing hosted limits', () => {

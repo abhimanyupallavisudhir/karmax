@@ -608,6 +608,23 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.signal('setAgentCapacity', { capacity: 1 });
     await expect.poll(async () => (await q()).capacity, { timeout: 10_000 }).toBe(1);
     expect((await q()).current).toHaveLength(2); // shrinking never kills running turns
+
+    await wf.signal('setAgentCapacity', { capacity: 0 });
+    await wf.signal('releaseAgentSlot', { taskId: held[0]!.taskId, turnId: held[0]!.turnId });
+    await expect.poll(async () => {
+      const view = await q();
+      return [view.capacity, view.current.map((x: any) => x.turnId), view.queue.map((x: any) => x.turnId)];
+    }, { timeout: 10_000 }).toEqual([
+      0,
+      [held[1]!.turnId],
+      [waiting[2]!.turnId, waiting[0]!.turnId, waiting[1]!.turnId],
+    ]);
+    await wf.signal('releaseAgentSlot', { taskId: held[1]!.taskId, turnId: held[1]!.turnId });
+    await expect.poll(async () => (await q()).current).toHaveLength(0);
+    expect((await q()).queue).toHaveLength(3); // blocked admission never promotes queued work
+
+    await wf.signal('setAgentCapacity', { capacity: 1 });
+    await expect.poll(async () => (await q()).current.map((x: any) => x.turnId)).toEqual([waiting[2]!.turnId]);
     await wf.terminate('test done');
   });
 

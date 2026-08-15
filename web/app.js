@@ -13372,13 +13372,20 @@ function organizationPlanMarkup(entitlements) {
   if (!entitlements) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
   if (entitlements.deployment === 'private') return `<div class="section-h">Private installation</div>
     <p class="task-sub">Hosted plan restrictions are not applied. Users, projects, and active agent runs are limited only by this installation’s own capacity settings.</p>`;
-  const users = entitlements.maxMembers == null ? 'Unlimited users' : `${entitlements.maxMembers} user${entitlements.maxMembers === 1 ? '' : 's'}`;
+  const memberCount = Number(entitlements.currentMemberCount ?? entitlements.activeUsers ?? 0);
+  const users = entitlements.maxMembers == null
+    ? `${memberCount} active user${memberCount === 1 ? '' : 's'} · unlimited`
+    : `${memberCount} of ${entitlements.maxMembers} user${entitlements.maxMembers === 1 ? '' : 's'}${entitlements.overMemberLimit ? ' · over limit' : ''}`;
   const projects = entitlements.unlimitedProjects ? 'Unlimited projects' : `${entitlements.maxProjects} projects`;
   const runs = `${entitlements.maxActiveAgentRuns} active agent run${entitlements.maxActiveAgentRuns === 1 ? '' : 's'}`;
   const monthly = Number(entitlements.currentMonthlyPriceCents || 0) / 100;
   const price = monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
   const usage = `${entitlements.activeAgentRuns || 0} active · ${entitlements.queuedAgentRuns || 0} queued`;
+  const memberWarning = entitlements.overMemberLimit
+    ? `<div class="card" style="padding:10px;border-color:var(--warn);margin:10px 0"><b>Agent runs are paused</b><div class="task-sub">${esc(entitlements.planName)} allows ${esc(entitlements.maxMembers)} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${esc(memberCount)}. Remove ${esc(memberCount - entitlements.maxMembers)} extra member${memberCount - entitlements.maxMembers === 1 ? '' : 's'} in <a href="#settings-people">People &amp; authorization</a>, or restore Team. Running agents may finish; no new agent run will start until this is resolved.</div></div>`
+    : '';
   return `<div class="section-h">${esc(entitlements.planName)} <span class="chip">${esc(price)}</span></div>
+    ${memberWarning}
     <div class="settings-grid"><label class="form-row">People<input value="${esc(users)}" readonly></label><label class="form-row">Projects<input value="${esc(projects)}" readonly></label><label class="form-row">Agent concurrency<input value="${esc(runs)}" readonly></label><label class="form-row">Current agent usage<input value="${esc(usage)}" readonly></label></div>
     <p class="task-sub">Concurrency is a shared maximum for this organization. Work above the limit waits in queue; it is not reserved capacity.</p>`;
 }

@@ -136,6 +136,7 @@ export function createAgentTurnLeaser(
     activeScope = scope;
     let slotHeld = false;
     let slotRequested = false;
+    let queueId: string | undefined;
     try {
       return await scope.run(async () => {
         if (durableAdmission) {
@@ -152,14 +153,23 @@ export function createAgentTurnLeaser(
           });
           if (usesHostCapacity) {
             slotRequested = true;
-            const admission = await coord.requestAgentSlot({
-              taskId: host.taskId,
-              turnId,
-              role,
-              provider,
-              title: host.task().title,
-              projectId: host.projectId,
-            });
+            let admission;
+            for (;;) {
+              admission = await coord.requestAgentSlot({
+                taskId: host.taskId,
+                turnId,
+                role,
+                provider,
+                title: host.task().title,
+                projectId: host.projectId,
+              });
+              queueId = admission.queueId;
+              if (!admission.blocked) break;
+              host.setWaitingFor({ kind: 'agentSlot', provider, detail: admission.detail });
+              await host.publish();
+              await condition(() => host.cancelled(), '30 seconds');
+              if (host.cancelled()) throw new AgentTurnCancelled();
+            }
             slotHeld = admission.granted || slotGrants.delete(turnId);
             if (!slotHeld) {
               host.setWaitingFor({
@@ -192,8 +202,8 @@ export function createAgentTurnLeaser(
     } finally {
       slotGrants.delete(turnId);
       if (durableAdmission && slotRequested) {
-        if (slotHeld) await coord.releaseAgentSlot(host.taskId, turnId).catch(() => undefined);
-        else await coord.cancelAgentSlot(host.taskId, turnId).catch(() => undefined);
+        if (slotHeld) await coord.releaseAgentSlot(host.taskId, turnId, queueId).catch(() => undefined);
+        else await coord.cancelAgentSlot(host.taskId, turnId, queueId).catch(() => undefined);
       }
       if (activeScope === scope) activeScope = undefined;
       if (currentTurn?.turnId === turnId) {

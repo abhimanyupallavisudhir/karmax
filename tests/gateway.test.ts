@@ -40,10 +40,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
   it('reports private-install entitlements without hosted restrictions', async () => {
     const organizationId = h.store.getProject(h.store.listProjects()[0]?.id ?? '')?.organizationId ?? 'org_personal';
+    const currentMemberCount = h.store.listOrganizationMemberships(organizationId).length;
     const response = await fetch(`${base}/api/organizations/${organizationId}/entitlements`, { headers: auth() });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       deployment: 'private', plan: null, maxMembers: null, maxActiveAgentRuns: null,
+      currentMemberCount, overMemberLimit: false,
+      memberAdmissionAllowed: true, agentRunAdmissionAllowed: true,
       unlimitedProjects: true, activeAgentRuns: 0, queuedAgentRuns: 0,
     });
   });

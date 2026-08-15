@@ -1125,7 +1125,8 @@ export class Store {
   organizationEntitlements(organizationId: string): OrganizationEntitlements {
     const organization = this.getOrganization(organizationId);
     if (!organization) throw new Error(`no organization ${organizationId}`);
-    return organizationEntitlements(organization.plan, this.hosted);
+    return organizationEntitlements(organization.plan, this.hosted,
+      this.listOrganizationMemberships(organizationId).length);
   }
 
   /** Billing's sole plan mutation boundary. Pricing and limits remain in the
@@ -1141,8 +1142,14 @@ export class Store {
     if (!this.hosted || (userId && this.organizationMembership(organizationId, userId))) return;
     const entitlements = this.organizationEntitlements(organizationId);
     if (entitlements.maxMembers == null) return;
-    const count = this.listOrganizationMemberships(organizationId).length;
-    if (count < entitlements.maxMembers) return;
+    const count = entitlements.currentMemberCount;
+    if (entitlements.memberAdmissionAllowed) return;
+    if (entitlements.overMemberLimit) {
+      const extra = count - entitlements.maxMembers;
+      throw new EntitlementError(
+        `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${count}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team before adding another person.`,
+      );
+    }
     throw new EntitlementError(
       `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}. Upgrade the plan before adding another person.`,
     );

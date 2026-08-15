@@ -1642,6 +1642,7 @@ async function softwareDevImpl(
       }
       let slotHeld = false;
       let slotRequested = false;
+      let agentQueueIdentity: string | undefined;
       try {
         return await runCancellable(async () => {
           if (durableAgentAdmission) {
@@ -1657,14 +1658,23 @@ async function softwareDevImpl(
             });
             if (usesHostCapacity) {
               slotRequested = true;
-              const admission = await coordinator.requestAgentSlot({
-                taskId,
-                turnId,
-                role,
-                provider,
-                title: input.title,
-                projectId: input.projectId,
-              });
+              let admission;
+              for (;;) {
+                admission = await coordinator.requestAgentSlot({
+                  taskId,
+                  turnId,
+                  role,
+                  provider,
+                  title: input.title,
+                  projectId: input.projectId,
+                });
+                agentQueueIdentity = admission.queueId;
+                if (!admission.blocked) break;
+                waitingFor = { kind: 'agentSlot', provider, detail: admission.detail };
+                await publish();
+                await condition(() => cancelled, '30 seconds');
+                if (cancelled) throw new Cancelled();
+              }
               slotHeld = admission.granted || agentSlotGrants.delete(turnId);
               if (!slotHeld) {
                 waitingFor = {
@@ -1698,8 +1708,8 @@ async function softwareDevImpl(
       } finally {
         agentSlotGrants.delete(turnId);
         if (durableAgentAdmission && slotRequested) {
-          if (slotHeld) await coordinator.releaseAgentSlot(taskId, turnId).catch(() => undefined);
-          else await coordinator.cancelAgentSlot(taskId, turnId).catch(() => undefined);
+          if (slotHeld) await coordinator.releaseAgentSlot(taskId, turnId, agentQueueIdentity).catch(() => undefined);
+          else await coordinator.cancelAgentSlot(taskId, turnId, agentQueueIdentity).catch(() => undefined);
         }
         if (liveAgentStates && agentTurn?.turnId === turnId) {
           agentTurn = undefined;

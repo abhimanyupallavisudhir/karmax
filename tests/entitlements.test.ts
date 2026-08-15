@@ -96,6 +96,42 @@ describe('hosted plan entitlements', () => {
     expect(store.listOrganizationMemberships(organization.id)).toHaveLength(1);
   });
 
+  it.each(['free', 'individual'] as const)(
+    'makes a Team → %s downgrade non-destructive and recovers after extra members are removed',
+    (plan) => {
+      const store = new Store(':memory:', { hosted: true });
+      const organization = store.createOrganization({ name: `Downgrade ${plan}`, ownerUserId: 'owner' });
+      store.setOrganizationPlan(organization.id, 'team');
+      store.setOrganizationMembership(organization.id, 'second', 'member');
+      store.setOrganizationMembership(organization.id, 'third', 'member');
+
+      store.setOrganizationPlan(organization.id, plan);
+      expect(store.listOrganizationMemberships(organization.id)).toHaveLength(3);
+      expect(store.organizationEntitlements(organization.id)).toMatchObject({
+        plan,
+        currentMemberCount: 3,
+        maxMembers: 1,
+        overMemberLimit: true,
+        memberAdmissionAllowed: false,
+        agentRunAdmissionAllowed: false,
+      });
+      expect(() => store.setOrganizationMembership(organization.id, 'fourth', 'member'))
+        .toThrow(`Remove 2 members or restore Team`);
+
+      store.removeOrganizationMembership(organization.id, 'second');
+      expect(store.organizationEntitlements(organization.id)).toMatchObject({
+        currentMemberCount: 2, overMemberLimit: true, agentRunAdmissionAllowed: false,
+      });
+      store.removeOrganizationMembership(organization.id, 'third');
+      expect(store.organizationEntitlements(organization.id)).toMatchObject({
+        currentMemberCount: 1,
+        overMemberLimit: false,
+        memberAdmissionAllowed: false,
+        agentRunAdmissionAllowed: true,
+      });
+    },
+  );
+
   it('requires hosted remote subscription turns to pass through admission', async () => {
     const hostedStore = new Store(':memory:', { hosted: true });
     const privateStore = new Store(':memory:');
@@ -114,6 +150,46 @@ describe('hosted plan entitlements', () => {
 });
 
 describe('hosted agent-run admission integration', () => {
+  it('blocks new run admission while over the member limit and reopens after recovery', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, 'team');
+    store.setOrganizationMembership(organization.id, 'second', 'member');
+    store.setOrganizationMembership(organization.id, 'third', 'member');
+    const project = store.createProject('Product', {}, organization.id);
+    const task = store.createTask({
+      projectId: project.id, title: 'Blocked', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Run' },
+    });
+    store.setOrganizationPlan(organization.id, 'free');
+    const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 1 }));
+    const signalWithStart = vi.fn(async () => undefined);
+    const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {
+      workflow: { signalWithStart, getHandle: vi.fn(() => ({ executeUpdate, signal: vi.fn(async () => undefined) })) },
+    } as any });
+
+    await expect(activities.requestAgentSlot({
+      taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
+    })).resolves.toMatchObject({
+      granted: false, blocked: true, capacity: 0, queueId: `agent-queue:${organization.id}`,
+      detail: 'Free allows 1 organization user, but this organization has 3. Remove 2 members or restore Team to start another agent run.',
+    });
+    expect(executeUpdate).not.toHaveBeenCalled();
+    expect(signalWithStart).toHaveBeenLastCalledWith('agentQueue', expect.objectContaining({
+      workflowId: `agent-queue:${organization.id}`,
+      args: [{ capacity: 0 }],
+      signalArgs: [{ capacity: 0 }],
+    }));
+
+    store.removeOrganizationMembership(organization.id, 'second');
+    store.removeOrganizationMembership(organization.id, 'third');
+    await expect(activities.requestAgentSlot({
+      taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
+    })).resolves.toMatchObject({
+      granted: true, capacity: 1, queueId: `agent-queue:${organization.id}`,
+    });
+    expect(executeUpdate).toHaveBeenCalledOnce();
+  });
+
   it('uses a durable organization queue and refreshes its capacity from plan changes', async () => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
@@ -159,6 +235,43 @@ describe('hosted agent-run admission integration', () => {
     await activities.releaseAgentSlot(task.id, `${task.id}#1`);
     expect(getHandle).toHaveBeenLastCalledWith(`agent-queue:${organization.id}`);
     expect(signal).toHaveBeenLastCalledWith('releaseAgentSlot', { taskId: task.id, turnId: `${task.id}#1` });
+  });
+
+  it('releases and cancels through the durable queue identity after task deletion', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Cleanup', ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, 'individual');
+    const project = store.createProject('Cleanup project', {}, organization.id);
+    const held = store.createTask({
+      projectId: project.id, title: 'Held', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Held' },
+    });
+    const waiting = store.createTask({
+      projectId: project.id, title: 'Waiting', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Waiting' },
+    });
+    const signal = vi.fn(async () => undefined);
+    const executeUpdate = vi.fn()
+      .mockResolvedValueOnce({ granted: true, position: 0, capacity: 5 })
+      .mockResolvedValueOnce({ granted: false, position: 1, capacity: 5 });
+    const getHandle = vi.fn(() => ({ executeUpdate, signal }));
+    const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {
+      workflow: { signalWithStart: vi.fn(async () => undefined), getHandle },
+    } as any });
+    const heldAdmission = await activities.requestAgentSlot({
+      taskId: held.id, turnId: `${held.id}#0`, role: 'do', projectId: project.id,
+    });
+    const waitingAdmission = await activities.requestAgentSlot({
+      taskId: waiting.id, turnId: `${waiting.id}#0`, role: 'do', projectId: project.id,
+    });
+
+    store.deleteTask(held.id);
+    store.deleteTask(waiting.id);
+    await activities.releaseAgentSlot(held.id, `${held.id}#0`, heldAdmission.queueId);
+    await activities.cancelAgentSlot(waiting.id, `${waiting.id}#0`, waitingAdmission.queueId);
+
+    expect(getHandle).toHaveBeenNthCalledWith(3, `agent-queue:${organization.id}`);
+    expect(getHandle).toHaveBeenNthCalledWith(4, `agent-queue:${organization.id}`);
+    expect(signal).toHaveBeenCalledWith('releaseAgentSlot', { taskId: held.id, turnId: `${held.id}#0` });
+    expect(signal).toHaveBeenCalledWith('cancelAgentSlot', { taskId: waiting.id, turnId: `${waiting.id}#0` });
   });
 
   it('keeps the configurable host queue for private installations', async () => {

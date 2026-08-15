@@ -41,23 +41,46 @@ export interface CoordinatorActivityDeps {
     organizationEntitlements(organizationId: string): {
       planName: string;
       maxActiveAgentRuns: number | null;
+      currentMemberCount: number;
+      maxMembers: number | null;
+      overMemberLimit: boolean;
+      agentRunAdmissionAllowed: boolean;
     };
   };
 }
 
 function agentQueueTarget(deps: CoordinatorActivityDeps,
-  item: { taskId: string; projectId?: string }): { workflowId: string; capacity: number; detail?: string } {
+  item: { taskId: string; projectId?: string; queueId?: string }): {
+    workflowId: string;
+    capacity: number;
+    detail?: string;
+    blocked?: boolean;
+  } {
   if (deps.store?.hosted) {
-    const projectId = item.projectId ?? deps.store.getTask(item.taskId)?.projectId;
-    const organizationId = projectId ? deps.store.getProject(projectId)?.organizationId : undefined;
+    const durableOrganizationId = item.queueId?.startsWith('agent-queue:')
+      ? item.queueId.slice('agent-queue:'.length)
+      : undefined;
+    const projectId = durableOrganizationId ? undefined : item.projectId ?? deps.store.getTask(item.taskId)?.projectId;
+    const organizationId = durableOrganizationId
+      ?? (projectId ? deps.store.getProject(projectId)?.organizationId : undefined);
     if (!organizationId) throw new Error(`cannot resolve the organization for agent turn ${item.taskId}`);
     const entitlements = deps.store.organizationEntitlements(organizationId);
-    const capacity = entitlements.maxActiveAgentRuns;
-    if (capacity == null) throw new Error(`hosted organization ${organizationId} has no active-run entitlement`);
+    const planCapacity = entitlements.maxActiveAgentRuns;
+    if (planCapacity == null) throw new Error(`hosted organization ${organizationId} has no active-run entitlement`);
+    if (!entitlements.agentRunAdmissionAllowed) {
+      const limit = entitlements.maxMembers ?? 0;
+      const extra = Math.max(1, entitlements.currentMemberCount - limit);
+      return {
+        workflowId: agentQueueId(organizationId),
+        capacity: 0,
+        blocked: true,
+        detail: `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team to start another agent run.`,
+      };
+    }
     return {
       workflowId: agentQueueId(organizationId),
-      capacity,
-      detail: `Waiting for ${entitlements.planName} plan capacity (${capacity} active agent run${capacity === 1 ? '' : 's'})`,
+      capacity: planCapacity,
+      detail: `Waiting for ${entitlements.planName} plan capacity (${planCapacity} active agent run${planCapacity === 1 ? '' : 's'})`,
     };
   }
   const saved = Number(deps.store?.getSettings('global', 'agent-queue')?.capacity);
@@ -172,7 +195,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: string;
       title?: string;
       projectId?: string;
-    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string }> {
+    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string; blocked?: boolean; queueId: string }> {
       const target = agentQueueTarget(deps, item);
       await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
         workflowId: target.workflowId,
@@ -184,14 +207,22 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_SET_AGENT_CAPACITY,
         signalArgs: [{ capacity: target.capacity }],
       });
+      if (target.blocked) return {
+        granted: false,
+        position: -1,
+        capacity: 0,
+        blocked: true,
+        queueId: target.workflowId,
+        detail: target.detail,
+      };
       const admission = await client.workflow.getHandle(target.workflowId).executeUpdate(UPD_REQUEST_AGENT, {
         args: [item],
       }) as { granted: boolean; position: number; capacity: number };
-      return { ...admission, ...(target.detail ? { detail: target.detail } : {}) };
+      return { ...admission, queueId: target.workflowId, ...(target.detail ? { detail: target.detail } : {}) };
     },
-    async cancelAgentSlot(taskId: string, turnId: string): Promise<void> {
+    async cancelAgentSlot(taskId: string, turnId: string, queueId?: string): Promise<void> {
       try {
-        const target = agentQueueTarget(deps, { taskId });
+        const target = agentQueueTarget(deps, { taskId, queueId });
         const handle = client.workflow.getHandle(target.workflowId);
         // Re-read the plan at every queue mutation as well as every request. In
         // particular, a downgrade must be applied before releasing a lease can
@@ -202,9 +233,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         /* coordinator gone — nothing to cancel */
       }
     },
-    async releaseAgentSlot(taskId: string, turnId: string): Promise<void> {
+    async releaseAgentSlot(taskId: string, turnId: string, queueId?: string): Promise<void> {
       try {
-        const target = agentQueueTarget(deps, { taskId });
+        const target = agentQueueTarget(deps, { taskId, queueId });
         const handle = client.workflow.getHandle(target.workflowId);
         await handle.signal(SIG_SET_AGENT_CAPACITY, { capacity: target.capacity });
         await handle.signal(SIG_RELEASE_AGENT, { taskId, turnId });
