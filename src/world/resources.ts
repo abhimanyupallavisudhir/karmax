@@ -380,7 +380,8 @@ export class ProjectResourceService {
     this.store.promoteResourceRevision(attachmentId, revision.id, attachment.currentRevisionId);
     this.store.recordUsage({ organizationId: attachment.organizationId, projectId: attachment.projectId,
       taskId: createdByTaskId, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes,
-      unit: 'byte', costMicros: 0, startedAt: revision.createdAt, endedAt: revision.createdAt,
+      unit: 'byte', costMicros: 0, fundingSource: this.store.getStorageLocation(captured.storageLocationId ?? '')?.kind === 's3' ? 'byok' : 'managed',
+      startedAt: revision.createdAt, endedAt: revision.createdAt,
       metadata: { attachmentId, revisionId: revision.id, files: captured.files } });
     return revision;
   }
@@ -554,7 +555,8 @@ export class ProjectResourceService {
       this.store.promoteResourceRevision(attachment.id, revision.id);
       this.store.recordUsage({ organizationId: project.organizationId!, projectId: project.id, taskId,
         worldId: handle.id, provider: this.engine.id, kind: 'resource.storage', quantity: captured.bytes, unit: 'byte',
-        costMicros: 0, startedAt: candidate.createdAt, endedAt: candidate.createdAt,
+        costMicros: 0, fundingSource: this.store.getStorageLocation(captured.storageLocationId ?? '')?.kind === 's3' ? 'byok' : 'managed',
+        startedAt: candidate.createdAt, endedAt: candidate.createdAt,
         metadata: { candidateId: candidate.id, attachmentId: attachment.id, revisionId: revision.id, files: captured.files } });
       this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:candidate-stage',
         scopeKey: `project:${project.id}`, detail: { candidateId: candidate.id, attachmentId: attachment.id,

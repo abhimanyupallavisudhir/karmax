@@ -56,6 +56,20 @@ describe('organization storage locations', () => {
       .not.toThrow();
   });
 
+  it('counts promoted artifacts against the same managed organization quota', () => {
+    const f = fixture(1024);
+    const managed = f.locations.defaultLocation(f.project.organizationId!);
+    const task = f.store.createTask({ projectId: f.project.id, title: 'Artifact', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'artifact' } as any });
+    f.store.savePromotedArtifact({ id: 'artifact-1', organizationId: f.project.organizationId!,
+      projectId: f.project.id, taskId: task.id, objectKey: 'artifact-1', sha256: 'abc', bytes: 800,
+      mediaType: 'application/octet-stream', name: 'artifact.bin', createdAt: Date.now() });
+
+    expect(f.locations.view(f.project.organizationId!, managed.id).usage.retainedBytes).toBe(800);
+    expect(() => f.locations.reserveUpload('artifact-2', f.project.organizationId!, managed.id, 300, Date.now() + 60_000))
+      .toThrow(/upload quota exceeded/i);
+  });
+
   it('keeps customer S3 secrets vaulted and pins revisions to the tested location', async () => {
     const f = fixture(1024);
     const objects = new Map<string, Buffer>();

@@ -279,9 +279,15 @@ export interface UsageEvent {
   taskId?: string;
   worldId?: string;
   provider: string;
-  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.tokens';
+  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
+  /** Who pays the upstream bill. `managed` is installation-funded and is
+   * disabled in hosted mode until an owner sets an explicit spend cap. */
+  fundingSource?: 'managed' | 'byok' | 'customer';
+  /** Whether costMicros is an upstream-incurred amount or a conservative
+   * estimate used when the provider did not expose priceable usage. */
+  costClassification?: 'incurred' | 'estimated' | 'none';
   quantity: number;
-  unit: 'second' | 'byte' | 'byte-second' | 'token';
+  unit: 'second' | 'byte' | 'byte-second' | 'request' | 'token';
   costMicros: number;
   startedAt: number;
   endedAt: number;
@@ -681,6 +687,25 @@ export interface OrganizationExecutionPolicy {
   environment?: ProjectConfig['environment'];
   monthlyBudgetMicros?: number;
   hibernateAfterMs?: number;
+}
+
+/** Trusted admission policy for hosted, organization-attributed work. Empty
+ * allowlists mean "all connected BYOK providers/models"; they never authorize
+ * an installation credential. Managed model rails require both an explicit
+ * provider boundary and an owner-set spend cap. */
+export interface OrganizationUsagePolicy {
+  managedSpendCapMicros?: number;
+  managedModelProviders: string[];
+  allowedModelProviders: string[];
+  allowedModels: string[];
+  maxAgentStartsPerMinute: number;
+  maxRemoteStartsPerMinute: number;
+  /** Optional owner-selected cap. Hosted admission clamps it to the central
+   * plan entitlement; omission means the marketed plan limit exactly. */
+  maxActiveAgentTurns?: number;
+  /** Computed, never persisted: min(owner cap, plan entitlement). */
+  effectiveMaxActiveAgentTurns: number;
+  maxActiveWorlds: number;
 }
 
 // ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────

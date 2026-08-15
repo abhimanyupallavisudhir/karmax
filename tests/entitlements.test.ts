@@ -151,6 +151,63 @@ describe('hosted plan entitlements', () => {
 });
 
 describe('hosted agent-run admission integration', () => {
+  it.each([
+    ['free', 1],
+    ['individual', 5],
+    ['team', 10],
+  ] as const)('uses the central %s plan limit of %i at model admission without a second default', (plan, limit) => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: `Usage ${plan}`, ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, plan);
+    const project = store.createProject('Product', {}, organization.id);
+    expect(store.getOrganizationUsagePolicy(organization.id)).toMatchObject({
+      effectiveMaxActiveAgentTurns: limit,
+    });
+    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveAgentTurns).toBeUndefined();
+    for (let index = 0; index < limit; index++) {
+      const task = store.createTask({ projectId: project.id, title: `Run ${index}`, workflow: 'just-do',
+        workflowVersion: '1.0.0', params: { prompt: 'run' } });
+      expect(store.admitAgentUsage({ id: `turn-${index}`, organizationId: organization.id,
+        projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }))
+        .toEqual({ reused: false });
+    }
+    const overflow = store.createTask({ projectId: project.id, title: 'Overflow', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'run' } });
+    expect(() => store.admitAgentUsage({ id: 'overflow', organizationId: organization.id,
+      projectId: project.id, taskId: overflow.id, provider: 'openai', fundingSource: 'byok' }))
+      .toThrow(/active model turn limit/);
+  });
+
+  it('allows only an optional owner cap tighter than the central plan entitlement', () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Tighter cap', ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, 'team');
+    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 3 })).toMatchObject({
+      maxActiveAgentTurns: 3, effectiveMaxActiveAgentTurns: 3,
+    });
+    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 99 })).toMatchObject({
+      maxActiveAgentTurns: 10, effectiveMaxActiveAgentTurns: 10,
+    });
+    const restored = store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: undefined });
+    expect(restored.maxActiveAgentTurns).toBeUndefined();
+    expect(restored.effectiveMaxActiveAgentTurns).toBe(10);
+  });
+
+  it('blocks over-member organizations at the final model boundary before any provider spend', () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Usage downgrade', ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, 'team');
+    store.setOrganizationMembership(organization.id, 'second', 'member');
+    const project = store.createProject('Product', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Blocked', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'run' } });
+    store.setOrganizationPlan(organization.id, 'free');
+    expect(() => store.admitAgentUsage({ id: 'blocked-turn', organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' }))
+      .toThrow(/Remove 1 member or restore Team to start another agent run/);
+    expect(Number((store.db.prepare('SELECT COUNT(*) n FROM usage_admissions').get() as any).n)).toBe(0);
+  });
+
   it('reconciles the durable queue directly from member and billing-plan mutations', async () => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Reconcile', ownerUserId: 'owner' });
