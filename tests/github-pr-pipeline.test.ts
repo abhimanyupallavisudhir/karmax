@@ -691,10 +691,17 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     };
     await handle.signal('confirm');
 
-    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 30_000 }).toMatchObject({
+    // A workflow query can observe the in-memory assignment immediately before
+    // the awaited publishView activity commits it to SQLite. Assert the durable
+    // projection directly so this regression cannot pass (or flake) in that gap.
+    await expect.poll(() => h.store.getTask(task.id)?.lastView?.waitingFor,
+      { timeout: 30_000 }).toMatchObject({
       kind: 'human',
       summary: 'GitHub Actions approval required',
       detail: expect.stringMatching(/run CI #1.*concluded action_required.*Classification: human/is),
+    });
+    expect((await view(handle)).waitingFor).toMatchObject({
+      kind: 'human', summary: 'GitHub Actions approval required',
     });
     expect(h.store.getTask(task.id)?.lastView?.waitingFor).toMatchObject({
       kind: 'human', summary: 'GitHub Actions approval required',
