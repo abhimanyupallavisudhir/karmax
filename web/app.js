@@ -13326,13 +13326,18 @@ async function hydrateOrganizationSubscription(organizationId) {
       <p class="task-sub">Hosted subscription billing does not apply to this private installation. Your organization plans and agent payment cards remain locally managed.</p>`;
     return;
   }
-  const names = { free: 'Free', individual: 'Individual', team: 'Team' };
+  const catalog = Object.fromEntries((state.catalog || []).map((plan) => [plan.id, plan]));
+  const names = Object.fromEntries(Object.values(catalog).map((plan) => [plan.id, plan.name]));
+  const price = (cents) => `$${(Number(cents || 0) / 100).toLocaleString(undefined,
+    { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
   const statusNames = { none: 'free', active: 'active', trialing: 'trial', past_due: 'payment failed',
     unpaid: 'unpaid', incomplete: 'checkout incomplete', incomplete_expired: 'checkout expired',
     paused: 'paused', canceled: 'canceled' };
   const problem = ['past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused'].includes(state.status);
   const period = state.currentPeriodEnd ? new Date(state.currentPeriodEnd).toLocaleDateString() : '';
-  const seats = state.plan === 'team'
+  const billedPlan = state.billedPlan || state.plan;
+  const hasSubscription = billedPlan !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
+  const seats = billedPlan === 'team'
     ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'} · <b>${state.seats}</b> verified billed seat${state.seats === 1 ? '' : 's'}${state.seatDeficit ? ` · <span style="color:var(--danger)">${state.seatDeficit} awaiting reconciliation</span>` : ''}`
     : `<b>${state.activeUsers}</b> of 1 user`;
   const grace = state.access === 'grace' && state.graceEndsAt
@@ -13343,18 +13348,24 @@ async function hydrateOrganizationSubscription(organizationId) {
     : checkoutReturn === 'canceled'
       ? '<div class="card" style="margin:12px 0;padding:12px"><b>Checkout canceled</b><p class="task-sub">No plan change was applied.</p></div>' : '';
   const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until Stripe confirms payment.')}${esc(grace)}</p></div>` : '';
-  const planCards = state.plan === 'free' || state.status === 'canceled' ? `<div class="settings-grid" style="margin-top:14px">
-      <div class="card" style="padding:14px"><b>Individual</b><div class="section-h" style="margin-top:6px">$9 / month</div><p class="task-sub">One user.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${state.providerConfigured ? '' : 'disabled'}>Choose Individual</button></div>
-      <div class="card" style="padding:14px"><b>Team</b><div class="section-h" style="margin-top:6px">$19 / month</div><p class="task-sub">First user included, then $5 / additional active user / month.</p><button class="btn sm primary billing-checkout" data-plan="team" ${state.providerConfigured ? '' : 'disabled'}>Choose Team</button></div>
+  const individual = catalog.individual || {};
+  const team = catalog.team || {};
+  const ownerDisabled = state.canManage ? '' : 'disabled title="Only an organization owner can administer this subscription"';
+  const planCards = !hasSubscription ? `<div class="settings-grid" style="margin-top:14px">
+      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${state.providerConfigured ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
+      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month.</p><button class="btn sm primary billing-checkout" data-plan="team" ${state.providerConfigured ? ownerDisabled : 'disabled'}>Choose Team</button></div>
       <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
-  const changes = state.plan === 'individual' && ['active', 'trialing', 'past_due'].includes(state.status)
-    ? '<button class="btn sm billing-change" data-plan="team">Upgrade to Team</button>'
-    : state.plan === 'team' && ['active', 'trialing', 'past_due'].includes(state.status)
-      ? `<button class="btn sm billing-change" data-plan="individual" ${state.activeUsers > 1 ? 'disabled title="Remove additional active users first"' : ''}>Downgrade to Individual</button>` : '';
-  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[state.plan] || state.plan)} <span class="chip">${esc(statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}</span></span>
+  const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
+    ? 'disabled title="Remove additional active users first"' : '');
+  const changes = billedPlan === 'individual' && ['active', 'trialing', 'past_due'].includes(state.status)
+    ? `<button class="btn sm billing-change" data-plan="team" ${ownerDisabled}>Upgrade to Team</button>`
+    : billedPlan === 'team' && ['active', 'trialing', 'past_due'].includes(state.status)
+      ? `<button class="btn sm billing-change" data-plan="individual" ${downgradeDisabled}>Downgrade to Individual</button>` : '';
+  const effective = state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
+  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[billedPlan] || billedPlan)} <span class="chip">${esc(statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
     <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}
-    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${state.plan !== 'free' && state.status !== 'canceled' ? '<button class="btn sm billing-portal">Billing portal</button>' : ''}${state.plan !== 'free' && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? '<button class="btn sm danger billing-cancel">Cancel at period end</button>' : ''}${state.seatDeficit ? '<button class="btn sm billing-sync">Reconcile seats</button>' : ''}</div>
+    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.canManage ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
     <p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Plan and seat access changes only after a signed billing event is reconciled.</p>`;
   box.querySelectorAll('.billing-checkout').forEach((button) => button.addEventListener('click', async () => {
     button.disabled = true;

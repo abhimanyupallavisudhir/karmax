@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../src/store/db.js';
 import { FakeSubscriptionProvider, StripeSubscriptionProvider,
-  SubscriptionBillingService } from '../src/billing/subscriptions.js';
+  PAST_DUE_GRACE_MS, SubscriptionBillingService } from '../src/billing/subscriptions.js';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -22,7 +22,7 @@ const event = (id: string, type: string, object: any, created = 100) =>
 
 describe('hosted subscription billing', () => {
   it('derives plan and seats only from verified provider events and reconciles failures idempotently', async () => {
-    const store = new Store(':memory:');
+    const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const provider = new FakeSubscriptionProvider();
     const billing = new SubscriptionBillingService(store, provider, true);
@@ -33,6 +33,7 @@ describe('hosted subscription billing', () => {
     // A checkout response is not an entitlement claim. Until the signed
     // subscription event arrives, the organization is still Free.
     expect(billing.current(organization.id)).toMatchObject({ plan: 'free', status: 'none', seats: 1 });
+    expect(store.getOrganization(organization.id)?.plan).toBe('free');
     expect(await billing.checkout(organization.id, 'team',
       { success: 'https://ignored.test', cancel: 'https://ignored.test' }, 'checkout-request-1')).toEqual(checkout);
     expect(provider.calls.filter((call) => call.method === 'createCheckout')).toHaveLength(1);
@@ -52,6 +53,7 @@ describe('hosted subscription billing', () => {
     expect(billing.handleWebhook(event('evt_1', 'customer.subscription.updated', subscription))).toEqual({ duplicate: false });
     expect(billing.current(organization.id)).toMatchObject({ plan: 'team', status: 'active', seats: 3,
       activeUsers: 1, seatDeficit: 0, access: 'active' });
+    expect(store.getOrganization(organization.id)?.plan).toBe('team');
     expect(billing.handleWebhook(event('evt_1', 'customer.subscription.updated', subscription))).toEqual({ duplicate: true });
 
     billing.handleWebhook(event('evt_fail', 'invoice.payment_failed', {
@@ -72,12 +74,11 @@ describe('hosted subscription billing', () => {
   });
 
   it('keeps server customer mappings as the tenant boundary and synchronizes active Team users', async () => {
-    const store = new Store(':memory:');
+    const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const other = store.createOrganization({ name: 'Other', ownerUserId: 'other-owner' });
     const provider = new FakeSubscriptionProvider();
     const billing = new SubscriptionBillingService(store, provider, true);
-    expect(() => billing.assertMayAddMember(organization.id)).toThrow('upgrade');
     await billing.checkout(organization.id, 'team',
       { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-request-2');
 
@@ -90,11 +91,21 @@ describe('hosted subscription billing', () => {
     }));
     expect(billing.current(other.id).plan).toBe('free');
 
+    const retryId = 'evt_retry_after_reconciliation_error';
+    expect(() => billing.handleWebhook(event(retryId, 'customer.subscription.updated', {
+      id: 'sub_acme', customer: `cus_${organization.id}`, status: 'active',
+      items: { data: [{ id: 'si_unknown', price: { id: 'price_unknown' }, quantity: 1 }] },
+    }, 101))).toThrow('no configured Karmax plan price');
+    expect(billing.handleWebhook(event(retryId, 'customer.subscription.updated', {
+      id: 'sub_acme', customer: `cus_${organization.id}`, status: 'active',
+      items: { data: [{ id: 'si_individual', price: { id: 'price_individual' }, quantity: 1 }] },
+    }, 101))).toEqual({ duplicate: false });
+    expect(store.getOrganization(organization.id)?.plan).toBe('individual');
+
     billing.handleWebhook(event('evt_team', 'customer.subscription.updated', {
       id: 'sub_acme', customer: `cus_${organization.id}`, status: 'active',
       items: { data: [{ id: 'si_base', price: { id: 'price_team_base' }, quantity: 1 }] },
-    }));
-    expect(() => billing.assertMayAddMember(organization.id)).not.toThrow();
+    }, 102));
     store.setOrganizationMembership(organization.id, 'second', 'member');
     await billing.syncSeats(organization.id);
     expect(provider.calls.at(-1)).toMatchObject({ method: 'updateSeats', input: {
@@ -104,13 +115,73 @@ describe('hosted subscription billing', () => {
     expect(billing.current(organization.id)).toMatchObject({ seats: 1, activeUsers: 2, seatDeficit: 1 });
   });
 
+  it('derives every lifecycle entitlement and closes past-due grace without deleting members', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Lifecycle', ownerUserId: 'owner' });
+    const provider = new FakeSubscriptionProvider();
+    const billing = new SubscriptionBillingService(store, provider, true);
+    await billing.checkout(organization.id, 'team',
+      { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-lifecycle');
+    const subscription = (status: string) => ({
+      id: 'sub_lifecycle', customer: `cus_${organization.id}`, status,
+      items: { data: [{ id: 'si_base', price: { id: 'price_team_base' }, quantity: 1 }] },
+    });
+
+    billing.handleWebhook(event('evt_trial', 'customer.subscription.updated', subscription('trialing'), 200));
+    expect(store.getOrganization(organization.id)?.plan).toBe('team');
+    store.setOrganizationMembership(organization.id, 'second', 'member');
+
+    billing.handleWebhook(event('evt_past_due', 'invoice.payment_failed', {
+      id: 'in_lifecycle', customer: `cus_${organization.id}`, subscription: 'sub_lifecycle',
+    }, 210));
+    const graceEndsAt = billing.current(organization.id).graceEndsAt!;
+    expect(graceEndsAt).toBeGreaterThan(Date.now());
+    expect(store.getOrganization(organization.id)?.plan).toBe('team');
+
+    // The scheduled sweep derives Free from the already-verified failure once
+    // grace elapses; no later provider event and no destructive member removal
+    // are required.
+    billing.reconcileEntitlements(graceEndsAt + 1);
+    expect(store.getOrganization(organization.id)?.plan).toBe('free');
+    expect(store.listOrganizationMemberships(organization.id)).toHaveLength(2);
+    expect(store.organizationEntitlements(organization.id)).toMatchObject({
+      currentMemberCount: 2, overMemberLimit: true,
+      memberAdmissionAllowed: false, agentRunAdmissionAllowed: false,
+    });
+    expect(() => store.setOrganizationMembership(organization.id, 'third', 'member'))
+      .toThrow('Remove 1 member or restore Team');
+
+    billing.handleWebhook(event('evt_recovered', 'invoice.paid', {
+      id: 'in_lifecycle', customer: `cus_${organization.id}`, subscription: 'sub_lifecycle',
+    }, 220));
+    expect(store.getOrganization(organization.id)?.plan).toBe('team');
+    expect(store.organizationEntitlements(organization.id)).toMatchObject({
+      overMemberLimit: false, memberAdmissionAllowed: true, agentRunAdmissionAllowed: true,
+    });
+    for (const [index, status] of ['unpaid', 'incomplete', 'incomplete_expired', 'paused', 'canceled'].entries()) {
+      const created = 230 + index * 2;
+      billing.handleWebhook(event(`evt_${status}`, 'customer.subscription.updated', subscription(status), created));
+      expect(store.getOrganization(organization.id)?.plan, status).toBe('free');
+      if (index < 4) {
+        billing.handleWebhook(event(`evt_active_${index}`, 'customer.subscription.updated', subscription('active'), created + 1));
+        expect(store.getOrganization(organization.id)?.plan).toBe('team');
+      }
+    }
+    billing.handleWebhook(event('evt_deleted', 'customer.subscription.deleted', subscription('canceled'), 300));
+    expect(store.getOrganization(organization.id)?.plan).toBe('free');
+    billing.handleWebhook(event('evt_late_invoice', 'invoice.paid', {
+      id: 'in_late', customer: `cus_${organization.id}`, subscription: 'sub_lifecycle',
+    }, 310));
+    expect(store.getOrganization(organization.id)?.plan).toBe('free');
+    expect(PAST_DUE_GRACE_MS).toBe(7 * 24 * 60 * 60 * 1000);
+  });
+
   it('preserves private/self-hosted behavior without calling a provider', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Private', ownerUserId: 'owner' });
     const provider = new FakeSubscriptionProvider();
     const billing = new SubscriptionBillingService(store, provider, false);
     expect(billing.current(organization.id)).toMatchObject({ managed: false, plan: 'self_hosted', status: 'unmetered' });
-    billing.assertMayAddMember(organization.id);
     await billing.syncSeats(organization.id);
     expect(provider.calls).toEqual([]);
     await expect(billing.checkout(organization.id, 'individual',
@@ -191,29 +262,42 @@ describe('subscription administration HTTP authorization', () => {
     store?.close();
   });
 
-  const post = (organizationId: string, token: string) => fetch(
-    `${base}/api/organizations/${organizationId}/subscription/checkout`, {
+  const post = (action: 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats',
+    organizationId: string, token: string) => fetch(
+    `${base}/api/organizations/${organizationId}/subscription/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
-        'idempotency-key': `checkout-${crypto.randomUUID()}` }, body: JSON.stringify({ plan: 'individual' }),
+        'idempotency-key': `billing-${crypto.randomUUID()}` }, body: JSON.stringify({ plan: 'individual' }),
     });
 
-  it('rejects a task agent even when it holds payment:write', async () => {
-    const agent = tokens.mint({ taskId: 'task_billing_attack', profileId: 'developer', principal: 'agent:test',
-      organizationId: memberOrganizationId, ceiling: ['payment:write'], grantorCaps: ['payment:write'] }).token;
-    const response = await post(memberOrganizationId, agent);
-    expect(response.status).toBe(401);
-    expect(await response.json()).toMatchObject({ error: 'an interactive human session is required' });
-  });
+  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
+    'rejects a task agent with payment:write from %s', async (action) => {
+      const agent = tokens.mint({ taskId: `task_billing_attack_${action}`, profileId: 'developer', principal: 'agent:test',
+        organizationId: memberOrganizationId, ceiling: ['payment:write'], grantorCaps: ['payment:write'] }).token;
+      const response = await post(action, memberOrganizationId, agent);
+      expect(response.status).toBe(401);
+      expect(await response.json()).toMatchObject({ error: 'an interactive human session is required' });
+    });
 
-  it('rejects an interactive organization member who is not an owner', async () => {
-    const response = await post(memberOrganizationId, browserToken);
-    expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ error: 'organization owner access is required to administer its subscription' });
-  });
+  it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
+    'rejects an interactive non-owner from %s', async (action) => {
+      const response = await post(action, memberOrganizationId, browserToken);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'organization owner access is required to administer its subscription' });
+    });
 
   it('allows the interactive owner of the organization', async () => {
-    const response = await post('org_personal', browserToken);
+    const response = await post('checkout', 'org_personal', browserToken);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ url: 'https://checkout.test/session' });
+  });
+
+  it('makes owner-only administration explicit in subscription status', async () => {
+    const memberState = await (await fetch(
+      `${base}/api/organizations/${memberOrganizationId}/subscription/status`,
+      { headers: { authorization: `Bearer ${browserToken}` } })).json() as any;
+    const ownerState = await (await fetch(`${base}/api/organizations/org_personal/subscription/status`,
+      { headers: { authorization: `Bearer ${browserToken}` } })).json() as any;
+    expect(memberState.canManage).toBe(false);
+    expect(ownerState.canManage).toBe(true);
   });
 });

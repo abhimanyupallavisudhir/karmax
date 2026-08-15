@@ -1,7 +1,11 @@
 import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
+import { HOSTED_PLANS, isHostedPlanId, type HostedPlanId } from '../domain/entitlements.js';
 
-export type HostedPlan = 'free' | 'individual' | 'team';
+type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
+const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
+  isHostedPlanId(value) && value !== HOSTED_PLANS.free.id;
+export const PAST_DUE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 export type SubscriptionStatus = 'none' | 'trialing' | 'active' | 'past_due' | 'unpaid'
   | 'incomplete' | 'incomplete_expired' | 'paused' | 'canceled';
 
@@ -18,7 +22,7 @@ export interface BillingAccount {
   provider: string;
   customerId?: string;
   subscriptionId?: string;
-  plan: HostedPlan;
+  plan: HostedPlanId;
   status: SubscriptionStatus;
   seats: number;
   items: Record<string, string>;
@@ -26,6 +30,7 @@ export interface BillingAccount {
   cancelAtPeriodEnd: boolean;
   lastEventAt: number;
   verifiedAt?: number;
+  pastDueAt?: number;
   lastError?: string;
 }
 
@@ -34,10 +39,10 @@ export interface SubscriptionProvider {
   configured(): boolean;
   catalog(): SubscriptionCatalogConfig | undefined;
   createCustomer(input: { organizationId: string; name: string; idempotencyKey: string }): Promise<{ id: string }>;
-  createCheckout(input: { organizationId: string; customerId: string; plan: Exclude<HostedPlan, 'free'>;
+  createCheckout(input: { organizationId: string; customerId: string; plan: PaidHostedPlanId;
     seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
   createPortal(input: { customerId: string; returnUrl: string; idempotencyKey: string }): Promise<{ url: string }>;
-  changePlan(input: { subscriptionId: string; plan: Exclude<HostedPlan, 'free'>; seats: number;
+  changePlan(input: { subscriptionId: string; plan: PaidHostedPlanId; seats: number;
     items: Record<string, string>; idempotencyKey: string }): Promise<{ id: string }>;
   cancelAtPeriodEnd(input: { subscriptionId: string; idempotencyKey: string }): Promise<{ id: string }>;
   updateSeats(input: { subscriptionId: string; seatItemId?: string; seats: number;
@@ -80,9 +85,10 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     }, input.idempotencyKey);
   }
 
-  async createCheckout(input: { organizationId: string; customerId: string; plan: Exclude<HostedPlan, 'free'>;
+  async createCheckout(input: { organizationId: string; customerId: string; plan: PaidHostedPlanId;
     seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }) {
     const catalog = this.requireCatalog();
+    const additionalTeamUsers = Math.max(0, input.seats - HOSTED_PLANS.team.includedActiveUsers);
     const params: Record<string, string | number | boolean> = {
       mode: 'subscription', customer: input.customerId, success_url: input.successUrl,
       cancel_url: input.cancelUrl, client_reference_id: input.organizationId,
@@ -90,9 +96,9 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
       'line_items[0][price]': input.plan === 'individual' ? catalog.individualPriceId : catalog.teamBasePriceId,
       'line_items[0][quantity]': 1, allow_promotion_codes: true,
     };
-    if (input.plan === 'team' && input.seats > 1) {
+    if (input.plan === 'team' && additionalTeamUsers > 0) {
       params['line_items[1][price]'] = catalog.teamSeatPriceId;
-      params['line_items[1][quantity]'] = input.seats - 1;
+      params['line_items[1][quantity]'] = additionalTeamUsers;
     }
     return this.request('/v1/checkout/sessions', params, input.idempotencyKey);
   }
@@ -102,9 +108,10 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
       return_url: input.returnUrl }, input.idempotencyKey);
   }
 
-  changePlan(input: { subscriptionId: string; plan: Exclude<HostedPlan, 'free'>; seats: number;
+  changePlan(input: { subscriptionId: string; plan: PaidHostedPlanId; seats: number;
     items: Record<string, string>; idempotencyKey: string }) {
     const catalog = this.requireCatalog();
+    const additionalTeamUsers = Math.max(0, input.seats - HOSTED_PLANS.team.includedActiveUsers);
     const params: Record<string, string | number | boolean> = { proration_behavior: 'create_prorations' };
     const baseItem = input.items.individual || input.items.teamBase;
     if (!baseItem) throw new Error('the verified subscription item is unavailable; retry after billing reconciliation');
@@ -114,10 +121,10 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     if (input.plan === 'individual' && input.items.teamSeat) {
       params['items[1][id]'] = input.items.teamSeat;
       params['items[1][deleted]'] = true;
-    } else if (input.plan === 'team' && input.seats > 1) {
+    } else if (input.plan === 'team' && additionalTeamUsers > 0) {
       if (input.items.teamSeat) params['items[1][id]'] = input.items.teamSeat;
       params['items[1][price]'] = catalog.teamSeatPriceId;
-      params['items[1][quantity]'] = input.seats - 1;
+      params['items[1][quantity]'] = additionalTeamUsers;
     }
     return this.request(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, params, input.idempotencyKey);
   }
@@ -129,11 +136,12 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
 
   updateSeats(input: { subscriptionId: string; seatItemId?: string; seats: number; idempotencyKey: string }) {
     const catalog = this.requireCatalog();
+    const additionalTeamUsers = Math.max(0, input.seats - HOSTED_PLANS.team.includedActiveUsers);
     const params: Record<string, string | number | boolean> = { proration_behavior: 'create_prorations' };
     if (input.seatItemId) params['items[0][id]'] = input.seatItemId;
     params['items[0][price]'] = catalog.teamSeatPriceId;
-    if (input.seats <= 1 && input.seatItemId) params['items[0][deleted]'] = true;
-    else params['items[0][quantity]'] = Math.max(1, input.seats - 1);
+    if (additionalTeamUsers === 0 && input.seatItemId) params['items[0][deleted]'] = true;
+    else params['items[0][quantity]'] = Math.max(1, additionalTeamUsers);
     return this.request(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, params, input.idempotencyKey);
   }
 
@@ -177,47 +185,51 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
 }
 
 export class SubscriptionBillingService {
-  constructor(private store: Store, private provider: SubscriptionProvider, private hosted: boolean) {}
+  constructor(private store: Store, private provider: SubscriptionProvider, private hosted: boolean,
+    private pastDueGraceMs = PAST_DUE_GRACE_MS) {}
 
   current(organizationId: string) {
     const members = this.store.listOrganizationMemberships(organizationId).length;
     if (!this.hosted) return { managed: false, providerConfigured: false, plan: 'self_hosted', status: 'unmetered',
       seats: null, activeUsers: members, seatDeficit: 0, access: 'unmetered', cancelAtPeriodEnd: false,
-      catalog: publicCatalog() };
+      catalog: Object.values(HOSTED_PLANS) };
     const account = this.account(organizationId);
-    const plan = account?.plan ?? 'free';
+    const plan = this.store.organizationEntitlements(organizationId).plan ?? 'free';
+    const billedPlan = account?.plan ?? 'free';
     const status = account?.status ?? 'none';
-    const seats = plan === 'team' ? account?.seats ?? 1 : 1;
-    const graceEndsAt = status === 'past_due' && account?.verifiedAt
-      ? account.verifiedAt + 7 * 24 * 60 * 60 * 1000 : undefined;
+    const seats = billedPlan === 'team' ? account?.seats ?? HOSTED_PLANS.team.includedActiveUsers
+      : HOSTED_PLANS.individual.includedActiveUsers;
+    const graceEndsAt = status === 'past_due' && account?.pastDueAt
+      ? account.pastDueAt + this.pastDueGraceMs : undefined;
     const access = ['active', 'trialing'].includes(status) ? 'active'
       : status === 'past_due' && graceEndsAt && graceEndsAt > Date.now() ? 'grace'
-        : plan === 'free' || status === 'none' || status === 'canceled' ? 'free' : 'restricted';
-    return { managed: true, providerConfigured: this.provider.configured(), plan, status, seats,
-      activeUsers: members, seatDeficit: plan === 'team' ? Math.max(0, members - seats) : Math.max(0, members - 1),
+        : status === 'none' || status === 'canceled' ? 'free' : 'restricted';
+    return { managed: true, providerConfigured: this.provider.configured(), plan, billedPlan, status, seats,
+      activeUsers: members, seatDeficit: plan === 'team' ? Math.max(0, members - seats)
+        : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
       currentPeriodEnd: account?.currentPeriodEnd, verifiedAt: account?.verifiedAt,
-      graceEndsAt, lastError: account?.lastError, catalog: publicCatalog() };
+      graceEndsAt, lastError: account?.lastError, catalog: Object.values(HOSTED_PLANS) };
   }
 
-  assertMayAddMember(organizationId: string): void {
+  /** Re-applies effective plans from the last verified provider state. The main
+   * process schedules this so past-due grace expires without another webhook. */
+  reconcileEntitlements(now = Date.now()): void {
     if (!this.hosted) return;
-    const state = this.current(organizationId);
-    if (state.plan === 'team' && !['active', 'grace'].includes(state.access))
-      throw new Error('resolve this organization’s subscription status before adding another active user');
-    if (state.plan !== 'team' && state.activeUsers >= 1)
-      throw new Error('upgrade this organization to Team before adding another active user');
+    const rows = this.store.db.prepare('SELECT * FROM subscription_billing_accounts').all() as any[];
+    for (const row of rows) this.reconcileAccount(rowAccount(row)!, now);
   }
 
-  async checkout(organizationId: string, plan: Exclude<HostedPlan, 'free'>, urls: { success: string; cancel: string }, key: string) {
+  async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string) {
     this.requireHosted(); this.requireKey(key);
-    if (!['individual', 'team'].includes(plan)) throw new Error('choose Individual or Team');
+    if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const current = this.account(organizationId);
     if (current?.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(current.status))
       throw new Error('use Change plan for an existing subscription');
     return this.idempotent(organizationId, `checkout:${plan}`, key, async () => {
       const customerId = await this.ensureCustomer(organizationId, `${key}:customer`);
-      const seats = Math.max(1, this.store.listOrganizationMemberships(organizationId).length);
+      const seats = Math.max(HOSTED_PLANS[plan].includedActiveUsers,
+        this.store.listOrganizationMemberships(organizationId).length);
       return this.provider.createCheckout({ organizationId, customerId, plan, seats,
         successUrl: urls.success, cancelUrl: urls.cancel, idempotencyKey: `${key}:checkout` });
     });
@@ -231,14 +243,17 @@ export class SubscriptionBillingService {
       () => this.provider.createPortal({ customerId, returnUrl, idempotencyKey: `${key}:portal` }));
   }
 
-  async changePlan(organizationId: string, plan: Exclude<HostedPlan, 'free'>, key: string) {
+  async changePlan(organizationId: string, plan: unknown, key: string) {
     this.requireHosted(); this.requireKey(key);
-    if (!['individual', 'team'].includes(plan)) throw new Error('choose Individual or Team');
+    if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const account = this.account(organizationId);
     if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
       throw new Error('there is no changeable subscription');
-    const seats = Math.max(1, this.store.listOrganizationMemberships(organizationId).length);
-    if (plan === 'individual' && seats > 1) throw new Error('remove additional active users before downgrading to Individual');
+    const seats = Math.max(HOSTED_PLANS[plan].includedActiveUsers,
+      this.store.listOrganizationMemberships(organizationId).length);
+    if (plan === 'individual' && HOSTED_PLANS.individual.maxMembers != null
+      && seats > HOSTED_PLANS.individual.maxMembers)
+      throw new Error('remove additional active users before downgrading to Individual');
     return this.idempotent(organizationId, `change:${plan}`, key, () => this.provider.changePlan({
       subscriptionId: account.subscriptionId!, plan, seats, items: account.items, idempotencyKey: `${key}:change`,
     }));
@@ -258,7 +273,8 @@ export class SubscriptionBillingService {
     if (!this.hosted) return;
     const account = this.account(organizationId);
     if (!account?.subscriptionId || account.plan !== 'team' || !['active', 'trialing', 'past_due'].includes(account.status)) return;
-    const seats = Math.max(1, this.store.listOrganizationMemberships(organizationId).length);
+    const seats = Math.max(HOSTED_PLANS.team.includedActiveUsers,
+      this.store.listOrganizationMemberships(organizationId).length);
     if (seats === account.seats) return;
     await this.provider.updateSeats({ subscriptionId: account.subscriptionId,
       seatItemId: account.items.teamSeat, seats,
@@ -268,18 +284,22 @@ export class SubscriptionBillingService {
   handleWebhook(raw: Buffer, signature?: string): { duplicate: boolean } {
     this.requireHosted();
     const event = this.provider.verifyWebhook(raw, signature);
-    const claim = this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_events
-      (provider, eventId, type, createdAt, processedAt) VALUES (?, ?, ?, ?, NULL)`)
-      .run(this.provider.name, event.id, event.type, event.created * 1000);
-    if (Number(claim.changes) === 0) return { duplicate: true };
+    this.store.db.exec('BEGIN');
     try {
+      const claim = this.store.db.prepare(`INSERT OR IGNORE INTO subscription_billing_events
+        (provider, eventId, type, createdAt, processedAt) VALUES (?, ?, ?, ?, NULL)`)
+        .run(this.provider.name, event.id, event.type, event.created * 1000);
+      if (Number(claim.changes) === 0) {
+        this.store.db.exec('ROLLBACK');
+        return { duplicate: true };
+      }
       this.applyEvent(event);
       this.store.db.prepare('UPDATE subscription_billing_events SET processedAt=? WHERE provider=? AND eventId=?')
         .run(Date.now(), this.provider.name, event.id);
+      this.store.db.exec('COMMIT');
       return { duplicate: false };
     } catch (error) {
-      this.store.db.prepare('DELETE FROM subscription_billing_events WHERE provider=? AND eventId=?')
-        .run(this.provider.name, event.id);
+      try { this.store.db.exec('ROLLBACK'); } catch { /* preserve the original reconciliation failure */ }
       throw error;
     }
   }
@@ -301,33 +321,56 @@ export class SubscriptionBillingService {
     }
     if (event.type.startsWith('customer.subscription.')) {
       if (event.type === 'customer.subscription.deleted') {
-        this.patchAccount(account.organizationId, { subscriptionId, status: 'canceled', plan: 'free', seats: 1,
+        const updated = this.patchAccount(account.organizationId, { subscriptionId, status: 'canceled',
+          seats: HOSTED_PLANS[account.plan].includedActiveUsers,
           items: {}, cancelAtPeriodEnd: false, currentPeriodEnd: epochMs(object.current_period_end),
-          lastEventAt: event.created * 1000, verifiedAt: Date.now() });
+          lastEventAt: event.created * 1000, verifiedAt: Date.now(), pastDueAt: undefined });
+        this.reconcileAccount(updated);
         return;
       }
       const mapped = this.mapSubscription(object);
-      this.patchAccount(account.organizationId, { subscriptionId: String(object.id), ...mapped,
-        status: normalizeStatus(object.status), cancelAtPeriodEnd: Boolean(object.cancel_at_period_end),
+      const status = normalizeStatus(object.status);
+      const updated = this.patchAccount(account.organizationId, { subscriptionId: String(object.id), ...mapped,
+        status, cancelAtPeriodEnd: Boolean(object.cancel_at_period_end),
         currentPeriodEnd: epochMs(object.current_period_end), lastEventAt: event.created * 1000,
-        verifiedAt: Date.now(), lastError: undefined });
+        verifiedAt: Date.now(), pastDueAt: status === 'past_due' ? account.pastDueAt ?? Date.now() : undefined,
+        lastError: undefined });
+      this.reconcileAccount(updated);
       return;
     }
-    if (event.type === 'invoice.payment_failed') {
-      this.patchAccount(account.organizationId, { status: 'past_due', lastError: 'The latest subscription payment failed.',
+    if (event.type === 'invoice.payment_failed'
+      && ['active', 'trialing', 'past_due'].includes(account.status)) {
+      const updated = this.patchAccount(account.organizationId, { status: 'past_due',
+        pastDueAt: account.pastDueAt ?? Date.now(), lastError: 'The latest subscription payment failed.',
         lastEventAt: event.created * 1000, verifiedAt: Date.now() });
-    } else if (event.type === 'invoice.paid' && account.plan !== 'free') {
-      this.patchAccount(account.organizationId, { status: 'active', lastError: undefined,
-        lastEventAt: event.created * 1000, verifiedAt: Date.now() });
+      this.reconcileAccount(updated);
+    } else if (event.type === 'invoice.paid' && ['past_due', 'unpaid'].includes(account.status)) {
+      const updated = this.patchAccount(account.organizationId, { status: 'active', pastDueAt: undefined,
+        lastError: undefined, lastEventAt: event.created * 1000, verifiedAt: Date.now() });
+      this.reconcileAccount(updated);
     }
   }
 
-  private mapSubscription(object: any): { plan: HostedPlan; seats: number; items: Record<string, string> } {
+  private effectivePlan(account: BillingAccount, now: number): HostedPlanId {
+    if (!account.verifiedAt) return 'free';
+    if (account.status === 'active' || account.status === 'trialing') return account.plan;
+    if (account.status === 'past_due' && account.pastDueAt
+      && now < account.pastDueAt + this.pastDueGraceMs) return account.plan;
+    return 'free';
+  }
+
+  private reconcileAccount(account: BillingAccount, now = Date.now()): void {
+    const plan = this.effectivePlan(account, now);
+    if (this.store.getOrganization(account.organizationId)?.plan !== plan)
+      this.store.setOrganizationPlan(account.organizationId, plan);
+  }
+
+  private mapSubscription(object: any): { plan: HostedPlanId; seats: number; items: Record<string, string> } {
     const catalog = this.provider.catalog();
     if (!catalog) throw new Error('subscription catalog is not configured');
     const items: Record<string, string> = {};
-    let plan: HostedPlan | undefined;
-    let seats = 1;
+    let plan: HostedPlanId | undefined;
+    let seats = HOSTED_PLANS.team.includedActiveUsers;
     for (const item of object.items?.data ?? []) {
       const price = stringId(item.price);
       const product = stringId(item.price?.product);
@@ -350,7 +393,7 @@ export class SubscriptionBillingService {
       }
     }
     if (!plan) throw new Error('subscription contains no configured Karmax plan price');
-    return { plan, seats: plan === 'team' ? seats : 1, items };
+    return { plan, seats: plan === 'team' ? seats : HOSTED_PLANS.individual.includedActiveUsers, items };
   }
 
   private account(organizationId: string): BillingAccount | undefined {
@@ -371,23 +414,26 @@ export class SubscriptionBillingService {
     const now = Date.now();
     this.store.db.prepare(`INSERT INTO subscription_billing_accounts
       (organizationId, provider, customerId, plan, status, seats, itemsJson, cancelAtPeriodEnd, lastEventAt, createdAt, updatedAt)
-      VALUES (?, ?, ?, 'free', 'none', 1, '{}', 0, 0, ?, ?)
+      VALUES (?, ?, ?, ?, 'none', ?, '{}', 0, 0, ?, ?)
       ON CONFLICT(organizationId) DO UPDATE SET customerId=excluded.customerId, updatedAt=excluded.updatedAt`)
-      .run(organizationId, this.provider.name, customer.id, now, now);
+      .run(organizationId, this.provider.name, customer.id, HOSTED_PLANS.free.id,
+        HOSTED_PLANS.free.includedActiveUsers, now, now);
     return customer.id;
   }
-  private patchAccount(organizationId: string, patch: Partial<BillingAccount>): void {
+  private patchAccount(organizationId: string, patch: Partial<BillingAccount>): BillingAccount {
     const current = this.account(organizationId);
     if (!current) throw new Error('billing account not found');
     this.store.db.prepare(`UPDATE subscription_billing_accounts SET subscriptionId=?, plan=?, status=?, seats=?,
-      itemsJson=?, currentPeriodEnd=?, cancelAtPeriodEnd=?, lastEventAt=?, verifiedAt=?, lastError=?, updatedAt=?
+      itemsJson=?, currentPeriodEnd=?, cancelAtPeriodEnd=?, lastEventAt=?, verifiedAt=?, pastDueAt=?, lastError=?, updatedAt=?
       WHERE organizationId=?`).run(patch.subscriptionId ?? current.subscriptionId ?? null,
       patch.plan ?? current.plan, patch.status ?? current.status, patch.seats ?? current.seats,
       JSON.stringify(patch.items ?? current.items), patch.currentPeriodEnd ?? current.currentPeriodEnd ?? null,
       (patch.cancelAtPeriodEnd ?? current.cancelAtPeriodEnd) ? 1 : 0, patch.lastEventAt ?? current.lastEventAt,
       patch.verifiedAt ?? current.verifiedAt ?? null,
+      Object.prototype.hasOwnProperty.call(patch, 'pastDueAt') ? patch.pastDueAt ?? null : current.pastDueAt ?? null,
       Object.prototype.hasOwnProperty.call(patch, 'lastError') ? patch.lastError ?? null : current.lastError ?? null,
       Date.now(), organizationId);
+    return this.account(organizationId)!;
   }
   private async idempotent<T>(organizationId: string, operation: string, key: string, work: () => Promise<T>): Promise<T> {
     const hash = crypto.createHash('sha256').update(`${organizationId}:${operation}`).digest('hex');
@@ -444,11 +490,13 @@ export class FakeSubscriptionProvider implements SubscriptionProvider {
 
 function rowAccount(row: any): BillingAccount | undefined {
   if (!row) return undefined;
+  if (!isHostedPlanId(row.plan)) throw new Error(`billing account contains unknown plan ${String(row.plan)}`);
   return { organizationId: row.organizationId, provider: row.provider, customerId: row.customerId ?? undefined,
-    subscriptionId: row.subscriptionId ?? undefined, plan: row.plan, status: row.status, seats: Number(row.seats),
+    subscriptionId: row.subscriptionId ?? undefined, plan: row.plan, status: normalizeStatus(row.status), seats: Number(row.seats),
     items: JSON.parse(row.itemsJson || '{}'), currentPeriodEnd: row.currentPeriodEnd ?? undefined,
     cancelAtPeriodEnd: Boolean(row.cancelAtPeriodEnd), lastEventAt: Number(row.lastEventAt),
-    verifiedAt: row.verifiedAt ?? undefined, lastError: row.lastError ?? undefined };
+    verifiedAt: row.verifiedAt ?? undefined, pastDueAt: row.pastDueAt ?? undefined,
+    lastError: row.lastError ?? undefined };
 }
 function stringId(value: any): string | undefined { return typeof value === 'string' ? value : value?.id ? String(value.id) : undefined; }
 function epochMs(value: any): number | undefined { const n = Number(value); return Number.isFinite(n) && n > 0 ? n * 1000 : undefined; }
@@ -456,12 +504,4 @@ function normalizeStatus(value: any): SubscriptionStatus {
   const status = String(value || 'incomplete') as SubscriptionStatus;
   return ['none', 'trialing', 'active', 'past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused', 'canceled'].includes(status)
     ? status : 'incomplete';
-}
-function publicCatalog() {
-  return [
-    { id: 'free', name: 'Free', monthlyBaseCents: 0, includedUsers: 1, additionalUserCents: 0, selfService: true },
-    { id: 'individual', name: 'Individual', monthlyBaseCents: 900, includedUsers: 1, additionalUserCents: 0, selfService: true },
-    { id: 'team', name: 'Team', monthlyBaseCents: 1900, includedUsers: 1, additionalUserCents: 500, selfService: true },
-    { id: 'enterprise', name: 'Enterprise', selfService: false },
-  ];
 }

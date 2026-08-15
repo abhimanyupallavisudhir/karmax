@@ -194,9 +194,20 @@ Subscribe it to `checkout.session.completed`, `customer.subscription.created`,
 `invoice.paid`, and `invoice.payment_failed`. The gateway verifies Stripe's raw
 payload signature before parsing it. Checkout and API responses never grant a
 plan: the signed subscription event's configured price IDs are the only source
-of plan and seat state. Duplicate event IDs and user retries are durably
-idempotent. Past-due organizations receive an explicit seven-day grace state and
-a billing portal recovery action; unpaid/paused/incomplete states are restricted.
+of billed plan and seat state. Reconciliation writes effective access through
+the central organization-entitlement Store boundary. Duplicate event IDs and
+user retries are durably idempotent. Only an interactive organization owner can
+start checkout, open the portal, change or cancel a plan, or request a seat sync;
+an agent holding `payment:write` cannot administer the SaaS subscription.
+
+Active and trialing subscriptions grant the verified plan. Past-due
+organizations retain it for seven days and receive a billing portal recovery
+action. A process-level sweep runs every minute and returns the organization to
+Free after that grace deadline even when Stripe sends no later webhook.
+Canceled/deleted, unpaid, paused, incomplete, and expired subscriptions also
+return to Free. Existing members are not deleted when a downgrade leaves an
+organization over its member limit; the entitlement layer restricts new
+admission until the owner upgrades or reduces membership.
 
 For local test-mode setup, use Stripe test keys and forward events with the
 Stripe CLI:
