@@ -31,6 +31,8 @@ import {
   PrincipalRef,
   ProjectPrincipalRef,
   ConfirmationPolicy,
+  Avatar,
+  AvatarAvailability,
   Repository,
   ProjectRepository,
   GitConnection,
@@ -558,6 +560,13 @@ export class Store {
       CREATE TABLE IF NOT EXISTS profiles (
         id TEXT PRIMARY KEY, json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS avatars (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        ownerUserId TEXT NOT NULL, json TEXT NOT NULL, createdAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL, deletedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_avatars_project ON avatars(projectId, deletedAt);
+      CREATE INDEX IF NOT EXISTS idx_avatars_owner ON avatars(ownerUserId, deletedAt);
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
@@ -1191,6 +1200,7 @@ export class Store {
       deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
       this.db.prepare('DELETE FROM resource_candidates WHERE projectId=?').run(id);
       this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
+      this.db.prepare('DELETE FROM avatars WHERE projectId=?').run(id);
       this.deletePermissionRequestKv(project.organizationId, taskIds);
       this.deleteProjectKv([id], taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
@@ -1385,6 +1395,7 @@ export class Store {
       team_memberships: rowsFor(this.db, 'team_memberships', 'teamId', teamIds),
       team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
       projects: rowsFor(this.db, 'projects', 'id', projectIds),
+      avatars: rowsFor(this.db, 'avatars', 'projectId', projectIds),
       resource_attachments: rowsFor(this.db, 'resource_attachments', 'projectId', projectIds)
         .map(({ credentialHandles: _handles, ...row }) => ({ ...row, credentialHandles: '[]' })),
       resource_revisions: rowsFor(this.db, 'resource_revisions', 'attachmentId',
@@ -1486,6 +1497,7 @@ export class Store {
     const wikiEdits = selectRows(this.db, 'organization_wiki_versions', 'principal IN (?,?)', [userId, principalId]);
     const previewLeases = selectRows(this.db, 'preview_leases', 'createdBy IN (?,?)', [userId, principalId])
       .map(({ tokenHash: _tokenHash, ...row }) => row);
+    const ownedAvatars = selectRows(this.db, 'avatars', 'ownerUserId=?', [userId]);
     const spendRequests = selectRows(this.db, 'payment_spend_requests', 'resolvedBy IN (?,?)', [userId, principalId]);
     const subscribedTaskIds = selectRows(this.db, 'task_subscribers', 'principalKey=?', [principalId])
       .map((row) => String(row.taskId));
@@ -1505,6 +1517,7 @@ export class Store {
     const projectIds = [...new Set([
       ...tasks.map((task) => task.projectId),
       ...projectMemberships.map((row) => String(row.projectId)),
+      ...ownedAvatars.map((row) => String(row.projectId)),
     ])];
     const projects = rowsFor(this.db, 'projects', 'id', projectIds);
     const projectById = new Map(projects.map((project) => [String(project.id), rowToProject(project)]));
@@ -1517,6 +1530,7 @@ export class Store {
       ...wikiEdits.map((row) => String(row.organizationId)),
       ...previewLeases.map((row) => String(row.organizationId)),
       ...spendRequests.map((row) => String(row.organizationId)),
+      ...ownedAvatars.map((row) => String(row.organizationId)),
     ])];
     const organizations = organizationIds.map((organizationId) => {
       const organization = this.getOrganization(organizationId);
@@ -1546,6 +1560,7 @@ export class Store {
             joinedAt: membership.joinedAt,
           } }];
         }),
+        avatars: ownedAvatars.filter((avatar) => avatar.organizationId === organizationId),
         tasks: tasks.filter((task) => organizationProjectIds.has(task.projectId))
           .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
           .map((task) => ({
@@ -1696,12 +1711,14 @@ export class Store {
       this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM inbox WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM avatars WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_invitations WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_wiki_versions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`avatars:organization:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-usage-policy:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
         `credpolicy:organization:${organizationId}`,
@@ -2145,6 +2162,8 @@ export class Store {
       throw new Error('team belongs to another organization');
     if (principal.kind === 'organization' && principal.organizationId !== organizationId)
       throw new Error('organization principal belongs to another organization');
+    if (principal.kind === 'avatar' && this.getAvatar(principal.avatarId)?.organizationId !== organizationId)
+      throw new Error('avatar principal belongs to another organization');
     if (principal.kind === 'task-agent') {
       const project = this.getProject(this.getTask(principal.taskId)?.projectId ?? '');
       if (project?.organizationId !== organizationId) throw new Error('task agent belongs to another organization');
@@ -3109,6 +3128,7 @@ export class Store {
     while (task && !visited.has(task.id)) {
       visited.add(task.id);
       if (task.createdBy?.kind === 'user') return task.createdBy.userId;
+      if (task.createdBy?.kind === 'avatar') return this.getAvatar(task.createdBy.avatarId)?.ownerUserId;
       if (task.createdBy?.kind !== 'task-agent') return undefined;
       task = this.getTaskShallow(task.createdBy.taskId);
     }
@@ -3119,6 +3139,7 @@ export class Store {
     if (principal.kind === 'user') return [principal.userId];
     if (principal.kind === 'team') return (this.listTeamMemberships(principal.teamId)).map((m) => m.userId);
     if (principal.kind === 'organization') return this.listOrganizationMemberships(principal.organizationId).map((member) => member.userId);
+    if (principal.kind === 'avatar') return [];
     return [];
   }
 
@@ -3135,6 +3156,10 @@ export class Store {
       if (!candidate || visited.has(candidate.id)) return;
       visited.add(candidate.id);
       if (candidate.createdBy?.kind === 'user') users.add(candidate.createdBy.userId);
+      else if (candidate.createdBy?.kind === 'avatar') {
+        const ownerUserId = this.getAvatar(candidate.createdBy.avatarId)?.ownerUserId;
+        if (ownerUserId) users.add(ownerUserId);
+      }
       else if (candidate.createdBy?.kind === 'task-agent')
         addHumanCreator(this.getTaskShallow(candidate.createdBy.taskId), visited);
     };
@@ -3658,6 +3683,52 @@ export class Store {
     this.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
   }
 
+  // ─── Avatars ───
+
+  upsertAvatar(avatar: Avatar): Avatar {
+    this.db.prepare(`INSERT INTO avatars
+      (id, organizationId, projectId, ownerUserId, json, createdAt, updatedAt, deletedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET organizationId=excluded.organizationId,
+      projectId=excluded.projectId, ownerUserId=excluded.ownerUserId,
+      json=excluded.json, updatedAt=excluded.updatedAt, deletedAt=excluded.deletedAt`)
+      .run(avatar.id, avatar.organizationId, avatar.projectId, avatar.ownerUserId,
+        JSON.stringify(avatar), avatar.createdAt, avatar.updatedAt, avatar.deletedAt ?? null);
+    return avatar;
+  }
+
+  getAvatar(id: string, includeDeleted = false): Avatar | undefined {
+    const row = this.db.prepare(`SELECT json FROM avatars WHERE id=?${includeDeleted ? '' : ' AND deletedAt IS NULL'}`).get(id) as any;
+    return row ? JSON.parse(row.json) as Avatar : undefined;
+  }
+
+  listAvatars(projectId?: string, includeDeleted = false): Avatar[] {
+    const where = [projectId ? 'projectId=?' : '', includeDeleted ? '' : 'deletedAt IS NULL'].filter(Boolean).join(' AND ');
+    const rows = this.db.prepare(`SELECT json FROM avatars${where ? ` WHERE ${where}` : ''} ORDER BY createdAt`)
+      .all(...(projectId ? [projectId] : [])) as any[];
+    return rows.map((row) => JSON.parse(row.json) as Avatar)
+      .sort((left, right) => left.name.localeCompare(right.name) || left.createdAt - right.createdAt);
+  }
+
+  deleteAvatar(id: string, at = Date.now()): Avatar | undefined {
+    const avatar = this.getAvatar(id);
+    if (!avatar) return undefined;
+    const removed = { ...avatar, enabled: false, deletedAt: at, updatedAt: at };
+    this.upsertAvatar(removed);
+    return removed;
+  }
+
+  avatarAvailability(projectId: string): AvatarAvailability {
+    const project = this.getProject(projectId);
+    if (!project) throw new Error(`no project ${projectId}`);
+    const organizationId = project.organizationId ?? 'org_personal';
+    const organization = this.kvGet(`avatars:organization:${organizationId}`) !== 'disabled';
+    const raw = this.kvGet(`avatars:project:${projectId}`);
+    const projectSetting: AvatarAvailability['project'] = raw === 'enabled' || raw === 'disabled' ? raw : 'inherit';
+    return { organization, project: projectSetting,
+      effective: organization && projectSetting !== 'disabled' };
+  }
+
   // ── identities are owned by Better Auth; these rows contain only karmax policy ──
   listAuthorizationProfiles(scopeKey?: string): any[] {
     const rows = scopeKey
@@ -3737,6 +3808,7 @@ export class Store {
     for (const projectId of projectIds) {
       exact.run(`authz:default:project:${projectId}`);
       exact.run(`credpolicy:project:${projectId}`);
+      exact.run(`avatars:project:${projectId}`);
       const workflowPrefix = `wfpin:${projectId}:`;
       prefix.run(workflowPrefix, workflowPrefix);
     }
@@ -4628,6 +4700,27 @@ export class Store {
   listWorldLeases(runnerPoolId: string): any[] {
     return this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state!='released'
       ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId) as any[];
+  }
+
+  worldLeasesForTask(taskId: string): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE taskId=? AND state!='released'
+      ORDER BY createdAt`).all(taskId) as any[];
+  }
+
+  /** Dedicated terminal/preview access can legitimately outlive its task's
+   * workflow. Runner reconciliation must preserve capacity explicitly owned by
+   * one of those live records rather than guessing from world state alone. */
+  worldLeaseHasLiveAccessor(leaseId: string, now = Date.now()): boolean {
+    const preview = this.db.prepare(`SELECT 1 FROM preview_leases
+      WHERE runnerLeaseId=? AND revokedAt IS NULL AND expiresAt>? LIMIT 1`).get(leaseId, now);
+    if (preview) return true;
+    return Boolean(this.db.prepare(`SELECT 1 FROM executions
+      WHERE runnerLeaseId=? AND state IN ('starting','running','stop-requested') LIMIT 1`).get(leaseId));
+  }
+
+  unreleasedWorldLeases(): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE state!='released'
+      ORDER BY createdAt`).all() as any[];
   }
 
   recordUsage(event: Omit<UsageEvent, 'id'> & { id?: string }): UsageEvent {
@@ -5655,6 +5748,7 @@ export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
   if (principal.kind === 'organization') return `organization:${principal.organizationId}`;
+  if (principal.kind === 'avatar') return `avatar:${principal.avatarId}`;
   return `task-agent:${principal.taskId}:${principal.role}`;
 }
 

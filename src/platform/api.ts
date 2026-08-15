@@ -49,8 +49,10 @@ import { sameRepository } from '../world/repository-identity.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
+import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { itemHandle } from '../autonomy/vault-items.js';
+import { applyAvatarProfile, avatarCallableBy, avatarEnabled } from './avatars.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -118,6 +120,7 @@ const wikiFiles = (root: string): string[] => {
 
 function principalRefOf(principal: string, kind?: 'agent' | 'human' | 'system'): PrincipalRef | undefined {
   if (principal.startsWith('user:')) return { kind: 'user', userId: principal.slice(5) };
+  if (principal.startsWith('avatar:')) return { kind: 'avatar', avatarId: principal.slice(7) };
   const taskAgent = principal.match(/^task-agent:([^:]+):(.+)$/);
   if (taskAgent) return { kind: 'task-agent', taskId: taskAgent[1]!, role: taskAgent[2]! };
   // Older callers used the bare user id as the token principal. Token kind is
@@ -297,6 +300,9 @@ export interface KarmaxApiDeps {
   /** World access for permission-checked collaboration tools. */
   worlds?: WorldRegistry;
   worldAccess?: WorldAccessService;
+  /** Durable execution-capacity leases. Production always supplies this; small
+   * unit harnesses may omit it and still get direct store-level release. */
+  runners?: RunnerPoolService;
   resources?: ProjectResourceService;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
@@ -848,6 +854,37 @@ export class KarmaxApi {
     }
   }
 
+  /** Resolve every Avatar referenced by the task's role fields and Review-agent
+   * layers. Invocation is checked against the human who initiated the calling
+   * chain, not against an arbitrary task-agent id. */
+  private validateTaskAvatars(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap) {
+    const callerUserId = caller.humanSubject?.userId
+      ?? (caller.taskId !== '*' ? this.deps.store.taskCreatorUserId(caller.taskId) : undefined);
+    const selected: Array<{ avatar: import('../domain/types.js').Avatar; role: string }> = [];
+    const add = (spec: unknown, role: string) => {
+      const record = spec && typeof spec === 'object' && !Array.isArray(spec)
+        ? spec as Record<string, unknown> : undefined;
+      const avatarId = record?.avatarId;
+      if (typeof avatarId !== 'string' || !avatarId) return;
+      const avatar = this.deps.store.getAvatar(avatarId);
+      if (!avatar || avatar.projectId !== project.id) throw new ValidationError('the selected Avatar is not available in this project');
+      if (!avatarEnabled(this.deps.store, avatar)) throw new ValidationError(`Avatar "${avatar.name}" is disabled`);
+      const purpose = typeof record?.avatarPurpose === 'string' ? record.avatarPurpose : role;
+      if (avatar.roles.length && !avatar.roles.includes(purpose))
+        throw new ValidationError(`Avatar "${avatar.name}" cannot be used for the ${purpose} role`);
+      if (!callerUserId || !avatarCallableBy(this.deps.store, avatar, callerUserId))
+        throw new CapabilityError(`you are not allowed to call Avatar "${avatar.name}"`);
+      selected.push({ avatar, role });
+    };
+    for (const field of manifest.params) {
+      if (field.type === 'agent') add(resolved[field.name], field.role ?? field.name.replace(/^agent:/, ''));
+      if (field.type === 'confirmer') {
+        for (const layer of confirmLayersOf(resolved[field.name] as any)) if (layer.kind === 'agent') add(layer, field.role ?? 'confirm');
+      }
+    }
+    return selected;
+  }
+
   async createTask(
     token: string,
     args: {
@@ -937,6 +974,10 @@ export class KarmaxApi {
     // against that task's project before anything is created.
     this.authorizeResumeSources(token, taskOverrides);
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
+    const selectedAvatars = this.validateTaskAvatars(caller, project, manifest, resolved);
+    for (const { avatar } of selectedAvatars) {
+      if (avatar.credentialPolicies) Object.assign(credentialPolicies, avatar.credentialPolicies);
+    }
     // Validate any repository selection after resolution so this sees the exact
     // effective list the world will. An empty list is a supported zero-repo run.
     if (!args.draft) this.assertRepositoriesValid(manifest, project, resolved);
@@ -952,11 +993,12 @@ export class KarmaxApi {
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
-    const githubAccountId = caller.kind === 'agent'
+    const avatarGithubAccountId = selectedAvatars.find(({ role }) => role === 'do')?.avatar.githubAccountId;
+    const githubAccountId = avatarGithubAccountId ?? (caller.kind === 'agent'
       ? caller.externalIdentities?.githubAccountId
       : caller.humanSubject
         ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
-        : undefined;
+        : undefined);
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
@@ -1278,12 +1320,15 @@ export class KarmaxApi {
       const role = field.role as AgentRole;
       const selected = input.agents?.[role];
       const base = resolver.resolve(role, input.profiles, undefined, input.projectId);
-      const profile = applyAgentSpec(base, selected);
+      const avatar = selected?.avatarId ? this.deps.store.getAvatar(selected.avatarId) : undefined;
+      const profile = applyAvatarProfile(base, selected, avatar);
       out[role] = {
         provider: profile.provider,
         ...(profile.model ? { model: profile.model } : {}),
         ...(profile.effort ? { effort: profile.effort } : {}),
         ...(selected?.resumeFrom ? { resumeFrom: selected.resumeFrom } : {}),
+        ...(selected?.avatarId ? { avatarId: selected.avatarId } : {}),
+        ...(selected?.avatarPurpose ? { avatarPurpose: selected.avatarPurpose } : {}),
       };
     }
     return out;
@@ -1339,6 +1384,9 @@ export class KarmaxApi {
         ...(effort ? { effort } : {}),
         ...(!providerChanged && current.resumeFrom ? { resumeFrom: current.resumeFrom } : {}),
         ...(incoming.resumeFrom ? { resumeFrom: incoming.resumeFrom } : {}),
+        ...(incoming.avatarId ?? current.avatarId ? { avatarId: incoming.avatarId ?? current.avatarId } : {}),
+        ...(incoming.avatarPurpose ?? current.avatarPurpose
+          ? { avatarPurpose: incoming.avatarPurpose ?? current.avatarPurpose } : {}),
       };
       changed = true;
     }
@@ -1388,7 +1436,7 @@ export class KarmaxApi {
    * against the CURRENT project/global defaults and pin the stamped version.
    * Meta fields (profiles/draft/archived/triggers) aren't workflow overrides.
    */
-  private async buildStart(task: TaskRecord, migrateToLatest = false): Promise<{ startType: string; input: TaskInput; version: string }> {
+  private async buildStart(task: TaskRecord, migrateToLatest = false, caller?: ScopedToken): Promise<{ startType: string; input: TaskInput; version: string }> {
     const project = this.deps.store.getProject(task.projectId);
     const start = this.resolveStart(task.workflow, migrateToLatest ? undefined : task.workflowVersion, project?.organizationId);
     if (!project || !start) throw new Error(`cannot start task ${task.id}`);
@@ -1399,6 +1447,7 @@ export class KarmaxApi {
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization,
       _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
+    if (caller) this.validateTaskAvatars(caller, project, manifest, resolved);
     // Drafts re-resolve at queue time. Stamp that the resulting common branch
     // values already include repository fallback so provisioning must not apply
     // the repository default again over a project/task override.
@@ -1500,7 +1549,7 @@ export class KarmaxApi {
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
-    this.require(token, 'create_task', { projectId: task.projectId, taskId });
+    const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
     const group = this.deps.store.attemptGroup(taskId);
     if (group?.committedAttemptId && group.committedAttemptId !== taskId) {
       throw new Error('another attempt has entered Merge; this task is committed and no other attempt can be queued');
@@ -1519,7 +1568,7 @@ export class KarmaxApi {
     }
     // Pin to the version stamped when the draft was created, not whatever is
     // current now — queueing a draft after an upgrade must not silently swap code.
-    const { startType, input } = await this.buildStart(task);
+    const { startType, input } = await this.buildStart(task, false, caller);
     const hadNumber = task.num != null;
     this.deps.store.clearDraft(taskId);
     // Bounded + compensated: on a wedged engine, restore the draft and release a
@@ -2419,6 +2468,7 @@ export class KarmaxApi {
     view: TaskView,
     reason: string,
     disposition: 'replace' | 'cancel' | 'discard' = 'replace',
+    gracefulTimeoutMs = 30_000,
   ): Promise<void> {
     const handle = this.workflowHandle(task.id);
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
@@ -2433,7 +2483,7 @@ export class KarmaxApi {
       }
       try {
         await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
-        await withTimeout(Promise.resolve((handle as any).result()), 30_000);
+        await withTimeout(Promise.resolve((handle as any).result()), gracefulTimeoutMs);
         stoppedGracefully = true;
       } catch {
         // A wedged/older execution still has the bounded termination fallback.
@@ -2487,6 +2537,16 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
+  }
+
+  /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
+   * ever published. Reclaim by durable task ownership instead of relying on an
+   * in-memory activity finally block that may never run after failover. */
+  private releaseTaskRunnerLeases(taskId: string): void {
+    for (const lease of this.deps.store.worldLeasesForTask(taskId)) {
+      if (this.deps.runners) this.deps.runners.release(String(lease.id), 'unknown');
+      else this.deps.store.releaseWorldLease(String(lease.id));
+    }
   }
 
   private async startTransitionReplacement(
@@ -2675,9 +2735,22 @@ export class KarmaxApi {
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
-    if (!audience.length) throw new Error('choose at least one human or team');
-    if (audience.length > 32) throw new Error('at most 32 human audience selectors may be used');
+    if (!audience.length) throw new Error('choose at least one person, team, or Avatar');
+    if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
+    const avatarRecipients: import('../domain/types.js').Avatar[] = [];
+    const initiatingUserId = this.deps.store.taskCreatorUserId(task.id);
     for (const selector of audience) {
+      if (selector.startsWith('avatar:')) {
+        const avatar = this.deps.store.getAvatar(selector.slice(7));
+        if (!avatar || avatar.projectId !== task.projectId || !avatarEnabled(this.deps.store, avatar))
+          throw new Error(`Avatar route ${selector} is not available in this project`);
+        if (avatar.roles.length && !avatar.roles.includes('respond'))
+          throw new Error(`Avatar "${avatar.name}" is not configured to respond to tasks`);
+        if (!initiatingUserId || !avatarCallableBy(this.deps.store, avatar, initiatingUserId))
+          throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
+        avatarRecipients.push(avatar);
+        continue;
+      }
       if (!this.deps.store.humanAudience(task.id, [selector]).length)
         throw new Error(`Human route ${selector} does not resolve to a human in this organization`);
     }
@@ -2699,14 +2772,40 @@ export class KarmaxApi {
     };
     const seq = this.deps.store.appendEvent(event);
     this.deps.bus?.emit({ ...event, seq });
+    for (const avatar of avatarRecipients) {
+      try {
+        await this.createTask(token, {
+          projectId: task.projectId,
+          workflow: 'just-do',
+          title: `${avatar.name}: respond to task #${task.num ?? task.id}`,
+          prompt: `The agent working on task #${task.num ?? task.id} (${task.title}) asked for your intervention:
+
+${detail}
+
+Act according to your Avatar instructions. When ready, call signal_task for task id ${task.id} with signal "followUp" and the concrete guidance or decision in text. Address role "${caller.role ?? 'do'}" when relevant. Then briefly report what you sent.`,
+          params: {
+            'agent:do': {
+              avatarId: avatar.id,
+              avatarPurpose: 'respond',
+              provider: avatar.runtime.provider,
+              ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
+              ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
+            },
+          },
+        });
+      } catch (error) {
+        const failed = { taskId: task.id, type: 'avatar.response-dispatch-failed', ts: Date.now(),
+          payload: { avatarId: avatar.id, error: error instanceof Error ? error.message : String(error) } };
+        const failedSeq = this.deps.store.appendEvent(failed);
+        this.deps.bus?.emit({ ...failed, seq: failedSeq });
+      }
+    }
     return held;
   }
 
-  /**
-   * Ask selected humans to add exact capabilities to this task. This is a
-   * request primitive, not an elevation primitive: only a selected human who
-   * independently holds every requested capability can approve it.
-   */
+  /** Ask selected people, teams, or owner-configured Avatars to add exact
+   * capabilities to this task. The deciding principal must independently hold
+   * every capability it grants. */
   async requestPermission(
     token: string,
     args: { capabilities: string[]; audience: string[]; reason: string; urgency?: Urgency },
@@ -2726,10 +2825,23 @@ export class KarmaxApi {
     if (!missing.length) return { status: 'granted', capabilities };
 
     const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
-    if (!audience.length) throw new Error('choose at least one human or team');
-    if (audience.length > 32) throw new Error('at most 32 human audience selectors may be used');
+    if (!audience.length) throw new Error('choose at least one person, team, or Avatar');
+    if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const recipients = new Set<string>();
+    const avatarRecipients = new Set<string>();
+    const initiatingUserId = this.deps.store.taskCreatorUserId(task.id);
     for (const selector of audience) {
+      if (selector.startsWith('avatar:')) {
+        const avatar = this.deps.store.getAvatar(selector.slice(7));
+        if (!avatar || avatar.projectId !== task.projectId || !avatarEnabled(this.deps.store, avatar))
+          throw new Error(`Avatar route ${selector} is not available in this project`);
+        if (avatar.roles.length && !avatar.roles.includes('authorize'))
+          throw new Error(`Avatar "${avatar.name}" is not configured to decide authorizations`);
+        if (!initiatingUserId || !avatarCallableBy(this.deps.store, avatar, initiatingUserId))
+          throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
+        avatarRecipients.add(avatar.id);
+        continue;
+      }
       const resolved = this.deps.store.humanAudience(task.id, [selector]);
       if (!resolved.length) throw new Error(`Human route ${selector} does not resolve to a human in this organization`);
       resolved.forEach((userId) => recipients.add(userId));
@@ -2746,6 +2858,7 @@ export class KarmaxApi {
       capabilities: missing,
       audience,
       recipients: [...recipients],
+      avatarRecipients: [...avatarRecipients],
       reason: args.reason,
       requestedBy: `task-agent:${task.id}:${caller.profileId}`,
     });
@@ -2760,6 +2873,7 @@ export class KarmaxApi {
           capabilities: request.capabilities,
           audience: request.audience,
           recipients: request.recipients,
+          avatarRecipients: request.avatarRecipients,
           reason: request.reason,
           requestedBy: request.requestedBy,
           // An approval blocks the agent on a person, so it is high by default —
@@ -2779,6 +2893,36 @@ export class KarmaxApi {
           audience: request.audience,
           detail: `Permission requested: ${request.capabilities.join(', ')} — ${request.reason}`,
         });
+      }
+      for (const avatarId of avatarRecipients) {
+        const avatar = this.deps.store.getAvatar(avatarId)!;
+        try {
+          await this.createTask(token, {
+            projectId: task.projectId,
+            workflow: 'just-do',
+            title: `${avatar.name}: decide permission request`,
+            prompt: `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
+
+Requested capabilities: ${request.capabilities.join(', ')}
+Reason from the requesting agent: ${request.reason}
+
+Act according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+            params: {
+              'agent:do': {
+                avatarId: avatar.id,
+                avatarPurpose: 'authorize',
+                provider: avatar.runtime.provider,
+                ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
+                ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
+              },
+            },
+          });
+        } catch (error) {
+          const failed = { taskId: task.id, type: 'avatar.authorization-dispatch-failed', ts: Date.now(),
+            payload: { requestId: request.id, avatarId, error: error instanceof Error ? error.message : String(error) } };
+          const failedSeq = this.deps.store.appendEvent(failed);
+          this.deps.bus?.emit({ ...failed, seq: failedSeq });
+        }
       }
     }
     return {
@@ -2827,10 +2971,14 @@ export class KarmaxApi {
       projectId: request.projectId,
       organizationId: input.organizationId,
     });
-    if (caller.kind !== 'human' || !caller.principal.startsWith('user:'))
-      throw new CapabilityError('a human account is required to resolve a permission request');
-    const userId = caller.principal.slice(5);
-    if (!request.recipients.includes(userId))
+    const humanUserId = caller.kind === 'human' && caller.principal.startsWith('user:')
+      ? caller.principal.slice(5) : undefined;
+    const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:')
+      ? caller.principal.slice(7) : undefined;
+    if (!humanUserId && !avatarId)
+      throw new CapabilityError('a routed human or Avatar principal is required to resolve a permission request');
+    if (humanUserId && !request.recipients.includes(humanUserId)
+      || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this permission request was not routed to you');
     if (input.action === 'approve') {
       for (const capability of request.capabilities) {
@@ -2874,6 +3022,7 @@ export class KarmaxApi {
     users: Array<{ id: string; selector: string }>;
     teams: Array<{ id: string; name: string; slug: string; selector: string }>;
     special: Array<{ selector: string; description: string }>;
+    avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
   } {
     const caller = this.require(token, 'escalate_to_human');
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
@@ -2898,7 +3047,14 @@ export class KarmaxApi {
     const special = Object.entries(descriptions)
       .filter(([selector]) => this.deps.store.humanAudience(task.id, [selector]).length > 0)
       .map(([selector, description]) => ({ selector, description }));
-    return { taskId: task.id, users, teams, special };
+    const creatorUserId = this.deps.store.taskCreatorUserId(task.id);
+    const avatars = this.deps.store.listAvatars(task.projectId)
+      .filter((avatar) => avatarEnabled(this.deps.store, avatar)
+        && (!avatar.roles.length || avatar.roles.includes('authorize') || avatar.roles.includes('respond'))
+        && Boolean(creatorUserId && avatarCallableBy(this.deps.store, avatar, creatorUserId)))
+      .map((avatar) => ({ id: avatar.id, name: avatar.name, ...(avatar.purpose ? { purpose: avatar.purpose } : {}),
+        selector: `avatar:${avatar.id}`, roles: avatar.roles }));
+    return { taskId: task.id, users, teams, special, avatars };
   }
 
   /** Resolve the human-facing project-local number (#100) without guessing ids. */
@@ -3372,6 +3528,30 @@ export class KarmaxApi {
         payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } });
       if (!vote.satisfied) return;
     }
+    // Setup is the one stage where the projected view has no WorldHandle yet.
+    // A plain signal used to wait behind the five-minute createWorld activity,
+    // leaving both the task and its runner slot visibly stuck. Give cooperative
+    // cancellation a short chance, then terminate the old execution and reclaim
+    // every capacity lease it acquired before publishing a handle. This also
+    // repairs already-running pre-fix workflow versions after deployment.
+    if (signal === SIG.cancel && scopedTask && heldView?.stage === 'setup'
+      && !['done', 'cancelled', 'failed'].includes(heldView.status)) {
+      await this.stopTaskActivity(scopedTask, heldView, 'Setup cancellation did not stop', 'cancel', 5_000);
+      this.releaseTaskRunnerLeases(taskId);
+      const latest = this.deps.store.getTask(taskId)?.lastView ?? heldView;
+      if (!['done', 'cancelled', 'failed'].includes(latest.status)) {
+        this.deps.store.saveView(taskId, {
+          ...latest,
+          stage: 'cancelled',
+          status: 'cancelled',
+          waitingFor: undefined,
+          actions: [],
+          state: { ...latest.state, cancelled: true, cancelledFrom: 'setup' },
+        });
+      }
+      return;
+    }
+
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) {

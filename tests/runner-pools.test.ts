@@ -77,6 +77,120 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.usageSummary(organization.id)).toMatchObject({ costMicros: 0, events: 0 });
   });
 
+  it('reclaims setup capacity from terminal tasks and admits the next waiter', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
+    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
+      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const cancelled = store.createTask({ projectId: project.id, title: 'Cancelled setup', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    const next = store.createTask({ projectId: project.id, title: 'Next setup', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    const first = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
+      projectId: project.id, taskId: cancelled.id, worldId: cancelled.id });
+    const second = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
+      projectId: project.id, taskId: next.id, worldId: next.id });
+    store.saveView(cancelled.id, {
+      taskId: cancelled.id, title: cancelled.title, workflow: cancelled.workflow, stage: 'cancelled',
+      status: 'cancelled', messages: [], actions: [], state: { cancelled: true }, updatedAt: Date.now(),
+    });
+    const runners = new RunnerPoolService(store);
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(Date.now());
+
+    expect(store.worldLease(first.id)?.state).toBe('released');
+    expect(store.worldLease(second.id)?.state).toBe('active');
+  });
+
+  it('releases a failed admission reservation when its Temporal heartbeat disappears', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Timed out admission', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
+    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
+      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const runners = new RunnerPoolService(store);
+    const held = await runners.acquire({ project, taskId: 'held', worldId: 'held', provider: 'e2b' });
+
+    await expect(runners.acquire({ project, taskId: 'timed-out', worldId: 'timed-out', provider: 'e2b', pollMs: 5,
+      heartbeat: () => { throw new Error('NOT_FOUND'); } })).rejects.toThrow('NOT_FOUND');
+
+    expect(store.worldLeasesForTask('timed-out')).toEqual([]);
+    runners.release(held.leaseId, 'e2b');
+  });
+
+  it('reclaims old active capacity from a parked nonterminal world', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Parked recovery', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
+    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
+      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const task = store.createTask({ projectId: project.id, title: 'Still working', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      meta: { projectId: project.id } }, project.id);
+    store.setWorldState(handle, 'parked');
+    const stale = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
+      projectId: project.id, taskId: task.id, worldId: task.id });
+    const now = Date.now();
+    store.db.prepare('UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id=?')
+      .run(now - 3 * 60_000, now - 3 * 60_000, stale.id);
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined,
+      new RunnerPoolService(store)).sweep(now);
+
+    expect(store.worldLease(stale.id)?.state).toBe('released');
+  });
+
+  it('keeps a newly admitted wake-up while it marks its parked world ready', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Wake-up grace', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Waking', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      meta: { projectId: project.id } }, project.id);
+    store.setWorldState(handle, 'parked');
+    const runners = new RunnerPoolService(store);
+    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(Date.now());
+
+    expect(store.worldLease(lease.leaseId)?.state).toBe('active');
+    runners.release(lease.leaseId, 'e2b');
+  });
+
+  it('preserves old capacity explicitly borrowed by a live preview', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Preview capacity', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Finished with preview', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'done',
+      status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() });
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      meta: { projectId: project.id } }, project.id);
+    const runners = new RunnerPoolService(store);
+    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+    const orphan = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+    const now = Date.now();
+    store.db.prepare('UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id IN (?,?)')
+      .run(now - 3 * 60_000, now - 3 * 60_000, lease.leaseId, orphan.leaseId);
+    store.createPreviewLease({ id: 'preview-live', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, worldId: task.id, generation: 1, port: 3000, public: false, provider: 'e2b',
+      runnerLeaseId: lease.leaseId, createdBy: 'owner', createdAt: now - 3 * 60_000, expiresAt: now + 60_000 });
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(now);
+
+    expect(store.worldLease(lease.leaseId)?.state).toBe('active');
+    expect(store.worldLease(orphan.leaseId)?.state).toBe('released');
+    runners.release(lease.leaseId, 'e2b');
+    store.setWorldState(handle, 'released');
+  });
+
   it('reconciles provider executions idempotently with actual E2B resources and runtime', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Reconciled', ownerUserId: 'owner' });

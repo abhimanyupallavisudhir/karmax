@@ -25,9 +25,11 @@ import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
+import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { applyAvatarProfile, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
@@ -45,6 +47,7 @@ import {
   GithubActionsApiError,
   classifyGithubActionsDiagnostic,
   classifyGithubActionsFailure,
+  githubActionsHumanWaitReason,
   githubActionsRunIdFromUrl,
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
@@ -213,6 +216,7 @@ export interface CoreActivityDeps {
   bus?: KarmaxBus;
   globalInstructions?: string;
   tokens?: TokenAuthority;
+  authorization?: AuthorizationService;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** GitHub REST endpoint/transport override for pull-request operations (tests). */
@@ -411,6 +415,11 @@ export function expectedTaskRemoteHeads(store: Store, taskId: string): Record<st
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
+  const turnProfile = (task: TaskInput, role: AgentRole, explicitProfileId?: string) => {
+    const base = profiles.resolve(role, task.profiles, explicitProfileId, task.projectId);
+    const avatar = avatarForRole(store, task, role);
+    return { avatar, profile: applyAvatarProfile(base, task.agents?.[role], avatar) };
+  };
 
   const organizationGitProfilesFor = (projectId?: string) => new GitProfiles(
     store,
@@ -1104,18 +1113,44 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const environmentSelection = projectId
         ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
         : { built: false, environment: executionConfig?.environment };
+      let activitySignal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let cancellationHeartbeat: NodeJS.Timeout | undefined;
+      if (remote) {
+        try {
+          const ctx = activityContext.current();
+          activitySignal = ctx.cancellationSignal;
+          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
+          // Temporal delivers activity cancellation at heartbeat boundaries.
+          // Keep that boundary live after admission while the provider allocates
+          // and provisions the sandbox.
+          cancellationHeartbeat = setInterval(() => ctx.heartbeat({ provisioning: args.kind }), 500);
+          cancellationHeartbeat.unref();
+        } catch {
+          // Direct activity unit tests have no ambient Temporal context.
+        }
+      }
+      const stopCancellationHeartbeat = () => {
+        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
+        cancellationHeartbeat = undefined;
+      };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
-        const ctx = activityContext.current();
-        acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
-          priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: ctx.cancellationSignal,
-          heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) });
+        try {
+          acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
+            priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: activitySignal,
+            heartbeat });
+        } catch (error) {
+          stopCancellationHeartbeat();
+          throw error;
+        }
       }
       let world: World;
       const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
       try {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
+          signal: activitySignal,
           generation,
           organizationId: project?.organizationId,
           repo: worldSources.length === 1 ? worldSources[0] : undefined,
@@ -1139,6 +1174,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
       } catch (error) {
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        stopCancellationHeartbeat();
         if (remote && isTransportError(error)) {
           const message = error instanceof Error ? error.message : String(error);
           throw ApplicationFailure.create({
@@ -1196,16 +1232,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        stopCancellationHeartbeat();
         throw error;
       }
+      stopCancellationHeartbeat();
       return world.handle;
     },
 
     /** The effective provider for a role's turn (task override → seeded profile),
      *  so the workflow can lease an account of the right provider (SPEC §6.2). */
     async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<string> {
-      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
-      return applyAgentSpec(baseProfile, args.task.agents?.[args.role]).provider;
+      return turnProfile(args.task, args.role).profile.provider;
     },
 
     /** Whether this turn consumes host model-process capacity. Remote subscription
@@ -1234,8 +1271,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (args.accountApiKeyHandle && deps.broker) return true;
       if (args.accountConfigHome) return false;
 
-      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
-      const profile = applyAgentSpec(baseProfile, args.task.agents?.[args.role]);
+      const profile = turnProfile(args.task, args.role).profile;
       const modelProvider = args.accountCredentialProvider
         ? canonicalModelProvider(args.accountCredentialProvider)
         : credentialProvider(profile);
@@ -1258,10 +1294,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const all = enumerateCredentials(sources);
       const layers = readPolicyLayers((k) => store.kvGet(k), { organizationId, projectId: args.projectId, taskId: args.taskId });
       const profile = args.role && args.task
-        ? applyAgentSpec(
-          profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId),
-          args.task.agents?.[args.role],
-        )
+        ? turnProfile(args.task, args.role).profile
         : undefined;
       const enabled = resolveCredentials(all, layers);
       let missingNamespace = args.provider;
@@ -1332,10 +1365,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
-      const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
-      // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
-      let profile = applyAgentSpec(baseProfile, spec);
+      const selectedTurn = turnProfile(args.task, args.role, args.explicitProfileId);
+      const avatar = selectedTurn.avatar;
+      let profile = selectedTurn.profile;
       const leasedCredentialProvider = args.accountCredentialProvider
         ? canonicalModelProvider(args.accountCredentialProvider)
         : undefined;
@@ -1445,9 +1478,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         organizationId?: string;
         delegationId?: string;
       } | undefined;
+      const delegatedAuthorization = avatar?.authorization;
+      const avatarOwnerCaps = avatar && deps.authorization
+        ? deps.authorization.capabilities(`user:${avatar.ownerUserId}`, args.task.projectId, avatar.organizationId)
+        : delegatedAuthorization?.capabilities;
+      const principalGrant = avatar
+        ? attenuate(delegatedAuthorization?.capabilities ?? [], avatarOwnerCaps ?? [])
+        : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
       const grant = [...new Set([
-        ...(storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT),
-        ...orgVaultItems.extensionCaps(args.taskId),
+        ...principalGrant,
+        ...(avatar ? [] : orgVaultItems.extensionCaps(args.taskId)),
         ...approvedPermissions,
         'task:escalate',
       ])];
@@ -1455,30 +1495,41 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // the workflow role's ordinary ceiling. Fold it into both token axes: the
       // normal stored task grant remains least-privilege, while the approved
       // exception is exact, task-scoped, durable, and audited.
-      const ceiling = [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
+      const ceiling = avatar
+        ? [...new Set(grant)]
+        : [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
       const effective = attenuate(ceiling, grant);
       let token: string | undefined;
       if (deps.tokens) {
         const authorizationScope = storedAuthorization?.scope;
+        const delegatedScope = delegatedAuthorization?.scope;
         const minted = deps.tokens.mint({
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
-          principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
-          projectId: authorizationScope ? undefined : args.task.projectId,
-          projectIds: authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
-          organizationId: authorizationScope === 'global' ? undefined
-            : (storedAuthorization?.organizationId ?? store.getProject(args.task.projectId)?.organizationId),
+          principal: avatar ? avatarPrincipal(avatar.id)
+            : args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
+          projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
+            : authorizationScope ? undefined : args.task.projectId,
+          projectIds: avatar
+            ? delegatedScope === 'projects' ? delegatedAuthorization?.projectIds : undefined
+            : authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
+          organizationId: avatar
+            ? delegatedScope === 'global' ? undefined : (delegatedAuthorization?.organizationId ?? avatar.organizationId)
+            : authorizationScope === 'global' ? undefined
+              : (storedAuthorization?.organizationId ?? store.getProject(args.task.projectId)?.organizationId),
           audience: 'karmax-platform',
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           worldGeneration: args.worldHandle.generation,
-          delegationId: storedAuthorization?.delegationId ?? args.task.delegationId,
+          delegationId: avatar ? undefined : (storedAuthorization?.delegationId ?? args.task.delegationId),
+          externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
           ceiling,
           grantorCaps: grant,
         });
         token = minted.token;
         record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: profile.id, caps: effective,
-          audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt });
+          audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt,
+          ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId, promptVersion: avatar.promptVersion } : {}) });
       }
 
       // JIT-resolve credentials via the broker (never journaled). Every current
@@ -1821,6 +1872,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           status: next.status,
           waitingFor: next.waitingFor?.kind ?? null,
           waitingDetail: next.waitingFor?.detail ?? null,
+          waitingSummary: next.waitingFor?.summary ?? null,
           waitingProvider: next.waitingFor?.provider ?? null,
           waitingResetAt: next.waitingFor?.earliestResetAt ?? null,
           agentTurn: next.agentTurn?.state ?? null,
@@ -3033,7 +3085,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
               const checkContext = check ? `${check.name}: ${check.state}\n${check.detail ?? ''}` : '';
               decisions.push(terminalObservation(
-                classifyGithubActionsFailure(inspected, { additionalContext: checkContext }),
+                classifyGithubActionsFailure(inspected, { providerContext: checkContext }),
                 reconciliation.key,
               ));
             } catch (error) {
@@ -3068,6 +3120,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
             detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
+            waitReason: githubActionsHumanWaitReason(summary),
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure === 'superseded') {
@@ -3115,6 +3168,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
           status: 'needs-human', prs: current, actorUserId, detail,
+          waitReason: human.decision.waitReason,
           eligibleUserIds: [actorUserId],
         };
         const revision = decisions.find(({ decision }) => decision.disposition === 'revision');
@@ -4261,6 +4315,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         status: view.status,
         waitingFor: view.waitingFor?.kind ?? null,
         waitingDetail: view.waitingFor?.detail ?? null,
+        waitingSummary: view.waitingFor?.summary ?? null,
         waitingProvider: view.waitingFor?.provider ?? null,
         waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
         agentTurn: view.agentTurn?.state ?? null,

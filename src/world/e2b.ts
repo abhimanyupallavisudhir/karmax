@@ -68,15 +68,15 @@ export interface E2BSandboxLike {
 export interface E2BFactory {
   create(options: { template?: string; desktop?: boolean; apiKey?: string; timeoutMs: number; requestTimeoutMs: number; lifecycle: { onTimeout: 'pause'; autoResume: true };
     metadata: Record<string, string>; allowInternetAccess?: boolean;
-    network?: { allowOut?: string[]; denyOut?: string[]; allowPublicTraffic: false } }): Promise<E2BSandboxLike>;
-  connect(id: string, options: { timeoutMs: number; requestTimeoutMs?: number; apiKey?: string; desktop?: boolean }): Promise<E2BSandboxLike>;
+    network?: { allowOut?: string[]; denyOut?: string[]; allowPublicTraffic: false }; signal?: AbortSignal }): Promise<E2BSandboxLike>;
+  connect(id: string, options: { timeoutMs: number; requestTimeoutMs?: number; apiKey?: string; desktop?: boolean; signal?: AbortSignal }): Promise<E2BSandboxLike>;
   /** Control-plane state lookup that must not resume a paused sandbox; absent
    * (or undefined result) means the provider cannot answer cheaply. */
   info?(id: string, options: { apiKey?: string }): Promise<{ state?: string } | undefined>;
   /** Control-plane enumeration of sandboxes carrying this deployment's
    * metadata, for orphan reaping. Never connects (which would resume a paused
    * sandbox and bill it). */
-  list?(options: { apiKey?: string; requestTimeoutMs?: number; metadata: Record<string, string> }): Promise<Array<{
+  list?(options: { apiKey?: string; requestTimeoutMs?: number; metadata: Record<string, string>; signal?: AbortSignal }): Promise<Array<{
     sandboxId: string; metadata?: Record<string, string> }>>;
   /** Control-plane teardown by id, so an orphan can be killed without a
    * handle — and, again, without resuming it first. */
@@ -123,6 +123,7 @@ export class E2BWorldProvider implements WorldProvider {
     const connectionOptions = {
       timeoutMs: this.idleMs,
       requestTimeoutMs,
+      ...(spec.signal ? { signal: spec.signal } : {}),
       ...(flavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}),
     };
@@ -145,6 +146,7 @@ export class E2BWorldProvider implements WorldProvider {
       // final task policy is installed atomically below before the World escapes.
       allowInternetAccess: true,
     }).catch(async (error) => {
+      if (spec.signal?.aborted) throw error;
       // E2B may finish allocating after its HTTP response exceeds the client
       // deadline. Reconcile provider truth before allowing Temporal to retry;
       // otherwise every retry can allocate another paid sandbox for one task.
@@ -158,7 +160,8 @@ export class E2BWorldProvider implements WorldProvider {
     this.sandboxes.set(sandbox.sandboxId, sandbox);
     this.states.set(sandbox.sandboxId, 'ready');
     try {
-      const provisioner = provisionTarget(sandbox);
+      spec.signal?.throwIfAborted();
+      const provisioner = provisionTarget(sandbox, spec.signal);
       // A recovered sandbox never escaped this create activity, so anything in
       // its workspace is an incomplete provisioning attempt, not user work.
       if (adopted) await provisionRun(provisioner, `rm -rf ${ROOT} && mkdir -p ${ROOT}`);
@@ -362,12 +365,13 @@ export class E2BWorldProvider implements WorldProvider {
    * key shipped (including in-flight activities during a worker roll). */
   private async findProvisioningSandbox(
     metadata: Record<string, string>,
-    options: { timeoutMs: number; requestTimeoutMs: number; apiKey?: string; desktop?: boolean },
+    options: { timeoutMs: number; requestTimeoutMs: number; apiKey?: string; desktop?: boolean; signal?: AbortSignal },
   ): Promise<E2BSandboxLike | undefined> {
     if (!this.factory.list) return undefined;
     const api = {
       ...(options.apiKey ? { apiKey: options.apiKey } : {}),
       requestTimeoutMs: options.requestTimeoutMs,
+      ...(options.signal ? { signal: options.signal } : {}),
     };
     let matches = await this.factory.list({ ...api, metadata });
     if (!matches.length) {
@@ -665,11 +669,11 @@ function commandErrorResult(error: any): ExecResult {
 
 /** Trusted-provisioning adapter over the sandbox SDK. Never catches: real SDK
  * errors (including nonzero-exit throws) must reach the caller unchanged. */
-function provisionTarget(sandbox: E2BSandboxLike): ProvisionTarget {
+function provisionTarget(sandbox: E2BSandboxLike, signal?: AbortSignal): ProvisionTarget {
   return {
     async run(command, timeoutMs) {
       try {
-        const result = await sandbox.commands.run(command, { timeoutMs });
+        const result = await sandbox.commands.run(command, { timeoutMs, ...(signal ? { signal } : {}) });
         return { stdout: String(result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
           code: Number(result?.exitCode ?? result?.code ?? 0) };
       } catch (error) {
