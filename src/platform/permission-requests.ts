@@ -13,6 +13,9 @@ export interface PermissionRequest {
   /** Materialized at request time so later membership changes cannot widen who
    * may decide an already-pending elevation. */
   recipients: string[];
+  /** Avatar principals selected at request time. Kept separate from human ids
+   * so the inbox never attempts to materialize an Avatar as a user. */
+  avatarRecipients?: string[];
   reason: string;
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied';
@@ -77,6 +80,7 @@ export class PermissionRequests {
     capabilities: Capability[];
     audience: string[];
     recipients: string[];
+    avatarRecipients?: string[];
     reason: string;
     requestedBy: string;
   }): PermissionRequest {
@@ -85,7 +89,8 @@ export class PermissionRequests {
     if (capabilities.length > 32) throw new Error('at most 32 capabilities may be requested');
     const audience = [...new Set(input.audience.map((value) => String(value).trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
-    if (!audience.length || !recipients.length) throw new Error('choose at least one human or team');
+    const avatarRecipients = [...new Set((input.avatarRecipients ?? []).map(String).filter(Boolean))];
+    if (!audience.length || (!recipients.length && !avatarRecipients.length)) throw new Error('choose at least one person, team, or Avatar');
     const reason = String(input.reason).trim();
     if (!reason) throw new Error('reason is required');
     if ([...reason].length > 4_000) throw new Error('reason must be at most 4000 characters');
@@ -108,6 +113,7 @@ export class PermissionRequests {
       capabilities,
       audience,
       recipients,
+      ...(avatarRecipients.length ? { avatarRecipients } : {}),
       reason,
       requestedBy: input.requestedBy,
       status: 'pending',
@@ -118,7 +124,7 @@ export class PermissionRequests {
       principalId: input.requestedBy,
       action: 'permission.requested',
       scopeKey: `project:${input.projectId}`,
-      detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, audience, recipients },
+      detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, audience, recipients, avatarRecipients },
     });
     return request;
   }

@@ -102,6 +102,18 @@ const repeatedProviderEntries = conversationEntries(transcript);
 ok(repeatedProviderEntries.filter((entry) => entry.activity?.title === 'All done').length === 1,
   'duplicate provider message items in one turn collapse to the last copy');
 S.taskEvents.pop();
+const replacedProviderIdEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'replaced-id', role: 'agent', text: 'All done', ts: 2,
+    sourceActivity: { turnId: 'turn-1', id: 'provider-replaced-this-id', attempt: 1 } },
+] });
+ok(replacedProviderIdEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.id === 'replaced-id').length === 1,
+  'a replaced provider item id still de-duplicates the final reply within its turn');
+const sameTextOtherTurnEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'other-turn', role: 'agent', text: 'All done', ts: 2,
+    sourceActivity: { turnId: 'turn-2', id: 'reply', attempt: 1 } },
+] });
+ok(sameTextOtherTurnEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.id === 'other-turn').length === 2,
+  'the turn-scoped fallback preserves a genuinely repeated reply from another turn');
 const legacyLineEndingEntries = conversationEntries({ role: 'do', messages: [
   { id: 'legacy-crlf', role: 'agent', text: 'All done\r\n', ts: 2 },
 ] });
