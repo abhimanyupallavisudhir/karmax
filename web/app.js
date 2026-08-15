@@ -14369,7 +14369,7 @@ function renderLanding() {
     <header class="landing-nav" aria-label="Primary navigation">
       <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
       <div class="landing-nav-actions">
-        <a href="https://github.com/abhimanyupallavisudhir/karmax" class="landing-text-link">GitHub</a>
+        <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
         <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
       </div>
@@ -14478,7 +14478,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/karmax">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);

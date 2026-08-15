@@ -6,4 +6,4 @@ krmax gives agents isolated cloud worlds, lets people or agents own review and i
 
 ## Links
 
-- [Source code](https://github.com/abhimanyupallavisudhir/karmax)
+- [Issue tracker](https://github.com/abhimanyupallavisudhir/krmax-issues/issues)

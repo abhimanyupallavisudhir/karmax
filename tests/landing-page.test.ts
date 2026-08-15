@@ -60,4 +60,10 @@ describe('public landing page', () => {
     expect(css).toContain('@media (max-width: 680px)');
     expect(css).toContain('@media (prefers-reduced-motion: reduce)');
   });
+
+  it('sends public GitHub links to the issue tracker, never the private repository', () => {
+    const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
+    expect(landing.match(/https:\/\/github\.com\/abhimanyupallavisudhir\/krmax-issues\/issues/g)).toHaveLength(2);
+    expect(landing).not.toContain('github.com/abhimanyupallavisudhir/karmax');
+  });
 });
