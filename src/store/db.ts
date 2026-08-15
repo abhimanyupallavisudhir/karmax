@@ -4422,6 +4422,17 @@ export class Store {
       ORDER BY createdAt`).all(taskId) as any[];
   }
 
+  /** Dedicated terminal/preview access can legitimately outlive its task's
+   * workflow. Runner reconciliation must preserve capacity explicitly owned by
+   * one of those live records rather than guessing from world state alone. */
+  worldLeaseHasLiveAccessor(leaseId: string, now = Date.now()): boolean {
+    const preview = this.db.prepare(`SELECT 1 FROM preview_leases
+      WHERE runnerLeaseId=? AND revokedAt IS NULL AND expiresAt>? LIMIT 1`).get(leaseId, now);
+    if (preview) return true;
+    return Boolean(this.db.prepare(`SELECT 1 FROM executions
+      WHERE runnerLeaseId=? AND state IN ('starting','running','stop-requested') LIMIT 1`).get(leaseId));
+  }
+
   unreleasedWorldLeases(): any[] {
     return this.db.prepare(`SELECT * FROM world_leases WHERE state!='released'
       ORDER BY createdAt`).all() as any[];
