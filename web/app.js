@@ -2934,11 +2934,8 @@ function connectWs() {
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
     setWsOnline(true);
-    if (wsHadDropped) {
-      checkConsoleRevision();
-      refreshTasks().catch(() => {});
-      if (S.selected) refreshTask().catch(() => {});
-    }
+    if (wsHadDropped) checkConsoleRevision();
+    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
     wsHadDropped = false;
   };
   ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };

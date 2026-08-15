@@ -27,7 +27,7 @@ ok(!context.consoleRevisionChanged(undefined, 'new'), 'the first observed revisi
 ok(!context.consoleRevisionChanged('same', 'same'), 'an unchanged deployment does not reload the console');
 ok(context.consoleRevisionChanged('old', 'new'), 'an already-open console detects a newly deployed app.js');
 ok(src.includes('setInterval(checkConsoleRevision, 60_000)'), 'the console checks for a deployment while a tab remains open');
-ok(src.includes('if (wsHadDropped) {\n      checkConsoleRevision();'), 'a deployment websocket reconnect checks immediately');
+ok(src.includes('if (wsHadDropped) checkConsoleRevision();'), 'a deployment websocket reconnect checks immediately');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
