@@ -609,7 +609,8 @@ export class Store {
         subscriptionId TEXT UNIQUE, plan TEXT NOT NULL, status TEXT NOT NULL,
         seats INTEGER NOT NULL, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
         cancelAtPeriodEnd INTEGER NOT NULL, lastEventAt INTEGER NOT NULL,
-        verifiedAt INTEGER, lastError TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        verifiedAt INTEGER, pastDueAt INTEGER, lastError TEXT,
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS subscription_billing_events (
         provider TEXT NOT NULL, eventId TEXT NOT NULL, type TEXT NOT NULL,
@@ -775,6 +776,9 @@ export class Store {
     const organizationCols = this.db.prepare('PRAGMA table_info(organizations)').all() as { name: string }[];
     if (!organizationCols.some((c) => c.name === 'plan'))
       this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'");
+    const subscriptionBillingCols = this.db.prepare('PRAGMA table_info(subscription_billing_accounts)').all() as { name: string }[];
+    if (!subscriptionBillingCols.some((c) => c.name === 'pastDueAt'))
+      this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN pastDueAt INTEGER');
     const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
     if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
     const attachmentCols = this.db.prepare('PRAGMA table_info(resource_attachments)').all() as { name: string }[];

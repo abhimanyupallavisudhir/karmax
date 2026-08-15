@@ -360,9 +360,22 @@ async function main() {
   const retentionTimer = setInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
 
+  // Re-derive effective plans from the last signed provider state at boot and
+  // throughout the process lifetime. In particular, this closes past-due grace
+  // even when Stripe sends no later event.
+  const reconcileSubscriptionEntitlements = () => {
+    try { subscriptionBilling.reconcileEntitlements(); }
+    catch (error) {
+      console.warn('  • Subscription entitlement reconciliation failed:',
+        error instanceof Error ? error.message : String(error));
+    }
+  };
+  reconcileSubscriptionEntitlements();
+  const subscriptionEntitlementTimer = setInterval(reconcileSubscriptionEntitlements, 60_000);
+  subscriptionEntitlementTimer.unref();
+
   // Membership hooks submit seat changes immediately; this bounded sweep makes
-  // that reconciliation eventual after a provider outage or process crash. It
-  // still does not alter local entitlements—the following signed webhook does.
+  // provider quantity reconciliation eventual after an outage or process crash.
   const syncSubscriptionSeats = () => {
     for (const organization of store.listOrganizations())
       void subscriptionBilling.syncSeats(organization.id).catch((error) =>

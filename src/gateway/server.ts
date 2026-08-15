@@ -1575,8 +1575,6 @@ export class Gateway {
         try {
           const invitationToken = String(b.token ?? '');
           const invited = store.organizationInvitationForToken(invitationToken);
-          if (invited && !store.organizationMembership(invited.organizationId, subject.userId))
-            this.deps.subscriptions?.assertMayAddMember(invited.organizationId);
           const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, session.email);
           this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
@@ -1624,9 +1622,14 @@ export class Gateway {
         if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
         const billing = this.deps.subscriptions;
         if (!billing) return this.json(res, 503, { error: 'subscription billing is unavailable' });
-        if (action === 'status') return method === 'GET'
-          ? this.json(res, 200, billing.current(organizationId))
-          : this.json(res, 405, { error: 'method not allowed' });
+        if (action === 'status') {
+          if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+          const interactiveUserId = callerIdentity.actor.kind === 'interactive-human'
+            ? callerIdentity.humanSubject?.userId : undefined;
+          const canManage = Boolean(interactiveUserId
+            && store.organizationMembership(organizationId, interactiveUserId)?.role === 'owner');
+          return this.json(res, 200, { ...billing.current(organizationId), canManage });
+        }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
         // Agent-card administration is delegable through payment:write. Paying
         // for the SaaS itself is not: require live browser presence and the
@@ -1640,7 +1643,7 @@ export class Gateway {
         try {
           if (action === 'checkout') {
             const body = await this.body(req);
-            const plan = String(body.plan ?? '') as 'individual' | 'team';
+            const plan = String(body.plan ?? '');
             const result = await billing.checkout(organizationId, plan,
               { success: `${settingsBase}?billing=success#settings-billing`,
                 cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
@@ -1650,7 +1653,7 @@ export class Gateway {
           if (action === 'change') {
             const body = await this.body(req);
             return this.json(res, 202, await billing.changePlan(organizationId,
-              String(body.plan ?? '') as 'individual' | 'team', idempotencyKey));
+              String(body.plan ?? ''), idempotencyKey));
           }
           if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
           await billing.syncSeats(organizationId);
@@ -1809,7 +1812,6 @@ export class Gateway {
           this.deps.authorization?.assertCanGrantSelection(actorPrincipal(callerIdentity.actor),
             organizationId, authorization, authRecord?.kind === 'human' ? undefined : authRecord?.caps);
           const existing = store.organizationMembership(organizationId, String(b.userId));
-          if (!existing) this.deps.subscriptions?.assertMayAddMember(organizationId);
           const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
           this.deps.authorization?.replacePrincipalAuthorization(actorPrincipal(callerIdentity.actor),
             `user:${membership.userId}`, organizationId, authorization,
@@ -6282,8 +6284,6 @@ export class Gateway {
           const email = String(body.userName ?? body.emails?.find((entry: any) => entry.primary)?.value ?? '').trim().toLowerCase();
           if (!email) return this.scimJson(res, 400, { detail: 'userName is required' });
           let user = this.deps.identity.listUsers().find((candidate) => candidate.email.toLowerCase() === email);
-          if (!user || !this.deps.store.organizationMembership(organizationId, user.id))
-            this.deps.subscriptions?.assertMayAddMember(organizationId);
           if (!user) user = await this.deps.identity.createUser({ name: String(body.displayName ?? body.name?.formatted ?? email.split('@')[0]),
             email, password: crypto.randomBytes(24).toString('base64url') });
           this.deps.store.setOrganizationMembership(organizationId, user.id, 'member');
@@ -6300,7 +6300,6 @@ export class Gateway {
             this.deps.store.deprovisionOrganizationUser(organizationId, id);
             this.deps.identity.revokeUserSessions(id);
           } else if (!this.deps.store.organizationMembership(organizationId, id)) {
-            this.deps.subscriptions?.assertMayAddMember(organizationId);
             this.deps.store.setOrganizationMembership(organizationId, id, 'member');
           }
           void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
