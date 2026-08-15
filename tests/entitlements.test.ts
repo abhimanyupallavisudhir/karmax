@@ -13,6 +13,7 @@ import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { EntitlementQueueReconciler } from '../src/platform/entitlement-queue-reconciler.js';
 
 describe('hosted plan entitlements', () => {
   it('keeps launch pricing and limits in one billing-safe catalog', () => {
@@ -150,6 +151,37 @@ describe('hosted plan entitlements', () => {
 });
 
 describe('hosted agent-run admission integration', () => {
+  it('reconciles the durable queue directly from member and billing-plan mutations', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Reconcile', ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, 'team');
+    store.setOrganizationMembership(organization.id, 'second', 'member');
+    store.setOrganizationMembership(organization.id, 'third', 'member');
+    store.setOrganizationPlan(organization.id, 'free');
+    const signal = vi.fn(async () => undefined);
+    const getHandle = vi.fn(() => ({ signal }));
+    const reconciler = new EntitlementQueueReconciler({
+      store,
+      client: { workflow: { getHandle } } as any,
+      intervalMs: 0,
+    });
+    reconciler.start();
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 0 }));
+
+    signal.mockClear();
+    store.removeOrganizationMembership(organization.id, 'second');
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 0 }));
+    signal.mockClear();
+    store.removeOrganizationMembership(organization.id, 'third');
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 1 }));
+
+    signal.mockClear();
+    store.setOrganizationPlan(organization.id, 'team');
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 10 }));
+    expect(getHandle).toHaveBeenLastCalledWith(`agent-queue:${organization.id}`);
+    reconciler.stop();
+  });
+
   it('blocks new run admission while over the member limit and reopens after recovery', async () => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Over limit', ownerUserId: 'owner' });

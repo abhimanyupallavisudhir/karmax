@@ -128,6 +128,7 @@ export class Store {
   readonly db: SqlDatabase;
   readonly hosted: boolean;
   private userNames?: () => Array<{ id: string; name: string }>;
+  private organizationEntitlementListeners = new Set<(organizationId: string) => void>();
 
   constructor(dbPath = ':memory:', options: { hosted?: boolean } = {}) {
     this.hosted = options.hosted === true;
@@ -1086,6 +1087,27 @@ export class Store {
     this.userNames = lookup;
   }
 
+  /**
+   * Observe organization mutations that can change hosted admission. The store
+   * remains the single synchronous billing/member write boundary; control-plane
+   * services use this hook to reconcile derived durable coordinator state.
+   */
+  onOrganizationEntitlementsChanged(listener: (organizationId: string) => void): () => void {
+    this.organizationEntitlementListeners.add(listener);
+    return () => this.organizationEntitlementListeners.delete(listener);
+  }
+
+  private notifyOrganizationEntitlementsChanged(organizationId: string): void {
+    // Run after the current synchronous write/transaction has completed. In
+    // particular, deprovisionOrganizationUser removes the membership inside a
+    // larger transaction and must never reconcile from an intermediate state.
+    queueMicrotask(() => {
+      for (const listener of this.organizationEntitlementListeners) {
+        try { listener(organizationId); } catch { /* a periodic reconciler retries */ }
+      }
+    });
+  }
+
   private assertOrganizationNameAvailable(name: string, options: {
     excludeOrganizationId?: string;
     allowUserId?: string;
@@ -1135,6 +1157,7 @@ export class Store {
     if (!isHostedPlanId(plan)) throw new Error(`unknown hosted plan ${String(plan)}`);
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     this.db.prepare('UPDATE organizations SET plan=? WHERE id=?').run(plan, organizationId);
+    this.notifyOrganizationEntitlementsChanged(organizationId);
     return this.getOrganization(organizationId)!;
   }
 
@@ -1651,6 +1674,7 @@ export class Store {
     const joinedAt = Date.now();
     this.db.prepare(`INSERT INTO organization_memberships (organizationId, userId, role, joinedAt)
       VALUES (?, ?, ?, ?) ON CONFLICT(organizationId, userId) DO UPDATE SET role=excluded.role`).run(organizationId, userId, role, joinedAt);
+    if (!existing) this.notifyOrganizationEntitlementsChanged(organizationId);
     return { organizationId, userId, role, joinedAt };
   }
 
@@ -1671,6 +1695,7 @@ export class Store {
     }
     this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId);
     this.db.prepare('DELETE FROM user_preferences WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId);
+    if (membership) this.notifyOrganizationEntitlementsChanged(organizationId);
   }
 
   getOrganizationIdentityPolicy(organizationId: string): OrganizationIdentityPolicy {
@@ -4988,6 +5013,7 @@ export class Store {
   kvDelete(k: string): void { this.db.prepare('DELETE FROM kv WHERE k=?').run(k); }
 
   close() {
+    this.organizationEntitlementListeners.clear();
     this.db.close();
   }
 

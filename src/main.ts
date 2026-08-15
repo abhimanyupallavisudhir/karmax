@@ -45,6 +45,7 @@ import { WorldAccessService } from './world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.js';
 import { sweepOrphanedServiceContainers } from './world/services.js';
 import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-restart.js';
+import { EntitlementQueueReconciler } from './platform/entitlement-queue-reconciler.js';
 import type { WorldHandle } from './world/types.js';
 
 const VERSION = '1.0.0';
@@ -365,6 +366,18 @@ async function main() {
   for (const { workflowId, reason } of health.reported)
     console.warn(`  ! Coordinator ${workflowId} is wedged; left alone: ${reason}`);
 
+  // Hosted plan/member writes are synchronous database boundaries, while the
+  // organization agent queue is durable Temporal state. Reconcile immediately
+  // after each write, at boot, and periodically so queued work recovers without
+  // waiting for another admission/release/cancel side effect.
+  const entitlementQueues = new EntitlementQueueReconciler({
+    store,
+    client,
+    intervalMs: RECONCILE_INTERVAL_MS,
+    log: (message) => console.warn(`  • ${message}`),
+  });
+  entitlementQueues.start();
+
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
   const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));
@@ -640,6 +653,7 @@ async function main() {
     clearInterval(orphanSweep);
     clearInterval(reconcileSweep);
     clearInterval(deploymentSweep);
+    entitlementQueues.stop();
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();
