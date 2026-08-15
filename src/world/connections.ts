@@ -68,8 +68,13 @@ export class WorldProviderConnectionService {
       };
     }
     if (value && !value.enabled) throw new Error(`${providerName(provider)} is disabled for this organization`);
-    // Environment credentials are a migration/bootstrap fallback. New hosted
-    // organizations use their own vault-backed connection instead.
+    // Hosted launches must never turn an installation credential into a
+    // centrally resold organization rail. importEnvironment() migrates a
+    // bootstrap key into the installation owner's explicit connection; every
+    // other hosted organization must connect its own account.
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted')
+      throw new Error(`${providerName(provider)} is not connected for this organization`);
+    // Environment credentials remain a self-hosted compatibility fallback.
     const apiKey = provider === 'e2b' ? process.env.E2B_API_KEY : provider === 'daytona' ? process.env.DAYTONA_API_KEY : undefined;
     if (!apiKey) throw new Error(`${providerName(provider)} is not connected for this organization`);
     return { organizationId, provider, apiKey, config: environmentConfig(provider) };

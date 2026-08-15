@@ -113,7 +113,15 @@ export class WorldCheckpointService {
     const encrypted = this.encrypt(compressed);
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
-    await this.objects.put(objectKey, encrypted);
+    const managedStorage = this.store.listStorageLocations(project.organizationId)
+      .find((location) => location.kind === 'managed');
+    if (managedStorage) this.store.reserveStorageUpload(`checkpoint:${checkpointId}`, project.organizationId,
+      managedStorage.id, encrypted.length, Date.now() + 60 * 60_000);
+    try { await this.objects.put(objectKey, encrypted); }
+    catch (error) {
+      if (managedStorage) this.store.releaseStorageUpload(`checkpoint:${checkpointId}`);
+      throw error;
+    }
     const checkpoint: WorldCheckpoint = {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
@@ -123,10 +131,13 @@ export class WorldCheckpointService {
       ...snapshotProjectRuntime(this.store, projectId),
       createdAt: Date.now(),
     };
-    this.store.saveWorldCheckpoint(checkpoint);
+    try { this.store.saveWorldCheckpoint(checkpoint); }
+    catch (error) { await this.objects.delete(objectKey).catch(() => undefined); throw error; }
+    finally { if (managedStorage) this.store.releaseStorageUpload(`checkpoint:${checkpointId}`); }
     this.store.attachWorldCheckpoint(handle, checkpoint.id);
     this.store.recordUsage({ organizationId: project.organizationId, projectId, taskId: handle.id, worldId: handle.id,
-      provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte-second', costMicros: 0,
+      provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte', costMicros: 0,
+      fundingSource: 'managed',
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
       metadata: { checkpointId, generation: checkpoint.generation } });
     await this.resources?.scrubSecrets(handle);

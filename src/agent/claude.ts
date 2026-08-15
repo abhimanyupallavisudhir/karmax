@@ -98,6 +98,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
+    const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 };
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed. This path rebuilds the full
@@ -152,6 +153,12 @@ export class ClaudeAdapter implements AgentAdapter {
         throw providerErrorFromMessage('claude', message, 'structured');
       }
       const data = (await res.json()) as any;
+      usage.inputTokens += Number(data.usage?.input_tokens ?? 0);
+      usage.outputTokens += Number(data.usage?.output_tokens ?? 0);
+      usage.cacheReadTokens += Number(data.usage?.cache_read_input_tokens ?? 0);
+      usage.cacheWriteTokens += Number(data.usage?.cache_creation_input_tokens ?? 0);
+      usage.totalTokens += Number(data.usage?.input_tokens ?? 0) + Number(data.usage?.output_tokens ?? 0)
+        + Number(data.usage?.cache_read_input_tokens ?? 0) + Number(data.usage?.cache_creation_input_tokens ?? 0);
       messages.push({ role: 'assistant', content: data.content });
       const toolUses = (data.content ?? []).filter((b: any) => b.type === 'tool_use');
       const text = (data.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
@@ -215,6 +222,7 @@ export class ClaudeAdapter implements AgentAdapter {
       session: input.session,
       output: finalText,
       delivered: deliveredIndex,
+      usage,
     };
   }
 
@@ -787,6 +795,15 @@ export class ClaudeAdapter implements AgentAdapter {
       session,
       output: finalText,
       delivered: deliveredIndex,
+      ...(successfulResult.usage ? { usage: {
+        inputTokens: Number(successfulResult.usage.input_tokens ?? 0),
+        outputTokens: Number(successfulResult.usage.output_tokens ?? 0),
+        cacheReadTokens: Number(successfulResult.usage.cache_read_input_tokens ?? 0),
+        cacheWriteTokens: Number(successfulResult.usage.cache_creation_input_tokens ?? 0),
+        totalTokens: Number(successfulResult.usage.input_tokens ?? 0) + Number(successfulResult.usage.output_tokens ?? 0)
+          + Number(successfulResult.usage.cache_read_input_tokens ?? 0)
+          + Number(successfulResult.usage.cache_creation_input_tokens ?? 0),
+      } } : {}),
       ...(pending ? { pendingSubagents: pending } : {}),
       ...(pendingShells ? { pendingBackgroundShells: pendingShells } : {}),
     };

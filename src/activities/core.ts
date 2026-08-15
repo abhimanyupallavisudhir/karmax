@@ -1817,6 +1817,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
       let result;
+      let usageAdmissionId: string | undefined;
+      let usageAdmissionFinished = false;
+      const fundingSource: 'managed' | 'byok' | 'customer' = process.env.KARMAX_DEPLOYMENT === 'hosted'
+        ? ((args.accountApiKeyHandle || args.accountConfigHome || args.accountCredentialKind === 'login') ? 'byok' : 'managed')
+        : 'customer';
+      const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
+      const managedReservationMicros = fundingSource === 'managed'
+        ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
       try {
         const signalTurnState = async (
           state: 'running' | 'waiting-host',
@@ -1845,6 +1853,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           lastPressureDetail = detail;
           await signalTurnState('waiting-host', detail);
         };
+        // Trusted model admission: this runs inside the activity, immediately
+        // before any provider process/API request. The stable turn id makes the
+        // reservation retry-safe and binds every request to its org/project/task.
+        if (profile.provider !== 'mock') {
+          usageAdmissionId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}:${activityAttempt}`;
+          store.admitAgentUsage({ id: usageAdmissionId, organizationId, projectId: args.task.projectId,
+            taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
+            reservedCostMicros: managedReservationMicros });
+          // Record the admitted request immediately, before the provider call. Its
+          // stable id makes retries/duplicate delivery a no-op. For managed rails,
+          // cost is the installation-configured worst-case request ceiling: a
+          // conservative hard-cap debit, never a claim of transferable credits.
+          store.recordUsage({ id: `usage:request:${usageAdmissionId}`, organizationId,
+            projectId: args.task.projectId, taskId: args.taskId, worldId: args.worldHandle.id,
+            provider: modelProvider, kind: 'agent.request', quantity: 1, unit: 'request',
+            costMicros: managedReservationMicros ?? 0, fundingSource, startedAt: Date.now(), endedAt: Date.now(),
+            metadata: { role: args.role, model: profile.model,
+              costBasis: fundingSource === 'managed' ? 'admission-ceiling' : 'customer-billed' } });
+        }
         // Remote subscription CLIs consume provider-world CPU/RAM, not host
         // capacity. API rails and local subprocesses retain the host admission
         // queue; account-level concurrency is enforced separately for every rail.
@@ -2073,6 +2100,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
         }
+        if (usageAdmissionId) {
+          const usage = result.usage;
+          if (usage) {
+            const quantity = usage.totalTokens ?? usage.inputTokens + usage.outputTokens;
+            store.recordUsage({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource,
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+                cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0 } });
+          }
+          store.finishUsageAdmission(usageAdmissionId, true);
+          usageAdmissionFinished = true;
+        }
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
@@ -2095,6 +2136,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         throw classifyTurnError(err, profile.provider);
       } finally {
+        if (usageAdmissionId && !usageAdmissionFinished) store.finishUsageAdmission(usageAdmissionId, false);
         await releaseSlot();
         releaseConfirm();
         publishLegacyAgentState(undefined);
@@ -4334,6 +4376,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return newId('task');
     },
   };
+}
+
+/** Installation-side authorization boundary for platform-funded model calls.
+ * Values are worst-case micro-dollar debits per admitted request, keyed by
+ * `provider/model`, `provider/*`, or `provider`. Invalid/absent configuration
+ * fails managed admission closed and never affects BYOK. */
+function managedModelCostCeiling(provider: string, model?: string): number | undefined {
+  const raw = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
+  if (!raw) return undefined;
+  let values: Record<string, unknown>;
+  try { values = JSON.parse(raw) as Record<string, unknown>; } catch { return undefined; }
+  const value = values[`${provider}/${model ?? '*'}`] ?? values[`${provider}/*`] ?? values[provider];
+  const amount = Number(value);
+  return Number.isSafeInteger(amount) && amount > 0 ? amount : undefined;
 }
 
 export type coreActivities = ReturnType<typeof makeCoreActivities>;

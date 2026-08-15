@@ -31,6 +31,7 @@ describe('gateway request scope for bare-id routes', () => {
   let home: string;
   let store: Store;
   let tokens: TokenAuthority;
+  let gateway: Gateway;
   let base: string;
   let close: () => Promise<void>;
   let mine: string;
@@ -69,7 +70,7 @@ describe('gateway request scope for bare-id routes', () => {
       },
     } as any;
     const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, contentDir: home, worlds: new WorldRegistry() });
-    const gateway = new Gateway({
+    gateway = new Gateway({
       api, store, tokens,
       bus: new KarmaxBus(),
       contributions: new ContributionRegistry(),
@@ -142,6 +143,28 @@ describe('gateway request scope for bare-id routes', () => {
 
     const foreign = await fetch(`${base}/api/settings/access?projectId=${theirs}`, { headers: auth() });
     expect(foreign.status).toBe(403);
+  });
+
+  it('lets only an organization owner enable managed spend while admins may edit other guardrails', async () => {
+    store.setOrganizationMembership(acmeId, 'b', 'admin');
+    const ownerToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId).token;
+    const adminToken = tokens.mintPrincipal('user:b', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId).token;
+    (gateway as any).sessions.set('owner-usage-session', { user: 'a', userId: 'a', apiToken: ownerToken });
+    (gateway as any).sessions.set('admin-usage-session', { user: 'b', userId: 'b', apiToken: adminToken });
+    const endpoint = `${base}/api/organizations/${acmeId}/usage-policy`;
+    const put = (bearer: string, policy: Record<string, unknown>) => fetch(endpoint, {
+      method: 'PUT', headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ policy }),
+    });
+
+    const denied = await put('admin-usage-session', { managedSpendCapMicros: 1_000_000 });
+    expect({ status: denied.status, body: await denied.json() }).toEqual({ status: 403,
+      body: { error: 'only an organization owner can enable or change managed spend' } });
+    expect((await put('owner-usage-session', { managedSpendCapMicros: 1_000_000, managedModelProviders: ['openai'] })).status).toBe(200);
+    expect((await put('admin-usage-session', { allowedModelProviders: ['openai'], maxActiveAgentTurns: 3 })).status).toBe(200);
+    const read = await fetch(endpoint, { headers: { authorization: 'Bearer owner-usage-session' } });
+    expect(await read.json()).toMatchObject({ managedSpendCapMicros: 1_000_000,
+      managedModelProviders: ['openai'], allowedModelProviders: ['openai'], maxActiveAgentTurns: 3 });
   });
 
   it('renames only with edit authority in the matching project or organization', async () => {

@@ -5,6 +5,36 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 describe('agent turn admission', () => {
+  it('attributes provider-reported model usage at the trusted turn boundary', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Usage', {});
+    const task = store.createTask({ projectId: project.id, title: 'Use model', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const adapters = new Map([['claude', { provider: 'claude', async runTurn() {
+      return { termination: { kind: 'success', status: 'end_turn' }, output: 'done',
+        usage: { inputTokens: 20, outputTokens: 5, cacheReadTokens: 3 } };
+    } }]]) as any;
+    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
+
+    await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
+      agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+      messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+      task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
+        agents: { do: { provider: 'claude' } } },
+    } as any);
+
+    expect(store.usageSummary('org_personal')).toMatchObject({
+      events: 2, quantities: { request: 1, token: 25 }, byFundingSource: { customer: 0 },
+      byProvider: { anthropic: 0 }, requests: { total: 1, customer: 1 }, active: { agentTurns: 0 },
+    });
+    const event = store.db.prepare("SELECT projectId, taskId, worldId, fundingSource, metadata FROM usage_events WHERE kind='agent.tokens'").get() as any;
+    expect(event).toMatchObject({ projectId: project.id, taskId: task.id, worldId: task.id, fundingSource: 'customer' });
+    expect(JSON.parse(event.metadata)).toMatchObject({ inputTokens: 20, outputTokens: 5, cacheReadTokens: 3 });
+    await world.destroy();
+  });
+
   it('uses a blocking update and classifies coordinator failures as retryable infrastructure', async () => {
     const store = new Store(':memory:');
     const worlds = new WorldRegistry();

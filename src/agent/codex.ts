@@ -173,6 +173,7 @@ export class CodexAdapter implements AgentAdapter {
     // only, so a pathological infinite tool-loop can't burn unbounded spend).
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
+    const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, totalTokens: 0 };
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed (the initial delta covers up to
@@ -217,6 +218,10 @@ export class CodexAdapter implements AgentAdapter {
         throw providerErrorFromMessage('codex', message, 'structured');
       }
       const data = (await res.json()) as any;
+      usage.inputTokens += Number(data.usage?.input_tokens ?? 0);
+      usage.outputTokens += Number(data.usage?.output_tokens ?? 0);
+      usage.cacheReadTokens += Number(data.usage?.input_tokens_details?.cached_tokens ?? 0);
+      usage.totalTokens += Number(data.usage?.input_tokens ?? 0) + Number(data.usage?.output_tokens ?? 0);
       respId = data.id ?? respId;
       // Checkpoint the session as soon as we have one. This is the sole writer of
       // the crash-resume record: without it a worker restart or heartbeat timeout
@@ -310,6 +315,7 @@ export class CodexAdapter implements AgentAdapter {
       session: respId,
       output: finalText,
       delivered: deliveredIndex,
+      usage,
     };
   }
 

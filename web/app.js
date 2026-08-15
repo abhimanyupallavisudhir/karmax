@@ -10627,7 +10627,7 @@ async function hydrateExecutionProviders(proj) {
     <div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
     <button class="btn sm primary" id="project-execution-save">Save</button>`;
     const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
-    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Organization BYOK default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
     $('#project-execution-network')?.addEventListener('change', (event) => {
       $('#project-network-restrictions').open = event.target.value === 'restricted';
     });
@@ -13394,7 +13394,7 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
-  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
+  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, usagePolicy, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
     api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
     api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
@@ -13402,6 +13402,7 @@ async function hydrateOrganizationView() {
     api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
     api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
     api(`/api/organizations/${organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${organizationId}/usage-policy`).catch(() => null),
     api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
     api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
     Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
@@ -13486,7 +13487,19 @@ async function hydrateOrganizationView() {
   const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
     : coverageFrom > Number(usage?.from || 0)
       ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Provider-reconciled compute · ${usagePeriod} · ${usage.events} completed executions${usageSyncLabel}</div></div>` : 'Usage unavailable.';
+  const usageFunding = usage?.byFundingSource || {};
+  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Attributed provider cost · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
+    <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
+    ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b></summary><div class="settings-grid">
+      <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
+      <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
+      <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
+      <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
+      <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
+      <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
+      <label class="form-row">Concurrent model turns<input id="usage-agent-active" type="number" min="1" value="${esc(usagePolicy.maxActiveAgentTurns)}" /></label>
+      <label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>
+    </div><p class="task-sub">Managed model use is off until an owner sets a spend cap and explicitly enables a provider. BYOK remains separately attributed. Remote sandboxes use the organization’s own provider account.</p><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
   if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
     <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
@@ -13561,7 +13574,7 @@ async function hydrateOrganizationView() {
   });
   $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
-  $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+  $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
   $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
   $('#org-execution-save')?.addEventListener('click', async () => {
     const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
@@ -13575,6 +13588,19 @@ async function hydrateOrganizationView() {
         monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
       } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); }
+  });
+  $('#usage-policy-save')?.addEventListener('click', async () => {
+    const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+    const cap = $('#usage-managed-cap').value.trim();
+    try {
+      await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
+        managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
+        managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
+        allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
+        maxRemoteStartsPerMinute: Number($('#usage-world-rate').value), maxActiveAgentTurns: Number($('#usage-agent-active').value),
+        maxActiveWorlds: Number($('#usage-world-active').value),
+      } }) }); toast('Usage guardrails saved'); await hydrateOrganizationView();
     } catch (error) { toast(error.message, true); }
   });
   $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));

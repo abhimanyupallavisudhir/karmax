@@ -55,6 +55,9 @@ describe('Store', () => {
     const migrated = new Store(dbPath);
     expect(migrated.usageSummary('org_personal')).toEqual({
       costMicros: 9_075, events: 1, byKind: { 'world.active': 9_075 },
+      byFundingSource: { customer: 9_075 }, byProvider: { e2b: 9_075 }, quantities: { second: 300 },
+      requests: { total: 0, managed: 0, byok: 0, customer: 0 },
+      active: { agentTurns: 0, worlds: 0, executions: 0 },
     });
     migrated.close();
     fs.rmSync(dir, { recursive: true, force: true });
