@@ -57,6 +57,13 @@ import {
   urgencyRank,
 } from '../domain/types.js';
 import { resourceDriver } from '../domain/resource-drivers.js';
+import {
+  EntitlementError,
+  isHostedPlanId,
+  organizationEntitlements,
+  type HostedPlanId,
+  type OrganizationEntitlements,
+} from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 
 export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
@@ -119,9 +126,11 @@ export const isReviewRequestEvent = (type: string): boolean =>
  */
 export class Store {
   readonly db: SqlDatabase;
+  readonly hosted: boolean;
   private userNames?: () => Array<{ id: string; name: string }>;
 
-  constructor(dbPath = ':memory:') {
+  constructor(dbPath = ':memory:', options: { hosted?: boolean } = {}) {
+    this.hosted = options.hosted === true;
     if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = openSqlDatabase(dbPath);
     // busy_timeout first: waiting (up to 5s) on a locked database beats failing
@@ -303,7 +312,7 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS organizations (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL, createdAt INTEGER NOT NULL
+        kind TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free', createdAt INTEGER NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_name_nocase
         ON organizations(name COLLATE NOCASE);
@@ -742,6 +751,9 @@ export class Store {
     if (!cols.some((c) => c.name === 'assignee')) this.db.exec('ALTER TABLE tasks ADD COLUMN assignee TEXT');
     if (!cols.some((c) => c.name === 'delegate')) this.db.exec('ALTER TABLE tasks ADD COLUMN delegate TEXT');
     if (!cols.some((c) => c.name === 'confirmationPolicy')) this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT');
+    const organizationCols = this.db.prepare('PRAGMA table_info(organizations)').all() as { name: string }[];
+    if (!organizationCols.some((c) => c.name === 'plan'))
+      this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'");
     const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
     if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
     const attachmentCols = this.db.prepare('PRAGMA table_info(resource_attachments)').all() as { name: string }[];
@@ -1097,10 +1109,10 @@ export class Store {
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
       id: newId('org'), name, slug,
-      kind: input.kind ?? 'team', createdAt: Date.now(),
+      kind: input.kind ?? 'team', plan: 'free', createdAt: Date.now(),
     };
-    this.db.prepare('INSERT INTO organizations (id, name, slug, kind, createdAt) VALUES (?, ?, ?, ?, ?)')
-      .run(organization.id, organization.name, organization.slug, organization.kind, organization.createdAt);
+    this.db.prepare('INSERT INTO organizations (id, name, slug, kind, plan, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(organization.id, organization.name, organization.slug, organization.kind, organization.plan, organization.createdAt);
     if (input.ownerUserId) this.setOrganizationMembership(organization.id, input.ownerUserId, 'owner');
     return organization;
   }
@@ -1108,6 +1120,32 @@ export class Store {
   getOrganization(id: string): Organization | undefined {
     const r = this.db.prepare('SELECT * FROM organizations WHERE id = ?').get(id) as any;
     return r ? rowToOrganization(r) : undefined;
+  }
+
+  organizationEntitlements(organizationId: string): OrganizationEntitlements {
+    const organization = this.getOrganization(organizationId);
+    if (!organization) throw new Error(`no organization ${organizationId}`);
+    return organizationEntitlements(organization.plan, this.hosted);
+  }
+
+  /** Billing's sole plan mutation boundary. Pricing and limits remain in the
+   * domain catalog rather than being copied into billing-provider code. */
+  setOrganizationPlan(organizationId: string, plan: HostedPlanId): Organization {
+    if (!isHostedPlanId(plan)) throw new Error(`unknown hosted plan ${String(plan)}`);
+    if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    this.db.prepare('UPDATE organizations SET plan=? WHERE id=?').run(plan, organizationId);
+    return this.getOrganization(organizationId)!;
+  }
+
+  private assertOrganizationMemberCapacity(organizationId: string, userId?: string): void {
+    if (!this.hosted || (userId && this.organizationMembership(organizationId, userId))) return;
+    const entitlements = this.organizationEntitlements(organizationId);
+    if (entitlements.maxMembers == null) return;
+    const count = this.listOrganizationMemberships(organizationId).length;
+    if (count < entitlements.maxMembers) return;
+    throw new EntitlementError(
+      `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}. Upgrade the plan before adding another person.`,
+    );
   }
 
   renameOrganization(id: string, name: string): Organization {
@@ -1597,6 +1635,7 @@ export class Store {
   setOrganizationMembership(organizationId: string, userId: string, role: OrganizationMembership['role']): OrganizationMembership {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     const existing = this.organizationMembership(organizationId, userId);
+    this.assertOrganizationMemberCapacity(organizationId, userId);
     if (existing?.role === 'owner' && role !== 'owner') {
       const owners = Number((this.db.prepare("SELECT COUNT(*) n FROM organization_memberships WHERE organizationId=? AND role='owner'")
         .get(organizationId) as any).n);
@@ -1705,6 +1744,7 @@ export class Store {
   createOrganizationInvitation(input: { organizationId: string; email: string; role?: OrganizationMembership['role']; profileId?: string;
     authorization?: AuthorizationSelection; invitedBy: string; ttlMs?: number }): { invitation: OrganizationInvitation; token: string } {
     if (!this.getOrganization(input.organizationId)) throw new Error(`no organization ${input.organizationId}`);
+    this.assertOrganizationMemberCapacity(input.organizationId);
     const token = `ki_${crypto.randomBytes(24).toString('base64url')}`;
     const invitation: OrganizationInvitation = {
       id: newId('invite'), organizationId: input.organizationId, email: input.email.trim().toLowerCase(),
@@ -4952,9 +4992,10 @@ export class Store {
 }
 
 /** Open the configured backend and import the legacy SQLite store once. */
-export function openStore(sqliteFile: string, databaseUrl?: string): { store: Store; migration?: SqliteImportResult } {
-  if (!databaseUrl) return { store: new Store(sqliteFile) };
-  const store = new Store(databaseUrl);
+export function openStore(sqliteFile: string, databaseUrl?: string,
+  options: { hosted?: boolean } = {}): { store: Store; migration?: SqliteImportResult } {
+  if (!databaseUrl) return { store: new Store(sqliteFile, options) };
+  const store = new Store(databaseUrl, options);
   try {
     const migration = importSqliteDatabase(sqliteFile, store.db, 'store', { sentinelTable: 'tasks' });
     if (migration.imported) store.finishLegacyImport();
@@ -5209,7 +5250,8 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 }
 
 function rowToOrganization(r: any): Organization {
-  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, createdAt: r.createdAt };
+  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind,
+    plan: isHostedPlanId(r.plan) ? r.plan : 'free', createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

@@ -7,7 +7,7 @@ import {
   SIG_RELEASE,
   SIG_PRIORITIZE,
   SIG_CANCEL_MERGE,
-  SIG_REQUEST_AGENT,
+  SIG_SET_AGENT_CAPACITY,
   SIG_CANCEL_AGENT,
   SIG_RELEASE_AGENT,
   SIG_LEASE_ACCOUNT,
@@ -34,8 +34,34 @@ export interface CoordinatorActivityDeps {
   client: Client;
   taskQueue: string;
   store?: {
+    readonly hosted: boolean;
     getSettings(scopeKey: string, workflow: string): Record<string, unknown> | undefined;
+    getProject(projectId: string): { organizationId?: string } | undefined;
+    getTask(taskId: string): { projectId: string } | undefined;
+    organizationEntitlements(organizationId: string): {
+      planName: string;
+      maxActiveAgentRuns: number | null;
+    };
   };
+}
+
+function agentQueueTarget(deps: CoordinatorActivityDeps,
+  item: { taskId: string; projectId?: string }): { workflowId: string; capacity: number; detail?: string } {
+  if (deps.store?.hosted) {
+    const projectId = item.projectId ?? deps.store.getTask(item.taskId)?.projectId;
+    const organizationId = projectId ? deps.store.getProject(projectId)?.organizationId : undefined;
+    if (!organizationId) throw new Error(`cannot resolve the organization for agent turn ${item.taskId}`);
+    const entitlements = deps.store.organizationEntitlements(organizationId);
+    const capacity = entitlements.maxActiveAgentRuns;
+    if (capacity == null) throw new Error(`hosted organization ${organizationId} has no active-run entitlement`);
+    return {
+      workflowId: agentQueueId(organizationId),
+      capacity,
+      detail: `Waiting for ${entitlements.planName} plan capacity (${capacity} active agent run${capacity === 1 ? '' : 's'})`,
+    };
+  }
+  const saved = Number(deps.store?.getSettings('global', 'agent-queue')?.capacity);
+  return { workflowId: agentQueueId(), capacity: Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3 };
 }
 
 /**
@@ -146,30 +172,42 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       provider?: string;
       title?: string;
       projectId?: string;
-    }): Promise<{ granted: boolean; position: number; capacity: number }> {
-      const saved = Number(deps.store?.getSettings('global', 'agent-queue')?.capacity);
-      const capacity = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3;
+    }): Promise<{ granted: boolean; position: number; capacity: number; detail?: string }> {
+      const target = agentQueueTarget(deps, item);
       await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
-        workflowId: agentQueueId(),
+        workflowId: target.workflowId,
         taskQueue,
-        args: [{ capacity }],
-        signal: SIG_REQUEST_AGENT,
-        signalArgs: [item],
+        args: [{ capacity: target.capacity }],
+        // Capacity is refreshed on every request, so a billing plan change takes
+        // effect without restarting the coordinator. Shrinks never evict current
+        // leases; the workflow simply keeps subsequent turns queued.
+        signal: SIG_SET_AGENT_CAPACITY,
+        signalArgs: [{ capacity: target.capacity }],
       });
-      return await client.workflow.getHandle(agentQueueId()).executeUpdate(UPD_REQUEST_AGENT, {
+      const admission = await client.workflow.getHandle(target.workflowId).executeUpdate(UPD_REQUEST_AGENT, {
         args: [item],
       }) as { granted: boolean; position: number; capacity: number };
+      return { ...admission, ...(target.detail ? { detail: target.detail } : {}) };
     },
     async cancelAgentSlot(taskId: string, turnId: string): Promise<void> {
       try {
-        await client.workflow.getHandle(agentQueueId()).signal(SIG_CANCEL_AGENT, { taskId, turnId });
+        const target = agentQueueTarget(deps, { taskId });
+        const handle = client.workflow.getHandle(target.workflowId);
+        // Re-read the plan at every queue mutation as well as every request. In
+        // particular, a downgrade must be applied before releasing a lease can
+        // promote more queued work at the former capacity.
+        await handle.signal(SIG_SET_AGENT_CAPACITY, { capacity: target.capacity });
+        await handle.signal(SIG_CANCEL_AGENT, { taskId, turnId });
       } catch {
         /* coordinator gone — nothing to cancel */
       }
     },
     async releaseAgentSlot(taskId: string, turnId: string): Promise<void> {
       try {
-        await client.workflow.getHandle(agentQueueId()).signal(SIG_RELEASE_AGENT, { taskId, turnId });
+        const target = agentQueueTarget(deps, { taskId });
+        const handle = client.workflow.getHandle(target.workflowId);
+        await handle.signal(SIG_SET_AGENT_CAPACITY, { capacity: target.capacity });
+        await handle.signal(SIG_RELEASE_AGENT, { taskId, turnId });
       } catch {
         /* coordinator gone — its lease is already gone too */
       }

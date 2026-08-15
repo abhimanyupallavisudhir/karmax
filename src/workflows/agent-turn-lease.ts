@@ -165,7 +165,7 @@ export function createAgentTurnLeaser(
               host.setWaitingFor({
                 kind: 'agentSlot',
                 provider,
-                detail: 'Waiting for host capacity to start agent',
+                detail: admission.detail ?? 'Waiting for host capacity to start agent',
               });
               await host.publish();
               await condition(() => slotGrants.has(turnId) || host.cancelled());

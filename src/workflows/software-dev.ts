@@ -1670,7 +1670,7 @@ async function softwareDevImpl(
                 waitingFor = {
                   kind: 'agentSlot',
                   provider,
-                  detail: 'Waiting for host capacity to start agent',
+                  detail: admission.detail ?? 'Waiting for host capacity to start agent',
                 };
                 await publish();
                 await condition(() => agentSlotGrants.has(turnId) || cancelled);

@@ -121,7 +121,8 @@ async function main() {
   const { client, close: closeClient } = await makeClient(conn);
 
   // ── Core services ──
-  const openedStore = openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL);
+  const openedStore = openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
+    { hosted: deployment.hosted });
   const store = openedStore.store;
   if (process.env.KARMAX_DATABASE_URL) {
     const migrated = openedStore.migration?.imported

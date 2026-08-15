@@ -20,7 +20,8 @@ import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
-import { accountCoordinatorId } from '../coordinators/names.js';
+import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
+import { hostedMonthlyPriceCents } from '../domain/entitlements.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -140,6 +141,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -1564,6 +1566,32 @@ export class Gateway {
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationEntitlementsMatch = p.match(/^\/api\/organizations\/([^/]+)\/entitlements$/);
+      if (organizationEntitlementsMatch && method === 'GET') {
+        const organizationId = organizationEntitlementsMatch[1]!;
+        if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
+        const entitlements = store.organizationEntitlements(organizationId);
+        const activeUsers = store.listOrganizationMemberships(organizationId).length;
+        let activeAgentRuns = 0;
+        let queuedAgentRuns = 0;
+        if (entitlements.deployment === 'hosted') {
+          try {
+            const queue = await this.deps.client.workflow.getHandle(agentQueueId(organizationId))
+              .query(QRY_AGENT_QUEUE) as { current: unknown[]; queue: unknown[] };
+            activeAgentRuns = queue.current.length;
+            queuedAgentRuns = queue.queue.length;
+          } catch { /* The organization has not run an agent yet. */ }
+        }
+        return this.json(res, 200, {
+          ...entitlements,
+          activeUsers,
+          currentMonthlyPriceCents: entitlements.plan
+            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers)
+            : null,
+          activeAgentRuns,
+          queuedAgentRuns,
+        });
+      }
       const organizationStorage = p.match(/^\/api\/organizations\/([^/]+)\/storage(?:\/([^/]+))?(?:\/(test|default))?$/);
       if (organizationStorage) {
         const organizationId = organizationStorage[1]!;
