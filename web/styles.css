@@ -950,6 +950,56 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 
 /* ── queue / dashboard / settings ──────────────────────────── */
 .card { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 16px; margin-bottom: 12px; }
+
+/* Hosted personal-workspace onboarding. Progress comes from the gateway; this
+   floating surface only guides the user to the existing first-party controls. */
+.hosted-onboarding { position: fixed; z-index: 60; right: 22px; bottom: 20px; width: min(390px, calc(100vw - 28px)); }
+.onboarding-card {
+  max-height: min(720px, calc(100vh - 82px)); overflow-y: auto;
+  border: 1px solid var(--line-strong); border-radius: 14px; padding: 18px;
+  background: color-mix(in srgb, var(--surface) 96%, var(--accent) 4%);
+  box-shadow: 0 18px 50px rgba(16, 24, 40, .18), 0 2px 8px rgba(16, 24, 40, .08);
+}
+.onboarding-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.onboarding-head h2 { margin: 2px 0 0; color: var(--ink); font-size: 19px; line-height: 1.2; letter-spacing: -.015em; }
+.onboarding-eyebrow { color: var(--accent); font-size: 10px; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }
+.onboarding-dismiss { flex: none; margin: -7px -7px 0 0; font-size: 20px; }
+.onboarding-progress { height: 4px; overflow: hidden; margin: 14px 0 0; border-radius: 999px; background: var(--line); }
+.onboarding-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .2s ease; }
+.onboarding-intro { margin: 11px 0 14px; color: var(--ink-2); font-size: 12px; line-height: 1.5; }
+.onboarding-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.onboarding-step { position: relative; display: grid; grid-template-columns: 27px minmax(0, 1fr); gap: 10px; padding: 8px 0 11px; }
+.onboarding-step:not(:last-child)::after { content: ''; position: absolute; left: 13px; top: 35px; bottom: -1px; width: 1px; background: var(--line); }
+.onboarding-check {
+  position: relative; z-index: 1; display: grid; place-items: center; width: 27px; height: 27px;
+  border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface);
+  color: var(--ink-3); font: 650 11px var(--font-mono);
+}
+.onboarding-step.complete .onboarding-check { border-color: transparent; background: var(--merged-weak); color: var(--merged); font-family: var(--font-ui); font-size: 13px; }
+.onboarding-step-copy { min-width: 0; }
+.onboarding-step-title { display: flex; align-items: center; gap: 8px; min-height: 27px; color: var(--ink); font-size: 13px; font-weight: 680; }
+.onboarding-step.complete .onboarding-step-title { color: var(--ink-2); }
+.onboarding-step-copy p { margin: 0 0 8px; color: var(--ink-3); font-size: 11px; line-height: 1.45; }
+.onboarding-optional { padding: 2px 6px; border: 1px solid var(--line); border-radius: 999px; color: var(--ink-3); font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.onboarding-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.onboarding-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 5px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 10px; }
+.onboarding-minimized {
+  display: flex; align-items: center; gap: 10px; margin-left: auto; padding: 9px 13px 9px 9px;
+  border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--ink);
+  box-shadow: 0 8px 28px rgba(16, 24, 40, .16); cursor: pointer; text-align: left;
+}
+.onboarding-minimized:hover { border-color: var(--accent); transform: translateY(-1px); }
+.onboarding-minimized-mark { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent-weak); color: var(--accent); font-weight: 800; }
+.onboarding-minimized > span:last-child { display: grid; gap: 1px; }
+.onboarding-minimized b { font-size: 12px; }
+.onboarding-minimized small { color: var(--ink-3); font-size: 10px; }
+@media (max-width: 760px) {
+  .hosted-onboarding { right: 14px; bottom: 14px; }
+  .onboarding-card { max-height: calc(100vh - 80px); padding: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-progress > span, .onboarding-minimized { transition: none; }
+}
 .phone-access-address { display:grid; gap:4px; margin-bottom:14px; }
 .phone-access-address > span { color:var(--ink-3); font-size:11px; font-weight:650; letter-spacing:.04em; text-transform:uppercase; }
 .phone-access-address > b { color:var(--ink-2); font-size:16px; }
