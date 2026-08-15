@@ -696,7 +696,10 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       summary: 'GitHub Actions approval required',
       detail: expect.stringMatching(/run CI #1.*concluded action_required.*Classification: human/is),
     });
-    expect(h.store.getTask(task.id)?.lastView?.waitingFor).toMatchObject({
+    // The workflow query is live state; publishView persists the projection in
+    // the following activity. Wait for that durable boundary instead of racing
+    // the worker immediately after the query observes the hold.
+    await expect.poll(() => h.store.getTask(task.id)?.lastView?.waitingFor, { timeout: 30_000 }).toMatchObject({
       kind: 'human', summary: 'GitHub Actions approval required',
     });
     const waitEvent = h.store.eventsSince(task.id, 0).findLast((event) =>

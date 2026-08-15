@@ -1112,18 +1112,44 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const environmentSelection = projectId
         ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
         : { built: false, environment: executionConfig?.environment };
+      let activitySignal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let cancellationHeartbeat: NodeJS.Timeout | undefined;
+      if (remote) {
+        try {
+          const ctx = activityContext.current();
+          activitySignal = ctx.cancellationSignal;
+          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
+          // Temporal delivers activity cancellation at heartbeat boundaries.
+          // Keep that boundary live after admission while the provider allocates
+          // and provisions the sandbox.
+          cancellationHeartbeat = setInterval(() => ctx.heartbeat({ provisioning: args.kind }), 500);
+          cancellationHeartbeat.unref();
+        } catch {
+          // Direct activity unit tests have no ambient Temporal context.
+        }
+      }
+      const stopCancellationHeartbeat = () => {
+        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
+        cancellationHeartbeat = undefined;
+      };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
-        const ctx = activityContext.current();
-        acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
-          priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: ctx.cancellationSignal,
-          heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) });
+        try {
+          acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
+            priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: activitySignal,
+            heartbeat });
+        } catch (error) {
+          stopCancellationHeartbeat();
+          throw error;
+        }
       }
       let world: World;
       const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
       try {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
+          signal: activitySignal,
           generation,
           organizationId: project?.organizationId,
           repo: worldSources.length === 1 ? worldSources[0] : undefined,
@@ -1147,6 +1173,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
       } catch (error) {
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        stopCancellationHeartbeat();
         if (remote && isTransportError(error)) {
           const message = error instanceof Error ? error.message : String(error);
           throw ApplicationFailure.create({
@@ -1204,8 +1231,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        stopCancellationHeartbeat();
         throw error;
       }
+      stopCancellationHeartbeat();
       return world.handle;
     },
 

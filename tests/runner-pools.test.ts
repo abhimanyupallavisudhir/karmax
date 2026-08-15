@@ -74,6 +74,32 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.usageSummary(organization.id)).toMatchObject({ costMicros: 0, events: 0 });
   });
 
+  it('reclaims setup capacity from terminal tasks and admits the next waiter', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
+    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
+      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const cancelled = store.createTask({ projectId: project.id, title: 'Cancelled setup', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    const next = store.createTask({ projectId: project.id, title: 'Next setup', workflow: 'software-dev',
+      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
+    const first = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
+      projectId: project.id, taskId: cancelled.id, worldId: cancelled.id });
+    const second = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
+      projectId: project.id, taskId: next.id, worldId: next.id });
+    store.saveView(cancelled.id, {
+      taskId: cancelled.id, title: cancelled.title, workflow: cancelled.workflow, stage: 'cancelled',
+      status: 'cancelled', messages: [], actions: [], state: { cancelled: true }, updatedAt: Date.now(),
+    });
+    const runners = new RunnerPoolService(store);
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(Date.now());
+
+    expect(store.worldLease(first.id)?.state).toBe('released');
+    expect(store.worldLease(second.id)?.state).toBe('active');
+  });
+
   it('reconciles provider executions idempotently with actual E2B resources and runtime', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Reconciled', ownerUserId: 'owner' });

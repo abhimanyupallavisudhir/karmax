@@ -72,6 +72,26 @@ export class RunnerPoolService {
       unit: 'second', costMicros: Math.round(seconds * costMicrosPerSecond(billedProvider, lease.cpu, lease.memoryMb, lease.gpu)),
       startedAt, endedAt, metadata: { runnerPoolId: lease.runnerPoolId, cpu: lease.cpu, memoryMb: lease.memoryMb, gpu: lease.gpu } });
   }
+
+  /** A workflow can be terminated between acquiring capacity and publishing its
+   * world handle, so deterministic cleanup never learns the lease id. Terminal
+   * task state is the durable liveness boundary: no cancelled/done/failed task
+   * may continue owning execution capacity. */
+  reconcileTerminalLeases(): number {
+    let released = 0;
+    for (const lease of this.store.unreleasedWorldLeases()) {
+      const task = this.store.getTask(String(lease.taskId));
+      if (task && !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? 'active')) continue;
+      const world = this.store.currentWorld(String(lease.worldId));
+      // A terminal task can still have an explicitly borrowed preview/terminal
+      // lease. Only the workflow lease is named by the durable handle; with no
+      // registered world, Setup is the only possible owner.
+      if (world && world.meta?.worldLeaseId !== lease.id) continue;
+      this.release(String(lease.id), String(this.store.getRunnerPool(String(lease.runnerPoolId))?.provider ?? 'unknown'));
+      released++;
+    }
+    return released;
+  }
 }
 
 /** Turns old parked provider state into cheap object/Git state. */
@@ -92,6 +112,7 @@ export class WorldLifecycleManager {
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
   async sweep(now = Date.now()): Promise<number> {
+    this.runners?.reconcileTerminalLeases();
     await this.reconcileProviderUsage(now);
     for (const artifact of this.store.expiredPromotedArtifacts(now)) {
       this.store.deletePromotedArtifact(artifact.id);

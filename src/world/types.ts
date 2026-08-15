@@ -121,6 +121,9 @@ export interface WorldGitIdentity {
 
 export interface WorldSpec {
   taskId: string;
+  /** Activity cancellation propagated into provider allocation/provisioning.
+   * Provider implementations must leave no live sandbox when it aborts. */
+  signal?: AbortSignal;
   /** Durable generation Karmax is provisioning. Remote providers use this as
    * an idempotency key when a create request times out after the provider has
    * already allocated the sandbox. */

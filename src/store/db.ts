@@ -4417,6 +4417,16 @@ export class Store {
       ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId) as any[];
   }
 
+  worldLeasesForTask(taskId: string): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE taskId=? AND state!='released'
+      ORDER BY createdAt`).all(taskId) as any[];
+  }
+
+  unreleasedWorldLeases(): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE state!='released'
+      ORDER BY createdAt`).all() as any[];
+  }
+
   recordUsage(event: Omit<UsageEvent, 'id'> & { id?: string }): UsageEvent {
     const value: UsageEvent = { ...event, id: event.id ?? newId('usage') };
     this.db.prepare(`INSERT OR IGNORE INTO usage_events (id, organizationId, projectId, taskId, worldId, provider,
