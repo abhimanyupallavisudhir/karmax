@@ -23,9 +23,20 @@ export class RunnerPoolService {
     }
     const remote = !['worktree', 'container', 'memory'].includes(provider);
     const id = `${organizationId}:${remote ? `managed-${provider}` : 'local'}`;
-    return this.store.getRunnerPool(id) ?? this.store.createRunnerPool({ id, organizationId,
-      name: remote ? `Krmax managed (${provider})` : 'Local runner', provider,
-      mode: remote ? 'managed' : 'customer', capacity: DEFAULT_CAPACITY, enabled: true });
+    const existing = this.store.getRunnerPool(id);
+    if (existing) {
+      // Older releases named the default remote pool "managed" even though the
+      // launch rail is now strictly organization BYOK. The provider connection
+      // boundary separately fails closed when that organization has no key.
+      if (remote && this.store.hosted && existing.mode === 'managed')
+        return this.store.createRunnerPool({ ...existing, name: `${provider.toUpperCase()} · organization BYOK`, mode: 'customer' });
+      return existing;
+    }
+    return this.store.createRunnerPool({ id, organizationId,
+      name: remote ? `${provider.toUpperCase()} · organization BYOK` : 'Local runner', provider,
+      // Remote launch credentials are organization-owned by default. A pool is
+      // capacity policy, not a resale entitlement or transferable provider credit.
+      mode: 'customer', capacity: DEFAULT_CAPACITY, enabled: true });
   }
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
@@ -70,7 +81,8 @@ export class RunnerPoolService {
     this.store.recordUsage({ id: `usage:${leaseId}`, organizationId: lease.organizationId, projectId: lease.projectId,
       taskId: lease.taskId, worldId: lease.worldId, provider: billedProvider, kind: 'world.active', quantity: seconds,
       unit: 'second', costMicros: Math.round(seconds * costMicrosPerSecond(billedProvider, lease.cpu, lease.memoryMb, lease.gpu)),
-      startedAt, endedAt, metadata: { runnerPoolId: lease.runnerPoolId, cpu: lease.cpu, memoryMb: lease.memoryMb, gpu: lease.gpu } });
+      startedAt, endedAt, fundingSource: this.store.getRunnerPool(lease.runnerPoolId)?.mode === 'managed' ? 'managed' : 'byok',
+      metadata: { runnerPoolId: lease.runnerPoolId, cpu: lease.cpu, memoryMb: lease.memoryMb, gpu: lease.gpu } });
   }
 }
 
@@ -175,6 +187,7 @@ export class WorldLifecycleManager {
               organizationId: organization.id,
               ...(attributed ? { projectId: project.id, taskId: task!.id, worldId: task!.id } : {}),
               provider: provider.kind, kind: 'world.active', quantity: seconds, unit: 'second',
+              fundingSource: 'byok',
               costMicros: Math.round(seconds * costMicrosPerSecond(provider.kind,
                 event.cpu, event.memoryMb, event.gpu ?? 0)),
               startedAt: event.startedAt, endedAt: event.endedAt,

@@ -10,8 +10,9 @@ describe('organization provider connection UI', () => {
     expect(source).not.toContain('placeholder="karmax-browser-v1"');
   });
 
-  it('labels reconciled compute as monthly instead of an unspecified query period', () => {
-    expect(source).toContain('Provider-reconciled compute · ${usagePeriod}');
+  it('distinguishes incurred, estimated, and reserved usage with monthly reconciliation coverage', () => {
+    expect(source).toContain('Metered + estimated usage · ${usagePeriod}');
+    expect(source).toContain('active managed reservations');
     expect(source).toContain(" : 'This month';");
     expect(source).not.toContain('This query period ·');
   });
