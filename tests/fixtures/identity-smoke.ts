@@ -8,6 +8,7 @@ import { ContributionRegistry } from '../../src/contrib/registry.js';
 import { Overlays } from '../../src/store/overlays.js';
 import { findFreePortFrom } from '../../src/util/ports.js';
 import { WorldRegistry } from '../../src/world/registry.js';
+import { policyVersions } from '../../src/launch/legal.js';
 
 const identity = await IdentityService.open(':memory:', { baseURL: 'http://localhost:4505' });
 const verificationRecipients: string[] = [];
@@ -65,20 +66,35 @@ const json = (path: string, init: RequestInit = {}) => fetch(`${base}${path}`, {
   ...init,
   headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
 });
+const launchResponse = await json('/api/launch');
+const launchPayload = await launchResponse.json() as any;
+const termsResponse = await json('/api/legal/terms');
+const termsPayload = await termsResponse.json() as any;
+const policyRoutesPublic = launchResponse.status === 200 && termsResponse.status === 200
+  && launchPayload.policyVersion === policyVersions('signup').terms
+  && termsPayload.slug === 'terms' && termsPayload.version === launchPayload.policyVersion;
 const setupBefore = await (await json('/api/session')).json() as any;
 const setupResponse = await json('/api/setup', { method: 'POST', body: JSON.stringify({ name: 'Root', email: 'root@example.com', password: 'root-password-long' }) });
 const rootCookie = setupResponse.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
 if (!rootCookie) throw new Error('gateway did not forward the Better Auth session cookie');
 const rootHeaders = { cookie: rootCookie };
+const unacceptedSignup = await json('/api/signup', {
+  method: 'POST', body: JSON.stringify({ name: 'No policy', email: 'no-policy@example.com', password: 'no-policy-password-long' }),
+});
+const policyAcceptanceRequired = unacceptedSignup.status === 400
+  && /acceptance|required|accept/i.test(String((await unacceptedSignup.json() as any).error));
 const signupResponse = await json('/api/signup', {
   method: 'POST',
-  body: JSON.stringify({ name: 'Waiting user', email: 'waiting@example.com', password: 'waiting-password-long' }),
+  body: JSON.stringify({ name: 'Waiting user', email: 'waiting@example.com', password: 'waiting-password-long',
+    acceptedPolicies: true, policyVersions: policyVersions('signup') }),
 });
 const signupCookie = signupResponse.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
 if (!signupResponse.ok || !signupCookie) throw new Error(`self signup failed: ${await signupResponse.text()}`);
 const signupFirstSession = await (await json('/api/session', { headers: { cookie: signupCookie } })).json() as any;
 const signupSecondSession = await (await json('/api/session', { headers: { cookie: signupCookie } })).json() as any;
 const signupGitOnboardingOnce = signupFirstSession.gitOnboarding === true && signupSecondSession.gitOnboarding === false;
+const signupAcceptanceRecorded = store.policyAcceptances(String(signupFirstSession.user?.id ?? '')).some((acceptance) =>
+  acceptance.context === 'signup' && acceptance.versions.terms === policyVersions('signup').terms);
 // Self-signup now lands the user in their own personal-workspace organization —
 // no "no access yet" waiting room. Projects is reachable (empty until they make
 // one) and the user owns exactly one personal org.
@@ -90,7 +106,8 @@ const signupHasPersonalWorkspace = signupOrgs.length === 1 && signupOrgs[0].kind
 const signupWorkspaceUsesUserName = signupOrgs[0]?.name === 'Waiting user';
 const collidingSignup = await json('/api/signup', {
   method: 'POST',
-  body: JSON.stringify({ name: 'Root', email: 'root-name-collision@example.com', password: 'collision-password-long' }),
+  body: JSON.stringify({ name: 'Root', email: 'root-name-collision@example.com', password: 'collision-password-long',
+    acceptedPolicies: true, policyVersions: policyVersions('signup') }),
 });
 const collidingDirectSignup = await json('/api/auth/sign-up/email', {
   method: 'POST',
@@ -147,6 +164,9 @@ process.stdout.write(JSON.stringify({
   visibleProjects: visibleProjects.map((p) => p.name),
   usersDenied,
   signupEntersApp,
+  policyRoutesPublic,
+  policyAcceptanceRequired,
+  signupAcceptanceRecorded,
   signupHasPersonalWorkspace,
   signupWorkspaceUsesUserName,
   collidingSignupRejected: !collidingSignup.ok,

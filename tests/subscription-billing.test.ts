@@ -16,6 +16,7 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
+import { POLICY_VERSION, policyVersions } from '../src/launch/legal.js';
 
 const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
@@ -311,6 +312,7 @@ describe('subscription administration HTTP authorization', () => {
   let store: Store;
   let tokens: TokenAuthority;
   let billing: SubscriptionBillingService;
+  let provider: FakeSubscriptionProvider;
   let base: string;
   let close: () => Promise<void>;
   let browserToken: string;
@@ -319,7 +321,17 @@ describe('subscription administration HTTP authorization', () => {
   beforeAll(async () => {
     store = new Store(':memory:', { hosted: true });
     tokens = new TokenAuthority();
-    billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+    provider = new FakeSubscriptionProvider();
+    billing = new SubscriptionBillingService(store, provider, true);
+    const launchEnv = {
+      KARMAX_PAID_LAUNCH: '1', KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: POLICY_VERSION,
+      KARMAX_LEGAL_ENTITY_NAME: 'Configured Operator', KARMAX_LEGAL_ENTITY_COUNTRY: 'Configured Country',
+      KARMAX_GOVERNING_LAW: 'Configured Law', KARMAX_LEGAL_NOTICE_ADDRESS: 'Configured Notice Address',
+      KARMAX_LEGAL_EMAIL: 'legal@example.test', KARMAX_PRIVACY_EMAIL: 'privacy@example.test',
+      KARMAX_SECURITY_EMAIL: 'security@example.test', KARMAX_INCIDENT_EMAIL: 'incident@example.test',
+      KARMAX_DPA_EMAIL: 'dpa@example.test', KARMAX_BILLING_EMAIL: 'billing@example.test',
+    };
+    for (const [name, value] of Object.entries(launchEnv)) vi.stubEnv(name, value);
     const memberOrganization = store.createOrganization({ name: 'Member only' });
     memberOrganizationId = memberOrganization.id;
     store.setOrganizationMembership(memberOrganization.id, 'me', 'member');
@@ -342,13 +354,15 @@ describe('subscription administration HTTP authorization', () => {
   afterAll(async () => {
     await close?.();
     store?.close();
+    vi.unstubAllEnvs();
   });
 
   const post = (action: 'checkout' | 'portal' | 'change' | 'cancel' | 'sync-seats',
-    organizationId: string, token: string) => fetch(
+    organizationId: string, token: string, body: Record<string, unknown> = {}) => fetch(
     `${base}/api/organizations/${organizationId}/subscription/${action}`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
-        'idempotency-key': `billing-${crypto.randomUUID()}` }, body: JSON.stringify({ plan: 'individual' }),
+        'idempotency-key': `billing-${crypto.randomUUID()}` }, body: JSON.stringify({ plan: 'individual',
+        acceptedPolicies: true, policyVersions: policyVersions('checkout'), ...body }),
     });
 
   it.each(['checkout', 'portal', 'change', 'cancel', 'sync-seats'] as const)(
@@ -367,6 +381,19 @@ describe('subscription administration HTTP authorization', () => {
       expect(await response.json()).toMatchObject({ error: 'organization owner access is required to administer its subscription' });
     });
 
+  it('requires the current checkout policy versions before creating a provider session', async () => {
+    const missing = await post('checkout', 'org_personal', browserToken, { acceptedPolicies: false });
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toMatchObject({ error: expect.stringMatching(/affirmative policy acceptance/i) });
+    const stale = await post('checkout', 'org_personal', browserToken, {
+      policyVersions: { ...policyVersions('checkout'), billing: 'stale' },
+    });
+    expect(stale.status).toBe(400);
+    expect(await stale.json()).toMatchObject({ error: expect.stringMatching(/current billing policy version/i) });
+    expect(provider.calls.filter((call) => call.method === 'createCheckout')).toHaveLength(0);
+    expect(store.policyAcceptances('me').filter((acceptance) => acceptance.context === 'checkout')).toHaveLength(0);
+  });
+
   it('allows the interactive owner of the organization', async () => {
     const response = await post('checkout', 'org_personal', browserToken);
     expect(response.status).toBe(200);
@@ -376,6 +403,17 @@ describe('subscription administration HTTP authorization', () => {
       checkoutRequestReference: expect.stringMatching(/^billing-/), checkoutSessionReference: 'cs_test',
       commercialTerms: { planId: 'individual', monthlyBasePriceCents: 900,
         activeUsers: 1, monthlyTotalPriceCents: 900 },
+    });
+    expect(store.policyAcceptances('me').at(-1)).toMatchObject({
+      userId: 'me', organizationId: 'org_personal', context: 'checkout',
+      versions: policyVersions('checkout'), checkoutSessionReference: 'cs_test',
+      checkoutRequestReference: expect.stringMatching(/^billing-/), commercialTerms: {
+        planId: 'individual', monthlyBasePriceCents: 900,
+        monthlyAdditionalActiveUserPriceCents: 0, currency: 'usd', billingInterval: 'month',
+        autoRenews: true, renewalDisclosure: expect.stringMatching(/renews monthly/i),
+        cancellationDisclosure: expect.stringMatching(/cancel online/i),
+        refundDisclosure: expect.stringMatching(/non-refundable/i),
+      },
     });
   });
 

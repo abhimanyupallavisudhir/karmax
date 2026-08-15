@@ -325,6 +325,14 @@ export class Store {
       CREATE TABLE IF NOT EXISTS user_preferences (
         userId TEXT PRIMARY KEY, defaultOrganizationId TEXT
       );
+      CREATE TABLE IF NOT EXISTS policy_acceptances (
+        id TEXT PRIMARY KEY, userId TEXT NOT NULL, email TEXT,
+        organizationId TEXT, context TEXT NOT NULL, versionsJson TEXT NOT NULL,
+        acceptedAt INTEGER NOT NULL, checkoutRequestReference TEXT,
+        checkoutSessionReference TEXT, commercialTermsJson TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_policy_acceptances_user
+        ON policy_acceptances(userId, acceptedAt);
       CREATE TABLE IF NOT EXISTS organization_invitations (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, email TEXT NOT NULL,
         role TEXT NOT NULL, tokenHash TEXT NOT NULL UNIQUE, invitedBy TEXT NOT NULL,
@@ -795,6 +803,16 @@ export class Store {
     const organizationCols = this.db.prepare('PRAGMA table_info(organizations)').all() as { name: string }[];
     if (!organizationCols.some((c) => c.name === 'plan'))
       this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'");
+    const policyAcceptanceCols = this.db.prepare('PRAGMA table_info(policy_acceptances)').all() as { name: string }[];
+    if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
+      this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT');
+    if (!policyAcceptanceCols.some((c) => c.name === 'checkoutRequestReference'))
+      this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN checkoutRequestReference TEXT');
+    if (!policyAcceptanceCols.some((c) => c.name === 'checkoutSessionReference'))
+      this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN checkoutSessionReference TEXT');
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_acceptances_checkout_request
+      ON policy_acceptances(organizationId, checkoutRequestReference)
+      WHERE organizationId IS NOT NULL AND checkoutRequestReference IS NOT NULL`);
     const subscriptionBillingCols = this.db.prepare('PRAGMA table_info(subscription_billing_accounts)').all() as { name: string }[];
     if (!subscriptionBillingCols.some((c) => c.name === 'pastDueAt'))
       this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN pastDueAt INTEGER');
@@ -1428,6 +1446,7 @@ export class Store {
       payment_transactions: selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId]),
       payment_events: selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId]),
       subscription_billing_accounts: selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId]),
+      policy_acceptances: selectRows(this.db, 'policy_acceptances', 'organizationId=?', [organizationId]),
       authorization_profiles: rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       principal_grants: rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       audit_log: rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
@@ -5333,6 +5352,40 @@ export class Store {
   }
 
   kvDelete(k: string): void { this.db.prepare('DELETE FROM kv WHERE k=?').run(k); }
+
+  /** Immutable evidence of the exact launch-policy set affirmatively accepted.
+   * Keep this normalized and append-only; a new policy release creates another
+   * row rather than rewriting the evidence for an older action. */
+  recordPolicyAcceptance(input: { userId: string; email?: string; organizationId?: string; context: 'signup' | 'checkout';
+    versions: Record<string, string>; acceptedAt?: number; checkoutRequestReference?: string;
+    checkoutSessionReference?: string;
+    commercialTerms?: Record<string, unknown> }) {
+    const row = { id: newId('pa'), userId: input.userId, email: input.email,
+      organizationId: input.organizationId, context: input.context, versions: { ...input.versions },
+      acceptedAt: input.acceptedAt ?? Date.now(), checkoutRequestReference: input.checkoutRequestReference,
+      checkoutSessionReference: input.checkoutSessionReference,
+      commercialTerms: input.commercialTerms ? { ...input.commercialTerms } : undefined };
+    this.db.prepare(`INSERT OR IGNORE INTO policy_acceptances
+      (id,userId,email,organizationId,context,versionsJson,acceptedAt,checkoutRequestReference,checkoutSessionReference,commercialTermsJson)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(row.id, row.userId, row.email ?? null, row.organizationId ?? null, row.context,
+        JSON.stringify(row.versions), row.acceptedAt, row.checkoutRequestReference ?? null,
+        row.checkoutSessionReference ?? null, row.commercialTerms ? JSON.stringify(row.commercialTerms) : null);
+    return row;
+  }
+
+  policyAcceptances(userId: string): Array<{ id: string; userId: string; email?: string; organizationId?: string;
+    context: 'signup' | 'checkout'; versions: Record<string, string>; acceptedAt: number;
+    checkoutRequestReference?: string; checkoutSessionReference?: string;
+    commercialTerms?: Record<string, unknown> }> {
+    return (this.db.prepare('SELECT * FROM policy_acceptances WHERE userId=? ORDER BY acceptedAt,id').all(userId) as any[])
+      .map((row) => ({ id: String(row.id), userId: String(row.userId), email: row.email ? String(row.email) : undefined,
+        organizationId: row.organizationId ? String(row.organizationId) : undefined,
+        context: row.context, versions: JSON.parse(String(row.versionsJson)), acceptedAt: Number(row.acceptedAt),
+        checkoutRequestReference: row.checkoutRequestReference ? String(row.checkoutRequestReference) : undefined,
+        checkoutSessionReference: row.checkoutSessionReference ? String(row.checkoutSessionReference) : undefined,
+        commercialTerms: row.commercialTermsJson ? JSON.parse(String(row.commercialTermsJson)) : undefined }));
+  }
 
   close() {
     this.organizationEntitlementListeners.clear();

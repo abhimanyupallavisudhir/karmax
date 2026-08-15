@@ -158,6 +158,7 @@ describe('platform catalog covers the gateway route table', () => {
    */
   const PRE_GATE = [
     /^\/api\/(login|logout|signup|setup|session|sso|auth)/,
+    /^\/api\/(launch|legal)/,
     // Provider webhooks/ingest: authenticated by signature or a minted secret,
     // answered before the session gate, and excluded from platform_request.
     /\/(webhooks?|ingest)$/,

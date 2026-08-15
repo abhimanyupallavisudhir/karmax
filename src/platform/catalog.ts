@@ -18,11 +18,12 @@ export const PLATFORM_API_CATALOG = {
     ],
     interactiveHuman: [
       'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding',
-      'POST /api/invitations/accept',
+      'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
       'DELETE /api/organizations/:organizationId',
       'POST /api/users', 'DELETE /api/users/:userId',
       'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
       'GET|POST|PUT|DELETE /api/user/github-accounts|git-profiles',
+      'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (owner only)',
       'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize',
       'POST /api/organizations/:organizationId/payments/connect',
       'POST /api/vault/items/:itemId/reveal',
@@ -209,7 +210,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   payments: [
     'GET /api/organizations/:organizationId/subscription/status (hosted SaaS plan and verified seat/payment state; self-hosted reports unmetered)',
-    'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (hosted SaaS billing; mutation calls require Idempotency-Key)',
+    'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (owner-only hosted SaaS billing; mutation calls require Idempotency-Key; checkout body also requires {plan,acceptedPolicies:true,policyVersions})',
     'GET /api/organizations/:organizationId/payments/providers',
     'POST /api/organizations/:organizationId/payments/connect',
     'DELETE /api/organizations/:organizationId/payments/connections/:provider',
@@ -224,6 +225,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   administration: [
     'GET /api/user/export (human identity only; all data directly linked to the signed-in user)',
+    'POST /api/user/account-deletion-request (human identity only; records a verified deletion/offboarding request)',
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
