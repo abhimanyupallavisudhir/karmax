@@ -13742,6 +13742,7 @@ async function createOrganization() {
     S.organizationId = organization.id;
     S.projectId = null;
     await loadCollaboration().catch(() => {});
+    await refreshOnboarding();
     renderShell();
     await go(globalRoute('organization'));
   } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }

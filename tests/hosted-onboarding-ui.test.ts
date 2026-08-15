@@ -30,6 +30,12 @@ describe('hosted onboarding UI', () => {
     expect(view).toContain("addEventListener('click', newProject)");
   });
 
+  it('loads the newly created organization’s onboarding state before repainting the shell', () => {
+    const createOrganization = source.slice(source.indexOf('async function createOrganization()'), source.indexOf('// ── theme'));
+    expect(createOrganization).toContain('await refreshOnboarding()');
+    expect(createOrganization.indexOf('await refreshOnboarding()')).toBeLessThan(createOrganization.indexOf('renderShell()'));
+  });
+
   it('is hosted-only, server-persisted, live-refreshed, minimizable, and accessible', () => {
     expect(source).toContain("if (!S.meta?.hosted || !organizationId || !S.user)");
     expect(source).toContain("method: 'PUT', body: JSON.stringify({ display })");

@@ -1493,7 +1493,8 @@ export class Gateway {
             || store.listGitConnections(organizationId).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
           e2b: Boolean(e2b?.enabled && this.deps.broker?.hasHandle(e2b.credentialHandle)),
-          vault: new VaultItems(store, this.deps.broker, undefined, organizationId).list().length > 0,
+          vault: new VaultItems(store, this.deps.broker, undefined, organizationId).list()
+            .some((item) => item.type === 'login' && item.fields.includes('password')),
           card: store.listOrganizationCards(organizationId).length > 0,
           project: store.listProjects().some((project) => project.organizationId === organizationId),
         };
@@ -1600,6 +1601,7 @@ export class Gateway {
             slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id);
+        if (this.deps.hosted) this.enableHostedOnboarding(subject.userId, organization.id);
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {

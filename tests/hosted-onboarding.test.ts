@@ -59,13 +59,14 @@ async function boot(hosted: boolean) {
   });
   expect(setup.status).toBe(200);
   const cookie = setup.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
-  const request = (method = 'GET', body?: object) => fetch(
-    `${running.url}/api/user/onboarding?organizationId=org_personal`, {
+  const onboarding = (organizationId: string, method = 'GET', body?: object) => fetch(
+    `${running.url}/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method, headers: { cookie, 'content-type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
     },
   );
-  return { store, broker, providers, request };
+  const request = (method = 'GET', body?: object) => onboarding('org_personal', method, body);
+  return { store, broker, providers, request, onboarding, base: running.url, cookie };
 }
 
 describe('hosted onboarding status API', () => {
@@ -107,9 +108,42 @@ describe('hosted onboarding status API', () => {
   });
 
   it('never enrolls a self-hosted account into the hosted walkthrough', async () => {
-    const { request } = await boot(false);
+    const { onboarding, base, cookie } = await boot(false);
+    const created = await fetch(`${base}/api/organizations`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Self-hosted team' }),
+    });
+    expect(created.status).toBe(200);
+    const organization = await created.json() as any;
+    const status = await (await onboarding(organization.id)).json() as any;
+    expect(status).toMatchObject({ organizationId: organization.id, eligible: false, visible: false, complete: false });
+  });
+
+  it('enrolls the owner when a signed-in user creates a hosted organization', async () => {
+    const { onboarding, base, cookie } = await boot(true);
+    const created = await fetch(`${base}/api/organizations`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'New hosted team' }),
+    });
+    expect(created.status).toBe(200);
+    const organization = await created.json() as any;
+    const status = await (await onboarding(organization.id)).json() as any;
+    expect(status).toMatchObject({
+      organizationId: organization.id,
+      eligible: true,
+      visible: true,
+      complete: false,
+      completedRequired: 0,
+    });
+  });
+
+  it('does not count an unrelated vault item as an optional password', async () => {
+    const { store, broker, request } = await boot(true);
+    new VaultItems(store, broker, undefined, 'org_personal').save({
+      type: 'note', label: 'Deployment notes', secrets: { note: 'not a password' },
+    });
     const status = await (await request()).json() as any;
-    expect(status).toMatchObject({ eligible: false, visible: false, complete: false });
+    expect(status.steps.optional).toMatchObject({ vault: false, complete: false, blocking: false });
   });
 });
 
