@@ -2313,7 +2313,18 @@ async function boot() {
   // card that a pending invitation is waiting, so a brand-new invitee knows to
   // create an account — with the address the invite was sent to.
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
-  if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
+  if (session.authRequired && !session.authenticated && !session.token) {
+    // The public root explains the product before asking for an account. Auth
+    // callbacks, invitations and explicit auth routes still land directly on
+    // the form they need, so a person following a link never has to hunt.
+    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login') return renderLogin();
+    if (location.pathname === '/signup') return renderSignup();
+    return renderLanding();
+  }
+  // Successful password/social auth returns to the public auth URL it started
+  // from. Those URLs are not organizations; canonicalise before app routing.
+  if (location.pathname === '/login' || location.pathname === '/signup')
+    history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
   const route = parseRoute(location.pathname);
@@ -2945,6 +2956,7 @@ function refreshBrandAssets() {
 }
 
 function renderShell() {
+  window.onpopstate = null; // public-page history is replaced by the app router below
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
@@ -14342,8 +14354,134 @@ function wireSocialBtn(id, provider, errSelector) {
   });
 }
 
+// ── public landing ──────────────────────────────────────────────────────────
+
+function openPublicAuth(path, render) {
+  history.pushState({ kx: 1 }, '', path);
+  render();
+}
+
+function renderLanding() {
+  document.body.classList.add('landing-active');
+  document.title = 'krmax — the to-do list for agents';
+  $('#app').innerHTML = `<div class="landing-page">
+    <a class="landing-skip" href="#landing-main">Skip to content</a>
+    <header class="landing-nav" aria-label="Primary navigation">
+      <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
+      <div class="landing-nav-actions">
+        <a href="https://github.com/abhimanyupallavisudhir/karmax" class="landing-text-link">GitHub</a>
+        <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
+        <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
+      </div>
+    </header>
+
+    <main id="landing-main">
+      <section class="landing-hero" aria-labelledby="landing-title">
+        <div class="landing-hero-copy">
+          <p class="landing-kicker"><span></span> An interface for work after code editors</p>
+          <h1 id="landing-title"><span>VS Code was a fancy</span> text editor.<br><strong>krmax is a fancy <em>to-do list.</em></strong></h1>
+          <p class="landing-intro">The correct interface for the era of <strong>managing agents</strong> rather than <s>manually writing code</s>.</p>
+          <div class="landing-hero-actions">
+            <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
+            <span>No new AI subscription required.</span>
+          </div>
+        </div>
+
+        <figure class="product-frame" aria-label="krmax task list showing agents working in parallel">
+          <div class="product-browserbar"><i></i><i></i><i></i><span>app.krmax.ai / product</span><b>⌘ K</b></div>
+          <div class="product-shell">
+            <aside class="product-rail">
+              <div class="product-wordmark">${brandMark()}<strong>krmax</strong></div>
+              <small>PROJECTS</small>
+              <div class="product-project active"><span>◇</span> Product</div>
+              <div class="product-project"><span>◇</span> Website</div>
+              <div class="product-project"><span>◇</span> Research</div>
+              <div class="product-rail-spacer"></div>
+              <div class="product-project"><span>▦</span> Dashboard</div>
+              <div class="product-project"><span>⚙</span> Settings</div>
+            </aside>
+            <div class="product-main">
+              <div class="product-topline"><span>Tasks <b>12</b></span><span>Queue</span><span>Activity</span><i>+ New task</i></div>
+              <div class="product-compose"><span>What needs doing?</span><kbd>⌘ ↵</kbd></div>
+              <div class="product-list-head"><span>NOW</span><span>3 agents working</span></div>
+              <article class="product-task active">
+                <span class="product-check">✓</span>
+                <div><strong>Ship the new onboarding flow</strong><small>#128 · Do agent</small></div>
+                <div class="product-agent"><i></i> coding</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Research our three closest competitors</strong><small>#127 · Research agent</small></div>
+                <div class="product-agent amber"><i></i> browsing</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Deploy the marketing site</strong><small>#126 · Do agent</small></div>
+                <div class="product-agent"><i></i> deploying</div>
+              </article>
+              <div class="product-list-head later"><span>NEXT</span><span>Review when ready</span></div>
+              <article class="product-task muted">
+                <span class="product-check product-empty-check"></span>
+                <div><strong>Buy a domain and connect analytics</strong><small>#125 · waiting for approval</small></div>
+                <div class="product-stage">human input</div>
+              </article>
+            </div>
+          </div>
+          <figcaption><span><i></i> Three isolated cloud worlds</span><span>One calm list</span></figcaption>
+        </figure>
+      </section>
+
+      <section class="landing-principles" aria-labelledby="principles-title">
+        <div class="landing-section-label">The whole idea</div>
+        <div class="landing-principles-content">
+          <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
+          <div class="landing-checks">
+            <article><span>01</span><div><h3>Parallel, isolated work</h3><p>Agents work in parallel in their own cloud worlds, without stepping on one another.</p></div></article>
+            <article><span>02</span><div><h3>The whole working set</h3><p>Gitignored files come too: secrets, databases, large assets, and everything real work depends on.</p></div></article>
+            <article><span>03</span><div><h3>Your models, your terms</h3><p>Bring the AI subscription or API key you already use.</p></div></article>
+            <article><span>04</span><div><h3>Agents can run krmax</h3><p>With krmax MCP, permitted agents can create tasks, manage projects, and change settings just like a human.</p></div></article>
+            <article class="wide"><span>05</span><div><h3>From “do this” to done</h3><p>Connect a password vault and payment card, and agents can securely just do things — even “buy me a website and deploy this project there.”</p></div><span class="landing-done">Done <b>✓</b></span></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-control" aria-labelledby="control-title">
+        <div class="landing-control-copy">
+          <div class="landing-section-label light">Human in the loop</div>
+          <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
+          <p>Want a human-managed to-do list of AI engineers? Want the automated company? krmax can do both.</p>
+        </div>
+        <div class="landing-control-list">
+          <article><span>Human</span><h3>Keep the decisions</h3><p>Assign review and human-input stages to people, with the context needed to decide.</p></article>
+          <article><span>Agent</span><h3>Automate the company</h3><p>Assign those same stages to agents. krmax MCP can manage anything a human can.</p></article>
+          <article><span>Policy</span><h3>Draw the boundaries</h3><p>A robust authorization system makes every permission explicit. You decide what each agent can do.</p></article>
+        </div>
+      </section>
+
+      <section class="landing-final" aria-labelledby="final-title">
+        <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+        <p>One list. However many agents.</p>
+        <h2 id="final-title">Stop juggling tools.<br><em>Start assigning outcomes.</em></h2>
+        <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with krmax <span aria-hidden="true">→</span></button>
+      </section>
+    </main>
+
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>The to-do list for agents.</p><a href="https://github.com/abhimanyupallavisudhir/karmax">GitHub ↗</a></footer>
+  </div>`;
+
+  const signIn = () => openPublicAuth('/login', renderLogin);
+  const signUp = () => openPublicAuth('/signup', renderSignup);
+  $('#landing-sign-in')?.addEventListener('click', signIn);
+  ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', signUp));
+  window.onpopstate = () => boot();
+}
+
 function renderLogin() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Sign in · krmax';
+  window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <a href="/" id="login-home" class="login-home">← About krmax</a>
     <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a krmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
@@ -14372,6 +14510,7 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  $('#login-home')?.addEventListener('click', (e) => { e.preventDefault(); history.pushState({ kx: 1 }, '', '/'); renderLanding(); });
   wireSocialBtn('google-btn', 'google', '#login-err');
   wireSocialBtn('github-btn', 'github', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
@@ -14382,7 +14521,7 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', renderSignup);
+  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
   $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -14457,6 +14596,9 @@ function renderResetPassword(token) {
 }
 
 function renderSignup() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Create account · krmax';
+  window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
     ${S.pendingInvite
@@ -14508,7 +14650,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err');
   wireSocialBtn('signup-github-btn', 'github', '#signup-err');
-  $('#signup-back').addEventListener('click', renderLogin);
+  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
