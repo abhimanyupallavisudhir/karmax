@@ -2840,6 +2840,7 @@ function patchTaskListFromEvent(ev) {
     ? {
         kind: payload.waitingFor,
         ...waitingField('waitingDetail', 'detail'),
+        ...waitingField('waitingSummary', 'summary'),
         ...waitingField('waitingProvider', 'provider'),
         ...waitingField('waitingResetAt', 'earliestResetAt'),
       }
@@ -3809,10 +3810,11 @@ function pullRequestLinks(v) {
 // the task ever leaving Landing. The short wait reason is rendered separately.
 function stageLabel(v) {
   if (v.state?.draft) return 'draft';
-  // Waiting for input is a public software-dev stage (Do ⇄ Waiting for
-  // input), even though the workflow retains its replay-safe Do/Review/Landing
-  // checkpoint internally so a follow-up knows where to resume.
-  if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return 'Waiting for input';
+  // A human hold is a public software-dev stage, even though the workflow keeps
+  // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
+  // where to resume. Direct provider blockers may supply a concise specific
+  // summary; ordinary holds retain the stable "Waiting for input" label.
+  if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
   const stage = v.stage || 'setup';
   if (stage === 'merge') return 'landing';
   return stage;
@@ -7777,6 +7779,10 @@ function waitingLabel(w) {
 // workflow's detailed diagnostic remains in durable state/history; copying it
 // into a status label made normal polling look like a stream of new problems.
 function waitingText(w) {
+  if (w?.kind === 'human' && typeof w.summary === 'string') {
+    const summary = w.summary.replace(/\s+/g, ' ').trim();
+    if (summary) return summary.slice(0, 72);
+  }
   const label = waitingLabel(w);
   if (label === 'merge') return 'Waiting to merge';
   return `Waiting for ${label}`;
