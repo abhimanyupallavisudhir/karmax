@@ -91,9 +91,6 @@ export interface MintArgs {
   /** Opaque authority-minted delegation provenance. Callers cannot supply a
    * user id or external account directly to token minting. */
   delegationId?: string;
-  /** Autonomous principals such as Avatars may carry an explicitly delegated
-   * external account without impersonating an interactive human. */
-  externalIdentities?: ExternalIdentityClaims;
 }
 
 export class TokenAuthority {
@@ -247,7 +244,6 @@ export class TokenAuthority {
       actor: args.principal.startsWith('system:')
         ? { kind: 'system', principal: args.principal }
         : { kind: 'task-agent', taskId: args.taskId, profileId: args.profileId, role: args.role },
-      ...(args.externalIdentities ? { externalIdentities: args.externalIdentities } : {}),
       ...(delegation ? {
         humanSubject: { kind: 'user' as const, userId: delegation.humanUserId, presence: 'delegated' as const,
           externalIdentities: delegation.externalIdentities },

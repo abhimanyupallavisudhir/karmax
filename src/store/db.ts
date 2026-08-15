@@ -21,6 +21,7 @@ import {
   TaskQuery,
   Organization,
   OrganizationExecutionPolicy,
+  OrganizationUsagePolicy,
   OrganizationMembership,
   OrganizationInvitation,
   AuthorizationSelection,
@@ -30,8 +31,6 @@ import {
   PrincipalRef,
   ProjectPrincipalRef,
   ConfirmationPolicy,
-  Avatar,
-  AvatarAvailability,
   Repository,
   ProjectRepository,
   GitConnection,
@@ -59,6 +58,13 @@ import {
   urgencyRank,
 } from '../domain/types.js';
 import { resourceDriver } from '../domain/resource-drivers.js';
+import {
+  EntitlementError,
+  isHostedPlanId,
+  organizationEntitlements,
+  type HostedPlanId,
+  type OrganizationEntitlements,
+} from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 
 export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
@@ -121,9 +127,12 @@ export const isReviewRequestEvent = (type: string): boolean =>
  */
 export class Store {
   readonly db: SqlDatabase;
+  readonly hosted: boolean;
   private userNames?: () => Array<{ id: string; name: string }>;
+  private organizationEntitlementListeners = new Set<(organizationId: string) => void>();
 
-  constructor(dbPath = ':memory:') {
+  constructor(dbPath = ':memory:', options: { hosted?: boolean } = {}) {
+    this.hosted = options.hosted === true;
     if (dbPath !== ':memory:' && !isPostgresTarget(dbPath)) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = openSqlDatabase(dbPath);
     // busy_timeout first: waiting (up to 5s) on a locked database beats failing
@@ -305,7 +314,7 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS organizations (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL, createdAt INTEGER NOT NULL
+        kind TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free', createdAt INTEGER NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_name_nocase
         ON organizations(name COLLATE NOCASE);
@@ -471,7 +480,13 @@ export class Store {
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT, taskId TEXT,
         worldId TEXT, provider TEXT NOT NULL, kind TEXT NOT NULL, quantity REAL NOT NULL,
         unit TEXT NOT NULL, costMicros INTEGER NOT NULL, startedAt INTEGER NOT NULL,
-        endedAt INTEGER NOT NULL, metadata TEXT
+        endedAt INTEGER NOT NULL, metadata TEXT, fundingSource TEXT NOT NULL DEFAULT 'customer',
+        costClassification TEXT NOT NULL DEFAULT 'none'
+      );
+      CREATE TABLE IF NOT EXISTS usage_admissions (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL, taskId TEXT NOT NULL,
+        kind TEXT NOT NULL, provider TEXT NOT NULL, model TEXT, fundingSource TEXT NOT NULL,
+        state TEXT NOT NULL, reservedCostMicros INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, releasedAt INTEGER
       );
       CREATE TABLE IF NOT EXISTS promoted_artifacts (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
@@ -535,13 +550,6 @@ export class Store {
       CREATE TABLE IF NOT EXISTS profiles (
         id TEXT PRIMARY KEY, json TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS avatars (
-        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
-        ownerUserId TEXT NOT NULL, json TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        updatedAt INTEGER NOT NULL, deletedAt INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_avatars_project ON avatars(projectId, deletedAt);
-      CREATE INDEX IF NOT EXISTS idx_avatars_owner ON avatars(ownerUserId, deletedAt);
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
@@ -658,6 +666,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_world_provider_connections_org ON world_provider_connections(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_leases_pool ON world_leases(runnerPoolId, state, priority DESC, createdAt);
       CREATE INDEX IF NOT EXISTS idx_usage_org_time ON usage_events(organizationId, startedAt);
+      CREATE INDEX IF NOT EXISTS idx_usage_admissions_org ON usage_admissions(organizationId, kind, state, createdAt);
       CREATE INDEX IF NOT EXISTS idx_artifacts_task ON promoted_artifacts(taskId, createdAt);
       CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(taskId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_execution_frames ON execution_frames(executionId, seq);
@@ -708,6 +717,15 @@ export class Store {
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT');
+    const usageCols = this.db.prepare('PRAGMA table_info(usage_events)').all() as { name: string }[];
+    if (!usageCols.some((c) => c.name === 'fundingSource'))
+      this.db.exec("ALTER TABLE usage_events ADD COLUMN fundingSource TEXT NOT NULL DEFAULT 'customer'");
+    if (!usageCols.some((c) => c.name === 'costClassification'))
+      this.db.exec("ALTER TABLE usage_events ADD COLUMN costClassification TEXT NOT NULL DEFAULT 'none'");
+    this.db.exec("UPDATE usage_events SET costClassification='incurred' WHERE costMicros>0 AND costClassification='none'");
+    const usageAdmissionCols = this.db.prepare('PRAGMA table_info(usage_admissions)').all() as { name: string }[];
+    if (!usageAdmissionCols.some((c) => c.name === 'reservedCostMicros'))
+      this.db.exec('ALTER TABLE usage_admissions ADD COLUMN reservedCostMicros INTEGER NOT NULL DEFAULT 0');
     const githubStateCols = this.db.prepare('PRAGMA table_info(github_install_states)').all() as { name: string }[];
     if (!githubStateCols.some((c) => c.name === 'returnTo'))
       this.db.exec('ALTER TABLE github_install_states ADD COLUMN returnTo TEXT');
@@ -751,6 +769,9 @@ export class Store {
     if (!cols.some((c) => c.name === 'assignee')) this.db.exec('ALTER TABLE tasks ADD COLUMN assignee TEXT');
     if (!cols.some((c) => c.name === 'delegate')) this.db.exec('ALTER TABLE tasks ADD COLUMN delegate TEXT');
     if (!cols.some((c) => c.name === 'confirmationPolicy')) this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT');
+    const organizationCols = this.db.prepare('PRAGMA table_info(organizations)').all() as { name: string }[];
+    if (!organizationCols.some((c) => c.name === 'plan'))
+      this.db.exec("ALTER TABLE organizations ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'");
     const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
     if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
     const attachmentCols = this.db.prepare('PRAGMA table_info(resource_attachments)').all() as { name: string }[];
@@ -945,6 +966,67 @@ export class Store {
     return this.getOrganizationExecutionPolicy(organizationId);
   }
 
+  getOrganizationUsagePolicy(organizationId: string): OrganizationUsagePolicy {
+    if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    const fallback: Omit<OrganizationUsagePolicy, 'effectiveMaxActiveAgentTurns'> = {
+      managedModelProviders: [],
+      allowedModelProviders: [],
+      allowedModels: [],
+      maxAgentStartsPerMinute: this.hosted ? 60 : 10_000,
+      maxRemoteStartsPerMinute: this.hosted ? 30 : 10_000,
+      maxActiveWorlds: this.hosted ? 20 : 10_000,
+    };
+    const raw = this.kvGet(`organization-usage-policy:${organizationId}`);
+    let saved: Partial<OrganizationUsagePolicy> = {};
+    if (raw) try { saved = JSON.parse(raw); } catch { saved = {}; }
+    delete saved.effectiveMaxActiveAgentTurns;
+    const planLimit = this.organizationEntitlements(organizationId).maxActiveAgentRuns ?? 10_000;
+    const ownerLimit = Number.isSafeInteger(saved.maxActiveAgentTurns) && saved.maxActiveAgentTurns! > 0
+      ? saved.maxActiveAgentTurns : undefined;
+    return { ...fallback, ...saved,
+      managedModelProviders: [...(saved.managedModelProviders ?? [])],
+      allowedModelProviders: [...(saved.allowedModelProviders ?? [])],
+      allowedModels: [...(saved.allowedModels ?? [])],
+      ...(ownerLimit == null ? {} : { maxActiveAgentTurns: ownerLimit }),
+      effectiveMaxActiveAgentTurns: ownerLimit == null ? planLimit : Math.min(ownerLimit, planLimit),
+    };
+  }
+
+  setOrganizationUsagePolicy(organizationId: string, patch: Partial<OrganizationUsagePolicy>): OrganizationUsagePolicy {
+    const current = this.getOrganizationUsagePolicy(organizationId);
+    const next = { ...current, ...patch } as OrganizationUsagePolicy;
+    delete (next as Partial<OrganizationUsagePolicy>).effectiveMaxActiveAgentTurns;
+    if (Object.prototype.hasOwnProperty.call(patch, 'managedSpendCapMicros')
+      && (patch as any).managedSpendCapMicros == null) delete next.managedSpendCapMicros;
+    if (Object.prototype.hasOwnProperty.call(patch, 'maxActiveAgentTurns')
+      && (patch as any).maxActiveAgentTurns == null) delete next.maxActiveAgentTurns;
+    const normalized = (values: unknown, label: string): string[] => {
+      if (!Array.isArray(values)) throw new Error(`${label} must be a list`);
+      const out = [...new Set(values.map((value) => String(value).trim()).filter(Boolean))];
+      if (out.some((value) => value.length > 160 || !/^[a-z0-9][a-z0-9._:/-]*$/i.test(value)))
+        throw new Error(`${label} contains an invalid value`);
+      return out;
+    };
+    next.managedModelProviders = normalized(next.managedModelProviders, 'managed model providers');
+    next.allowedModelProviders = normalized(next.allowedModelProviders, 'allowed model providers');
+    next.allowedModels = normalized(next.allowedModels, 'allowed models');
+    for (const [key, value] of Object.entries({
+      maxAgentStartsPerMinute: next.maxAgentStartsPerMinute,
+      maxRemoteStartsPerMinute: next.maxRemoteStartsPerMinute,
+      maxActiveWorlds: next.maxActiveWorlds,
+    })) if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000) throw new Error(`${key} must be an integer from 1 to 1000000`);
+    if (next.maxActiveAgentTurns != null && (!Number.isSafeInteger(next.maxActiveAgentTurns)
+      || next.maxActiveAgentTurns < 1 || next.maxActiveAgentTurns > 1_000_000))
+      throw new Error('maxActiveAgentTurns must be an integer from 1 to 1000000');
+    const planLimit = this.organizationEntitlements(organizationId).maxActiveAgentRuns;
+    if (next.maxActiveAgentTurns != null && planLimit != null)
+      next.maxActiveAgentTurns = Math.min(next.maxActiveAgentTurns, planLimit);
+    if (next.managedSpendCapMicros != null && (!Number.isSafeInteger(next.managedSpendCapMicros) || next.managedSpendCapMicros < 1))
+      throw new Error('managed spend cap must be a positive integer');
+    this.kvSet(`organization-usage-policy:${organizationId}`, JSON.stringify(next));
+    return this.getOrganizationUsagePolicy(organizationId);
+  }
+
   /** Effective config used by workflows and provider activities. Project values
    * are sparse overrides; nested resource/network objects remain atomic enough
    * that choosing "organization default" really removes project infrastructure. */
@@ -1058,7 +1140,6 @@ export class Store {
       deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
       this.db.prepare('DELETE FROM resource_candidates WHERE projectId=?').run(id);
       this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
-      this.db.prepare('DELETE FROM avatars WHERE projectId=?').run(id);
       this.deletePermissionRequestKv(project.organizationId, taskIds);
       this.deleteProjectKv([id], taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
@@ -1084,6 +1165,27 @@ export class Store {
     this.userNames = lookup;
   }
 
+  /**
+   * Observe organization mutations that can change hosted admission. The store
+   * remains the single synchronous billing/member write boundary; control-plane
+   * services use this hook to reconcile derived durable coordinator state.
+   */
+  onOrganizationEntitlementsChanged(listener: (organizationId: string) => void): () => void {
+    this.organizationEntitlementListeners.add(listener);
+    return () => this.organizationEntitlementListeners.delete(listener);
+  }
+
+  private notifyOrganizationEntitlementsChanged(organizationId: string): void {
+    // Run after the current synchronous write/transaction has completed. In
+    // particular, deprovisionOrganizationUser removes the membership inside a
+    // larger transaction and must never reconcile from an intermediate state.
+    queueMicrotask(() => {
+      for (const listener of this.organizationEntitlementListeners) {
+        try { listener(organizationId); } catch { /* a periodic reconciler retries */ }
+      }
+    });
+  }
+
   private assertOrganizationNameAvailable(name: string, options: {
     excludeOrganizationId?: string;
     allowUserId?: string;
@@ -1107,10 +1209,10 @@ export class Store {
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
       id: newId('org'), name, slug,
-      kind: input.kind ?? 'team', createdAt: Date.now(),
+      kind: input.kind ?? 'team', plan: 'free', createdAt: Date.now(),
     };
-    this.db.prepare('INSERT INTO organizations (id, name, slug, kind, createdAt) VALUES (?, ?, ?, ?, ?)')
-      .run(organization.id, organization.name, organization.slug, organization.kind, organization.createdAt);
+    this.db.prepare('INSERT INTO organizations (id, name, slug, kind, plan, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(organization.id, organization.name, organization.slug, organization.kind, organization.plan, organization.createdAt);
     if (input.ownerUserId) this.setOrganizationMembership(organization.id, input.ownerUserId, 'owner');
     return organization;
   }
@@ -1118,6 +1220,40 @@ export class Store {
   getOrganization(id: string): Organization | undefined {
     const r = this.db.prepare('SELECT * FROM organizations WHERE id = ?').get(id) as any;
     return r ? rowToOrganization(r) : undefined;
+  }
+
+  organizationEntitlements(organizationId: string): OrganizationEntitlements {
+    const organization = this.getOrganization(organizationId);
+    if (!organization) throw new Error(`no organization ${organizationId}`);
+    return organizationEntitlements(organization.plan, this.hosted,
+      this.listOrganizationMemberships(organizationId).length);
+  }
+
+  /** Billing's sole plan mutation boundary. Pricing and limits remain in the
+   * domain catalog rather than being copied into billing-provider code. */
+  setOrganizationPlan(organizationId: string, plan: HostedPlanId): Organization {
+    if (!isHostedPlanId(plan)) throw new Error(`unknown hosted plan ${String(plan)}`);
+    if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    this.db.prepare('UPDATE organizations SET plan=? WHERE id=?').run(plan, organizationId);
+    this.notifyOrganizationEntitlementsChanged(organizationId);
+    return this.getOrganization(organizationId)!;
+  }
+
+  private assertOrganizationMemberCapacity(organizationId: string, userId?: string): void {
+    if (!this.hosted || (userId && this.organizationMembership(organizationId, userId))) return;
+    const entitlements = this.organizationEntitlements(organizationId);
+    if (entitlements.maxMembers == null) return;
+    const count = entitlements.currentMemberCount;
+    if (entitlements.memberAdmissionAllowed) return;
+    if (entitlements.overMemberLimit) {
+      const extra = count - entitlements.maxMembers;
+      throw new EntitlementError(
+        `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${count}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team before adding another person.`,
+      );
+    }
+    throw new EntitlementError(
+      `${entitlements.planName} allows ${entitlements.maxMembers} organization user${entitlements.maxMembers === 1 ? '' : 's'}. Upgrade the plan before adding another person.`,
+    );
   }
 
   renameOrganization(id: string, name: string): Organization {
@@ -1198,7 +1334,6 @@ export class Store {
       team_memberships: rowsFor(this.db, 'team_memberships', 'teamId', teamIds),
       team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
       projects: rowsFor(this.db, 'projects', 'id', projectIds),
-      avatars: rowsFor(this.db, 'avatars', 'projectId', projectIds),
       resource_attachments: rowsFor(this.db, 'resource_attachments', 'projectId', projectIds)
         .map(({ credentialHandles: _handles, ...row }) => ({ ...row, credentialHandles: '[]' })),
       resource_revisions: rowsFor(this.db, 'resource_revisions', 'attachmentId',
@@ -1244,6 +1379,7 @@ export class Store {
         .map(({ credentialHandle: _credential, ...row }) => row),
       world_leases: selectRows(this.db, 'world_leases', 'organizationId=?', [organizationId]),
       usage_events: selectRows(this.db, 'usage_events', 'organizationId=?', [organizationId]),
+      usage_admissions: selectRows(this.db, 'usage_admissions', 'organizationId=?', [organizationId]),
       promoted_artifacts: selectRows(this.db, 'promoted_artifacts', 'organizationId=?', [organizationId]),
       executions: selectRows(this.db, 'executions', 'organizationId=?', [organizationId]),
       execution_frames: rowsFor(this.db, 'execution_frames', 'executionId', executionIds),
@@ -1274,6 +1410,7 @@ export class Store {
       },
       organization,
       executionPolicy: this.getOrganizationExecutionPolicy(organizationId),
+      usagePolicy: this.getOrganizationUsagePolicy(organizationId),
       identityPolicy: { ...identityPolicy, scimTokenId: undefined },
       tables,
     };
@@ -1296,7 +1433,6 @@ export class Store {
     const wikiEdits = selectRows(this.db, 'organization_wiki_versions', 'principal IN (?,?)', [userId, principalId]);
     const previewLeases = selectRows(this.db, 'preview_leases', 'createdBy IN (?,?)', [userId, principalId])
       .map(({ tokenHash: _tokenHash, ...row }) => row);
-    const ownedAvatars = selectRows(this.db, 'avatars', 'ownerUserId=?', [userId]);
     const spendRequests = selectRows(this.db, 'payment_spend_requests', 'resolvedBy IN (?,?)', [userId, principalId]);
     const subscribedTaskIds = selectRows(this.db, 'task_subscribers', 'principalKey=?', [principalId])
       .map((row) => String(row.taskId));
@@ -1316,7 +1452,6 @@ export class Store {
     const projectIds = [...new Set([
       ...tasks.map((task) => task.projectId),
       ...projectMemberships.map((row) => String(row.projectId)),
-      ...ownedAvatars.map((row) => String(row.projectId)),
     ])];
     const projects = rowsFor(this.db, 'projects', 'id', projectIds);
     const projectById = new Map(projects.map((project) => [String(project.id), rowToProject(project)]));
@@ -1329,7 +1464,6 @@ export class Store {
       ...wikiEdits.map((row) => String(row.organizationId)),
       ...previewLeases.map((row) => String(row.organizationId)),
       ...spendRequests.map((row) => String(row.organizationId)),
-      ...ownedAvatars.map((row) => String(row.organizationId)),
     ])];
     const organizations = organizationIds.map((organizationId) => {
       const organization = this.getOrganization(organizationId);
@@ -1359,7 +1493,6 @@ export class Store {
             joinedAt: membership.joinedAt,
           } }];
         }),
-        avatars: ownedAvatars.filter((avatar) => avatar.organizationId === organizationId),
         tasks: tasks.filter((task) => organizationProjectIds.has(task.projectId))
           .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
           .map((task) => ({
@@ -1498,6 +1631,7 @@ export class Store {
       this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM usage_events WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM usage_admissions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM world_leases WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM runner_pools WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM world_provider_connections WHERE organizationId=?').run(organizationId);
@@ -1507,14 +1641,13 @@ export class Store {
       this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM inbox WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId);
-      this.db.prepare('DELETE FROM avatars WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_invitations WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_wiki_versions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
-      this.db.prepare('DELETE FROM kv WHERE k=?').run(`avatars:organization:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-usage-policy:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
         `credpolicy:organization:${organizationId}`,
         `git:profiles:${organizationId}`,
@@ -1614,6 +1747,7 @@ export class Store {
   setOrganizationMembership(organizationId: string, userId: string, role: OrganizationMembership['role']): OrganizationMembership {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     const existing = this.organizationMembership(organizationId, userId);
+    this.assertOrganizationMemberCapacity(organizationId, userId);
     if (existing?.role === 'owner' && role !== 'owner') {
       const owners = Number((this.db.prepare("SELECT COUNT(*) n FROM organization_memberships WHERE organizationId=? AND role='owner'")
         .get(organizationId) as any).n);
@@ -1622,6 +1756,7 @@ export class Store {
     const joinedAt = Date.now();
     this.db.prepare(`INSERT INTO organization_memberships (organizationId, userId, role, joinedAt)
       VALUES (?, ?, ?, ?) ON CONFLICT(organizationId, userId) DO UPDATE SET role=excluded.role`).run(organizationId, userId, role, joinedAt);
+    if (!existing) this.notifyOrganizationEntitlementsChanged(organizationId);
     return { organizationId, userId, role, joinedAt };
   }
 
@@ -1642,6 +1777,7 @@ export class Store {
     }
     this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId);
     this.db.prepare('DELETE FROM user_preferences WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId);
+    if (membership) this.notifyOrganizationEntitlementsChanged(organizationId);
   }
 
   getOrganizationIdentityPolicy(organizationId: string): OrganizationIdentityPolicy {
@@ -1722,6 +1858,7 @@ export class Store {
   createOrganizationInvitation(input: { organizationId: string; email: string; role?: OrganizationMembership['role']; profileId?: string;
     authorization?: AuthorizationSelection; invitedBy: string; ttlMs?: number }): { invitation: OrganizationInvitation; token: string } {
     if (!this.getOrganization(input.organizationId)) throw new Error(`no organization ${input.organizationId}`);
+    this.assertOrganizationMemberCapacity(input.organizationId);
     const token = `ki_${crypto.randomBytes(24).toString('base64url')}`;
     const invitation: OrganizationInvitation = {
       id: newId('invite'), organizationId: input.organizationId, email: input.email.trim().toLowerCase(),
@@ -1944,8 +2081,6 @@ export class Store {
       throw new Error('team belongs to another organization');
     if (principal.kind === 'organization' && principal.organizationId !== organizationId)
       throw new Error('organization principal belongs to another organization');
-    if (principal.kind === 'avatar' && this.getAvatar(principal.avatarId)?.organizationId !== organizationId)
-      throw new Error('avatar principal belongs to another organization');
     if (principal.kind === 'task-agent') {
       const project = this.getProject(this.getTask(principal.taskId)?.projectId ?? '');
       if (project?.organizationId !== organizationId) throw new Error('task agent belongs to another organization');
@@ -2910,7 +3045,6 @@ export class Store {
     while (task && !visited.has(task.id)) {
       visited.add(task.id);
       if (task.createdBy?.kind === 'user') return task.createdBy.userId;
-      if (task.createdBy?.kind === 'avatar') return this.getAvatar(task.createdBy.avatarId)?.ownerUserId;
       if (task.createdBy?.kind !== 'task-agent') return undefined;
       task = this.getTaskShallow(task.createdBy.taskId);
     }
@@ -2921,7 +3055,6 @@ export class Store {
     if (principal.kind === 'user') return [principal.userId];
     if (principal.kind === 'team') return (this.listTeamMemberships(principal.teamId)).map((m) => m.userId);
     if (principal.kind === 'organization') return this.listOrganizationMemberships(principal.organizationId).map((member) => member.userId);
-    if (principal.kind === 'avatar') return [];
     return [];
   }
 
@@ -2938,10 +3071,6 @@ export class Store {
       if (!candidate || visited.has(candidate.id)) return;
       visited.add(candidate.id);
       if (candidate.createdBy?.kind === 'user') users.add(candidate.createdBy.userId);
-      else if (candidate.createdBy?.kind === 'avatar') {
-        const ownerUserId = this.getAvatar(candidate.createdBy.avatarId)?.ownerUserId;
-        if (ownerUserId) users.add(ownerUserId);
-      }
       else if (candidate.createdBy?.kind === 'task-agent')
         addHumanCreator(this.getTaskShallow(candidate.createdBy.taskId), visited);
     };
@@ -3465,52 +3594,6 @@ export class Store {
     this.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
   }
 
-  // ─── Avatars ───
-
-  upsertAvatar(avatar: Avatar): Avatar {
-    this.db.prepare(`INSERT INTO avatars
-      (id, organizationId, projectId, ownerUserId, json, createdAt, updatedAt, deletedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET organizationId=excluded.organizationId,
-      projectId=excluded.projectId, ownerUserId=excluded.ownerUserId,
-      json=excluded.json, updatedAt=excluded.updatedAt, deletedAt=excluded.deletedAt`)
-      .run(avatar.id, avatar.organizationId, avatar.projectId, avatar.ownerUserId,
-        JSON.stringify(avatar), avatar.createdAt, avatar.updatedAt, avatar.deletedAt ?? null);
-    return avatar;
-  }
-
-  getAvatar(id: string, includeDeleted = false): Avatar | undefined {
-    const row = this.db.prepare(`SELECT json FROM avatars WHERE id=?${includeDeleted ? '' : ' AND deletedAt IS NULL'}`).get(id) as any;
-    return row ? JSON.parse(row.json) as Avatar : undefined;
-  }
-
-  listAvatars(projectId?: string, includeDeleted = false): Avatar[] {
-    const where = [projectId ? 'projectId=?' : '', includeDeleted ? '' : 'deletedAt IS NULL'].filter(Boolean).join(' AND ');
-    const rows = this.db.prepare(`SELECT json FROM avatars${where ? ` WHERE ${where}` : ''} ORDER BY createdAt`)
-      .all(...(projectId ? [projectId] : [])) as any[];
-    return rows.map((row) => JSON.parse(row.json) as Avatar)
-      .sort((left, right) => left.name.localeCompare(right.name) || left.createdAt - right.createdAt);
-  }
-
-  deleteAvatar(id: string, at = Date.now()): Avatar | undefined {
-    const avatar = this.getAvatar(id);
-    if (!avatar) return undefined;
-    const removed = { ...avatar, enabled: false, deletedAt: at, updatedAt: at };
-    this.upsertAvatar(removed);
-    return removed;
-  }
-
-  avatarAvailability(projectId: string): AvatarAvailability {
-    const project = this.getProject(projectId);
-    if (!project) throw new Error(`no project ${projectId}`);
-    const organizationId = project.organizationId ?? 'org_personal';
-    const organization = this.kvGet(`avatars:organization:${organizationId}`) !== 'disabled';
-    const raw = this.kvGet(`avatars:project:${projectId}`);
-    const projectSetting: AvatarAvailability['project'] = raw === 'enabled' || raw === 'disabled' ? raw : 'inherit';
-    return { organization, project: projectSetting,
-      effective: organization && projectSetting !== 'disabled' };
-  }
-
   // ── identities are owned by Better Auth; these rows contain only karmax policy ──
   listAuthorizationProfiles(scopeKey?: string): any[] {
     const rows = scopeKey
@@ -3590,7 +3673,6 @@ export class Store {
     for (const projectId of projectIds) {
       exact.run(`authz:default:project:${projectId}`);
       exact.run(`credpolicy:project:${projectId}`);
-      exact.run(`avatars:project:${projectId}`);
       const workflowPrefix = `wfpin:${projectId}:`;
       prefix.run(workflowPrefix, workflowPrefix);
     }
@@ -4084,9 +4166,16 @@ export class Store {
   storageLocationUsage(locationId: string): StorageLocationUsage {
     const location = this.getStorageLocation(locationId);
     if (!location) throw new Error('storage location not found');
-    const retainedBytes = Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
+    let retainedBytes = Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
       FROM resource_snapshot_chunks WHERE organizationId=? AND storageLocationId=?`)
       .get(location.organizationId, locationId) as any)?.bytes ?? 0);
+    if (location.kind === 'managed') {
+      retainedBytes += Number((this.db.prepare('SELECT COALESCE(SUM(bytes), 0) bytes FROM promoted_artifacts WHERE organizationId=?')
+        .get(location.organizationId) as any)?.bytes ?? 0);
+      retainedBytes += Number((this.db.prepare(`SELECT COALESCE(SUM(CAST(json_extract(manifest, '$.filesystemDelta.bytes') AS INTEGER)), 0) bytes
+        FROM world_checkpoints WHERE projectId IN (SELECT id FROM projects WHERE organizationId=?)`)
+        .get(location.organizationId) as any)?.bytes ?? 0);
+    }
     return { locationId, retainedBytes, quotaBytes: location.quotaBytes,
       ...(location.quotaBytes == null ? {} : { availableBytes: Math.max(0, location.quotaBytes - retainedBytes) }) };
   }
@@ -4103,11 +4192,12 @@ export class Store {
     if (!location || location.organizationId !== organizationId) throw new Error('storage location does not belong to organization');
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const total = Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
+      const retained = this.storageLocationUsage(storageLocationId).retainedBytes;
+      const total = retained + Number((this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes
         FROM storage_upload_reservations WHERE storageLocationId=? AND uploadId<>?`)
         .get(storageLocationId, uploadId) as any)?.bytes ?? 0) + bytes;
       if (location.quotaBytes != null && total > location.quotaBytes)
-        throw new Error(`managed upload quota exceeded (${total} temporary bytes, ${location.quotaBytes} byte limit)`);
+        throw new Error(`managed upload quota exceeded (${total} retained or pending bytes, ${location.quotaBytes} byte limit)`);
       this.db.prepare(`INSERT INTO storage_upload_reservations (uploadId, organizationId, storageLocationId, bytes, expiresAt)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT(uploadId) DO UPDATE SET bytes=excluded.bytes, expiresAt=excluded.expiresAt`)
         .run(uploadId, organizationId, storageLocationId, bytes, expiresAt);
@@ -4351,6 +4441,10 @@ export class Store {
     worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number }): { id: string; acquired: boolean } {
     const pool = this.getRunnerPool(input.runnerPoolId);
     if (!pool?.enabled || pool.organizationId !== input.organizationId) throw new Error('runner pool is unavailable');
+    const project = this.getProject(input.projectId);
+    const task = this.getTask(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+      throw new Error('runner admission attribution does not match the organization project and task');
     const resources = { cpu: Math.max(1, input.cpu ?? 2), memoryMb: Math.max(128, input.memoryMb ?? 2048), gpu: Math.max(0, input.gpu ?? 0) };
     if (resources.cpu > pool.capacity.cpu || resources.memoryMb > pool.capacity.memoryMb || resources.gpu > pool.capacity.gpu
       || pool.capacity.activeWorlds < 1) throw new Error('world resource request exceeds runner pool capacity');
@@ -4358,10 +4452,33 @@ export class Store {
     const now = Date.now();
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const policy = this.getOrganizationUsagePolicy(input.organizationId);
+      const month = monthWindow(now);
+      const organizationBudget = this.getOrganizationExecutionPolicy(input.organizationId).monthlyBudgetMicros;
+      if (organizationBudget != null && this.usageSummary(input.organizationId, month.from, month.to).costMicros >= organizationBudget)
+        throw new Error('organization monthly cloud budget is exhausted');
+      if (project.config.monthlyBudgetMicros != null
+        && this.usageSummary(input.organizationId, month.from, month.to, project.id).costMicros >= project.config.monthlyBudgetMicros)
+        throw new Error('project monthly cloud budget is exhausted');
+      const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+      if (remote && this.hosted && pool.mode === 'managed')
+        throw new Error('centrally funded remote sandbox pools are not enabled; connect the organization provider account');
+      if (remote) {
+        const organizationActive = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+          JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
+            AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId) as any).n);
+        if (organizationActive >= policy.maxActiveWorlds) throw new Error('organization active remote sandbox limit reached');
+      }
       const active = this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
         COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id) as any;
       const acquired = Number(active.n) < pool.capacity.activeWorlds && Number(active.cpu) + resources.cpu <= pool.capacity.cpu
         && Number(active.memoryMb) + resources.memoryMb <= pool.capacity.memoryMb && Number(active.gpu) + resources.gpu <= pool.capacity.gpu;
+      if (remote && acquired) {
+        const recent = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+          JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
+            AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId, now - 60_000) as any).n);
+        if (recent >= policy.maxRemoteStartsPerMinute) throw new Error('organization remote sandbox start rate limit exceeded');
+      }
       this.db.prepare(`INSERT INTO world_leases (id, runnerPoolId, organizationId, projectId, taskId, worldId,
         cpu, memoryMb, gpu, priority, state, createdAt, acquiredAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, pool.id, input.organizationId, input.projectId, input.taskId, input.worldId, resources.cpu,
@@ -4388,6 +4505,25 @@ export class Store {
       for (const queued of this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state='queued'
         ORDER BY priority DESC, createdAt`).all(lease.runnerPoolId) as any[]) {
         const pool = this.getRunnerPool(lease.runnerPoolId)!;
+        const policy = this.getOrganizationUsagePolicy(queued.organizationId);
+        const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+        if (remote && this.hosted && pool.mode === 'managed') continue;
+        if (remote) {
+          const organizationActive = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+            JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
+              AND p.provider NOT IN ('worktree','container','memory')`).get(queued.organizationId) as any).n);
+          if (organizationActive >= policy.maxActiveWorlds) continue;
+          const recent = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+            JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
+              AND p.provider NOT IN ('worktree','container','memory')`).get(queued.organizationId, Date.now() - 60_000) as any).n);
+          if (recent >= policy.maxRemoteStartsPerMinute) continue;
+        }
+        const project = this.getProject(queued.projectId);
+        const month = monthWindow(Date.now());
+        const organizationBudget = this.getOrganizationExecutionPolicy(queued.organizationId).monthlyBudgetMicros;
+        if (organizationBudget != null && this.usageSummary(queued.organizationId, month.from, month.to).costMicros >= organizationBudget) continue;
+        if (project?.config.monthlyBudgetMicros != null
+          && this.usageSummary(queued.organizationId, month.from, month.to, queued.projectId).costMicros >= project.config.monthlyBudgetMicros) continue;
         const active = this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
           COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id) as any;
         if (Number(active.n) >= pool.capacity.activeWorlds || Number(active.cpu) + queued.cpu > pool.capacity.cpu
@@ -4417,48 +4553,140 @@ export class Store {
       ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId) as any[];
   }
 
-  worldLeasesForTask(taskId: string): any[] {
-    return this.db.prepare(`SELECT * FROM world_leases WHERE taskId=? AND state!='released'
-      ORDER BY createdAt`).all(taskId) as any[];
-  }
-
-  /** Dedicated terminal/preview access can legitimately outlive its task's
-   * workflow. Runner reconciliation must preserve capacity explicitly owned by
-   * one of those live records rather than guessing from world state alone. */
-  worldLeaseHasLiveAccessor(leaseId: string, now = Date.now()): boolean {
-    const preview = this.db.prepare(`SELECT 1 FROM preview_leases
-      WHERE runnerLeaseId=? AND revokedAt IS NULL AND expiresAt>? LIMIT 1`).get(leaseId, now);
-    if (preview) return true;
-    return Boolean(this.db.prepare(`SELECT 1 FROM executions
-      WHERE runnerLeaseId=? AND state IN ('starting','running','stop-requested') LIMIT 1`).get(leaseId));
-  }
-
-  unreleasedWorldLeases(): any[] {
-    return this.db.prepare(`SELECT * FROM world_leases WHERE state!='released'
-      ORDER BY createdAt`).all() as any[];
-  }
-
   recordUsage(event: Omit<UsageEvent, 'id'> & { id?: string }): UsageEvent {
     const value: UsageEvent = { ...event, id: event.id ?? newId('usage') };
     this.db.prepare(`INSERT OR IGNORE INTO usage_events (id, organizationId, projectId, taskId, worldId, provider,
-      kind, quantity, unit, costMicros, startedAt, endedAt, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      kind, quantity, unit, costMicros, startedAt, endedAt, metadata, fundingSource, costClassification)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(value.id, value.organizationId, value.projectId ?? null, value.taskId ?? null, value.worldId ?? null,
         value.provider, value.kind, value.quantity, value.unit, value.costMicros, value.startedAt, value.endedAt,
-        value.metadata ? JSON.stringify(value.metadata) : null);
-    return value;
+        value.metadata ? JSON.stringify(value.metadata) : null, value.fundingSource ?? 'customer',
+        value.costClassification ?? (value.costMicros > 0 ? 'incurred' : 'none'));
+    const stored = this.db.prepare('SELECT fundingSource, costClassification FROM usage_events WHERE id=?').get(value.id) as any;
+    return { ...value, fundingSource: stored?.fundingSource ?? value.fundingSource ?? 'customer',
+      costClassification: stored?.costClassification ?? value.costClassification ?? (value.costMicros > 0 ? 'incurred' : 'none') };
   }
 
-  usageSummary(organizationId: string, from = 0, to = Date.now(), projectId?: string): { costMicros: number; events: number; byKind: Record<string, number> } {
+  /** Idempotent model admission. The stable turn id is the retry key: a retry
+   * reuses an active reservation, while a completed turn is rejected rather
+   * than billed twice after an acknowledgement loss. */
+  admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
+    provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
+    reservedCostMicros?: number; now?: number }): { reused: boolean } {
+    const now = input.now ?? Date.now();
+    const project = this.getProject(input.projectId);
+    const task = this.getTask(input.taskId);
+    if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
+      throw new Error('usage attribution does not match the organization project and task');
+    const entitlements = this.organizationEntitlements(input.organizationId);
+    if (!entitlements.agentRunAdmissionAllowed) {
+      const limit = entitlements.maxMembers ?? 0;
+      const extra = Math.max(1, entitlements.currentMemberCount - limit);
+      throw new EntitlementError(
+        `${entitlements.planName} allows ${limit} organization user${limit === 1 ? '' : 's'}, but this organization has ${entitlements.currentMemberCount}. Remove ${extra} member${extra === 1 ? '' : 's'} or restore Team to start another agent run.`,
+      );
+    }
+    const policy = this.getOrganizationUsagePolicy(input.organizationId);
+    if (policy.allowedModelProviders.length && !policy.allowedModelProviders.includes(input.provider))
+      throw new Error(`model provider ${input.provider} is not allowed by the organization`);
+    if (input.model && policy.allowedModels.length && !policy.allowedModels.includes(input.model))
+      throw new Error(`model ${input.model} is not allowed by the organization`);
+    if (input.fundingSource === 'managed') {
+      if (!policy.managedSpendCapMicros) throw new Error('managed model usage is disabled until an organization owner sets a spend cap');
+      if (!policy.managedModelProviders.includes(input.provider))
+        throw new Error(`managed ${input.provider} usage is not enabled for this organization`);
+      if (!Number.isSafeInteger(input.reservedCostMicros) || input.reservedCostMicros! < 1)
+        throw new Error('managed model usage has no installation-configured per-request cost ceiling');
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const assertManagedCapacity = () => {
+        if (input.fundingSource !== 'managed') return;
+        const month = monthWindow(now);
+        const spent = this.usageSummary(input.organizationId, month.from, month.to).byFundingSource.managed ?? 0;
+        const reserved = Number((this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n FROM usage_admissions
+          WHERE organizationId=? AND fundingSource='managed' AND state='active'`).get(input.organizationId) as any).n);
+        if (spent + reserved + input.reservedCostMicros! > policy.managedSpendCapMicros!)
+          throw new Error('organization managed spend cap is exhausted');
+      };
+      const existing = this.db.prepare('SELECT * FROM usage_admissions WHERE id=?').get(input.id) as any;
+      if (existing) {
+        if (existing.organizationId !== input.organizationId || existing.projectId !== input.projectId
+          || existing.taskId !== input.taskId || existing.provider !== input.provider
+          || existing.fundingSource !== input.fundingSource || (existing.model ?? undefined) !== input.model
+          || Number(existing.reservedCostMicros) !== Number(input.reservedCostMicros ?? 0))
+          throw new Error('usage admission retry key belongs to different attributed work');
+        if (existing.state === 'active') {
+          this.db.exec('COMMIT');
+          return { reused: true };
+        }
+        if (existing.state === 'released') {
+          assertManagedCapacity();
+          const active = Number((this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
+            WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId) as any).n);
+          if (active >= policy.effectiveMaxActiveAgentTurns) throw new Error('organization active model turn limit reached');
+          this.db.prepare("UPDATE usage_admissions SET state='active', releasedAt=NULL WHERE id=?").run(input.id);
+          this.db.exec('COMMIT');
+          return { reused: true };
+        }
+        this.db.exec('COMMIT');
+        throw new Error('this model turn was already completed; refusing duplicate provider admission');
+      }
+      assertManagedCapacity();
+      const minute = now - 60_000;
+      const recent = Number((this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
+        WHERE organizationId=? AND kind='agent' AND createdAt>=?`).get(input.organizationId, minute) as any).n);
+      if (recent >= policy.maxAgentStartsPerMinute) throw new Error('organization model request rate limit exceeded');
+      const active = Number((this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions
+        WHERE organizationId=? AND kind='agent' AND state='active'`).get(input.organizationId) as any).n);
+      if (active >= policy.effectiveMaxActiveAgentTurns) throw new Error('organization active model turn limit reached');
+      this.db.prepare(`INSERT INTO usage_admissions (id, organizationId, projectId, taskId, kind, provider, model,
+        fundingSource, state, reservedCostMicros, createdAt) VALUES (?, ?, ?, ?, 'agent', ?, ?, ?, 'active', ?, ?)`)
+        .run(input.id, input.organizationId, input.projectId, input.taskId, input.provider, input.model ?? null,
+          input.fundingSource, input.reservedCostMicros ?? 0, now);
+      this.db.exec('COMMIT');
+      return { reused: false };
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* transaction already committed */ }
+      throw error;
+    }
+  }
+
+  finishUsageAdmission(id: string, completed: boolean, now = Date.now(),
+    events: Array<Omit<UsageEvent, 'id'> & { id?: string }> = []): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const event of events) this.recordUsage(event);
+      this.db.prepare(`UPDATE usage_admissions SET state=?, releasedAt=? WHERE id=? AND state='active'`)
+        .run(completed ? 'completed' : 'released', now, id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  usageSummary(organizationId: string, from = 0, to = Date.now() + 1, projectId?: string): {
+    costMicros: number; events: number; byKind: Record<string, number>; byFundingSource: Record<string, number>;
+    incurredCostMicros: number; estimatedCostMicros: number; activeReservationsMicros: number;
+    byCostClassification: Record<string, number>; byProvider: Record<string, number>; quantities: Record<string, number>;
+    requests: { total: number; managed: number; byok: number; customer: number };
+    active: { agentTurns: number; worlds: number; executions: number };
+  } {
     const rows = (projectId
-      ? this.db.prepare(`SELECT kind, costMicros, startedAt, endedAt FROM usage_events
+      ? this.db.prepare(`SELECT kind, provider, fundingSource, costClassification, unit, quantity, costMicros, startedAt, endedAt FROM usage_events
           WHERE organizationId=? AND projectId=? AND startedAt<?
             AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
         .all(organizationId, projectId, to, from, from)
-      : this.db.prepare(`SELECT kind, costMicros, startedAt, endedAt FROM usage_events
+      : this.db.prepare(`SELECT kind, provider, fundingSource, costClassification, unit, quantity, costMicros, startedAt, endedAt FROM usage_events
           WHERE organizationId=? AND startedAt<?
             AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
         .all(organizationId, to, from, from)) as any[];
     const byKind: Record<string, number> = {};
+    const byFundingSource: Record<string, number> = {};
+    const byCostClassification: Record<string, number> = {};
+    const byProvider: Record<string, number> = {};
+    const quantities: Record<string, number> = {};
     let costMicros = 0;
     for (const row of rows) {
       const startedAt = Number(row.startedAt);
@@ -4467,9 +4695,34 @@ export class Store {
       const overlap = duration > 0 ? Math.max(0, Math.min(endedAt, to) - Math.max(startedAt, from)) : 0;
       const cost = duration > 0 ? Math.round(Number(row.costMicros) * overlap / duration) : Number(row.costMicros);
       byKind[row.kind] = (byKind[row.kind] ?? 0) + cost;
+      byFundingSource[row.fundingSource] = (byFundingSource[row.fundingSource] ?? 0) + cost;
+      byCostClassification[row.costClassification] = (byCostClassification[row.costClassification] ?? 0) + cost;
+      byProvider[row.provider] = (byProvider[row.provider] ?? 0) + cost;
+      quantities[row.unit] = (quantities[row.unit] ?? 0) + Number(row.quantity);
       costMicros += cost;
     }
-    return { costMicros, events: rows.length, byKind };
+    const scope = projectId ? ' AND projectId=?' : '';
+    const args = projectId ? [organizationId, projectId] : [organizationId];
+    const requestRows = this.db.prepare(`SELECT fundingSource, COUNT(*) n FROM usage_admissions
+      WHERE organizationId=?${scope} AND createdAt>=? AND createdAt<? GROUP BY fundingSource`).all(...args, from, to) as any[];
+    const requests = { total: 0, managed: 0, byok: 0, customer: 0 };
+    for (const row of requestRows) {
+      const count = Number(row.n);
+      requests.total += count;
+      const source = String(row.fundingSource) as 'managed' | 'byok' | 'customer';
+      if (source === 'managed' || source === 'byok' || source === 'customer') requests[source] += count;
+    }
+    const active = {
+      agentTurns: Number((this.db.prepare(`SELECT COUNT(*) n FROM usage_admissions WHERE organizationId=?${scope} AND kind='agent' AND state='active'`).get(...args) as any).n),
+      worlds: Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases WHERE organizationId=?${scope} AND state='active'`).get(...args) as any).n),
+      executions: Number((this.db.prepare(`SELECT COUNT(*) n FROM executions WHERE organizationId=?${scope} AND state IN ('starting','running','stop-requested')`).get(...args) as any).n),
+    };
+    const activeReservationsMicros = Number((this.db.prepare(`SELECT COALESCE(SUM(reservedCostMicros), 0) n
+      FROM usage_admissions WHERE organizationId=?${scope} AND fundingSource='managed' AND state='active'`)
+      .get(...args) as any).n);
+    return { costMicros, incurredCostMicros: byCostClassification.incurred ?? 0,
+      estimatedCostMicros: byCostClassification.estimated ?? 0, activeReservationsMicros,
+      events: rows.length, byKind, byFundingSource, byCostClassification, byProvider, quantities, requests, active };
   }
 
   savePromotedArtifact(artifact: PromotedArtifact): PromotedArtifact {
@@ -5034,6 +5287,7 @@ export class Store {
   kvDelete(k: string): void { this.db.prepare('DELETE FROM kv WHERE k=?').run(k); }
 
   close() {
+    this.organizationEntitlementListeners.clear();
     this.db.close();
   }
 
@@ -5045,9 +5299,10 @@ export class Store {
 }
 
 /** Open the configured backend and import the legacy SQLite store once. */
-export function openStore(sqliteFile: string, databaseUrl?: string): { store: Store; migration?: SqliteImportResult } {
-  if (!databaseUrl) return { store: new Store(sqliteFile) };
-  const store = new Store(databaseUrl);
+export function openStore(sqliteFile: string, databaseUrl?: string,
+  options: { hosted?: boolean } = {}): { store: Store; migration?: SqliteImportResult } {
+  if (!databaseUrl) return { store: new Store(sqliteFile, options) };
+  const store = new Store(databaseUrl, options);
   try {
     const migration = importSqliteDatabase(sqliteFile, store.db, 'store', { sentinelTable: 'tasks' });
     if (migration.imported) store.finishLegacyImport();
@@ -5239,6 +5494,12 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   }
 }
 
+function monthWindow(now: number): { from: number; to: number } {
+  const date = new Date(now);
+  return { from: Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1),
+    to: Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) };
+}
+
 function validateResourceAttachment(value: ResourceAttachment): void {
   if (!value.name.trim() || value.name.length > 120) throw new Error('resource name is required and must be at most 120 characters');
   if (!/^[a-z][a-z0-9._-]*@\d+$/i.test(value.driver)) throw new Error('resource driver must be a versioned registry id');
@@ -5280,7 +5541,6 @@ export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
   if (principal.kind === 'organization') return `organization:${principal.organizationId}`;
-  if (principal.kind === 'avatar') return `avatar:${principal.avatarId}`;
   return `task-agent:${principal.taskId}:${principal.role}`;
 }
 
@@ -5303,7 +5563,8 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 }
 
 function rowToOrganization(r: any): Organization {
-  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, createdAt: r.createdAt };
+  return { id: r.id, name: r.name, slug: r.slug, kind: r.kind,
+    plan: isHostedPlanId(r.plan) ? r.plan : 'free', createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

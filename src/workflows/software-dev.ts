@@ -55,14 +55,6 @@ const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
   retry: { maximumAttempts: 3 },
 });
-// World provisioning is a long provider operation just like an agent turn. A
-// cancellation must wait until the activity has aborted its provider request
-// and released admission capacity; older pins retain the historical proxy.
-const cancellationAwareCore = proxyActivities<coreActivities>({
-  startToCloseTimeout: '5 minutes',
-  retry: { maximumAttempts: 3 },
-  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
-});
 // Merges + checks can be long-running (test suites) but don't heartbeat.
 const long = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
@@ -404,19 +396,13 @@ export async function softwareDevV1_25(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.25.0');
 }
 
-/** Setup provisioning is cancellable and acknowledges provider/lease cleanup
- * before the workflow publishes a terminal result. */
-export async function softwareDevV1_26(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
-  return softwareDevImpl(input, '1.26.0');
-}
-
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -523,7 +509,6 @@ async function softwareDevImpl(
   const modeSwitching = minor >= 3;
   const durableAgentAdmission = minor >= 4;
   const responsiveHumanHold = minor >= 7;
-  const cancellableSetup = minor >= 26;
   // New activity calls in an existing stage would break replay for executions
   // recorded before them, so the PR lifecycle is pinned to its own version.
   const githubPrLifecycle = minor >= 8;
@@ -751,7 +736,6 @@ async function softwareDevImpl(
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
-  let activeSetup: CancellationScope | undefined;
 
   const kind = input.project.worldProvider ?? 'worktree';
 
@@ -1273,7 +1257,6 @@ async function softwareDevImpl(
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
       cancelled = true;
-      activeSetup?.cancel(); // abort provider allocation/provisioning during Setup
       activeTurn?.cancel(); // abort an in-flight agent turn immediately (SPEC §5.6)
       cancelChildren(); // and tear down any running sub-task agents
     }
@@ -1282,7 +1265,6 @@ async function softwareDevImpl(
     if (restoresStagePrerequisites && !pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
       lifecycleReplacement = true;
       cancelled = true;
-      activeSetup?.cancel();
       activeTurn?.cancel();
       cancelChildren();
     }
@@ -1660,6 +1642,7 @@ async function softwareDevImpl(
       }
       let slotHeld = false;
       let slotRequested = false;
+      let agentQueueIdentity: string | undefined;
       try {
         return await runCancellable(async () => {
           if (durableAgentAdmission) {
@@ -1675,20 +1658,29 @@ async function softwareDevImpl(
             });
             if (usesHostCapacity) {
               slotRequested = true;
-              const admission = await coordinator.requestAgentSlot({
-                taskId,
-                turnId,
-                role,
-                provider,
-                title: input.title,
-                projectId: input.projectId,
-              });
+              let admission;
+              for (;;) {
+                admission = await coordinator.requestAgentSlot({
+                  taskId,
+                  turnId,
+                  role,
+                  provider,
+                  title: input.title,
+                  projectId: input.projectId,
+                });
+                agentQueueIdentity = admission.queueId;
+                if (!admission.blocked) break;
+                waitingFor = { kind: 'agentSlot', provider, detail: admission.detail };
+                await publish();
+                await condition(() => cancelled, '30 seconds');
+                if (cancelled) throw new Cancelled();
+              }
               slotHeld = admission.granted || agentSlotGrants.delete(turnId);
               if (!slotHeld) {
                 waitingFor = {
                   kind: 'agentSlot',
                   provider,
-                  detail: 'Waiting for host capacity to start agent',
+                  detail: admission.detail ?? 'Waiting for host capacity to start agent',
                 };
                 await publish();
                 await condition(() => agentSlotGrants.has(turnId) || cancelled);
@@ -1716,8 +1708,8 @@ async function softwareDevImpl(
       } finally {
         agentSlotGrants.delete(turnId);
         if (durableAgentAdmission && slotRequested) {
-          if (slotHeld) await coordinator.releaseAgentSlot(taskId, turnId).catch(() => undefined);
-          else await coordinator.cancelAgentSlot(taskId, turnId).catch(() => undefined);
+          if (slotHeld) await coordinator.releaseAgentSlot(taskId, turnId, agentQueueIdentity).catch(() => undefined);
+          else await coordinator.cancelAgentSlot(taskId, turnId, agentQueueIdentity).catch(() => undefined);
         }
         if (liveAgentStates && agentTurn?.turnId === turnId) {
           agentTurn = undefined;
@@ -2347,18 +2339,10 @@ Inspect the complete current diff and specifically compare its delta from the re
   try {
   // ── Setup ──
   await publish();
-  if (cancellableSetup && cancelled) return await abort();
   if (!world) {
-    const create = () => {
-      const args = { taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress, ...(input.project.multiPr ? { multiPr: true } : {}) };
-      if (!cancellableSetup) return core.createWorld(args);
-      const scope = new CancellationScope({ cancellable: true });
-      activeSetup = scope;
-      return scope.run(() => cancellationAwareCore.createWorld(args)).finally(() => {
-        activeSetup = undefined;
-      });
-    };
-    world = (await withResolve('setup', create)) as WorldHandleLike;
+    world = (await withResolve('setup', () =>
+      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress, ...(input.project.multiPr ? { multiPr: true } : {}) }),
+    )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coordinator.accountPoolSize().catch(() => 0);
@@ -3596,7 +3580,6 @@ Inspect the complete current diff and specifically compare its delta from the re
           : '';
         waitingFor = {
           kind: 'human', audience,
-          ...(decision.waitReason ? { summary: decision.waitReason } : {}),
           detail: `${decision.detail ?? (decision.status === 'needs-authorizer'
             ? 'A connected human with GitHub merge access must confirm this merge.'
             : 'The pull request needs human attention on GitHub.')}${exhausted}`,

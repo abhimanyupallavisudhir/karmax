@@ -69,8 +69,8 @@ export function accountCoordinatorId(): string {
   return 'account-coordinator';
 }
 
-export function agentQueueId(): string {
-  return 'agent-queue';
+export function agentQueueId(organizationId?: string): string {
+  return organizationId ? `agent-queue:${organizationId}` : 'agent-queue';
 }
 
 export function resourcePublishCoordinatorId(attachmentId: string): string {

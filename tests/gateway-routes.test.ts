@@ -58,6 +58,10 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/organizations/o1')).toBe('organization:read');
   });
 
+  it('exposes plan entitlements as organization-scoped read data', () => {
+    expect(cap('GET', '/api/organizations/o1/entitlements')).toBe('organization:read');
+  });
+
   it('gates a password-manager export import as a credential write', () => {
     expect(cap('POST', '/api/vault/import/bitwarden')).toBe('credential:write');
     expect(cap('POST', '/api/vault/items/vi_1/reveal')).toBe('credential:write');

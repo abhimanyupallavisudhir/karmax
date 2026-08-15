@@ -41,9 +41,7 @@ describe('GitHub Actions API', () => {
       'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
       { conclusion: 'cancelled' },
     )).disposition).toBe('superseded');
-    expect(classifyGithubActionsFailure(inspection('The job never started'), {
-      providerContext: 'GitHub annotation: Recent account payments failed and the spending limit must be increased',
-    })).toMatchObject({ disposition: 'human', waitReason: 'GitHub Actions billing action required' });
+    expect(classifyGithubActionsFailure(inspection('The job was not started because recent account payments have failed or your spending limit needs to be increased')).disposition).toBe('human');
     expect(classifyGithubActionsDiagnostic('Workflow did not start because your spending limit needs to be increased')).toBe('human');
     expect(classifyGithubActionsDiagnostic(
       'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
@@ -56,46 +54,6 @@ describe('GitHub Actions API', () => {
     expect(renderGithubActionsFailure(deployment)).toContain('backup contains a symbolic link');
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/actions/runs/123/job/456')).toBe(123);
     expect(githubActionsRunIdFromUrl('https://github.com/acme/app/pull/1')).toBeUndefined();
-  });
-
-  it('routes CI #410 source-diff keywords to revision because a job log is not provider evidence', () => {
-    const vitestDiff = [
-      'FAIL tests/web-console-ux.test.ts > reconnects after a dropped socket',
-      'AssertionError: expected app.js to contain if (wsHadDropped) { refreshTasks()',
-      '- Expected',
-      '+ Received',
-      '+ const fixtures = {',
-      '+ billing: "Payment failed; increase the spending limit or budget",',
-      '+ quota: "Quota for Actions minutes exhausted; no included minutes",',
-      '+ permissions: "Resource not accessible by integration; not permitted to use this action",',
-      '+ approval: "Action required: requires approval; approve and run",',
-      '+ runners: "Actions is disabled; workflows are disabled; no hosted runners",',
-      '+ prepaid: "Your prepaid balance has been fully consumed"',
-      '+ };',
-    ].join('\n');
-
-    const decision = classifyGithubActionsFailure(inspection(vitestDiff));
-    expect(decision.disposition).toBe('revision');
-    expect(renderGithubActionsFailure(decision)).toContain('tests/web-console-ux.test.ts');
-  });
-
-  it('routes only direct provider evidence and action_required to a human', () => {
-    const annotation = classifyGithubActionsFailure(inspection('AssertionError: ordinary test failure'), {
-      providerContext: 'GitHub check annotation: Actions is disabled for this repository',
-    });
-    expect(annotation).toMatchObject({
-      disposition: 'human',
-      waitReason: 'GitHub Actions is disabled',
-      providerEvidence: expect.stringContaining('Actions is disabled'),
-    });
-    expect(renderGithubActionsFailure(annotation)).toContain('Provider evidence:');
-
-    expect(classifyGithubActionsFailure(inspection('', {
-      conclusion: 'action_required',
-    }))).toMatchObject({
-      disposition: 'human',
-      waitReason: 'GitHub Actions approval required',
-    });
   });
 
   it('classifies GitHub concurrency preemption as superseded in inspected and fallback diagnostics', () => {
@@ -123,7 +81,7 @@ describe('GitHub Actions API', () => {
     // block accurately even when the execution itself was cancelled.
     expect(classifyGithubActionsFailure(inspection('The operation was canceled.', {
       conclusion: 'cancelled', status: 'completed',
-    }), { providerContext: 'GitHub annotation: Actions is disabled for this repository' }).disposition).toBe('human');
+    }), { additionalContext: 'GitHub annotation: Actions is disabled for this repository' }).disposition).toBe('human');
   });
 
   it('reconciles duplicate run observations by canonical exact-head validation identity', () => {

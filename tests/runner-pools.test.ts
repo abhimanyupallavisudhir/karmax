@@ -45,9 +45,11 @@ describe('runner capacity and world lifecycle', () => {
     const project = store.createProject('Cloud', { worldProvider: 'daytona', runnerPoolId: 'tiny', resources: { cpu: 2, memoryMb: 2048 } }, organization.id);
     store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'daytona', mode: 'managed',
       capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const one = createTask(store, project.id, 'One');
+    const two = createTask(store, project.id, 'Two');
     const runners = new RunnerPoolService(store);
-    const first = await runners.acquire({ project, taskId: 'one', worldId: 'one', provider: 'daytona', pollMs: 5 });
-    const secondPromise = runners.acquire({ project, taskId: 'two', worldId: 'two', provider: 'daytona', priority: 10, pollMs: 5 });
+    const first = await runners.acquire({ project, taskId: one.id, worldId: one.id, provider: 'daytona', pollMs: 5 });
+    const secondPromise = runners.acquire({ project, taskId: two.id, worldId: two.id, provider: 'daytona', priority: 10, pollMs: 5 });
     await new Promise((resolve) => setTimeout(resolve, 15));
     expect(store.listWorldLeases('tiny').map((lease) => lease.state)).toEqual(['active', 'queued']);
     runners.release(first.leaseId, 'daytona');
@@ -61,8 +63,9 @@ describe('runner capacity and world lifecycle', () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Metering', ownerUserId: 'owner' });
     const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const task = createTask(store, project.id, 'Stale');
     const runners = new RunnerPoolService(store);
-    const lease = await runners.acquire({ project, taskId: 'stale', worldId: 'stale', provider: 'e2b' });
+    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
 
     // A real E2B sandbox auto-pauses while a stale karmax lease can remain active
     // for days. Releasing capacity must not turn that wall-clock interval into a
@@ -72,120 +75,6 @@ describe('runner capacity and world lifecycle', () => {
     runners.release(lease.leaseId, 'e2b');
 
     expect(store.usageSummary(organization.id)).toMatchObject({ costMicros: 0, events: 0 });
-  });
-
-  it('reclaims setup capacity from terminal tasks and admits the next waiter', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
-    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
-      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
-    const cancelled = store.createTask({ projectId: project.id, title: 'Cancelled setup', workflow: 'software-dev',
-      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
-    const next = store.createTask({ projectId: project.id, title: 'Next setup', workflow: 'software-dev',
-      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
-    const first = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
-      projectId: project.id, taskId: cancelled.id, worldId: cancelled.id });
-    const second = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
-      projectId: project.id, taskId: next.id, worldId: next.id });
-    store.saveView(cancelled.id, {
-      taskId: cancelled.id, title: cancelled.title, workflow: cancelled.workflow, stage: 'cancelled',
-      status: 'cancelled', messages: [], actions: [], state: { cancelled: true }, updatedAt: Date.now(),
-    });
-    const runners = new RunnerPoolService(store);
-
-    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(Date.now());
-
-    expect(store.worldLease(first.id)?.state).toBe('released');
-    expect(store.worldLease(second.id)?.state).toBe('active');
-  });
-
-  it('releases a failed admission reservation when its Temporal heartbeat disappears', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Timed out admission', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
-    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
-      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
-    const runners = new RunnerPoolService(store);
-    const held = await runners.acquire({ project, taskId: 'held', worldId: 'held', provider: 'e2b' });
-
-    await expect(runners.acquire({ project, taskId: 'timed-out', worldId: 'timed-out', provider: 'e2b', pollMs: 5,
-      heartbeat: () => { throw new Error('NOT_FOUND'); } })).rejects.toThrow('NOT_FOUND');
-
-    expect(store.worldLeasesForTask('timed-out')).toEqual([]);
-    runners.release(held.leaseId, 'e2b');
-  });
-
-  it('reclaims old active capacity from a parked nonterminal world', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Parked recovery', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { worldProvider: 'e2b', runnerPoolId: 'tiny' }, organization.id);
-    store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
-      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
-    const task = store.createTask({ projectId: project.id, title: 'Still working', workflow: 'software-dev',
-      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
-    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
-      meta: { projectId: project.id } }, project.id);
-    store.setWorldState(handle, 'parked');
-    const stale = store.requestWorldLease({ runnerPoolId: 'tiny', organizationId: organization.id,
-      projectId: project.id, taskId: task.id, worldId: task.id });
-    const now = Date.now();
-    store.db.prepare('UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id=?')
-      .run(now - 3 * 60_000, now - 3 * 60_000, stale.id);
-
-    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined,
-      new RunnerPoolService(store)).sweep(now);
-
-    expect(store.worldLease(stale.id)?.state).toBe('released');
-  });
-
-  it('keeps a newly admitted wake-up while it marks its parked world ready', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Wake-up grace', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Waking', workflow: 'software-dev',
-      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
-    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
-      meta: { projectId: project.id } }, project.id);
-    store.setWorldState(handle, 'parked');
-    const runners = new RunnerPoolService(store);
-    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
-
-    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(Date.now());
-
-    expect(store.worldLease(lease.leaseId)?.state).toBe('active');
-    runners.release(lease.leaseId, 'e2b');
-  });
-
-  it('preserves old capacity explicitly borrowed by a live preview', async () => {
-    const store = new Store(':memory:');
-    const organization = store.createOrganization({ name: 'Preview capacity', ownerUserId: 'owner' });
-    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
-    const task = store.createTask({ projectId: project.id, title: 'Finished with preview', workflow: 'software-dev',
-      workflowVersion: '1.25.0', params: { prompt: 'x' } as any });
-    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'done',
-      status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() });
-    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
-      meta: { projectId: project.id } }, project.id);
-    const runners = new RunnerPoolService(store);
-    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
-    const orphan = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
-    const now = Date.now();
-    store.db.prepare('UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id IN (?,?)')
-      .run(now - 3 * 60_000, now - 3 * 60_000, lease.leaseId, orphan.leaseId);
-    store.createPreviewLease({ id: 'preview-live', organizationId: organization.id, projectId: project.id,
-      taskId: task.id, worldId: task.id, generation: 1, port: 3000, public: false, provider: 'e2b',
-      runnerLeaseId: lease.leaseId, createdBy: 'owner', createdAt: now - 3 * 60_000, expiresAt: now + 60_000 });
-
-    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(now);
-
-    expect(store.worldLease(lease.leaseId)?.state).toBe('active');
-    expect(store.worldLease(orphan.leaseId)?.state).toBe('released');
-    runners.release(lease.leaseId, 'e2b');
-    store.setWorldState(handle, 'released');
   });
 
   it('reconciles provider executions idempotently with actual E2B resources and runtime', async () => {
@@ -211,6 +100,11 @@ describe('runner capacity and world lifecycle', () => {
     // 5 minutes × (2 × $0.000014/vCPU/s + 0.5 × $0.0000045/GiB/s)
     expect(store.usageSummary(organization.id)).toEqual({
       costMicros: 9_075, events: 1, byKind: { 'world.active': 9_075 },
+      incurredCostMicros: 9_075, estimatedCostMicros: 0, activeReservationsMicros: 0,
+      byCostClassification: { incurred: 9_075 },
+      byFundingSource: { byok: 9_075 }, byProvider: { e2b: 9_075 }, quantities: { second: 300 },
+      requests: { total: 0, managed: 0, byok: 0, customer: 0 },
+      active: { agentTurns: 0, worlds: 0, executions: 0 },
     });
     expect(JSON.parse(store.kvGet(`usage-sync:${organization.id}:e2b`)!)).toMatchObject({
       status: 'ready', coverageFrom: Date.UTC(2026, 6, 24, 10, 6), retentionDays: 7,
@@ -227,7 +121,137 @@ describe('runner capacity and world lifecycle', () => {
     await expect(runners.acquire({ project: wrong, taskId: 'one', worldId: 'one', provider: 'e2b' })).rejects.toThrow(/not e2b/);
     const oversized = store.createProject('Large', { worldProvider: 'daytona', runnerPoolId: 'daytona-only',
       resources: { cpu: 4, memoryMb: 2048 } }, organization.id);
-    await expect(runners.acquire({ project: oversized, taskId: 'two', worldId: 'two', provider: 'daytona' })).rejects.toThrow(/exceeds/);
+    const oversizedTask = createTask(store, oversized.id, 'Large');
+    await expect(runners.acquire({ project: oversized, taskId: oversizedTask.id, worldId: oversizedTask.id, provider: 'daytona' })).rejects.toThrow(/exceeds/);
+  });
+
+  it('admits model usage idempotently with managed opt-in, allowlists, rate limits, and tenant attribution', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Guarded', ownerUserId: 'owner' });
+    const project = store.createProject('Product', {}, organization.id);
+    const first = createTask(store, project.id, 'First');
+    const second = createTask(store, project.id, 'Second');
+
+    expect(() => store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_000 }))
+      .toThrow(/disabled until an organization owner sets a spend cap/);
+    store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 1_000_000,
+      managedModelProviders: ['openai'], allowedModelProviders: ['openai'], allowedModels: ['gpt-approved'],
+      maxAgentStartsPerMinute: 2, maxActiveAgentTurns: 1 });
+    expect(() => store.admitAgentUsage({ id: 'wrong-model', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-other', fundingSource: 'byok', now: 1_000_000 }))
+      .toThrow(/not allowed/);
+    expect(() => store.admitAgentUsage({ id: 'unbounded-managed', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed', now: 1_000_000 }))
+      .toThrow(/no installation-configured per-request cost ceiling/);
+    expect(store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed',
+      reservedCostMicros: 250_000, now: 1_000_000 }))
+      .toEqual({ reused: false });
+    expect(store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed',
+      reservedCostMicros: 250_000, now: 1_000_001 }))
+      .toEqual({ reused: true });
+    expect(() => store.admitAgentUsage({ id: 'turn-2', organizationId: organization.id, projectId: project.id,
+      taskId: second.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'byok', now: 1_000_002 }))
+      .toThrow(/active model turn limit/);
+
+    store.recordUsage({ id: 'usage:turn-1', organizationId: organization.id, projectId: project.id, taskId: first.id,
+      provider: 'openai', kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: 1_000_000,
+      fundingSource: 'managed', costClassification: 'incurred', startedAt: 1_000_000, endedAt: 1_000_000 });
+    store.finishUsageAdmission('turn-1', true, 1_000_010);
+    expect(() => store.admitAgentUsage({ id: 'turn-1', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'managed',
+      reservedCostMicros: 250_000, now: 1_000_011 }))
+      .toThrow(/spend cap is exhausted|already completed/);
+    expect(store.admitAgentUsage({ id: 'turn-2', organizationId: organization.id, projectId: project.id,
+      taskId: second.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'byok', now: 1_000_012 }))
+      .toEqual({ reused: false });
+    expect(() => store.admitAgentUsage({ id: 'turn-3', organizationId: organization.id, projectId: project.id,
+      taskId: first.id, provider: 'openai', model: 'gpt-approved', fundingSource: 'byok', now: 1_000_013 }))
+      .toThrow(/rate limit/);
+
+    expect(store.usageSummary(organization.id, 0, 2_000_000)).toMatchObject({
+      costMicros: 1_000_000, byFundingSource: { managed: 1_000_000 },
+      incurredCostMicros: 1_000_000, estimatedCostMicros: 0,
+      byProvider: { openai: 1_000_000 }, active: { agentTurns: 1 },
+    });
+  });
+
+  it('keeps reservations separate, releases failures, and makes retries and completion idempotent', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Retry safe', ownerUserId: 'owner' });
+    const project = store.createProject('Product', {}, organization.id);
+    const task = createTask(store, project.id, 'Retry');
+    store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 250_000,
+      managedModelProviders: ['openai'] });
+    const admission = { id: 'stable-turn', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, provider: 'openai', model: 'gpt-test', fundingSource: 'managed' as const,
+      reservedCostMicros: 250_000, now: 1_000_000 };
+    expect(store.admitAgentUsage(admission)).toEqual({ reused: false });
+    store.recordUsage({ id: 'usage:request:stable-turn', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, provider: 'openai', kind: 'agent.request', quantity: 1, unit: 'request',
+      costMicros: 0, fundingSource: 'managed', costClassification: 'none', startedAt: 1_000_000, endedAt: 1_000_000 });
+    expect(store.usageSummary(organization.id, 0, 2_000_000)).toMatchObject({
+      costMicros: 0, activeReservationsMicros: 250_000, events: 1,
+    });
+    const concurrent = createTask(store, project.id, 'Concurrent reservation');
+    expect(() => store.admitAgentUsage({ ...admission, id: 'concurrent-turn', taskId: concurrent.id,
+      now: 1_000_001 })).toThrow(/managed spend cap is exhausted/);
+    store.finishUsageAdmission(admission.id, false, 1_000_001);
+    expect(store.usageSummary(organization.id, 0, 2_000_000)).toMatchObject({
+      costMicros: 0, activeReservationsMicros: 0, events: 1,
+    });
+    expect(store.admitAgentUsage({ ...admission, now: 1_000_002 })).toEqual({ reused: true });
+    expect(store.admitAgentUsage({ ...admission, now: 1_000_003 })).toEqual({ reused: true });
+    store.finishUsageAdmission(admission.id, true, 1_000_004, [{ id: 'usage:cost:stable-turn',
+      organizationId: organization.id, projectId: project.id, taskId: task.id, provider: 'openai',
+      kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: 250_000,
+      fundingSource: 'managed', costClassification: 'estimated', startedAt: 1_000_004, endedAt: 1_000_004,
+      metadata: { costBasis: 'admission-ceiling-estimate' } }]);
+    expect(() => store.admitAgentUsage({ ...admission, now: 1_000_005 })).toThrow(/already completed/);
+    const next = createTask(store, project.id, 'After estimate');
+    expect(() => store.admitAgentUsage({ ...admission, id: 'next-turn', taskId: next.id, now: 1_000_006 }))
+      .toThrow(/managed spend cap is exhausted/);
+    expect(store.usageSummary(organization.id, 0, 2_000_000)).toMatchObject({
+      costMicros: 250_000, incurredCostMicros: 0, estimatedCostMicros: 250_000,
+      activeReservationsMicros: 0, events: 2, requests: { total: 1, managed: 1 }, active: { agentTurns: 0 },
+    });
+  });
+
+  it('keeps hosted remote execution BYOK by default and refuses centrally funded pools', async () => {
+    const previous = process.env.KARMAX_DEPLOYMENT;
+    delete process.env.KARMAX_DEPLOYMENT;
+    try {
+      const store = new Store(':memory:', { hosted: true });
+      const organization = store.createOrganization({ name: 'BYOK', ownerUserId: 'owner' });
+      const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+      const task = createTask(store, project.id, 'Run');
+      const runners = new RunnerPoolService(store);
+      store.createRunnerPool({ id: `${organization.id}:managed-e2b`, organizationId: organization.id,
+        name: 'Legacy managed E2B', provider: 'e2b', mode: 'managed',
+        capacity: { activeWorlds: 1, cpu: 40, memoryMb: 81920, gpu: 0 }, enabled: true });
+      const pool = runners.ensureDefaultPool(project, 'e2b');
+      expect(pool).toMatchObject({ mode: 'customer', provider: 'e2b', name: 'E2B · organization BYOK' });
+      store.setOrganizationUsagePolicy(organization.id, { maxRemoteStartsPerMinute: 1 });
+      const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+      const queuedTask = createTask(store, project.id, 'Queued');
+      const queued = store.requestWorldLease({ runnerPoolId: pool.id, organizationId: organization.id,
+        projectId: project.id, taskId: queuedTask.id, worldId: queuedTask.id });
+      expect(queued.acquired).toBe(false);
+      runners.release(lease.leaseId, 'e2b');
+      expect(store.worldLease(queued.id).state).toBe('queued');
+
+      store.createRunnerPool({ id: 'resold-e2b', organizationId: organization.id, name: 'Resold', provider: 'e2b',
+        mode: 'managed', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+      const blocked = store.createProject('Blocked', { worldProvider: 'e2b', runnerPoolId: 'resold-e2b' }, organization.id);
+      const blockedTask = createTask(store, blocked.id, 'Blocked');
+      await expect(runners.acquire({ project: blocked, taskId: blockedTask.id, worldId: blockedTask.id, provider: 'e2b' }))
+        .rejects.toThrow(/centrally funded remote sandbox pools are not enabled/);
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_DEPLOYMENT;
+      else process.env.KARMAX_DEPLOYMENT = previous;
+    }
   });
 
   it('accounts non-workflow access and reparks a remote world when the last accessor leaves', async () => {
@@ -408,12 +432,13 @@ describe('runner capacity and world lifecycle', () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });
     const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const task = createTask(store, project.id, 'Recover');
     const runners = new RunnerPoolService(store);
-    const lease = await runners.acquire({ project, taskId: 'task-1', worldId: 'task-1', provider: 'e2b' });
-    store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: 'task-1', generation: 1,
-      root: '/workspace', workspaceRoot: '/workspace', branch: 'karmax/task-1', base: 'main', meta: {} }, project.id);
+    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+    store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main', meta: {} }, project.id);
     store.createExecution({ id: 'execution-1', organizationId: organization.id, projectId: project.id,
-      taskId: 'task-1', worldId: 'task-1', generation: 1, kind: 'terminal', label: 'Terminal',
+      taskId: task.id, worldId: task.id, generation: 1, kind: 'terminal', label: 'Terminal',
       server: false, openUrls: [], runnerLeaseId: lease.leaseId, state: 'running', heartbeatAt: 1, startedAt: 1 });
     const lifecycle = new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners);
     await lifecycle.sweep(3 * 60_000);
@@ -421,3 +446,7 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.worldLease(lease.leaseId)?.state).toBe('released');
   });
 });
+
+function createTask(store: Store, projectId: string, title: string) {
+  return store.createTask({ projectId, title, workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: title } as any });
+}

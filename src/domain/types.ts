@@ -6,6 +6,7 @@
 // ─── Identity ────────────────────────────────────────────────────────────────
 
 import type { TaskTrigger, TriggerState } from './triggers.js';
+import type { HostedPlanId } from './entitlements.js';
 export type { TaskTrigger, TriggerState } from './triggers.js';
 
 /**
@@ -24,7 +25,6 @@ export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | 'responder' | (
 export type PrincipalRef =
   | { kind: 'user'; userId: string }
   | { kind: 'team'; teamId: string }
-  | { kind: 'avatar'; avatarId: string }
   | { kind: 'task-agent'; taskId: string; role: string };
 
 /** Project access may also target the entire containing organization. This is
@@ -43,6 +43,8 @@ export interface Organization {
   name: string;
   slug: string;
   kind: 'personal' | 'team';
+  /** Hosted billing selection. Private installations ignore monetization plans. */
+  plan: HostedPlanId;
   createdAt: number;
 }
 
@@ -57,46 +59,6 @@ export interface AuthorizationSelection {
   level: string;
   scope: 'projects' | 'organization' | 'global';
   projectIds?: string[];
-}
-
-/** A durable, user-authored autonomous principal. Avatars are project-owned for
- * discovery/routing, while their authority is an explicit delegation captured
- * at creation or edit time. `roles=[]` means every workflow role; callableBy
- * uses the same stable user/team selectors as task routing plus `@project`. */
-export interface Avatar {
-  id: string;
-  organizationId: string;
-  projectId: string;
-  ownerUserId: string;
-  name: string;
-  purpose?: string;
-  prompt: string;
-  promptVersion: number;
-  enabled: boolean;
-  authorityMode: 'full' | 'restricted';
-  authorization: AuthorizationSelection & {
-    profileId: string;
-    capabilities: string[];
-    organizationId?: string;
-  };
-  credentialPolicies?: Record<string, { use?: 'auto' | 'ask' | 'never'; reveal?: 'auto' | 'ask' | 'never' }>;
-  githubAccountId?: string;
-  callableBy: string[];
-  roles: string[];
-  runtime: {
-    provider: Provider;
-    model?: string;
-    effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  };
-  createdAt: number;
-  updatedAt: number;
-  deletedAt?: number;
-}
-
-export interface AvatarAvailability {
-  organization: boolean;
-  project: 'inherit' | 'enabled' | 'disabled';
-  effective: boolean;
 }
 
 export interface OrganizationInvitation {
@@ -317,9 +279,15 @@ export interface UsageEvent {
   taskId?: string;
   worldId?: string;
   provider: string;
-  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.tokens';
+  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
+  /** Who pays the upstream bill. `managed` is installation-funded and is
+   * disabled in hosted mode until an owner sets an explicit spend cap. */
+  fundingSource?: 'managed' | 'byok' | 'customer';
+  /** Whether costMicros is an upstream-incurred amount or a conservative
+   * estimate used when the provider did not expose priceable usage. */
+  costClassification?: 'incurred' | 'estimated' | 'none';
   quantity: number;
-  unit: 'second' | 'byte' | 'byte-second' | 'token';
+  unit: 'second' | 'byte' | 'byte-second' | 'request' | 'token';
   costMicros: number;
   startedAt: number;
   endedAt: number;
@@ -721,6 +689,25 @@ export interface OrganizationExecutionPolicy {
   hibernateAfterMs?: number;
 }
 
+/** Trusted admission policy for hosted, organization-attributed work. Empty
+ * allowlists mean "all connected BYOK providers/models"; they never authorize
+ * an installation credential. Managed model rails require both an explicit
+ * provider boundary and an owner-set spend cap. */
+export interface OrganizationUsagePolicy {
+  managedSpendCapMicros?: number;
+  managedModelProviders: string[];
+  allowedModelProviders: string[];
+  allowedModels: string[];
+  maxAgentStartsPerMinute: number;
+  maxRemoteStartsPerMinute: number;
+  /** Optional owner-selected cap. Hosted admission clamps it to the central
+   * plan entitlement; omission means the marketed plan limit exactly. */
+  maxActiveAgentTurns?: number;
+  /** Computed, never persisted: min(owner cap, plan entitlement). */
+  effectiveMaxActiveAgentTurns: number;
+  maxActiveWorlds: number;
+}
+
 // ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
 
 export type RemotePolicy = 'none' | 'push' | 'pr';
@@ -799,9 +786,6 @@ export interface GitHubMergeAuthorization {
   actorUserId?: string;
   sha?: string;
   detail?: string;
-  /** Concise provider-owned wait reason for task summaries. Detailed evidence
-   * remains in `detail`. */
-  waitReason?: string;
   /** Project members whose live GitHub role currently permits a merge request. */
   eligibleUserIds?: string[];
   /** Why landing returned to Do, and whether the already-recorded intent
@@ -1295,13 +1279,6 @@ export interface FieldSpec {
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
   provider: Provider;
-  /** Select a durable Avatar. Provider/model remain snapshotted for replay and
-   * display, but current turns resolve the owner-controlled prompt + authority
-   * from this id and refuse execution when it has been disabled. */
-  avatarId?: string;
-  /** Internal invocation purpose when an Avatar is answering an authorization
-   * or response request rather than filling the workflow role itself. */
-  avatarPurpose?: 'authorize' | 'respond';
   /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
   modelProvider?: string;
   model?: string;
@@ -1467,7 +1444,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;

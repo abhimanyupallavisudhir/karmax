@@ -241,6 +241,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     completed,
     ...(openPrRequested ? { openPrRequested: true } : {}),
     output: turn.output,
+    usage: turn.usage,
     delivered: turn.delivered,
     reviewInfo,
     resolution,

@@ -7,6 +7,8 @@ import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 import { accountCoordinatorId, mergeQueueId } from '../src/coordinators/names.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
+import { Store } from '../src/store/db.js';
+import { EntitlementQueueReconciler } from '../src/platform/entitlement-queue-reconciler.js';
 
 const view = (h: any) => h.query('view') as Promise<any>;
 const baseInput = (taskId: string, repo: string, over: any = {}) => ({
@@ -28,52 +30,6 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
   afterAll(async () => {
     await h?.stop();
   });
-
-  it('software-dev: cancelling Setup aborts provider provisioning and settles promptly', async () => {
-    const project = h.store.createProject('Blocked setup', { worldProvider: 'blocked-setup' as any });
-    const task = h.store.createTask({ projectId: project.id, title: 'Cancel setup', workflow: 'software-dev',
-      workflowVersion: '1.26.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'a' } });
-    let started = false;
-    let aborted = false;
-    let release!: (error: Error) => void;
-    h.worlds.register({
-      kind: 'blocked-setup',
-      capabilities: { remote: true },
-      async create(spec: any) {
-        started = true;
-        return await new Promise((_resolve, reject) => {
-          release = reject;
-          spec.signal?.addEventListener('abort', () => {
-            aborted = true;
-            reject(spec.signal.reason ?? new Error('provisioning cancelled'));
-          }, { once: true });
-        });
-      },
-    } as any);
-    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
-      taskQueue: TASK_QUEUE,
-      workflowId: task.id,
-      args: [{
-        taskId: task.id,
-        projectId: project.id,
-        title: task.title,
-        prompt: 'x',
-        base: 'main',
-        target: 'main',
-        project: { repos: [], worldProvider: 'blocked-setup', defaultBase: 'main', defaultTarget: 'main' },
-      }],
-    });
-    await expect.poll(() => started, { timeout: 10_000 }).toBe(true);
-    await handle.signal('cancel');
-    const settled = await Promise.race([
-      handle.result().then((result) => result.stage === 'cancelled', () => false),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
-    ]);
-    if (!settled) release?.(new Error('test cleanup'));
-
-    expect(settled).toBe(true);
-    expect(aborted).toBe(true);
-  }, 30_000);
 
   it('just-do: a single agent call, work committed to the branch (no merge)', async () => {
     const repo = await h.makeRepo('jd');
@@ -654,7 +610,84 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.signal('setAgentCapacity', { capacity: 1 });
     await expect.poll(async () => (await q()).capacity, { timeout: 10_000 }).toBe(1);
     expect((await q()).current).toHaveLength(2); // shrinking never kills running turns
+
+    await wf.signal('setAgentCapacity', { capacity: 0 });
+    await wf.signal('releaseAgentSlot', { taskId: held[0]!.taskId, turnId: held[0]!.turnId });
+    await expect.poll(async () => {
+      const view = await q();
+      return [view.capacity, view.current.map((x: any) => x.turnId), view.queue.map((x: any) => x.turnId)];
+    }, { timeout: 10_000 }).toEqual([
+      0,
+      [held[1]!.turnId],
+      [waiting[2]!.turnId, waiting[0]!.turnId, waiting[1]!.turnId],
+    ]);
+    await wf.signal('releaseAgentSlot', { taskId: held[1]!.taskId, turnId: held[1]!.turnId });
+    await expect.poll(async () => (await q()).current).toHaveLength(0);
+    expect((await q()).queue).toHaveLength(3); // blocked admission never promotes queued work
+
+    await wf.signal('setAgentCapacity', { capacity: 1 });
+    await expect.poll(async () => (await q()).current.map((x: any) => x.turnId)).toEqual([waiting[2]!.turnId]);
     await wf.terminate('test done');
+  });
+
+  it('promotes an existing hosted queue when member or plan recovery restores capacity', async () => {
+    const { agentQueueId } = await import('../src/coordinators/names.js');
+    const scenarios = [
+      { name: 'free member removal', plan: 'free' as const, expectedCapacity: 1,
+        recover: (store: Store, organizationId: string) => {
+          store.removeOrganizationMembership(organizationId, 'second');
+          store.removeOrganizationMembership(organizationId, 'third');
+        } },
+      { name: 'individual member removal', plan: 'individual' as const, expectedCapacity: 5,
+        recover: (store: Store, organizationId: string) => {
+          store.removeOrganizationMembership(organizationId, 'second');
+          store.removeOrganizationMembership(organizationId, 'third');
+        } },
+      { name: 'Team plan restoration', plan: 'free' as const, expectedCapacity: 10,
+        recover: (store: Store, organizationId: string) => {
+          store.setOrganizationPlan(organizationId, 'team');
+        } },
+    ];
+
+    for (const scenario of scenarios) {
+      const store = new Store(':memory:', { hosted: true });
+      const organization = store.createOrganization({ name: scenario.name, ownerUserId: 'owner' });
+      store.setOrganizationPlan(organization.id, 'team');
+      store.setOrganizationMembership(organization.id, 'second', 'member');
+      store.setOrganizationMembership(organization.id, 'third', 'member');
+      store.setOrganizationPlan(organization.id, scenario.plan);
+      const waiting = Array.from({ length: 10 }, (_, index) => ({
+        taskId: `${scenario.name}-${index}`,
+        turnId: `${scenario.name}-${index}#0`,
+        role: 'do',
+      }));
+      const wf = await h.client.workflow.start('agentQueue', {
+        taskQueue: TASK_QUEUE,
+        workflowId: agentQueueId(organization.id),
+        args: [{ capacity: 0, state: { capacity: 0, current: [], queue: waiting, processed: 0 } }],
+      });
+      const reconciler = new EntitlementQueueReconciler({ store, client: h.client, intervalMs: 0 });
+      try {
+        reconciler.start();
+        await expect.poll(async () => (await wf.query('agentQueue') as any).capacity, { timeout: 10_000 }).toBe(0);
+
+        // No admission, release, cancel, or other queue mutation follows this
+        // entitlement recovery. The store notification must refresh the queue.
+        scenario.recover(store, organization.id);
+        await expect.poll(async () => {
+          const view = await wf.query('agentQueue') as any;
+          return [view.capacity, view.current.length, view.queue.length];
+        }, { timeout: 10_000 }).toEqual([
+          scenario.expectedCapacity,
+          scenario.expectedCapacity,
+          waiting.length - scenario.expectedCapacity,
+        ]);
+      } finally {
+        reconciler.stop();
+        await wf.terminate('test done');
+        store.close();
+      }
+    }
   });
 
   it('acknowledges queued turns without a blocking Update and rotates with an active lease', async () => {

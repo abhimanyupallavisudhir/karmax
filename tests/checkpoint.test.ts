@@ -257,8 +257,10 @@ describe('portable world checkpoints', () => {
     await world.destroy();
 
     // Saturate the pool: the restore below cannot be granted until this is released.
-    const occupant = await runners.acquire({ project: store.getProject(project.id)!, taskId: 'other',
-      worldId: 'other', provider: 'sandbox-test' });
+    const other = store.createTask({ projectId: project.id, title: 'Other', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'other' } as any });
+    const occupant = await runners.acquire({ project: store.getProject(project.id)!, taskId: other.id,
+      worldId: other.id, provider: 'sandbox-test' });
     expect(store.worldLease(occupant.leaseId)?.state).toBe('active');
 
     // `restore` is reached from an activity, and `RunnerPoolService.acquire` polls

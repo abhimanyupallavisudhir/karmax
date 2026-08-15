@@ -66,16 +66,6 @@ describe('waiting labels in task summaries', () => {
       waitingFor: { kind: 'human', detail: 'Review this proposal.' },
     })).toBe('Waiting for input');
     expect(stageLabel({
-      stage: 'merge',
-      status: 'waiting',
-      state: {},
-      waitingFor: {
-        kind: 'human',
-        summary: 'GitHub Actions approval required',
-        detail: 'GitHub returned action_required for CI run 410.',
-      },
-    })).toBe('GitHub Actions approval required');
-    expect(stageLabel({
       stage: 'do',
       status: 'waiting',
       state: {},
@@ -117,11 +107,6 @@ describe('waiting labels in task summaries', () => {
       kind: 'human',
       detail: 'A long internal explanation of the decision needed',
     })).toBe('Waiting for input');
-    expect(waitingText({
-      kind: 'human',
-      summary: '  GitHub Actions billing\n action required  ',
-      detail: 'A long provider annotation and full failed-job inspection',
-    })).toBe('GitHub Actions billing action required');
     expect(waitingText({
       kind: 'responder',
       detail: 'The response agent is answering the working agent',
@@ -206,26 +191,5 @@ describe('waiting labels in task summaries', () => {
       provider: 'codex',
     });
     expect(stageLabel(view)).toBe('do');
-
-    expect(patchTaskListFromEvent({
-      taskId: 'task-1',
-      type: 'view.updated',
-      payload: {
-        stage: 'merge',
-        status: 'waiting',
-        waitingFor: 'human',
-        waitingDetail: 'GitHub annotation: Actions is disabled for this repository. Full evidence follows.',
-        waitingSummary: 'GitHub Actions is disabled',
-        waitingProvider: null,
-        waitingResetAt: null,
-        agentTurn: null,
-      },
-    })).toBe(true);
-    expect(context.S.tasks[0].lastView.waitingFor).toEqual({
-      kind: 'human',
-      detail: 'GitHub annotation: Actions is disabled for this repository. Full evidence follows.',
-      summary: 'GitHub Actions is disabled',
-    });
-    expect(stageLabel(context.S.tasks[0].lastView)).toBe('GitHub Actions is disabled');
   });
 });

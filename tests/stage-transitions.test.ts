@@ -11,7 +11,6 @@ import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/na
 import { PermissionRequests } from '../src/platform/permission-requests.js';
 import { sameProposalIdentity } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
-import { RunnerPoolService } from '../src/world/runners.js';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -58,8 +57,7 @@ function fixture() {
       },
     },
   } as any;
-  const runners = new RunnerPoolService(store);
-  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, runners });
+  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
   const task = store.createTask({
     projectId: project.id,
     title: 'Move me',
@@ -82,50 +80,13 @@ function fixture() {
   };
   store.saveView(task.id, view);
   return {
-    store, project, tokens, token, api, task, view, starts, terminated, signalled, runners,
+    store, project, tokens, token, api, task, view, starts, terminated, signalled,
     setLiveView(view?: TaskView) { liveViewOverride = view; },
     setGracefulResult(result?: () => Promise<unknown>) { gracefulResult = result; },
   };
 }
 
 describe('task stage transitions', () => {
-  it('force-stops a wedged Setup cancellation and releases its runner capacity', async () => {
-    const f = fixture();
-    f.store.setTaskWorkflowVersion(f.task.id, '1.25.0');
-    f.store.saveView(f.task.id, {
-      ...f.view,
-      stage: 'setup',
-      status: 'active',
-      state: {},
-      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
-    });
-    f.store.createRunnerPool({
-      id: 'setup-capacity',
-      organizationId: f.project.organizationId!,
-      name: 'Setup capacity',
-      provider: 'e2b',
-      mode: 'managed',
-      capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 },
-      enabled: true,
-    });
-    const lease = f.store.requestWorldLease({
-      runnerPoolId: 'setup-capacity',
-      organizationId: f.project.organizationId!,
-      projectId: f.project.id,
-      taskId: f.task.id,
-      worldId: f.task.id,
-    });
-    f.setGracefulResult(async () => { throw new Error('setup did not acknowledge cancellation'); });
-
-    await f.api.signalTask(f.token, f.task.id, 'cancel');
-
-    expect(f.terminated).toEqual([expect.stringContaining('Setup cancellation did not stop')]);
-    expect(f.store.getTask(f.task.id)?.lastView).toMatchObject({
-      stage: 'cancelled', status: 'cancelled', state: { cancelled: true },
-    });
-    expect(f.store.worldLease(lease.id)?.state).toBe('released');
-  });
-
   it('binds restored approval to every multi-repository PR identity and head', () => {
     const reviewed = [
       { slug: 'Acme/App', number: 7, headSha: 'aaa' },

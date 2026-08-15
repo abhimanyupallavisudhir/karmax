@@ -403,7 +403,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.26.0',
+    version: '1.25.0',
     description: 'World → do/wait → review → optional per-PR provider/external landing or canonical Karmax fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -510,7 +510,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.26.0',
+    version: '1.25.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -634,7 +634,7 @@ const GITHUB_PR_ACTION_FIELDS = {
  * picker offers meaningful choices rather than raw noise.
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
-  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', waitingDetail: 'string | null', waitingSummary: 'string | null', waitingProvider: 'string | null', waitingResetAt: 'number | null', agentTurn: 'waiting-slot | running | null' } },
+  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', waitingDetail: 'string | null', waitingProvider: 'string | null', waitingResetAt: 'number | null', agentTurn: 'waiting-slot | running | null' } },
   { type: 'pr.opened', description: 'karmax opened a pull request for a task (remote policy "pr").', fields: { repo: 'world repo name', slug: 'owner/name on GitHub', number: 'number', url: 'string', base: 'the branch the PR merges into', state: 'open | closed' } },
   // The GitHub side of the same pull request, fed back by the App's webhook —
   // what happened *on GitHub*, as opposed to what karmax did (SPEC §5.4).

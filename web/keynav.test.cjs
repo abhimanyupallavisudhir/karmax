@@ -58,7 +58,7 @@ ok(
 // usable, but users must not discover it through the tab bar, command palette,
 // keyboard help, or a g+a shortcut.
 ok(
-  src.includes("const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];"),
+  src.includes("const tabs = ['tasks', 'queue', 'wiki', 'settings'];"),
   'project navigation omits the debugging-only Activity tab',
 );
 ok(!src.includes("id: 'nav.activity'"), 'Activity has no user-facing navigation command');
