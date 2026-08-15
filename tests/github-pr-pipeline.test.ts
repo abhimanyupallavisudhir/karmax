@@ -88,12 +88,17 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
   });
   if (u.pathname === `/repos/${SLUG}/actions/workflows/7/runs` && method === 'GET') return json(200, {
-    total_count: 1, workflow_runs: [{
+    total_count: actionsReplacementSuccess ? 2 : 1, workflow_runs: [{
       id: 42, name: 'CI', workflow_id: 7, run_number: 1, run_attempt: actionsRunAttempt,
-      event: 'pull_request', status: 'completed', conclusion: 'failure', head_branch: prs[0]?.head?.ref,
+      event: 'pull_request', status: 'completed', conclusion: actionsRunConclusion, head_branch: prs[0]?.head?.ref,
       head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/42`,
       created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
-    }],
+    }, ...(actionsReplacementSuccess ? [{
+      id: 43, name: 'CI', workflow_id: 7, run_number: 2, run_attempt: 1,
+      event: 'pull_request', status: 'completed', conclusion: 'success', head_branch: prs[0]?.head?.ref,
+      head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/43`,
+      created_at: '2026-08-10T00:02:00Z', updated_at: '2026-08-10T00:03:00Z',
+    }] : [])],
   });
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/jobs` && method === 'GET') return json(200, { jobs: [{
     id: 99, name: 'unit tests', status: 'completed', conclusion: actionsJobConclusion,
@@ -103,15 +108,6 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/artifacts` && method === 'GET') return json(200, { artifacts: [] });
   if (u.pathname === `/repos/${SLUG}/actions/jobs/99/logs` && method === 'GET')
     return new Response(actionsJobLog);
-  if (u.pathname === `/repos/${SLUG}/actions/workflows/7/runs` && method === 'GET') return json(200, {
-    total_count: actionsReplacementSuccess ? 1 : 0,
-    workflow_runs: actionsReplacementSuccess ? [{
-      id: 43, name: 'CI', workflow_id: 7, run_number: 2, run_attempt: 1,
-      event: 'pull_request', status: 'completed', conclusion: 'success', head_branch: prs[0]?.head?.ref,
-      head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/43`,
-      created_at: '2026-08-10T00:02:00Z', updated_at: '2026-08-10T00:03:00Z',
-    }] : [],
-  });
   if (u.pathname === `/repos/${SLUG}/actions/runs/42/rerun-failed-jobs` && method === 'POST') {
     actionsReruns++;
     return new Response(null, { status: 201 });
@@ -684,7 +680,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       .not.toMatch(/repair it against the newest target/i);
   }, 120_000);
 
-  it('stops once with permission guidance when Actions inspection is forbidden', async () => {
+  it('keeps a superseded exact-head cancellation waiting when Actions inspection is forbidden', async () => {
     const repo = await repoWithOrigin('github-actions-forbidden');
     const project = h.store.createProject('Forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -707,18 +703,19 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadiness = {
       mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
-        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'CANCELLED',
-        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+        __typename: 'StatusContext', context: 'unit tests', state: 'FAILURE',
+        targetUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+        description: 'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
       }] } },
     };
     await handle.signal('confirm');
     await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
-      .toMatch(/Grant the GitHub App Actions: read and write permission/);
+      .toMatch(/equivalent CI request.*waiting.*releasing its landing position/is);
     const current = await view(handle);
     expect(current.stage).toBe('merge');
     expect(current.landing?.repairAttempts ?? 0).toBe(0);
     expect(current.messages.map((message: any) => message.text).join('\n'))
-      .not.toMatch(/repair it against the newest target/i);
+      .not.toMatch(/repair it against the newest target|Grant the GitHub App/i);
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);

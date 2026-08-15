@@ -2790,6 +2790,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const recordedCurrents = new Set(events
           .filter((event) => event.type === 'github.ci.validation-current')
           .map((event) => `${event.payload?.key}:${event.payload?.runId}:${event.payload?.attempt}:${event.payload?.state}`));
+        const recordedSupersessions = new Set(events
+          .filter((event) => event.type === 'github.ci.superseded')
+          .map((event) => `${event.payload?.key}:${event.payload?.runId}:${event.payload?.attempt}:${event.payload?.supersedingRunId}:${event.payload?.supersedingAttempt}`));
         const terminalObservation = (decision: GithubActionsFailureDecision, key: string) => {
           const run = decision.inspection.run;
           const state = String(run.conclusion ?? run.status).toLowerCase();
@@ -2887,6 +2890,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               const reconciliation = reconcileGithubActionsRuns(identity, inspected.run, listed.runs);
               currentObservation(reconciliation.key, reconciliation.current);
               if (reconciliation.successful) {
+                if (String(inspected.run.conclusion ?? '').toLowerCase() === 'cancelled'
+                  && reconciliation.successful.id !== inspected.run.id) {
+                  const supersession = `${reconciliation.key}:${inspected.run.id}:${inspected.run.attempt}:${reconciliation.successful.id}:${reconciliation.successful.attempt}`;
+                  if (!recordedSupersessions.has(supersession)) {
+                    record(handle.id, 'github.ci.superseded', {
+                      key: reconciliation.key, slug: ref.slug, number: ref.number,
+                      candidateHead: ref.headSha, runId: inspected.run.id, attempt: inspected.run.attempt,
+                      supersedingRunId: reconciliation.successful.id,
+                      supersedingAttempt: reconciliation.successful.attempt,
+                    });
+                    recordedSupersessions.add(supersession);
+                  }
+                }
                 satisfied.push({ key: reconciliation.key, run: reconciliation.successful });
                 satisfiedRunIds.add(runId);
                 continue;
@@ -2951,17 +2967,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             status: 'waiting', prs: current, actorUserId,
             detail: 'A current GitHub Actions run was cancelled with no replacement yet visible. Karmax is performing bounded exact-head reconciliation before classification or rerun.',
           };
-          const permissionFailure = inspectionFailures.find(({ error }) =>
-            error instanceof GithubActionsApiError && [401, 403].includes(error.status));
-          if (permissionFailure || (runIds.length > 0 && !inspection.actions)) return {
-            status: 'needs-human', prs: current, actorUserId,
-            detail: `${summary}\n\nKrmax cannot inspect the replacement workflow run. Grant the GitHub App Actions: read and write permission and approve the updated installation permissions, then retry.`,
-            eligibleUserIds: [actorUserId],
-          };
-          if (actionReconciliationFailed && runIds.length) return {
-            status: 'retryable-error', prs: current, actorUserId,
-            detail: `${summary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
-          };
           const providerFailure = classifyGithubActionsDiagnostic(summary);
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
@@ -2983,6 +2988,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: `${summary}\n\nGitHub reported a transient Actions failure, but run inspection is unavailable so krmax cannot safely rerun it. Retrying inspection without reopening the proposal.`,
             };
           }
+          const permissionFailure = inspectionFailures.find(({ error }) =>
+            error instanceof GithubActionsApiError && [401, 403].includes(error.status));
+          const inspectionPermissionDetail = permissionFailure || (runIds.length > 0 && !inspection.actions)
+            ? '\n\nEnhanced exact-head Actions inspection is unavailable. The GitHub App Actions permission can be reauthorized separately; this does not change the CI failure classification.'
+            : '';
+          if (actionReconciliationFailed && runIds.length && !permissionFailure) return {
+            status: 'retryable-error', prs: current, actorUserId,
+            detail: `${summary}\n\nExact-head GitHub Actions reconciliation was unavailable. Retrying inspection without rerunning or reopening the proposal.`,
+          };
           const fallbackKey = fallbackIdentityKey;
           fallbackObservation(fallbackKey, 'revision');
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
@@ -2994,7 +3008,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             runId: runIds[0] ?? 0, attempt: 0,
           });
           return {
-            status: 'needs-revision', prs: current, actorUserId, detail: summary,
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: `${summary}${inspectionPermissionDetail}`,
             ...(intentAuthorizedLanding ? { repair: { kind: 'ci' as const, preserveAuthorization: true,
               fingerprint: fallbackKey } } : {}),
           };
