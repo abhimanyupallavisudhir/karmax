@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
-import { HOSTED_PLANS, isHostedPlanId, type HostedPlanId } from '../domain/entitlements.js';
+import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
+  type HostedPlanId } from '../domain/entitlements.js';
 
-type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
+export type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
 const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
   isHostedPlanId(value) && value !== HOSTED_PLANS.free.id;
 export const PAST_DUE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -15,6 +16,30 @@ export interface SubscriptionCatalogConfig {
   teamSeatPriceId: string;
   individualProductId?: string;
   teamProductId?: string;
+}
+
+/** Authoritative commercial snapshot returned by the canonical checkout service.
+ * Policy acceptance is intentionally outside this billing-owned structure. */
+export interface SubscriptionCommercialTerms {
+  planId: PaidHostedPlanId;
+  planName: string;
+  currency: 'usd';
+  billingInterval: 'month';
+  monthlyBasePriceCents: number;
+  includedActiveUsers: number;
+  monthlyAdditionalActiveUserPriceCents: number;
+  activeUsers: number;
+  monthlyTotalPriceCents: number;
+}
+
+export interface SubscriptionCheckoutResult {
+  organizationId: string;
+  plan: PaidHostedPlanId;
+  commercialTerms: SubscriptionCommercialTerms;
+  checkoutRequestReference: string;
+  checkoutSessionReference: string;
+  checkoutProvider: string;
+  url: string;
 }
 
 export interface BillingAccount {
@@ -220,18 +245,36 @@ export class SubscriptionBillingService {
     for (const row of rows) this.reconcileAccount(rowAccount(row)!, now);
   }
 
-  async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string) {
+  async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
     this.requireHosted(); this.requireKey(key);
     if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
     const current = this.account(organizationId);
     if (current?.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(current.status))
       throw new Error('use Change plan for an existing subscription');
     return this.idempotent(organizationId, `checkout:${plan}`, key, async () => {
+      const activeUsers = this.store.listOrganizationMemberships(organizationId).length;
+      const definition = HOSTED_PLANS[plan];
+      if (definition.maxMembers != null && activeUsers > definition.maxMembers)
+        throw new Error(`remove additional active users before choosing ${definition.name}`);
       const customerId = await this.ensureCustomer(organizationId, `${key}:customer`);
-      const seats = Math.max(HOSTED_PLANS[plan].includedActiveUsers,
-        this.store.listOrganizationMemberships(organizationId).length);
-      return this.provider.createCheckout({ organizationId, customerId, plan, seats,
+      const seats = Math.max(definition.includedActiveUsers, activeUsers);
+      const session = await this.provider.createCheckout({ organizationId, customerId, plan, seats,
         successUrl: urls.success, cancelUrl: urls.cancel, idempotencyKey: `${key}:checkout` });
+      return {
+        organizationId, plan,
+        commercialTerms: {
+          planId: plan, planName: definition.name, currency: 'usd', billingInterval: 'month',
+          monthlyBasePriceCents: definition.monthlyBasePriceCents,
+          includedActiveUsers: definition.includedActiveUsers,
+          monthlyAdditionalActiveUserPriceCents: definition.monthlyAdditionalActiveUserPriceCents,
+          activeUsers,
+          monthlyTotalPriceCents: hostedMonthlyPriceCents(plan, activeUsers),
+        },
+        checkoutRequestReference: key,
+        checkoutSessionReference: session.id,
+        checkoutProvider: this.provider.name,
+        url: session.url,
+      };
     });
   }
 
