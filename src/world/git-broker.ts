@@ -181,6 +181,33 @@ export function describePublishFailures(result: GitBrokerPublishResult): string 
     .join('; ');
 }
 
+const NON_FAST_FORWARD = /non-fast-forward|fetch first|stale info|\brejected\b/i;
+const GIT_AUTHORIZATION = /authentication failed|permission denied|could not read from remote repository|repository not found|http basic: access denied|403\b|401\b/i;
+
+/** Turn Git's provider prose into errors that identify the failing safety layer.
+ * In particular, a remote ref race must never be rendered as an instruction to
+ * connect a GitHub profile, and a local ancestry break must never mention remote
+ * credentials at all. */
+export function describeGitPushError(repo: WorldRepo, detail: string): string {
+  const compact = detail.trim().replace(/\s+/g, ' ').slice(0, 500);
+  if (NON_FAST_FORWARD.test(detail)) {
+    return `remote task branch non-fast-forward for "${repo.branch}": origin advanced or diverged, so Karmax did not overwrite it. `
+      + `Fetch origin/${repo.branch} and integrate the remote work, or retry a Karmax-owned rebase only after its exact prior PR head is recorded. `
+      + `Reconnect GitHub will not fix this remote-state conflict.${compact ? ` Git said: ${compact}` : ''}`;
+  }
+  if (GIT_AUTHORIZATION.test(detail)) {
+    return `GitHub repository transport authorization is missing or expired for "${repo.name}". `
+      + `Reconnect or re-authorize the repository's GitHub App installation, then retry.${compact ? ` Git said: ${compact}` : ''}`;
+  }
+  return compact || 'git push failed';
+}
+
+function recordedBaseViolation(repo: WorldRepo): string {
+  return `local recorded-base ancestry violation for branch "${repo.branch}"`
+    + `${repo.baseSha ? ` (base ${repo.baseSha.slice(0, 12)})` : ''}: the branch no longer descends from the commit provisioned for this task. `
+    + 'Karmax did not publish it; reconnecting GitHub will not help. Restore the provisioned HEAD as an ancestor and integrate the selected target normally.';
+}
+
 /**
  * Trusted Git handoff for cloud worlds. The untrusted sandbox never receives a
  * write credential: it emits a git bundle, the broker downloads that bundle,
@@ -255,7 +282,7 @@ async function verifySharedWorktreeBranch(world: World, repo: WorldRepo, localRe
     throw new Error(`world and local task branch "${repo.branch}" disagree`);
   if (repo.baseSha) {
     const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, ref]);
-    if (ancestor.code !== 0) throw new Error('world branch is not descended from its recorded base commit');
+    if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
   }
 }
 
@@ -274,12 +301,12 @@ async function pushBranchToOrigin(
     // previously observed: a concurrent writer makes the lease fail instead of
     // being overwritten. With no recorded PR head we never force an existing
     // branch—the collision needs investigation rather than an ownership guess.
-    if (result.code !== 0 && expectedRemoteHead && /non-fast-forward|fetch first|rejected/i.test(result.stderr || result.stdout)) {
+    if (result.code !== 0 && expectedRemoteHead && NON_FAST_FORWARD.test(result.stderr || result.stdout)) {
       result = await git(clone, [
         'push', `--force-with-lease=${ref}:${expectedRemoteHead}`, 'origin', `${ref}:${ref}`,
       ], { env });
     }
-    if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
+    if (result.code !== 0) throw new Error(describeGitPushError(repo, result.stderr || result.stdout || 'push failed'));
   });
 }
 
@@ -301,7 +328,7 @@ async function importBranchToLocal(world: World, repo: WorldRepo, localRepo: str
     if (fetched.code !== 0) throw new Error(`local checkout could not import the world branch: ${fetched.stderr || fetched.stdout}`);
     if (repo.baseSha) {
       const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, staging]);
-      if (ancestor.code !== 0) throw new Error('world branch is not descended from its recorded base commit');
+      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
     }
     const updated = await git(localRepo, ['fetch', '.', `+${staging}:refs/heads/${repo.branch}`]);
     if (updated.code !== 0) throw new Error(`could not update local task branch "${repo.branch}": ${updated.stderr || updated.stdout}`);
@@ -644,7 +671,7 @@ async function withTransferredRepo<T>(
     if (fetched.code !== 0) throw new Error(`bundle import failed: ${fetched.stderr || fetched.stdout}`);
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
-      if (ancestor.code !== 0) throw new Error('world branch is not descended from its recorded base commit');
+      if (ancestor.code !== 0) throw new Error(recordedBaseViolation(repo));
     }
     return await use(clone, env);
   } catch (error) {

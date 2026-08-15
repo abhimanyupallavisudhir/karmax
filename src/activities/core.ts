@@ -81,6 +81,7 @@ import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
+import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
   AGENT_QUEUE_WORKFLOW,
@@ -722,9 +723,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const token = await githubTokenFor(handle, slug, repository);
     if (!token) {
       if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).oauthConfigured) {
-        throw new Error('Connect GitHub on your profile, then try again.');
+        throw new Error(`GitHub PR identity is not connected for ${slug}. Connect GitHub on your profile so the pull request has a human author, then retry. Repository transport authorization is already separate; this is not a non-fast-forward or local ancestry error.`);
       }
-      throw new Error(`Your GitHub account cannot access ${slug}. Grant it access on GitHub, then reconnect GitHub on your profile.`);
+      throw new Error(`GitHub identity/authorization is missing for ${slug}. Grant the acting account access to this repository, then connect or re-authorize GitHub on your profile. This is not a branch-history conflict.`);
     }
     return new GithubPrApi(token, deps.githubPr ?? {});
   }
@@ -1760,10 +1761,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } finally {
         wikiSnapshot?.release();
       }
+      const liveTarget = store.getTask(args.taskId)?.lastView?.targetBranch ?? args.task.target;
+      const promptTask = liveTarget && liveTarget !== args.task.target
+        ? { ...args.task, target: liveTarget }
+        : args.task;
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
-        task: args.task,
+        task: promptTask,
         world: args.worldHandle,
         globalInstructions,
         projectInstructions,
@@ -2247,9 +2252,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return { summary, changedFiles };
     },
 
-    /** Read-only readiness check for the explicit Open PR transition. The Do
-     * agent owns commit-vs-ignore judgment; machinery only refuses to publish a
-     * proposal that still has unresolved or uncommitted state. */
+    /** Readiness check for the explicit Open PR transition. The Do agent owns
+     * commit-vs-ignore judgment; machinery refuses unresolved/uncommitted state
+     * and may add the narrow, content-neutral ancestry repair described below. */
     async checkProposal(handle: WorldHandle): Promise<{
       ready: boolean;
       dirty?: string;
@@ -2275,6 +2280,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       if (dirty.length) {
         return { ready: false, dirty: [...new Set(dirty)].join('\n'), note: 'the proposal has uncommitted changes' };
+      }
+      // Publication's immutable baseSha check used to be the first place a
+      // reset/reparented recovery branch was discovered. Check at the explicit
+      // Do → PR boundary instead. The helper repairs only the safe target-based,
+      // content-neutral case and otherwise fails closed with local Git guidance.
+      const liveTarget = store.getTask(handle.id)?.lastView?.targetBranch
+        ?? world.handle.target ?? handle.target ?? world.handle.base;
+      const ancestry = await ensureTaskBranchAncestry(world, liveTarget);
+      if (ancestry.repaired.length) {
+        for (const repair of ancestry.repaired) record(handle.id, 'branch.ancestry-repaired', repair);
+      }
+      if (Object.keys(ancestry.errors).length) {
+        return {
+          ready: false,
+          conflict: Object.entries(ancestry.errors).map(([repo, detail]) => `${repo}: ${detail}`).join('\n'),
+          note: 'the proposal lost its recorded task-branch ancestry',
+        };
       }
       return { ready: true };
     },
@@ -2452,6 +2474,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (!isRemote(handle.kind)) return { pushed: [] };
       const world = await openWorld(handle);
       await enrollLiveProjectRepositories(world, handle.id);
+      const ancestry = await ensureTaskBranchAncestry(world,
+        store.getTask(handle.id)?.lastView?.targetBranch ?? world.handle.target ?? world.handle.base);
+      if (Object.keys(ancestry.errors).length)
+        throw new Error(`cloud task branch was not persisted for: ${Object.entries(ancestry.errors)
+          .map(([repo, detail]) => `${repo}: ${detail}`).join('; ')}`);
+      for (const repair of ancestry.repaired) record(handle.id, 'branch.ancestry-repaired', repair);
       const result = await brokerPublishBranch(world, brokerAuthFor(world.handle, handle.id));
       if (!result.pushed.length || result.skipped.length) {
         throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${describePublishFailures(result)}` : ' because it has no remote repository'}`);
@@ -4306,7 +4334,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         title: args.title,
         workflow: 'software-dev',
         workflowVersion: parent?.workflowVersion ?? '1.0.0',
-        params: { prompt: args.prompt, base: args.base, target: args.target },
+        params: { prompt: args.prompt, base: args.base, target: args.target,
+          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true },
         parentTaskId: args.parentTaskId,
         createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
         assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },

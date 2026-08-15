@@ -225,6 +225,10 @@ describe('cloud Git broker', () => {
     await gitOrThrow(world.handle.root, ['add', '-A']);
     await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'repaired proposal']);
     const repairedHead = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+    const unleased = await brokerPushBranches(world, env);
+    expect(unleased.pushed).toEqual([]);
+    expect(unleased.errors?.source).toMatch(/remote task branch non-fast-forward.*Reconnect GitHub will not fix/i);
+    expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(firstHead);
     expect(await brokerPushBranches(world, env, undefined, { source: firstHead }))
       .toEqual({ pushed: ['source'], skipped: [] });
     expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
@@ -237,7 +241,7 @@ describe('cloud Git broker', () => {
     const refused = await brokerPushBranches(world, env, undefined, { source: firstHead });
     expect(refused.pushed).toEqual([]);
     expect(refused.skipped).toEqual(['source']);
-    expect(refused.errors?.source).toMatch(/stale info|rejected/i);
+    expect(refused.errors?.source).toMatch(/remote task branch non-fast-forward.*Reconnect GitHub will not fix/i);
     expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
   });
 
