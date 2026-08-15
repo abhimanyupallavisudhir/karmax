@@ -441,6 +441,17 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
 };
 
+export function staticAssetHeaders(file: string): Record<string, string> {
+  return {
+    'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
+    // The console has no build step or content-hashed asset names, so a cached
+    // app.js can keep running old UI code after a deploy. Force revalidation of
+    // the SPA shell and its assets; the service worker deliberately follows the
+    // network response instead of maintaining a second application cache.
+    'cache-control': 'no-cache',
+  };
+}
+
 /** Content types for review "open" artifacts (a superset of the static MIME map). */
 const ARTIFACT_MIME: Record<string, string> = {
   ...MIME,
@@ -5912,7 +5923,7 @@ export class Gateway {
     }
     try {
       const data = await fs.promises.readFile(file);
-      res.writeHead(200, { 'content-type': MIME[path.extname(file)] ?? 'application/octet-stream' });
+      res.writeHead(200, staticAssetHeaders(file));
       res.end(data);
     } catch {
       res.writeHead(404).end('not found');
