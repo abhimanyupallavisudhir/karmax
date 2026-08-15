@@ -13310,6 +13310,89 @@ function installationView() {
   </div></div>`;
 }
 
+function billingRequestKey() {
+  try { return crypto.randomUUID(); } catch { return `billing-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+}
+
+async function hydrateOrganizationSubscription(organizationId) {
+  const box = $('#org-subscription');
+  if (!box) return;
+  let state;
+  try { state = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/status`); }
+  catch (error) { box.innerHTML = `<p class="task-sub" style="color:var(--danger)">${esc(error.message)}</p>`; return; }
+  if (!$('#org-subscription') || S.organizationId !== organizationId) return;
+  if (!state.managed) {
+    box.innerHTML = `<div class="section-h">Self-hosted <span class="chip">unmetered</span></div>
+      <p class="task-sub">Hosted subscription billing does not apply to this private installation. Your organization plans and agent payment cards remain locally managed.</p>`;
+    return;
+  }
+  const names = { free: 'Free', individual: 'Individual', team: 'Team' };
+  const statusNames = { none: 'free', active: 'active', trialing: 'trial', past_due: 'payment failed',
+    unpaid: 'unpaid', incomplete: 'checkout incomplete', incomplete_expired: 'checkout expired',
+    paused: 'paused', canceled: 'canceled' };
+  const problem = ['past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused'].includes(state.status);
+  const period = state.currentPeriodEnd ? new Date(state.currentPeriodEnd).toLocaleDateString() : '';
+  const seats = state.plan === 'team'
+    ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'} · <b>${state.seats}</b> verified billed seat${state.seats === 1 ? '' : 's'}${state.seatDeficit ? ` · <span style="color:var(--danger)">${state.seatDeficit} awaiting reconciliation</span>` : ''}`
+    : `<b>${state.activeUsers}</b> of 1 user`;
+  const grace = state.access === 'grace' && state.graceEndsAt
+    ? ` Access continues through ${new Date(state.graceEndsAt).toLocaleDateString()}.` : '';
+  const checkoutReturn = new URLSearchParams(location.search).get('billing');
+  const checkoutNotice = checkoutReturn === 'success'
+    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for Stripe’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
+    : checkoutReturn === 'canceled'
+      ? '<div class="card" style="margin:12px 0;padding:12px"><b>Checkout canceled</b><p class="task-sub">No plan change was applied.</p></div>' : '';
+  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until Stripe confirms payment.')}${esc(grace)}</p></div>` : '';
+  const planCards = state.plan === 'free' || state.status === 'canceled' ? `<div class="settings-grid" style="margin-top:14px">
+      <div class="card" style="padding:14px"><b>Individual</b><div class="section-h" style="margin-top:6px">$9 / month</div><p class="task-sub">One user.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${state.providerConfigured ? '' : 'disabled'}>Choose Individual</button></div>
+      <div class="card" style="padding:14px"><b>Team</b><div class="section-h" style="margin-top:6px">$19 / month</div><p class="task-sub">First user included, then $5 / additional active user / month.</p><button class="btn sm primary billing-checkout" data-plan="team" ${state.providerConfigured ? '' : 'disabled'}>Choose Team</button></div>
+      <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
+  const changes = state.plan === 'individual' && ['active', 'trialing', 'past_due'].includes(state.status)
+    ? '<button class="btn sm billing-change" data-plan="team">Upgrade to Team</button>'
+    : state.plan === 'team' && ['active', 'trialing', 'past_due'].includes(state.status)
+      ? `<button class="btn sm billing-change" data-plan="individual" ${state.activeUsers > 1 ? 'disabled title="Remove additional active users first"' : ''}>Downgrade to Individual</button>` : '';
+  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[state.plan] || state.plan)} <span class="chip">${esc(statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}</span></span>
+    <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
+    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}
+    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${state.plan !== 'free' && state.status !== 'canceled' ? '<button class="btn sm billing-portal">Billing portal</button>' : ''}${state.plan !== 'free' && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? '<button class="btn sm danger billing-cancel">Cancel at period end</button>' : ''}${state.seatDeficit ? '<button class="btn sm billing-sync">Reconcile seats</button>' : ''}</div>
+    <p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Plan and seat access changes only after a signed billing event is reconciled.</p>`;
+  box.querySelectorAll('.billing-checkout').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/checkout`, {
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan: button.dataset.plan }),
+      });
+      location.assign(result.url);
+    } catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
+  box.querySelector('.billing-portal')?.addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    try { location.assign((await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/portal`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    })).url); } catch (error) { event.currentTarget.disabled = false; toast(error.message, true); }
+  });
+  box.querySelector('.billing-change')?.addEventListener('click', async (event) => {
+    const plan = event.currentTarget.dataset.plan;
+    if (!confirm(`Change this organization to ${names[plan]}? Stripe will prorate the current billing period.`)) return;
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/change`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
+    }); toast('Plan change submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
+    if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    }); toast('Cancellation submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-sync')?.addEventListener('click', async () => {
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/sync-seats`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    }); toast('Seat reconciliation submitted.'); } catch (error) { toast(error.message, true); }
+  });
+}
+
 function wireInstallationSettings() {
   wireSettingsNavigation();
   wireAppearanceCard();
@@ -13328,11 +13411,13 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
-    <div class="settings-section-title" id="settings-plan"><div>Plan<small>Current organization limits</small></div></div>
+    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
     <div class="card" id="org-plan">Loading…</div>
+    <div class="settings-section-title" id="settings-billing"><div>Subscription billing<small>Hosted subscription and active-user seats—not cards used by agents</small></div></div>
+    <div class="card" id="org-subscription"><p class="task-sub">Loading verified subscription status…</p></div>
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
@@ -13408,6 +13493,7 @@ async function hydrateOrganizationView() {
     && !!$('#org-members');
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
+  hydrateOrganizationSubscription(organizationId);
   await loadCollaboration().catch(() => {});
   if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
