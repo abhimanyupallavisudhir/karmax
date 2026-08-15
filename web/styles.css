@@ -1266,14 +1266,9 @@ body.landing-active {
   min-height: 720px; padding: 82px 0 84px;
   display: grid; grid-template-columns: minmax(0, .78fr) minmax(570px, 1.22fr); align-items: center; gap: 52px;
 }
-.landing-kicker {
-  display: flex; align-items: center; gap: 10px; margin: 0 0 26px;
-  color: var(--land-blue); font: 650 12px/1.2 ui-monospace, "SFMono-Regular", Consolas, monospace; text-transform: uppercase; letter-spacing: .09em;
-}
-.landing-kicker span { width: 24px; height: 1px; background: currentColor; }
 .landing-analogy { margin: 0; display: grid; gap: 14px; font-size: clamp(22px, 2.15vw, 31px); line-height: 1.08; letter-spacing: -.04em; font-weight: 450; }
 .landing-analogy > span { display: block; color: #637086; white-space: nowrap; }
-.landing-analogy > span > strong { display: inline-block; width: 118px; margin-right: 12px; color: var(--land-ink); font-weight: 730; }
+.landing-analogy > span > strong { margin-right: 12px; color: var(--land-ink); font: 700 .9em ui-monospace, "SFMono-Regular", Consolas, monospace; letter-spacing: -.05em; }
 .landing-analogy > span > span { display: inline; }
 .landing-analogy b { color: var(--land-blue); font-weight: 730; }
 .landing-page em { font-family: "Iowan Old Style", "Baskerville", "Times New Roman", serif; font-weight: 400; }
@@ -1347,7 +1342,6 @@ body.landing-active {
 .landing-control-list strong { color: #fff; font-weight: 680; }
 
 .landing-final { position: relative; padding: 128px 24px 140px; text-align: center; background: #edf2ff; overflow: hidden; }
-.landing-final h2 em { color: var(--land-blue); }
 .landing-final .landing-start { margin-top: 36px; }
 .landing-orbit { position: absolute; left: 50%; top: 50%; width: 610px; height: 610px; border: 1px solid rgba(49,94,231,.09); border-radius: 50%; transform: translate(-50%,-50%); pointer-events: none; }
 .landing-orbit::before, .landing-orbit::after { content: ''; position: absolute; inset: 80px; border: inherit; border-radius: inherit; }
@@ -1374,7 +1368,7 @@ body.landing-active {
   .landing-text-link, .landing-sign-in { display: none; }
   .landing-hero { width: min(100% - 32px, 1180px); min-height: 0; padding: 54px 0 70px; gap: 46px; }
   .landing-analogy { font-size: 22px; gap: 10px; }
-  .landing-analogy > span > strong { width: 84px; margin-right: 8px; }
+  .landing-analogy > span > strong { margin-right: 8px; }
   .landing-intro { font-size: 17px; }
   .landing-hero-actions { align-items: flex-start; flex-direction: column; }
   .product-frame { width: 100%; justify-self: start; transform: none; border-radius: 10px; }

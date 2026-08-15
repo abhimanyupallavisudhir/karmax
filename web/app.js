@@ -14378,9 +14378,8 @@ function renderLanding() {
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
         <div class="landing-hero-copy">
-          <p class="landing-kicker"><span></span> Your Integrated Management Environment</p>
           <h1 id="landing-title" class="landing-analogy">
-            <span><strong>VS Code</strong><span>was a fancy <b>text editor.</b></span></span>
+            <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
             <span><strong>krmax</strong><span>is a fancy <b>to-do list.</b></span></span>
           </h1>
           <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
@@ -14451,10 +14450,10 @@ function renderLanding() {
           <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
           <div class="landing-checks">
             <article><h3>Agents work parallelly in isolated cloud worlds.</h3></article>
-            <article><h3>Yes, we handle gitignored files.</h3><p>secrets, databases, big files</p></article>
-            <article><h3>Bring your own key</h3><p>or OpenAI/Claude subscription</p></article>
+            <article><h3>Yes, gitignored files are handled correctly.</h3><p>secrets, databases, big files</p></article>
+            <article><h3>Bring your own key or OpenAI/Claude subscription</h3></article>
             <article><h3>krmax MCP lets agents access and manage your krmax projects</h3><p>if you authorize it.</p></article>
-            <article class="wide"><h3>Connect a password vault and a payment card, and agents can Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
+            <article class="wide"><h3>Connect a password vault and a payment card, and let agents Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
           </div>
         </div>
       </section>
@@ -14473,7 +14472,7 @@ function renderLanding() {
 
       <section class="landing-final" aria-labelledby="final-title">
         <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
-        <h2 id="final-title">Leave the permanent<br><em>underclass</em> today.</h2>
+        <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
         <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with krmax <span aria-hidden="true">→</span></button>
       </section>
     </main>
