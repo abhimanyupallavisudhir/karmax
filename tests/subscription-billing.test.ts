@@ -29,7 +29,17 @@ describe('hosted subscription billing', () => {
 
     const checkout = await billing.checkout(organization.id, 'team',
       { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-request-1');
-    expect(checkout.url).toBe('https://checkout.test/session');
+    expect(checkout).toMatchObject({
+      organizationId: organization.id, plan: 'team', url: 'https://checkout.test/session',
+      checkoutRequestReference: 'checkout-request-1',
+      checkoutSessionReference: 'cs_test', checkoutProvider: 'fake-billing',
+      commercialTerms: {
+        planId: 'team', planName: 'Team', currency: 'usd', billingInterval: 'month',
+        monthlyBasePriceCents: 1_900, includedActiveUsers: 1,
+        monthlyAdditionalActiveUserPriceCents: 500, activeUsers: 1,
+        monthlyTotalPriceCents: 1_900,
+      },
+    });
     // A checkout response is not an entitlement claim. Until the signed
     // subscription event arrives, the organization is still Free.
     expect(billing.current(organization.id)).toMatchObject({ plan: 'free', status: 'none', seats: 1 });
@@ -173,6 +183,16 @@ describe('hosted subscription billing', () => {
       id: 'in_late', customer: `cus_${organization.id}`, subscription: 'sub_lifecycle',
     }, 310));
     expect(store.getOrganization(organization.id)?.plan).toBe('free');
+    await expect(billing.checkout(organization.id, 'individual',
+      { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-too-many-users'))
+      .rejects.toThrow('remove additional active users before choosing Individual');
+    const nextCheckout = await billing.checkout(organization.id, 'team',
+      { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-team-again');
+    expect(nextCheckout).toMatchObject({
+      organizationId: organization.id, plan: 'team',
+      checkoutRequestReference: 'checkout-team-again', checkoutSessionReference: 'cs_test',
+      commercialTerms: { activeUsers: 2, monthlyTotalPriceCents: 2_400 },
+    });
     expect(PAST_DUE_GRACE_MS).toBe(7 * 24 * 60 * 60 * 1000);
   });
 
@@ -288,7 +308,13 @@ describe('subscription administration HTTP authorization', () => {
   it('allows the interactive owner of the organization', async () => {
     const response = await post('checkout', 'org_personal', browserToken);
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ url: 'https://checkout.test/session' });
+    expect(await response.json()).toMatchObject({
+      organizationId: 'org_personal', plan: 'individual',
+      url: 'https://checkout.test/session', checkoutProvider: 'fake-billing',
+      checkoutRequestReference: expect.stringMatching(/^billing-/), checkoutSessionReference: 'cs_test',
+      commercialTerms: { planId: 'individual', monthlyBasePriceCents: 900,
+        activeUsers: 1, monthlyTotalPriceCents: 900 },
+    });
   });
 
   it('makes owner-only administration explicit in subscription status', async () => {

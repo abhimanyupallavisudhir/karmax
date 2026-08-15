@@ -200,6 +200,15 @@ user retries are durably idempotent. Only an interactive organization owner can
 start checkout, open the portal, change or cancel a plan, or request a seat sync;
 an agent holding `payment:write` cannot administer the SaaS subscription.
 
+The canonical checkout seam is
+`POST /api/organizations/:organizationId/subscription/checkout`, backed by
+`SubscriptionBillingService.checkout`. Its response includes the server-derived
+plan and commercial snapshot, the durable local idempotency/request reference,
+and the provider checkout-session reference. Policy acceptance is deliberately
+not owned by billing; callers that require it can wrap this owner-only seam and
+persist their versioned acceptance record alongside the returned commercial
+snapshot without trusting prices submitted by the browser.
+
 Active and trialing subscriptions grant the verified plan. Past-due
 organizations retain it for seven days and receive a billing portal recovery
 action. A process-level sweep runs every minute and returns the organization to
