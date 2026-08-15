@@ -458,6 +458,24 @@ export function staticAssetHeaders(file: string): Record<string, string> {
   };
 }
 
+const staticRevisionCache = new Map<string, { mtimeMs: number; size: number; revision: string }>();
+
+/** A content revision for the no-build console, used by already-open tabs to
+ * notice that a deploy replaced the JavaScript they are currently executing. */
+export function staticAssetRevision(file: string): string | undefined {
+  try {
+    const stat = fs.statSync(file);
+    const cached = staticRevisionCache.get(file);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.revision;
+    const revision = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    staticRevisionCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, revision });
+    return revision;
+  } catch {
+    // Minimal/test gateways may intentionally have no console static directory.
+    return undefined;
+  }
+}
+
 /** Content types for review "open" artifacts (a superset of the static MIME map). */
 const ARTIFACT_MIME: Record<string, string> = {
   ...MIME,
@@ -1317,9 +1335,11 @@ export class Gateway {
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     }
     if (p === '/api/meta' && method === 'GET') {
+      const consoleRevision = staticAssetRevision(path.join(this.deps.staticDir, 'app.js'));
       return this.json(res, 200, {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
+        ...(consoleRevision ? { consoleRevision } : {}),
         safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',

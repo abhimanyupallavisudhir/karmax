@@ -2323,6 +2323,33 @@ function showTaskError(error, projectId) {
   return toast(message, true);
 }
 
+// A deploy cannot replace JavaScript that is already executing in a long-lived
+// SPA tab. Compare the server's content revision periodically (and immediately
+// after a websocket reconnect, which normally accompanies a deploy) so fixes do
+// not require the operator to remember to refresh krmax.io manually.
+let consoleRevisionTimer = null;
+
+function consoleRevisionChanged(current, next) {
+  return !!current && !!next && current !== next;
+}
+
+async function checkConsoleRevision() {
+  try {
+    const meta = await api('/api/meta');
+    if (consoleRevisionChanged(S.meta?.consoleRevision, meta.consoleRevision)) {
+      location.reload();
+      return true;
+    }
+    if (!S.meta?.consoleRevision && meta.consoleRevision) S.meta.consoleRevision = meta.consoleRevision;
+  } catch {}
+  return false;
+}
+
+function watchConsoleRevision() {
+  if (consoleRevisionTimer) return;
+  consoleRevisionTimer = setInterval(checkConsoleRevision, 60_000);
+}
+
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   // The emailed password-reset link lands here unauthenticated; handle it before
@@ -2388,6 +2415,7 @@ async function boot() {
     }
   }
   S.meta = await api('/api/meta');
+  watchConsoleRevision();
   try {
     S.installationInfo = await api('/api/settings/installation');
     S.installationAccess = S.installationInfo?.canManage === true;
@@ -2906,6 +2934,7 @@ function connectWs() {
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
     setWsOnline(true);
+    if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
     wsHadDropped = false;
   };
@@ -7157,6 +7186,11 @@ function conversationEntries(t) {
       .filter((entry) => entry.activity.kind === 'message')
       .map((entry) => messageTextKey(entry.activity.title)),
   );
+  const providerGroupTexts = new Set(
+    visibleActivities
+      .filter((entry) => entry.activity.kind === 'message')
+      .map((entry) => `${entry.activityGroup}/${messageTextKey(entry.activity.title)}`),
+  );
   // User messages carry real epoch-ms timestamps; agent/system replies are stamped
   // by the deterministic workflow with a per-array sequence number (it has no wall
   // clock). Carry the last real timestamp forward so a sequence-numbered reply sorts
@@ -7167,7 +7201,14 @@ function conversationEntries(t) {
     .filter((message) => {
       if (message.role !== 'agent') return true;
       const source = message.sourceActivity;
-      if (source) return !providerActivityRefs.has(`${source.turnId}/${source.id}/${source.attempt}`);
+      if (source) {
+        if (providerActivityRefs.has(`${source.turnId}/${source.id}/${source.attempt}`)) return false;
+        // A provider may replace the final item id while completing a streamed
+        // message. Keep the identity check primary, then fall back only inside
+        // that same turn/attempt so a genuinely repeated reply in another turn
+        // remains visible.
+        return !providerGroupTexts.has(`${source.turnId}/${source.attempt}/${messageTextKey(message.text)}`);
+      }
       // Replay/back-compat for messages recorded before sourceActivity existed.
       return !providerTexts.has(messageTextKey(message.text));
     })
