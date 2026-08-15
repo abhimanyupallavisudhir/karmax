@@ -1238,11 +1238,17 @@ export class KarmaxApi {
     if (resolved.separateAgents !== false) return;
     let spec = resolved['agent:do'] as AgentSpec | undefined;
     if (!spec?.provider) {
+      const resumeFrom = spec?.resumeFrom;
       const profile = roleDefaultProfile(this.deps.store, 'do', projectId);
       const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
       const model = profile?.model ?? defaultModel(provider);
       const effort = profile?.effort ?? defaultEffort(provider);
-      spec = { provider, ...(model ? { model } : {}), ...(effort ? { effort: effort as AgentSpec['effort'] } : {}) };
+      spec = {
+        provider,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort: effort as AgentSpec['effort'] } : {}),
+        ...(resumeFrom ? { resumeFrom } : {}),
+      };
     }
     resolved['agent:do'] = spec;
     const { resumeFrom: _resumeFrom, ...shared } = spec;
@@ -2918,7 +2924,8 @@ export class KarmaxApi {
   }
 
   /** Branch a source agent into an independent task/session; the source is never mutated. */
-  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<TaskRecord> {
+  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string;
+    authorizationProfile?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
     if (!source) throw new NotFoundError(`no task ${args.taskId}`);
@@ -2929,7 +2936,15 @@ export class KarmaxApi {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
       workflow: 'software-dev',
-      params: { prompt: args.message, 'agent:do': { resumeFrom: { taskId: args.taskId, role } } },
+      params: {
+        prompt: args.message,
+        'agent:do': {
+          ...(args.provider ? { provider: args.provider } : {}),
+          ...(args.model ? { model: args.model } : {}),
+          ...(args.effort ? { effort: args.effort } : {}),
+          resumeFrom: { taskId: args.taskId, role },
+        },
+      },
       authorizationProfile: args.authorizationProfile,
     });
   }

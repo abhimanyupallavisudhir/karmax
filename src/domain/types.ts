@@ -1255,9 +1255,21 @@ export interface AgentSpec {
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  /** Continue a prior agent session: a source task (+ which role's agent) or a
-   *  raw provider conversation/session id. */
-  resumeFrom?: { taskId?: string; role?: string; sessionId?: string };
+  /** Fork prior context from a task agent, a provider conversation id/public
+   * share link, or a project-scoped uploaded Codex/Claude conversation file. */
+  resumeFrom?: {
+    taskId?: string;
+    role?: string;
+    /** Native provider id, or a public chatgpt.com/share / claude.ai/share URL. */
+    sessionId?: string;
+    upload?: {
+      id: string;
+      name: string;
+      bytes: number;
+      format: 'codex' | 'claude-code' | 'claude-export' | 'panagent';
+      projectId: string;
+    };
+  };
 }
 
 /**

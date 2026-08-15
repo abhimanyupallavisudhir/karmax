@@ -38,6 +38,33 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(meta.hostLocal).toBe(true);
   });
 
+  it('accepts only recognized project-scoped conversation files', async () => {
+    const project = h.store.createProject('Conversation imports');
+    const sessionId = '11111111-1111-4111-8111-111111111111';
+    const history = Buffer.from(JSON.stringify({
+      parentUuid: null, isSidechain: false, userType: 'external', cwd: '/tmp/source',
+      sessionId, version: '2.1.0', gitBranch: 'main', type: 'user',
+      message: { role: 'user', content: 'Carry this context forward.' },
+      uuid: '10000000-0000-4000-8000-000000000001', timestamp: '2026-08-01T10:00:00Z',
+    }) + '\n');
+    const uploaded = await fetch(`${base}/api/conversation-imports?projectId=${project.id}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/octet-stream',
+        'x-file-name': encodeURIComponent('Claude conversation.jsonl') },
+      body: history,
+    });
+    expect(uploaded.status).toBe(200);
+    expect(await uploaded.json()).toMatchObject({
+      name: 'Claude conversation.jsonl', bytes: history.length, format: 'claude-code', projectId: project.id,
+    });
+    const invalid = await fetch(`${base}/api/conversation-imports?projectId=${project.id}`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/octet-stream' },
+      body: Buffer.from('not a conversation'),
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json() as any).error).toContain('Codex or Claude');
+  });
+
   it('keeps untrusted preview hosts outside the app/API origin', async () => {
     const previous = process.env.KARMAX_PREVIEW_ORIGIN;
     process.env.KARMAX_PREVIEW_ORIGIN = 'http://preview.invalid';

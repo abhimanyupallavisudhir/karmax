@@ -37,12 +37,15 @@ export function materializeFork(opts: {
   srcHome?: string;
 }): boolean {
   try {
+    if (!validNativeSessionId(opts.session)) return false;
     if (opts.provider === 'codex') return materializeCodex(opts);
     return materializeClaude(opts); // claude (and any subscription-CLI provider)
   } catch {
     return false; // any fs hiccup → caller replays
   }
 }
+
+const validNativeSessionId = (value: string): boolean => /^[a-zA-Z0-9_-]{8,160}$/.test(value);
 
 // ── Claude ─────────────────────────────────────────────────────────────────────
 /** Claude's cwd-slug: the world path with every non-alphanumeric char turned to '-'. */
@@ -69,6 +72,30 @@ function findClaudeSession(session: string, srcHome?: string, forkHome?: string)
       const f = path.join(projects, d, `${session}.jsonl`);
       if (fs.existsSync(f)) return f;
     }
+  }
+  return undefined;
+}
+
+/** Resolve a native Codex/Claude session for cross-provider panagent conversion.
+ * Search is intentionally limited to provider history roots; callers cannot turn
+ * a pasted id into an arbitrary host-filesystem read. */
+export function findProviderSession(opts: {
+  provider: string;
+  session: string;
+  srcHome?: string;
+  forkHome?: string;
+}): string | undefined {
+  // Provider ids are opaque, but current Claude/Codex ids are UUID-like. A
+  // minimum length prevents a vague substring (for example `.` or `abc`) from
+  // selecting the first unrelated Codex rollout whose filename happens to match.
+  if (!validNativeSessionId(opts.session)) return undefined;
+  if (opts.provider === 'claude') return findClaudeSession(opts.session, opts.srcHome, opts.forkHome);
+  if (opts.provider === 'codex') {
+    if (opts.forkHome) {
+      const local = findCodexRollout(opts.session, opts.forkHome);
+      if (local) return local;
+    }
+    return findCodexRolloutAnywhere(opts.session, opts.srcHome);
   }
   return undefined;
 }

@@ -1,0 +1,143 @@
+import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { importWithPanagent, publicConversationShare } from '../src/agent/panagent.js';
+import {
+  ConversationImportError,
+  conversationImportObjectKey,
+  detectConversationImport,
+  putConversationImport,
+} from '../src/store/conversation-imports.js';
+import { LocalObjectStore } from '../src/store/objects.js';
+
+const SOURCE_SESSION = '11111111-1111-4111-8111-111111111111';
+const CLAUDE_JSONL = [
+  {
+    parentUuid: null, isSidechain: false, userType: 'external', cwd: '/tmp/source',
+    sessionId: SOURCE_SESSION, version: '2.1.0', gitBranch: 'main', type: 'user',
+    message: { role: 'user', content: 'Design the importer.' },
+    uuid: '10000000-0000-4000-8000-000000000001', timestamp: '2026-08-01T10:00:00Z',
+  },
+  {
+    parentUuid: '10000000-0000-4000-8000-000000000001', isSidechain: false,
+    userType: 'external', cwd: '/tmp/source', sessionId: SOURCE_SESSION, version: '2.1.0',
+    gitBranch: 'main', type: 'assistant',
+    message: {
+      id: 'msg_fixture', type: 'message', role: 'assistant', model: 'claude-fixture',
+      content: [{ type: 'text', text: 'Use a provider-neutral handoff.' }],
+      stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 },
+    },
+    uuid: '10000000-0000-4000-8000-000000000002', timestamp: '2026-08-01T10:00:01Z',
+  },
+].map((record) => JSON.stringify(record)).join('\n') + '\n';
+const CODEX_JSONL = [
+  { timestamp: '2026-08-01T11:00:00Z', type: 'session_meta', payload: {
+    id: '22222222-2222-4222-8222-222222222222', timestamp: '2026-08-01T11:00:00Z',
+    cwd: '/tmp/source', originator: 'codex_cli_rs', cli_version: '0.144.5', source: 'cli', model_provider: 'openai',
+  } },
+  { timestamp: '2026-08-01T11:00:01Z', type: 'response_item', payload: {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Carry Codex context.' }],
+  } },
+  { timestamp: '2026-08-01T11:00:02Z', type: 'response_item', payload: {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Context retained.' }],
+  } },
+].map((record) => JSON.stringify(record)).join('\n') + '\n';
+
+const temporary = (prefix: string) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+
+describe('conversation import storage', () => {
+  it('detects and stores a project-scoped native history content-addressed', async () => {
+    const root = temporary('karmax-conversation-objects-');
+    try {
+      const objects = new LocalObjectStore(root);
+      const data = Buffer.from(CLAUDE_JSONL);
+      expect(detectConversationImport(data)).toBe('claude-code');
+      const ref = await putConversationImport(objects, 'project_1', data, '../Source session.jsonl');
+      expect(ref.name).toBe('Source session.jsonl');
+      expect(ref.projectId).toBe('project_1');
+      expect(ref.id).toMatch(/^[a-f0-9]{64}$/);
+      expect((await objects.get(conversationImportObjectKey('project_1', ref.id))).equals(data)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects junk and unsafe object references', () => {
+    expect(() => detectConversationImport(Buffer.from('not json'))).toThrow(ConversationImportError);
+    expect(() => conversationImportObjectKey('../other', 'a'.repeat(64))).toThrow(ConversationImportError);
+    expect(() => conversationImportObjectKey('project', '../secret')).toThrow(ConversationImportError);
+  });
+
+  it('recognizes Codex JSONL and pretty-printed Claude exports', () => {
+    expect(detectConversationImport(Buffer.from(CODEX_JSONL))).toBe('codex');
+    expect(detectConversationImport(Buffer.from(JSON.stringify({ chat_messages: [] }, null, 2)))).toBe('claude-export');
+  });
+});
+
+describe('Krmax panagent bridge', () => {
+  it('converts an uploaded Claude history into a fresh resumable Codex session', async () => {
+    const home = temporary('karmax-panagent-codex-');
+    try {
+      const result = await importWithPanagent({
+        source: { data: Buffer.from(CLAUDE_JSONL), name: 'claude.jsonl' },
+        provider: 'codex', forkHome: home, worldPath: '/tmp/new-world', mode: 'transcript', native: true,
+      });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      expect(result.sessionId).not.toBe(SOURCE_SESSION);
+      const file = path.join(home, 'sessions', 'forked', `rollout-panagent-${result.sessionId}.jsonl`);
+      const records = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(records[0].payload.id).toBe(result.sessionId);
+      expect(records.some((record) => record.type === 'response_item'
+        && record.payload?.role === 'assistant')).toBe(true);
+      expect(fs.statSync(file).mode & 0o077).toBe(0);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('uses a guarded semantic handoff when the destination has no native writer', async () => {
+    const home = temporary('karmax-panagent-context-');
+    try {
+      const result = await importWithPanagent({
+        source: { data: Buffer.from(CLAUDE_JSONL) }, provider: 'mock', forkHome: home,
+        worldPath: '/tmp/new-world', mode: 'transcript', native: false,
+      });
+      expect(result.kind).toBe('context');
+      if (result.kind !== 'context') return;
+      expect(result.message.text).toContain('untrusted context');
+      expect(result.message.text).toContain('Design the importer.');
+      expect(result.message.text).toContain('Use a provider-neutral handoff.');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('installs a converted Codex history where Claude resolves the new world', async () => {
+    const home = temporary('karmax-panagent-claude-');
+    try {
+      const result = await importWithPanagent({
+        source: { data: Buffer.from(CODEX_JSONL), name: 'codex.jsonl' },
+        provider: 'claude', forkHome: home, worldPath: '/tmp/another-world', mode: 'transcript', native: true,
+      });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      const file = path.join(home, 'projects', '-tmp-another-world', `${result.sessionId}.jsonl`);
+      const records = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(records.every((record) => record.sessionId === result.sessionId)).toBe(true);
+      expect(records.some((record) => record.type === 'assistant')).toBe(true);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts only public ChatGPT and Claude share URLs', () => {
+    expect(publicConversationShare('https://chatgpt.com/share/abc')).toBe('https://chatgpt.com/share/abc');
+    expect(publicConversationShare('https://claude.ai/share/abc')).toBe('https://claude.ai/share/abc');
+    expect(publicConversationShare('https://chatgpt.com/c/private')).toBeUndefined();
+    expect(publicConversationShare('http://chatgpt.com/share/abc')).toBeUndefined();
+    expect(publicConversationShare('https://example.com/share/abc')).toBeUndefined();
+    expect(publicConversationShare('not a url')).toBeUndefined();
+  });
+});

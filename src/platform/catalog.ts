@@ -116,6 +116,7 @@ export const PLATFORM_API_CATALOG = {
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
     'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
+    'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload)',
     'GET /api/tasks/:taskId/events?since=', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent)',
     'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})',
   ],

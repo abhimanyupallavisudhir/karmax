@@ -10,6 +10,7 @@ import type { TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
+import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
@@ -209,6 +210,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments') return 'task:create';
+  if (p === '/api/conversation-imports') return 'task:create';
   // Reading one back is a read of the task content it belongs to. The exact match
   // above does not cover `/api/attachments/:id`, which therefore fell through to the
   // conservative fallback — an implicit binding for a route that serves task bytes.
@@ -2204,6 +2206,25 @@ export class Gateway {
         } catch (e) {
           if (e instanceof AttachmentError) return this.json(res, 400, { error: e.message });
           throw e;
+        }
+      }
+
+      // Uploaded Codex/Claude histories are stored out of workflow params; the
+      // task carries only this project-scoped content-addressed reference.
+      if (p === '/api/conversation-imports' && method === 'POST') {
+        if (!requestedScope.projectId) return this.json(res, 400, { error: 'projectId is required' });
+        if (!store.getProject(requestedScope.projectId)) return this.json(res, 404, { error: 'project not found' });
+        if (!this.deps.objects) return this.json(res, 503, { error: 'conversation import storage is unavailable' });
+        try {
+          const data = await this.rawBody(req, MAX_CONVERSATION_IMPORT_BYTES);
+          let name = 'conversation.jsonl';
+          try { name = decodeURIComponent(String(req.headers['x-file-name'] || name)); } catch { /* use default */ }
+          const ref = await putConversationImport(this.deps.objects, requestedScope.projectId, data, name);
+          return this.json(res, 200, ref);
+        } catch (error) {
+          if (error instanceof ConversationImportError || error instanceof AttachmentError)
+            return this.json(res, 400, { error: error.message });
+          throw error;
         }
       }
 

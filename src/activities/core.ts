@@ -58,13 +58,16 @@ import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/pay
 import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
-import { materializeFork } from '../agent/fork.js';
+import { findProviderSession, materializeFork } from '../agent/fork.js';
+import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { paths } from '../config/paths.js';
+import type { ObjectStore } from '../store/objects.js';
+import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -222,6 +225,7 @@ export interface CoreActivityDeps {
   paymentRegistry?: PaymentRegistry;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
+  objects?: ObjectStore;
   contentDir?: string;
 }
 
@@ -1534,12 +1538,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       ));
       const remoteSubscriptionRail = isRemote(args.worldHandle.kind) && !apiRail;
       // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
-      // Branch a NEW session from the source's REAL conversation — NOT by stuffing its
-      // transcript into the prompt. Make the source session visible to THIS turn's
-      // (home × world), then let the adapter run a native fork (Claude --fork-session /
-      // Codex exec resume). Falls back to transcript replay only if the source session
-      // file is gone (worlds get cleaned; the session survives in the home) or it's a
-      // cross-provider jump.
+      // Same-provider task forks use the provider's native branch operation. Cross-
+      // provider histories, uploads, and public shares go through panagent; API rails
+      // and unsupported native targets receive a guarded context message instead.
       if (!session && spec?.resumeFrom) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
         // The config home THIS turn runs under — where the source session must be
@@ -1551,7 +1552,42 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
           : '.claude';
         const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
-        if (spec.resumeFrom.sessionId) {
+        const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript') => {
+          const imported = await importWithPanagent({
+            source,
+            provider: profile.provider,
+            forkHome,
+            worldPath: worldWorkingDirectory(world.handle),
+            mode,
+            native: !apiRail && ['claude', 'codex'].includes(profile.provider),
+          });
+          if (imported.kind === 'native') session = imported.sessionId;
+          else {
+            messages = [imported.message, ...args.messages];
+            deliveredMessages = 0;
+          }
+          return imported.kind;
+        };
+        const upload = spec.resumeFrom.upload;
+        const share = spec.resumeFrom.sessionId ? publicConversationShare(spec.resumeFrom.sessionId) : undefined;
+        if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
+          throw ApplicationFailure.create({
+            message: 'Use a public HTTPS ChatGPT or Claude share link, or paste a provider conversation ID.',
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+        }
+        if (upload) {
+          if (upload.projectId !== args.task.projectId)
+            throw new Error('uploaded conversation belongs to a different project');
+          if (!deps.objects) throw new Error('conversation import storage is unavailable');
+          const data = await deps.objects.get(conversationImportObjectKey(args.task.projectId, upload.id));
+          const kind = await applyPanagent({ data, name: upload.name }, 'transcript');
+          record(args.taskId, 'session.imported', { source: 'upload', format: upload.format, provider: profile.provider, kind });
+        } else if (share) {
+          const kind = await applyPanagent({ url: share }, 'context');
+          record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind });
+        } else if (spec.resumeFrom.sessionId) {
           // A raw pasted provider session id = "continue THIS exact session" (resume,
           // not fork). Materialize it into this turn's (home × world) so the provider
           // resolves it even when the id was minted under a DIFFERENT config home or
@@ -1562,11 +1598,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // The mock provider is hermetic — it has no on-disk session, so materialize is
           // meaningless; pass the id straight through. Real providers (claude/codex) key
           // a session to a file; make it visible in this turn's (home × world) or fail.
-          const materialized =
+          let materialized =
             profile.provider === 'mock' || apiRail
               || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
               ? true
               : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
+          // A local id may belong to the other native provider. Convert it into a
+          // new independent destination session instead of rejecting the id merely
+          // because the user selected a different agent above the source control.
+          if (!materialized && (profile.provider === 'claude' || profile.provider === 'codex')) {
+            const sourceProvider = profile.provider === 'claude' ? 'codex' : 'claude';
+            const sourceFile = findProviderSession({ provider: sourceProvider, session });
+            if (sourceFile) {
+              const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+              materialized = true;
+              record(args.taskId, 'session.imported', { source: 'local-id', sourceProvider, provider: profile.provider, kind });
+            }
+          }
           if (!materialized) {
             // The id resolves in NO config home for this provider. Fail loudly instead
             // of handing an unknown id to the adapter, which would silently start a
@@ -1576,19 +1624,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // id (we run under this profile's provider).
             record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
             throw ApplicationFailure.create({
-              message: `Cannot resume session "${session}": no such ${profile.provider} conversation found in any connected config home. Check the id, or that it belongs to a ${profile.provider} login connected to krmax (cross-provider resume is unsupported).`,
+              message: `Cannot find conversation "${session}" in any connected Codex or Claude history. Check the provider conversation ID and try again.`,
               type: 'agent-error',
               nonRetryable: true,
             });
           }
-          record(args.taskId, 'session.resumed', { session, materialized });
+          if (session === spec.resumeFrom.sessionId)
+            record(args.taskId, 'session.resumed', { session, materialized });
         } else if (spec.resumeFrom.taskId) {
           const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
           let srcHome: string | undefined;
           let srcProvider: string | undefined;
           const metaRaw = store.kvGet(`sessionmeta:${spec.resumeFrom.taskId}:${srcRole}`);
           if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
-          let forked = false;
+          let prepared = false;
           if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
             // OpenCode sessions live inside the harness's isolated XDG data home.
             // A native fork must start in the SOURCE home; otherwise account
@@ -1621,27 +1670,49 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // ids. Kimi and Grok currently do not; their native harnesses are not
             // admitted, and any historical profile uses the honest replay path.
             if (profile.provider === 'opencode') {
-              forked = true;
+              prepared = true;
             } else if (profile.provider !== 'kimi' && profile.provider !== 'grok') {
               if (remoteSubscriptionRail) {
                 const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
                 if (sourceHandle && isRemote(sourceHandle.kind)) {
                   try {
                     const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
-                    forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
+                    prepared = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
                   } catch { /* source world may have expired; try the durable local home below */ }
                 }
               }
-              if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
+              if (!prepared) prepared = materializeFork({ provider: profile.provider, session: srcSession,
                 forkHome, worldPath: worldWorkingDirectory(world.handle), srcHome });
             }
-            if (forked) {
+            if (prepared) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
               record(args.taskId, 'session.forked', { from: spec.resumeFrom, session: srcSession, native: true });
             }
           }
-          if (!forked) {
+          // When the selected destination agent differs, panagent translates the
+          // source's real native history into a fresh destination session. A missing
+          // native file still degrades safely to the stored visible transcript.
+          if (!prepared && srcSession && srcProvider && srcProvider !== profile.provider
+            && ['claude', 'codex'].includes(srcProvider)) {
+            const sourceFile = findProviderSession({ provider: srcProvider, session: srcSession, srcHome });
+            if (sourceFile) {
+              try {
+                const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+                prepared = true;
+                record(args.taskId, 'session.forked', {
+                  from: spec.resumeFrom, session: srcSession, native: kind === 'native', converted: true,
+                  sourceProvider: srcProvider, provider: profile.provider,
+                });
+              } catch (error) {
+                record(args.taskId, 'session.fork-conversion-failed', {
+                  from: spec.resumeFrom,
+                  reason: error instanceof Error ? error.message : String(error),
+                });
+              }
+            }
+          }
+          if (!prepared) {
             // Degraded fallback (no real source session file — e.g. the mock adapter,
             // a cleaned source, or a cross-provider jump): replay the source transcript
             // as context. NOT a native fork — flagged `native: false`.

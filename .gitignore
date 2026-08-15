@@ -22,6 +22,8 @@ deploy/backups/
 coverage/
 .vitest/
 .cache/
+__pycache__/
+*.py[cod]
 
 # editor / OS
 .DS_Store
