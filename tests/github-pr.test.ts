@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -1703,6 +1703,39 @@ describe('PR stage (remote policy "pr")', () => {
     await core.destroyWorld(handle);
   });
 
+  it('identifies a genuinely missing human GitHub PR connection before transport', async () => {
+    const gh = fakeGithub();
+    const repo = await repoWithGithubOrigin('missing-human');
+    const transport = vi.fn(async () => ({ env: {} }));
+    const core = await coreFor(gh, {
+      status: () => ({ configured: true, oauthConfigured: true, userAuthorized: false }),
+      activeUserAccountId: () => undefined,
+      repositoryCloneToken: async () => 'clone-token',
+      brokerCredentials: transport,
+    });
+    core.store.claimPersonalOrganization('jane');
+    const project = core.store.createProject('Missing human identity', { repos: [repo] });
+    const connection = core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: '77', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main', private: true,
+      gitConnectionId: connection.id });
+    core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = core.store.createTask({ projectId: project.id, title: 'Missing identity', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } });
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo,
+      base: 'main', target: 'main', kind: 'worktree' });
+    await fs.promises.writeFile(path.join(handle.root, 'change.txt'), 'x');
+    await git(handle.root, ['add', '-A']);
+    await git(handle.root, ['commit', '-q', '-m', 'change']);
+
+    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(
+      /GitHub PR identity is not connected.*Connect GitHub on your profile.*not a non-fast-forward or local ancestry error/i,
+    );
+    expect(transport).not.toHaveBeenCalled();
+    await core.destroyWorld(handle);
+  });
+
   it('uses the connected account for a configured local origin without a project attachment', async () => {
     const gh = fakeGithub();
     const repo = await repoWithGithubOrigin('connected-local');
@@ -1872,7 +1905,7 @@ describe('PR stage (remote policy "pr")', () => {
     const repo = await repoWithGithubOrigin('nocred');
     const handle = await core.createWorld({ taskId: 'task_pr3', projectId: project.id, repo,
       base: 'main', target: 'main', kind: 'worktree' });
-    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/GitHub account cannot access acme\/widgets.*reconnect GitHub on your profile/i);
+    await expect(core.openPr(handle, 'main', {})).rejects.toThrow(/GitHub identity\/authorization is missing for acme\/widgets.*not a branch-history conflict/i);
     await core.destroyWorld(handle);
   });
 });

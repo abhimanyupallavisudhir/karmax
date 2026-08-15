@@ -218,7 +218,7 @@ const DO_ROLE: WorkflowRole = {
 {{prompt}}
 
 # World
-Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
+Working directory: {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
 {{worldRepos}}
 
 {{instructions}}`,
@@ -289,7 +289,7 @@ const CONFIRM_ROLE: WorkflowRole = {
 You are the CONFIRM (review) agent for task "{{title}}". The Do agent has opened the finished proposal and it has reached the Review gate. Your job is to decide whether to accept this pull request — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work and its exact proposed head.
 
 # Work under review
-Worktree: {{worldPath}} (branch {{branch}} off {{base}}).
+Worktree: {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
 {{worldRepos}}
 Review summary: {{reviewInfo}}
 Changed files:
@@ -317,7 +317,7 @@ const RESPONDER_ROLE: WorkflowRole = {
 
 You are the RESPONDER for task "{{title}}". The working agent has paused and needs one decision or piece of information before it can continue. Answer that request; do not take over the task, edit its work, or review its finished proposal.
 
-Worktree (read-only context if needed): {{worldPath}} (branch {{branch}} off {{base}}).
+Worktree (read-only context if needed): {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
 {{worldRepos}}
 
 {{instructions}}

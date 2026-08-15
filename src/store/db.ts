@@ -4367,6 +4367,19 @@ export class Store {
     return next;
   }
 
+  /** Persist an accepted in-flight retarget on the durable world handle. The
+   * immutable base/baseSha remain untouched; only non-pinned repository targets
+   * follow the task-level destination. */
+  updateCurrentWorldTarget(worldId: string, target: string): WorldHandleRef {
+    const current = this.currentWorld(worldId);
+    if (!current) throw new Error('cannot retarget a missing world');
+    const repos = current.repos?.map((repo) => repo.targetPinned === false ? { ...repo, target } : repo);
+    const next = { ...current, target, ...(repos ? { repos } : {}) };
+    this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), current.id, current.generation ?? 1);
+    return next;
+  }
+
   updateWorldMeta(handle: WorldHandleRef, patch: Record<string, unknown>): WorldHandleRef {
     const current = this.currentWorld(handle.id);
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');

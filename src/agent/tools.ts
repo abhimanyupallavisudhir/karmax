@@ -565,7 +565,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'fork_agent',
     description: 'Branch an attached agent into an independent new task/session. The source remains untouched.',
-    parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' }, authorization_profile: { type: 'string' } }, required: ['task_id', 'message'] },
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' }, target: { type: 'string' }, authorization_profile: { type: 'string' } }, required: ['task_id', 'message'] },
   },
   {
     name: 'message_agent',
@@ -1153,7 +1153,7 @@ export function platformToolHandlers(
     async fork_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       return JSON.stringify(await platformRequest('POST', `/api/tasks/${taskId}/fork-agent`, {
-        role: args?.role ?? 'do', title: args?.title, message: args?.message,
+        role: args?.role ?? 'do', title: args?.title, message: args?.message, target: args?.target,
         authorizationProfile: args?.authorization_profile,
       }));
     },
