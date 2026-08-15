@@ -7,6 +7,7 @@ import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent, reconcilePullRequestView } from '../src/integrations/github-pr.js';
+import { GithubActionsApiError } from '../src/integrations/github-actions.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 
@@ -776,6 +777,7 @@ describe('GitHub-authoritative merge activity', () => {
     let newerSucceeded = false;
     let newerActive = false;
     let actionsAvailable = true;
+    let actionsForbidden = false;
     let readiness: any = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', databaseId: 501, name: 'CI', status: 'COMPLETED', conclusion: 'CANCELLED',
@@ -800,16 +802,19 @@ describe('GitHub-authoritative merge activity', () => {
     }) as typeof fetch;
     let reruns = 0;
     const actions = {
-      inspectFailure: async () => ({
-        run: { id: 31737743200, name: 'CI', workflowId: 9, runNumber: 100, attempt: cancelledAttempt,
-          event: 'pull_request', status: 'completed', conclusion: 'cancelled', branch: 'karmax/task_preempted',
-          // GitHub's pull_request run is attached to refs/pull/113/merge, not the PR head.
-          headSha: 'synthetic-merge-ref-sha', url: 'https://github.test/run/31737743200',
-          createdAt: '2026-08-14T00:00:00Z', updatedAt: '2026-08-14T00:01:00Z' },
-        jobs: [], failedJobs: [{ id: 501, name: 'CI', status: 'completed', conclusion: 'cancelled', url: '',
-          steps: [], log: { excerpt: inspectionLog, downloadedBytes: inspectionLog.length, truncated: false } }],
-        artifacts: [], notices: [],
-      }),
+      inspectFailure: async () => {
+        if (actionsForbidden) throw new GithubActionsApiError(403, 'Resource not accessible by integration');
+        return {
+          run: { id: 31737743200, name: 'CI', workflowId: 9, runNumber: 100, attempt: cancelledAttempt,
+            event: 'pull_request', status: 'completed', conclusion: 'cancelled', branch: 'karmax/task_preempted',
+            // GitHub's pull_request run is attached to refs/pull/113/merge, not the PR head.
+            headSha: 'synthetic-merge-ref-sha', url: 'https://github.test/run/31737743200',
+            createdAt: '2026-08-14T00:00:00Z', updatedAt: '2026-08-14T00:01:00Z' },
+          jobs: [], failedJobs: [{ id: 501, name: 'CI', status: 'completed', conclusion: 'cancelled', url: '',
+            steps: [], log: { excerpt: inspectionLog, downloadedBytes: inspectionLog.length, truncated: false } }],
+          artifacts: [], notices: [],
+        };
+      },
       listRuns: async () => ({ total: newerSucceeded || newerActive ? 2 : 1, page: 1, perPage: 100,
         runs: newerSucceeded || newerActive ? [{
         id: 31737743300, name: 'CI', workflowId: 9, runNumber: 101, attempt: 1,
@@ -909,6 +914,40 @@ describe('GitHub-authoritative merge activity', () => {
     expect(duplicateFallback).toMatchObject({ status: 'waiting',
       detail: expect.stringMatching(/instead of.*releasing its landing position.*asking a human/is) });
     expect(duplicateFallback).not.toHaveProperty('releaseAdmission');
+
+    // Missing App Actions access is diagnostic metadata, not the owner of the
+    // CI disposition. Permission-safe PR evidence still sends deterministic
+    // failures to Do, keeps supersession informational, and routes only direct
+    // provider/account evidence to a human.
+    actionsAvailable = true;
+    actionsForbidden = true;
+    readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'StatusContext', context: 'CI', state: 'FAILURE',
+        targetUrl: `https://github.com/${SLUG}/actions/runs/44`, description: 'AssertionError: expected 2 to equal 3',
+      }] } } };
+    const deterministic = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(deterministic).toMatchObject({
+      status: 'needs-revision',
+      detail: expect.stringMatching(/Actions permission can be reauthorized separately.*does not change.*classification/is),
+      repair: { kind: 'ci', fingerprint: expect.any(String) },
+    });
+    const repairFingerprint = deterministic.repair?.fingerprint;
+    await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(core.store.eventsSince(task.id, 0).filter((event) => event.type === 'github.ci.repair-requested'
+      && event.payload?.key === repairFingerprint)).toHaveLength(1);
+
+    readiness.statusCheckRollup.contexts.nodes[0].description = cancellation;
+    const forbiddenSuperseded = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    expect(forbiddenSuperseded).toMatchObject({ status: 'waiting',
+      detail: expect.stringMatching(/equivalent CI request.*waiting.*releasing its landing position/is) });
+    expect(forbiddenSuperseded).not.toHaveProperty('releaseAdmission');
+    expect(forbiddenSuperseded.detail).not.toMatch(/grant the GitHub App/i);
+
+    readiness.statusCheckRollup.contexts.nodes[0].description = 'GitHub Actions is disabled for this repository';
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
+      status: 'needs-human', detail: expect.stringMatching(/provider or account condition/i),
+    });
   });
 
   it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
