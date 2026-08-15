@@ -2105,15 +2105,22 @@ export class Gateway {
           const b = await this.body(req);
           const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
           const currentPolicy = store.getOrganizationUsagePolicy(organizationId);
+          const normalizedManagedProviders = (value: unknown): string[] | undefined => Array.isArray(value)
+            ? [...new Set(value.map((provider) => String(provider).trim()).filter(Boolean))].sort()
+            : undefined;
+          const requestedManagedProviders = normalizedManagedProviders((policy as any).managedModelProviders);
+          const managedProvidersChanged = Object.prototype.hasOwnProperty.call(policy, 'managedModelProviders')
+            && (requestedManagedProviders == null || JSON.stringify(requestedManagedProviders)
+              !== JSON.stringify(normalizedManagedProviders(currentPolicy.managedModelProviders)));
           const ownerOnlyChange = ([
             ['managedSpendCapMicros', currentPolicy.managedSpendCapMicros ?? null],
             ['maxActiveAgentTurns', currentPolicy.maxActiveAgentTurns ?? null],
           ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
-            && (policy as any)[key] !== current);
+            && (policy as any)[key] !== current) || managedProvidersChanged;
           if (ownerOnlyChange) {
             const subject = requireInteractiveHuman(callerIdentity);
             if (store.organizationMembership(organizationId, subject.userId)?.role !== 'owner')
-              return this.json(res, 403, { error: 'only an organization owner can change managed spend or agent concurrency guardrails' });
+              return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
           }
           try { return this.json(res, 200, store.setOrganizationUsagePolicy(organizationId, policy)); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }

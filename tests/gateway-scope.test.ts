@@ -166,7 +166,7 @@ describe('gateway request scope for bare-id routes', () => {
     store.setOrganizationPlan(acmeId, 'team');
   });
 
-  it('lets only an organization owner enable managed spend while admins may edit other guardrails', async () => {
+  it('lets only an organization owner change managed funding while admins may edit ordinary guardrails', async () => {
     store.setOrganizationPlan(acmeId, 'team');
     store.setOrganizationMembership(acmeId, 'b', 'admin');
     const ownerToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, acmeId).token;
@@ -181,16 +181,25 @@ describe('gateway request scope for bare-id routes', () => {
 
     const denied = await put('admin-usage-session', { managedSpendCapMicros: 1_000_000 });
     expect({ status: denied.status, body: await denied.json() }).toEqual({ status: 403,
-      body: { error: 'only an organization owner can change managed spend or agent concurrency guardrails' } });
+      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
     const deniedConcurrency = await put('admin-usage-session', { maxActiveAgentTurns: 3 });
     expect({ status: deniedConcurrency.status, body: await deniedConcurrency.json() }).toEqual({ status: 403,
-      body: { error: 'only an organization owner can change managed spend or agent concurrency guardrails' } });
+      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
+    const deniedManagedAdd = await put('admin-usage-session', { managedModelProviders: ['openai'] });
+    expect({ status: deniedManagedAdd.status, body: await deniedManagedAdd.json() }).toEqual({ status: 403,
+      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
     expect((await put('owner-usage-session', { managedSpendCapMicros: 1_000_000,
       managedModelProviders: ['openai'], maxActiveAgentTurns: 3 })).status).toBe(200);
-    expect((await put('admin-usage-session', { allowedModelProviders: ['openai'] })).status).toBe(200);
+    const deniedManagedRemove = await put('admin-usage-session', { managedModelProviders: [] });
+    expect({ status: deniedManagedRemove.status, body: await deniedManagedRemove.json() }).toEqual({ status: 403,
+      body: { error: 'only an organization owner can change managed funding or agent concurrency guardrails' } });
+    expect((await put('admin-usage-session', { allowedModelProviders: ['openai'],
+      allowedModels: ['openai/gpt-5'], maxAgentStartsPerMinute: 12,
+      maxRemoteStartsPerMinute: 6 })).status).toBe(200);
     const read = await fetch(endpoint, { headers: { authorization: 'Bearer owner-usage-session' } });
     expect(await read.json()).toMatchObject({ managedSpendCapMicros: 1_000_000,
-      managedModelProviders: ['openai'], allowedModelProviders: ['openai'], maxActiveAgentTurns: 3 });
+      managedModelProviders: ['openai'], allowedModelProviders: ['openai'], allowedModels: ['openai/gpt-5'],
+      maxAgentStartsPerMinute: 12, maxRemoteStartsPerMinute: 6, maxActiveAgentTurns: 3 });
   });
 
   it('renames only with edit authority in the matching project or organization', async () => {
