@@ -57,7 +57,7 @@ export interface PlatformOps {
   findTask(projectId: string, num: number): Promise<unknown>;
   listAgents(taskId: string): Promise<unknown>;
   getConversation(taskId: string, role?: string): Promise<unknown>;
-  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<{ id: string }>;
+  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; target?: string; authorizationProfile?: string }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
   listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
     workflow?: string | number; page?: number; perPage?: number }): Promise<unknown>;
@@ -415,7 +415,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'fork_agent',
     {
       description: 'Branch an attached agent into a new independent task and native provider session, preserving the source. Use message_agent for later back-and-forth with the fork.',
-      inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(), authorizationProfile: z.string().optional() },
+      inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(), target: z.string().optional(), authorizationProfile: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.forkAgent(a)).id),
   );

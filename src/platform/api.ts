@@ -47,6 +47,7 @@ import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
+import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
@@ -574,6 +575,13 @@ export class KarmaxApi {
         if (dirty.code !== 0) throw new Error(`could not inspect ${repo.name}: ${dirty.stderr || dirty.stdout}`);
         if (dirty.stdout.trim()) throw new Error(`repo "${repo.name}" has uncommitted changes; commit them before publishing`);
       }
+      const ancestry = await ensureTaskBranchAncestry(access.world,
+        task.lastView?.targetBranch ?? access.world.handle.target ?? access.world.handle.base);
+      if (Object.keys(ancestry.errors).length)
+        throw new Error(`could not publish ${Object.entries(ancestry.errors).map(([repo, detail]) => `${repo}: ${detail}`).join('; ')}`);
+      for (const repair of ancestry.repaired) {
+        this.deps.store.appendEvent({ taskId: task.id, type: 'branch.ancestry-repaired', ts: Date.now(), payload: repair });
+      }
       const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
       if (!result.pushed.length || result.skipped.length)
         throw new Error(`could not publish ${result.skipped.length ? describePublishFailures(result) : 'task branch'}`);
@@ -1010,6 +1018,12 @@ export class KarmaxApi {
       params: {
         ...taskOverrides,
         prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
+        // Once an immediate task is queued, branch policy is execution state,
+        // not an inheritable form default. Persist the exact pair provisioning
+        // receives so recovery/fork/retarget paths cannot reconstruct a
+        // different base from changed project settings.
+        ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
+        ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
         [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
         profiles: args.profiles,
         draft: !!args.draft,
@@ -1439,6 +1453,8 @@ export class KarmaxApi {
     // the repository default again over a project/task override.
     this.deps.store.updateTaskParams(task.id, {
       ...task.params,
+      ...(typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
+      ...(typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
     });
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
@@ -3074,7 +3090,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   /** Branch a source agent into an independent task/session; the source is never mutated. */
-  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<TaskRecord> {
+  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string; target?: string; authorizationProfile?: string }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
     if (!source) throw new NotFoundError(`no task ${args.taskId}`);
@@ -3085,7 +3101,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
       workflow: 'software-dev',
-      params: { prompt: args.message, 'agent:do': { resumeFrom: { taskId: args.taskId, role } } },
+      params: { prompt: args.message, ...(args.target ? { base: args.target, target: args.target } : {}),
+        'agent:do': { resumeFrom: { taskId: args.taskId, role } } },
       authorizationProfile: args.authorizationProfile,
     });
   }
@@ -3865,11 +3882,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    let accepted: boolean;
     try {
-      return (await this.workflowHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
+      accepted = (await this.workflowHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
     } catch {
       return false;
     }
+    if (accepted) this.persistAcceptedTarget(taskId, branch);
+    return accepted;
   }
 
   /**
@@ -3894,6 +3914,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     try {
       const result = (await this.workflowHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
+      if (result.applied.includes('target') && typeof patch.target === 'string')
+        this.persistAcceptedTarget(taskId, patch.target);
       // Unlike target (published in the live view) and agents (kept in their
       // effective snapshot), the Responder has no separate projection. Persist an
       // accepted route so refreshes and later edits show the route actually in play.
@@ -3910,6 +3932,17 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     } catch (e) {
       throw new Error(unwrapCause(e));
     }
+  }
+
+  /** Keep the workflow's accepted destination, stored task snapshot, and durable
+   * world handle coherent. The immutable base/baseSha deliberately do not move:
+   * retargeting changes where work lands, not where its custody chain began. */
+  private persistAcceptedTarget(taskId: string, target: string): void {
+    const task = this.deps.store.getTask(taskId);
+    if (task) this.deps.store.updateTaskParams(taskId, { ...task.params, target,
+      [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true });
+    const world = this.deps.store.currentWorld(taskId);
+    if (world) this.deps.store.updateCurrentWorldTarget(taskId, target);
   }
 
   /** The task's Review-route field (if its workflow has one) with the manifest it came from. */

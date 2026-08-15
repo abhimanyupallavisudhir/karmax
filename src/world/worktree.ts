@@ -150,14 +150,19 @@ export class WorktreeProvider implements WorldProvider {
         warnings?.push(`repo "${name}": local ${spec.base} differs from origin/${spec.base} — PR policy forked off origin`);
       }
     }
-    const verify = await git(repo, ['rev-parse', '--verify', baseRef]);
+    let verify = await git(repo, ['rev-parse', '--verify', baseRef]);
     if (verify.code !== 0) {
       baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
       // Don't fork off the wrong ref silently — surface that the configured base
       // was ignored so the misconfiguration is visible (and merges downstream can
       // no longer resolve `base` either; see finalizeMergeRepo).
       warnings?.push(`repo "${name}": base branch "${spec.base}" not found — forked off HEAD instead`);
+      verify = await git(repo, ['rev-parse', '--verify', baseRef]);
     }
+    // The ancestry check needs the exact provisioned commit, not a branch name
+    // that may move later. Origin-authoritative worlds set this while fetching;
+    // local/project-authoritative worlds resolve the same immutable fact here.
+    baseSha ??= verify.code === 0 ? verify.stdout.trim() : undefined;
 
     // Clean any stale worktree at this path, then claim a fresh one. The prune
     // and the add share one critical section: the prune frees admin-dir names
