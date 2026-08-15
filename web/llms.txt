@@ -1,0 +1,9 @@
+# krmax
+
+> krmax is a to-do list for managing AI agents instead of manually doing the work.
+
+krmax gives agents isolated cloud worlds, lets people or agents own review and input stages, and uses explicit authorization for project management, credentials, and payments.
+
+## Links
+
+- [Issue tracker](https://github.com/abhimanyupallavisudhir/krmax-issues/issues)

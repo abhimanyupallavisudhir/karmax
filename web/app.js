@@ -58,6 +58,8 @@ const S = {
   inboxFilter: 'all', // which kind of notification the inbox is pinned to (URL-owned)
   projectId: null,
   tasks: [],
+  avatars: [],
+  avatarAvailability: null,
   attemptGroup: null, // logical-task group for the open task page
   deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
   // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
@@ -332,7 +334,7 @@ function parseRoute(url) {
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', sub: seg[1] || null, legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
-    const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
     const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -347,7 +349,7 @@ function parseRoute(url) {
   // The inbox is the one org view with a sub-view (which kind of notification).
   if (ORG_VIEWS[seg[1]] === 'inbox') return { name: 'global', org, tab: 'inbox', sub: seg[2] || null };
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
-  const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const tab = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
@@ -577,17 +579,20 @@ async function applyRoute() {
     // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
     // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
+    S.avatarSelected = null;
     S.search = '';
     S.searchResult = null;
     S.searchPending = false;
     S.cursorId = null;
     await loadTasks().catch(() => {});
+    await loadAvatars().catch(() => {});
     if (!routeIsCurrent()) return;
   }
   else if (!S.tasks?.length) {
     await loadTasks().catch(() => {});
     if (!routeIsCurrent()) return;
   }
+  if (sameProject && (!S.avatarAvailability || S.avatarProjectId !== pid)) await loadAvatars().catch(() => {});
   // Same-project tabs are local navigation. Their complete last-painted inputs
   // are already in memory, so reveal the destination before refreshing tags,
   // views, fields, and (for the task list) the authoritative search result.
@@ -763,6 +768,7 @@ function principalLabel(principal) {
   if (!principal) return 'Unassigned';
   if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
   if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
+  if (principal.kind === 'avatar') return S.avatars?.find((a) => a.id === principal.avatarId)?.name || principal.avatarId;
   return principal.role === 'do' ? 'Task agent · Agent' : `Task agent · ${principal.role}`;
 }
 
@@ -967,15 +973,28 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
 
 function renderAgentField(f, spec, inherited) {
   const inh = inherited || {};
-  const e = spec || inh; // prefill with the effective spec
+  const role = f.role || f.name;
+  const pendingAvatarId = role === 'do' ? S.pendingAvatarId : null;
+  const requestedAvatarId = spec?.avatarId || pendingAvatarId || inh.avatarId || '';
+  const selectedAvatar = (S.avatars || []).find((avatar) => avatar.id === requestedAvatarId);
+  const e = selectedAvatar
+    ? { ...selectedAvatar.runtime, avatarId: selectedAvatar.id, resumeFrom: spec?.resumeFrom }
+    : spec || inh; // prefill with the effective spec
   const providerVisible = !e.provider || AGENT_PROVIDERS.includes(e.provider);
   const provider = agentProviderChoice(e.provider);
   const model = providerVisible ? e.model : '';
   const effort = providerVisible ? e.effort : '';
-  const role = f.role || f.name;
   const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
+  const availableAvatars = (S.avatars || []).filter((avatar) => avatar.callable && avatar.effectiveEnabled
+    && (!avatar.roles?.length || avatar.roles.includes(role)));
+  if (selectedAvatar && !availableAvatars.some((avatar) => avatar.id === selectedAvatar.id)) availableAvatars.push(selectedAvatar);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
-    <div class="agent-controls">
+    ${availableAvatars.length ? `<select class="af-avatar" aria-label="Agent identity">
+      <option value="">Project/default agent</option>
+      ${availableAvatars.map((avatar) => `<option value="${esc(avatar.id)}" ${avatar.id === selectedAvatar?.id ? 'selected' : ''}>${esc(avatar.name)} · Avatar</option>`).join('')}
+    </select>` : ''}
+    <div class="af-avatar-note" ${selectedAvatar ? '' : 'hidden'}>${selectedAvatar ? `${esc(selectedAvatar.purpose || 'Owner-controlled prompt and delegated authority')} · owned by ${esc(avatarOwnerName(selectedAvatar))}` : ''}</div>
+    <div class="agent-controls" ${selectedAvatar ? 'hidden' : ''}>
       <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
         <input class="af-model" placeholder="model" value="${esc(model || '')}" autocomplete="off" />
@@ -1011,6 +1030,20 @@ function readResume(box) {
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
   if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
   return resumeFrom;
+}
+
+function readAgentSpec(box) {
+  const avatarId = box.querySelector('.af-avatar')?.value || '';
+  const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarId);
+  const spec = { provider: avatar?.runtime?.provider || box.querySelector('.af-provider').value };
+  if (avatarId) spec.avatarId = avatarId;
+  const model = avatar?.runtime?.model || box.querySelector('.af-model').value.trim();
+  const effort = avatar?.runtime?.effort || box.querySelector('.af-effort').value;
+  if (model) spec.model = model;
+  if (effort) spec.effort = effort;
+  const resumeFrom = readResume(box);
+  if (resumeFrom) spec.resumeFrom = resumeFrom;
+  return spec;
 }
 
 // The confirmer field: an ordered LIST of confirm layers, played sequentially at
@@ -1078,12 +1111,12 @@ function renderConfirmerField(f, own, inherited, alt) {
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
+const normSpec = (s) => (s ? { avatarId: s.avatarId || '', provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
 // Canonical shape of a confirm layer for changed-vs-inherited comparison.
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
+      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -1096,13 +1129,7 @@ function readConfirmerLayers(box) {
       return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
     }
     const ab = row.querySelector('.agent-field');
-    const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
-    const model = ab.querySelector('.af-model').value.trim();
-    const effort = ab.querySelector('.af-effort').value;
-    if (model) spec.model = model;
-    if (effort) spec.effort = effort;
-    const resumeFrom = readResume(ab);
-    if (resumeFrom) spec.resumeFrom = resumeFrom;
+    const spec = { kind: 'agent', ...readAgentSpec(ab) };
     // Store the review-request prompt only when it diverges from the built-in
     // default; the pre-filled default itself is never persisted.
     const prompt = row.querySelector('.cf-prompt')?.value ?? '';
@@ -1175,13 +1202,8 @@ function collectForm(root, fields) {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
-      const spec = { provider: box.querySelector('.af-provider').value };
-      const model = box.querySelector('.af-model').value.trim();
-      const effort = box.querySelector('.af-effort').value;
-      if (model) spec.model = model;
-      if (effort) spec.effort = effort;
-      const resumeFrom = readResume(box);
-      if (resumeFrom) spec.resumeFrom = resumeFrom;
+      const spec = readAgentSpec(box);
+      const resumeFrom = spec.resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
       if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
       continue;
@@ -1460,6 +1482,28 @@ function wireAgentBox(box) {
     box.querySelector('.af-model').value = ''; // model choices are provider-specific
     refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
   });
+  const avatarSelect = box.querySelector('.af-avatar');
+  const syncAvatar = () => {
+    const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarSelect?.value);
+    const controls = box.querySelector('.agent-controls');
+    const note = box.querySelector('.af-avatar-note');
+    if (controls) controls.hidden = !!avatar;
+    if (note) {
+      note.hidden = !avatar;
+      note.textContent = avatar ? `${avatar.purpose || 'Owner-controlled prompt and delegated authority'} · owned by ${avatarOwnerName(avatar)}` : '';
+    }
+    if (avatar) {
+      box.querySelector('.af-provider').value = avatar.runtime.provider;
+      box.querySelector('.af-model').value = avatar.runtime.model || '';
+      refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+      const effort = box.querySelector('.af-effort');
+      if (effort && avatar.runtime.effort && [...effort.options].some((option) => option.value === avatar.runtime.effort)) effort.value = avatar.runtime.effort;
+    }
+  };
+  avatarSelect?.addEventListener('change', () => {
+    syncAvatar();
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  });
   // Fork-from search: the full task-picker overlay in agent mode (archived tasks
   // included — the completed ones are the ones you most often fork from).
   const chosen = box.querySelector('.af-resume-chosen');
@@ -1514,6 +1558,7 @@ function wireAgentBox(box) {
     }),
   );
   syncForkState();
+  syncAvatar();
 }
 function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach(wireAgentBox);
@@ -1648,11 +1693,7 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
-    const spec = { provider: box.querySelector('.af-provider').value };
-    const model = box.querySelector('.af-model').value.trim();
-    const effort = box.querySelector('.af-effort').value;
-    if (model) spec.model = model;
-    if (effort) spec.effort = effort;
+    const spec = readAgentSpec(box);
     return !sameJson(normSpec(spec), normSpec(inh));
   }
   if (f.type === 'confirmer') {
@@ -1690,12 +1731,15 @@ function resetPlainField(el, f, attr = 'data-inherit') {
 
 function resetAgentField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
+  const avatar = box.querySelector('.af-avatar');
+  if (avatar) avatar.value = inh.avatarId || '';
   const prov = box.querySelector('.af-provider');
   prov.value = inh.provider || 'claude';
   box.querySelector('.af-model').value = inh.model || '';
   refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
   const eff = box.querySelector('.af-effort');
   if (eff && inh.effort) eff.value = inh.effort;
+  avatar?.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function resetConfirmerField(box, attr = 'data-inherit') {
@@ -2341,7 +2385,18 @@ async function boot() {
   // card that a pending invitation is waiting, so a brand-new invitee knows to
   // create an account — with the address the invite was sent to.
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
-  if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
+  if (session.authRequired && !session.authenticated && !session.token) {
+    // The public root explains the product before asking for an account. Auth
+    // callbacks, invitations and explicit auth routes still land directly on
+    // the form they need, so a person following a link never has to hunt.
+    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login') return renderLogin();
+    if (location.pathname === '/signup') return renderSignup();
+    return renderLanding();
+  }
+  // Successful password/social auth returns to the public auth URL it started
+  // from. Those URLs are not organizations; canonicalise before app routing.
+  if (location.pathname === '/login' || location.pathname === '/signup')
+    history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
   const route = parseRoute(location.pathname);
@@ -2501,6 +2556,18 @@ async function loadTasks() {
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id)).map(pendingCancellationTask);
+  return true;
+}
+
+async function loadAvatars() {
+  const projectId = S.projectId;
+  if (!projectId) return false;
+  const epoch = S.avatarLoadEpoch = (S.avatarLoadEpoch || 0) + 1;
+  const result = await api(`/api/projects/${encodeURIComponent(projectId)}/avatars`);
+  if (S.avatarLoadEpoch !== epoch || S.projectId !== projectId) return false;
+  S.avatars = result.avatars || [];
+  S.avatarAvailability = result.availability || null;
+  S.avatarProjectId = projectId;
   return true;
 }
 
@@ -2978,6 +3045,7 @@ function refreshBrandAssets() {
 }
 
 function renderShell() {
+  window.onpopstate = null; // public-page history is replaced by the app router below
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
@@ -3266,9 +3334,9 @@ function renderMain() {
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: 'Project settings' };
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
+  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', avatars: 'Avatars', settings: 'Project settings' };
+  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
@@ -3284,6 +3352,7 @@ function renderMain() {
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
+  else if (S.tab === 'avatars') content = avatarsView(proj);
   else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
@@ -3299,6 +3368,7 @@ function renderMain() {
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
+  if (S.tab === 'avatars') wireAvatarsView(proj);
   if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
@@ -4881,6 +4951,8 @@ async function openTaskForm(workflow, draft, seedText) {
   });
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
+  // "Start with this Avatar" is a one-shot seed for the new task form.
+  S.pendingAvatarId = null;
   wireFieldResets($('#tf-body'), fields);
   const confirmerFrozen = !!draft?.id
     && !!formAttemptGroup?.attempts?.some((a) => !a.params?.draft);
@@ -9319,6 +9391,78 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
 
 const quickDefaultsHeader = () => '';
 
+// ── Avatars ──────────────────────────────────────────────────────────────
+function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
+function avatarRoleSummary(avatar) {
+  if (!avatar.roles?.length) return 'Any role';
+  const labels = { do: 'Do', confirm: 'Review', respond: 'Response', resolve: 'Resolve', merge: 'Merge', authorize: 'Authorize' };
+  return avatar.roles.map((role) => labels[role] || role).join(', ');
+}
+function avatarCallerSummary(avatar) {
+  const callers = avatar.callableBy || [];
+  if (callers.includes('@project')) return 'Everyone in this project';
+  if (callers.length === 1 && callers[0] === `user:${avatar.ownerUserId}`) return 'Only the owner';
+  return callers.length === 1 ? callers[0].replace(/^@?/, '') : `${callers.length} people or teams`;
+}
+function avatarDetailView(avatar) {
+  return `<div class="avatars-page avatar-detail"><button class="avatar-back icon-btn" type="button" aria-label="Back to Avatars">←</button>
+    <div class="avatar-detail-head"><div class="avatar-mark" aria-hidden="true">✦</div><div class="avatar-identity"><h1 class="page-title">${esc(avatar.name)}</h1><p>${esc(avatar.purpose || 'User-authored autonomous principal')}</p><span class="task-sub">Owned by ${esc(avatarOwnerName(avatar))} · Prompt version ${avatar.promptVersion}</span></div><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span></div>
+    <div class="avatar-actions">${avatar.callable && avatar.effectiveEnabled ? '<button class="btn primary avatar-start" type="button">Create task with Avatar</button>' : ''}${avatar.canEdit ? '<button class="btn avatar-edit" type="button">Edit</button>' : ''}${avatar.canDisable ? `<button class="btn avatar-toggle" type="button">${avatar.enabled ? 'Disable' : 'Enable'}</button>` : ''}${avatar.canEdit || avatar.canDisable ? '<button class="icon-btn avatar-remove" type="button" aria-label="Remove Avatar">⋯</button>' : ''}</div>
+    <div class="avatar-detail-grid"><section class="card"><div class="section-h">Instructions</div><div class="avatar-prompt">${renderMarkdown(avatar.prompt)}</div></section><aside><div class="card avatar-summary"><div><span>Authority</span><b>${avatar.authorityMode === 'full' ? 'Full delegation' : esc(avatar.authorization?.level || 'Restricted')}</b></div><div><span>Callable by</span><b>${esc(avatarCallerSummary(avatar))}</b></div><div><span>Roles</span><b>${esc(avatarRoleSummary(avatar))}</b></div><div><span>Runtime</span><b>${esc(`${avatar.runtime.provider}${avatar.runtime.model ? ` · ${avatar.runtime.model}` : ''}`)}</b></div><div><span>Vault</span><b>${(avatar.authorization?.capabilities || []).includes('*') || (avatar.authorization?.capabilities || []).includes('use-credential:*') ? 'Full access' : `${(avatar.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).length} credentials`}</b></div><div><span>GitHub</span><b>${avatar.githubAccountId ? 'Owner account connected' : 'No delegated account'}</b></div></div></aside></div></div>`;
+}
+function avatarsView(proj) {
+  if (!proj) return '<div class="empty">Select a project.</div>';
+  const selected = S.avatars.find((avatar) => avatar.id === S.avatarSelected);
+  if (selected) return avatarDetailView(selected);
+  const disabled = S.avatarAvailability && !S.avatarAvailability.effective;
+  return `<div class="avatars-page"><div class="settings-header avatar-list-head"><div><h1 class="page-title">Avatars</h1><p class="settings-intro">Trusted agents with delegated authority.</p></div>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
+    ${disabled ? '<div class="avatar-disabled card"><div><b>Avatars are disabled for this project.</b><p>Existing Avatars and their history remain visible, but they cannot be called.</p></div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>' : ''}
+    <div class="avatar-list">${S.avatars.map((avatar) => `<button class="avatar-row" type="button" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></button>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
+}
+
+async function openAvatarEditor(proj, avatar) {
+  const overlay = document.createElement('div'); overlay.className = 'overlay avatar-editor-overlay';
+  overlay.innerHTML = '<div class="modal-card avatar-editor"><div class="loading">Loading…</div></div>'; document.body.appendChild(overlay);
+  const close = () => overlay.remove(); overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  const [vaultItems, githubData] = await Promise.all([api(`/api/vault/items?organizationId=${encodeURIComponent(proj.organizationId)}`).catch(() => []), api('/api/user/github-accounts').catch(() => ({ accounts: [] }))]);
+  const githubAccounts = githubData.accounts || [], activeGithub = githubAccounts.find((account) => account.active);
+  const selectedCredentialIds = new Set((avatar?.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)));
+  let credentialPolicies = JSON.parse(JSON.stringify(avatar?.credentialPolicies || {}));
+  const callMode = avatar?.callableBy?.includes('@project') ? 'project' : avatar?.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
+  const roles = new Set(avatar?.roles || []), selectedAuth = avatar?.authorityMode === 'restricted' ? avatar.authorization : { level: 'developer', scope: 'projects', projectIds: [proj.id] };
+  const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
+  overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
+    <label class="form-row"><span>Name</span><input id="avatar-name" maxlength="80" value="${esc(avatar?.name || '')}" placeholder="Atlas"></label><label class="form-row"><span>Purpose</span><input id="avatar-purpose" maxlength="240" value="${esc(avatar?.purpose || '')}" placeholder="Handles implementation and routine approvals"></label><label class="form-row"><span>Instructions</span><textarea id="avatar-prompt" rows="12" placeholder="You are my trusted engineering delegate…">${esc(avatar?.prompt || '')}</textarea></label>
+    <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(`${runtime.provider}${runtime.model ? ` · ${runtime.model}` : ''}`)}</b></div></div>
+    <details class="settings-disclosure avatar-customize" ${avatar && (avatar.authorityMode === 'restricted' || callMode !== 'me' || roles.size) ? 'open' : ''}><summary><b>Customize…</b></summary><div class="avatar-custom-section"><div class="section-h">Authority</div>
+      <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All krmax, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
+      <div id="avatar-restricted" ${avatar?.authorityMode === 'restricted' ? '' : 'hidden'}>${authorizationEditorHtml('avatar-authorization', selectedAuth, S.projects.filter((item) => item.organizationId === proj.organizationId), proj.id)}<button class="btn tf-vault-button" id="avatar-vault" type="button"><span>Vault credentials</span><span id="avatar-vault-count">${selectedCredentialIds.size} selected</span></button></div>${activeGithub ? `<label class="choice-row compact"><input id="avatar-github" type="checkbox" ${avatar?.githubAccountId ? 'checked' : ''}><span><b>Use GitHub account ${esc(activeGithub.login)}</b><small>Delegate this connected account to the Avatar.</small></span></label>` : ''}</div>
+      <div class="avatar-custom-section"><div class="section-h">Callable by</div><select id="avatar-call-mode"><option value="me" ${callMode === 'me' ? 'selected' : ''}>Only me</option><option value="project" ${callMode === 'project' ? 'selected' : ''}>Everyone in this project</option><option value="specific" ${callMode === 'specific' ? 'selected' : ''}>Specific people and teams</option></select><input id="avatar-callers" value="${esc(callMode === 'specific' ? avatar.callableBy.join(', ') : '')}" placeholder="user:id, @team:engineering" ${callMode === 'specific' ? '' : 'hidden'}></div>
+      <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Do'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
+      <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls"><select id="avatar-provider">${AGENT_PROVIDERS.map((provider) => `<option value="${provider}" ${provider === runtime.provider ? 'selected' : ''}>${provider}</option>`).join('')}</select><input id="avatar-model" value="${esc(runtime.model || '')}" placeholder="Project default model"><select id="avatar-effort"><option value="">Default effort</option>${['low','medium','high','xhigh','max'].map((effort) => `<option ${runtime.effort === effort ? 'selected' : ''}>${effort}</option>`).join('')}</select></div></div></details></div>
+    <div class="avatar-editor-actions"><button class="btn avatar-editor-cancel" type="button">Cancel</button><button class="btn primary avatar-editor-save" type="button">${avatar ? 'Save Avatar' : 'Create Avatar'}</button></div>`;
+  overlay.querySelector('.avatar-editor-close').addEventListener('click', close); overlay.querySelector('.avatar-editor-cancel').addEventListener('click', close);
+  const authorityInputs = [...overlay.querySelectorAll('[name="avatar-authority"]')];
+  const syncAuthority = () => { const mode = authorityInputs.find((input) => input.checked)?.value || 'full'; overlay.querySelector('#avatar-restricted').hidden = mode !== 'restricted'; overlay.querySelector('#avatar-authority-summary').textContent = mode === 'full' ? 'Full delegation from you' : 'Restricted delegation'; };
+  authorityInputs.forEach((input) => input.addEventListener('change', syncAuthority)); wireAuthorizationEditor(overlay.querySelector('#avatar-authorization'), S.projects.filter((item) => item.organizationId === proj.organizationId));
+  overlay.querySelector('#avatar-vault')?.addEventListener('click', () => openVaultGrantPicker(vaultItems, selectedCredentialIds, credentialPolicies, (ids, policies) => { selectedCredentialIds.clear(); ids.forEach((id) => selectedCredentialIds.add(id)); credentialPolicies = policies; overlay.querySelector('#avatar-vault-count').textContent = `${selectedCredentialIds.size} selected`; }));
+  const callModeEl = overlay.querySelector('#avatar-call-mode'); callModeEl.addEventListener('change', () => { overlay.querySelector('#avatar-callers').hidden = callModeEl.value !== 'specific'; });
+  const anyRole = overlay.querySelector('#avatar-any-role'), roleGrid = overlay.querySelector('.avatar-role-grid'); anyRole.addEventListener('change', () => { roleGrid.hidden = anyRole.checked; });
+  overlay.querySelector('.avatar-editor-save').addEventListener('click', async () => {
+    const button = overlay.querySelector('.avatar-editor-save'); button.disabled = true; const authorityMode = authorityInputs.find((input) => input.checked)?.value || 'full';
+    const callableBy = callModeEl.value === 'me' ? [`user:${S.user.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
+    try { const saved = await api(`/api/projects/${proj.id}/avatars${avatar ? `/${avatar.id}` : ''}`, { method: avatar ? 'PUT' : 'POST', body: JSON.stringify({ name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value, prompt: overlay.querySelector('#avatar-prompt').value, authorityMode, ...(authorityMode === 'restricted' ? { authorization: readAuthorizationEditor(overlay.querySelector('#avatar-authorization')), credentialIds: [...selectedCredentialIds], credentialPolicies } : {}), githubAccountId: overlay.querySelector('#avatar-github')?.checked ? activeGithub?.id : null, callableBy, roles: anyRole.checked ? [] : [...roleGrid.querySelectorAll('input:checked')].map((input) => input.value), runtime: { provider: overlay.querySelector('#avatar-provider').value, model: overlay.querySelector('#avatar-model').value.trim() || undefined, effort: overlay.querySelector('#avatar-effort').value || undefined } }) }); close(); await loadAvatars(); S.avatarSelected = saved.id; renderMain(); toast(avatar ? 'Avatar saved' : 'Avatar created'); } catch (error) { button.disabled = false; toast(error.message, true); }
+  }); overlay.querySelector('#avatar-name').focus();
+}
+
+function wireAvatarsView(proj) {
+  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelectorAll('.avatar-row').forEach((row) => row.addEventListener('click', () => { S.avatarSelected = row.dataset.avatar; renderMain(); })); document.querySelector('.avatar-back')?.addEventListener('click', () => { S.avatarSelected = null; renderMain(); });
+  const avatar = S.avatars.find((item) => item.id === S.avatarSelected); document.querySelector('.avatar-edit')?.addEventListener('click', () => openAvatarEditor(proj, avatar)); document.querySelector('.avatar-start')?.addEventListener('click', () => { S.pendingAvatarId = avatar.id; openTaskForm('software-dev'); });
+  document.querySelector('.avatar-toggle')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !avatar.enabled }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
+  document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); S.avatarSelected = null; await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
+  document.querySelector('.avatar-project-enable')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatar-settings`, { method: 'PUT', body: JSON.stringify({ value: 'enabled' }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
+}
+
 // ── wiki (org/project skills, memories, and prompts — one content system) ─────
 // One view serves both scopes: /<org>/wiki (proj = null) and /<org>/<project>/wiki.
 // The left rail lists the wiki tree; the pane shows the Index (every `default`-
@@ -10031,7 +10175,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Where tasks run</a><a href="#project-agents">Codex/Claude</a><a href="#project-avatars">Avatars</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
@@ -10053,6 +10197,8 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-compute"><div>Where tasks run</div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Codex/Claude</div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization Codex/Claude accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="settings-section-title" id="project-avatars"><div>Avatars<small>Whether autonomous principals may be used in this project</small></div></div>
+    <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     ${explanationSettingsCard('project')}
@@ -10083,6 +10229,31 @@ function cloudEnvironmentCard(proj) {
 function paneError(box, error, retry) {
   box.innerHTML = `<div class="inline-form"><span class="task-sub" style="color:var(--warn)" title="${esc(error?.message || '')}">Couldn’t load this section.</span><button type="button" class="btn sm">Retry</button></div>`;
   box.querySelector('button').addEventListener('click', retry);
+}
+
+async function hydrateAvatarAvailability(scope, id) {
+  const box = scope === 'project' ? $('#project-avatar-settings') : $('#organization-avatar-settings');
+  if (!box) return;
+  const url = scope === 'project'
+    ? `/api/projects/${encodeURIComponent(id)}/avatar-settings`
+    : `/api/organizations/${encodeURIComponent(id)}/avatar-settings`;
+  try {
+    const policy = await api(url);
+    if (scope === 'organization') {
+      box.innerHTML = `<label class="choice-row compact"><input type="checkbox" ${policy.enabled ? 'checked' : ''}><span><b>Enable Avatars in this organization</b><small>Projects can disable them individually. Disabling preserves every Avatar and its history.</small></span></label>`;
+      box.querySelector('input').addEventListener('change', async (event) => {
+        try { await api(url, { method: 'PUT', body: JSON.stringify({ enabled: event.target.checked }) }); toast(event.target.checked ? 'Avatars enabled' : 'Avatars disabled'); }
+        catch (error) { event.target.checked = !event.target.checked; toast(error.message, true); }
+      });
+      return;
+    }
+    box.innerHTML = `<label class="form-row"><span>Availability</span><select><option value="inherit" ${policy.project === 'inherit' ? 'selected' : ''}>Inherit organization setting</option><option value="enabled" ${policy.project === 'enabled' ? 'selected' : ''}>Enabled</option><option value="disabled" ${policy.project === 'disabled' ? 'selected' : ''}>Disabled</option></select></label><p class="task-sub">Currently <b>${policy.effective ? 'enabled' : 'disabled'}</b>${policy.organization ? '' : ' because Avatars are disabled for the organization'}. Existing Avatars are retained when disabled.</p>`;
+    box.querySelector('select').addEventListener('change', async (event) => {
+      const previous = policy.project;
+      try { await api(url, { method: 'PUT', body: JSON.stringify({ value: event.target.value }) }); await loadAvatars().catch(() => {}); toast('Avatar availability saved'); await hydrateAvatarAvailability(scope, id); }
+      catch (error) { event.target.value = previous; toast(error.message, true); }
+    });
+  } catch (error) { paneError(box, error, () => hydrateAvatarAvailability(scope, id)); }
 }
 
 async function hydrateProjectSecrets(proj) {
@@ -10543,6 +10714,7 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
+  hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);
   hydrateProjectData(proj);
   hydrateProjectServices(proj);
@@ -13360,7 +13532,7 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-avatars">Avatars</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -13373,6 +13545,9 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-compute"><div>Where tasks run</div></div>
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+
+    <div class="settings-section-title" id="settings-avatars"><div>Avatars<small>Organization-wide availability</small></div></div>
+    <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
 
     ${globalSettingsView(true)}
 
@@ -13415,6 +13590,7 @@ async function hydrateOrganizationView() {
     && !!$('#org-members');
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
+  hydrateAvatarAvailability('organization', organizationId);
   await loadCollaboration().catch(() => {});
   if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -14387,8 +14563,145 @@ function wireSocialBtn(id, provider, errSelector) {
   });
 }
 
+// ── public landing ──────────────────────────────────────────────────────────
+
+function openPublicAuth(path, render) {
+  history.pushState({ kx: 1 }, '', path);
+  render();
+}
+
+function renderLanding() {
+  document.body.classList.add('landing-active');
+  document.title = 'krmax — the to-do list for agents';
+  $('#app').innerHTML = `<div class="landing-page">
+    <a class="landing-skip" href="#landing-main">Skip to content</a>
+    <header class="landing-nav" aria-label="Primary navigation">
+      <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
+      <div class="landing-nav-actions">
+        <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
+        <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
+        <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
+      </div>
+    </header>
+
+    <main id="landing-main">
+      <section class="landing-hero" aria-labelledby="landing-title">
+        <div class="landing-hero-copy">
+          <h1 id="landing-title" class="landing-analogy">
+            <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
+            <span><strong>krmax</strong><span>is a fancy <b>to-do list.</b></span></span>
+          </h1>
+          <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
+          <div class="landing-hero-actions">
+            <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
+          </div>
+        </div>
+
+        <figure class="product-frame" aria-label="krmax task list showing agents working in parallel">
+          <div class="product-browserbar"><i></i><i></i><i></i><span>krmax.io / krmax</span><b>⌘ K</b></div>
+          <div class="product-shell">
+            <aside class="product-rail">
+              <div class="product-wordmark">${brandMark()}<strong>krmax</strong></div>
+              <small>PROJECTS</small>
+              <div class="product-project active"><span>◇</span> krmax</div>
+              <div class="product-project"><span>◇</span> Website</div>
+              <div class="product-project"><span>◇</span> Research</div>
+              <div class="product-rail-spacer"></div>
+              <div class="product-project"><span>🕮</span> Wiki</div>
+              <div class="product-project"><span>⚙</span> Settings</div>
+            </aside>
+            <div class="product-main">
+              <div class="product-topline"><span>Tasks <b>7</b></span><span>Queues</span><span>Wiki</span><span>Settings</span><i>+ New task</i></div>
+              <div class="product-compose"><span>What needs doing?</span><kbd>⌘ ↵</kbd></div>
+              <div class="product-list-head"><span>COMPLETED</span><span>7 tasks</span></div>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Support e2b cloud environments for agents</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Support Github auto-merge, merge queues in addition to native merge queue</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Password vault: implement git-backed <code>unix pass</code> importer</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Let agents create accounts with agentmail.to</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Add spending limits for agents</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>MathJaX support in agent conversations</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Wiki-based agent memory</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+            </div>
+          </div>
+        </figure>
+      </section>
+
+      <section class="landing-principles" aria-labelledby="principles-title">
+        <div class="landing-principles-content">
+          <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
+          <div class="landing-checks">
+            <article><h3>Agents work parallelly in isolated cloud worlds.</h3></article>
+            <article><h3>Yes, gitignored files are handled correctly.</h3><p>secrets, databases, big files</p></article>
+            <article><h3>Bring your own key or OpenAI/Claude subscription</h3></article>
+            <article><h3>krmax MCP lets agents access and manage your krmax projects</h3><p>if you authorize it.</p></article>
+            <article class="wide"><h3>Connect a password vault and a payment card, and let agents Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-control" aria-labelledby="control-title">
+        <div class="landing-control-copy">
+          <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
+          <p>Want a human-managed to-do list of AI engineers? Want the automated company? krmax can do both.</p>
+        </div>
+        <div class="landing-control-list">
+          <article><p>krmax MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
+          <article><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
+          <article><p>krmax comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
+        </div>
+      </section>
+
+      <section class="landing-final" aria-labelledby="final-title">
+        <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+        <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
+        <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with krmax <span aria-hidden="true">→</span></button>
+      </section>
+    </main>
+
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+  </div>`;
+
+  const signIn = () => openPublicAuth('/login', renderLogin);
+  const signUp = () => openPublicAuth('/signup', renderSignup);
+  $('#landing-sign-in')?.addEventListener('click', signIn);
+  ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', signUp));
+  window.onpopstate = () => boot();
+}
+
 function renderLogin() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Sign in · krmax';
+  window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <a href="/" id="login-home" class="login-home">← About krmax</a>
     <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a krmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
@@ -14417,6 +14730,7 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  $('#login-home')?.addEventListener('click', (e) => { e.preventDefault(); history.pushState({ kx: 1 }, '', '/'); renderLanding(); });
   wireSocialBtn('google-btn', 'google', '#login-err');
   wireSocialBtn('github-btn', 'github', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
@@ -14427,7 +14741,7 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', renderSignup);
+  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
   $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -14502,6 +14816,9 @@ function renderResetPassword(token) {
 }
 
 function renderSignup() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Create account · krmax';
+  window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
     ${S.pendingInvite
@@ -14553,7 +14870,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err');
   wireSocialBtn('signup-github-btn', 'github', '#signup-err');
-  $('#signup-back').addEventListener('click', renderLogin);
+  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 

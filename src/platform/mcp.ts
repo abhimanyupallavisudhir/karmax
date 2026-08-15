@@ -428,10 +428,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'escalate_to_human',
     {
       description:
-        'Pause your current task at its exact stage and request input from selected people or teams. ' +
-        'Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+        'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
+        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Calling this stops the current turn; the task resumes when a selected human responds. ' +
+        'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
@@ -447,9 +447,9 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Request exact missing Karmax capabilities for this task. The request appears in the task Approval Requests tab ' +
-        'and is routed to selected people or teams. Audience selectors: user:<id>, @team:<slug>, @creator, @owners, ' +
+        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, ' +
         '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Only a selected human who already holds every requested capability can approve; approval resumes the task ' +
+        'Only a selected principal that already holds every requested capability can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {

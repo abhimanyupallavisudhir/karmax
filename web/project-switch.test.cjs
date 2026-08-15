@@ -33,6 +33,7 @@ global.projectBySlug = (slug) => (slug === 'b' ? { id: 'B', name: 'B' } : null);
 global.go = () => { calls.push('go'); };
 global.toast = () => { calls.push('toast'); };
 global.loadTasks = async () => { calls.push('loadTasks'); S.tasks = [{ id: 't_new', projectId: S.projectId }]; };
+global.loadAvatars = async () => { calls.push('loadAvatars'); S.avatarProjectId = S.projectId; S.avatarAvailability = { effective: true }; };
 global.loadOrg = async () => { calls.push(`loadOrg:${S.projectId}`); S.orgProjectId = S.projectId; S.views = [{ id: 'vB' }]; };
 global.loadOrganizationRuntimeCatalog = async () => {};
 global.loadCollaboration = async () => { calls.push(`loadCollaboration:${S.organizationId}`); };
@@ -62,6 +63,8 @@ global.S = {
   views: [{ id: 'vA' }],
   tab: 'tasks',
   selected: null,
+  avatars: [],
+  avatarAvailability: null,
 };
 
 eval(extractFn('applyRoute'));
