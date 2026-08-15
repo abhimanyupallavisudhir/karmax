@@ -610,6 +610,7 @@ export class Store {
         subscriptionId TEXT UNIQUE, plan TEXT NOT NULL, status TEXT NOT NULL,
         seats INTEGER NOT NULL, itemsJson TEXT NOT NULL, currentPeriodEnd INTEGER,
         cancelAtPeriodEnd INTEGER NOT NULL, lastEventAt INTEGER NOT NULL,
+        lastEventRank INTEGER NOT NULL DEFAULT 0,
         verifiedAt INTEGER, pastDueAt INTEGER, lastError TEXT,
         createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
@@ -780,6 +781,13 @@ export class Store {
     const subscriptionBillingCols = this.db.prepare('PRAGMA table_info(subscription_billing_accounts)').all() as { name: string }[];
     if (!subscriptionBillingCols.some((c) => c.name === 'pastDueAt'))
       this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN pastDueAt INTEGER');
+    if (!subscriptionBillingCols.some((c) => c.name === 'lastEventRank'))
+      this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN lastEventRank INTEGER NOT NULL DEFAULT 0');
+    this.db.exec(`UPDATE subscription_billing_accounts SET lastEventRank=CASE status
+      WHEN 'canceled' THEN 690 WHEN 'incomplete_expired' THEN 680
+      WHEN 'unpaid' THEN 670 WHEN 'paused' THEN 660 WHEN 'incomplete' THEN 650
+      WHEN 'past_due' THEN 640 WHEN 'active' THEN 630 WHEN 'trialing' THEN 620
+      ELSE 610 END WHERE lastEventAt > 0 AND lastEventRank=0`);
     const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
     if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
     const attachmentCols = this.db.prepare('PRAGMA table_info(resource_attachments)').all() as { name: string }[];

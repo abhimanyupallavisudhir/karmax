@@ -21,11 +21,64 @@ const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
 
 describe('hosted subscription billing', () => {
+  it('reconciles equal-second lifecycle collisions deterministically', async () => {
+    const reconcile = async (deliveries: Array<'active' | 'deleted' | 'paid' | 'failed'>) => {
+      const store = new Store(':memory:', { hosted: true });
+      const organization = store.createOrganization({ name: `Collision ${deliveries.join('-')}`, ownerUserId: 'owner' });
+      const billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+      await billing.checkout(organization.id, 'team',
+        { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' },
+        `checkout-${deliveries.join('-')}`);
+      const subscription = { id: `sub_${organization.id}`, customer: `cus_${organization.id}`,
+        status: 'active', items: { data: [
+          { id: 'si_base', price: { id: 'price_team_base' }, quantity: 1 },
+        ] } };
+      if (deliveries.includes('paid') || deliveries.includes('failed'))
+        billing.handleWebhook(event('evt_seed', 'customer.subscription.updated', subscription, 90));
+      for (const [index, delivery] of deliveries.entries()) {
+        if (delivery === 'active')
+          billing.handleWebhook(event(`evt_active_${index}`, 'customer.subscription.updated', subscription, 100));
+        else if (delivery === 'deleted')
+          billing.handleWebhook(event(`evt_deleted_${index}`, 'customer.subscription.deleted', subscription, 100));
+        else billing.handleWebhook(event(`evt_invoice_${delivery}_${index}`,
+          delivery === 'paid' ? 'invoice.paid' : 'invoice.payment_failed',
+          { id: 'in_collision', customer: `cus_${organization.id}`, subscription: subscription.id }, 100));
+      }
+      const state = billing.current(organization.id);
+      store.close();
+      return state;
+    };
+
+    // Deletion is sticky and payment recovery outranks failure for the same
+    // provider second, regardless of network delivery order.
+    await expect(reconcile(['active', 'deleted'])).resolves.toMatchObject({ plan: 'free', status: 'canceled' });
+    await expect(reconcile(['deleted', 'active'])).resolves.toMatchObject({ plan: 'free', status: 'canceled' });
+    await expect(reconcile(['paid', 'failed'])).resolves.toMatchObject({ plan: 'team', status: 'active' });
+    await expect(reconcile(['failed', 'paid'])).resolves.toMatchObject({ plan: 'team', status: 'active' });
+
+    const database = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-billing-order-')), 'billing.db');
+    let durableStore = new Store(database, { hosted: true });
+    const durableOrganization = durableStore.createOrganization({ name: 'Durable collision', ownerUserId: 'owner' });
+    let durableBilling = new SubscriptionBillingService(durableStore, new FakeSubscriptionProvider(), true);
+    await durableBilling.checkout(durableOrganization.id, 'team',
+      { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-durable-order');
+    const durableSubscription = { id: 'sub_durable', customer: `cus_${durableOrganization.id}`, status: 'active',
+      items: { data: [{ id: 'si_base', price: { id: 'price_team_base' }, quantity: 1 }] } };
+    durableBilling.handleWebhook(event('evt_durable_deleted', 'customer.subscription.deleted', durableSubscription, 100));
+    durableStore.close();
+    durableStore = new Store(database, { hosted: true });
+    durableBilling = new SubscriptionBillingService(durableStore, new FakeSubscriptionProvider(), true);
+    durableBilling.handleWebhook(event('evt_durable_active', 'customer.subscription.updated', durableSubscription, 100));
+    expect(durableBilling.current(durableOrganization.id)).toMatchObject({ plan: 'free', status: 'canceled' });
+    durableStore.close();
+  });
+
   it('derives plan and seats only from verified provider events and reconciles failures idempotently', async () => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const provider = new FakeSubscriptionProvider();
     const billing = new SubscriptionBillingService(store, provider, true);
+    expect(() => billing.assertOrganizationDeletionAllowed(organization.id)).not.toThrow();
 
     const checkout = await billing.checkout(organization.id, 'team',
       { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-request-1');
@@ -60,6 +113,8 @@ describe('hosted subscription billing', () => {
     billing.handleWebhook(event('evt_checkout', 'checkout.session.completed', {
       id: 'cs_test', customer: `cus_${organization.id}`, subscription: 'sub_acme',
     }, 110));
+    expect(() => billing.assertOrganizationDeletionAllowed(organization.id))
+      .toThrow('provider subscription is none');
     expect(billing.handleWebhook(event('evt_1', 'customer.subscription.updated', subscription))).toEqual({ duplicate: false });
     expect(billing.current(organization.id)).toMatchObject({ plan: 'team', status: 'active', seats: 3,
       activeUsers: 1, seatDeficit: 0, access: 'active' });
@@ -139,6 +194,7 @@ describe('hosted subscription billing', () => {
 
     billing.handleWebhook(event('evt_trial', 'customer.subscription.updated', subscription('trialing'), 200));
     expect(store.getOrganization(organization.id)?.plan).toBe('team');
+    expect(() => billing.assertOrganizationDeletionAllowed(organization.id)).toThrow('provider subscription is trialing');
     store.setOrganizationMembership(organization.id, 'second', 'member');
 
     billing.handleWebhook(event('evt_past_due', 'invoice.payment_failed', {
@@ -158,6 +214,7 @@ describe('hosted subscription billing', () => {
       currentMemberCount: 2, overMemberLimit: true,
       memberAdmissionAllowed: false, agentRunAdmissionAllowed: false,
     });
+    expect(() => billing.assertOrganizationDeletionAllowed(organization.id)).toThrow('provider subscription is past_due');
     expect(() => store.setOrganizationMembership(organization.id, 'third', 'member'))
       .toThrow('Remove 1 member or restore Team');
 
@@ -172,6 +229,10 @@ describe('hosted subscription billing', () => {
       const created = 230 + index * 2;
       billing.handleWebhook(event(`evt_${status}`, 'customer.subscription.updated', subscription(status), created));
       expect(store.getOrganization(organization.id)?.plan, status).toBe('free');
+      if (status === 'incomplete_expired' || status === 'canceled')
+        expect(() => billing.assertOrganizationDeletionAllowed(organization.id), status).not.toThrow();
+      else expect(() => billing.assertOrganizationDeletionAllowed(organization.id), status)
+        .toThrow(`provider subscription is ${status}`);
       if (index < 4) {
         billing.handleWebhook(event(`evt_active_${index}`, 'customer.subscription.updated', subscription('active'), created + 1));
         expect(store.getOrganization(organization.id)?.plan).toBe('team');
@@ -179,6 +240,7 @@ describe('hosted subscription billing', () => {
     }
     billing.handleWebhook(event('evt_deleted', 'customer.subscription.deleted', subscription('canceled'), 300));
     expect(store.getOrganization(organization.id)?.plan).toBe('free');
+    expect(() => billing.assertOrganizationDeletionAllowed(organization.id)).not.toThrow();
     billing.handleWebhook(event('evt_late_invoice', 'invoice.paid', {
       id: 'in_late', customer: `cus_${organization.id}`, subscription: 'sub_lifecycle',
     }, 310));
@@ -255,10 +317,10 @@ describe('subscription administration HTTP authorization', () => {
   let memberOrganizationId: string;
 
   beforeAll(async () => {
-    store = new Store(':memory:');
+    store = new Store(':memory:', { hosted: true });
     tokens = new TokenAuthority();
     billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
-    const memberOrganization = store.createOrganization({ name: 'Member only', ownerUserId: 'another-owner' });
+    const memberOrganization = store.createOrganization({ name: 'Member only' });
     memberOrganizationId = memberOrganization.id;
     store.setOrganizationMembership(memberOrganization.id, 'me', 'member');
     const client = { workflow: { getHandle: () => ({}) } } as any;
@@ -325,5 +387,31 @@ describe('subscription administration HTTP authorization', () => {
       { headers: { authorization: `Bearer ${browserToken}` } })).json() as any;
     expect(memberState.canManage).toBe(false);
     expect(ownerState.canManage).toBe(true);
+  });
+
+  it('blocks organization deletion for nonterminal billing even when effective access is Free', async () => {
+    const organization = store.createOrganization({ name: 'Delete billing safely', ownerUserId: 'me' });
+    await billing.checkout(organization.id, 'individual',
+      { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-delete-safety');
+    const subscription = (status: string) => ({ id: `sub_${organization.id}`,
+      customer: `cus_${organization.id}`, status,
+      items: { data: [{ id: 'si_individual', price: { id: 'price_individual' }, quantity: 1 }] } });
+    billing.handleWebhook(event('evt_delete_active', 'customer.subscription.updated', subscription('active'), 400));
+    billing.handleWebhook(event('evt_delete_unpaid', 'customer.subscription.updated', subscription('unpaid'), 410));
+    expect(store.getOrganization(organization.id)?.plan).toBe('free');
+
+    const remove = () => fetch(`${base}/api/organizations/${organization.id}`, {
+      method: 'DELETE', headers: { authorization: `Bearer ${browserToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ confirmSlug: organization.slug }),
+    });
+    const blocked = await remove();
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toMatchObject({ error: expect.stringContaining('provider subscription is unpaid') });
+    expect(store.getOrganization(organization.id)).toBeDefined();
+
+    billing.handleWebhook(event('evt_delete_canceled', 'customer.subscription.updated', subscription('canceled'), 420));
+    const removed = await remove();
+    expect(removed.status).toBe(200);
+    expect(store.getOrganization(organization.id)).toBeUndefined();
   });
 });

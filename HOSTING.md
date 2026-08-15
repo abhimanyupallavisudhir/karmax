@@ -209,6 +209,15 @@ not owned by billing; callers that require it can wrap this owner-only seam and
 persist their versioned acceptance record alongside the returned commercial
 snapshot without trusting prices submitted by the browser.
 
+Webhook reconciliation persists both the provider timestamp and a deterministic
+same-second precedence. Signed subscription snapshots outrank invoice summaries,
+terminal deletion/cancellation is sticky, and `invoice.paid` outranks an
+equal-time `invoice.payment_failed`; a strictly newer event can still recover or
+start a replacement subscription. Organization deletion is refused whenever a
+mapped provider subscription is nonterminal—even if effective access is Free.
+Only signed `canceled`/deleted or `incomplete_expired` state is terminal; an
+account with no associated provider subscription is also safe to remove.
+
 Active and trialing subscriptions grant the verified plan. Past-due
 organizations retain it for seven days and receive a billing portal recovery
 action. A process-level sweep runs every minute and returns the organization to

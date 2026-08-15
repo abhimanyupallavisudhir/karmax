@@ -9,6 +9,7 @@ const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
 export const PAST_DUE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 export type SubscriptionStatus = 'none' | 'trialing' | 'active' | 'past_due' | 'unpaid'
   | 'incomplete' | 'incomplete_expired' | 'paused' | 'canceled';
+export const TERMINAL_PROVIDER_SUBSCRIPTION_STATUSES = ['canceled', 'incomplete_expired'] as const;
 
 export interface SubscriptionCatalogConfig {
   individualPriceId: string;
@@ -54,6 +55,7 @@ export interface BillingAccount {
   currentPeriodEnd?: number;
   cancelAtPeriodEnd: boolean;
   lastEventAt: number;
+  lastEventRank: number;
   verifiedAt?: number;
   pastDueAt?: number;
   lastError?: string;
@@ -324,6 +326,16 @@ export class SubscriptionBillingService {
       idempotencyKey: `seat-sync:${organizationId}:${seats}:${account.lastEventAt}` });
   }
 
+  /** Organization metadata must retain the tenant mapping until a signed
+   * provider event says the associated subscription is terminal. */
+  assertOrganizationDeletionAllowed(organizationId: string): void {
+    if (!this.hosted) return;
+    const account = this.account(organizationId);
+    if (!account?.subscriptionId) return;
+    if ((TERMINAL_PROVIDER_SUBSCRIPTION_STATUSES as readonly SubscriptionStatus[]).includes(account.status)) return;
+    throw new Error(`the provider subscription is ${account.status}; cancel it and wait for signed terminal confirmation before deleting this organization`);
+  }
+
   handleWebhook(raw: Buffer, signature?: string): { duplicate: boolean } {
     this.requireHosted();
     const event = this.provider.verifyWebhook(raw, signature);
@@ -354,7 +366,8 @@ export class SubscriptionBillingService {
       : stringId(object.subscription);
     const account = customerId ? this.accountByCustomer(customerId) : subscriptionId ? this.accountBySubscription(subscriptionId) : undefined;
     if (!account) return; // Never adopt a tenant association from provider metadata.
-    if (event.created * 1000 < account.lastEventAt) return;
+    const eventAt = event.created * 1000;
+    if (eventAt < account.lastEventAt) return;
     if (event.type === 'checkout.session.completed') {
       // This event associates the provider subscription but carries no verified
       // line-item snapshot. Do not advance the reconciliation clock: Stripe may
@@ -364,18 +377,26 @@ export class SubscriptionBillingService {
     }
     if (event.type.startsWith('customer.subscription.')) {
       if (event.type === 'customer.subscription.deleted') {
+        const rank = billingEventRank(event.type, 'canceled');
+        const next = { status: 'canceled' as const, plan: account.plan,
+          seats: HOSTED_PLANS[account.plan].includedActiveUsers, cancelAtPeriodEnd: false };
+        if (!shouldApplyBillingTransition(account, eventAt, rank, next)) return;
         const updated = this.patchAccount(account.organizationId, { subscriptionId, status: 'canceled',
           seats: HOSTED_PLANS[account.plan].includedActiveUsers,
           items: {}, cancelAtPeriodEnd: false, currentPeriodEnd: epochMs(object.current_period_end),
-          lastEventAt: event.created * 1000, verifiedAt: Date.now(), pastDueAt: undefined });
+          lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now(), pastDueAt: undefined });
         this.reconcileAccount(updated);
         return;
       }
       const mapped = this.mapSubscription(object);
       const status = normalizeStatus(object.status);
+      const rank = billingEventRank(event.type, status);
+      const cancelAtPeriodEnd = Boolean(object.cancel_at_period_end);
+      if (!shouldApplyBillingTransition(account, eventAt, rank,
+        { status, plan: mapped.plan, seats: mapped.seats, cancelAtPeriodEnd })) return;
       const updated = this.patchAccount(account.organizationId, { subscriptionId: String(object.id), ...mapped,
-        status, cancelAtPeriodEnd: Boolean(object.cancel_at_period_end),
-        currentPeriodEnd: epochMs(object.current_period_end), lastEventAt: event.created * 1000,
+        status, cancelAtPeriodEnd,
+        currentPeriodEnd: epochMs(object.current_period_end), lastEventAt: eventAt, lastEventRank: rank,
         verifiedAt: Date.now(), pastDueAt: status === 'past_due' ? account.pastDueAt ?? Date.now() : undefined,
         lastError: undefined });
       this.reconcileAccount(updated);
@@ -383,13 +404,22 @@ export class SubscriptionBillingService {
     }
     if (event.type === 'invoice.payment_failed'
       && ['active', 'trialing', 'past_due'].includes(account.status)) {
+      const rank = billingEventRank(event.type, 'past_due');
+      if (!shouldApplyBillingTransition(account, eventAt, rank,
+        { status: 'past_due', plan: account.plan, seats: account.seats,
+          cancelAtPeriodEnd: account.cancelAtPeriodEnd })) return;
       const updated = this.patchAccount(account.organizationId, { status: 'past_due',
         pastDueAt: account.pastDueAt ?? Date.now(), lastError: 'The latest subscription payment failed.',
-        lastEventAt: event.created * 1000, verifiedAt: Date.now() });
+        lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now() });
       this.reconcileAccount(updated);
-    } else if (event.type === 'invoice.paid' && ['past_due', 'unpaid'].includes(account.status)) {
+    } else if (event.type === 'invoice.paid'
+      && ['active', 'trialing', 'past_due', 'unpaid'].includes(account.status)) {
+      const rank = billingEventRank(event.type, 'active');
+      if (!shouldApplyBillingTransition(account, eventAt, rank,
+        { status: 'active', plan: account.plan, seats: account.seats,
+          cancelAtPeriodEnd: account.cancelAtPeriodEnd })) return;
       const updated = this.patchAccount(account.organizationId, { status: 'active', pastDueAt: undefined,
-        lastError: undefined, lastEventAt: event.created * 1000, verifiedAt: Date.now() });
+        lastError: undefined, lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now() });
       this.reconcileAccount(updated);
     }
   }
@@ -467,11 +497,12 @@ export class SubscriptionBillingService {
     const current = this.account(organizationId);
     if (!current) throw new Error('billing account not found');
     this.store.db.prepare(`UPDATE subscription_billing_accounts SET subscriptionId=?, plan=?, status=?, seats=?,
-      itemsJson=?, currentPeriodEnd=?, cancelAtPeriodEnd=?, lastEventAt=?, verifiedAt=?, pastDueAt=?, lastError=?, updatedAt=?
+      itemsJson=?, currentPeriodEnd=?, cancelAtPeriodEnd=?, lastEventAt=?, lastEventRank=?, verifiedAt=?, pastDueAt=?, lastError=?, updatedAt=?
       WHERE organizationId=?`).run(patch.subscriptionId ?? current.subscriptionId ?? null,
       patch.plan ?? current.plan, patch.status ?? current.status, patch.seats ?? current.seats,
       JSON.stringify(patch.items ?? current.items), patch.currentPeriodEnd ?? current.currentPeriodEnd ?? null,
       (patch.cancelAtPeriodEnd ?? current.cancelAtPeriodEnd) ? 1 : 0, patch.lastEventAt ?? current.lastEventAt,
+      patch.lastEventRank ?? current.lastEventRank,
       patch.verifiedAt ?? current.verifiedAt ?? null,
       Object.prototype.hasOwnProperty.call(patch, 'pastDueAt') ? patch.pastDueAt ?? null : current.pastDueAt ?? null,
       Object.prototype.hasOwnProperty.call(patch, 'lastError') ? patch.lastError ?? null : current.lastError ?? null,
@@ -538,6 +569,7 @@ function rowAccount(row: any): BillingAccount | undefined {
     subscriptionId: row.subscriptionId ?? undefined, plan: row.plan, status: normalizeStatus(row.status), seats: Number(row.seats),
     items: JSON.parse(row.itemsJson || '{}'), currentPeriodEnd: row.currentPeriodEnd ?? undefined,
     cancelAtPeriodEnd: Boolean(row.cancelAtPeriodEnd), lastEventAt: Number(row.lastEventAt),
+    lastEventRank: Number(row.lastEventRank || 0),
     verifiedAt: row.verifiedAt ?? undefined, pastDueAt: row.pastDueAt ?? undefined,
     lastError: row.lastError ?? undefined };
 }
@@ -547,4 +579,34 @@ function normalizeStatus(value: any): SubscriptionStatus {
   const status = String(value || 'incomplete') as SubscriptionStatus;
   return ['none', 'trialing', 'active', 'past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused', 'canceled'].includes(status)
     ? status : 'incomplete';
+}
+
+/** Stripe event timestamps have one-second resolution. At a collision,
+ * subscription snapshots outrank invoice summaries, terminal states are
+ * sticky, and a paid invoice outranks a failed invoice. Equal snapshot ranks
+ * deterministically prefer the lower-entitlement plan, cancellation intent,
+ * then the larger billed seat quantity. A strictly newer event always wins. */
+function billingEventRank(type: string, status: SubscriptionStatus): number {
+  if (type === 'customer.subscription.deleted') return 700;
+  if (type.startsWith('customer.subscription.')) return ({
+    canceled: 690, incomplete_expired: 680, unpaid: 670, paused: 660,
+    incomplete: 650, past_due: 640, active: 630, trialing: 620, none: 610,
+  } satisfies Record<SubscriptionStatus, number>)[status];
+  if (type === 'invoice.paid') return 500;
+  if (type === 'invoice.payment_failed') return 400;
+  return 0;
+}
+
+function shouldApplyBillingTransition(current: BillingAccount, eventAt: number, eventRank: number,
+  next: Pick<BillingAccount, 'status' | 'plan' | 'seats' | 'cancelAtPeriodEnd'>): boolean {
+  if (eventAt > current.lastEventAt) return true;
+  if (eventAt < current.lastEventAt) return false;
+  if (eventRank !== current.lastEventRank) return eventRank > current.lastEventRank;
+  const planRestriction = (plan: HostedPlanId) => plan === 'free' ? 3 : plan === 'individual' ? 2 : 1;
+  const before = [planRestriction(current.plan), current.cancelAtPeriodEnd ? 1 : 0, current.seats];
+  const after = [planRestriction(next.plan), next.cancelAtPeriodEnd ? 1 : 0, next.seats];
+  for (let index = 0; index < before.length; index++) {
+    if (after[index] !== before[index]) return after[index]! > before[index]!;
+  }
+  return false;
 }

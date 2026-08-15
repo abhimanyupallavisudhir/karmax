@@ -1748,9 +1748,10 @@ export class Gateway {
         const b = await this.body(req);
         if (String(b.confirmSlug ?? '') !== organization.slug)
           return this.json(res, 400, { error: `type the organization slug (${organization.slug}) to confirm deletion` });
-        const subscriptionState = this.deps.subscriptions?.current(organizationId);
-        if (subscriptionState?.managed && subscriptionState.plan !== 'free' && subscriptionState.status !== 'canceled')
-          return this.json(res, 409, { error: 'cancel the hosted subscription and wait for provider confirmation before deleting this organization' });
+        try { this.deps.subscriptions?.assertOrganizationDeletionAllowed(organizationId); }
+        catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
 
         // External resources go first. These operations are idempotent, so an
         // outage never commits a deceptively successful partial deletion.
