@@ -2314,7 +2314,18 @@ async function boot() {
   // card that a pending invitation is waiting, so a brand-new invitee knows to
   // create an account — with the address the invite was sent to.
   S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
-  if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
+  if (session.authRequired && !session.authenticated && !session.token) {
+    // The public root explains the product before asking for an account. Auth
+    // callbacks, invitations and explicit auth routes still land directly on
+    // the form they need, so a person following a link never has to hunt.
+    if (S.pendingInvite || S.justVerified || S.signInError || location.pathname === '/login') return renderLogin();
+    if (location.pathname === '/signup') return renderSignup();
+    return renderLanding();
+  }
+  // Successful password/social auth returns to the public auth URL it started
+  // from. Those URLs are not organizations; canonicalise before app routing.
+  if (location.pathname === '/login' || location.pathname === '/signup')
+    history.replaceState({ kx: 1 }, '', '/');
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
   const route = parseRoute(location.pathname);
@@ -2946,6 +2957,7 @@ function refreshBrandAssets() {
 }
 
 function renderShell() {
+  window.onpopstate = null; // public-page history is replaced by the app router below
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
@@ -14343,8 +14355,145 @@ function wireSocialBtn(id, provider, errSelector) {
   });
 }
 
+// ── public landing ──────────────────────────────────────────────────────────
+
+function openPublicAuth(path, render) {
+  history.pushState({ kx: 1 }, '', path);
+  render();
+}
+
+function renderLanding() {
+  document.body.classList.add('landing-active');
+  document.title = 'krmax — the to-do list for agents';
+  $('#app').innerHTML = `<div class="landing-page">
+    <a class="landing-skip" href="#landing-main">Skip to content</a>
+    <header class="landing-nav" aria-label="Primary navigation">
+      <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
+      <div class="landing-nav-actions">
+        <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
+        <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
+        <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
+      </div>
+    </header>
+
+    <main id="landing-main">
+      <section class="landing-hero" aria-labelledby="landing-title">
+        <div class="landing-hero-copy">
+          <h1 id="landing-title" class="landing-analogy">
+            <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
+            <span><strong>krmax</strong><span>is a fancy <b>to-do list.</b></span></span>
+          </h1>
+          <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
+          <div class="landing-hero-actions">
+            <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
+          </div>
+        </div>
+
+        <figure class="product-frame" aria-label="krmax task list showing agents working in parallel">
+          <div class="product-browserbar"><i></i><i></i><i></i><span>krmax.io / krmax</span><b>⌘ K</b></div>
+          <div class="product-shell">
+            <aside class="product-rail">
+              <div class="product-wordmark">${brandMark()}<strong>krmax</strong></div>
+              <small>PROJECTS</small>
+              <div class="product-project active"><span>◇</span> krmax</div>
+              <div class="product-project"><span>◇</span> Website</div>
+              <div class="product-project"><span>◇</span> Research</div>
+              <div class="product-rail-spacer"></div>
+              <div class="product-project"><span>🕮</span> Wiki</div>
+              <div class="product-project"><span>⚙</span> Settings</div>
+            </aside>
+            <div class="product-main">
+              <div class="product-topline"><span>Tasks <b>7</b></span><span>Queues</span><span>Wiki</span><span>Settings</span><i>+ New task</i></div>
+              <div class="product-compose"><span>What needs doing?</span><kbd>⌘ ↵</kbd></div>
+              <div class="product-list-head"><span>COMPLETED</span><span>7 tasks</span></div>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Support e2b cloud environments for agents</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Support Github auto-merge, merge queues in addition to native merge queue</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Password vault: implement git-backed <code>unix pass</code> importer</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Let agents create accounts with agentmail.to</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Add spending limits for agents</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>MathJaX support in agent conversations</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Wiki-based agent memory</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+            </div>
+          </div>
+        </figure>
+      </section>
+
+      <section class="landing-principles" aria-labelledby="principles-title">
+        <div class="landing-principles-content">
+          <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
+          <div class="landing-checks">
+            <article><h3>Agents work parallelly in isolated cloud worlds.</h3></article>
+            <article><h3>Yes, gitignored files are handled correctly.</h3><p>secrets, databases, big files</p></article>
+            <article><h3>Bring your own key or OpenAI/Claude subscription</h3></article>
+            <article><h3>krmax MCP lets agents access and manage your krmax projects</h3><p>if you authorize it.</p></article>
+            <article class="wide"><h3>Connect a password vault and a payment card, and let agents Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="landing-control" aria-labelledby="control-title">
+        <div class="landing-control-copy">
+          <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
+          <p>Want a human-managed to-do list of AI engineers? Want the automated company? krmax can do both.</p>
+        </div>
+        <div class="landing-control-list">
+          <article><p>krmax MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
+          <article><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
+          <article><p>krmax comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
+        </div>
+      </section>
+
+      <section class="landing-final" aria-labelledby="final-title">
+        <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+        <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
+        <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with krmax <span aria-hidden="true">→</span></button>
+      </section>
+    </main>
+
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+  </div>`;
+
+  const signIn = () => openPublicAuth('/login', renderLogin);
+  const signUp = () => openPublicAuth('/signup', renderSignup);
+  $('#landing-sign-in')?.addEventListener('click', signIn);
+  ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', signUp));
+  window.onpopstate = () => boot();
+}
+
 function renderLogin() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Sign in · krmax';
+  window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <a href="/" id="login-home" class="login-home">← About krmax</a>
     <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a krmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
@@ -14373,6 +14522,7 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  $('#login-home')?.addEventListener('click', (e) => { e.preventDefault(); history.pushState({ kx: 1 }, '', '/'); renderLanding(); });
   wireSocialBtn('google-btn', 'google', '#login-err');
   wireSocialBtn('github-btn', 'github', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
@@ -14383,7 +14533,7 @@ function renderLogin() {
       location.href = result.url;
     } catch (error) { $('#login-err').textContent = error.message; }
   });
-  $('#signup-open').addEventListener('click', renderSignup);
+  $('#signup-open').addEventListener('click', () => openPublicAuth('/signup', renderSignup));
   $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -14458,6 +14608,9 @@ function renderResetPassword(token) {
 }
 
 function renderSignup() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Create account · krmax';
+  window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
     ${S.pendingInvite
@@ -14509,7 +14662,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err');
   wireSocialBtn('signup-github-btn', 'github', '#signup-err');
-  $('#signup-back').addEventListener('click', renderLogin);
+  $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
