@@ -1628,6 +1628,12 @@ export class Gateway {
           ? this.json(res, 200, billing.current(organizationId))
           : this.json(res, 405, { error: 'method not allowed' });
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        // Agent-card administration is delegable through payment:write. Paying
+        // for the SaaS itself is not: require live browser presence and the
+        // durable owner membership even after the ordinary capability gate.
+        const billingSubject = requireInteractiveHuman(callerIdentity);
+        if (store.organizationMembership(organizationId, billingSubject.userId)?.role !== 'owner')
+          return this.json(res, 403, { error: 'organization owner access is required to administer its subscription' });
         const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
         const settingsBase = `${this.publicUrl(req)}${organizationSettingsPath(store, organizationId)}`;
         const settingsUrl = `${settingsBase}#settings-billing`;

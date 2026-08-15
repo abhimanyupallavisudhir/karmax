@@ -1,8 +1,21 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Store } from '../src/store/db.js';
 import { FakeSubscriptionProvider, StripeSubscriptionProvider,
   SubscriptionBillingService } from '../src/billing/subscriptions.js';
+import { Gateway } from '../src/gateway/server.js';
+import { KarmaxApi } from '../src/platform/api.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
+import { AuthorizationService } from '../src/platform/authorization.js';
+import { KarmaxBus } from '../src/contrib/bus.js';
+import { ContributionRegistry } from '../src/contrib/registry.js';
+import { Overlays } from '../src/store/overlays.js';
+import { WorldRegistry } from '../src/world/registry.js';
+import { findFreePortFrom } from '../src/util/ports.js';
 
 const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
@@ -138,5 +151,69 @@ describe('Stripe subscription provider', () => {
       .update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
     expect(provider.verifyWebhook(raw, `t=${timestamp},v1=${digest}`).id).toBe('evt_signed');
     expect(() => provider.verifyWebhook(raw, `t=${timestamp},v1=bad`)).toThrow('invalid subscription webhook signature');
+  });
+});
+
+describe('subscription administration HTTP authorization', () => {
+  let store: Store;
+  let tokens: TokenAuthority;
+  let billing: SubscriptionBillingService;
+  let base: string;
+  let close: () => Promise<void>;
+  let browserToken: string;
+  let memberOrganizationId: string;
+
+  beforeAll(async () => {
+    store = new Store(':memory:');
+    tokens = new TokenAuthority();
+    billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+    const memberOrganization = store.createOrganization({ name: 'Member only', ownerUserId: 'another-owner' });
+    memberOrganizationId = memberOrganization.id;
+    store.setOrganizationMembership(memberOrganization.id, 'me', 'member');
+    const client = { workflow: { getHandle: () => ({}) } } as any;
+    const worlds = new WorldRegistry();
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens,
+      contentDir: fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-billing-content-')), worlds });
+    const gateway = new Gateway({ api, store, tokens, client, taskQueue: 'test', worlds,
+      bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(),
+      authorization: new AuthorizationService(store), subscriptions: billing,
+      staticDir: fileURLToPath(new URL('../web', import.meta.url)),
+      agentInfo: { provider: 'mock', reason: 'billing authorization test' },
+    } as any);
+    const started = await gateway.listen(await findFreePortFrom(49_700));
+    base = started.url;
+    close = started.close;
+    browserToken = (await (await fetch(`${base}/api/session`)).json() as any).token;
+  });
+
+  afterAll(async () => {
+    await close?.();
+    store?.close();
+  });
+
+  const post = (organizationId: string, token: string) => fetch(
+    `${base}/api/organizations/${organizationId}/subscription/checkout`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json',
+        'idempotency-key': `checkout-${crypto.randomUUID()}` }, body: JSON.stringify({ plan: 'individual' }),
+    });
+
+  it('rejects a task agent even when it holds payment:write', async () => {
+    const agent = tokens.mint({ taskId: 'task_billing_attack', profileId: 'developer', principal: 'agent:test',
+      organizationId: memberOrganizationId, ceiling: ['payment:write'], grantorCaps: ['payment:write'] }).token;
+    const response = await post(memberOrganizationId, agent);
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ error: 'an interactive human session is required' });
+  });
+
+  it('rejects an interactive organization member who is not an owner', async () => {
+    const response = await post(memberOrganizationId, browserToken);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: 'organization owner access is required to administer its subscription' });
+  });
+
+  it('allows the interactive owner of the organization', async () => {
+    const response = await post('org_personal', browserToken);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ url: 'https://checkout.test/session' });
   });
 });
