@@ -166,7 +166,72 @@ This is for large *versioned* data. A live bucket, database, or API should inste
 be configured as a project Service so tasks access it directly and krmax stores
 no snapshot copy.
 
-## Payment rails
+## Hosted SaaS subscription billing
+
+Subscription billing is enabled only when `KARMAX_DEPLOYMENT=hosted`. Private and
+self-hosted installations remain unmetered and do not contact the subscription
+provider. This billing domain pays for krmax.io itself; it is deliberately
+separate from the customer-owned cards that agents use under **Passwords &
+payments** and from the optional Stripe Issuing Connect application below.
+
+Create recurring monthly USD prices in the platform's Stripe Billing account:
+
+| Plan component | Amount |
+|---|---:|
+| Individual | $9 / month |
+| Team base (includes first active user) | $19 / month |
+| Team additional active user | $5 / month |
+
+Set the `KARMAX_SUBSCRIPTION_STRIPE_*` variables shown in
+`deploy/.env.example`; price and optional product IDs are configuration, never
+compiled constants. Enterprise is intentionally absent from self-service
+checkout. Register this distinct webhook endpoint:
+
+`https://<krmax-origin>/api/subscriptions/webhook`
+
+Subscribe it to `checkout.session.completed`, `customer.subscription.created`,
+`customer.subscription.updated`, `customer.subscription.deleted`,
+`invoice.paid`, and `invoice.payment_failed`. The gateway verifies Stripe's raw
+payload signature before parsing it. Checkout and API responses never grant a
+plan: the signed subscription event's configured price IDs are the only source
+of billed plan and seat state. Reconciliation writes effective access through
+the central organization-entitlement Store boundary. Duplicate event IDs and
+user retries are durably idempotent. Only an interactive organization owner can
+start checkout, open the portal, change or cancel a plan, or request a seat sync;
+an agent holding `payment:write` cannot administer the SaaS subscription.
+
+The canonical checkout seam is
+`POST /api/organizations/:organizationId/subscription/checkout`, backed by
+`SubscriptionBillingService.checkout`. Its response includes the server-derived
+plan and commercial snapshot, the durable local idempotency/request reference,
+and the provider checkout-session reference. Policy acceptance is deliberately
+not owned by billing; callers that require it can wrap this owner-only seam and
+persist their versioned acceptance record alongside the returned commercial
+snapshot without trusting prices submitted by the browser.
+
+Active and trialing subscriptions grant the verified plan. Past-due
+organizations retain it for seven days and receive a billing portal recovery
+action. A process-level sweep runs every minute and returns the organization to
+Free after that grace deadline even when Stripe sends no later webhook.
+Canceled/deleted, unpaid, paused, incomplete, and expired subscriptions also
+return to Free. Existing members are not deleted when a downgrade leaves an
+organization over its member limit; the entitlement layer restricts new
+admission until the owner upgrades or reduces membership.
+
+For local test-mode setup, use Stripe test keys and forward events with the
+Stripe CLI:
+
+```bash
+stripe listen --forward-to localhost:4505/api/subscriptions/webhook
+```
+
+Copy the CLI's `whsec_...` value into
+`KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET`, use test-mode price IDs, and start
+with `KARMAX_DEPLOYMENT=hosted`. The automated suite does not use the CLI,
+network, or paid calls: `FakeSubscriptionProvider` drives signed-event-equivalent
+fixtures against an in-memory database.
+
+## Agent payment rails
 
 Karmax has three rails, in increasing order of setup cost. **Only the first two
 move real money, and only the first works everywhere.**

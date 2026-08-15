@@ -78,4 +78,14 @@ describe('hosted plan organization UI', () => {
     expect(hydration).toContain('/entitlements');
     expect(hydration).toContain('organizationPlanMarkup(entitlements)');
   });
+
+  it('renders subscription prices and owner controls from server-derived state', () => {
+    const subscription = extractFunction('hydrateOrganizationSubscription');
+    expect(subscription).toContain('monthlyBasePriceCents');
+    expect(subscription).toContain('monthlyAdditionalActiveUserPriceCents');
+    expect(subscription).toContain('state.canManage');
+    expect(subscription).toContain('Only an organization owner can administer this subscription');
+    expect(subscription).not.toContain('$9 / month');
+    expect(subscription).not.toContain('$19 / month');
+  });
 });
