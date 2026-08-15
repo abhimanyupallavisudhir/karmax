@@ -29,7 +29,7 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
-import { applyAvatarProfile, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
+import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
@@ -1437,18 +1437,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // cannot be used to interrupt peer work or widen the agent's authority.
       const storedAuthorization = store.getTask(args.taskId)?.params?._authorization as {
         capabilities?: string[];
+        principal?: string;
         scope?: 'projects' | 'organization' | 'global';
         projectIds?: string[];
         organizationId?: string;
         delegationId?: string;
       } | undefined;
       const delegatedAuthorization = avatar?.authorization;
-      const avatarOwnerCaps = avatar && deps.authorization
-        ? deps.authorization.capabilities(`user:${avatar.ownerUserId}`, args.task.projectId, avatar.organizationId)
-        : delegatedAuthorization?.capabilities;
+      // A task may have been authorized by a routed Avatar without itself using
+      // that Avatar as its role profile. Re-evaluate that delegation on every
+      // turn so disabling the authorizer, narrowing its authority, or revoking
+      // its backing principal immediately attenuates the task as well.
+      const authorizingAvatarId = !avatar && storedAuthorization?.principal?.startsWith('avatar:')
+        ? storedAuthorization.principal.slice(7) : undefined;
+      const authorizingAvatar = authorizingAvatarId ? store.getAvatar(authorizingAvatarId) : undefined;
+      const authorizingAvatarBackingCaps = authorizingAvatar
+        ? avatarAuthorizationCapabilities(store, deps.authorization, authorizingAvatar, args.task.projectId)
+        : [];
       const principalGrant = avatar
-        ? attenuate(delegatedAuthorization?.capabilities ?? [], avatarOwnerCaps ?? [])
-        : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
+        ? avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId)
+        : authorizingAvatarId
+          ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
+          : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
       const grant = [...new Set([
         ...principalGrant,
         ...(avatar ? [] : orgVaultItems.extensionCaps(args.taskId)),

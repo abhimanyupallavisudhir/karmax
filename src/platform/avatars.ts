@@ -2,6 +2,8 @@ import type { AgentProfile, AgentRole, AgentSpec, Avatar } from '../domain/types
 import type { Store } from '../store/db.js';
 import { agentRoleDef } from '../contrib/manifests.js';
 import { applyAgentSpec } from '../agent/profiles.js';
+import { attenuate, type Capability } from './capabilities.js';
+import type { AuthorizationService } from './authorization.js';
 
 export class AvatarUnavailableError extends Error {
   code = 'avatar_unavailable';
@@ -16,6 +18,30 @@ export function avatarEnabled(store: Store, avatar: Avatar): boolean {
   if (!avatar.enabled || avatar.deletedAt) return false;
   const availability = store.avatarAvailability(avatar.projectId);
   return availability.effective;
+}
+
+/** Resolve an Avatar delegation through its live backing principal. Avatar-backed
+ * approvals may form a short chain; cycles, deletion, or disablement fail closed. */
+export function avatarAuthorizationCapabilities(
+  store: Store,
+  authorization: AuthorizationService | undefined,
+  avatar: Avatar,
+  projectId = avatar.projectId,
+  seen = new Set<string>(),
+): Capability[] {
+  if (seen.has(avatar.id) || !avatarEnabled(store, avatar)) return [];
+  seen.add(avatar.id);
+  const principal = avatar.authorization.principal ?? `user:${avatar.ownerUserId}`;
+  let backing: Capability[];
+  if (principal.startsWith('avatar:')) {
+    const parent = store.getAvatar(principal.slice(7));
+    backing = parent ? avatarAuthorizationCapabilities(store, authorization, parent, projectId, seen) : [];
+  } else {
+    backing = authorization
+      ? authorization.capabilities(principal, projectId, avatar.organizationId)
+      : avatar.authorization.capabilities;
+  }
+  return attenuate(avatar.authorization.capabilities, backing);
 }
 
 /** Invocation is a delegation decision made by the owner. Team membership is
