@@ -6,6 +6,7 @@ import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
 
 const DEFAULT_CAPACITY = { activeWorlds: 20, cpu: 40, memoryMb: 81_920, gpu: 0 };
+const STALE_PARKED_LEASE_MS = 2 * 60_000;
 
 /** Durable admission and cost attribution for execution-plane capacity. The DB
  * queue is the source of truth, so a waiting activity can restart on any worker. */
@@ -30,6 +31,8 @@ export class RunnerPoolService {
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
+    if (input.signal?.aborted)
+      throw input.signal.reason ?? new Error('runner lease cancelled');
     const config = this.store.effectiveProjectConfig(input.project);
     const pool = this.ensureDefaultPool(input.project, input.provider);
     const month = monthWindow(Date.now());
@@ -44,15 +47,30 @@ export class RunnerPoolService {
       projectId: input.project.id, taskId: input.taskId, worldId: input.worldId,
       cpu: config.resources?.cpu, memoryMb: config.resources?.memoryMb,
       gpu: config.resources?.gpu, priority: input.priority });
-    while (!this.store.worldLease(requested.id)?.acquiredAt) {
-      if (input.signal?.aborted) {
-        this.store.releaseWorldLease(requested.id);
-        throw input.signal.reason ?? new Error('runner lease cancelled');
+    try {
+      for (;;) {
+        const lease = this.store.worldLease(requested.id);
+        if (!lease || lease.state === 'released')
+          throw new Error('runner lease was released before admission');
+        if (lease.acquiredAt) break;
+        if (input.signal?.aborted)
+          throw input.signal.reason ?? new Error('runner lease cancelled');
+        // A heartbeat can throw when Temporal has already timed this activity
+        // out. Treat that exactly like cancellation: the retry must not inherit
+        // an invisible reservation from an activity that no longer exists.
+        input.heartbeat?.();
+        await new Promise((resolve) => setTimeout(resolve, Math.max(100, input.pollMs ?? 1_000)));
       }
-      input.heartbeat?.();
-      await new Promise((resolve) => setTimeout(resolve, Math.max(100, input.pollMs ?? 1_000)));
+      if (input.signal?.aborted)
+        throw input.signal.reason ?? new Error('runner lease cancelled');
+      return { leaseId: requested.id, runnerPoolId: pool.id };
+    } catch (error) {
+      // This reservation has not been published into the durable world handle,
+      // so no other lifecycle owner can know to release it. Do not call the
+      // billed release path: a failed admission wait never ran a sandbox.
+      this.store.releaseWorldLease(requested.id);
+      throw error;
     }
-    return { leaseId: requested.id, runnerPoolId: pool.id };
   }
 
   release(leaseId: string, provider: string): void {
@@ -72,6 +90,35 @@ export class RunnerPoolService {
       unit: 'second', costMicros: Math.round(seconds * costMicrosPerSecond(billedProvider, lease.cpu, lease.memoryMb, lease.gpu)),
       startedAt, endedAt, metadata: { runnerPoolId: lease.runnerPoolId, cpu: lease.cpu, memoryMb: lease.memoryMb, gpu: lease.gpu } });
   }
+
+  /** Repair reservations whose activity owner disappeared before it could
+   * publish or release them. Terminal tasks own no workflow capacity. Likewise,
+   * a parked/hibernated/released world cannot own an old active reservation: a
+   * genuine wake-up has a short grace period in which to mark the world ready. */
+  reconcileWorldLeases(now = Date.now()): number {
+    let released = 0;
+    for (const lease of this.store.unreleasedWorldLeases()) {
+      const task = this.store.getTask(String(lease.taskId));
+      const world = this.store.currentWorld(String(lease.worldId));
+      const worldState = this.store.worldState(String(lease.worldId));
+      const passiveWorld = ['parked', 'hibernated', 'released'].includes(worldState ?? '');
+      const terminal = !task || ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? 'active');
+      const stale = Number(lease.acquiredAt ?? lease.createdAt) <= now - STALE_PARKED_LEASE_MS;
+      const borrowed = this.store.worldLeaseHasLiveAccessor(String(lease.id), now);
+      const terminalWorkflowLease = terminal
+        && (!world || world.meta?.worldLeaseId === lease.id || (lease.state === 'active' && stale && !borrowed));
+      const stalePassiveLease = lease.state === 'active'
+        && passiveWorld
+        && stale
+        && !borrowed;
+      if (!terminalWorkflowLease && !stalePassiveLease) continue;
+      // Reconciliation fixes an internal reservation leak; it must not bill the
+      // tenant for wall time in which the provider world was already parked.
+      this.store.releaseWorldLease(String(lease.id));
+      released++;
+    }
+    return released;
+  }
 }
 
 /** Turns old parked provider state into cheap object/Git state. */
@@ -86,12 +133,16 @@ export class WorldLifecycleManager {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.sweep(), this.intervalMs);
+    // Recover capacity during boot, before new setup activities spend another
+    // poll interval queued behind stale state from the previous process.
+    void this.sweep().catch(() => undefined);
+    this.timer = setInterval(() => void this.sweep().catch(() => undefined), this.intervalMs);
     this.timer.unref();
   }
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
   async sweep(now = Date.now()): Promise<number> {
+    this.runners?.reconcileWorldLeases(now);
     await this.reconcileProviderUsage(now);
     for (const artifact of this.store.expiredPromotedArtifacts(now)) {
       this.store.deletePromotedArtifact(artifact.id);

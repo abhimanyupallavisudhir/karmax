@@ -47,6 +47,7 @@ import {
   GithubActionsApiError,
   classifyGithubActionsDiagnostic,
   classifyGithubActionsFailure,
+  githubActionsHumanWaitReason,
   githubActionsRunIdFromUrl,
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
@@ -1111,18 +1112,44 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const environmentSelection = projectId
         ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
         : { built: false, environment: executionConfig?.environment };
+      let activitySignal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let cancellationHeartbeat: NodeJS.Timeout | undefined;
+      if (remote) {
+        try {
+          const ctx = activityContext.current();
+          activitySignal = ctx.cancellationSignal;
+          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
+          // Temporal delivers activity cancellation at heartbeat boundaries.
+          // Keep that boundary live after admission while the provider allocates
+          // and provisions the sandbox.
+          cancellationHeartbeat = setInterval(() => ctx.heartbeat({ provisioning: args.kind }), 500);
+          cancellationHeartbeat.unref();
+        } catch {
+          // Direct activity unit tests have no ambient Temporal context.
+        }
+      }
+      const stopCancellationHeartbeat = () => {
+        if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
+        cancellationHeartbeat = undefined;
+      };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
-        const ctx = activityContext.current();
-        acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
-          priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: ctx.cancellationSignal,
-          heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) });
+        try {
+          acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
+            priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: activitySignal,
+            heartbeat });
+        } catch (error) {
+          stopCancellationHeartbeat();
+          throw error;
+        }
       }
       let world: World;
       const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
       try {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
+          signal: activitySignal,
           generation,
           organizationId: project?.organizationId,
           repo: worldSources.length === 1 ? worldSources[0] : undefined,
@@ -1146,6 +1173,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
       } catch (error) {
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        stopCancellationHeartbeat();
         if (remote && isTransportError(error)) {
           const message = error instanceof Error ? error.message : String(error);
           throw ApplicationFailure.create({
@@ -1203,8 +1231,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        stopCancellationHeartbeat();
         throw error;
       }
+      stopCancellationHeartbeat();
       return world.handle;
     },
 
@@ -1822,6 +1852,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           status: next.status,
           waitingFor: next.waitingFor?.kind ?? null,
           waitingDetail: next.waitingFor?.detail ?? null,
+          waitingSummary: next.waitingFor?.summary ?? null,
           waitingProvider: next.waitingFor?.provider ?? null,
           waitingResetAt: next.waitingFor?.earliestResetAt ?? null,
           agentTurn: next.agentTurn?.state ?? null,
@@ -2957,7 +2988,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
               const checkContext = check ? `${check.name}: ${check.state}\n${check.detail ?? ''}` : '';
               decisions.push(terminalObservation(
-                classifyGithubActionsFailure(inspected, { additionalContext: checkContext }),
+                classifyGithubActionsFailure(inspected, { providerContext: checkContext }),
                 reconciliation.key,
               ));
             } catch (error) {
@@ -2992,6 +3023,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (providerFailure === 'human') return {
             status: 'needs-human', prs: current, actorUserId,
             detail: `${summary}\n\nGitHub reported a provider or account condition that changing the proposal cannot repair. Resolve it on GitHub, then retry.`,
+            waitReason: githubActionsHumanWaitReason(summary),
             eligibleUserIds: [actorUserId],
           };
           if (providerFailure === 'superseded') {
@@ -3039,6 +3071,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
           status: 'needs-human', prs: current, actorUserId, detail,
+          waitReason: human.decision.waitReason,
           eligibleUserIds: [actorUserId],
         };
         const revision = decisions.find(({ decision }) => decision.disposition === 'revision');
@@ -4185,6 +4218,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         status: view.status,
         waitingFor: view.waitingFor?.kind ?? null,
         waitingDetail: view.waitingFor?.detail ?? null,
+        waitingSummary: view.waitingFor?.summary ?? null,
         waitingProvider: view.waitingFor?.provider ?? null,
         waitingResetAt: view.waitingFor?.earliestResetAt ?? null,
         agentTurn: view.agentTurn?.state ?? null,

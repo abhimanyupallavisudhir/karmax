@@ -48,6 +48,7 @@ import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, des
 import { sameRepository } from '../world/repository-identity.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import type { WorldAccessService } from '../world/access.js';
+import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { itemHandle } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarCallableBy, avatarEnabled } from './avatars.js';
@@ -298,6 +299,9 @@ export interface KarmaxApiDeps {
   /** World access for permission-checked collaboration tools. */
   worlds?: WorldRegistry;
   worldAccess?: WorldAccessService;
+  /** Durable execution-capacity leases. Production always supplies this; small
+   * unit harnesses may omit it and still get direct store-level release. */
+  runners?: RunnerPoolService;
   resources?: ProjectResourceService;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
@@ -2448,6 +2452,7 @@ export class KarmaxApi {
     view: TaskView,
     reason: string,
     disposition: 'replace' | 'cancel' | 'discard' = 'replace',
+    gracefulTimeoutMs = 30_000,
   ): Promise<void> {
     const handle = this.workflowHandle(task.id);
     const minor = Number(String(task.workflowVersion ?? '').split('.')[1] ?? 0);
@@ -2462,7 +2467,7 @@ export class KarmaxApi {
       }
       try {
         await handle.signal(disposition === 'cancel' ? 'cancel' : 'prepareLifecycleReplacement');
-        await withTimeout(Promise.resolve((handle as any).result()), 30_000);
+        await withTimeout(Promise.resolve((handle as any).result()), gracefulTimeoutMs);
         stoppedGracefully = true;
       } catch {
         // A wedged/older execution still has the bounded termination fallback.
@@ -2516,6 +2521,16 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
+  }
+
+  /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
+   * ever published. Reclaim by durable task ownership instead of relying on an
+   * in-memory activity finally block that may never run after failover. */
+  private releaseTaskRunnerLeases(taskId: string): void {
+    for (const lease of this.deps.store.worldLeasesForTask(taskId)) {
+      if (this.deps.runners) this.deps.runners.release(String(lease.id), 'unknown');
+      else this.deps.store.releaseWorldLease(String(lease.id));
+    }
   }
 
   private async startTransitionReplacement(
@@ -3496,6 +3511,30 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } });
       if (!vote.satisfied) return;
     }
+    // Setup is the one stage where the projected view has no WorldHandle yet.
+    // A plain signal used to wait behind the five-minute createWorld activity,
+    // leaving both the task and its runner slot visibly stuck. Give cooperative
+    // cancellation a short chance, then terminate the old execution and reclaim
+    // every capacity lease it acquired before publishing a handle. This also
+    // repairs already-running pre-fix workflow versions after deployment.
+    if (signal === SIG.cancel && scopedTask && heldView?.stage === 'setup'
+      && !['done', 'cancelled', 'failed'].includes(heldView.status)) {
+      await this.stopTaskActivity(scopedTask, heldView, 'Setup cancellation did not stop', 'cancel', 5_000);
+      this.releaseTaskRunnerLeases(taskId);
+      const latest = this.deps.store.getTask(taskId)?.lastView ?? heldView;
+      if (!['done', 'cancelled', 'failed'].includes(latest.status)) {
+        this.deps.store.saveView(taskId, {
+          ...latest,
+          stage: 'cancelled',
+          status: 'cancelled',
+          waitingFor: undefined,
+          actions: [],
+          state: { ...latest.state, cancelled: true, cancelledFrom: 'setup' },
+        });
+      }
+      return;
+    }
+
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) {

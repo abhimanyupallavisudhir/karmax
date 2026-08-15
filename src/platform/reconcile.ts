@@ -53,9 +53,36 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         // Bound the describe: a wedged server makes describe hang without
         // rejecting, which would otherwise freeze boot. On timeout, leave the
         // task as-is (assume in-flight) rather than wrongly failing it.
-        const desc = await withTimeout(client.workflow.getHandle(t.id).describe(), DESCRIBE_TIMEOUT_MS);
+        const handle = client.workflow.getHandle(t.id);
+        const desc = await withTimeout(handle.describe(), DESCRIBE_TIMEOUT_MS);
         const name = desc.status.name;
-        if (name === 'RUNNING') continue; // genuinely in-flight — Temporal will resume it
+        if (name === 'RUNNING') {
+          // software-dev pins before 1.26 accepted Cancel during Setup but did
+          // not cancel createWorld. Their live query says cancelled while the
+          // persisted projection remains active indefinitely. Recover those
+          // already-signalled production executions on deploy; current pins
+          // own acknowledged provider cleanup inside the workflow itself.
+          const minor = Number(String(t.workflowVersion ?? '').split('.')[1] ?? 0);
+          if (base.stage === 'setup' && ['software-dev', 'goal'].includes(t.workflow) && minor < 26) {
+            const live = await withTimeout(handle.query('view') as Promise<TaskView>, DESCRIBE_TIMEOUT_MS)
+              .catch(() => undefined);
+            if (live?.state?.cancelled) {
+              await handle.terminate('cancelled Setup did not settle').catch(() => undefined);
+              for (const lease of store.worldLeasesForTask(t.id)) store.releaseWorldLease(String(lease.id));
+              store.saveView(t.id, {
+                ...live,
+                stage: 'cancelled',
+                status: 'cancelled',
+                waitingFor: undefined,
+                actions: [],
+                state: { ...live.state, cancelled: true, cancelledFrom: 'setup' },
+                updatedAt: Date.now(),
+              });
+              settled++;
+            }
+          }
+          continue;
+        }
         const next: TaskView =
           name === 'COMPLETED'
             ? { ...base, status: 'done', stage: 'done', updatedAt: base.updatedAt }
