@@ -14378,95 +14378,107 @@ function renderLanding() {
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
         <div class="landing-hero-copy">
-          <p class="landing-kicker"><span></span> An interface for work after code editors</p>
-          <h1 id="landing-title"><span>VS Code was a fancy</span> text editor.<br><strong>krmax is a fancy <em>to-do list.</em></strong></h1>
-          <p class="landing-intro">The correct interface for the era of <strong>managing agents</strong> rather than <s>manually writing code</s>.</p>
+          <p class="landing-kicker"><span></span> Your Integrated Management Environment</p>
+          <h1 id="landing-title" class="landing-analogy">
+            <span><strong>VS Code</strong><span>was a fancy <b>text editor.</b></span></span>
+            <span><strong>krmax</strong><span>is a fancy <b>to-do list.</b></span></span>
+          </h1>
+          <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
-            <span>No new AI subscription required.</span>
           </div>
         </div>
 
         <figure class="product-frame" aria-label="krmax task list showing agents working in parallel">
-          <div class="product-browserbar"><i></i><i></i><i></i><span>app.krmax.ai / product</span><b>⌘ K</b></div>
+          <div class="product-browserbar"><i></i><i></i><i></i><span>krmax.io / krmax</span><b>⌘ K</b></div>
           <div class="product-shell">
             <aside class="product-rail">
               <div class="product-wordmark">${brandMark()}<strong>krmax</strong></div>
               <small>PROJECTS</small>
-              <div class="product-project active"><span>◇</span> Product</div>
+              <div class="product-project active"><span>◇</span> krmax</div>
               <div class="product-project"><span>◇</span> Website</div>
               <div class="product-project"><span>◇</span> Research</div>
               <div class="product-rail-spacer"></div>
-              <div class="product-project"><span>▦</span> Dashboard</div>
+              <div class="product-project"><span>🕮</span> Wiki</div>
               <div class="product-project"><span>⚙</span> Settings</div>
             </aside>
             <div class="product-main">
-              <div class="product-topline"><span>Tasks <b>12</b></span><span>Queue</span><span>Activity</span><i>+ New task</i></div>
+              <div class="product-topline"><span>Tasks <b>7</b></span><span>Queues</span><span>Wiki</span><span>Settings</span><i>+ New task</i></div>
               <div class="product-compose"><span>What needs doing?</span><kbd>⌘ ↵</kbd></div>
-              <div class="product-list-head"><span>NOW</span><span>3 agents working</span></div>
-              <article class="product-task active">
+              <div class="product-list-head"><span>COMPLETED</span><span>7 tasks</span></div>
+              <article class="product-task">
                 <span class="product-check">✓</span>
-                <div><strong>Ship the new onboarding flow</strong><small>#128 · Do agent</small></div>
-                <div class="product-agent"><i></i> coding</div>
+                <div><strong>Support e2b cloud environments for agents</strong></div>
+                <div class="product-stage done">done</div>
               </article>
               <article class="product-task">
                 <span class="product-check">✓</span>
-                <div><strong>Research our three closest competitors</strong><small>#127 · Research agent</small></div>
-                <div class="product-agent amber"><i></i> browsing</div>
+                <div><strong>Support Github auto-merge, merge queues in addition to native merge queue</strong></div>
+                <div class="product-stage done">done</div>
               </article>
               <article class="product-task">
                 <span class="product-check">✓</span>
-                <div><strong>Deploy the marketing site</strong><small>#126 · Do agent</small></div>
-                <div class="product-agent"><i></i> deploying</div>
+                <div><strong>Password vault: implement git-backed <code>unix pass</code> importer</strong></div>
+                <div class="product-stage done">done</div>
               </article>
-              <div class="product-list-head later"><span>NEXT</span><span>Review when ready</span></div>
-              <article class="product-task muted">
-                <span class="product-check product-empty-check"></span>
-                <div><strong>Buy a domain and connect analytics</strong><small>#125 · waiting for approval</small></div>
-                <div class="product-stage">human input</div>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Let agents create accounts with agentmail.to</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Add spending limits for agents</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>MathJaX support in agent conversations</strong></div>
+                <div class="product-stage done">done</div>
+              </article>
+              <article class="product-task">
+                <span class="product-check">✓</span>
+                <div><strong>Wiki-based agent memory</strong></div>
+                <div class="product-stage done">done</div>
               </article>
             </div>
           </div>
-          <figcaption><span><i></i> Three isolated cloud worlds</span><span>One calm list</span></figcaption>
         </figure>
       </section>
 
       <section class="landing-principles" aria-labelledby="principles-title">
-        <div class="landing-section-label">The whole idea</div>
         <div class="landing-principles-content">
           <h2 id="principles-title">Your agents need a place to work.<br>Your attention needs <em>one place</em> to look.</h2>
           <div class="landing-checks">
-            <article><span>01</span><div><h3>Parallel, isolated work</h3><p>Agents work in parallel in their own cloud worlds, without stepping on one another.</p></div></article>
-            <article><span>02</span><div><h3>The whole working set</h3><p>Gitignored files come too: secrets, databases, large assets, and everything real work depends on.</p></div></article>
-            <article><span>03</span><div><h3>Your models, your terms</h3><p>Bring the AI subscription or API key you already use.</p></div></article>
-            <article><span>04</span><div><h3>Agents can run krmax</h3><p>With krmax MCP, permitted agents can create tasks, manage projects, and change settings just like a human.</p></div></article>
-            <article class="wide"><span>05</span><div><h3>From “do this” to done</h3><p>Connect a password vault and payment card, and agents can securely just do things — even “buy me a website and deploy this project there.”</p></div><span class="landing-done">Done <b>✓</b></span></article>
+            <article><h3>Agents work parallelly in isolated cloud worlds.</h3></article>
+            <article><h3>Yes, we handle gitignored files.</h3><p>secrets, databases, big files</p></article>
+            <article><h3>Bring your own key</h3><p>or OpenAI/Claude subscription</p></article>
+            <article><h3>krmax MCP lets agents access and manage your krmax projects</h3><p>if you authorize it.</p></article>
+            <article class="wide"><h3>Connect a password vault and a payment card, and agents can Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
           </div>
         </div>
       </section>
 
       <section class="landing-control" aria-labelledby="control-title">
         <div class="landing-control-copy">
-          <div class="landing-section-label light">Human in the loop</div>
           <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
           <p>Want a human-managed to-do list of AI engineers? Want the automated company? krmax can do both.</p>
         </div>
         <div class="landing-control-list">
-          <article><span>Human</span><h3>Keep the decisions</h3><p>Assign review and human-input stages to people, with the context needed to decide.</p></article>
-          <article><span>Agent</span><h3>Automate the company</h3><p>Assign those same stages to agents. krmax MCP can manage anything a human can.</p></article>
-          <article><span>Policy</span><h3>Draw the boundaries</h3><p>A robust authorization system makes every permission explicit. You decide what each agent can do.</p></article>
+          <article><p>krmax MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
+          <article><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
+          <article><p>krmax comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
         </div>
       </section>
 
       <section class="landing-final" aria-labelledby="final-title">
         <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
-        <p>One list. However many agents.</p>
-        <h2 id="final-title">Stop juggling tools.<br><em>Start assigning outcomes.</em></h2>
+        <h2 id="final-title">Leave the permanent<br><em>underclass</em> today.</h2>
         <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with krmax <span aria-hidden="true">→</span></button>
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>The to-do list for agents.</p><a href="https://github.com/abhimanyupallavisudhir/karmax">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/karmax">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
