@@ -78,6 +78,9 @@ export interface Avatar {
     profileId: string;
     capabilities: string[];
     organizationId?: string;
+    /** Principal whose live grant backs this delegation. Legacy Avatars fall
+     * back to their owner so revocation behavior remains unchanged. */
+    principal?: string;
   };
   credentialPolicies?: Record<string, { use?: 'auto' | 'ask' | 'never'; reveal?: 'auto' | 'ask' | 'never' }>;
   githubAccountId?: string;
@@ -220,6 +223,9 @@ export interface InboxItem {
   actionable: boolean;
   createdAt: number;
   readAt?: number;
+  /** Resource-backed asks use the inbox without manufacturing a task merely to
+   * carry a notification. */
+  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string };
 }
 
 export interface DeliveryPreferences {

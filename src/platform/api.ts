@@ -36,8 +36,9 @@ import { defaultProvider } from '../agent/adapters.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
-import type { AuthorizationService } from './authorization.js';
+import { AuthorizationGrantError, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
+import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import type { KarmaxBus } from '../contrib/bus.js';
@@ -52,7 +53,7 @@ import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { itemHandle } from '../autonomy/vault-items.js';
-import { applyAvatarProfile, avatarCallableBy, avatarEnabled } from './avatars.js';
+import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -914,6 +915,11 @@ export class KarmaxApi {
       authorizationProfile?: string;
       /** Canonical level plus its project-list / organization / global scope. */
       authorization?: AuthorizationSelection;
+      /** Draft auto-save may preserve an over-broad selection as an explicitly
+       * unaccepted attenuated package. `acceptAttenuation` is the user's choice
+       * to run with that limited package. */
+      allowAttenuation?: boolean;
+      acceptAttenuation?: boolean;
       /** Per-task vault item grants (PLAN-passwords.md §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
@@ -947,8 +953,10 @@ export class KarmaxApi {
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps)
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
-    if (args.authorization && authorization.attenuated)
-      throw new CapabilityError('you cannot grant an authorization level you do not hold for the selected scope');
+    const profileAttenuated = authorization.attenuated;
+    if (args.authorization && profileAttenuated
+      && !(args.draft && args.allowAttenuation) && !args.acceptAttenuation)
+      throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     this.applyCredentialGrants(authorization, args.credentialGrants, caller.caps);
     const credentialPolicies = this.credentialPolicyOverrides(
       project.organizationId ?? 'org_personal', args.credentialPolicies, caller.caps, authorization,
@@ -1027,7 +1035,8 @@ export class KarmaxApi {
         [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
         profiles: args.profiles,
         draft: !!args.draft,
-        _authorization: { ...authorization, principal: caller.principal, credentialPolicies },
+        _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
+          ...(profileAttenuated ? { attenuationAccepted: args.acceptAttenuation === true } : {}) },
         ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
         ...(repeatable ? { repeatable: true } : {}),
       },
@@ -1550,6 +1559,11 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
+    const storedAuthorization = task.params?._authorization as {
+      profileAttenuated?: boolean; attenuationAccepted?: boolean;
+    } | undefined;
+    if (storedAuthorization?.profileAttenuated && !storedAuthorization.attenuationAccepted)
+      throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     const group = this.deps.store.attemptGroup(taskId);
     if (group?.committedAttemptId && group.committedAttemptId !== taskId) {
       throw new Error('another attempt has entered Merge; this task is committed and no other attempt can be queued');
@@ -1700,6 +1714,7 @@ export class KarmaxApi {
     requested: string | AuthorizationSelection,
     credentialGrants?: string[],
     credentialPolicies?: VaultTaskPolicyOverrides,
+    options: { allowAttenuation?: boolean; acceptAttenuation?: boolean; preserveCredentialGrants?: boolean } = {},
   ): Promise<TaskRecord> {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new NotFoundError(`no task ${taskId}`);
@@ -1713,12 +1728,16 @@ export class KarmaxApi {
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps)
       : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
-    if (typeof requested !== 'string' && authorization.attenuated)
-      throw new CapabilityError('you cannot grant an authorization level you do not hold for the selected scope');
+    const profileAttenuated = authorization.attenuated;
     this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
     const priorAuthorization = task.params?._authorization as {
-      credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string;
+      credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
+      attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
     } | undefined;
+    if (options.preserveCredentialGrants) for (const capability of priorAuthorization?.capabilities ?? []) {
+      if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
+        authorization.capabilities.push(capability);
+    }
     const priorPolicies = priorAuthorization?.credentialPolicies;
     const policies = credentialPolicies === undefined
       ? (priorPolicies ?? {})
@@ -1728,6 +1747,16 @@ export class KarmaxApi {
         caller.caps,
         authorization,
       );
+    const sameSelection = typeof requested === 'string'
+      ? requested === priorAuthorization?.level
+      : requested.level === priorAuthorization?.level
+        && requested.scope === priorAuthorization?.scope
+        && JSON.stringify(requested.projectIds ?? []) === JSON.stringify(priorAuthorization?.projectIds ?? []);
+    const attenuationAccepted = profileAttenuated
+      && (options.acceptAttenuation === true || sameSelection && priorAuthorization?.attenuationAccepted === true);
+    if (typeof requested !== 'string' && profileAttenuated
+      && !(editInPlace && options.allowAttenuation) && !attenuationAccepted)
+      throw new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
@@ -1775,9 +1804,10 @@ export class KarmaxApi {
     const { delegationId: _staleDelegationId, ...priorAuthorizationWithoutDelegation } = priorAuthorization ?? {};
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization,
+      _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization, profileAttenuated,
         principal: caller.principal, credentialPolicies: policies,
-        ...(delegation ? { delegationId: delegation.id } : {}) },
+        ...(delegation ? { delegationId: delegation.id } : {}),
+        ...(profileAttenuated ? { attenuationAccepted } : { attenuationAccepted: undefined }) },
       ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
     });
@@ -2936,6 +2966,255 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       capabilities: request.capabilities,
       audience: request.audience,
     };
+  }
+
+  authorizationEscalationTargets(
+    token: string,
+    input: { projectId: string; authorization: AuthorizationSelection },
+  ): {
+    projectId: string;
+    authorization: AuthorizationSelection;
+    requestedCapabilities: Capability[];
+    missingCapabilities: Capability[];
+    users: Array<{ id: string; selector: string }>;
+    teams: Array<{ id: string; name: string; slug: string; selector: string; eligibleUserIds: string[] }>;
+    special: Array<{ selector: '@all' | '@owners'; eligibleUserIds: string[] }>;
+    avatars: Array<{ id: string; name: string; purpose?: string; selector: string }>;
+  } {
+    const caller = this.require(token, 'create_task', { projectId: input.projectId });
+    if (caller.kind !== 'human' || !caller.principal.startsWith('user:'))
+      throw new CapabilityError('an interactive human is required to route an authorization request');
+    const project = this.deps.store.getProject(input.projectId);
+    if (!project?.organizationId) throw new NotFoundError('project organization not found');
+    const authorization = this.deps.authorization;
+    if (!authorization) throw new Error('authorization service is unavailable');
+    const requestedCapabilities = authorization.requestedCapabilities(input.projectId, input.authorization);
+    const missingCapabilities = authorization.missingCapabilities(caller.principal, input.projectId, input.authorization);
+    const memberIds = this.deps.store.listOrganizationMemberships(project.organizationId).map((member) => member.userId);
+    const eligibleUserIds = memberIds.filter((userId) =>
+      allows(authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId), 'task:create')
+      && authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization));
+    const users = eligibleUserIds.map((id) => ({ id, selector: `user:${id}` }));
+    const eligible = new Set(eligibleUserIds);
+    const teams = this.deps.store.listTeams(project.organizationId, input.projectId)
+      .map((team) => ({ ...team, eligibleUserIds: this.deps.store.listTeamMemberships(team.id)
+        .map((member) => member.userId).filter((id) => eligible.has(id)) }))
+      .filter((team) => team.eligibleUserIds.length)
+      .map((team) => ({ id: team.id, name: team.name, slug: team.slug,
+        selector: `@team:${team.slug}`, eligibleUserIds: team.eligibleUserIds }));
+    const ownerIds = this.deps.store.listOrganizationMemberships(project.organizationId)
+      .filter((member) => member.role === 'owner' && eligible.has(member.userId)).map((member) => member.userId);
+    const initiatingUserId = caller.principal.slice(5);
+    const avatars = this.deps.store.listAvatars(input.projectId)
+      .filter((avatar) => avatarEnabled(this.deps.store, avatar)
+        && (!avatar.roles.length || avatar.roles.includes('authorize'))
+        && avatarCallableBy(this.deps.store, avatar, initiatingUserId))
+      .filter((avatar) => {
+        const effective = avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, input.projectId);
+        return allows(effective, 'task:create')
+          && requestedCapabilities.every((capability) => allows(effective, capability));
+      })
+      .map((avatar) => ({ id: avatar.id, name: avatar.name,
+        ...(avatar.purpose ? { purpose: avatar.purpose } : {}), selector: `avatar:${avatar.id}` }));
+    return {
+      projectId: input.projectId, authorization: input.authorization,
+      requestedCapabilities, missingCapabilities, users, teams,
+      special: [
+        ...(eligibleUserIds.length ? [{ selector: '@all' as const, eligibleUserIds }] : []),
+        ...(ownerIds.length ? [{ selector: '@owners' as const, eligibleUserIds: ownerIds }] : []),
+      ],
+      avatars,
+    };
+  }
+
+  async requestAuthorization(
+    token: string,
+    input: {
+      projectId: string;
+      target: { kind: 'task'; taskId: string; queueAfterApproval?: boolean }
+        | { kind: 'avatar'; avatarId: string; enableAfterApproval?: boolean };
+      authorization: AuthorizationSelection;
+      audience: string[];
+      reason?: string;
+    },
+  ): Promise<AuthorizationRequest> {
+    const caller = this.require(token, 'create_task', { projectId: input.projectId });
+    if (caller.kind !== 'human' || !caller.principal.startsWith('user:'))
+      throw new CapabilityError('an interactive human is required to request delegated authorization');
+    const project = this.deps.store.getProject(input.projectId);
+    if (!project?.organizationId) throw new NotFoundError('project organization not found');
+    const requesterId = caller.principal.slice(5);
+    if (input.target.kind === 'task') {
+      const task = this.deps.store.getTask(input.target.taskId);
+      if (!task || task.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
+      if (!task.params?.draft && task.params?.triggerState !== 'armed' && !task.params?.repeatable)
+        throw new ValidationError('authorization must be approved before this task starts');
+      if (this.deps.store.taskCreatorUserId(task.id) !== requesterId)
+        throw new CapabilityError('only the task creator can route its initial authorization request');
+    } else {
+      const avatar = this.deps.store.getAvatar(input.target.avatarId);
+      if (!avatar || avatar.projectId !== input.projectId) throw new NotFoundError('Avatar not found in this project');
+      if (avatar.ownerUserId !== requesterId)
+        throw new CapabilityError('only the Avatar owner can route its authorization request');
+    }
+    const targets = this.authorizationEscalationTargets(token, {
+      projectId: input.projectId, authorization: input.authorization,
+    });
+    if (!targets.missingCapabilities.length)
+      throw new ValidationError('you already have the requested authorization');
+    const eligibleUsers = new Set(targets.users.map((user) => user.id));
+    const eligibleAvatars = new Set(targets.avatars.map((avatar) => avatar.id));
+    const audience = [...new Set((input.audience ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
+    if (!audience.length || audience.length > 32) throw new ValidationError('choose between 1 and 32 eligible recipients');
+    const recipients = new Set<string>();
+    const avatarRecipients = new Set<string>();
+    for (const selector of audience) {
+      if (selector.startsWith('user:')) {
+        const id = selector.slice(5);
+        if (!eligibleUsers.has(id)) throw new CapabilityError(`${selector} cannot grant the complete requested authorization`);
+        recipients.add(id);
+      } else if (selector.startsWith('avatar:')) {
+        const id = selector.slice(7);
+        if (input.target.kind === 'avatar' && input.target.avatarId === id)
+          throw new CapabilityError('an Avatar cannot grant authorization to itself');
+        if (!eligibleAvatars.has(id)) throw new CapabilityError(`${selector} cannot grant the complete requested authorization`);
+        avatarRecipients.add(id);
+      } else if (selector.startsWith('@team:')) {
+        const team = targets.teams.find((candidate) => candidate.selector === selector);
+        if (!team) throw new CapabilityError(`${selector} has no member who can grant the complete requested authorization`);
+        team.eligibleUserIds.forEach((id) => recipients.add(id));
+      } else {
+        const special = targets.special.find((candidate) => candidate.selector === selector);
+        if (!special) throw new CapabilityError(`${selector} has no member who can grant the complete requested authorization`);
+        special.eligibleUserIds.forEach((id) => recipients.add(id));
+      }
+    }
+    const service = new AuthorizationRequests(this.deps.store, project.organizationId);
+    const existing = input.target.kind === 'task'
+      ? service.requests({ status: 'pending', taskId: input.target.taskId })[0]
+      : service.requests({ status: 'pending', avatarId: input.target.avatarId })[0];
+    // A repeated click must not fan out duplicate Avatar decision tasks or route
+    // a second audience that is not recorded on the durable request.
+    if (existing) return existing;
+    const request = service.request({
+      projectId: input.projectId, target: input.target, authorization: input.authorization,
+      capabilities: targets.requestedCapabilities, missingCapabilities: targets.missingCapabilities,
+      audience, recipients: [...recipients], avatarRecipients: [...avatarRecipients],
+      reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization to this ${input.target.kind}.`,
+      requestedBy: caller.principal,
+    });
+    if (input.target.kind === 'task') {
+      const event = { taskId: input.target.taskId, type: 'authorization.approval-requested', ts: Date.now(), payload: {
+        requestId: request.id, recipients: request.recipients, audience: request.audience,
+        authorization: request.authorization, missingCapabilities: request.missingCapabilities,
+        urgency: normalizeUrgency(undefined, DEFAULT_URGENCY['approval-requested']),
+      } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+    } else {
+      this.deps.store.addAuthorizationInbox(project.organizationId, request.recipients, {
+        kind: 'avatar-authorization', avatarId: input.target.avatarId,
+        projectId: input.projectId, requestId: request.id,
+      }, request.createdAt);
+      const event = { taskId: `avatar:${input.target.avatarId}`, type: 'authorization.approval-requested',
+        ts: request.createdAt, payload: { requestId: request.id, recipients: request.recipients,
+          audience: request.audience, authorization: request.authorization } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+    }
+    for (const avatarId of avatarRecipients) {
+      const avatar = this.deps.store.getAvatar(avatarId)!;
+      try {
+        await this.createTask(token, {
+          projectId: input.projectId, workflow: 'just-do',
+          title: `${avatar.name}: decide authorization request`,
+          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})\nMissing capabilities: ${request.missingCapabilities.join(', ')}\nReason: ${request.reason}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+          params: { 'agent:do': { avatarId: avatar.id, avatarPurpose: 'authorize', provider: avatar.runtime.provider,
+            ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
+            ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}) } },
+        });
+      } catch (error) {
+        const failed = { taskId: input.target.kind === 'task' ? input.target.taskId : `avatar:${input.target.avatarId}`,
+          type: 'avatar.authorization-dispatch-failed', ts: Date.now(),
+          payload: { requestId: request.id, avatarId, error: error instanceof Error ? error.message : String(error) } };
+        if (input.target.kind === 'task') {
+          const seq = this.deps.store.appendEvent(failed);
+          this.deps.bus?.emit({ ...failed, seq });
+        }
+      }
+    }
+    return request;
+  }
+
+  listAuthorizationRequests(
+    token: string,
+    input: { organizationId: string; status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string },
+  ): AuthorizationRequest[] {
+    const projectId = input.taskId ? this.deps.store.getTask(input.taskId)?.projectId
+      : input.avatarId ? this.deps.store.getAvatar(input.avatarId)?.projectId : undefined;
+    if (!projectId) throw new ValidationError('taskId or avatarId is required');
+    this.require(token, 'task:read', { projectId, organizationId: input.organizationId,
+      ...(input.taskId ? { taskId: input.taskId } : {}) });
+    return new AuthorizationRequests(this.deps.store, input.organizationId).requests(input);
+  }
+
+  async resolveAuthorizationRequest(
+    token: string,
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' },
+  ): Promise<AuthorizationRequest & { queued?: boolean }> {
+    const service = new AuthorizationRequests(this.deps.store, input.organizationId);
+    const request = service.requests().find((candidate) => candidate.id === input.requestId);
+    if (!request) throw new NotFoundError(`no authorization request ${input.requestId}`);
+    const caller = this.require(token, 'task:read', { projectId: request.projectId, organizationId: input.organizationId });
+    const humanUserId = caller.kind === 'human' && caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+    const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:') ? caller.principal.slice(7) : undefined;
+    if (!humanUserId && !avatarId) throw new CapabilityError('a routed human or Avatar is required to resolve this request');
+    if (humanUserId && !request.recipients.includes(humanUserId)
+      || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
+      throw new CapabilityError('this authorization request was not routed to you');
+    let queued = false;
+    if (input.action === 'approve') {
+      const grantorCaps = this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId);
+      const authorization = this.deps.authorization?.taskGrant(caller.principal, request.projectId, request.authorization, grantorCaps);
+      if (!authorization || authorization.attenuated)
+        throw new CapabilityError('you can no longer grant the complete requested authorization');
+      if (request.target.kind === 'task') {
+        const group = this.deps.store.attemptGroup(request.target.taskId);
+        const attempts = group?.attempts?.length ? group.attempts : [this.deps.store.getTask(request.target.taskId)!];
+        for (const attempt of attempts) await this.setTaskAuthorization(
+          token, attempt.id, request.authorization, undefined, undefined,
+          { acceptAttenuation: false, preserveCredentialGrants: true });
+        if (request.target.queueAfterApproval) {
+          for (const attempt of attempts) if (this.deps.store.getTask(attempt.id)?.params?.draft)
+            await this.queueTask(token, attempt.id);
+          queued = true;
+        }
+      } else {
+        const avatar = this.deps.store.getAvatar(request.target.avatarId);
+        if (!avatar || avatar.projectId !== request.projectId) throw new NotFoundError('Avatar no longer exists');
+        for (const capability of avatar.authorization.capabilities) {
+          if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
+            authorization.capabilities.push(capability);
+        }
+        this.deps.store.upsertAvatar({ ...avatar, enabled: request.target.enableAfterApproval ? true : avatar.enabled,
+          authorization: { ...authorization, principal: caller.principal }, updatedAt: Date.now() });
+      }
+    }
+    const resolved = service.resolve(request.id, input.action, caller.principal);
+    if (request.target.kind === 'task') {
+      const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
+        requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
+      } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+    } else {
+      this.deps.store.removeAuthorizationInbox(request.id);
+      const event = { taskId: `avatar:${request.target.avatarId}`, type: 'authorization.approval-resolved',
+        ts: Date.now(), payload: { requestId: request.id, action: input.action, resolvedBy: caller.principal } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+    }
+    return { ...resolved, ...(queued ? { queued } : {}) };
   }
 
   listPermissionRequests(

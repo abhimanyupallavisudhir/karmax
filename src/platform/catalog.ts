@@ -26,6 +26,8 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/payments/connect',
       'POST /api/vault/items/:itemId/reveal',
       'POST /api/tasks/:taskId/explanations',
+      'POST /api/authorization/escalation-targets',
+      'POST /api/authorization-requests',
     ],
   },
   resources: ['GET /api/resource-drivers'],
@@ -112,6 +114,9 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
     'POST /api/permission-requests/:id/resolve?organizationId= (routed human or Avatar: body {action: approve|deny})',
+    'POST /api/authorization/escalation-targets (interactive grantor chooser; body {projectId, authorization})',
+    'GET|POST /api/authorization-requests (GET by taskId or avatarId; POST routes an over-authorization request)',
+    'POST /api/authorization-requests/:id/resolve?organizationId= (routed human or authorizer Avatar: body {action: approve|deny})',
     'POST /api/agent/collaboration/request',
   ],
   conversations: [

@@ -1321,6 +1321,88 @@ function authorizationSummary(value, projects) {
   return `${level} · ${(selected.projectIds || []).map((id) => names.get(id) || id).join(', ')}`;
 }
 
+function isAuthorizationGrantGap(error) {
+  return error?.code === 'authorization_grant_denied'
+    || /more authorization than you have|authorization level you do not hold/i.test(error?.message || '');
+}
+
+/** One deliberate decision point shared by task and Avatar creation. Recipient
+ * choices come from the server already intersected with principals that can
+ * grant the complete requested package; selectors are still re-checked when the
+ * request is created and when it is approved. */
+async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent') {
+  const targets = await api('/api/authorization/escalation-targets', {
+    method: 'POST', body: JSON.stringify({ projectId, authorization }),
+  });
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay authorization-gap-overlay';
+    const recipientRows = [
+      ...targets.special.map((item) => ({ selector: item.selector,
+        label: item.selector === '@all' ? 'Everyone who can grant it' : 'Organization owners who can grant it',
+        detail: `${item.eligibleUserIds.length} eligible ${item.eligibleUserIds.length === 1 ? 'person' : 'people'}`, kind: 'group' })),
+      ...targets.teams.map((team) => ({ selector: team.selector, label: team.name,
+        detail: `${team.eligibleUserIds.length} eligible ${team.eligibleUserIds.length === 1 ? 'member' : 'members'}`, kind: 'team' })),
+      ...targets.users.map((user) => ({ selector: user.selector, label: user.name || user.email || user.id,
+        detail: user.name && user.email ? user.email : 'Person', kind: 'person' })),
+      ...targets.avatars.map((avatar) => ({ selector: avatar.selector, label: avatar.name,
+        detail: avatar.purpose || 'Authorization Avatar', kind: 'avatar' })),
+    ];
+    overlay.innerHTML = `<div class="modal-card authorization-gap-card" role="dialog" aria-modal="true" aria-labelledby="authorization-gap-title">
+      <div class="authorization-gap-head"><span class="authorization-gap-mark" aria-hidden="true">↗</span><div>
+        <div class="section-h">Delegation boundary</div>
+        <h2 id="authorization-gap-title">You are trying to grant this ${esc(targetLabel)} more authorization than you have.</h2>
+        <p>Choose who should approve the requested ${esc(authorizationSummary(authorization,
+          S.projects.filter((project) => project.organizationId === projectById(projectId)?.organizationId)))} authorization, or continue with only your capabilities.</p>
+      </div></div>
+      <div class="authorization-gap-paths">
+        <section class="authorization-gap-path ask-path">
+          <div class="authorization-gap-number">1</div><div class="authorization-gap-path-copy"><b>Ask someone who can grant it</b>
+          <span>The request goes only to eligible recipients. Any one of them can decide.</span></div>
+          <button type="button" class="btn authorization-gap-show">Choose recipients</button>
+        </section>
+        <div class="authorization-gap-recipients" hidden>
+          ${recipientRows.length ? `<div class="authorization-gap-list">${recipientRows.map((row) =>
+            `<label class="authorization-gap-recipient"><input type="checkbox" value="${esc(row.selector)}">
+              <span class="authorization-gap-recipient-icon ${esc(row.kind)}">${row.kind === 'avatar' ? 'A' : row.kind === 'team' || row.kind === 'group' ? '@' : '•'}</span>
+              <span><b>${esc(row.label)}</b><small>${esc(row.detail)}</small></span></label>`).join('')}</div>
+            <label class="authorization-gap-reason"><span>Note for approvers</span><textarea rows="2">Please approve the requested authorization for this ${esc(targetLabel)}.</textarea></label>
+            <button type="button" class="btn primary authorization-gap-send" disabled>Send authorization request</button>`
+            : '<div class="authorization-gap-empty">No person or Avatar currently holds the complete requested authorization.</div>'}
+        </div>
+        <section class="authorization-gap-path limit-path">
+          <div class="authorization-gap-number">2</div><div class="authorization-gap-path-copy"><b>Limit it to my capabilities</b>
+          <span>The ${esc(targetLabel)} continues now without the ${targets.missingCapabilities.length} missing ${targets.missingCapabilities.length === 1 ? 'capability' : 'capabilities'}.</span></div>
+          <button type="button" class="btn authorization-gap-limit">Use my authorization</button>
+        </section>
+      </div>
+      <details class="authorization-gap-details"><summary>${targets.missingCapabilities.length} capabilities need approval</summary>
+        <div>${targets.missingCapabilities.map((capability) => `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div></details>
+      <button type="button" class="icon-btn authorization-gap-close" aria-label="Cancel">×</button>
+    </div>`;
+    document.body.appendChild(overlay);
+    const finish = (value) => { overlay.remove(); resolve(value); };
+    const recipients = overlay.querySelector('.authorization-gap-recipients');
+    const send = overlay.querySelector('.authorization-gap-send');
+    const sync = () => { if (send) send.disabled = !overlay.querySelector('.authorization-gap-recipient input:checked'); };
+    overlay.querySelector('.authorization-gap-show').addEventListener('click', () => {
+      recipients.hidden = false;
+      overlay.querySelector('.authorization-gap-show').hidden = true;
+      recipients.querySelector('input')?.focus();
+    });
+    overlay.querySelectorAll('.authorization-gap-recipient input').forEach((input) => input.addEventListener('change', sync));
+    send?.addEventListener('click', () => finish({ action: 'ask',
+      audience: [...overlay.querySelectorAll('.authorization-gap-recipient input:checked')].map((input) => input.value),
+      reason: overlay.querySelector('.authorization-gap-reason textarea').value.trim(),
+    }));
+    overlay.querySelector('.authorization-gap-limit').addEventListener('click', () => finish({ action: 'limit' }));
+    overlay.querySelector('.authorization-gap-close').addEventListener('click', () => finish(null));
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) finish(null); });
+    overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') finish(null); });
+    overlay.querySelector('.authorization-gap-show').focus();
+  });
+}
+
 function wireAuthorizationEditor(root, projects, onChange) {
   if (!root) return;
   const levelSelect = root.querySelector('.authz-level-select');
@@ -2817,6 +2899,10 @@ const LIST_RELOAD_EVENTS = new Set([
   'task.responsibility-changed',
   'credential.approval-requested',
   'credential.approval-resolved',
+  'permission.approval-requested',
+  'permission.approval-resolved',
+  'authorization.approval-requested',
+  'authorization.approval-resolved',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -2906,7 +2992,7 @@ function connectWs() {
         else renderTaskEvents();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
-        || ev.type === 'credential.approval-requested' || ev.type === 'credential.approval-resolved') {
+        || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
       } else if (ev.type === 'session.started') {
@@ -2926,7 +3012,9 @@ function connectWs() {
     // Collaboration state changes only for collaboration events. Reloading five
     // organization endpoints for every workflow view transition multiplied the
     // websocket refresh storm without changing any of that data.
-    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested'].includes(ev.type))
+    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested',
+      'permission.approval-requested', 'authorization.approval-requested',
+      'permission.approval-resolved', 'authorization.approval-resolved'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
@@ -5166,12 +5254,12 @@ async function openTaskForm(workflow, draft, seedText) {
       }
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, allowAttenuation: true }) });
         }
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
@@ -5215,7 +5303,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorization: state.authorization, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorization: state.authorization, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true, allowAttenuation: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -5234,29 +5322,33 @@ async function openTaskForm(workflow, draft, seedText) {
   // clicking a button still keeps the draft.
   closeForm = () => { clearTimeout(saveTimer); const st = formState(); root.innerHTML = ''; persistDraft(st); };
 
-  const submit = async (draftMode) => {
+  const submit = async (draftMode, authorizationDecision) => {
     clearTimeout(saveTimer);
     const st = formState();
     // Drain any in-flight auto-save first: it may still be creating the draft (setting
     // draftId) or PATCHing older text. Waiting lets the branches below see the right
     // draftId and land last, so the explicit save/queue reflects the final form state.
     await saveChain.catch(() => {});
+    const attemptCount = Math.max(1, Math.min(8, Number($('#tf-attempt-count')?.value || 1)));
     try {
       let primaryId = draftId || draft?.id || null;
-      const attemptCount = Math.max(1, Math.min(8, Number($('#tf-attempt-count')?.value || 1)));
       let createdWithAttempts = false;
+      const authorizationOptions = {
+        ...(draftMode ? { allowAttenuation: true } : {}),
+        ...(authorizationDecision === 'limit' ? { acceptAttenuation: true } : {}),
+      };
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) });
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -5266,13 +5358,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, allowAttenuation: true, ...authorizationOptions }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...authorizationOptions }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -5296,7 +5388,40 @@ async function openTaskForm(workflow, draft, seedText) {
         ? (draftMode ? 'Moved to drafts' : 'Saved')
         : draftMode ? 'Draft saved' : draft ? 'Queued' : 'Task created');
       refreshTasks();
-    } catch (e) { showTaskError(e, projectId); }
+    } catch (e) {
+      if (!draftMode && isAuthorizationGrantGap(e)) {
+        try {
+          const decision = await chooseAuthorizationGrant(projectId, st.authorization, 'task agent');
+          if (!decision) return;
+          if (decision.action === 'limit') return submit(false, 'limit');
+          let targetId = draftId || draft?.id;
+          if (!targetId) {
+            const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({
+              workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization,
+              credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies,
+              draft: true, attempts: attemptCount, allowAttenuation: true,
+            }) });
+            targetId = draftId = created.id;
+          } else {
+            await api(`/api/tasks/${targetId}/authorization`, { method: 'PATCH', body: JSON.stringify({
+              authorization: st.authorization, credentialGrants: st.credentialGrants,
+              credentialPolicies: st.credentialPolicies, allowAttenuation: true,
+            }) });
+            if (!draft) for (let i = 1; i < attemptCount; i++)
+              await api(`/api/tasks/${targetId}/attempts`, { method: 'POST', body: '{}' });
+          }
+          await api('/api/authorization-requests', { method: 'POST', body: JSON.stringify({
+            projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true },
+            authorization: st.authorization, audience: decision.audience, reason: decision.reason,
+          }) });
+          root.innerHTML = '';
+          toast('Authorization request sent — the task will queue when approved');
+          refreshTasks();
+          return;
+        } catch (requestError) { showTaskError(requestError, projectId); return; }
+      }
+      showTaskError(e, projectId);
+    }
   };
   $('#tf-draft').addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));
@@ -5559,6 +5684,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.attemptGroup = null;
   S.approvalRequests = [];
   S.permissionRequests = [];
+  S.authorizationRequests = [];
   S.approvalItems = [];
   try {
     // Start secondary resources in parallel, but let the compact task projection
@@ -5577,6 +5703,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
       draft ? Promise.resolve([]) : api(`/api/vault/requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/permission-requests?${approvalQuery}`).catch(() => []),
+      api(`/api/authorization-requests?${approvalQuery}`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []),
       taskProjectId ? api(`/api/projects/${encodeURIComponent(taskProjectId)}/explanation-settings`).catch(() => ({ effective: DEFAULT_EXPLANATION_SETTINGS }))
         : Promise.resolve({ effective: DEFAULT_EXPLANATION_SETTINGS }),
@@ -5591,7 +5718,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (!S.taskTab) S.taskTab = defaultTaskTab(S.view);
     renderTaskPage();
 
-    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems, explanationSettings, explanationEvents] = await details;
+    const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
     if (S.selected !== taskId) return;
     // Events may have arrived over the websocket while the bounded durable window
     // was loading. Preserve those instead of replacing them with the older response.
@@ -5613,6 +5740,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.attemptGroup = attempts;
     S.approvalRequests = approvalRequests;
     S.permissionRequests = permissionRequests;
+    S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
@@ -5646,13 +5774,14 @@ async function refreshTask() {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, approvalItems] = await Promise.all([
+    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
       api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
       api(`/api/vault/requests?${approvalQuery}`).catch(() => S.approvalRequests),
       api(`/api/permission-requests?${approvalQuery}`).catch(() => S.permissionRequests),
+      api(`/api/authorization-requests?${approvalQuery}`).catch(() => S.authorizationRequests),
       api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => S.approvalItems),
     ]);
     // The user may have opened another task while this websocket-driven refresh
@@ -5668,6 +5797,7 @@ async function refreshTask() {
     S.attemptGroup = attempts;
     S.approvalRequests = approvalRequests;
     S.permissionRequests = permissionRequests;
+    S.authorizationRequests = authorizationRequests;
     S.approvalItems = approvalItems;
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
@@ -6172,19 +6302,20 @@ function taskTabBody(v, tab) {
 }
 
 function approvalRequestsTab(v) {
-  const pending = [...S.approvalRequests, ...S.permissionRequests]
+  const pending = [...S.approvalRequests, ...S.permissionRequests, ...(S.authorizationRequests || [])]
     .filter((request) => request.status === 'pending').length;
   return `<div class="task-approvals" id="task-approval-requests">
     <div class="approval-page-head">
       <div><div class="section-h">Approval Requests</div>
-        <p class="task-sub">Credential and permission decisions raised by this task. A decision automatically resumes the agent.</p></div>
+        <p class="task-sub">Credential, permission, and initial authorization decisions raised by this task.</p></div>
       ${pending ? `<span class="chip approval-needed">${pending} pending</span>` : ''}
     </div>
     <div class="approval-list">
       ${permissionRequestRows(S.permissionRequests)}
+      ${authorizationRequestRows(S.authorizationRequests || [])}
       ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
         historyLimit: 20,
-        showEmpty: !S.permissionRequests.length,
+        showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length,
       })}
     </div>
   </div>`;
@@ -6197,6 +6328,9 @@ function wireTaskApprovalRequests(v) {
     await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
   });
   wirePermissionRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
+    await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
+  });
+  wireAuthorizationRequestActions(document.getElementById('task-approval-requests'), organizationId, async () => {
     await Promise.all([refreshTask(), refreshTasks(), loadCollaboration().catch(() => {})]);
   });
 }
@@ -7355,7 +7489,13 @@ function fileTargetQuery(target) {
 }
 
 function worldFileHref(raw, v = S.view) {
-  const target = worldFileTarget(raw, v?.worldPath, !!v?.worldAvailable && !v?.worldPath);
+  // The conversation outlives its execution world. Completed/released task
+  // views intentionally stop advertising terminal availability, but their
+  // citations still belong to this task and remain resolvable through its
+  // durable world record + published branch. The gateway is the authoritative
+  // confinement check; a transient `worldAvailable` hint must not decide
+  // whether an agent-authored filesystem path becomes a handoff permalink.
+  const target = worldFileTarget(raw, v?.worldPath, !!v?.taskId && !v?.worldPath);
   return target && v?.taskId ? `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}` : null;
 }
 
@@ -9467,7 +9607,14 @@ function avatarDetailView(avatar) {
   return `<div class="avatars-page avatar-detail"><button class="avatar-back icon-btn" type="button" aria-label="Back to Avatars">←</button>
     <div class="avatar-detail-head"><div class="avatar-mark" aria-hidden="true">✦</div><div class="avatar-identity"><h1 class="page-title">${esc(avatar.name)}</h1><p>${esc(avatar.purpose || 'User-authored autonomous principal')}</p><span class="task-sub">Owned by ${esc(avatarOwnerName(avatar))} · Prompt version ${avatar.promptVersion}</span></div><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span></div>
     <div class="avatar-actions">${avatar.callable && avatar.effectiveEnabled ? '<button class="btn primary avatar-start" type="button">Create task with Avatar</button>' : ''}${avatar.canEdit ? '<button class="btn avatar-edit" type="button">Edit</button>' : ''}${avatar.canDisable ? `<button class="btn avatar-toggle" type="button">${avatar.enabled ? 'Disable' : 'Enable'}</button>` : ''}${avatar.canEdit || avatar.canDisable ? '<button class="icon-btn avatar-remove" type="button" aria-label="Remove Avatar">⋯</button>' : ''}</div>
+    ${(S.avatarAuthorizationRequests || []).length ? `<section class="card avatar-authorization-requests"><div class="section-h">Authorization request</div>${authorizationRequestRows(S.avatarAuthorizationRequests)}</section>` : ''}
     <div class="avatar-detail-grid"><section class="card"><div class="section-h">Instructions</div><div class="avatar-prompt">${renderMarkdown(avatar.prompt)}</div></section><aside><div class="card avatar-summary"><div><span>Authority</span><b>${avatar.authorityMode === 'full' ? 'Full delegation' : esc(avatar.authorization?.level || 'Restricted')}</b></div><div><span>Callable by</span><b>${esc(avatarCallerSummary(avatar))}</b></div><div><span>Roles</span><b>${esc(avatarRoleSummary(avatar))}</b></div><div><span>Runtime</span><b>${esc(`${avatar.runtime.provider}${avatar.runtime.model ? ` · ${avatar.runtime.model}` : ''}`)}</b></div><div><span>Vault</span><b>${(avatar.authorization?.capabilities || []).includes('*') || (avatar.authorization?.capabilities || []).includes('use-credential:*') ? 'Full access' : `${(avatar.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).length} credentials`}</b></div><div><span>GitHub</span><b>${avatar.githubAccountId ? 'Owner account connected' : 'No delegated account'}</b></div></div></aside></div></div>`;
+}
+async function loadAvatarAuthorizationRequests(avatarId) {
+  const project = projectById(S.projectId);
+  S.avatarAuthorizationRequests = avatarId && project?.organizationId
+    ? await api(`/api/authorization-requests?organizationId=${encodeURIComponent(project.organizationId)}&avatarId=${encodeURIComponent(avatarId)}`).catch(() => [])
+    : [];
 }
 function avatarsView(proj) {
   if (!proj) return '<div class="empty">Select a project.</div>';
@@ -9510,16 +9657,60 @@ async function openAvatarEditor(proj, avatar) {
   overlay.querySelector('.avatar-editor-save').addEventListener('click', async () => {
     const button = overlay.querySelector('.avatar-editor-save'); button.disabled = true; const authorityMode = authorityInputs.find((input) => input.checked)?.value || 'full';
     const callableBy = callModeEl.value === 'me' ? [`user:${S.user.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
-    try { const saved = await api(`/api/projects/${proj.id}/avatars${avatar ? `/${avatar.id}` : ''}`, { method: avatar ? 'PUT' : 'POST', body: JSON.stringify({ name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value, prompt: overlay.querySelector('#avatar-prompt').value, authorityMode, ...(authorityMode === 'restricted' ? { authorization: readAuthorizationEditor(overlay.querySelector('#avatar-authorization')), credentialIds: [...selectedCredentialIds], credentialPolicies } : {}), githubAccountId: overlay.querySelector('#avatar-github')?.checked ? activeGithub?.id : null, callableBy, roles: anyRole.checked ? [] : [...roleGrid.querySelectorAll('input:checked')].map((input) => input.value), runtime: { provider: overlay.querySelector('#avatar-provider').value, model: overlay.querySelector('#avatar-model').value.trim() || undefined, effort: overlay.querySelector('#avatar-effort').value || undefined } }) }); close(); await loadAvatars(); S.avatarSelected = saved.id; renderMain(); toast(avatar ? 'Avatar saved' : 'Avatar created'); } catch (error) { button.disabled = false; toast(error.message, true); }
+    const requestedAuthorization = authorityMode === 'restricted'
+      ? readAuthorizationEditor(overlay.querySelector('#avatar-authorization')) : null;
+    const payload = { name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value,
+      prompt: overlay.querySelector('#avatar-prompt').value, authorityMode,
+      ...(requestedAuthorization ? { authorization: requestedAuthorization, credentialIds: [...selectedCredentialIds], credentialPolicies } : {}),
+      githubAccountId: overlay.querySelector('#avatar-github')?.checked ? activeGithub?.id : null, callableBy,
+      roles: anyRole.checked ? [] : [...roleGrid.querySelectorAll('input:checked')].map((input) => input.value),
+      runtime: { provider: overlay.querySelector('#avatar-provider').value,
+        model: overlay.querySelector('#avatar-model').value.trim() || undefined,
+        effort: overlay.querySelector('#avatar-effort').value || undefined } };
+    const save = (body, current = avatar) => api(`/api/projects/${proj.id}/avatars${current ? `/${current.id}` : ''}`, {
+      method: current ? 'PUT' : 'POST', body: JSON.stringify(body),
+    });
+    try {
+      let saved;
+      try { saved = await save(payload); }
+      catch (error) {
+        if (!requestedAuthorization || !isAuthorizationGrantGap(error)) throw error;
+        const decision = await chooseAuthorizationGrant(proj.id, requestedAuthorization, 'Avatar');
+        if (!decision) { button.disabled = false; return; }
+        if (decision.action === 'limit') saved = await save({ ...payload, limitAuthorization: true });
+        else {
+          // Existing Avatars keep their current authority while approval is
+          // pending. A new one is saved disabled at the owner's safe ceiling.
+          saved = avatar
+            ? await save({ ...payload, authorization: normalizedAuthorization({
+              level: avatar.authorization.level || avatar.authorization.profileId,
+              scope: avatar.authorization.scope, projectIds: avatar.authorization.projectIds,
+            }, proj.id) })
+            : await save({ ...payload, limitAuthorization: true, enabled: false });
+          await api('/api/authorization-requests', { method: 'POST', body: JSON.stringify({
+            projectId: proj.id,
+            target: { kind: 'avatar', avatarId: saved.id, enableAfterApproval: !avatar },
+            authorization: requestedAuthorization, audience: decision.audience, reason: decision.reason,
+          }) });
+          close(); await loadAvatars(); S.avatarSelected = saved.id; await loadAvatarAuthorizationRequests(saved.id); renderMain();
+          toast('Authorization request sent'); return;
+        }
+      }
+      close(); await loadAvatars(); S.avatarSelected = saved.id; renderMain(); toast(avatar ? 'Avatar saved' : 'Avatar created');
+    } catch (error) { button.disabled = false; toast(error.message, true); }
   }); overlay.querySelector('#avatar-name').focus();
 }
 
 function wireAvatarsView(proj) {
-  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelectorAll('.avatar-row').forEach((row) => row.addEventListener('click', () => { S.avatarSelected = row.dataset.avatar; renderMain(); })); document.querySelector('.avatar-back')?.addEventListener('click', () => { S.avatarSelected = null; renderMain(); });
+  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelectorAll('.avatar-row').forEach((row) => row.addEventListener('click', async () => { S.avatarSelected = row.dataset.avatar; await loadAvatarAuthorizationRequests(S.avatarSelected); renderMain(); })); document.querySelector('.avatar-back')?.addEventListener('click', () => { S.avatarSelected = null; S.avatarAuthorizationRequests = []; renderMain(); });
   const avatar = S.avatars.find((item) => item.id === S.avatarSelected); document.querySelector('.avatar-edit')?.addEventListener('click', () => openAvatarEditor(proj, avatar)); document.querySelector('.avatar-start')?.addEventListener('click', () => { S.pendingAvatarId = avatar.id; openTaskForm('software-dev'); });
   document.querySelector('.avatar-toggle')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !avatar.enabled }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); S.avatarSelected = null; await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   document.querySelector('.avatar-project-enable')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatar-settings`, { method: 'PUT', body: JSON.stringify({ value: 'enabled' }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
+  wireAuthorizationRequestActions(document.querySelector('.avatar-authorization-requests'), proj.organizationId, async () => {
+    await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {})]);
+    renderMain();
+  });
 }
 
 // ── wiki (org/project skills, memories, and prompts — one content system) ─────
@@ -11865,6 +12056,51 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   return pendingHtml + history;
 }
 
+function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
+  const signedInUserId = typeof S.user === 'string' ? S.user : S.user?.id;
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const pendingHtml = pending.map((request) => {
+    const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
+    return `<div class="approval-request" data-areq="${esc(request.id)}">
+    <div class="approval-request-main">
+      <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
+        <span class="chip approval-needed">approval needed</span>
+      </div>
+      <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
+        S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
+      <div class="task-sub">${esc(request.reason)}</div>
+      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval delegates this authorization directly to the ${esc(request.target.kind)}; it does not elevate the requester.</div>
+    </div>
+    <div class="approval-request-actions">
+      ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
+        : '<span class="task-sub">Awaiting a routed approver</span>'}
+    </div>
+  </div>`;
+  }).join('');
+  const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent authorization decisions</div>${recent.map((request) =>
+    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+      <span>${esc(authorizationSummary(request.authorization, S.projects))}</span>
+      <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>` : '';
+  return pendingHtml + history;
+}
+
+function wireAuthorizationRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-areq]').forEach((row) => row.querySelectorAll('[data-areq-act]').forEach((button) =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+          method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
+        });
+        toast(button.dataset.areqAct === 'deny' ? 'Authorization denied'
+          : result.queued ? 'Approved — task queued' : 'Authorization approved');
+        await onResolved?.(result);
+      } catch (error) { button.disabled = false; toast(error.message, true); }
+    })));
+}
+
 function wirePermissionRequestActions(root, organizationId, onResolved) {
   if (!root) return;
   root.querySelectorAll('[data-preq]').forEach((row) => row.querySelectorAll('[data-preq-act]').forEach((button) =>
@@ -12863,6 +13099,7 @@ function inboxTabs() {
 // What a row is about. An ask names itself ("review requested"); an update's
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
+  if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
 }
 // Only an above-normal level is worth a chip: the list is already ordered by
@@ -12879,7 +13116,7 @@ function inboxView() {
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
     <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
-      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.kind)}</b>${urgencyChip(item.urgency)}
+      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.resource?.name || item.kind)}</b>${urgencyChip(item.urgency)}
       <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
     <p class="task-sub">Sorted by urgency, then by age. What each level does when it arrives — a system
@@ -12962,7 +13199,7 @@ function showSystemNotification(item) {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
-    const notification = new Notification(item.task?.title || 'karmax', {
+    const notification = new Notification(item.task?.title || item.resource?.name || 'karmax', {
       body: `${number}${inboxRowLabel(item)}`,
       tag: item.id,                                    // a restated ask replaces its own popup
       requireInteraction: item.urgency === 'critical', // critical waits to be dismissed
@@ -12996,7 +13233,7 @@ function playNotificationSound(urgency = 'normal') {
 }
 
 async function openInboxItem(item) {
-  if (!item?.task) return;
+  if (!item?.task && !item?.subject) return;
   if (item.unread) {
     // Reading the notification is bookkeeping, not a prerequisite for opening
     // its task. Update the badge locally and let the PATCH finish behind the
@@ -13004,6 +13241,16 @@ async function openInboxItem(item) {
     markInboxItemReadLocally(item);
     api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
       .catch(() => { item.unread = true; updateBell(); });
+  }
+  if (item.subject?.kind === 'avatar-authorization') {
+    const project = projectById(item.subject.projectId); if (!project) return;
+    await go(projectRoute(project.id, 'avatars'));
+    // A cross-project navigation resets project-local selection state, so choose
+    // the Avatar only after the route has switched projects.
+    S.avatarSelected = item.subject.avatarId;
+    await loadAvatarAuthorizationRequests(item.subject.avatarId);
+    renderMain();
+    return;
   }
   const project = projectById(item.task.projectId); if (!project) return;
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';

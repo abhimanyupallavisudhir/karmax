@@ -180,6 +180,13 @@ ok(worldFileTarget('/other/task/app.js:3', S.view.worldPath) === null, 'absolute
 ok(worldFileTarget('/workspace/web/app.js:3', undefined, true).path === '/workspace/web/app.js', 'cloud-world file links are intercepted without leaking the remote root');
 const cloudLinked = renderConversationText('[app.js](/workspace/web/app.js:3)', 'agent', { taskId: 'task-cloud', worldAvailable: true });
 ok(cloudLinked.includes('/acme/app/tasks/task-cloud/file?path=%2Fworkspace%2Fweb%2Fapp.js&amp;line=3'), 'cloud-world file links keep working when this browser is not on the gateway host');
+const completedLinked = renderConversationText(
+  'Main entry point: [site/index.html](/home/user/karmax/grier/site/index.html)',
+  'agent',
+  { taskId: 'task-finished', status: 'done' },
+);
+ok(completedLinked.includes('/acme/app/tasks/task-finished/file?path=%2Fhome%2Fuser%2Fkarmax%2Fgrier%2Fsite%2Findex.html'),
+  'a completed task keeps file citations routable after its world availability hint is released');
 const markdownLinked = annotateWorldFileLinks('<p><a href="/work/task-1/web/app.js:42" target="_blank">app.js</a></p>', S.view);
 ok(markdownLinked.includes('/acme/app/tasks/task-1/file?path=%2Fwork%2Ftask-1%2Fweb%2Fapp.js&amp;line=42'), 'the default Markdown path emits the same durable handoff URL');
 ok(renderConversationText('[app](/work/task-1/app.js)', 'user', S.view).includes('[app]('), 'user-authored Markdown remains literal');
