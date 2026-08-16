@@ -77,6 +77,18 @@ ok(authorizationScopePlaceholder(['@organization']) === '' && authorizationScope
 ok(source.includes('input.placeholder = authorizationScopePlaceholder('),
   'the live editor keeps the placeholder in step with the chips');
 
+ok(source.includes('function chooseAuthorizationGrant('), 'task and Avatar flows share one authorization-gap prompt');
+ok(source.includes('Ask someone who can grant it') && source.includes('Limit it to my capabilities'),
+  'the prompt presents both secure outcomes in plain language');
+ok(source.includes("api('/api/authorization/escalation-targets'"),
+  'recipient choices come from the server-filtered eligibility endpoint');
+ok(source.includes("target: { kind: 'task'") && source.includes("target: { kind: 'avatar'"),
+  'both task and Avatar creation can route approval to the target resource');
+ok(source.includes('Awaiting a routed approver') && source.includes('request.recipients.includes(signedInUserId)'),
+  'only a routed human sees controls for deciding an authorization request');
+ok(css.includes('.authorization-gap-card') && css.includes('.authorization-gap-recipient'),
+  'the shared decision prompt and recipient picker have dedicated responsive styling');
+
 // Stacked, and styled from inside .authz-editor: the generic `.form-row input`
 // rules are more specific than a bare `.authz-scope-input`, so without the
 // parent qualifier the task form repaints the field as its own boxed input.

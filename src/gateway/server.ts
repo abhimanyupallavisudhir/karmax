@@ -31,7 +31,7 @@ import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
-import type { AuthorizationService } from '../platform/authorization.js';
+import { AuthorizationGrantError, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -59,6 +59,7 @@ import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, 
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
   resolveCallerIdentity } from '../platform/identity.js';
@@ -175,6 +176,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return 'task:conversation:read';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
+  if (p === '/api/authorization/escalation-targets' || p === '/api/authorization-requests')
+    return read ? 'task:read' : 'task:create';
+  if (/^\/api\/authorization-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p.startsWith('/api/authorization') || p.startsWith('/api/audit')) return read ? 'authorization:read' : 'authorization:write';
   if (p.startsWith('/api/accounts') || p.startsWith('/api/git-profiles')) return read ? 'credential:read' : 'credential:write';
   if (p === '/api/credentials/policy') {
@@ -550,9 +554,18 @@ export class Gateway {
       .requests({ taskId, status: 'pending' });
   }
 
+  private pendingAuthorizationRequests(taskId: string) {
+    const task = this.deps.store.getTask(taskId);
+    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
+    if (!organizationId) return [];
+    return new AuthorizationRequests(this.deps.store, organizationId)
+      .requests({ taskId, status: 'pending' });
+  }
+
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
     if (!view) return view;
-    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length;
+    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length
+      + this.pendingAuthorizationRequests(taskId).length;
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -2098,7 +2111,12 @@ export class Gateway {
         const items = store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
         const headers = store.taskHeaders(items.map((item) => item.taskId));
-        return this.json(res, 200, items.map((item) => ({ ...item, task: headers.get(item.taskId) })));
+        return this.json(res, 200, items.map((item) => {
+          const avatar = item.subject?.kind === 'avatar-authorization'
+            ? store.getAvatar(item.subject.avatarId) : undefined;
+          return { ...item, task: headers.get(item.taskId),
+            ...(avatar ? { resource: { kind: 'avatar', id: avatar.id, name: avatar.name, projectId: avatar.projectId } } : {}) };
+        }));
       }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
@@ -2380,14 +2398,23 @@ export class Gateway {
           let authorization: Avatar['authorization'];
           if (authorityMode === 'full') {
             authorization = { level: 'full', profileId: 'full', scope: 'projects', projectIds: [projectId],
-              organizationId, capabilities: [...ownerCaps] };
+              organizationId, capabilities: [...ownerCaps], principal: ownerPrincipal };
           } else {
             const selection = authorizationSelectionFromBody(b.authorization)
               ?? (existing?.authorityMode === 'restricted' ? existing.authorization : { level: 'developer', scope: 'projects', projectIds: [projectId] });
-            const effective = this.deps.authorization?.taskGrant(ownerPrincipal, projectId, selection, ownerCaps)
-              ?? { ...selection, profileId: selection.level, capabilities: ownerCaps, attenuated: false };
-            if (effective.attenuated) throw new Error('you cannot delegate an authorization level you do not hold');
-            authorization = effective;
+            const keepsApprovedSelection = existing?.authorityMode === 'restricted'
+              && existing.authorization.principal && existing.authorization.principal !== ownerPrincipal
+              && selection.level === existing.authorization.level
+              && selection.scope === existing.authorization.scope
+              && JSON.stringify(selection.projectIds ?? []) === JSON.stringify(existing.authorization.projectIds ?? []);
+            if (keepsApprovedSelection) authorization = { ...existing.authorization };
+            else {
+              const effective = this.deps.authorization?.taskGrant(ownerPrincipal, projectId, selection, ownerCaps)
+                ?? { ...selection, profileId: selection.level, capabilities: ownerCaps, attenuated: false };
+              if (effective.attenuated && b.limitAuthorization !== true)
+                throw new AuthorizationGrantError('you cannot grant the Avatar more authorization than you have');
+              authorization = { ...effective, principal: ownerPrincipal };
+            }
           }
           const retainedCredentialIds = existing?.authorization.capabilities
             .filter((capability) => capability.startsWith('use-credential:item:'))
@@ -2428,7 +2455,10 @@ export class Gateway {
               authorityMode, roles, callableBy, capabilities: authorization.capabilities } });
           return this.json(res, existing ? 200 : 201, view(avatar));
         } catch (error) {
-          return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+          return this.json(res, Number((error as any)?.status ?? 400), {
+            error: error instanceof Error ? error.message : String(error),
+            ...((error as any)?.code ? { code: (error as any).code } : {}),
+          });
         }
       }
 
@@ -3452,11 +3482,15 @@ export class Gateway {
             authorizationSelectionFromBody(b.authorization) ?? String(b.profileId ?? ''),
             Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
             b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
-              ? b.credentialPolicies as any : undefined));
+              ? b.credentialPolicies as any : undefined,
+            { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: b.acceptAttenuation === true }));
         } catch (e) {
           // Frozen in-flight (cancelled / past the point of no return / finished),
           // or a stale draft edit — the workflow validator's reason is authoritative.
-          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+          return this.json(res, Number((e as any)?.status ?? 409), {
+            error: e instanceof Error ? e.message : String(e),
+            ...((e as any)?.code ? { code: (e as any).code } : {}),
+          });
         }
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
@@ -3682,6 +3716,70 @@ export class Gateway {
           }));
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (p === '/api/authorization/escalation-targets' && method === 'POST') {
+        const b = await this.body(req);
+        const authorization = authorizationSelectionFromBody(b.authorization);
+        if (!authorization) return this.json(res, 400, { error: 'authorization is required' });
+        try {
+          const result = api.authorizationEscalationTargets(token, {
+            projectId: String(b.projectId ?? ''), authorization,
+          });
+          const names = new Map((this.deps.identity?.listUsers() ?? []).map((user) =>
+            [user.id, { name: user.name, email: user.email }]));
+          return this.json(res, 200, {
+            ...result,
+            users: result.users.map((user) => ({ ...user, ...names.get(user.id) })),
+          });
+        } catch (error) {
+          return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (p === '/api/authorization-requests') {
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const authorization = authorizationSelectionFromBody(b.authorization);
+          if (!authorization || !b.target || typeof b.target !== 'object')
+            return this.json(res, 400, { error: 'target and authorization are required' });
+          try {
+            return this.json(res, 200, await api.requestAuthorization(token, {
+              projectId: String(b.projectId ?? ''), target: b.target as any, authorization,
+              audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
+              reason: b.reason == null ? undefined : String(b.reason),
+            }));
+          } catch (error) {
+            return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        if (method === 'GET') {
+          const organizationId = String(url.searchParams.get('organizationId') ?? '');
+          if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+          try {
+            return this.json(res, 200, api.listAuthorizationRequests(token, {
+              organizationId,
+              status: (url.searchParams.get('status') || undefined) as any,
+              taskId: url.searchParams.get('taskId') || undefined,
+              avatarId: url.searchParams.get('avatarId') || undefined,
+            }));
+          } catch (error) {
+            return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }
+      const authorizationResolution = p.match(/^\/api\/authorization-requests\/([^/]+)\/resolve$/);
+      if (authorizationResolution && method === 'POST') {
+        const b = await this.body(req);
+        const organizationId = String(url.searchParams.get('organizationId') ?? '');
+        if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (b.action !== 'approve' && b.action !== 'deny')
+          return this.json(res, 400, { error: 'action must be approve | deny' });
+        try {
+          return this.json(res, 200, await api.resolveAuthorizationRequest(token, {
+            organizationId, requestId: authorizationResolution[1]!, action: b.action,
+          }));
+        } catch (error) {
+          return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
         }
       }
       if (p === '/api/agent/escalation-targets' && method === 'GET') {
@@ -6826,7 +6924,8 @@ export class Gateway {
     const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
     try {
       this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
-        { error: String((e as Error)?.message ?? e) });
+        { error: String((e as Error)?.message ?? e),
+          ...((e as any)?.code ? { code: String((e as any).code) } : {}) });
     } catch {
       /* ignore */
     }
