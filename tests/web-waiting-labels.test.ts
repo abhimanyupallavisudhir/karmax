@@ -32,6 +32,8 @@ vm.runInContext(
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
     extractFunction('humanWaitDetail'),
+    extractFunction('conversationTextKey'),
+    extractFunction('conversationInputRequest'),
     extractFunction('stageLabel'),
     extractFunction('runSubRow'),
     extractFunction('runPageRow'),
@@ -43,6 +45,10 @@ vm.runInContext(
 const stageLabel = context.stageLabel as (view: Record<string, any>) => string;
 const waitingText = context.waitingText as (wait: Record<string, any>) => string;
 const humanWaitDetail = context.humanWaitDetail as (view: Record<string, any>) => string;
+const conversationInputRequest = context.conversationInputRequest as (
+  view: Record<string, any>,
+  entries: Array<Record<string, any>>,
+) => string;
 const runSubRow = context.runSubRow as (run: Record<string, any>) => string;
 const runPageRow = context.runPageRow as (run: Record<string, any>) => string;
 const conversationPresence = context.conversationPresence as (
@@ -65,6 +71,16 @@ describe('waiting labels in task summaries', () => {
       state: {},
       waitingFor: { kind: 'human', detail: 'Review this proposal.' },
     })).toBe('Waiting for input');
+    expect(stageLabel({
+      stage: 'merge',
+      status: 'waiting',
+      state: {},
+      waitingFor: {
+        kind: 'human',
+        summary: 'GitHub Actions approval required',
+        detail: 'GitHub returned action_required for CI run 410.',
+      },
+    })).toBe('GitHub Actions approval required');
     expect(stageLabel({
       stage: 'do',
       status: 'waiting',
@@ -108,6 +124,11 @@ describe('waiting labels in task summaries', () => {
       detail: 'A long internal explanation of the decision needed',
     })).toBe('Waiting for input');
     expect(waitingText({
+      kind: 'human',
+      summary: '  GitHub Actions billing\n action required  ',
+      detail: 'A long provider annotation and full failed-job inspection',
+    })).toBe('GitHub Actions billing action required');
+    expect(waitingText({
       kind: 'responder',
       detail: 'The response agent is answering the working agent',
     })).toBe('Waiting for responder');
@@ -126,6 +147,32 @@ describe('waiting labels in task summaries', () => {
       status: 'active',
       waitingFor: { kind: 'human', detail: 'Stale question' },
     })).toBe('');
+  });
+
+  it('does not repeat the visible final agent reply as an input request', () => {
+    const view = {
+      status: 'waiting',
+      waitingFor: {
+        kind: 'human',
+        detail: 'The tests pass.\r\nPlease choose a release window.',
+      },
+    };
+    expect(conversationInputRequest(view, [
+      { type: 'message', message: { role: 'user', text: 'Check the release.' } },
+      { type: 'activity', activity: { kind: 'message', title: 'The tests pass.\nPlease choose a release window.' } },
+      { type: 'activity', activity: { kind: 'turn', title: 'Agent finished working' } },
+    ])).toBe('');
+  });
+
+  it('keeps a separate targeted question in the conversation', () => {
+    const view = {
+      status: 'waiting',
+      waitingFor: { kind: 'human', detail: 'Choose the release window.' },
+    };
+    expect(conversationInputRequest(view, [
+      { type: 'message', message: { role: 'agent', text: 'The release build is ready.' } },
+    ])).toBe('Choose the release window.');
+    expect(conversationInputRequest(view, [])).toBe('Choose the release window.');
   });
 
   it('keeps ordinary and legacy merge-stage labels intact', () => {
@@ -191,5 +238,26 @@ describe('waiting labels in task summaries', () => {
       provider: 'codex',
     });
     expect(stageLabel(view)).toBe('do');
+
+    expect(patchTaskListFromEvent({
+      taskId: 'task-1',
+      type: 'view.updated',
+      payload: {
+        stage: 'merge',
+        status: 'waiting',
+        waitingFor: 'human',
+        waitingDetail: 'GitHub annotation: Actions is disabled for this repository. Full evidence follows.',
+        waitingSummary: 'GitHub Actions is disabled',
+        waitingProvider: null,
+        waitingResetAt: null,
+        agentTurn: null,
+      },
+    })).toBe(true);
+    expect(context.S.tasks[0].lastView.waitingFor).toEqual({
+      kind: 'human',
+      detail: 'GitHub annotation: Actions is disabled for this repository. Full evidence follows.',
+      summary: 'GitHub Actions is disabled',
+    });
+    expect(stageLabel(context.S.tasks[0].lastView)).toBe('GitHub Actions is disabled');
   });
 });

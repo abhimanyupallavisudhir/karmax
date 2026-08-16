@@ -52,7 +52,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -102,6 +102,18 @@ const repeatedProviderEntries = conversationEntries(transcript);
 ok(repeatedProviderEntries.filter((entry) => entry.activity?.title === 'All done').length === 1,
   'duplicate provider message items in one turn collapse to the last copy');
 S.taskEvents.pop();
+const replacedProviderIdEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'replaced-id', role: 'agent', text: 'All done', ts: 2,
+    sourceActivity: { turnId: 'turn-1', id: 'provider-replaced-this-id', attempt: 1 } },
+] });
+ok(replacedProviderIdEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.id === 'replaced-id').length === 1,
+  'a replaced provider item id still de-duplicates the final reply within its turn');
+const sameTextOtherTurnEntries = conversationEntries({ role: 'do', messages: [
+  { id: 'other-turn', role: 'agent', text: 'All done', ts: 2,
+    sourceActivity: { turnId: 'turn-2', id: 'reply', attempt: 1 } },
+] });
+ok(sameTextOtherTurnEntries.filter((entry) => entry.activity?.title === 'All done' || entry.message?.id === 'other-turn').length === 2,
+  'the turn-scoped fallback preserves a genuinely repeated reply from another turn');
 const legacyLineEndingEntries = conversationEntries({ role: 'do', messages: [
   { id: 'legacy-crlf', role: 'agent', text: 'All done\r\n', ts: 2 },
 ] });
@@ -168,6 +180,13 @@ ok(worldFileTarget('/other/task/app.js:3', S.view.worldPath) === null, 'absolute
 ok(worldFileTarget('/workspace/web/app.js:3', undefined, true).path === '/workspace/web/app.js', 'cloud-world file links are intercepted without leaking the remote root');
 const cloudLinked = renderConversationText('[app.js](/workspace/web/app.js:3)', 'agent', { taskId: 'task-cloud', worldAvailable: true });
 ok(cloudLinked.includes('/acme/app/tasks/task-cloud/file?path=%2Fworkspace%2Fweb%2Fapp.js&amp;line=3'), 'cloud-world file links keep working when this browser is not on the gateway host');
+const completedLinked = renderConversationText(
+  'Main entry point: [site/index.html](/home/user/karmax/grier/site/index.html)',
+  'agent',
+  { taskId: 'task-finished', status: 'done' },
+);
+ok(completedLinked.includes('/acme/app/tasks/task-finished/file?path=%2Fhome%2Fuser%2Fkarmax%2Fgrier%2Fsite%2Findex.html'),
+  'a completed task keeps file citations routable after its world availability hint is released');
 const markdownLinked = annotateWorldFileLinks('<p><a href="/work/task-1/web/app.js:42" target="_blank">app.js</a></p>', S.view);
 ok(markdownLinked.includes('/acme/app/tasks/task-1/file?path=%2Fwork%2Ftask-1%2Fweb%2Fapp.js&amp;line=42'), 'the default Markdown path emits the same durable handoff URL');
 ok(renderConversationText('[app](/work/task-1/app.js)', 'user', S.view).includes('[app]('), 'user-authored Markdown remains literal');

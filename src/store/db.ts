@@ -30,6 +30,8 @@ import {
   PrincipalRef,
   ProjectPrincipalRef,
   ConfirmationPolicy,
+  Avatar,
+  AvatarAvailability,
   Repository,
   ProjectRepository,
   GitConnection,
@@ -500,7 +502,7 @@ export class Store {
         eventSeq INTEGER NOT NULL, taskId TEXT NOT NULL, kind TEXT NOT NULL,
         urgency INTEGER NOT NULL DEFAULT ${urgencyRank('normal')},
         unread INTEGER NOT NULL, actionable INTEGER NOT NULL, createdAt INTEGER NOT NULL,
-        readAt INTEGER, UNIQUE (userId, eventSeq, kind)
+        readAt INTEGER, subject TEXT, UNIQUE (userId, eventSeq, kind)
       );
       CREATE TABLE IF NOT EXISTS delivery_preferences (
         userId TEXT NOT NULL, organizationId TEXT NOT NULL, json TEXT NOT NULL,
@@ -533,6 +535,13 @@ export class Store {
       CREATE TABLE IF NOT EXISTS profiles (
         id TEXT PRIMARY KEY, json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS avatars (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        ownerUserId TEXT NOT NULL, json TEXT NOT NULL, createdAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL, deletedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_avatars_project ON avatars(projectId, deletedAt);
+      CREATE INDEX IF NOT EXISTS idx_avatars_owner ON avatars(ownerUserId, deletedAt);
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
@@ -694,6 +703,7 @@ export class Store {
     const inboxCols = this.db.prepare('PRAGMA table_info(inbox)').all() as { name: string }[];
     if (!inboxCols.some((c) => c.name === 'urgency'))
       this.db.exec(`ALTER TABLE inbox ADD COLUMN urgency INTEGER NOT NULL DEFAULT ${urgencyRank('normal')}`);
+    if (!inboxCols.some((c) => c.name === 'subject')) this.db.exec('ALTER TABLE inbox ADD COLUMN subject TEXT');
     const invitationCols = this.db.prepare('PRAGMA table_info(organization_invitations)').all() as any[];
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     if (!invitationCols.some((c) => c.name === 'authorizationJson')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN authorizationJson TEXT');
@@ -1010,7 +1020,11 @@ export class Store {
     const intentIds = tasks.map((row) => String(row.intentId)).filter(Boolean);
     const executionIds = (this.db.prepare('SELECT id FROM executions WHERE projectId=?').all(id) as any[])
       .map((row) => String(row.id));
-    const inboxIds = rowsFor(this.db, 'inbox', 'taskId', taskIds).map((row) => String(row.id));
+    const avatarIds = (this.db.prepare('SELECT id FROM avatars WHERE projectId=?').all(id) as any[])
+      .map((row) => String(row.id));
+    const authorizationInboxIds = (this.db.prepare("SELECT id FROM inbox WHERE json_extract(subject, '$.projectId')=?").all(id) as any[])
+      .map((row) => String(row.id));
+    const inboxIds = [...rowsFor(this.db, 'inbox', 'taskId', taskIds).map((row) => String(row.id)), ...authorizationInboxIds];
     const teamIds = (this.db.prepare('SELECT id FROM teams WHERE projectId=?').all(id) as any[])
       .map((row) => String(row.id));
     const scopeKey = `project:${id}`;
@@ -1029,9 +1043,11 @@ export class Store {
       deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
       deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
+      deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`));
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
       this.db.prepare('DELETE FROM inbox WHERE taskId IN (SELECT id FROM tasks WHERE projectId=?)').run(id);
+      deleteRows(this.db, 'inbox', 'id', authorizationInboxIds);
       this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id);
       this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id);
       this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id);
@@ -1049,7 +1065,9 @@ export class Store {
       deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
       this.db.prepare('DELETE FROM resource_candidates WHERE projectId=?').run(id);
       this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
+      this.db.prepare('DELETE FROM avatars WHERE projectId=?').run(id);
       this.deletePermissionRequestKv(project.organizationId, taskIds);
+      this.deleteAuthorizationRequestKv(project.organizationId, { kind: 'avatar', ids: avatarIds });
       this.deleteProjectKv([id], taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id);
@@ -1188,6 +1206,7 @@ export class Store {
       team_memberships: rowsFor(this.db, 'team_memberships', 'teamId', teamIds),
       team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
       projects: rowsFor(this.db, 'projects', 'id', projectIds),
+      avatars: rowsFor(this.db, 'avatars', 'projectId', projectIds),
       resource_attachments: rowsFor(this.db, 'resource_attachments', 'projectId', projectIds)
         .map(({ credentialHandles: _handles, ...row }) => ({ ...row, credentialHandles: '[]' })),
       resource_revisions: rowsFor(this.db, 'resource_revisions', 'attachmentId',
@@ -1285,6 +1304,7 @@ export class Store {
     const wikiEdits = selectRows(this.db, 'organization_wiki_versions', 'principal IN (?,?)', [userId, principalId]);
     const previewLeases = selectRows(this.db, 'preview_leases', 'createdBy IN (?,?)', [userId, principalId])
       .map(({ tokenHash: _tokenHash, ...row }) => row);
+    const ownedAvatars = selectRows(this.db, 'avatars', 'ownerUserId=?', [userId]);
     const spendRequests = selectRows(this.db, 'payment_spend_requests', 'resolvedBy IN (?,?)', [userId, principalId]);
     const subscribedTaskIds = selectRows(this.db, 'task_subscribers', 'principalKey=?', [principalId])
       .map((row) => String(row.taskId));
@@ -1304,6 +1324,7 @@ export class Store {
     const projectIds = [...new Set([
       ...tasks.map((task) => task.projectId),
       ...projectMemberships.map((row) => String(row.projectId)),
+      ...ownedAvatars.map((row) => String(row.projectId)),
     ])];
     const projects = rowsFor(this.db, 'projects', 'id', projectIds);
     const projectById = new Map(projects.map((project) => [String(project.id), rowToProject(project)]));
@@ -1316,6 +1337,7 @@ export class Store {
       ...wikiEdits.map((row) => String(row.organizationId)),
       ...previewLeases.map((row) => String(row.organizationId)),
       ...spendRequests.map((row) => String(row.organizationId)),
+      ...ownedAvatars.map((row) => String(row.organizationId)),
     ])];
     const organizations = organizationIds.map((organizationId) => {
       const organization = this.getOrganization(organizationId);
@@ -1345,6 +1367,7 @@ export class Store {
             joinedAt: membership.joinedAt,
           } }];
         }),
+        avatars: ownedAvatars.filter((avatar) => avatar.organizationId === organizationId),
         tasks: tasks.filter((task) => organizationProjectIds.has(task.projectId))
           .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
           .map((task) => ({
@@ -1439,6 +1462,7 @@ export class Store {
     const teamIds = (this.db.prepare('SELECT id FROM teams WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const repositoryIds = (this.db.prepare('SELECT id FROM repositories WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const executionIds = (this.db.prepare('SELECT id FROM executions WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
+    const avatarIds = (this.db.prepare('SELECT id FROM avatars WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const inboxIds = (this.db.prepare('SELECT id FROM inbox WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const scopeKeys = [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)];
     const projectSettingKeys = [
@@ -1462,6 +1486,7 @@ export class Store {
       deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
       deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
+      deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`));
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
       deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys);
@@ -1492,12 +1517,15 @@ export class Store {
       this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM inbox WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM avatars WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_invitations WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_wiki_versions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`authorization:requests:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`avatars:organization:${organizationId}`);
       this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
         `credpolicy:organization:${organizationId}`,
         `git:profiles:${organizationId}`,
@@ -1927,6 +1955,8 @@ export class Store {
       throw new Error('team belongs to another organization');
     if (principal.kind === 'organization' && principal.organizationId !== organizationId)
       throw new Error('organization principal belongs to another organization');
+    if (principal.kind === 'avatar' && this.getAvatar(principal.avatarId)?.organizationId !== organizationId)
+      throw new Error('avatar principal belongs to another organization');
     if (principal.kind === 'task-agent') {
       const project = this.getProject(this.getTask(principal.taskId)?.projectId ?? '');
       if (project?.organizationId !== organizationId) throw new Error('task agent belongs to another organization');
@@ -2864,6 +2894,43 @@ export class Store {
     return r ? rowToInbox(r) : undefined;
   }
 
+  /** Deliver a resource-backed approval ask through the same inbox/outbox as
+   * task events. The synthetic task key is namespaced and the structured subject
+   * gives clients the real destination. */
+  addAuthorizationInbox(
+    organizationId: string,
+    userIds: string[],
+    subject: NonNullable<InboxItem['subject']>,
+    createdAt = Date.now(),
+  ): void {
+    const requestOffset = [...subject.requestId].reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) % 997, 0);
+    const eventSeq = createdAt * 1000 + requestOffset;
+    for (const userId of new Set(userIds)) {
+      this.deleteInbox("userId=? AND taskId=? AND kind='approval-requested'", [userId, `avatar:${subject.avatarId}`]);
+      const item: InboxItem = {
+        id: newId('inbox'), organizationId, userId, eventSeq,
+        taskId: `avatar:${subject.avatarId}`, kind: 'approval-requested', urgency: 'high',
+        unread: true, actionable: true, createdAt, subject,
+      };
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO inbox
+        (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`).run(
+        item.id, organizationId, userId, eventSeq, item.taskId, item.kind,
+        urgencyRank(item.urgency), createdAt, JSON.stringify(subject));
+      if (!Number(inserted.changes)) continue;
+      const preferences = this.getDeliveryPreferences(userId, organizationId);
+      const channels = [preferences.browser && 'browser', preferences.email && 'email', preferences.slack && 'slack']
+        .filter(Boolean) as string[];
+      for (const channel of channels) this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+        (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+        .run(newId('delivery'), item.id, channel, createdAt, createdAt);
+    }
+  }
+
+  removeAuthorizationInbox(requestId: string): void {
+    this.deleteInbox("kind='approval-requested' AND json_extract(subject, '$.requestId')=?", [requestId]);
+  }
+
   getDeliveryPreferences(userId: string, organizationId: string): DeliveryPreferences {
     const r = this.db.prepare('SELECT json FROM delivery_preferences WHERE userId=? AND organizationId=?').get(userId, organizationId) as any;
     return r ? JSON.parse(r.json) : { userId, organizationId, browser: true, email: false, slack: false, routine: true };
@@ -2891,6 +2958,7 @@ export class Store {
     while (task && !visited.has(task.id)) {
       visited.add(task.id);
       if (task.createdBy?.kind === 'user') return task.createdBy.userId;
+      if (task.createdBy?.kind === 'avatar') return this.getAvatar(task.createdBy.avatarId)?.ownerUserId;
       if (task.createdBy?.kind !== 'task-agent') return undefined;
       task = this.getTaskShallow(task.createdBy.taskId);
     }
@@ -2901,6 +2969,7 @@ export class Store {
     if (principal.kind === 'user') return [principal.userId];
     if (principal.kind === 'team') return (this.listTeamMemberships(principal.teamId)).map((m) => m.userId);
     if (principal.kind === 'organization') return this.listOrganizationMemberships(principal.organizationId).map((member) => member.userId);
+    if (principal.kind === 'avatar') return [];
     return [];
   }
 
@@ -2917,6 +2986,10 @@ export class Store {
       if (!candidate || visited.has(candidate.id)) return;
       visited.add(candidate.id);
       if (candidate.createdBy?.kind === 'user') users.add(candidate.createdBy.userId);
+      else if (candidate.createdBy?.kind === 'avatar') {
+        const ownerUserId = this.getAvatar(candidate.createdBy.avatarId)?.ownerUserId;
+        if (ownerUserId) users.add(ownerUserId);
+      }
       else if (candidate.createdBy?.kind === 'task-agent')
         addHumanCreator(this.getTaskShallow(candidate.createdBy.taskId), visited);
     };
@@ -2996,9 +3069,9 @@ export class Store {
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
   private hasPendingApprovals(taskId: string): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM events e
-      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested')
+      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved')
+          AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
       LIMIT 1`).get(taskId));
   }
@@ -3027,7 +3100,8 @@ export class Store {
     const finished = ['done', 'failed', 'cancelled'].includes(status);
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
-    if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved') {
+    if (ev.type === 'credential.approval-resolved' || ev.type === 'permission.approval-resolved'
+      || ev.type === 'authorization.approval-resolved') {
       if (!this.hasPendingApprovals(task.id)) this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]);
       return;
     }
@@ -3058,7 +3132,7 @@ export class Store {
       // remain a deterministic resolver for automated/delegated tasks.
       for (const member of this.listOrganizationMemberships(project.organizationId))
         if (member.role === 'owner') users.push(member.userId);
-    } else if (ev.type === 'permission.approval-requested') {
+    } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested') {
       kind = 'approval-requested'; actionable = true;
       users = Array.isArray(ev.payload.recipients) ? ev.payload.recipients.map(String) : [];
     } else if (isReviewRequestEvent(ev.type)) {
@@ -3121,7 +3195,7 @@ export class Store {
    */
   pruneStaleInbox(): number {
     let dropped = 0;
-    dropped += this.deleteInbox('taskId NOT IN (SELECT id FROM tasks)', []);
+    dropped += this.deleteInbox('subject IS NULL AND taskId NOT IN (SELECT id FROM tasks)', []);
     dropped += this.deleteInbox(`actionable=1 AND taskId IN (SELECT id FROM tasks
       WHERE json_extract(lastView, '$.status') IN ('done', 'failed', 'cancelled'))`, []);
     dropped += this.deleteInbox(`kind='update' AND taskId IN (SELECT id FROM tasks
@@ -3129,11 +3203,11 @@ export class Store {
     dropped += this.deleteInbox(`kind IN ('review-requested', 'escalated') AND taskId IN (SELECT id FROM tasks
       WHERE COALESCE(json_extract(lastView, '$.waitingFor.kind'), '') <> 'human')`, []);
     if (this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get()) {
-      dropped += this.deleteInbox(`kind='approval-requested' AND taskId NOT IN (
+      dropped += this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
-        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested')
+        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested')
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved')
+            AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved', 'authorization.approval-resolved')
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []);
     }
     return dropped;
@@ -3146,7 +3220,7 @@ export class Store {
       this.db.prepare("UPDATE delivery_outbox SET state='pending', claimedAt=NULL WHERE state='sending' AND claimedAt<?")
         .run(now - 60_000);
       const row = this.db.prepare(`SELECT d.*, i.organizationId, i.userId, i.eventSeq, i.taskId, i.kind, i.urgency,
-        i.unread, i.actionable, i.createdAt inboxCreatedAt, i.readAt FROM delivery_outbox d
+        i.unread, i.actionable, i.subject, i.createdAt inboxCreatedAt, i.readAt FROM delivery_outbox d
         JOIN inbox i ON i.id=d.inboxId WHERE d.state='pending' AND d.nextAt<=? ORDER BY d.createdAt LIMIT 1`).get(now) as any;
       if (!row) { this.db.exec('COMMIT'); return undefined; }
       this.db.prepare("UPDATE delivery_outbox SET state='sending', claimedAt=? WHERE id=? AND state='pending'").run(now, row.id);
@@ -3154,6 +3228,7 @@ export class Store {
       return { id: row.id, channel: row.channel, attempts: Number(row.attempts), inbox: rowToInbox({
         id: row.inboxId, organizationId: row.organizationId, userId: row.userId, eventSeq: row.eventSeq,
         taskId: row.taskId, kind: row.kind, urgency: row.urgency, unread: row.unread, actionable: row.actionable,
+        subject: row.subject,
         createdAt: row.inboxCreatedAt, readAt: row.readAt,
       }) };
     } catch (error) {
@@ -3440,6 +3515,54 @@ export class Store {
     this.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
   }
 
+  // ─── Avatars ───
+
+  upsertAvatar(avatar: Avatar): Avatar {
+    this.db.prepare(`INSERT INTO avatars
+      (id, organizationId, projectId, ownerUserId, json, createdAt, updatedAt, deletedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET organizationId=excluded.organizationId,
+      projectId=excluded.projectId, ownerUserId=excluded.ownerUserId,
+      json=excluded.json, updatedAt=excluded.updatedAt, deletedAt=excluded.deletedAt`)
+      .run(avatar.id, avatar.organizationId, avatar.projectId, avatar.ownerUserId,
+        JSON.stringify(avatar), avatar.createdAt, avatar.updatedAt, avatar.deletedAt ?? null);
+    return avatar;
+  }
+
+  getAvatar(id: string, includeDeleted = false): Avatar | undefined {
+    const row = this.db.prepare(`SELECT json FROM avatars WHERE id=?${includeDeleted ? '' : ' AND deletedAt IS NULL'}`).get(id) as any;
+    return row ? JSON.parse(row.json) as Avatar : undefined;
+  }
+
+  listAvatars(projectId?: string, includeDeleted = false): Avatar[] {
+    const where = [projectId ? 'projectId=?' : '', includeDeleted ? '' : 'deletedAt IS NULL'].filter(Boolean).join(' AND ');
+    const rows = this.db.prepare(`SELECT json FROM avatars${where ? ` WHERE ${where}` : ''} ORDER BY createdAt`)
+      .all(...(projectId ? [projectId] : [])) as any[];
+    return rows.map((row) => JSON.parse(row.json) as Avatar)
+      .sort((left, right) => left.name.localeCompare(right.name) || left.createdAt - right.createdAt);
+  }
+
+  deleteAvatar(id: string, at = Date.now()): Avatar | undefined {
+    const avatar = this.getAvatar(id);
+    if (!avatar) return undefined;
+    const removed = { ...avatar, enabled: false, deletedAt: at, updatedAt: at };
+    this.upsertAvatar(removed);
+    this.deleteAuthorizationRequestKv(avatar.organizationId, { kind: 'avatar', ids: [id] });
+    this.deleteInbox("json_extract(subject, '$.avatarId')=?", [id]);
+    return removed;
+  }
+
+  avatarAvailability(projectId: string): AvatarAvailability {
+    const project = this.getProject(projectId);
+    if (!project) throw new Error(`no project ${projectId}`);
+    const organizationId = project.organizationId ?? 'org_personal';
+    const organization = this.kvGet(`avatars:organization:${organizationId}`) !== 'disabled';
+    const raw = this.kvGet(`avatars:project:${projectId}`);
+    const projectSetting: AvatarAvailability['project'] = raw === 'enabled' || raw === 'disabled' ? raw : 'inherit';
+    return { organization, project: projectSetting,
+      effective: organization && projectSetting !== 'disabled' };
+  }
+
   // ── identities are owned by Better Auth; these rows contain only karmax policy ──
   listAuthorizationProfiles(scopeKey?: string): any[] {
     const rows = scopeKey
@@ -3519,6 +3642,7 @@ export class Store {
     for (const projectId of projectIds) {
       exact.run(`authz:default:project:${projectId}`);
       exact.run(`credpolicy:project:${projectId}`);
+      exact.run(`avatars:project:${projectId}`);
       const workflowPrefix = `wfpin:${projectId}:`;
       prefix.run(workflowPrefix, workflowPrefix);
     }
@@ -3531,6 +3655,7 @@ export class Store {
 
   private deletePermissionRequestKv(organizationId: string | undefined, taskIds: string[]): void {
     if (!taskIds.length) return;
+    this.deleteAuthorizationRequestKv(organizationId, { kind: 'task', ids: taskIds });
     const exact = this.db.prepare('DELETE FROM kv WHERE k=?');
     for (const taskId of taskIds) exact.run(`permission:grant:${taskId}`);
     if (!organizationId) return;
@@ -3547,6 +3672,30 @@ export class Store {
     } catch {
       // Leave malformed metadata available for diagnostics instead of masking it
       // with an unrelated task/project deletion.
+    }
+  }
+
+  private deleteAuthorizationRequestKv(
+    organizationId: string | undefined,
+    target: { kind: 'task' | 'avatar'; ids: string[] },
+  ): void {
+    if (!organizationId || !target.ids.length) return;
+    const key = `authorization:requests:${organizationId}`;
+    const raw = this.kvGet(key);
+    if (!raw) return;
+    try {
+      const removed = new Set(target.ids);
+      const requests = JSON.parse(raw);
+      if (!Array.isArray(requests)) return;
+      const remaining = requests.filter((request) => {
+        if (request?.target?.kind !== target.kind) return true;
+        const id = target.kind === 'task' ? request.target.taskId : request.target.avatarId;
+        return !removed.has(String(id ?? ''));
+      });
+      if (remaining.length) this.kvSet(key, JSON.stringify(remaining));
+      else this.db.prepare('DELETE FROM kv WHERE k=?').run(key);
+    } catch {
+      // Preserve malformed metadata for diagnostics.
     }
   }
 
@@ -4141,6 +4290,19 @@ export class Store {
     return next;
   }
 
+  /** Persist an accepted in-flight retarget on the durable world handle. The
+   * immutable base/baseSha remain untouched; only non-pinned repository targets
+   * follow the task-level destination. */
+  updateCurrentWorldTarget(worldId: string, target: string): WorldHandleRef {
+    const current = this.currentWorld(worldId);
+    if (!current) throw new Error('cannot retarget a missing world');
+    const repos = current.repos?.map((repo) => repo.targetPinned === false ? { ...repo, target } : repo);
+    const next = { ...current, target, ...(repos ? { repos } : {}) };
+    this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), current.id, current.generation ?? 1);
+    return next;
+  }
+
   updateWorldMeta(handle: WorldHandleRef, patch: Record<string, unknown>): WorldHandleRef {
     const current = this.currentWorld(handle.id);
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
@@ -4343,6 +4505,27 @@ export class Store {
   listWorldLeases(runnerPoolId: string): any[] {
     return this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state!='released'
       ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId) as any[];
+  }
+
+  worldLeasesForTask(taskId: string): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE taskId=? AND state!='released'
+      ORDER BY createdAt`).all(taskId) as any[];
+  }
+
+  /** Dedicated terminal/preview access can legitimately outlive its task's
+   * workflow. Runner reconciliation must preserve capacity explicitly owned by
+   * one of those live records rather than guessing from world state alone. */
+  worldLeaseHasLiveAccessor(leaseId: string, now = Date.now()): boolean {
+    const preview = this.db.prepare(`SELECT 1 FROM preview_leases
+      WHERE runnerLeaseId=? AND revokedAt IS NULL AND expiresAt>? LIMIT 1`).get(leaseId, now);
+    if (preview) return true;
+    return Boolean(this.db.prepare(`SELECT 1 FROM executions
+      WHERE runnerLeaseId=? AND state IN ('starting','running','stop-requested') LIMIT 1`).get(leaseId));
+  }
+
+  unreleasedWorldLeases(): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE state!='released'
+      ORDER BY createdAt`).all() as any[];
   }
 
   recordUsage(event: Omit<UsageEvent, 'id'> & { id?: string }): UsageEvent {
@@ -5187,6 +5370,7 @@ export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
   if (principal.kind === 'organization') return `organization:${principal.organizationId}`;
+  if (principal.kind === 'avatar') return `avatar:${principal.avatarId}`;
   return `task-agent:${principal.taskId}:${principal.role}`;
 }
 
@@ -5234,7 +5418,8 @@ function rowToInbox(r: any): InboxItem {
   return { id: r.id, organizationId: r.organizationId, userId: r.userId, eventSeq: r.eventSeq,
     taskId: r.taskId, kind: r.kind, urgency: URGENCY_LEVELS[Number(r.urgency ?? urgencyRank('normal'))] ?? 'normal',
     unread: Boolean(r.unread), actionable: Boolean(r.actionable),
-    createdAt: r.createdAt, readAt: r.readAt ?? undefined };
+    createdAt: r.createdAt, readAt: r.readAt ?? undefined,
+    ...(r.subject ? { subject: JSON.parse(r.subject) } : {}) };
 }
 
 function rowToExecution(row: any): ExecutionRecord {

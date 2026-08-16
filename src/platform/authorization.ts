@@ -318,6 +318,27 @@ export class AuthorizationService {
     return this.scopedTaskGrant(principalId, projectId, requested, grantorCaps);
   }
 
+  /** The complete package represented by a selection, before it is attenuated
+   * against any grantor. Used for gap explanations and recipient eligibility. */
+  requestedCapabilities(projectId: string, requested: AuthorizationSelection): Capability[] {
+    return this.scopedTaskGrant('system:authorization-preview', projectId, requested, ['*']).capabilities;
+  }
+
+  missingCapabilities(
+    principalId: string,
+    projectId: string,
+    requested: AuthorizationSelection,
+    grantorCaps?: Capability[],
+  ): Capability[] {
+    const full = this.requestedCapabilities(projectId, requested);
+    const held = this.scopedTaskGrant(principalId, projectId, requested, grantorCaps).capabilities;
+    return full.filter((capability) => !allows(held, capability));
+  }
+
+  canGrantSelection(principalId: string, projectId: string, requested: AuthorizationSelection): boolean {
+    return !this.scopedTaskGrant(principalId, projectId, requested).attenuated;
+  }
+
   scopedTaskGrant(
     principalId: string,
     taskProjectId: string,

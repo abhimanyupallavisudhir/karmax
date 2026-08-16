@@ -46,6 +46,33 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
     expect(store.getTask(first.id)!.lastView!.status).toBe('failed');
     expect(store.getTask(second.id)!.lastView!.status).toBe('failed');
   });
+
+  it('settles a running Setup whose live workflow already received cancellation', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Hosted', ownerUserId: 'owner' });
+    const p = store.createProject('P', {}, organization.id);
+    const t = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.25.0', params: { prompt: 'x' } });
+    const setup = { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'setup' as const,
+      status: 'active' as const, messages: [], actions: [], state: {}, updatedAt: 0 };
+    store.saveView(t.id, setup);
+    store.createRunnerPool({ id: 'pool', organizationId: organization.id, name: 'Pool', provider: 'e2b',
+      mode: 'managed', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const lease = store.requestWorldLease({ runnerPoolId: 'pool', organizationId: organization.id,
+      projectId: p.id, taskId: t.id, worldId: t.id });
+    const terminated: string[] = [];
+    const fakeClient: any = { workflow: { getHandle: () => ({
+      describe: async () => ({ status: { name: 'RUNNING' } }),
+      query: async () => ({ ...setup, state: { cancelled: true } }),
+      terminate: async (reason: string) => { terminated.push(reason); },
+    }) } };
+
+    const r = await reconcileTasks(store, fakeClient);
+
+    expect(r.settled).toBe(1);
+    expect(terminated).toEqual(['cancelled Setup did not settle']);
+    expect(store.getTask(t.id)?.lastView).toMatchObject({ stage: 'cancelled', status: 'cancelled' });
+    expect(store.worldLease(lease.id)?.state).toBe('released');
+  });
 });
 
 describe('default branch + auto-review (real Temporal + git)', () => {

@@ -582,23 +582,41 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     });
 
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = [
+      'FAIL tests/web-console-ux.test.ts:54 reconnect behavior',
+      'AssertionError: expected app.js to contain if (wsHadDropped) { refreshTasks()',
+      'Received source fixtures: billing payment spending limit budget prepaid;',
+      'quota for Actions minutes and included minutes; Actions is disabled; workflows are disabled;',
+      'no hosted runners; not permitted to use this action; resource not accessible by integration;',
+      'requires approval; approve and run; action required.',
+    ].join('\n');
     githubReadiness = {
       mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
-        detailsUrl: 'https://github.test/checks/ci-repair',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
       }] } },
     };
+    const beforeLanding = h.store.eventsSince(task.id, 0).at(-1)?.seq ?? 0;
     await handle.signal('confirm');
 
     await expect.poll(async () => {
       const current = await view(handle);
       const context = current.messages.map((message: any) => message.text).join('\n');
-      // CheckRun output text requires an additional GitHub App permission and
-      // is deliberately not part of readiness. The actionable, permission-safe
-      // packet is the terminal classification plus check name and details URL.
-      return `${current.stage}/${/terminally failing CI.*unit tests.*ci-repair/is.test(context)}`;
+      return `${current.stage}/${/web-console-ux\.test\.ts:54.*wsHadDropped.*refreshTasks/is.test(context)}`;
     }, { timeout: 30_000 }).toBe('review/true');
+    const repairViews = h.store.eventsSince(task.id, beforeLanding)
+      .filter((event) => event.type === 'view.updated').map((event) => event.payload);
+    expect(repairViews).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: 'do', status: 'active' }),
+    ]));
+    expect(h.store.eventsSince(task.id, beforeLanding)
+      .filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
+    const repaired = await view(handle);
+    expect(repaired.prs).toHaveLength(1);
+    expect(repaired.messages.map((message: any) => message.text).join('\n'))
+      .toMatch(/Classification: revision.*repair the proposal/is);
     githubReadiness = {};
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done', sha: prs[0].merge_commit_sha });
@@ -639,6 +657,57 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     githubReadiness = {};
     expect(await handle.result()).toMatchObject({ stage: 'done' });
     expect(actionsReruns).toBe(1);
+  }, 120_000);
+
+  it('projects a direct action_required hold with concise status and durable evidence', async () => {
+    const repo = await repoWithOrigin('github-action-required');
+    const project = h.store.createProject('GitHub action required', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'action-required', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'action-required-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE,
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Approve GitHub Actions', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.21.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write approval.md :: exact proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 25,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsRunConclusion = 'action_required';
+    actionsJobConclusion = 'action_required';
+    actionsJobLog = 'The workflow is awaiting repository-owner approval.\n';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'ACTION_REQUIRED',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    await handle.signal('confirm');
+
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 30_000 }).toMatchObject({
+      kind: 'human',
+      summary: 'GitHub Actions approval required',
+      detail: expect.stringMatching(/run CI #1.*concluded action_required.*Classification: human/is),
+    });
+    // The workflow query is live state; publishView persists the projection in
+    // the following activity. Wait for that durable boundary instead of racing
+    // the worker immediately after the query observes the hold.
+    await expect.poll(() => h.store.getTask(task.id)?.lastView?.waitingFor, { timeout: 30_000 }).toMatchObject({
+      kind: 'human', summary: 'GitHub Actions approval required',
+    });
+    const waitEvent = h.store.eventsSince(task.id, 0).findLast((event) =>
+      event.type === 'view.updated' && event.payload?.waitingSummary === 'GitHub Actions approval required');
+    expect(waitEvent?.payload).toMatchObject({ waitingFor: 'human', waitingSummary: 'GitHub Actions approval required' });
+
+    await handle.signal('cancel');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
   it('accepts a successful exact-revision replacement for superseded CI without reopening the proposal', async () => {

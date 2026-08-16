@@ -102,6 +102,12 @@ export type GithubActionsFailureDisposition = 'revision' | 'retry' | 'superseded
 export interface GithubActionsFailureDecision {
   disposition: GithubActionsFailureDisposition;
   reason: string;
+  /** Bounded UI copy for a direct provider-owned hold. Full evidence remains in
+   * the rendered inspection and must not be squeezed into this label. */
+  waitReason?: string;
+  /** Structured GitHub check/annotation context that justified human routing.
+   * Job logs are deliberately never copied here. */
+  providerEvidence?: string;
   inspection: GithubActionsFailureInspection;
 }
 
@@ -324,27 +330,26 @@ export class GithubActionsApi {
  * rerun; failures after merge belong to a separate deployment recovery task. */
 export function classifyGithubActionsFailure(
   inspection: GithubActionsFailureInspection,
-  options: { postMerge?: boolean; additionalContext?: string } = {},
+  options: { postMerge?: boolean; providerContext?: string } = {},
 ): GithubActionsFailureDecision {
   if (options.postMerge) return {
     disposition: 'deployment',
     reason: 'The failing workflow ran after the revision was merged; repairing it must not reopen or mutate the completed proposal.',
     inspection,
   };
-  const corpus = `${githubActionsFailureCorpus(inspection)}\n${options.additionalContext ?? ''}`;
-  // Cancellation is an execution outcome, not evidence that arbitrary strings
-  // printed before cancellation describe the provider account. Negative-path
-  // tests routinely print realistic billing/permission fixtures. For an
-  // interrupted run, human routing therefore requires direct GitHub metadata,
-  // check output/annotations supplied by the caller, or action_required—not a
-  // keyword found only in the cancelled job log.
-  const providerCorpus = `${githubActionsProviderCorpus(inspection)}\n${options.additionalContext ?? ''}`;
+  const corpus = githubActionsFailureCorpus(inspection);
+  // Workflow, job, step, and log text are repository-controlled output. Tests
+  // routinely print realistic billing, quota, permission, and approval fixtures,
+  // so none of that text can establish that the GitHub account itself is blocked.
+  // Human ownership requires GitHub's structured run conclusion or direct
+  // provider/check/annotation evidence collected outside the job log.
+  const providerEvidence = githubActionsProviderEvidence(inspection, options.providerContext);
   const conclusion = String(inspection.run.conclusion ?? '').toLowerCase();
-  const interrupted = ['cancelled', 'stale', 'startup_failure', 'timed_out'].includes(conclusion);
-  if ((interrupted ? HUMAN_CONFIGURATION_FAILURE.test(providerCorpus) : HUMAN_CONFIGURATION_FAILURE.test(corpus))
-    || conclusion === 'action_required') return {
+  if (HUMAN_CONFIGURATION_FAILURE.test(providerEvidence) || conclusion === 'action_required') return {
     disposition: 'human',
     reason: 'GitHub reported an account, billing, permission, approval, runner-availability, or repository configuration problem that changing the proposal cannot fix.',
+    waitReason: githubActionsHumanWaitReason(providerEvidence, conclusion),
+    ...(providerEvidence ? { providerEvidence } : {}),
     inspection,
   };
   if (SUPERSEDED_RUN_FAILURE.test(corpus)) return {
@@ -376,6 +381,23 @@ export function classifyGithubActionsDiagnostic(input: string): 'human' | 'retry
   return undefined;
 }
 
+/** Project a direct GitHub diagnostic into a stable, concise task-status label.
+ * The detailed annotation/check output remains durable in the wait detail. */
+export function githubActionsHumanWaitReason(input: string, conclusion = ''): string {
+  if (/billing|payment|spending limit|budget|prepaid/i.test(input))
+    return 'GitHub Actions billing action required';
+  if (/quota for (?:actions|minutes)|included minutes/i.test(input))
+    return 'GitHub Actions quota action required';
+  if (/actions (?:is|are) disabled|workflow(?:s)? (?:is|are) disabled/i.test(input))
+    return 'GitHub Actions is disabled';
+  if (/no hosted runners?/i.test(input)) return 'GitHub Actions runner setup required';
+  if (/not permitted|resource not accessible|permission/i.test(input))
+    return 'GitHub Actions permission required';
+  if (/requires? approval|approve and run|action required/i.test(input)
+    || conclusion === 'action_required') return 'GitHub Actions approval required';
+  return 'GitHub Actions action required';
+}
+
 /** Render bounded but otherwise complete diagnostics for every failed job that
  * GitHub exposed. The inspection API already strips signed log URLs and caps
  * each downloaded log; this adds a total event/prompt boundary. */
@@ -389,6 +411,7 @@ export function renderGithubActionsFailure(
     `Revision: ${run.headSha || 'unknown'}`,
     ...(run.url ? [`Run: ${run.url}`] : []),
     `Classification: ${decision.disposition} — ${decision.reason}`,
+    ...(decision.providerEvidence ? [`Provider evidence:\n${decision.providerEvidence}`] : []),
   ];
   if (!failedJobs.length) lines.push('GitHub exposed no terminally failing job output.');
   for (const job of failedJobs) {
@@ -491,17 +514,11 @@ function githubActionsFailureCorpus(inspection: GithubActionsFailureInspection):
   ].filter(Boolean).join('\n');
 }
 
-function githubActionsProviderCorpus(inspection: GithubActionsFailureInspection): string {
-  return [
-    inspection.run.name,
-    inspection.run.displayTitle,
-    inspection.run.conclusion,
-    ...inspection.notices,
-    ...inspection.failedJobs.flatMap((job) => [
-      job.name, job.conclusion,
-      ...job.steps.flatMap((step) => [step.name, step.conclusion]),
-    ]),
-  ].filter(Boolean).join('\n');
+function githubActionsProviderEvidence(inspection: GithubActionsFailureInspection,
+  providerContext: string | undefined): string {
+  return [...inspection.notices, providerContext]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join('\n').slice(0, 32_000);
 }
 
 function normalizeRun(raw: any): GithubActionsRun {

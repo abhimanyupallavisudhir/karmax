@@ -24,6 +24,7 @@ export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | 'responder' | (
 export type PrincipalRef =
   | { kind: 'user'; userId: string }
   | { kind: 'team'; teamId: string }
+  | { kind: 'avatar'; avatarId: string }
   | { kind: 'task-agent'; taskId: string; role: string };
 
 /** Project access may also target the entire containing organization. This is
@@ -56,6 +57,49 @@ export interface AuthorizationSelection {
   level: string;
   scope: 'projects' | 'organization' | 'global';
   projectIds?: string[];
+}
+
+/** A durable, user-authored autonomous principal. Avatars are project-owned for
+ * discovery/routing, while their authority is an explicit delegation captured
+ * at creation or edit time. `roles=[]` means every workflow role; callableBy
+ * uses the same stable user/team selectors as task routing plus `@project`. */
+export interface Avatar {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  ownerUserId: string;
+  name: string;
+  purpose?: string;
+  prompt: string;
+  promptVersion: number;
+  enabled: boolean;
+  authorityMode: 'full' | 'restricted';
+  authorization: AuthorizationSelection & {
+    profileId: string;
+    capabilities: string[];
+    organizationId?: string;
+    /** Principal whose live grant backs this delegation. Legacy Avatars fall
+     * back to their owner so revocation behavior remains unchanged. */
+    principal?: string;
+  };
+  credentialPolicies?: Record<string, { use?: 'auto' | 'ask' | 'never'; reveal?: 'auto' | 'ask' | 'never' }>;
+  githubAccountId?: string;
+  callableBy: string[];
+  roles: string[];
+  runtime: {
+    provider: Provider;
+    model?: string;
+    effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  };
+  createdAt: number;
+  updatedAt: number;
+  deletedAt?: number;
+}
+
+export interface AvatarAvailability {
+  organization: boolean;
+  project: 'inherit' | 'enabled' | 'disabled';
+  effective: boolean;
 }
 
 export interface OrganizationInvitation {
@@ -179,6 +223,9 @@ export interface InboxItem {
   actionable: boolean;
   createdAt: number;
   readAt?: number;
+  /** Resource-backed asks use the inbox without manufacturing a task merely to
+   * carry a notification. */
+  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string };
 }
 
 export interface DeliveryPreferences {
@@ -758,6 +805,9 @@ export interface GitHubMergeAuthorization {
   actorUserId?: string;
   sha?: string;
   detail?: string;
+  /** Concise provider-owned wait reason for task summaries. Detailed evidence
+   * remains in `detail`. */
+  waitReason?: string;
   /** Project members whose live GitHub role currently permits a merge request. */
   eligibleUserIds?: string[];
   /** Why landing returned to Do, and whether the already-recorded intent
@@ -1251,6 +1301,13 @@ export interface FieldSpec {
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
   provider: Provider;
+  /** Select a durable Avatar. Provider/model remain snapshotted for replay and
+   * display, but current turns resolve the owner-controlled prompt + authority
+   * from this id and refuse execution when it has been disabled. */
+  avatarId?: string;
+  /** Internal invocation purpose when an Avatar is answering an authorization
+   * or response request rather than filling the workflow role itself. */
+  avatarPurpose?: 'authorize' | 'respond';
   /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
   modelProvider?: string;
   model?: string;
@@ -1428,7 +1485,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'github' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm' | 'responder'; provider?: string; earliestResetAt?: number; detail?: string; summary?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;

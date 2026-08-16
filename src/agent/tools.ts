@@ -569,7 +569,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' },
-        authorization_profile: { type: 'string' }, provider: { type: 'string', enum: ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'] },
+        target: { type: 'string' }, authorization_profile: { type: 'string' },
+        provider: { type: 'string', enum: ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'] },
         model: { type: 'string' }, effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
       },
       required: ['task_id', 'message'],
@@ -604,10 +605,10 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'escalate_to_human',
     description:
-      'Pause your current task at its exact stage and ask selected people or teams for input. ' +
-      'Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+      'Pause your current task at its exact stage and ask selected people, teams, or Avatars for input. ' +
+      'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
       'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets"). ' +
-      'Calling this stops your current turn; the task resumes when a selected human responds.',
+      'Calling this stops your current turn; the task resumes when a selected principal responds.',
     parameters: {
       type: 'object',
       properties: {
@@ -616,7 +617,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'One or more human/team routing selectors; any selected person may respond.',
+          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond.',
         },
         message: {
           type: 'string',
@@ -633,8 +634,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'request_permission',
     description:
       'Request exact missing Karmax capabilities for this task. The request appears in Approval Requests and is routed ' +
-      'to selected people or teams. Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
-      'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected human who already ' +
+      'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+      'Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
       'holds every requested capability can approve. Do not request wildcards. An approval or denial resumes the task.',
     parameters: {
       type: 'object',
@@ -651,7 +652,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'One or more human/team routing selectors; any selected capable person may decide.',
+          description: 'One or more person/team/Avatar routing selectors; any selected capable principal may decide.',
         },
         reason: {
           type: 'string',
@@ -1161,7 +1162,7 @@ export function platformToolHandlers(
     async fork_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       return JSON.stringify(await platformRequest('POST', `/api/tasks/${taskId}/fork-agent`, {
-        role: args?.role ?? 'do', title: args?.title, message: args?.message,
+        role: args?.role ?? 'do', title: args?.title, message: args?.message, target: args?.target,
         authorizationProfile: args?.authorization_profile, provider: args?.provider,
         model: args?.model, effort: args?.effort,
       }));

@@ -26,13 +26,13 @@ import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
+import { AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
-import type { AuthorizationService } from '../platform/authorization.js';
+import { AuthorizationGrantError, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -60,11 +60,13 @@ import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, 
 import { ITEM_FIELDS, VaultItems } from '../autonomy/vault-items.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireInteractiveHuman,
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
+import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -164,14 +166,20 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The wiki is the skills store: reads need the scope's read capability, edits
   // reuse skill:write (agents and developers can both grow it).
   if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  if (/^\/api\/organizations\/[^/]+\/avatar-settings$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   // The agent mailbox is a credential surface, org-scoped by its path (the
   // token/session check enforces the tenant boundary from requestScope).
   if (/^\/api\/organizations\/[^/]+\/agent-mail(?:\/|$)/.test(p)) return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
+  if (/^\/api\/projects\/[^/]+\/avatar-settings$/.test(p)) return read ? 'project:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return 'task:conversation:read';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
+  if (p === '/api/authorization/escalation-targets' || p === '/api/authorization-requests')
+    return read ? 'task:read' : 'task:create';
+  if (/^\/api\/authorization-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p.startsWith('/api/authorization') || p.startsWith('/api/audit')) return read ? 'authorization:read' : 'authorization:write';
   if (p.startsWith('/api/accounts') || p.startsWith('/api/git-profiles')) return read ? 'credential:read' : 'credential:write';
   if (p === '/api/credentials/policy') {
@@ -229,7 +237,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/explanation-settings$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
-  if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources|checkout)(?:\/|$)/.test(p))
+    return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
   if (/^\/api\/projects\/[^/]+\/resources/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
@@ -298,6 +307,8 @@ function principalFromBody(value: unknown): PrincipalRef {
   if (candidate.kind === 'team' && typeof candidate.teamId === 'string' && candidate.teamId) return { kind: 'team', teamId: candidate.teamId };
   if (candidate.kind === 'task-agent' && typeof candidate.taskId === 'string' && typeof candidate.role === 'string' && candidate.taskId && candidate.role)
     return { kind: 'task-agent', taskId: candidate.taskId, role: candidate.role };
+  if (candidate.kind === 'avatar' && typeof candidate.avatarId === 'string' && candidate.avatarId)
+    return { kind: 'avatar', avatarId: candidate.avatarId };
   throw new Error('invalid principal reference');
 }
 
@@ -454,6 +465,24 @@ export function staticAssetHeaders(file: string): Record<string, string> {
   };
 }
 
+const staticRevisionCache = new Map<string, { mtimeMs: number; size: number; revision: string }>();
+
+/** A content revision for the no-build console, used by already-open tabs to
+ * notice that a deploy replaced the JavaScript they are currently executing. */
+export function staticAssetRevision(file: string): string | undefined {
+  try {
+    const stat = fs.statSync(file);
+    const cached = staticRevisionCache.get(file);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.revision;
+    const revision = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    staticRevisionCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, revision });
+    return revision;
+  } catch {
+    // Minimal/test gateways may intentionally have no console static directory.
+    return undefined;
+  }
+}
+
 /** Content types for review "open" artifacts (a superset of the static MIME map). */
 const ARTIFACT_MIME: Record<string, string> = {
   ...MIME,
@@ -527,9 +556,18 @@ export class Gateway {
       .requests({ taskId, status: 'pending' });
   }
 
+  private pendingAuthorizationRequests(taskId: string) {
+    const task = this.deps.store.getTask(taskId);
+    const organizationId = task && this.deps.store.getProject(task.projectId)?.organizationId;
+    if (!organizationId) return [];
+    return new AuthorizationRequests(this.deps.store, organizationId)
+      .requests({ taskId, status: 'pending' });
+  }
+
   private withApprovalRequests(view: TaskView | undefined, taskId: string): TaskView | undefined {
     if (!view) return view;
-    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length;
+    const count = this.pendingCredentialRequests(taskId).length + this.pendingPermissionRequests(taskId).length
+      + this.pendingAuthorizationRequests(taskId).length;
     return { ...view, ...(count ? { approvalRequests: count } : { approvalRequests: undefined }) };
   }
 
@@ -1313,9 +1351,11 @@ export class Gateway {
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     }
     if (p === '/api/meta' && method === 'GET') {
+      const consoleRevision = staticAssetRevision(path.join(this.deps.staticDir, 'app.js'));
       return this.json(res, 200, {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
+        ...(consoleRevision ? { consoleRevision } : {}),
         safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
         cellId: this.deps.cellId ?? 'local',
@@ -2073,7 +2113,12 @@ export class Gateway {
         const items = store.listInbox(subject.userId, requestedScope.organizationId,
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
         const headers = store.taskHeaders(items.map((item) => item.taskId));
-        return this.json(res, 200, items.map((item) => ({ ...item, task: headers.get(item.taskId) })));
+        return this.json(res, 200, items.map((item) => {
+          const avatar = item.subject?.kind === 'avatar-authorization'
+            ? store.getAvatar(item.subject.avatarId) : undefined;
+          return { ...item, task: headers.get(item.taskId),
+            ...(avatar ? { resource: { kind: 'avatar', id: avatar.id, name: avatar.name, projectId: avatar.projectId } } : {}) };
+        }));
       }
       const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
       if (inboxItem && method === 'PATCH') {
@@ -2225,6 +2270,216 @@ export class Gateway {
           if (error instanceof ConversationImportError || error instanceof AttachmentError)
             return this.json(res, 400, { error: error.message });
           throw error;
+        }
+      }
+
+      // Avatars are durable autonomous principals owned by one user. Their
+      // prompt/runtime/authority are edited together so a caller never observes
+      // a half-updated identity. Organization/project kill switches are separate
+      // policy and therefore do not rewrite the Avatar itself.
+      const organizationAvatarSettings = p.match(/^\/api\/organizations\/([^/]+)\/avatar-settings$/);
+      if (organizationAvatarSettings) {
+        const organizationId = organizationAvatarSettings[1]!;
+        if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
+        if (method === 'GET') return this.json(res, 200, {
+          enabled: store.kvGet(`avatars:organization:${organizationId}`) !== 'disabled',
+        });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.kvSet(`avatars:organization:${organizationId}`, b.enabled === false ? 'disabled' : 'enabled');
+          store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor), action: 'avatar.organization-policy.changed',
+            scopeKey: `organization:${organizationId}`, detail: { enabled: b.enabled !== false } });
+          return this.json(res, 200, { enabled: b.enabled !== false });
+        }
+      }
+      const projectAvatarSettings = p.match(/^\/api\/projects\/([^/]+)\/avatar-settings$/);
+      if (projectAvatarSettings) {
+        const projectId = projectAvatarSettings[1]!;
+        if (!store.getProject(projectId)) return this.json(res, 404, { error: 'project not found' });
+        if (method === 'GET') return this.json(res, 200, store.avatarAvailability(projectId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const value = String(b.value ?? 'inherit');
+          if (!['inherit', 'enabled', 'disabled'].includes(value))
+            return this.json(res, 400, { error: 'value must be inherit | enabled | disabled' });
+          if (value === 'inherit') store.kvSet(`avatars:project:${projectId}`, 'inherit');
+          else store.kvSet(`avatars:project:${projectId}`, value);
+          store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor), action: 'avatar.project-policy.changed',
+            scopeKey: `project:${projectId}`, detail: { value } });
+          return this.json(res, 200, store.avatarAvailability(projectId));
+        }
+      }
+      const avatarsMatch = p.match(/^\/api\/projects\/([^/]+)\/avatars(?:\/([^/]+))?$/);
+      if (avatarsMatch) {
+        const projectId = avatarsMatch[1]!;
+        const avatarId = avatarsMatch[2];
+        const project = store.getProject(projectId);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        const organizationId = project.organizationId ?? 'org_personal';
+        const availability = store.avatarAvailability(projectId);
+        const subjectId = callerIdentity.humanSubject?.userId;
+        const canAdmin = this.deps.tokens.check(token, 'project:edit', { projectId, organizationId }).ok;
+        const view = (avatar: Avatar) => ({
+          ...avatar,
+          effectiveEnabled: avatarEnabled(store, avatar),
+          callable: Boolean(subjectId && avatarCallableBy(store, avatar, subjectId)),
+          canEdit: avatar.ownerUserId === subjectId,
+          canDisable: avatar.ownerUserId === subjectId || canAdmin,
+        });
+        if (method === 'GET') {
+          if (avatarId) {
+            const avatar = store.getAvatar(avatarId);
+            return avatar?.projectId === projectId
+              ? this.json(res, 200, view(avatar))
+              : this.json(res, 404, { error: 'avatar not found' });
+          }
+          return this.json(res, 200, { availability, avatars: store.listAvatars(projectId).map(view) });
+        }
+
+        const subject = requireInteractiveHuman(callerIdentity);
+        const existing = avatarId ? store.getAvatar(avatarId) : undefined;
+        if (avatarId && !existing) return this.json(res, 404, { error: 'avatar not found' });
+        if (existing?.projectId !== projectId) return this.json(res, 404, { error: 'avatar not found' });
+        if (method === 'DELETE') {
+          if (existing!.ownerUserId !== subject.userId && !canAdmin)
+            return this.json(res, 403, { error: 'only the owner or a project administrator can remove this Avatar' });
+          const removed = store.deleteAvatar(existing!.id)!;
+          store.appendAudit({ principalId: `user:${subject.userId}`, action: 'avatar.removed',
+            scopeKey: `project:${projectId}`, detail: { avatarId: removed.id, ownerUserId: removed.ownerUserId } });
+          return this.json(res, 200, { removed: true, id: removed.id });
+        }
+        if (method !== 'POST' && method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
+        const b = await this.body(req);
+        if (existing && existing.ownerUserId !== subject.userId) {
+          // Administrators get a kill switch, never the ability to rewrite the
+          // owner's trusted prompt or delegation package.
+          if (!canAdmin || Object.keys(b).some((key) => key !== 'enabled'))
+            return this.json(res, 403, { error: 'only the Avatar owner can edit it; administrators may only enable or disable it' });
+          const updated = store.upsertAvatar({ ...existing, enabled: b.enabled !== false, updatedAt: Date.now() });
+          store.appendAudit({ principalId: `user:${subject.userId}`, action: 'avatar.enabled.changed',
+            scopeKey: `project:${projectId}`, detail: { avatarId: updated.id, enabled: updated.enabled } });
+          return this.json(res, 200, view(updated));
+        }
+        if (!existing && !availability.effective)
+          return this.json(res, 409, { error: 'Avatars are disabled for this project' });
+
+        try {
+          const name = String(b.name ?? existing?.name ?? '').trim();
+          const purpose = String(b.purpose ?? existing?.purpose ?? '').trim();
+          const prompt = String(b.prompt ?? existing?.prompt ?? '').trim();
+          if (!name) throw new Error('name is required');
+          if ([...name].length > 80) throw new Error('name must be at most 80 characters');
+          if ([...purpose].length > 240) throw new Error('purpose must be at most 240 characters');
+          if (!prompt) throw new Error('instructions are required');
+          if ([...prompt].length > 100_000) throw new Error('instructions must be at most 100,000 characters');
+          if (store.listAvatars(projectId).some((candidate) => candidate.id !== existing?.id
+            && candidate.name.toLowerCase() === name.toLowerCase())) throw new Error(`an Avatar named "${name}" already exists`);
+
+          const runtimeInput = b.runtime && typeof b.runtime === 'object' ? b.runtime : existing?.runtime;
+          const fallback = roleDefaultProfile(store, 'do', projectId);
+          const provider = String(runtimeInput?.provider ?? fallback?.provider ?? this.deps.agentInfo.provider) as Provider;
+          if (!isAgentProvider(provider)) throw new Error(`unknown agent provider "${provider}"`);
+          const runtime: Avatar['runtime'] = {
+            provider,
+            ...(runtimeInput?.model ? { model: String(runtimeInput.model) } : fallback?.model ? { model: fallback.model } : {}),
+            ...(runtimeInput?.effort ? { effort: String(runtimeInput.effort) as Avatar['runtime']['effort'] }
+              : fallback?.effort ? { effort: fallback.effort } : {}),
+          };
+          if (runtime.effort && !['low', 'medium', 'high', 'xhigh', 'max'].includes(runtime.effort))
+            throw new Error('invalid reasoning effort');
+
+          const callableInput: string[] = (Array.isArray(b.callableBy)
+            ? b.callableBy.map((value: unknown) => String(value))
+            : existing?.callableBy ?? [`user:${subject.userId}`]);
+          const callableBy = [...new Set(callableInput.map((value: string) => value.trim()).filter(Boolean))];
+          if (!callableBy.length) callableBy.push(`user:${subject.userId}`);
+          for (const selector of callableBy) {
+            if (selector === '@project') continue;
+            if (selector.startsWith('user:')) {
+              if (!store.organizationMembership(organizationId, selector.slice(5))) throw new Error(`unknown organization user ${selector}`);
+              continue;
+            }
+            const team = selector.startsWith('@team:')
+              ? store.listTeams(organizationId, projectId).find((candidate) => candidate.slug === selector.slice(6))
+              : selector.startsWith('team:') ? store.getTeam(selector.slice(5)) : undefined;
+            if (!team || team.organizationId !== organizationId) throw new Error(`unknown Avatar caller ${selector}`);
+          }
+          const roleInput: string[] = Array.isArray(b.roles)
+            ? b.roles.map((value: unknown) => String(value)) : existing?.roles ?? [];
+          const roles = [...new Set(roleInput.filter(Boolean))];
+          const { allRoles } = await import('../contrib/manifests.js');
+          const knownRoles = new Set([...allRoles().map((role) => role.name), 'authorize', 'respond']);
+          if (roles.some((role) => !knownRoles.has(role))) throw new Error(`unknown Avatar role ${roles.find((role) => !knownRoles.has(role))}`);
+
+          const ownerPrincipal = `user:${subject.userId}`;
+          const ownerCaps = this.deps.authorization?.capabilities(ownerPrincipal, projectId, organizationId)
+            ?? authRecord?.caps ?? [];
+          const authorityMode: Avatar['authorityMode'] = b.authorityMode === 'restricted' ? 'restricted'
+            : b.authorityMode === 'full' ? 'full' : existing?.authorityMode ?? 'full';
+          let authorization: Avatar['authorization'];
+          if (authorityMode === 'full') {
+            authorization = { level: 'full', profileId: 'full', scope: 'projects', projectIds: [projectId],
+              organizationId, capabilities: [...ownerCaps], principal: ownerPrincipal };
+          } else {
+            const selection = authorizationSelectionFromBody(b.authorization)
+              ?? (existing?.authorityMode === 'restricted' ? existing.authorization : { level: 'developer', scope: 'projects', projectIds: [projectId] });
+            const keepsApprovedSelection = existing?.authorityMode === 'restricted'
+              && existing.authorization.principal && existing.authorization.principal !== ownerPrincipal
+              && selection.level === existing.authorization.level
+              && selection.scope === existing.authorization.scope
+              && JSON.stringify(selection.projectIds ?? []) === JSON.stringify(existing.authorization.projectIds ?? []);
+            if (keepsApprovedSelection) authorization = { ...existing.authorization };
+            else {
+              const effective = this.deps.authorization?.taskGrant(ownerPrincipal, projectId, selection, ownerCaps)
+                ?? { ...selection, profileId: selection.level, capabilities: ownerCaps, attenuated: false };
+              if (effective.attenuated && b.limitAuthorization !== true)
+                throw new AuthorizationGrantError('you cannot grant the Avatar more authorization than you have');
+              authorization = { ...effective, principal: ownerPrincipal };
+            }
+          }
+          const retainedCredentialIds = existing?.authorization.capabilities
+            .filter((capability) => capability.startsWith('use-credential:item:'))
+            .map((capability) => capability.slice('use-credential:item:'.length)) ?? [];
+          const credentialInput: string[] = Array.isArray(b.credentialIds)
+            ? b.credentialIds.map((value: unknown) => String(value)) : retainedCredentialIds;
+          const credentialIds = [...new Set(credentialInput.filter(Boolean))];
+          if (credentialIds.length) {
+            const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
+            for (const id of credentialIds) {
+              if (!vault.get(id)) throw new Error(`unknown vault credential ${id}`);
+              const capability = `use-credential:item:${id}`;
+              if (!allows(ownerCaps, capability)) throw new Error(`you cannot delegate vault credential ${id}`);
+              authorization.capabilities.push(capability);
+            }
+          }
+          authorization.capabilities = [...new Set(authorization.capabilities)];
+          const githubAccountId = b.githubAccountId === null ? undefined
+            : b.githubAccountId ? String(b.githubAccountId) : existing?.githubAccountId;
+          if (githubAccountId && this.deps.githubApp?.activeUserAccountId(subject.userId) !== githubAccountId)
+            throw new Error('the selected GitHub account is not your active connected account');
+
+          const now = Date.now();
+          const avatar: Avatar = {
+            id: existing?.id ?? newId('avatar'), organizationId, projectId,
+            ownerUserId: subject.userId, name, ...(purpose ? { purpose } : {}), prompt,
+            promptVersion: existing ? existing.promptVersion + (prompt === existing.prompt ? 0 : 1) : 1,
+            enabled: b.enabled === undefined ? existing?.enabled ?? true : b.enabled !== false,
+            authorityMode, authorization,
+            ...(b.credentialPolicies && typeof b.credentialPolicies === 'object'
+              ? { credentialPolicies: b.credentialPolicies } : existing?.credentialPolicies ? { credentialPolicies: existing.credentialPolicies } : {}),
+            ...(githubAccountId ? { githubAccountId } : {}), callableBy, roles, runtime,
+            createdAt: existing?.createdAt ?? now, updatedAt: now,
+          };
+          store.upsertAvatar(avatar);
+          store.appendAudit({ principalId: ownerPrincipal, action: existing ? 'avatar.updated' : 'avatar.created',
+            scopeKey: `project:${projectId}`, detail: { avatarId: avatar.id, promptVersion: avatar.promptVersion,
+              authorityMode, roles, callableBy, capabilities: authorization.capabilities } });
+          return this.json(res, existing ? 200 : 201, view(avatar));
+        } catch (error) {
+          return this.json(res, Number((error as any)?.status ?? 400), {
+            error: error instanceof Error ? error.message : String(error),
+            ...((error as any)?.code ? { code: (error as any).code } : {}),
+          });
         }
       }
 
@@ -2886,6 +3141,12 @@ export class Gateway {
           }
         }
       }
+      const projectCheckout = p.match(/^\/api\/projects\/([^/]+)\/checkout$/);
+      if (projectCheckout && method === 'GET') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        try { return this.json(res, 200, this.deps.handoffs.projectCheckout(projectCheckout[1]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       const githubMergeEligibility = p.match(/^\/api\/projects\/([^/]+)\/github-merge-eligibility$/);
       if (githubMergeEligibility && method === 'GET') {
         const project = store.getProject(githubMergeEligibility[1]!);
@@ -3242,11 +3503,15 @@ export class Gateway {
             authorizationSelectionFromBody(b.authorization) ?? String(b.profileId ?? ''),
             Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
             b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
-              ? b.credentialPolicies as any : undefined));
+              ? b.credentialPolicies as any : undefined,
+            { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: b.acceptAttenuation === true }));
         } catch (e) {
           // Frozen in-flight (cancelled / past the point of no return / finished),
           // or a stale draft edit — the workflow validator's reason is authoritative.
-          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+          return this.json(res, Number((e as any)?.status ?? 409), {
+            error: e instanceof Error ? e.message : String(e),
+            ...((e as any)?.code ? { code: (e as any).code } : {}),
+          });
         }
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
@@ -3472,6 +3737,70 @@ export class Gateway {
           }));
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (p === '/api/authorization/escalation-targets' && method === 'POST') {
+        const b = await this.body(req);
+        const authorization = authorizationSelectionFromBody(b.authorization);
+        if (!authorization) return this.json(res, 400, { error: 'authorization is required' });
+        try {
+          const result = api.authorizationEscalationTargets(token, {
+            projectId: String(b.projectId ?? ''), authorization,
+          });
+          const names = new Map((this.deps.identity?.listUsers() ?? []).map((user) =>
+            [user.id, { name: user.name, email: user.email }]));
+          return this.json(res, 200, {
+            ...result,
+            users: result.users.map((user) => ({ ...user, ...names.get(user.id) })),
+          });
+        } catch (error) {
+          return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (p === '/api/authorization-requests') {
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const authorization = authorizationSelectionFromBody(b.authorization);
+          if (!authorization || !b.target || typeof b.target !== 'object')
+            return this.json(res, 400, { error: 'target and authorization are required' });
+          try {
+            return this.json(res, 200, await api.requestAuthorization(token, {
+              projectId: String(b.projectId ?? ''), target: b.target as any, authorization,
+              audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
+              reason: b.reason == null ? undefined : String(b.reason),
+            }));
+          } catch (error) {
+            return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        if (method === 'GET') {
+          const organizationId = String(url.searchParams.get('organizationId') ?? '');
+          if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+          try {
+            return this.json(res, 200, api.listAuthorizationRequests(token, {
+              organizationId,
+              status: (url.searchParams.get('status') || undefined) as any,
+              taskId: url.searchParams.get('taskId') || undefined,
+              avatarId: url.searchParams.get('avatarId') || undefined,
+            }));
+          } catch (error) {
+            return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }
+      const authorizationResolution = p.match(/^\/api\/authorization-requests\/([^/]+)\/resolve$/);
+      if (authorizationResolution && method === 'POST') {
+        const b = await this.body(req);
+        const organizationId = String(url.searchParams.get('organizationId') ?? '');
+        if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (b.action !== 'approve' && b.action !== 'deny')
+          return this.json(res, 400, { error: 'action must be approve | deny' });
+        try {
+          return this.json(res, 200, await api.resolveAuthorizationRequest(token, {
+            organizationId, requestId: authorizationResolution[1]!, action: b.action,
+          }));
+        } catch (error) {
+          return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });
         }
       }
       if (p === '/api/agent/escalation-targets' && method === 'GET') {
@@ -6616,7 +6945,8 @@ export class Gateway {
     const declared = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : undefined;
     try {
       this.json(res, declared ?? (e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500),
-        { error: String((e as Error)?.message ?? e) });
+        { error: String((e as Error)?.message ?? e),
+          ...((e as any)?.code ? { code: String((e as any).code) } : {}) });
     } catch {
       /* ignore */
     }

@@ -48,7 +48,7 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by karmax for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
 - open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
 - confirm_decision(action, text?): use only when the workflow explicitly asks this turn to review or verify an already-open exact candidate. A final Do-agent integration verification uses this tool instead of open_pr and must not edit the proposal in that verification turn.
-- escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
+- escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team/Avatar when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.
 Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response. If you are the Do agent and the work is ready for review, call open_pr as your final action. If you need a human decision first, use escalate_to_human instead; waiting for input and opening a PR are separate decisions.
 If you need the result of a long command (e.g. a test or build run), wait for it in THIS turn — run it in the foreground, or wait for your backgrounded job to finish — then fold in the result before ending your turn. Do NOT end your turn expecting to be re-notified later except for a durable request_agent_action collaboration: ordinary background jobs do not pause the task. Only leave a job running in the background if you genuinely don't need its result (e.g. a dev server).`;
@@ -62,7 +62,7 @@ const FALLBACK_TEMPLATE = `{{toolsPreamble}}
 {{prompt}}
 
 # World
-Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
+Working directory: {{worldPath}} (branch {{branch}}; recorded base {{base}}; target {{target}}).
 {{worldRepos}}
 
 {{instructions}}`;
@@ -91,6 +91,12 @@ export function assemblePrompt(args: AssembleArgs): string {
 
 Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; karmax will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only when the requested input is inherently human-only (for example an approval, secret, or irreversible personal decision).`;
   }
+  const target = args.task.target ?? args.world.target ?? args.world.base;
+  if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
+    preamble += `
+
+Git ancestry for recovered, forked, or retargeted work: "recorded base" is the immutable commit this task world was provisioned from; "target" is only the branch the proposal will merge into; current HEAD is the tip you are editing. Retargeting does not rewrite the recorded base. Keep the initially provisioned task HEAD as an ancestor: do not reset, recreate, or replace the task branch with a source/target branch. Integrate the selected target into the existing task branch and apply recovered changes as descendant commits. Karmax checks this before publication and refuses unrelated or reparented history.`;
+  }
   const values: Record<string, string> = {
     toolsPreamble: preamble,
     title: args.task.title,
@@ -99,7 +105,7 @@ Input routing for this task: its ordinary Waiting-for-input Responder is an agen
     worldRepos: describeRepos(args.world),
     branch: args.world.branch,
     base: args.world.base,
-    target: args.task.target ?? args.world.target ?? args.world.base,
+    target,
     instructions,
     reviewInfo: '',
     stage: '',

@@ -62,6 +62,24 @@ describe('hosted/local Git handoff', () => {
     store.close();
   });
 
+  it('produces a default-branch checkout plan for a hosted project', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const project = store.createProject('Platform Tools', { worldProvider: 'e2b' }, organization.id);
+    const repository = store.upsertRepository({ organizationId: organization.id, provider: 'github', providerId: '7',
+      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'trunk', private: true });
+    store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id, baseBranch: 'release' });
+
+    const plan = new WorldHandoffService(store, new WorldRegistry(), {} as any).projectCheckout(project.id);
+
+    expect(plan.workspace).toBe('karmax-platform-tools');
+    expect(plan.repositories).toEqual([expect.objectContaining({ name: 'app', branch: 'trunk' })]);
+    expect(plan.cloneScript).toContain("git clone --branch 'trunk' --single-branch 'git@github.com:acme/app.git' 'app'");
+    expect(plan.updateScript).toContain("git -C 'app' merge --ff-only 'origin/trunk'");
+    expect(JSON.stringify(plan)).not.toMatch(/token|private.key|credential/i);
+    store.close();
+  });
+
   it('imports a pushed branch through a credential-free bundle and only fast-forwards the cloud checkout', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-handoff-'));
     const remote = path.join(dir, 'remote.git');
@@ -211,6 +229,18 @@ describe('hosted/local Git handoff', () => {
     expect(worldOpens).toBe(2);
     expect(fs.readFileSync(path.join(refreshed.cwd, 'after-review.txt'), 'utf8')).toBe('new task work\n');
     expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'push.branch')).toHaveLength(2);
+
+    // The final task view no longer advertises a live world, and provider
+    // compute has been released. Its published checkpoint still materializes
+    // without attempting to reopen the destroyed sandbox.
+    store.setWorldState(handle, 'released');
+    const releasedRoot = path.join(dir, 'released-local');
+    const released = await new WorldHandoffService(store, worlds, github, undefined, undefined, releasedRoot)
+      .openFile(task.id, { ...view, stage: 'done', status: 'done', updatedAt: 3 }, `${cloud}/after-review.txt`, 9);
+    expect(released.path).toBe(path.join(releasedRoot, task.id, 'app', 'after-review.txt'));
+    expect(released.command).toBe(`code --goto '${path.join(releasedRoot, task.id, 'app', 'after-review.txt')}:9'`);
+    expect(fs.readFileSync(released.path, 'utf8')).toBe('new task work\n');
+    expect(worldOpens).toBe(2);
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 

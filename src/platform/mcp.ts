@@ -58,7 +58,7 @@ export interface PlatformOps {
   listAgents(taskId: string): Promise<unknown>;
   getConversation(taskId: string, role?: string): Promise<unknown>;
   forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string;
-    provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<{ id: string }>;
+    target?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
   listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
     workflow?: string | number; page?: number; perPage?: number }): Promise<unknown>;
@@ -418,7 +418,8 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. The source remains untouched. Use message_agent for later back-and-forth with the fork.',
       inputSchema: {
         taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(),
-        authorizationProfile: z.string().optional(), provider: z.enum(['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock']).optional(),
+        target: z.string().optional(), authorizationProfile: z.string().optional(),
+        provider: z.enum(['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock']).optional(),
         model: z.string().optional(), effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
       },
     },
@@ -433,10 +434,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'escalate_to_human',
     {
       description:
-        'Pause your current task at its exact stage and request input from selected people or teams. ' +
-        'Audience selectors: user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
+        'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
+        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Calling this stops the current turn; the task resumes when a selected human responds. ' +
+        'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
@@ -452,9 +453,9 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     {
       description:
         'Request exact missing Karmax capabilities for this task. The request appears in the task Approval Requests tab ' +
-        'and is routed to selected people or teams. Audience selectors: user:<id>, @team:<slug>, @creator, @owners, ' +
+        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @owners, ' +
         '@project, or @all. Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Only a selected human who already holds every requested capability can approve; approval resumes the task ' +
+        'Only a selected principal that already holds every requested capability can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted.',
       inputSchema: {
