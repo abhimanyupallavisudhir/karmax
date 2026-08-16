@@ -1731,12 +1731,15 @@ export class KarmaxApi {
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
-    // Historical tasks (and tasks authorized before delegated subjects were
-    // introduced) may have a human creator + pinned GitHub identity but no
-    // durable delegation. An authorization update is itself carried by a
-    // verified bearer, so use that authority boundary to backfill provenance for
-    // the next turn. Never infer a subject from `principal`, and never replace a
-    // task's already-pinned account with the caller's currently-active account.
+    // Every authorization update must mint fresh delegated provenance with the
+    // new scope. Reusing the old delegation is not merely stale metadata: a
+    // project-scoped draft promoted to Administrator would otherwise keep its
+    // project-only human delegation, then fail before its first agent turn when
+    // the workflow mints an organization-scoped token from it. An authorization
+    // update is itself carried by a verified bearer, so it is the correct
+    // authority boundary both for backfilling historical tasks and for changing
+    // scope. Never infer a subject from `principal`, and never replace a task's
+    // already-pinned account with the caller's currently-active account.
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string'
       ? task.params._githubAccountId : undefined;
     const delegatedGithubAccountId = pinnedGithubAccountId
@@ -1745,7 +1748,7 @@ export class KarmaxApi {
         : caller.humanSubject
           ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
           : undefined);
-    const delegation = priorAuthorization?.delegationId ? undefined : this.deps.tokens.delegateHuman(token, {
+    const delegation = this.deps.tokens.delegateHuman(token, {
       taskId,
       projectId: authorizationScope.scope ? undefined : task.projectId,
       projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
@@ -1769,9 +1772,11 @@ export class KarmaxApi {
         throw new Error(unwrapCause(e));
       }
     }
+    const { delegationId: _staleDelegationId, ...priorAuthorizationWithoutDelegation } = priorAuthorization ?? {};
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...priorAuthorization, ...authorization, principal: caller.principal, credentialPolicies: policies,
+      _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization,
+        principal: caller.principal, credentialPolicies: policies,
         ...(delegation ? { delegationId: delegation.id } : {}) },
       ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
