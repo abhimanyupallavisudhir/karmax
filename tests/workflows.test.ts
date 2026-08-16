@@ -29,6 +29,52 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await h?.stop();
   });
 
+  it('software-dev: cancelling Setup aborts provider provisioning and settles promptly', async () => {
+    const project = h.store.createProject('Blocked setup', { worldProvider: 'blocked-setup' as any });
+    const task = h.store.createTask({ projectId: project.id, title: 'Cancel setup', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'a' } });
+    let started = false;
+    let aborted = false;
+    let release!: (error: Error) => void;
+    h.worlds.register({
+      kind: 'blocked-setup',
+      capabilities: { remote: true },
+      async create(spec: any) {
+        started = true;
+        return await new Promise((_resolve, reject) => {
+          release = reject;
+          spec.signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(spec.signal.reason ?? new Error('provisioning cancelled'));
+          }, { once: true });
+        });
+      },
+    } as any);
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id,
+        projectId: project.id,
+        title: task.title,
+        prompt: 'x',
+        base: 'main',
+        target: 'main',
+        project: { repos: [], worldProvider: 'blocked-setup', defaultBase: 'main', defaultTarget: 'main' },
+      }],
+    });
+    await expect.poll(() => started, { timeout: 10_000 }).toBe(true);
+    await handle.signal('cancel');
+    const settled = await Promise.race([
+      handle.result().then((result) => result.stage === 'cancelled', () => false),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
+    ]);
+    if (!settled) release?.(new Error('test cleanup'));
+
+    expect(settled).toBe(true);
+    expect(aborted).toBe(true);
+  }, 30_000);
+
   it('just-do: a single agent call, work committed to the branch (no merge)', async () => {
     const repo = await h.makeRepo('jd');
     const taskId = newId('task');

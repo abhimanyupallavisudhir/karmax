@@ -7055,7 +7055,7 @@ function conversationPane(v, t) {
   const presence = conversationPresence(v, t);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
-  const requestedInput = canFollowUp ? humanWaitDetail(v) : '';
+  const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
   const request = requestedInput
     ? `<div class="msg system"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderMessageBody(requestedInput)}</div></div>`
     : '';
@@ -7118,9 +7118,6 @@ function conversationEntries(t) {
   const updates = orderedEvents.filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
   const activities = new Map();
   const activityRefsBySource = new Map();
-  // Provider streams and workflow snapshots may normalize line endings
-  // differently even though the browser renders the same prose.
-  const messageTextKey = (value) => String(value || '').replace(/\r\n?/g, '\n').trim();
   // A Temporal activity retry continues the same logical turn, so provider item
   // ids (especially the synthetic `turn` id) repeat. Keep attempts distinct:
   // otherwise the resumed `started` event overwrites the prior `failed` event
@@ -7178,20 +7175,20 @@ function conversationEntries(t) {
   const lastProviderMessage = new Map();
   for (const entry of activities.values()) {
     if (entry.activity.kind !== 'message') continue;
-    lastProviderMessage.set(`${entry.activityGroup}/${messageTextKey(entry.activity.title)}`, entry);
+    lastProviderMessage.set(`${entry.activityGroup}/${conversationTextKey(entry.activity.title)}`, entry);
   }
   const visibleActivities = [...activities.values()].filter((entry) =>
     entry.activity.kind !== 'message'
-      || lastProviderMessage.get(`${entry.activityGroup}/${messageTextKey(entry.activity.title)}`) === entry);
+      || lastProviderMessage.get(`${entry.activityGroup}/${conversationTextKey(entry.activity.title)}`) === entry);
   const providerTexts = new Set(
     visibleActivities
       .filter((entry) => entry.activity.kind === 'message')
-      .map((entry) => messageTextKey(entry.activity.title)),
+      .map((entry) => conversationTextKey(entry.activity.title)),
   );
   const providerGroupTexts = new Set(
     visibleActivities
       .filter((entry) => entry.activity.kind === 'message')
-      .map((entry) => `${entry.activityGroup}/${messageTextKey(entry.activity.title)}`),
+      .map((entry) => `${entry.activityGroup}/${conversationTextKey(entry.activity.title)}`),
   );
   // User messages carry real epoch-ms timestamps; agent/system replies are stamped
   // by the deterministic workflow with a per-array sequence number (it has no wall
@@ -7209,10 +7206,10 @@ function conversationEntries(t) {
         // message. Keep the identity check primary, then fall back only inside
         // that same turn/attempt so a genuinely repeated reply in another turn
         // remains visible.
-        return !providerGroupTexts.has(`${source.turnId}/${source.attempt}/${messageTextKey(message.text)}`);
+        return !providerGroupTexts.has(`${source.turnId}/${source.attempt}/${conversationTextKey(message.text)}`);
       }
       // Replay/back-compat for messages recorded before sourceActivity existed.
-      return !providerTexts.has(messageTextKey(message.text));
+      return !providerTexts.has(conversationTextKey(message.text));
     })
     .map((message, index) => {
       const real = Number(message.ts) > 100000000000;
@@ -7795,6 +7792,33 @@ function waitingText(w) {
 function humanWaitDetail(v) {
   if (v?.status !== 'waiting' || v.waitingFor?.kind !== 'human') return '';
   return typeof v.waitingFor.detail === 'string' ? v.waitingFor.detail.trim() : '';
+}
+
+// Provider streams and workflow snapshots may normalize line endings
+// differently even though the browser renders the same prose.
+function conversationTextKey(value) {
+  return String(value ?? '').replace(/\r\n?/g, '\n').trim();
+}
+
+// A normal Do turn uses its final reply as waitingFor.detail so responders and
+// the Overview tab retain the full request. That reply is already the last
+// agent message in the conversation, however, so appending the detail again as
+// an italic "Input requested" row only repeats the same content. Preserve the
+// row when a targeted hold carries a genuinely separate question.
+function conversationInputRequest(v, entries) {
+  const detail = humanWaitDetail(v);
+  if (!detail) return '';
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    const agentText = entry.type === 'message' && entry.message?.role === 'agent'
+      ? entry.message.text
+      : entry.type === 'activity' && entry.activity?.kind === 'message'
+        ? entry.activity.title
+        : '';
+    if (!agentText) continue;
+    return conversationTextKey(agentText) === conversationTextKey(detail) ? '' : detail;
+  }
+  return detail;
 }
 
 // A CLI command to FORK this agent's session into the user's terminal — a branched

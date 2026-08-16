@@ -4213,6 +4213,19 @@ export class Store {
     return next;
   }
 
+  /** Persist an accepted in-flight retarget on the durable world handle. The
+   * immutable base/baseSha remain untouched; only non-pinned repository targets
+   * follow the task-level destination. */
+  updateCurrentWorldTarget(worldId: string, target: string): WorldHandleRef {
+    const current = this.currentWorld(worldId);
+    if (!current) throw new Error('cannot retarget a missing world');
+    const repos = current.repos?.map((repo) => repo.targetPinned === false ? { ...repo, target } : repo);
+    const next = { ...current, target, ...(repos ? { repos } : {}) };
+    this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
+      .run(JSON.stringify(next), Date.now(), current.id, current.generation ?? 1);
+    return next;
+  }
+
   updateWorldMeta(handle: WorldHandleRef, patch: Record<string, unknown>): WorldHandleRef {
     const current = this.currentWorld(handle.id);
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
@@ -4415,6 +4428,27 @@ export class Store {
   listWorldLeases(runnerPoolId: string): any[] {
     return this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state!='released'
       ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, priority DESC, createdAt`).all(runnerPoolId) as any[];
+  }
+
+  worldLeasesForTask(taskId: string): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE taskId=? AND state!='released'
+      ORDER BY createdAt`).all(taskId) as any[];
+  }
+
+  /** Dedicated terminal/preview access can legitimately outlive its task's
+   * workflow. Runner reconciliation must preserve capacity explicitly owned by
+   * one of those live records rather than guessing from world state alone. */
+  worldLeaseHasLiveAccessor(leaseId: string, now = Date.now()): boolean {
+    const preview = this.db.prepare(`SELECT 1 FROM preview_leases
+      WHERE runnerLeaseId=? AND revokedAt IS NULL AND expiresAt>? LIMIT 1`).get(leaseId, now);
+    if (preview) return true;
+    return Boolean(this.db.prepare(`SELECT 1 FROM executions
+      WHERE runnerLeaseId=? AND state IN ('starting','running','stop-requested') LIMIT 1`).get(leaseId));
+  }
+
+  unreleasedWorldLeases(): any[] {
+    return this.db.prepare(`SELECT * FROM world_leases WHERE state!='released'
+      ORDER BY createdAt`).all() as any[];
   }
 
   recordUsage(event: Omit<UsageEvent, 'id'> & { id?: string }): UsageEvent {
