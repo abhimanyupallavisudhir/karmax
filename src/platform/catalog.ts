@@ -73,6 +73,7 @@ export const PLATFORM_API_CATALOG = {
   sourceControl: [
     'GET|PUT /api/projects/:projectId/repository-sources',
     'GET|POST /api/projects/:projectId/repositories',
+    'GET /api/projects/:projectId/checkout (portable default-branch checkout instructions)',
     'GET /api/projects/:projectId/github-merge-eligibility (verified human subject; delegation accepted; live external GitHub permission preflight)',
     'DELETE /api/projects/:projectId/repositories/:repositoryId',
     'GET|POST /api/organizations/:organizationId/repositories',

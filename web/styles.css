@@ -247,6 +247,8 @@ a { color: var(--accent); text-decoration: none; }
 .tab:hover { color: var(--ink); }
 .tab.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 .tab .pill { margin-left: 6px; font-size: 11px; font-family: var(--font-mono); color: var(--ink-3); }
+.tabs-spacer { flex: 1 1 12px; min-width: 12px; }
+.tabs-action { flex: none; align-self: center; margin: 0 4px 0 0; }
 
 .page-title { font-size: 15px; font-weight: 650; margin: 0 0 14px; letter-spacing: -0.01em; }
 

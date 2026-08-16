@@ -3338,7 +3338,7 @@ function renderMain() {
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
-        .join('')}</div>`
+        .join('')}${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="project-local-checkout">Work locally</button>' : ''}</div>`
     : '';
 
   let content = '';
@@ -3363,6 +3363,7 @@ function renderMain() {
 
   main.innerHTML = tabbar + content;
   // Project tabs are real <a> links; installLinkRouter() handles the plain click.
+  $('#project-local-checkout')?.addEventListener('click', () => openProjectCheckout(proj));
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
@@ -5991,6 +5992,7 @@ function renderTaskPage() {
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
           ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}${t.key === 'approvals' && v.approvalRequests ? `<span class="pill">${v.approvalRequests}</span>` : ''}</a>`).join('')}
+          ${S.meta?.hosted ? '<span class="tabs-spacer"></span><button class="btn sm tabs-action" id="local-checkout">Work locally</button>' : ''}
         </div>
       </div>
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
@@ -6011,6 +6013,7 @@ function renderTaskPage() {
   wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
+  $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
@@ -7518,7 +7521,6 @@ function terminalPane(v) {
       <span style="flex:1"></span>
       ${localWorldPath(v) ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
       ${v.worldAvailable && !localWorldPath(v) ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
-      ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       ${(v.checkouts || []).length > 1 ? `<select class="sel sm" id="term-checkout" title="Which branch's checkout to open the shell in">
         ${v.checkouts.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')}
@@ -7537,7 +7539,6 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
-  $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
@@ -7585,6 +7586,34 @@ async function openLocalCheckout(v) {
       await refreshTask();
     } catch (error) { result.textContent = error.message; button.disabled = false; }
   });
+}
+
+async function openProjectCheckout(project) {
+  if (!project?.id) return;
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <div class="tf-loading modal-loading" role="status"><span class="global-search-loading">Preparing checkout instructions…</span></div>
+  </div></div>`;
+  const wireClose = () => {
+    host.querySelector('.local-handoff-close')?.addEventListener('click', () => host.remove());
+    host.querySelector('.local-handoff-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  };
+  wireClose();
+  let plan;
+  try { plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`); }
+  catch (error) { host.remove(); return toast(error.message, true); }
+  if (!host.isConnected) return;
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to krmax.</p>
+    <div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
+  </div></div>`;
+  wireClose();
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
 }
 
 async function materializeLocalCheckout(v, session) {
