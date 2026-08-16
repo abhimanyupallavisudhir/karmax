@@ -7839,7 +7839,10 @@ const asyncElementRenderEpoch = new WeakMap();
 function beginAsyncElementRender(element) {
   const epoch = (asyncElementRenderEpoch.get(element) || 0) + 1;
   asyncElementRenderEpoch.set(element, epoch);
-  return () => asyncElementRenderEpoch.get(element) === epoch;
+  // A route change can detach the element while its request is in flight. Its
+  // epoch is still current in the WeakMap, but it is no longer safe to paint or
+  // wire children through document-level selectors.
+  return () => element.isConnected && asyncElementRenderEpoch.get(element) === epoch;
 }
 
 async function renderCredentialEditor(el, scope, opts = {}) {
