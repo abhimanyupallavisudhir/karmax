@@ -231,7 +231,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/explanation-settings$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
-  if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources|checkout)(?:\/|$)/.test(p))
+    return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
   if (/^\/api\/projects\/[^/]+\/resources/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
@@ -3088,6 +3089,12 @@ export class Gateway {
               { error: error instanceof Error ? error.message : String(error) });
           }
         }
+      }
+      const projectCheckout = p.match(/^\/api\/projects\/([^/]+)\/checkout$/);
+      if (projectCheckout && method === 'GET') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        try { return this.json(res, 200, this.deps.handoffs.projectCheckout(projectCheckout[1]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubMergeEligibility = p.match(/^\/api\/projects\/([^/]+)\/github-merge-eligibility$/);
       if (githubMergeEligibility && method === 'GET') {

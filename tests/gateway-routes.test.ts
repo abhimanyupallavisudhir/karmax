@@ -84,6 +84,7 @@ describe('gateway route capability binding', () => {
     expect(cap('POST', '/api/organizations/o1/repositories/create')).toBe('repository:write');
     expect(cap('POST', '/api/projects/p1/repositories')).toBe('repository:write');
     expect(cap('GET', '/api/projects/p1/repositories')).toBe('repository:read');
+    expect(cap('GET', '/api/projects/p1/checkout')).toBe('repository:read');
   });
 
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {

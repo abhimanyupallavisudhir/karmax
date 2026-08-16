@@ -31,6 +31,15 @@ export interface LocalCheckoutPlan {
   pushScript: string;
 }
 
+export interface ProjectCheckoutPlan {
+  projectId: string;
+  name: string;
+  workspace: string;
+  repositories: Array<{ id: string; name: string; sshUrl: string; branch: string }>;
+  cloneScript: string;
+  updateScript: string;
+}
+
 export interface MaterializedLocalCheckout {
   taskId: string;
   root: string;
@@ -259,6 +268,35 @@ export class WorldHandoffService {
     }
     return { taskId, taskNumber: task.num, title: task.title, workspace, repositories,
       cloneScript: clone.join('\n'), updateScript: update.join('\n'), pushScript: push.join('\n') };
+  }
+
+  /** Build a portable, credential-free checkout plan for the project's source
+   * repositories. Unlike a task handoff this intentionally follows each
+   * repository's default branch: it is the clean starting point for local work,
+   * not a way to enter or mutate a live task world. */
+  projectCheckout(projectId: string): ProjectCheckoutPlan {
+    const project = this.store.getProject(projectId);
+    if (!project) throw new Error('project not found');
+    const linked = this.store.listProjectRepositories(projectId);
+    if (!linked.length) throw new Error('project has no GitHub repositories');
+    const repositories = linked.map(({ repository }) => ({
+      id: repository.id,
+      name: repository.name,
+      sshUrl: repository.sshUrl,
+      branch: repository.defaultBranch,
+    }));
+    const slug = safeName(project.name.toLowerCase()).replace(/^-+|-+$/g, '') || safeName(project.id);
+    const workspace = `karmax-${slug}`;
+    const clone = ['set -eu', `mkdir -p ${sh(workspace)}`, `cd ${sh(workspace)}`];
+    const update = ['set -eu', `cd ${sh(workspace)}`];
+    for (const repository of repositories) {
+      clone.push(`git clone --branch ${sh(repository.branch)} --single-branch ${sh(repository.sshUrl)} ${sh(repository.name)}`);
+      update.push(`git -C ${sh(repository.name)} fetch origin ${sh(repository.branch)}`,
+        `git -C ${sh(repository.name)} switch ${sh(repository.branch)}`,
+        `git -C ${sh(repository.name)} merge --ff-only ${sh(`origin/${repository.branch}`)}`);
+    }
+    return { projectId, name: project.name, workspace, repositories,
+      cloneScript: clone.join('\n'), updateScript: update.join('\n') };
   }
 
   async refresh(taskId: string, view: TaskView): Promise<{ updated: Array<{ repo: string; branch: string; sha: string }>;
