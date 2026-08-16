@@ -1028,33 +1028,40 @@ export class Store {
 
   getOrganizationUsagePolicy(organizationId: string): OrganizationUsagePolicy {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    const planLimit = this.organizationEntitlements(organizationId).maxActiveAgentRuns ?? 10_000;
     const fallback: Omit<OrganizationUsagePolicy, 'effectiveMaxActiveAgentTurns'> = {
       managedModelProviders: [],
       allowedModelProviders: [],
       allowedModels: [],
       maxAgentStartsPerMinute: this.hosted ? 60 : 10_000,
       maxRemoteStartsPerMinute: this.hosted ? 30 : 10_000,
-      maxActiveWorlds: this.hosted ? 20 : 10_000,
+      maxActiveWorlds: this.hosted ? planLimit : 10_000,
     };
     const raw = this.kvGet(`organization-usage-policy:${organizationId}`);
     let saved: Partial<OrganizationUsagePolicy> = {};
     if (raw) try { saved = JSON.parse(raw); } catch { saved = {}; }
     delete saved.effectiveMaxActiveAgentTurns;
-    const planLimit = this.organizationEntitlements(organizationId).maxActiveAgentRuns ?? 10_000;
     const ownerLimit = Number.isSafeInteger(saved.maxActiveAgentTurns) && saved.maxActiveAgentTurns! > 0
       ? saved.maxActiveAgentTurns : undefined;
+    const effectiveAgentLimit = ownerLimit == null ? planLimit : Math.min(ownerLimit, planLimit);
     return { ...fallback, ...saved,
       managedModelProviders: [...(saved.managedModelProviders ?? [])],
       allowedModelProviders: [...(saved.allowedModelProviders ?? [])],
       allowedModels: [...(saved.allowedModels ?? [])],
       ...(ownerLimit == null ? {} : { maxActiveAgentTurns: ownerLimit }),
-      effectiveMaxActiveAgentTurns: ownerLimit == null ? planLimit : Math.min(ownerLimit, planLimit),
+      effectiveMaxActiveAgentTurns: effectiveAgentLimit,
+      // Customer-funded hosted worlds use the same marketed concurrency number
+      // as agent turns. Ignore legacy/custom saved values so there is no second
+      // SaaS capacity product hiding behind the plan entitlement.
+      maxActiveWorlds: this.hosted ? effectiveAgentLimit : (saved.maxActiveWorlds ?? fallback.maxActiveWorlds),
     };
   }
 
   setOrganizationUsagePolicy(organizationId: string, patch: Partial<OrganizationUsagePolicy>): OrganizationUsagePolicy {
     const current = this.getOrganizationUsagePolicy(organizationId);
-    const next = { ...current, ...patch } as OrganizationUsagePolicy;
+    const effectivePatch = { ...patch };
+    if (this.hosted) delete effectivePatch.maxActiveWorlds;
+    const next = { ...current, ...effectivePatch } as OrganizationUsagePolicy;
     delete (next as Partial<OrganizationUsagePolicy>).effectiveMaxActiveAgentTurns;
     if (Object.prototype.hasOwnProperty.call(patch, 'managedSpendCapMicros')
       && (patch as any).managedSpendCapMicros == null) delete next.managedSpendCapMicros;
@@ -1073,7 +1080,7 @@ export class Store {
     for (const [key, value] of Object.entries({
       maxAgentStartsPerMinute: next.maxAgentStartsPerMinute,
       maxRemoteStartsPerMinute: next.maxRemoteStartsPerMinute,
-      maxActiveWorlds: next.maxActiveWorlds,
+      ...(!this.hosted ? { maxActiveWorlds: next.maxActiveWorlds } : {}),
     })) if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000) throw new Error(`${key} must be an integer from 1 to 1000000`);
     if (next.maxActiveAgentTurns != null && (!Number.isSafeInteger(next.maxActiveAgentTurns)
       || next.maxActiveAgentTurns < 1 || next.maxActiveAgentTurns > 1_000_000))
@@ -1083,7 +1090,18 @@ export class Store {
       next.maxActiveAgentTurns = Math.min(next.maxActiveAgentTurns, planLimit);
     if (next.managedSpendCapMicros != null && (!Number.isSafeInteger(next.managedSpendCapMicros) || next.managedSpendCapMicros < 1))
       throw new Error('managed spend cap must be a positive integer');
-    this.kvSet(`organization-usage-policy:${organizationId}`, JSON.stringify(next));
+    const persisted: Partial<OrganizationUsagePolicy> = { ...next };
+    delete persisted.effectiveMaxActiveAgentTurns;
+    if (this.hosted) delete persisted.maxActiveWorlds;
+    this.kvSet(`organization-usage-policy:${organizationId}`, JSON.stringify(persisted));
+    if (this.hosted) {
+      const activeWorlds = this.getOrganizationUsagePolicy(organizationId).maxActiveWorlds;
+      for (const pool of this.listRunnerPools(organizationId)) {
+        if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
+          this.createRunnerPool({ ...pool, capacity: { ...pool.capacity, activeWorlds } });
+      }
+      this.reconcileWorldLeaseCapacity(organizationId);
+    }
     return this.getOrganizationUsagePolicy(organizationId);
   }
 
@@ -1296,6 +1314,14 @@ export class Store {
     if (!isHostedPlanId(plan)) throw new Error(`unknown hosted plan ${String(plan)}`);
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     this.db.prepare('UPDATE organizations SET plan=? WHERE id=?').run(plan, organizationId);
+    if (this.hosted) {
+      const activeWorlds = this.getOrganizationUsagePolicy(organizationId).maxActiveWorlds;
+      for (const pool of this.listRunnerPools(organizationId)) {
+        if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
+          this.createRunnerPool({ ...pool, capacity: { ...pool.capacity, activeWorlds } });
+      }
+      this.reconcileWorldLeaseCapacity(organizationId);
+    }
     this.notifyOrganizationEntitlementsChanged(organizationId);
     return this.getOrganization(organizationId)!;
   }
@@ -4590,13 +4616,15 @@ export class Store {
     worldId: string; cpu?: number; memoryMb?: number; gpu?: number; priority?: number }): { id: string; acquired: boolean } {
     const pool = this.getRunnerPool(input.runnerPoolId);
     if (!pool?.enabled || pool.organizationId !== input.organizationId) throw new Error('runner pool is unavailable');
+    const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+    const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
     const project = this.getProject(input.projectId);
     const task = this.getTask(input.taskId);
     if (!project || project.organizationId !== input.organizationId || !task || task.projectId !== project.id)
       throw new Error('runner admission attribution does not match the organization project and task');
     const resources = { cpu: Math.max(1, input.cpu ?? 2), memoryMb: Math.max(128, input.memoryMb ?? 2048), gpu: Math.max(0, input.gpu ?? 0) };
-    if (resources.cpu > pool.capacity.cpu || resources.memoryMb > pool.capacity.memoryMb || resources.gpu > pool.capacity.gpu
-      || pool.capacity.activeWorlds < 1) throw new Error('world resource request exceeds runner pool capacity');
+    if (!hostedCustomerWorld && (resources.cpu > pool.capacity.cpu || resources.memoryMb > pool.capacity.memoryMb || resources.gpu > pool.capacity.gpu
+      || pool.capacity.activeWorlds < 1)) throw new Error('world resource request exceeds runner pool capacity');
     const id = newId('lease');
     const now = Date.now();
     this.db.exec('BEGIN IMMEDIATE');
@@ -4609,19 +4637,20 @@ export class Store {
       if (project.config.monthlyBudgetMicros != null
         && this.usageSummary(input.organizationId, month.from, month.to, project.id).costMicros >= project.config.monthlyBudgetMicros)
         throw new Error('project monthly cloud budget is exhausted');
-      const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
       if (remote && this.hosted && pool.mode === 'managed')
         throw new Error('centrally funded remote sandbox pools are not enabled; connect the organization provider account');
+      let organizationActive = 0;
       if (remote) {
-        const organizationActive = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+        organizationActive = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
             AND p.provider NOT IN ('worktree','container','memory')`).get(input.organizationId) as any).n);
-        if (organizationActive >= policy.maxActiveWorlds) throw new Error('organization active remote sandbox limit reached');
       }
       const active = this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
         COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id) as any;
-      const acquired = Number(active.n) < pool.capacity.activeWorlds && Number(active.cpu) + resources.cpu <= pool.capacity.cpu
-        && Number(active.memoryMb) + resources.memoryMb <= pool.capacity.memoryMb && Number(active.gpu) + resources.gpu <= pool.capacity.gpu;
+      const acquired = hostedCustomerWorld
+        ? organizationActive < policy.maxActiveWorlds
+        : Number(active.n) < pool.capacity.activeWorlds && Number(active.cpu) + resources.cpu <= pool.capacity.cpu
+          && Number(active.memoryMb) + resources.memoryMb <= pool.capacity.memoryMb && Number(active.gpu) + resources.gpu <= pool.capacity.gpu;
       if (remote && acquired) {
         const recent = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
           JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
@@ -4644,42 +4673,76 @@ export class Store {
     this.db.prepare("UPDATE world_leases SET priority=? WHERE id=? AND state='queued'").run(priority, id);
   }
 
+  private promoteQueuedWorldLeases(filter: { runnerPoolId?: string; organizationId?: string; remoteOnly?: boolean }): string[] {
+    const queued = filter.runnerPoolId
+      ? this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state='queued'
+          ORDER BY priority DESC, createdAt`).all(filter.runnerPoolId) as any[]
+      : this.db.prepare(`SELECT * FROM world_leases WHERE organizationId=? AND state='queued'
+          ORDER BY priority DESC, createdAt`).all(filter.organizationId) as any[];
+    const activated: string[] = [];
+    for (const candidate of queued) {
+      const pool = this.getRunnerPool(candidate.runnerPoolId);
+      if (!pool?.enabled || pool.organizationId !== candidate.organizationId) continue;
+      const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
+      if (filter.remoteOnly && !remote) continue;
+      if (remote && this.hosted && pool.mode === 'managed') continue;
+      const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
+      const policy = this.getOrganizationUsagePolicy(candidate.organizationId);
+      if (remote) {
+        const organizationActive = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+          JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
+            AND p.provider NOT IN ('worktree','container','memory')`).get(candidate.organizationId) as any).n);
+        if (organizationActive >= policy.maxActiveWorlds) continue;
+        const recent = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
+          JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
+            AND p.provider NOT IN ('worktree','container','memory')`).get(candidate.organizationId, Date.now() - 60_000) as any).n);
+        if (recent >= policy.maxRemoteStartsPerMinute) continue;
+      }
+      const project = this.getProject(candidate.projectId);
+      const month = monthWindow(Date.now());
+      const organizationBudget = this.getOrganizationExecutionPolicy(candidate.organizationId).monthlyBudgetMicros;
+      if (organizationBudget != null && this.usageSummary(candidate.organizationId, month.from, month.to).costMicros >= organizationBudget) continue;
+      if (project?.config.monthlyBudgetMicros != null
+        && this.usageSummary(candidate.organizationId, month.from, month.to, candidate.projectId).costMicros >= project.config.monthlyBudgetMicros) continue;
+      if (!hostedCustomerWorld) {
+        const active = this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
+          COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id) as any;
+        if (Number(active.n) >= pool.capacity.activeWorlds || Number(active.cpu) + candidate.cpu > pool.capacity.cpu
+          || Number(active.memoryMb) + candidate.memoryMb > pool.capacity.memoryMb || Number(active.gpu) + candidate.gpu > pool.capacity.gpu) continue;
+      }
+      this.db.prepare("UPDATE world_leases SET state='active', acquiredAt=? WHERE id=? AND state='queued'").run(Date.now(), candidate.id);
+      activated.push(candidate.id);
+    }
+    return activated;
+  }
+
+  /** Re-evaluate customer-funded hosted worlds after a plan change. Downgrades
+   * are non-destructive; upgrades immediately admit queued setup work. */
+  reconcileWorldLeaseCapacity(organizationId: string): string[] {
+    if (!this.hosted) return [];
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const activated = this.promoteQueuedWorldLeases({ organizationId, remoteOnly: true });
+      this.db.exec('COMMIT');
+      return activated;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   releaseWorldLease(id: string): string[] {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const lease = this.db.prepare('SELECT runnerPoolId FROM world_leases WHERE id=?').get(id) as any;
+      const lease = this.db.prepare('SELECT runnerPoolId, organizationId FROM world_leases WHERE id=?').get(id) as any;
       if (!lease) { this.db.exec('COMMIT'); return []; }
       this.db.prepare("UPDATE world_leases SET state='released', releasedAt=? WHERE id=? AND state!='released'").run(Date.now(), id);
-      const activated: string[] = [];
-      for (const queued of this.db.prepare(`SELECT * FROM world_leases WHERE runnerPoolId=? AND state='queued'
-        ORDER BY priority DESC, createdAt`).all(lease.runnerPoolId) as any[]) {
-        const pool = this.getRunnerPool(lease.runnerPoolId)!;
-        const policy = this.getOrganizationUsagePolicy(queued.organizationId);
-        const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
-        if (remote && this.hosted && pool.mode === 'managed') continue;
-        if (remote) {
-          const organizationActive = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
-            JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.state='active'
-              AND p.provider NOT IN ('worktree','container','memory')`).get(queued.organizationId) as any).n);
-          if (organizationActive >= policy.maxActiveWorlds) continue;
-          const recent = Number((this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
-            JOIN runner_pools p ON p.id=l.runnerPoolId WHERE l.organizationId=? AND l.acquiredAt>=?
-              AND p.provider NOT IN ('worktree','container','memory')`).get(queued.organizationId, Date.now() - 60_000) as any).n);
-          if (recent >= policy.maxRemoteStartsPerMinute) continue;
-        }
-        const project = this.getProject(queued.projectId);
-        const month = monthWindow(Date.now());
-        const organizationBudget = this.getOrganizationExecutionPolicy(queued.organizationId).monthlyBudgetMicros;
-        if (organizationBudget != null && this.usageSummary(queued.organizationId, month.from, month.to).costMicros >= organizationBudget) continue;
-        if (project?.config.monthlyBudgetMicros != null
-          && this.usageSummary(queued.organizationId, month.from, month.to, queued.projectId).costMicros >= project.config.monthlyBudgetMicros) continue;
-        const active = this.db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(cpu),0) cpu, COALESCE(SUM(memoryMb),0) memoryMb,
-          COALESCE(SUM(gpu),0) gpu FROM world_leases WHERE runnerPoolId=? AND state='active'`).get(pool.id) as any;
-        if (Number(active.n) >= pool.capacity.activeWorlds || Number(active.cpu) + queued.cpu > pool.capacity.cpu
-          || Number(active.memoryMb) + queued.memoryMb > pool.capacity.memoryMb || Number(active.gpu) + queued.gpu > pool.capacity.gpu) continue;
-        this.db.prepare("UPDATE world_leases SET state='active', acquiredAt=? WHERE id=? AND state='queued'").run(Date.now(), queued.id);
-        activated.push(queued.id);
-      }
+      const pool = this.getRunnerPool(lease.runnerPoolId);
+      const hostedCustomerRemote = !!pool && this.hosted && pool.mode === 'customer'
+        && !['worktree', 'container', 'memory'].includes(pool.provider);
+      const activated = hostedCustomerRemote
+        ? this.promoteQueuedWorldLeases({ organizationId: lease.organizationId, remoteOnly: true })
+        : this.promoteQueuedWorldLeases({ runnerPoolId: lease.runnerPoolId });
       this.db.exec('COMMIT');
       return activated;
     } catch (error) {

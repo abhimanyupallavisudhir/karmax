@@ -16,4 +16,10 @@ describe('organization provider connection UI', () => {
     expect(source).toContain(" : 'This month';");
     expect(source).not.toContain('This query period ·');
   });
+
+  it('derives hosted remote-world capacity from the plan instead of exposing a second limit', () => {
+    expect(source).toContain('concurrency capacity ${usagePolicy?.maxActiveWorlds');
+    expect(source).toContain('Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}');
+    expect(source).toContain("hostLocal() ? { maxActiveWorlds:");
+  });
 });

@@ -2265,10 +2265,15 @@ export class Gateway {
           if (b.mode === 'managed') return this.json(res, 400, {
             error: 'centrally funded remote runner pools require a separate installation authorization boundary; organization BYOK is the supported default',
           });
+          const provider = String(b.provider ?? 'e2b');
+          const hostedCustomerWorld = this.deps.hosted === true
+            && !['worktree', 'container', 'memory'].includes(provider);
           return this.json(res, 200, store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
-            provider: String(b.provider ?? 'e2b'), region: b.region ? String(b.region) : undefined,
+            provider, region: b.region ? String(b.region) : undefined,
             mode: b.mode === 'managed' ? 'managed' : 'customer', enabled: b.enabled !== false,
-            capacity: { activeWorlds: Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
+            capacity: { activeWorlds: hostedCustomerWorld
+              ? store.getOrganizationUsagePolicy(organizationId).maxActiveWorlds
+              : Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
               cpu: Math.max(1, Number(b.capacity?.cpu ?? 40)), memoryMb: Math.max(128, Number(b.capacity?.memoryMb ?? 81920)),
               gpu: Math.max(0, Number(b.capacity?.gpu ?? 0)) } }));
         }
@@ -2280,12 +2285,16 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
+            const hostedCustomerWorld = this.deps.hosted === true && current.mode === 'customer'
+              && !['worktree', 'container', 'memory'].includes(current.provider);
             return this.json(res, 200, store.createRunnerPool({ ...current,
               name: b.name == null ? current.name : String(b.name),
               region: b.region === null ? undefined : b.region == null ? current.region : String(b.region),
               enabled: b.enabled == null ? current.enabled : Boolean(b.enabled),
               capacity: b.capacity && typeof b.capacity === 'object' ? {
-                activeWorlds: Math.max(1, Number(b.capacity.activeWorlds ?? current.capacity.activeWorlds)),
+                activeWorlds: hostedCustomerWorld
+                  ? store.getOrganizationUsagePolicy(current.organizationId).maxActiveWorlds
+                  : Math.max(1, Number(b.capacity.activeWorlds ?? current.capacity.activeWorlds)),
                 cpu: Math.max(1, Number(b.capacity.cpu ?? current.capacity.cpu)),
                 memoryMb: Math.max(128, Number(b.capacity.memoryMb ?? current.capacity.memoryMb)),
                 gpu: Math.max(0, Number(b.capacity.gpu ?? current.capacity.gpu)),

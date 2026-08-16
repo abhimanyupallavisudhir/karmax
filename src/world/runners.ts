@@ -5,6 +5,8 @@ import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
 
+// Private/explicit pools retain physical resource totals. Hosted customer-owned
+// pools ignore these totals and derive active worlds from plan concurrency.
 const DEFAULT_CAPACITY = { activeWorlds: 20, cpu: 40, memoryMb: 81_920, gpu: 0 };
 const STALE_PARKED_LEASE_MS = 2 * 60_000;
 
@@ -23,21 +25,27 @@ export class RunnerPoolService {
       return pool;
     }
     const remote = !['worktree', 'container', 'memory'].includes(provider);
+    const hostedActiveWorlds = remote && this.store.hosted
+      ? this.store.getOrganizationUsagePolicy(organizationId).maxActiveWorlds
+      : undefined;
     const id = `${organizationId}:${remote ? `managed-${provider}` : 'local'}`;
     const existing = this.store.getRunnerPool(id);
     if (existing) {
       // Older releases named the default remote pool "managed" even though the
       // launch rail is now strictly organization BYOK. The provider connection
       // boundary separately fails closed when that organization has no key.
-      if (remote && this.store.hosted && existing.mode === 'managed')
-        return this.store.createRunnerPool({ ...existing, name: `${provider.toUpperCase()} · organization BYOK`, mode: 'customer' });
+      if (remote && this.store.hosted && (existing.mode === 'managed'
+        || existing.capacity.activeWorlds !== hostedActiveWorlds))
+        return this.store.createRunnerPool({ ...existing, name: `${provider.toUpperCase()} · organization BYOK`, mode: 'customer',
+          capacity: { ...existing.capacity, activeWorlds: hostedActiveWorlds! } });
       return existing;
     }
     return this.store.createRunnerPool({ id, organizationId,
       name: remote ? `${provider.toUpperCase()} · organization BYOK` : 'Local runner', provider,
-      // Remote launch credentials are organization-owned by default. A pool is
-      // capacity policy, not a resale entitlement or transferable provider credit.
-      mode: 'customer', capacity: DEFAULT_CAPACITY, enabled: true });
+      // Remote launch credentials are organization-owned by default. Hosted
+      // active-world capacity is the plan entitlement, not a second pool product.
+      mode: 'customer', capacity: { ...DEFAULT_CAPACITY,
+        ...(hostedActiveWorlds == null ? {} : { activeWorlds: hostedActiveWorlds }) }, enabled: true });
   }
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;

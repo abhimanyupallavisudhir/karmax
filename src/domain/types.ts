@@ -746,6 +746,8 @@ export interface OrganizationUsagePolicy {
   maxActiveAgentTurns?: number;
   /** Computed, never persisted: min(owner cap, plan entitlement). */
   effectiveMaxActiveAgentTurns: number;
+  /** Hosted: computed from the plan's active-agent concurrency and never
+   * independently configurable. Private installs retain their saved pool guard. */
   maxActiveWorlds: number;
 }
 

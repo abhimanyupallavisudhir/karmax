@@ -110,12 +110,14 @@ describe('runner capacity and world lifecycle', () => {
     store.createRunnerPool({ id: 'tiny', organizationId: organization.id, name: 'Tiny', provider: 'e2b', mode: 'managed',
       capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
     const runners = new RunnerPoolService(store);
-    const held = await runners.acquire({ project, taskId: 'held', worldId: 'held', provider: 'e2b' });
+    const heldTask = createTask(store, project.id, 'Held');
+    const timedOutTask = createTask(store, project.id, 'Timed out');
+    const held = await runners.acquire({ project, taskId: heldTask.id, worldId: heldTask.id, provider: 'e2b' });
 
-    await expect(runners.acquire({ project, taskId: 'timed-out', worldId: 'timed-out', provider: 'e2b', pollMs: 5,
+    await expect(runners.acquire({ project, taskId: timedOutTask.id, worldId: timedOutTask.id, provider: 'e2b', pollMs: 5,
       heartbeat: () => { throw new Error('NOT_FOUND'); } })).rejects.toThrow('NOT_FOUND');
 
-    expect(store.worldLeasesForTask('timed-out')).toEqual([]);
+    expect(store.worldLeasesForTask(timedOutTask.id)).toEqual([]);
     runners.release(held.leaseId, 'e2b');
   });
 
@@ -366,6 +368,44 @@ describe('runner capacity and world lifecycle', () => {
       if (previous === undefined) delete process.env.KARMAX_DEPLOYMENT;
       else process.env.KARMAX_DEPLOYMENT = previous;
     }
+  });
+
+  it('uses hosted plan concurrency as BYOK world capacity and admits queued setup on upgrade', () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Plan worlds', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    store.createRunnerPool({ id: 'customer-e2b', organizationId: organization.id, name: 'Customer E2B', provider: 'e2b',
+      mode: 'customer', capacity: { activeWorlds: 20, cpu: 1, memoryMb: 128, gpu: 0 }, enabled: true });
+    const lease = (title: string) => {
+      const task = createTask(store, project.id, title);
+      return store.requestWorldLease({ runnerPoolId: 'customer-e2b', organizationId: organization.id,
+        projectId: project.id, taskId: task.id, worldId: task.id, cpu: 8, memoryMb: 16_384, gpu: 1 });
+    };
+
+    const first = lease('Free active');
+    const second = lease('Free queued');
+    expect(first.acquired).toBe(true);
+    expect(second.acquired).toBe(false);
+
+    store.setOrganizationPlan(organization.id, 'individual');
+    expect(store.getRunnerPool('customer-e2b')?.capacity.activeWorlds).toBe(5);
+    expect(store.worldLease(second.id).state).toBe('active');
+    const third = lease('Individual 3');
+    const fourth = lease('Individual 4');
+    const fifth = lease('Individual 5');
+    const overflow = lease('Individual queued');
+    expect([third, fourth, fifth].every((candidate) => candidate.acquired)).toBe(true);
+    expect(overflow.acquired).toBe(false);
+
+    // A downgrade does not destroy running customer sandboxes. The queued world
+    // stays queued until enough existing work parks or finishes.
+    store.setOrganizationPlan(organization.id, 'free');
+    expect(store.getRunnerPool('customer-e2b')?.capacity.activeWorlds).toBe(1);
+    expect(store.worldLease(overflow.id).state).toBe('queued');
+    for (const active of [first, second, third, fourth]) store.releaseWorldLease(active.id);
+    expect(store.worldLease(overflow.id).state).toBe('queued');
+    store.releaseWorldLease(fifth.id);
+    expect(store.worldLease(overflow.id).state).toBe('active');
   });
 
   it('accounts non-workflow access and reparks a remote world when the last accessor leaves', async () => {

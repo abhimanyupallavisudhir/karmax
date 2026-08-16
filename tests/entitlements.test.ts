@@ -162,6 +162,7 @@ describe('hosted agent-run admission integration', () => {
     const project = store.createProject('Product', {}, organization.id);
     expect(store.getOrganizationUsagePolicy(organization.id)).toMatchObject({
       effectiveMaxActiveAgentTurns: limit,
+      maxActiveWorlds: limit,
     });
     expect(store.getOrganizationUsagePolicy(organization.id).maxActiveAgentTurns).toBeUndefined();
     for (let index = 0; index < limit; index++) {
@@ -183,14 +184,26 @@ describe('hosted agent-run admission integration', () => {
     const organization = store.createOrganization({ name: 'Tighter cap', ownerUserId: 'owner' });
     store.setOrganizationPlan(organization.id, 'team');
     expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 3 })).toMatchObject({
-      maxActiveAgentTurns: 3, effectiveMaxActiveAgentTurns: 3,
+      maxActiveAgentTurns: 3, effectiveMaxActiveAgentTurns: 3, maxActiveWorlds: 3,
     });
     expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 99 })).toMatchObject({
-      maxActiveAgentTurns: 10, effectiveMaxActiveAgentTurns: 10,
+      maxActiveAgentTurns: 10, effectiveMaxActiveAgentTurns: 10, maxActiveWorlds: 10,
     });
     const restored = store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: undefined });
     expect(restored.maxActiveAgentTurns).toBeUndefined();
     expect(restored.effectiveMaxActiveAgentTurns).toBe(10);
+  });
+
+  it('does not retain a second hosted remote-world limit outside the plan', () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'One capacity', ownerUserId: 'owner' });
+    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveWorlds: 999 }).maxActiveWorlds).toBe(1);
+    expect(JSON.parse(store.kvGet(`organization-usage-policy:${organization.id}`) ?? '{}'))
+      .not.toHaveProperty('maxActiveWorlds');
+    store.setOrganizationPlan(organization.id, 'individual');
+    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(5);
+    store.setOrganizationPlan(organization.id, 'team');
+    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(10);
   });
 
   it('blocks over-member organizations at the final model boundary before any provider spend', () => {
