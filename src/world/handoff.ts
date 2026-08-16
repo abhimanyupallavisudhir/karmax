@@ -169,16 +169,26 @@ export class WorldHandoffService {
       return this.githubApp.brokerCredentials(repository);
     };
 
-    const access = this.worldAccess ? await this.worldAccess.open(taskId, handle, { dedicated: true }) : undefined;
-    const world = access?.world ?? await this.worlds.open(handle);
-    try {
-      const published = await brokerPublishBranch(world, auth);
-      if (published.skipped.length) throw new Error(`could not publish committed cloud branch for: ${describePublishFailures(published)}`);
-      this.store.appendEvent({ taskId, type: 'push.branch', ts: Date.now(), payload: {
-        branch: handle.branch, repos: published.pushed, reason: 'local-materialization',
-      } });
-    } finally {
-      await access?.release(true);
+    const released = this.store.worldState(taskId) === 'released';
+    if (released) {
+      // Completion deliberately destroys provider compute after checkpointing
+      // and publishing the task branch. Reopening that provider can never work;
+      // the published branch is now the durable materialization source.
+      const published = this.store.eventsSince(taskId, 0).some((event) => event.type === 'push.branch'
+        && (event.payload as { branch?: string } | undefined)?.branch === handle.branch);
+      if (!published) throw new Error('the released task world has no published branch to materialize');
+    } else {
+      const access = this.worldAccess ? await this.worldAccess.open(taskId, handle, { dedicated: true }) : undefined;
+      const world = access?.world ?? await this.worlds.open(handle);
+      try {
+        const published = await brokerPublishBranch(world, auth);
+        if (published.skipped.length) throw new Error(`could not publish committed cloud branch for: ${describePublishFailures(published)}`);
+        this.store.appendEvent({ taskId, type: 'push.branch', ts: Date.now(), payload: {
+          branch: handle.branch, repos: published.pushed, reason: 'local-materialization',
+        } });
+      } finally {
+        await access?.release(true);
+      }
     }
 
     fs.mkdirSync(root, { recursive: true });

@@ -7355,7 +7355,13 @@ function fileTargetQuery(target) {
 }
 
 function worldFileHref(raw, v = S.view) {
-  const target = worldFileTarget(raw, v?.worldPath, !!v?.worldAvailable && !v?.worldPath);
+  // The conversation outlives its execution world. Completed/released task
+  // views intentionally stop advertising terminal availability, but their
+  // citations still belong to this task and remain resolvable through its
+  // durable world record + published branch. The gateway is the authoritative
+  // confinement check; a transient `worldAvailable` hint must not decide
+  // whether an agent-authored filesystem path becomes a handoff permalink.
+  const target = worldFileTarget(raw, v?.worldPath, !!v?.taskId && !v?.worldPath);
   return target && v?.taskId ? `${taskUrl(v.taskId)}/file?${fileTargetQuery(target)}` : null;
 }
 

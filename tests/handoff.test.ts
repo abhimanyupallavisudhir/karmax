@@ -229,6 +229,18 @@ describe('hosted/local Git handoff', () => {
     expect(worldOpens).toBe(2);
     expect(fs.readFileSync(path.join(refreshed.cwd, 'after-review.txt'), 'utf8')).toBe('new task work\n');
     expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'push.branch')).toHaveLength(2);
+
+    // The final task view no longer advertises a live world, and provider
+    // compute has been released. Its published checkpoint still materializes
+    // without attempting to reopen the destroyed sandbox.
+    store.setWorldState(handle, 'released');
+    const releasedRoot = path.join(dir, 'released-local');
+    const released = await new WorldHandoffService(store, worlds, github, undefined, undefined, releasedRoot)
+      .openFile(task.id, { ...view, stage: 'done', status: 'done', updatedAt: 3 }, `${cloud}/after-review.txt`, 9);
+    expect(released.path).toBe(path.join(releasedRoot, task.id, 'app', 'after-review.txt'));
+    expect(released.command).toBe(`code --goto '${path.join(releasedRoot, task.id, 'app', 'after-review.txt')}:9'`);
+    expect(fs.readFileSync(released.path, 'utf8')).toBe('new task work\n');
+    expect(worldOpens).toBe(2);
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
