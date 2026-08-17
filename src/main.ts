@@ -322,6 +322,7 @@ async function main() {
     paymentRegistry,
     configHomes,
     resources,
+    objects: objectStore,
     contentDir: p.content,
     taskQueue: TASK_QUEUE,
   });

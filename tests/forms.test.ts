@@ -324,6 +324,34 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     await Promise.all([poll(b.id, 'done'), poll(c.id, 'done')]);
   });
 
+  it('lets the dedicated fork-agent endpoint choose a new agent and retains its source', async () => {
+    const { a } = await runSource('Tool fork source', { provider: 'mock', model: 'source-model', effort: 'high' });
+    const forked = await post(`/api/tasks/${a.id}/fork-agent`, {
+      role: 'do', title: 'Tool fork destination', message: '@write tool-fork.txt :: done\n@review tool fork',
+      provider: 'mock', model: 'destination-model', effort: 'low',
+    });
+    await poll(forked.id, 'review');
+    expect(h.store.getTask(forked.id)?.params['agent:do']).toMatchObject({
+      provider: 'mock', model: 'destination-model', effort: 'low', resumeFrom: { taskId: a.id, role: 'do' },
+    });
+    const events = await get(`/api/tasks/${forked.id}/events?since=0`);
+    expect(events.some((event: any) => event.type === 'session.forked')).toBe(true);
+    await post(`/api/tasks/${forked.id}/signal`, { signal: 'confirm' });
+    await poll(forked.id, 'done');
+
+    // Omitting destination overrides must still preserve resumeFrom while the
+    // unified-agent defaults are materialized.
+    const inherited = await post(`/api/tasks/${a.id}/fork-agent`, {
+      role: 'do', title: 'Tool fork defaults', message: '@write tool-fork-defaults.txt :: done\n@review tool fork defaults',
+    });
+    await poll(inherited.id, 'review');
+    expect(h.store.getTask(inherited.id)?.params['agent:do']).toMatchObject({
+      resumeFrom: { taskId: a.id, role: 'do' },
+    });
+    await post(`/api/tasks/${inherited.id}/signal`, { signal: 'confirm' });
+    await poll(inherited.id, 'done');
+  });
+
   it('CONTINUES (not forks) when given a raw pasted session id', async () => {
     const b = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Raw resume',

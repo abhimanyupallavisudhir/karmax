@@ -16,7 +16,7 @@ ENV NODE_ENV=production \
     KARMAX_PORT=4505
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init gh git gnupg openssh-client ripgrep \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl dumb-init gh git gnupg openssh-client python3 ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /bin/bash karmax \
     && mkdir -p /app /var/lib/karmax \
@@ -27,6 +27,7 @@ COPY --from=dependencies --chown=karmax:karmax /app/node_modules ./node_modules
 COPY --chown=karmax:karmax package.json package-lock.json tsconfig.json ./
 COPY --chown=karmax:karmax src ./src
 COPY --chown=karmax:karmax web ./web
+COPY --chown=karmax:karmax vendor ./vendor
 USER karmax
 
 EXPOSE 4505

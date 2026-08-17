@@ -128,6 +128,7 @@ export async function bootHarness(
     taskQueue: TASK_QUEUE,
     broker,
     resources,
+    objects,
     ...overrides,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);

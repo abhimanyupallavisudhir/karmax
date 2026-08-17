@@ -1760,11 +1760,17 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-panel { margin: 6px 0 0 22px; }
 .af-resume-panel[hidden] { display: none !important; }
 .af-resume-session { width: 100%; margin-top: 6px; padding: 7px 10px; }
-.agent-field.af-has-task-fork .af-provider { opacity: .6; cursor: not-allowed; }
 .af-resume-chosen { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
 .af-resume-chosen:empty { display: none; }
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .af-resume-clear:hover { color: var(--danger); }
+.af-resume-import-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; min-height: 28px; }
+.af-resume-upload { cursor: pointer; white-space: nowrap; }
+.af-resume-uploaded { display: flex; align-items: center; gap: 5px; min-width: 0; color: var(--accent); font-size: 12px; }
+.af-resume-uploaded:empty { display: none; }
+.af-resume-uploaded:not(:empty) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-resume-upload-clear { flex: 0 0 auto; border: 0; padding: 0 2px; background: none; color: var(--ink-3); cursor: pointer; }
+.af-resume-upload-clear:hover { color: var(--danger); }
 
 .parameter-fields .agent-field {
   padding: 10px; border: 1px solid var(--line); border-radius: 10px;

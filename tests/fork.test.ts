@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { materializeFork, claudeCwdSlug } from '../src/agent/fork.js';
+import { materializeFork, claudeCwdSlug, findProviderSession } from '../src/agent/fork.js';
 
 /**
  * Hermetic verification of fork materialization (SPEC §10.5 / the fork-bug fix):
@@ -128,6 +128,23 @@ describe('materializeFork — Codex (by id in the home)', () => {
       if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
       fs.rmSync(dataHome, { recursive: true, force: true });
       fs.rmSync(forkHome, { recursive: true, force: true });
+    }
+  });
+
+  it('exposes native source files for panagent without accepting path-like ids', () => {
+    const sourceHome = tmp('karmax-panagent-source-');
+    const session = sid();
+    try {
+      const file = path.join(sourceHome, 'projects', '-tmp-source', `${session}.jsonl`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '{}\n');
+      expect(findProviderSession({ provider: 'claude', session, srcHome: sourceHome })).toBe(file);
+      expect(findProviderSession({ provider: 'claude', session: '../../etc/passwd', srcHome: sourceHome })).toBeUndefined();
+      expect(findProviderSession({ provider: 'codex', session: '.', srcHome: sourceHome })).toBeUndefined();
+      expect(findProviderSession({ provider: 'codex', session: 'abc', srcHome: sourceHome })).toBeUndefined();
+      expect(findProviderSession({ provider: 'opencode', session, srcHome: sourceHome })).toBeUndefined();
+    } finally {
+      fs.rmSync(sourceHome, { recursive: true, force: true });
     }
   });
 

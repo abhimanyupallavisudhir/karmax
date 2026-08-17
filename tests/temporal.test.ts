@@ -5,6 +5,9 @@ import { makeWorker, WorkerHandle } from '../src/temporal/worker.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { pingWorkflow, bump, finish, countQuery } from '../src/workflows/ping.js';
 import type { Client } from '@temporalio/client';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 describe('Temporal durable substrate (real dev server)', () => {
   let server: DevServer;
@@ -54,4 +57,32 @@ describe('Temporal durable substrate (real dev server)', () => {
     expect(result.count).toBe(7);
     expect(typeof result.at).toBe('number');
   });
+
+  it('retries a transient Temporal startup failure with a fresh process', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-temporal-retry-'));
+    const marker = path.join(root, 'failed-once');
+    const wrapper = path.join(root, 'temporal-once');
+    const temporal = process.env.TEMPORAL_CLI ?? path.join(os.homedir(), '.temporalio', 'bin', 'temporal');
+    const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+    fs.writeFileSync(wrapper, [
+      '#!/bin/sh',
+      'set -eu',
+      `if [ ! -e ${quote(marker)} ]; then`,
+      `  : > ${quote(marker)}`,
+      "  echo 'intentional transient startup failure' >&2",
+      '  exit 2',
+      'fi',
+      `exec ${quote(temporal)} "$@"`,
+      '',
+    ].join('\n'), { mode: 0o700 });
+    let recovered: DevServer | undefined;
+    try {
+      recovered = await startDevServer({ headless: true, logLevel: 'never', cliPath: wrapper });
+      expect(recovered.address).toMatch(/^127\.0\.0\.1:\d+$/);
+      expect(fs.existsSync(marker)).toBe(true);
+    } finally {
+      await recovered?.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
