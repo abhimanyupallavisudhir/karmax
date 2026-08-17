@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
 import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
+import type { SubscriptionRuntimeConfig } from '../launch/settings.js';
 
 export type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
 const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
@@ -90,20 +91,35 @@ type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
  * it uses a platform-owned Billing key and never exposes or provisions agent cards. */
 export class StripeSubscriptionProvider implements SubscriptionProvider {
   readonly name = 'stripe-billing';
-  constructor(private env: NodeJS.ProcessEnv = process.env, private fetcher: FetchLike = fetch) {}
+  constructor(private source: NodeJS.ProcessEnv | (() => SubscriptionRuntimeConfig) = process.env,
+    private fetcher: FetchLike = fetch) {}
+
+  private config(): SubscriptionRuntimeConfig {
+    if (typeof this.source === 'function') return this.source();
+    return {
+      secretKey: this.source.KARMAX_SUBSCRIPTION_STRIPE_SECRET_KEY?.trim(),
+      webhookSecret: this.source.KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET?.trim(),
+      individualPriceId: this.source.KARMAX_SUBSCRIPTION_STRIPE_INDIVIDUAL_PRICE_ID?.trim(),
+      teamBasePriceId: this.source.KARMAX_SUBSCRIPTION_STRIPE_TEAM_BASE_PRICE_ID?.trim(),
+      teamSeatPriceId: this.source.KARMAX_SUBSCRIPTION_STRIPE_TEAM_SEAT_PRICE_ID?.trim(),
+      individualProductId: this.source.KARMAX_SUBSCRIPTION_STRIPE_INDIVIDUAL_PRODUCT_ID?.trim(),
+      teamProductId: this.source.KARMAX_SUBSCRIPTION_STRIPE_TEAM_PRODUCT_ID?.trim(),
+    };
+  }
 
   configured(): boolean {
     return Boolean(this.secretKey() && this.webhookSecret() && this.catalog());
   }
 
   catalog(): SubscriptionCatalogConfig | undefined {
-    const individualPriceId = this.env.KARMAX_SUBSCRIPTION_STRIPE_INDIVIDUAL_PRICE_ID?.trim();
-    const teamBasePriceId = this.env.KARMAX_SUBSCRIPTION_STRIPE_TEAM_BASE_PRICE_ID?.trim();
-    const teamSeatPriceId = this.env.KARMAX_SUBSCRIPTION_STRIPE_TEAM_SEAT_PRICE_ID?.trim();
+    const config = this.config();
+    const individualPriceId = config.individualPriceId?.trim();
+    const teamBasePriceId = config.teamBasePriceId?.trim();
+    const teamSeatPriceId = config.teamSeatPriceId?.trim();
     if (!individualPriceId || !teamBasePriceId || !teamSeatPriceId) return undefined;
     return { individualPriceId, teamBasePriceId, teamSeatPriceId,
-      individualProductId: this.env.KARMAX_SUBSCRIPTION_STRIPE_INDIVIDUAL_PRODUCT_ID?.trim() || undefined,
-      teamProductId: this.env.KARMAX_SUBSCRIPTION_STRIPE_TEAM_PRODUCT_ID?.trim() || undefined };
+      individualProductId: config.individualProductId?.trim() || undefined,
+      teamProductId: config.teamProductId?.trim() || undefined };
   }
 
   async createCustomer(input: { organizationId: string; name: string; idempotencyKey: string }) {
@@ -190,8 +206,8 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     return event;
   }
 
-  private secretKey(): string | undefined { return this.env.KARMAX_SUBSCRIPTION_STRIPE_SECRET_KEY?.trim(); }
-  private webhookSecret(): string | undefined { return this.env.KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET?.trim(); }
+  private secretKey(): string | undefined { return this.config().secretKey?.trim(); }
+  private webhookSecret(): string | undefined { return this.config().webhookSecret?.trim(); }
   private requireCatalog(): SubscriptionCatalogConfig {
     const catalog = this.catalog();
     if (!catalog) throw new Error('subscription price identifiers are not configured');

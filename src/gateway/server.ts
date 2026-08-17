@@ -102,6 +102,7 @@ export interface GatewayDeps {
   objects?: ObjectStore;
   resources?: import('../world/resources.js').ProjectResourceService;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
+  paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -1025,7 +1026,7 @@ export class Gateway {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
         if (current) {
           this.consumeSignupPolicyAcceptance(req, current.user.id, current.user.email);
-          if (publicLaunchInfo().paidLaunch && !this.deps.store.policyAcceptances(current.user.id)
+          if ((this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).paidLaunch && !this.deps.store.policyAcceptances(current.user.id)
             .some((acceptance) => acceptance.context === 'signup')) {
             return this.json(res, 200, { authRequired: true, authenticated: false, policyAcceptanceRequired: true,
               user: current.user, sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
@@ -1065,10 +1066,11 @@ export class Gateway {
       }
       return this.json(res, 200, { authRequired: true });
     }
-    if (p === '/api/launch' && method === 'GET') return this.json(res, 200, publicLaunchInfo());
+    if (p === '/api/launch' && method === 'GET')
+      return this.json(res, 200, this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo());
     const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
     if (legalMatch && method === 'GET') {
-      const document = policyDocument(legalMatch[1]!);
+      const document = this.deps.paidLaunchSettings?.policyDocument(legalMatch[1]!) ?? policyDocument(legalMatch[1]!);
       return document ? this.json(res, 200, document) : this.json(res, 404, { error: 'policy not found' });
     }
     if (p === '/api/legal/preaccept' && method === 'POST') {
@@ -1553,7 +1555,7 @@ export class Gateway {
       }
       if (p === '/api/user/account-deletion-request' && method === 'POST') {
         const subject = requireInteractiveHuman(callerIdentity);
-        const privacyContact = publicLaunchInfo().contacts.privacy;
+        const privacyContact = (this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).contacts.privacy;
         const request = { requestedAt: Date.now(), userId: subject.userId, email: session.email };
         store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request));
         if (privacyContact && this.deps.email?.configured()) {
@@ -1674,6 +1676,25 @@ export class Gateway {
       if (p === '/api/settings/installation' && method === 'GET') {
         return this.json(res, 200, { canManage: this.deps.tokens.check(token, 'settings:write').ok,
           hostLocal: this.hostLocal });
+      }
+      if (p === '/api/settings/paid-launch') {
+        if (!this.deps.paidLaunchSettings)
+          return this.json(res, 503, { error: 'paid-launch settings are unavailable' });
+        const publicUrl = this.publicUrl(req);
+        if (method === 'GET') return this.json(res, 200, {
+          ...this.deps.paidLaunchSettings.status(publicUrl),
+          canManage: this.deps.tokens.check(token, 'settings:write').ok,
+        });
+        if (method === 'PUT') {
+          if (!this.deps.tokens.check(token, 'settings:write').ok)
+            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure paid launch' });
+          try {
+            return this.json(res, 200, { ...this.deps.paidLaunchSettings.configure(await this.body(req), publicUrl),
+              canManage: true });
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
@@ -1799,7 +1820,8 @@ export class Gateway {
           if (action === 'checkout') {
             const body = await this.body(req);
             const plan = String(body.plan ?? '');
-            assertPaidLaunchReady();
+            if (this.deps.paidLaunchSettings) this.deps.paidLaunchSettings.assertReady();
+            else assertPaidLaunchReady();
             const versions = assertPolicyAcceptance('checkout', body.acceptedPolicies, body.policyVersions);
             const result = await billing.checkout(organizationId, plan,
               { success: `${settingsBase}?billing=success#settings-billing`,
@@ -6929,7 +6951,7 @@ export class Gateway {
     if (!this.deps.identity) return undefined;
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
-    if (publicLaunchInfo().paidLaunch && !this.deps.store.policyAcceptances(identity.user.id)
+    if ((this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).paidLaunch && !this.deps.store.policyAcceptances(identity.user.id)
       .some((acceptance) => acceptance.context === 'signup')) return undefined;
     const principal = `user:${identity.user.id}`;
     const resolvedOrganizationId = organizationId ?? (projectId ? this.deps.store.getProject(projectId)?.organizationId : undefined);

@@ -192,10 +192,12 @@ Create recurring monthly USD prices in the platform's Stripe Billing account:
 | Team base (includes first active user) | $19 / month |
 | Team additional active user | $5 / month |
 
-Set the `KARMAX_SUBSCRIPTION_STRIPE_*` variables shown in
-`deploy/.env.example`; price and optional product IDs are configuration, never
-compiled constants. Enterprise is intentionally absent from self-service
-checkout. Register this distinct webhook endpoint:
+Open **Installation settings → Paid launch** and follow the guided setup. Price
+and optional product IDs are persisted installation configuration; the Stripe
+secret key and webhook signing secret are stored in the encrypted vault. No
+subscription-billing environment variables are required. Enterprise is
+intentionally absent from self-service checkout. Register the distinct webhook
+endpoint shown on that page (normally):
 
 `https://<krmax-origin>/api/subscriptions/webhook`
 
@@ -244,9 +246,9 @@ Stripe CLI:
 stripe listen --forward-to localhost:4505/api/subscriptions/webhook
 ```
 
-Copy the CLI's `whsec_...` value into
-`KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET`, use test-mode price IDs, and start
-with `KARMAX_DEPLOYMENT=hosted`. The automated suite does not use the CLI,
+Copy the CLI's `whsec_...` value into Installation settings → Paid launch, use
+test-mode price IDs there, and start with `KARMAX_DEPLOYMENT=hosted`. The
+automated suite does not use the CLI,
 network, or paid calls: `FakeSubscriptionProvider` drives signed-event-equivalent
 fixtures against an in-memory database.
 

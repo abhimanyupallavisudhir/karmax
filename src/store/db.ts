@@ -4720,13 +4720,17 @@ export class Store {
    * are non-destructive; upgrades immediately admit queued setup work. */
   reconcileWorldLeaseCapacity(organizationId: string): string[] {
     if (!this.hosted) return [];
-    this.db.exec('BEGIN IMMEDIATE');
+    // Billing and organization-policy mutations may already own the surrounding
+    // transaction. Join it instead of attempting a nested BEGIN (unsupported by
+    // both SQLite and PostgreSQL); standalone callers still get an atomic pass.
+    const ownsTransaction = !this.db.inTransaction();
+    if (ownsTransaction) this.db.exec('BEGIN IMMEDIATE');
     try {
       const activated = this.promoteQueuedWorldLeases({ organizationId, remoteOnly: true });
-      this.db.exec('COMMIT');
+      if (ownsTransaction) this.db.exec('COMMIT');
       return activated;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if (ownsTransaction) this.db.exec('ROLLBACK');
       throw error;
     }
   }

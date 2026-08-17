@@ -192,8 +192,34 @@ export interface LaunchConfig {
   ready: boolean;
 }
 
-export function launchConfig(env: NodeJS.ProcessEnv = process.env): LaunchConfig {
-  const value = (name: string) => env[name]?.trim() || undefined;
+export interface StoredLaunchConfig {
+  paidLaunch?: boolean;
+  founderReviewedPolicyVersion?: string;
+  operatorName?: string;
+  operatorCountry?: string;
+  governingLaw?: string;
+  legalNoticeAddress?: string;
+  contacts?: LaunchConfig['contacts'];
+}
+
+/** Resolve founder-entered installation settings before the legacy environment
+ * bootstrap values. Environment variables remain an upgrade path, but the
+ * normal hosted setup is persisted and editable in Installation settings. */
+export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig): LaunchConfig {
+  const storedValues: Record<string, string | undefined> = {
+    KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: stored?.founderReviewedPolicyVersion,
+    KARMAX_LEGAL_ENTITY_NAME: stored?.operatorName,
+    KARMAX_LEGAL_ENTITY_COUNTRY: stored?.operatorCountry,
+    KARMAX_GOVERNING_LAW: stored?.governingLaw,
+    KARMAX_LEGAL_NOTICE_ADDRESS: stored?.legalNoticeAddress,
+    KARMAX_LEGAL_EMAIL: stored?.contacts?.legal,
+    KARMAX_PRIVACY_EMAIL: stored?.contacts?.privacy,
+    KARMAX_SECURITY_EMAIL: stored?.contacts?.security,
+    KARMAX_INCIDENT_EMAIL: stored?.contacts?.incident,
+    KARMAX_DPA_EMAIL: stored?.contacts?.dpa,
+    KARMAX_BILLING_EMAIL: stored?.contacts?.billing,
+  };
+  const value = (name: string) => storedValues[name]?.trim() || env[name]?.trim() || undefined;
   const email = (name: string) => {
     const candidate = value(name);
     return candidate && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(candidate) ? candidate : undefined;
@@ -215,15 +241,15 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env): LaunchConfig
   ];
   const missing = required.filter(([, configured]) => configured === undefined).map(([name]) => name);
   return {
-    paidLaunch: value('KARMAX_PAID_LAUNCH') === '1',
+    paidLaunch: stored?.paidLaunch ?? value('KARMAX_PAID_LAUNCH') === '1',
     operatorName: value('KARMAX_LEGAL_ENTITY_NAME'), operatorCountry: value('KARMAX_LEGAL_ENTITY_COUNTRY'),
     governingLaw: value('KARMAX_GOVERNING_LAW'), legalNoticeAddress: value('KARMAX_LEGAL_NOTICE_ADDRESS'), contacts,
     missing, ready: missing.length === 0,
   };
 }
 
-export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env) {
-  const config = launchConfig(env);
+export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig) {
+  const config = launchConfig(env, stored);
   return {
     policyVersion: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE, draftNotice: POLICY_DRAFT_NOTICE,
     policies: POLICY_SLUGS.map((slug) => ({ slug, title: docs[slug].title, summary: docs[slug].summary, version: POLICY_VERSION })),
@@ -238,16 +264,16 @@ export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env) {
   };
 }
 
-export function assertPaidLaunchReady(env: NodeJS.ProcessEnv = process.env): LaunchConfig {
-  const config = launchConfig(env);
+export function assertPaidLaunchReady(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig): LaunchConfig {
+  const config = launchConfig(env, stored);
   if (!config.paidLaunch) throw new Error('paid checkout is not enabled');
   if (!config.ready) throw new Error(`paid checkout is unavailable until the launch checklist is complete: ${config.missing.join(', ')}`);
   return config;
 }
 
-export function policyDocument(slug: string, env: NodeJS.ProcessEnv = process.env): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
+export function policyDocument(slug: string, env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
   if (!POLICY_SLUGS.includes(slug as PolicySlug)) return undefined;
-  const info = publicLaunchInfo(env);
+  const info = publicLaunchInfo(env, stored);
   return { ...docs[slug as PolicySlug], version: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,
     draftNotice: POLICY_DRAFT_NOTICE, operator: info.operator, contacts: info.contacts };
 }

@@ -146,6 +146,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/skills', 'POST /api/safe-mode',
   ],
   installation: [
+    'GET|PUT /api/settings/paid-launch (installation operator: persisted legal entity, Stripe Billing catalog/secrets, paid-checkout gate, and founder task checklist)',
     'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
     'GET /api/email', 'POST /api/email/connect|test',
     'GET|POST /api/remote-access',

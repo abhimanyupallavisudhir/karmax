@@ -11442,6 +11442,107 @@ async function wireStripePlatformCard() {
     } catch (error) { toast(error.message, true); }
   });
 }
+
+function paidLaunchCard() {
+  return '<div class="card" id="paid-launch-card"><div class="task-sub">Loading paid-launch setup…</div></div>';
+}
+
+async function wirePaidLaunchCard() {
+  const box = $('#paid-launch-card');
+  if (!box) return;
+  let state;
+  try { state = await api('/api/settings/paid-launch'); }
+  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  const contacts = state.contacts || {};
+  const stripe = state.stripe || {};
+  const completed = new Set(state.completedTasks || []);
+  const groups = [...new Set((state.tasks || []).map((task) => task.group))];
+  const readiness = state.paidLaunch
+    ? '<span class="chip" style="color:var(--ok,#4ec9a3)">paid checkout live</span>'
+    : state.canEnable ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready to enable</span>'
+      : '<span class="chip">setup incomplete</span>';
+  const missing = [...(state.missing || []), ...(stripe.missing || [])];
+  const taskMarkup = groups.map((group) => `<div class="section-h" style="margin-top:18px">${esc(group)}</div>${(state.tasks || [])
+    .filter((task) => task.group === group).map((task) => `<label class="card" style="display:flex;gap:10px;padding:12px;margin:8px 0;cursor:pointer">
+      <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
+      <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
+  box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
+    <p class="task-sub">This is the control center for selling krmax.io subscriptions. Values are saved with the installation; Stripe secrets are encrypted in the krmax vault and are never returned to the browser. No paid-launch environment variables are required.</p>
+    ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
+
+    <div class="section-h" style="margin-top:18px">Stripe Billing</div>
+    <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. krmax uses hosted Stripe Checkout, so it does not need a publishable key.</p>
+    <ol class="task-sub"><li>Create the live recurring products/prices described in the founder checklist below.</li><li>Create a webhook endpoint at <span class="mono">${esc(stripe.webhookUrl || '')}</span> and subscribe to customer.subscription and invoice lifecycle events.</li><li>Paste the live secret key, webhook signing secret, and IDs here. Blank secret fields keep the encrypted values already saved.</li><li>Configure and test the Stripe customer portal, then exercise the full lifecycle in test mode before enabling checkout.</li></ol>
+    <div class="settings-grid">
+      <label class="form-row">Stripe secret key<input class="paid-stripe-secret" type="password" autocomplete="new-password" placeholder="${stripe.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_live_…'}" /></label>
+      <label class="form-row">Webhook signing secret<input class="paid-stripe-webhook" type="password" autocomplete="new-password" placeholder="${stripe.webhookSecretConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
+      <label class="form-row">Individual $9 price ID<input class="paid-stripe-individual-price" value="${esc(stripe.individualPriceId || '')}" placeholder="price_…" /></label>
+      <label class="form-row">Team $19 base price ID<input class="paid-stripe-team-base-price" value="${esc(stripe.teamBasePriceId || '')}" placeholder="price_…" /></label>
+      <label class="form-row">Team $5 extra-user price ID<input class="paid-stripe-team-seat-price" value="${esc(stripe.teamSeatPriceId || '')}" placeholder="price_…" /></label>
+      <label class="form-row">Individual product ID (optional)<input class="paid-stripe-individual-product" value="${esc(stripe.individualProductId || '')}" placeholder="prod_…" /></label>
+      <label class="form-row">Team product ID (optional)<input class="paid-stripe-team-product" value="${esc(stripe.teamProductId || '')}" placeholder="prod_…" /></label>
+      <label class="form-row">Webhook destination<input value="${esc(stripe.webhookUrl || '')}" readonly /></label>
+    </div>
+
+    <div class="section-h" style="margin-top:18px">Legal operator and public contacts</div>
+    <p class="task-sub">Use the contracting entity’s exact details. These values populate public policies and support/deletion flows. Ask qualified counsel to review the supplied policy drafts for the business, jurisdiction, data flows, and customers.</p>
+    <div class="settings-grid">
+      <label class="form-row">Legal entity name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" /></label>
+      <label class="form-row">Country of establishment<input class="paid-operator-country" value="${esc(state.operatorCountry || '')}" /></label>
+      <label class="form-row">Governing law and courts<input class="paid-governing-law" value="${esc(state.governingLaw || '')}" placeholder="e.g. laws of …; courts of …" /></label>
+      <label class="form-row">Legal notice address<textarea class="paid-legal-address" rows="3">${esc(state.legalNoticeAddress || '')}</textarea></label>
+      <label class="form-row">Legal email<input class="paid-email-legal" type="email" value="${esc(contacts.legal || '')}" /></label>
+      <label class="form-row">Privacy email<input class="paid-email-privacy" type="email" value="${esc(contacts.privacy || '')}" /></label>
+      <label class="form-row">Security email<input class="paid-email-security" type="email" value="${esc(contacts.security || '')}" /></label>
+      <label class="form-row">Incident email<input class="paid-email-incident" type="email" value="${esc(contacts.incident || '')}" /></label>
+      <label class="form-row">DPA email<input class="paid-email-dpa" type="email" value="${esc(contacts.dpa || '')}" /></label>
+      <label class="form-row">Billing email<input class="paid-email-billing" type="email" value="${esc(contacts.billing || '')}" /></label>
+    </div>
+    <label class="card" style="display:flex;gap:10px;padding:12px;margin-top:14px"><input type="checkbox" class="paid-founder-reviewed" ${state.founderReviewed ? 'checked' : ''} /><span><b>I reviewed and approved policy version ${esc(state.policyVersion)}</b><span class="task-sub" style="display:block">This records founder approval; it is not a substitute for legal advice.</span></span></label>
+
+    <div class="section-h" style="margin-top:22px">Real-world founder checklist</div>
+    <p class="task-sub">These items happen outside krmax. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that krmax verified the work.</p>
+    ${taskMarkup}
+
+    <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
+      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Only turn this on after the legal and Stripe configuration is complete. Disabling it immediately closes new paid checkout without deleting subscriptions or settings.</span></span></label>
+    </div>
+    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
+    ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
+  box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
+    try {
+      await api('/api/settings/paid-launch', { method: 'PUT', body: JSON.stringify({
+        paidLaunch: box.querySelector('.paid-launch-enabled').checked,
+        founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
+        operatorName: box.querySelector('.paid-operator-name').value,
+        operatorCountry: box.querySelector('.paid-operator-country').value,
+        governingLaw: box.querySelector('.paid-governing-law').value,
+        legalNoticeAddress: box.querySelector('.paid-legal-address').value,
+        contacts: {
+          legal: box.querySelector('.paid-email-legal').value,
+          privacy: box.querySelector('.paid-email-privacy').value,
+          security: box.querySelector('.paid-email-security').value,
+          incident: box.querySelector('.paid-email-incident').value,
+          dpa: box.querySelector('.paid-email-dpa').value,
+          billing: box.querySelector('.paid-email-billing').value,
+        },
+        stripe: {
+          secretKey: box.querySelector('.paid-stripe-secret').value || undefined,
+          webhookSecret: box.querySelector('.paid-stripe-webhook').value || undefined,
+          individualPriceId: box.querySelector('.paid-stripe-individual-price').value,
+          teamBasePriceId: box.querySelector('.paid-stripe-team-base-price').value,
+          teamSeatPriceId: box.querySelector('.paid-stripe-team-seat-price').value,
+          individualProductId: box.querySelector('.paid-stripe-individual-product').value,
+          teamProductId: box.querySelector('.paid-stripe-team-product').value,
+        },
+        completedTasks: [...box.querySelectorAll('.paid-launch-task:checked')].map((input) => input.value),
+      }) });
+      toast('Paid-launch setup saved');
+      S.launch = await api('/api/launch');
+      await wirePaidLaunchCard();
+    } catch (error) { toast(error.message, true); await wirePaidLaunchCard(); }
+  });
+}
 // ── card fields ──────────────────────────────────────────────────────────────
 // Card number, expiry and CVC behave like any checkout form: separators appear
 // as you type, a pasted number is regrouped whatever it was punctuated with,
@@ -13624,13 +13725,14 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-stripe">Stripe</a><a href="#installation-email">Email</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
-      <div class="settings-section-title" id="installation-stripe"><div>Stripe<small>The shared Connect application; organizations keep separate accounts and funds</small></div></div>${stripePlatformCard()}
+      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
+      <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
@@ -13748,6 +13850,7 @@ function wireInstallationSettings() {
   wireAppearanceCard();
   wireHostCapacityCard();
   wireInstallationGithubCard();
+  wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
   hydrateResilienceCard();

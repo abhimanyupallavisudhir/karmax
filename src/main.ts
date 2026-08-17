@@ -133,6 +133,8 @@ async function main() {
   }
   const authorization = new AuthorizationService(store);
   const broker = new CredentialBroker(new Vault(p.vault));
+  const { PaidLaunchSettingsService } = await import('./launch/settings.js');
+  const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
     broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
   if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
@@ -289,7 +291,7 @@ async function main() {
   // status calls can report "unmetered", but it never contacts Stripe there.
   const { StripeSubscriptionProvider, SubscriptionBillingService } = await import('./billing/subscriptions.js');
   const subscriptionBilling = new SubscriptionBillingService(store,
-    new StripeSubscriptionProvider(process.env, fetch), deployment.hosted);
+    new StripeSubscriptionProvider(() => paidLaunchSettings.subscriptionConfig(), fetch), deployment.hosted);
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
   const configHomes = new ConfigHomeManager();
@@ -598,6 +600,7 @@ async function main() {
     objects: objectStore,
     resources,
     subscriptions: subscriptionBilling,
+    paidLaunchSettings,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,

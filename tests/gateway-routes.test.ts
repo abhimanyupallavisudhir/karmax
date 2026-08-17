@@ -76,6 +76,8 @@ describe('gateway route capability binding', () => {
 
   it('binds installation surfaces to installation settings capabilities', () => {
     expect(cap('GET', '/api/settings/installation')).toBe('settings:read');
+    expect(cap('GET', '/api/settings/paid-launch')).toBe('settings:read');
+    expect(cap('PUT', '/api/settings/paid-launch')).toBe('settings:write');
     expect(cap('PUT', '/api/organizations/o1/payments/stripe/platform')).toBe('settings:write');
     expect(cap('POST', '/api/organizations/o1/github/app-manifest')).toBe('settings:write');
     expect(cap('PUT', '/api/organizations/o1/github/app')).toBe('settings:write');
