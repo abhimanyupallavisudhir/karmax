@@ -144,6 +144,15 @@ export interface AdapterTurn {
   };
   session?: string;
   output: string;
+  /** Provider-reported token counts. Subscription CLIs do not consistently
+   * expose these; omission is honest and remains distinguishable from zero. */
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number;
+    /** OpenAI includes cached reads in input_tokens; Anthropic reports them
+     * separately. Pricing normalizes this without guessing. */
+    inputTokensIncludeCacheRead?: boolean;
+    /** Provider-normalized total; avoids double-counting APIs where cached input
+     * is included in inputTokens while retaining cache details for reporting. */
+    totalTokens?: number };
   /** How many leading `input.messages` this turn actually delivered to the agent —
    *  the initial delta PLUS any follow-ups injected in-flight (streaming adapters).
    *  Absolute index into the `msgs` conversation, so the workflow can position the
@@ -180,6 +189,7 @@ export interface TurnResult {
   /** The Do agent explicitly requested the PR/Review cycle. */
   openPrRequested?: boolean;
   output: string;
+  usage?: AdapterTurn['usage'];
   /** Provider timeline item carrying `output`, when the adapter emitted one. */
   finalActivity?: NonNullable<Message['sourceActivity']>;
   reviewInfo?: ReviewInfo;

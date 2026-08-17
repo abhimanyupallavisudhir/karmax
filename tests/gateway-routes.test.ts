@@ -58,6 +58,10 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/organizations/o1')).toBe('organization:read');
   });
 
+  it('exposes plan entitlements as organization-scoped read data', () => {
+    expect(cap('GET', '/api/organizations/o1/entitlements')).toBe('organization:read');
+  });
+
   it('gates a password-manager export import as a credential write', () => {
     expect(cap('POST', '/api/vault/import/bitwarden')).toBe('credential:write');
     expect(cap('POST', '/api/vault/items/vi_1/reveal')).toBe('credential:write');
@@ -72,12 +76,22 @@ describe('gateway route capability binding', () => {
 
   it('binds installation surfaces to installation settings capabilities', () => {
     expect(cap('GET', '/api/settings/installation')).toBe('settings:read');
+    expect(cap('GET', '/api/settings/paid-launch')).toBe('settings:read');
+    expect(cap('PUT', '/api/settings/paid-launch')).toBe('settings:write');
     expect(cap('PUT', '/api/organizations/o1/payments/stripe/platform')).toBe('settings:write');
     expect(cap('POST', '/api/organizations/o1/github/app-manifest')).toBe('settings:write');
     expect(cap('PUT', '/api/organizations/o1/github/app')).toBe('settings:write');
     // Tenant-owned connections stay tenant capabilities.
     expect(cap('POST', '/api/organizations/o1/payments/connect')).toBe('payment:write');
     expect(cap('POST', '/api/organizations/o1/github/install-url')).toBe('repository:write');
+  });
+
+  it('separates hosted subscription billing from agent payment cards', () => {
+    expect(cap('GET', '/api/organizations/o1/subscription/status')).toBe('organization:read');
+    expect(cap('POST', '/api/organizations/o1/subscription/checkout')).toBe('payment:write');
+    expect(cap('POST', '/api/organizations/o1/subscription/cancel')).toBe('payment:write');
+    expect(cap('POST', '/api/subscriptions/webhook')).toBe('none');
+    expect(cap('POST', '/api/payments/stripe/webhook')).toBe('none');
   });
 
   it('requires repository writes for both delegated creation and project attachment', () => {
@@ -147,6 +161,7 @@ describe('platform catalog covers the gateway route table', () => {
    */
   const PRE_GATE = [
     /^\/api\/(login|logout|signup|setup|session|sso|auth)/,
+    /^\/api\/(launch|legal)/,
     // Provider webhooks/ingest: authenticated by signature or a minted secret,
     // answered before the session gate, and excluded from platform_request.
     /\/(webhooks?|ingest)$/,

@@ -1,7 +1,7 @@
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
-import { TokenAuthority, type ScopedToken } from './tokens.js';
+import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, allows } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -1052,7 +1052,7 @@ export class KarmaxApi {
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
-    const delegation = this.deps.tokens.delegateHuman(token, {
+    const delegation = this.delegateTaskHuman(token, caller, {
       taskId: task.id,
       projectId: authorizationScope.scope ? undefined : task.projectId,
       projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
@@ -1766,12 +1766,15 @@ export class KarmaxApi {
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
-    // Historical tasks (and tasks authorized before delegated subjects were
-    // introduced) may have a human creator + pinned GitHub identity but no
-    // durable delegation. An authorization update is itself carried by a
-    // verified bearer, so use that authority boundary to backfill provenance for
-    // the next turn. Never infer a subject from `principal`, and never replace a
-    // task's already-pinned account with the caller's currently-active account.
+    // Every authorization update must mint fresh delegated provenance with the
+    // new scope. Reusing the old delegation is not merely stale metadata: a
+    // project-scoped draft promoted to Administrator would otherwise keep its
+    // project-only human delegation, then fail before its first agent turn when
+    // the workflow mints an organization-scoped token from it. An authorization
+    // update is itself carried by a verified bearer, so it is the correct
+    // authority boundary both for backfilling historical tasks and for changing
+    // scope. Never infer a subject from `principal`, and never replace a task's
+    // already-pinned account with the caller's currently-active account.
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string'
       ? task.params._githubAccountId : undefined;
     const delegatedGithubAccountId = pinnedGithubAccountId
@@ -1780,9 +1783,7 @@ export class KarmaxApi {
         : caller.humanSubject
           ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
           : undefined);
-    const replaceDelegation = Boolean(priorAuthorization?.delegationId
-      && priorAuthorization.principal && priorAuthorization.principal !== caller.principal);
-    const delegation = priorAuthorization?.delegationId && !replaceDelegation ? undefined : this.deps.tokens.delegateHuman(token, {
+    const delegation = this.delegateTaskHuman(token, caller, {
       taskId,
       projectId: authorizationScope.scope ? undefined : task.projectId,
       projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
@@ -1806,12 +1807,12 @@ export class KarmaxApi {
         throw new Error(unwrapCause(e));
       }
     }
+    const { delegationId: _staleDelegationId, ...priorAuthorizationWithoutDelegation } = priorAuthorization ?? {};
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...priorAuthorization, ...authorization, profileAttenuated,
+      _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization, profileAttenuated,
         principal: caller.principal, credentialPolicies: policies,
-        ...(delegation ? { delegationId: delegation.id }
-          : replaceDelegation ? { delegationId: undefined } : {}),
+        ...(delegation ? { delegationId: delegation.id } : {}),
         ...(profileAttenuated ? { attenuationAccepted } : { attenuationAccepted: undefined }) },
       ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
@@ -1844,6 +1845,16 @@ export class KarmaxApi {
       throw new CapabilityError('this token cannot delegate global access');
     }
     return caller.caps;
+  }
+
+  /** `taskGrant` has already checked an interactive human's durable grants for
+   * the selected scope. Preserve that wider authorization when the browser's
+   * short-lived API token is intentionally narrowed to the current route's
+   * project; non-human callers still attenuate strictly from their bearer. */
+  private delegateTaskHuman(token: string, caller: ScopedToken, args: HumanDelegationArgs) {
+    return this.deps.authorization && caller.kind === 'human' && caller.principal.startsWith('user:')
+      ? this.deps.tokens.delegateAuthorizedInteractiveHuman(token, args)
+      : this.deps.tokens.delegateHuman(token, args);
   }
 
   /**

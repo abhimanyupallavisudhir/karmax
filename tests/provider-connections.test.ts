@@ -53,6 +53,28 @@ describe('organization cloud provider connections', () => {
     }
   });
 
+  it('never uses an installation-wide provider key for an unconnected hosted organization', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-provider-hosted-'));
+    const store = new Store(':memory:', { hosted: true });
+    const service = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(dir)));
+    const organization = store.createOrganization({ name: 'Tenant', ownerUserId: 'owner' });
+    const previousDeployment = process.env.KARMAX_DEPLOYMENT;
+    const previousKey = process.env.E2B_API_KEY;
+    delete process.env.KARMAX_DEPLOYMENT;
+    process.env.E2B_API_KEY = 'installation-secret';
+    try {
+      expect(() => service.resolve(organization.id, 'e2b')).toThrow(/not connected/);
+      service.save({ organizationId: organization.id, provider: 'e2b', apiKey: 'tenant-secret' });
+      expect(service.resolve(organization.id, 'e2b').apiKey).toBe('tenant-secret');
+    } finally {
+      if (previousDeployment === undefined) delete process.env.KARMAX_DEPLOYMENT;
+      else process.env.KARMAX_DEPLOYMENT = previousDeployment;
+      if (previousKey === undefined) delete process.env.E2B_API_KEY;
+      else process.env.E2B_API_KEY = previousKey;
+      store.close(); fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps credentials out of provider metadata URLs', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-provider-url-'));
     const store = new Store(':memory:');

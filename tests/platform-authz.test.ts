@@ -6,7 +6,7 @@ import { KarmaxApi, CapabilityError, NotFoundError } from '../src/platform/api.j
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { WorldRegistry } from '../src/world/registry.js';
-import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
+import { AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
 
 /**
  * Service-layer authorization scope, exercised directly against KarmaxApi (no
@@ -284,6 +284,54 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     });
     expect(autonomousRetry.record.caps).toEqual(['repository:write']);
     expect(autonomousRetry.record.humanSubject).toBeUndefined();
+  });
+
+  it('uses durable Administrator scope beyond a project-bound browser token', async () => {
+    const organizationId = store.getProject(mine)!.organizationId!;
+    const authorization = new AuthorizationService(store);
+    authorization.grant('root', {
+      principalId: 'user:a', scopeKey: organizationScope(organizationId), profileId: 'administrator',
+    });
+    const delegatedApi = new KarmaxApi({
+      store, client: {} as any, taskQueue: 'karmax', tokens, contentDir,
+      worlds: new WorldRegistry(), authorization,
+    });
+    // Browser requests are deliberately pinned to the project in the current
+    // route even when the signed-in human has a durable organization grant.
+    const human = tokens.mintPrincipal('user:a', ['*'], mine, 60_000, organizationId);
+    const draft = await delegatedApi.createTask(human.token, {
+      projectId: mine, title: 'Cross-project investigation', prompt: 'inspect a sibling project', draft: true,
+      authorization: { level: 'developer', scope: 'projects', projectIds: [mine] },
+    });
+    const projectAuthorization = draft.params._authorization as any;
+
+    const elevated = await delegatedApi.setTaskAuthorization(human.token, draft.id, {
+      level: 'administrator', scope: 'organization',
+    });
+    const administratorAuthorization = elevated.params._authorization as any;
+
+    expect(administratorAuthorization).toMatchObject({
+      level: 'administrator', scope: 'organization', organizationId,
+    });
+    expect(administratorAuthorization.delegationId).toMatch(/^dlg_/);
+    expect(administratorAuthorization.delegationId).not.toBe(projectAuthorization.delegationId);
+    expect(() => tokens.mint({
+      taskId: draft.id, profileId: 'do', role: 'do', principal: 'user:a', organizationId,
+      ceiling: ['task:read'], grantorCaps: administratorAuthorization.capabilities,
+      delegationId: administratorAuthorization.delegationId,
+    })).not.toThrow();
+
+    const direct = await delegatedApi.createTask(human.token, {
+      projectId: mine, title: 'Direct Administrator task', prompt: 'inspect a sibling project', draft: true,
+      authorization: { level: 'administrator', scope: 'organization' },
+    });
+    const directAuthorization = direct.params._authorization as any;
+    expect(directAuthorization.delegationId).toMatch(/^dlg_/);
+    expect(() => tokens.mint({
+      taskId: direct.id, profileId: 'do', role: 'do', principal: 'user:a', organizationId,
+      ceiling: ['task:read'], grantorCaps: directAuthorization.capabilities,
+      delegationId: directAuthorization.delegationId,
+    })).not.toThrow();
   });
 
   it('stores explicit multi-project and organization authorization on tasks and refuses over-granting', async () => {

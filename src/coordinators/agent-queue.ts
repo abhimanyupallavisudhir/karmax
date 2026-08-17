@@ -79,7 +79,7 @@ const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({
  * check because only the worker can inspect the live host.
  */
 export async function agentQueue(input: { capacity?: number; state?: AgentQueueState } = {}): Promise<void> {
-  let capacity = positiveInt(input.state?.capacity ?? input.capacity, 3);
+  let capacity = nonNegativeInt(input.state?.capacity ?? input.capacity, 3);
   let queue = input.state?.queue ?? [];
   let current = input.state?.current ?? [];
   let processed = input.state?.processed ?? 0;
@@ -109,7 +109,7 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
     queue = idx < 0 ? [...rest, item] : [...rest.slice(0, idx), item, ...rest.slice(idx)];
   });
   setHandler(setAgentCapacitySignal, ({ capacity: next }) => {
-    capacity = positiveInt(next, capacity);
+    capacity = nonNegativeInt(next, capacity);
   });
   // A waiter durably enqueues and blocks in one Update. The separate
   // signalWithStart remains the crash-safe way to create the singleton, while
@@ -205,7 +205,7 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
   }
 }
 
-function positiveInt(value: unknown, fallback: number): number {
+function nonNegativeInt(value: unknown, fallback: number): number {
   const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
 }

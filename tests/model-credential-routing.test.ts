@@ -86,6 +86,8 @@ describe('model-agnostic harness credential routing', () => {
 
   it('passes the exact leased environment-key provider to the OpenCode turn', async () => {
     const project = store.createProject('Personal design');
+    const runtimeTask = store.createTask({ projectId: project.id, title: 'Design', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'design it' } as any });
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault-runtime')));
     broker.registerHandle('xai:legacy', 'must-not-be-resolved');
     store.upsertProfile({
@@ -107,7 +109,7 @@ describe('model-agnostic harness credential routing', () => {
     }]]);
     const worlds = new WorldRegistry();
     worlds.register(new MemoryWorldProvider());
-    const world = await worlds.create('memory', { taskId: 'runtime-route', base: 'main' });
+    const world = await worlds.create('memory', { taskId: runtimeTask.id, base: 'main' });
     const core = makeCoreActivities({
       store,
       worlds,
@@ -117,7 +119,7 @@ describe('model-agnostic harness credential routing', () => {
     });
 
     await core.runAgentTurn({
-      taskId: 'runtime-route',
+      taskId: runtimeTask.id,
       role: 'do',
       worldHandle: world.handle,
       messages: [{ id: 'm1', role: 'user', text: 'design it', ts: 0 }],

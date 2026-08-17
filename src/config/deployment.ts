@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
+import { launchConfig } from '../launch/legal.js';
 
 export interface DeploymentConfig {
   hosted: boolean;
@@ -133,6 +134,9 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
       if (!env[name]) failures.push(`${name} is required when KARMAX_OBJECT_STORE=s3`);
   }
   if (!['e2b', 'daytona'].includes(config.cloudWorldProvider!)) failures.push('KARMAX_CLOUD_WORLD_PROVIDER must be e2b or daytona');
+  const launch = launchConfig(env);
+  if (launch.paidLaunch && !launch.ready)
+    failures.push(`KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: ${launch.missing.join(', ')}`);
   if (failures.length) throw new Error(`hosted deployment is unsafe:\n- ${failures.join('\n- ')}`);
   return config;
 }
