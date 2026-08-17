@@ -40,6 +40,9 @@ export interface DevServerOptions {
   /** Disable the Web UI (tests). */
   headless?: boolean;
   logLevel?: 'debug' | 'info' | 'warn' | 'error' | 'never';
+  /** Override the Temporal CLI executable. Primarily useful for validating
+   * startup/recovery behavior without replacing the process-wide environment. */
+  cliPath?: string;
 }
 
 /** What we persist so a later boot/reload can find and reuse the running server. */
@@ -66,6 +69,8 @@ interface PortTriple {
 }
 
 const HEALTH_TIMEOUT_MS = 6000;
+const EPHEMERAL_START_ATTEMPTS = 3;
+const STARTUP_STDERR_EDGE_BYTES = 8 * 1024;
 
 const recordFile = (dbFilename: string) => path.join(path.dirname(dbFilename), 'dev-server.json');
 const logFilePath = (dbFilename: string) => path.join(path.dirname(dbFilename), 'dev-server.log');
@@ -185,7 +190,7 @@ async function unitMainPid(unit: string): Promise<number | undefined> {
  * Returns undefined when systemd-run isn't usable (no systemd, no user
  * manager, non-Linux) — the caller falls back to the detached spawn.
  */
-async function spawnViaSystemdRun(args: string[], logPath: string): Promise<{ pid: number; unit: string } | undefined> {
+async function spawnViaSystemdRun(args: string[], logPath: string, cliPath = TEMPORAL_BIN): Promise<{ pid: number; unit: string } | undefined> {
   const unit = `karmax-temporal-${crypto.randomBytes(4).toString('hex')}`;
   const custody = process.env[CUSTODY_ENV];
   try {
@@ -199,7 +204,7 @@ async function spawnViaSystemdRun(args: string[], logPath: string): Promise<{ pi
       `--property=StandardError=append:${logPath}`,
       ...(custody ? [`--setenv=${CUSTODY_ENV}=${custody}`] : []),
       '--',
-      TEMPORAL_BIN,
+      cliPath,
       ...args,
     ]);
   } catch {
@@ -339,9 +344,10 @@ async function awaitStartup(child: ChildProcess, grpcPort: number, onFail: () =>
  * `stop()` actually kills, so each test file gets an isolated server.
  */
 export async function startDevServer(opts: DevServerOptions = {}): Promise<DevServer> {
-  if (!fs.existsSync(TEMPORAL_BIN)) {
+  const cliPath = opts.cliPath ?? TEMPORAL_BIN;
+  if (!fs.existsSync(cliPath)) {
     throw new Error(
-      `Temporal CLI not found at ${TEMPORAL_BIN}. Install it (https://temporal.io/setup/install-temporal-cli) or set TEMPORAL_CLI.`,
+      `Temporal CLI not found at ${cliPath}. Install it (https://temporal.io/setup/install-temporal-cli) or set TEMPORAL_CLI.`,
     );
   }
   const namespace = opts.namespace ?? 'default';
@@ -386,7 +392,18 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
   }
 
   reapOrphanedEphemeralServers();
-  return spawnEphemeral(opts, namespace);
+  const failures: string[] = [];
+  for (let attempt = 1; attempt <= EPHEMERAL_START_ATTEMPTS; attempt++) {
+    try {
+      return await spawnEphemeral(opts, namespace, cliPath);
+    } catch (error) {
+      failures.push(`attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`);
+      reapOrphanedEphemeralServers();
+      if (attempt < EPHEMERAL_START_ATTEMPTS)
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    }
+  }
+  throw new Error(`temporal dev server failed after ${EPHEMERAL_START_ATTEMPTS} attempts:\n${failures.join('\n')}`);
 }
 
 /**
@@ -427,7 +444,7 @@ async function spawnPersistent(
   // terminal that booted karmax can't reap it (see spawnViaSystemdRun).
   let pid: number;
   let unit: string | undefined;
-  const viaUnit = await spawnViaSystemdRun(args, logPath);
+  const viaUnit = await spawnViaSystemdRun(args, logPath, opts.cliPath ?? TEMPORAL_BIN);
   if (viaUnit) {
     ({ pid, unit } = viaUnit);
     // Race the port coming up against the unit dying on startup.
@@ -451,7 +468,7 @@ async function spawnPersistent(
     // detached + unref: the server must outlive this (reload-prone) process so the
     // next boot can reuse it. stdio → a log file (not a pipe) so it's not tied to
     // our lifetime, and so Temporal's logs survive for later diagnosis.
-    const child = spawn(TEMPORAL_BIN, args, { stdio: ['ignore', out, out], detached: true });
+    const child = spawn(opts.cliPath ?? TEMPORAL_BIN, args, { stdio: ['ignore', out, out], detached: true });
     try {
       await awaitStartup(child, ports.grpcPort, () => `log:\n${tail(logPath)}`);
     } finally {
@@ -484,10 +501,10 @@ async function spawnPersistent(
   };
 }
 
-async function spawnEphemeral(opts: DevServerOptions, namespace: string): Promise<DevServer> {
+async function spawnEphemeral(opts: DevServerOptions, namespace: string, cliPath: string): Promise<DevServer> {
   const [grpcPort, uiPort, metricsPort] = await findFreePorts(3);
   const args = buildArgs({ grpcPort: grpcPort!, uiPort: uiPort!, metricsPort: metricsPort! }, namespace, opts);
-  const child: ChildProcess = spawn(TEMPORAL_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+  const child: ChildProcess = spawn(cliPath, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
   const record = child.pid ? ephemeralRecordFile(child.pid) : undefined;
   if (child.pid && record) {
     try {
@@ -504,11 +521,34 @@ async function spawnEphemeral(opts: DevServerOptions, namespace: string): Promis
   };
   process.once('exit', killOnOwnerExit);
   child.once('exit', cleanupRecord);
+  let stderrBytes = 0;
+  let stderrHead = '';
   let stderrTail = '';
   child.stderr?.on('data', (b) => {
-    stderrTail = (stderrTail + b.toString()).slice(-2000);
+    const chunk = b.toString();
+    stderrBytes += Buffer.byteLength(chunk);
+    if (Buffer.byteLength(stderrHead) < STARTUP_STDERR_EDGE_BYTES)
+      stderrHead = (stderrHead + chunk).slice(0, STARTUP_STDERR_EDGE_BYTES);
+    stderrTail = (stderrTail + chunk).slice(-STARTUP_STDERR_EDGE_BYTES);
   });
-  await awaitStartup(child, grpcPort!, () => `stderr:\n${stderrTail}`);
+  try {
+    await awaitStartup(child, grpcPort!, () => {
+      const stderr = stderrBytes <= STARTUP_STDERR_EDGE_BYTES
+        ? stderrHead
+        : `${stderrHead}\n... stderr truncated (${stderrBytes} bytes total) ...\n${stderrTail}`;
+      return `stderr:\n${stderr}`;
+    });
+  } catch (error) {
+    process.off('exit', killOnOwnerExit);
+    if (child.exitCode === null && child.pid) try { process.kill(child.pid, 'SIGKILL'); } catch {}
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null) return resolve();
+      child.once('exit', () => resolve());
+      setTimeout(resolve, 1000).unref();
+    });
+    cleanupRecord();
+    throw error;
+  }
 
   const address = `127.0.0.1:${grpcPort}`;
   const uiUrl = opts.headless ? '' : `http://127.0.0.1:${uiPort}`;
