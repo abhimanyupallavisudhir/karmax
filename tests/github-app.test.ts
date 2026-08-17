@@ -375,9 +375,111 @@ describe('GitHub App integration', () => {
       .rejects.toThrow(/reconnect/i);
     // The dead credential is cleared so the UI stops showing GitHub as connected
     // and the operator is prompted to reconnect instead of a silent 401 storm.
-    expect(service.status('owner').userAuthorized).toBe(false);
+    expect(service.status('owner')).toMatchObject({
+      userAuthorized: false,
+      lastAuthorizationFailure: {
+        code: 'refresh_rejected',
+        disconnected: true,
+        providerError: 'bad_refresh_token',
+      },
+    });
+    expect(store.auditSince().at(-1)).toMatchObject({
+      principalId: 'user:owner',
+      action: 'github.user-authorization.refresh-failed',
+      scopeKey: 'user:owner',
+      detail: { code: 'refresh_rejected', disconnected: true, providerError: 'bad_refresh_token' },
+    });
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('shares one single-use refresh across concurrent callers', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-singleflight-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const handle = 'github-app:user:owner:authorization';
+    broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    let refreshes = 0;
+    const fakeFetch = async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') {
+        refreshes++;
+        await new Promise((resolve) => setImmediate(resolve));
+        return Response.json({ access_token: 'fresh-token', expires_in: 28_800,
+          refresh_token: 'refresh-2', refresh_token_expires_in: 15_552_000 });
+      }
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+
+    await expect(Promise.all([
+      service.userAccessToken('owner'),
+      service.userAccessToken('owner'),
+      service.userAccessToken('owner'),
+    ])).resolves.toEqual(['fresh-token', 'fresh-token', 'fresh-token']);
+    expect(refreshes).toBe(1);
+    expect(JSON.parse(broker.resolve(handle, { caps: [`use-credential:${handle}`] })))
+      .toMatchObject({ accessToken: 'fresh-token', refreshToken: 'refresh-2' });
+    expect(store.auditSince().filter((entry) => entry.action === 'github.user-authorization.refreshed')).toHaveLength(1);
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps a newer token when a stale concurrent refresh is rejected', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-contention-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const handle = 'github-app:user:owner:authorization';
+    broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    const replacement = JSON.stringify({ accessToken: 'other-instance-token', expiresAt: Date.now() + 28_800_000,
+      refreshToken: 'refresh-2', refreshExpiresAt: Date.now() + 180 * 86_400_000 });
+    const fakeFetch = async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') {
+        broker.registerHandle(handle, replacement);
+        return Response.json({ error: 'bad_refresh_token',
+          error_description: 'The refresh token passed is incorrect or expired.' });
+      }
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+
+    await expect(service.userAccessToken('owner')).resolves.toBe('other-instance-token');
+    expect(broker.resolve(handle, { caps: [`use-credential:${handle}`] })).toBe(replacement);
+    expect(service.status('owner')).toMatchObject({ userAuthorized: true });
+    expect(service.status('owner').lastAuthorizationFailure).toBeUndefined();
+    expect(store.auditSince().at(-1)).toMatchObject({
+      action: 'github.user-authorization.refresh-contention-recovered',
+      detail: { providerError: 'bad_refresh_token' },
+    });
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('preserves a secret-free transient refresh failure without disconnecting', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-diagnostic-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret');
+    const handle = 'github-app:user:owner:authorization';
+    broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'sensitive-refresh-token', refreshExpiresAt: Date.now() + 180 * 86_400_000 }));
+    const fakeFetch = async () => new Response('provider body must not be persisted', { status: 503 });
+    const service = new GitHubAppService(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch });
+
+    await expect(service.userAccessToken('owner')).rejects.toThrow(/refresh_request_failed/);
+    expect(service.status('owner')).toMatchObject({
+      userAuthorized: true,
+      lastAuthorizationFailure: {
+        code: 'refresh_request_failed', disconnected: false, providerError: 'http_503',
+      },
+    });
+    const diagnostic = JSON.stringify(store.auditSince().at(-1));
+    expect(diagnostic).not.toContain('sensitive-refresh-token');
+    expect(diagnostic).not.toContain('provider body must not be persisted');
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('imports repositories, uses scoped installation tokens for Git, and verifies webhooks', async () => {

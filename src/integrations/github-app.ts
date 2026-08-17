@@ -22,6 +22,8 @@ const githubUserTokenHandle = (userId: string, accountId: string) =>
   `github-app:user:${userId}:account:${accountId}:authorization`;
 const githubUserAccountsKey = (userId: string) => `github-app:user:${userId}:accounts`;
 const githubUserActiveAccountKey = (userId: string) => `github-app:user:${userId}:active-account`;
+const githubUserAuthorizationFailureKey = (userId: string, accountId?: string) =>
+  `github-app:user:${userId}:${accountId ? `account:${accountId}:` : ''}authorization-failure`;
 
 function permissionLevel(value: unknown): 'write' | 'read' | 'none' {
   return value === 'write' ? 'write' : value === 'read' ? 'read' : 'none';
@@ -178,6 +180,22 @@ export interface GitHubUserAccount extends GitHubUserIdentity {
   active: boolean;
 }
 
+export type GitHubUserAuthorizationFailureCode =
+  | 'refresh_token_missing'
+  | 'refresh_token_expired'
+  | 'refresh_rejected'
+  | 'refresh_request_failed';
+
+/** Secret-free, durable context for the most recent user-token refresh failure. */
+export interface GitHubUserAuthorizationFailure {
+  code: GitHubUserAuthorizationFailureCode;
+  summary: string;
+  occurredAt: number;
+  disconnected: boolean;
+  accountId?: string;
+  providerError?: string;
+}
+
 /** A live observation from GitHub, never a krmax capability grant. `canMerge`
  * is deliberately conservative: GitHub's push/maintain/admin repository roles
  * may request a merge, while branch protection and rulesets still decide the
@@ -307,6 +325,9 @@ export class GitHubAppService {
   private tokenCache = new Map<string, { token: string; expiresAt: number }>();
   /** In-flight token mints, keyed by connection — collapses concurrent callers. */
   private tokenMints = new Map<string, Promise<string>>();
+  /** GitHub refresh tokens are single-use. Sharing one refresh per account is a
+   * correctness requirement: two callers must not consume the same chain. */
+  private userTokenRefreshes = new Map<string, Promise<string>>();
   /** Bounds refreshes while an installation owner is still approving a newly
    * requested permission; without this, every landing poll would mint a token. */
   private tokenInvalidatedAt = new Map<string, number>();
@@ -336,12 +357,14 @@ export class GitHubAppService {
   }
 
   status(userId?: string): { configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
-    webhookConfigured: boolean; syncMode: 'webhook' | 'on-demand'; userAuthorized: boolean } {
+    webhookConfigured: boolean; syncMode: 'webhook' | 'on-demand'; userAuthorized: boolean;
+    lastAuthorizationFailure?: GitHubUserAuthorizationFailure } {
     let syncMode: 'webhook' | 'on-demand' = 'on-demand';
     try {
       const publicUrl = this.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY);
       if (publicUrl && publicWebhookOrigin(new URL(publicUrl))) syncMode = 'webhook';
     } catch {}
+    const lastAuthorizationFailure = userId ? this.lastUserAuthorizationFailure(userId) : undefined;
     return {
       configured: this.configured(),
       ...(this.options.appId ? { appId: this.options.appId } : {}),
@@ -352,6 +375,7 @@ export class GitHubAppService {
       userAuthorized: Boolean(userId && (this.userAccounts(userId).some((account) =>
         this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
         || this.broker.hasHandle(legacyGithubUserTokenHandle(userId)))),
+      ...(lastAuthorizationFailure ? { lastAuthorizationFailure } : {}),
     };
   }
 
@@ -454,6 +478,8 @@ export class GitHubAppService {
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
     this.saveUserToken(userId, identity.id, value);
+    this.clearUserAuthorizationFailure(userId, identity.id);
+    this.clearUserAuthorizationFailure(userId);
     this.saveUserIdentity(userId, identity, options.makeActive);
     return identity;
   }
@@ -475,6 +501,8 @@ export class GitHubAppService {
       ...(authorization.refreshToken ? { refreshToken: authorization.refreshToken } : {}),
       ...(authorization.refreshTokenExpiresAt ? { refreshExpiresAt: authorization.refreshTokenExpiresAt.getTime() } : {}),
     }));
+    this.clearUserAuthorizationFailure(userId, identity.id);
+    this.clearUserAuthorizationFailure(userId);
     this.saveUserIdentity(userId, identity, false);
     return identity;
   }
@@ -518,6 +546,53 @@ export class GitHubAppService {
 
   private saveUserAccounts(userId: string, accounts: GitHubUserIdentity[]): void {
     this.store.kvSet(githubUserAccountsKey(userId), JSON.stringify(accounts));
+  }
+
+  private userAuthorizationFailure(userId: string, accountId?: string): GitHubUserAuthorizationFailure | undefined {
+    try {
+      const value = JSON.parse(this.store.kvGet(githubUserAuthorizationFailureKey(userId, accountId)) ?? 'null');
+      if (!value || typeof value !== 'object' || !Number.isFinite(value.occurredAt)
+        || typeof value.code !== 'string' || typeof value.summary !== 'string') return undefined;
+      return value as GitHubUserAuthorizationFailure;
+    } catch { return undefined; }
+  }
+
+  private lastUserAuthorizationFailure(userId: string): GitHubUserAuthorizationFailure | undefined {
+    const failures = [this.userAuthorizationFailure(userId),
+      ...this.userAccounts(userId).map((account) => this.userAuthorizationFailure(userId, account.id))]
+      .filter((failure): failure is GitHubUserAuthorizationFailure => Boolean(failure));
+    return failures.sort((left, right) => right.occurredAt - left.occurredAt)[0];
+  }
+
+  private clearUserAuthorizationFailure(userId: string, accountId?: string): void {
+    this.store.kvDelete(githubUserAuthorizationFailureKey(userId, accountId));
+  }
+
+  private recordUserAuthorizationFailure(userId: string, accountId: string | undefined,
+    failure: Omit<GitHubUserAuthorizationFailure, 'occurredAt' | 'accountId'>): GitHubUserAuthorizationFailure {
+    const recorded: GitHubUserAuthorizationFailure = {
+      ...failure,
+      occurredAt: Date.now(),
+      ...(accountId ? { accountId } : {}),
+    };
+    this.store.kvSet(githubUserAuthorizationFailureKey(userId, accountId), JSON.stringify(recorded));
+    this.store.appendAudit({
+      principalId: `user:${userId}`,
+      action: 'github.user-authorization.refresh-failed',
+      scopeKey: `user:${userId}`,
+      detail: { ...recorded },
+    });
+    return recorded;
+  }
+
+  private recordRefreshContentionRecovery(userId: string, accountId: string | undefined,
+    providerError?: string): void {
+    this.store.appendAudit({
+      principalId: `user:${userId}`,
+      action: 'github.user-authorization.refresh-contention-recovered',
+      scopeKey: `user:${userId}`,
+      detail: { ...(accountId ? { accountId } : {}), ...(providerError ? { providerError } : {}) },
+    });
   }
 
   activeUserAccountId(userId: string): string | undefined {
@@ -589,6 +664,7 @@ export class GitHubAppService {
     if (!accounts.some((account) => account.id === accountId)) throw new Error('GitHub account is not connected');
     if (accounts.length <= 1) throw new Error('Connect a new GitHub account first');
     this.broker.deleteHandle(githubUserTokenHandle(userId, accountId));
+    this.clearUserAuthorizationFailure(userId, accountId);
     const remaining = accounts.filter((account) => account.id !== accountId);
     this.saveUserAccounts(userId, remaining);
     const active = this.activeUserAccountId(userId) ?? remaining[0]!.id;
@@ -1263,37 +1339,150 @@ export class GitHubAppService {
     }));
   }
 
-  /** Resolve the signed-in person's refreshable GitHub authorization for
-   * user-attributed work (repository creation, pull requests, comments). This
-   * is intentionally distinct from installationToken(): GitHub records actions
-   * made with this token as the person, not as the organization App.
-   * `forceRefresh` recovers from early invalidation; a dead refresh grant is
-   * cleared so status flips to disconnected instead of 401ing forever. */
-  async userAccessToken(userId: string, opts: { forceRefresh?: boolean; accountId?: string } = {}): Promise<string> {
-    const accountId = opts.accountId ?? this.activeUserAccountId(userId);
-    const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
-    if (!this.broker.hasHandle(handle)) throw new Error('Connect GitHub on your profile, then try again.');
-    const stored = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as {
-      accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
-    };
-    if (!opts.forceRefresh && (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000)) return stored.accessToken;
-    if (!stored.refreshToken || (stored.refreshExpiresAt && stored.refreshExpiresAt <= Date.now())) {
-      this.broker.deleteHandle(handle);
-      throw new Error('Reconnect GitHub on your profile, then try again.');
+  private resolvedUserToken(handle: string): { raw: string; value: {
+    accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
+  } } | undefined {
+    if (!this.broker.hasHandle(handle)) return undefined;
+    const raw = this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+    return { raw, value: JSON.parse(raw) };
+  }
+
+  /** Delete only the credential whose refresh attempt failed. A different
+   * process may already have rotated the single-use chain and stored its new
+   * token while this request was in flight. */
+  private deleteUserTokenIfUnchanged(handle: string, observed: string): boolean {
+    const current = this.resolvedUserToken(handle);
+    if (!current || current.raw !== observed) return false;
+    this.broker.deleteHandle(handle);
+    return true;
+  }
+
+  private replacementUserToken(handle: string, observed: string): string | undefined {
+    const current = this.resolvedUserToken(handle);
+    return current && current.raw !== observed && current.value.accessToken
+      ? current.value.accessToken
+      : undefined;
+  }
+
+  private refreshFailureSummary(code: GitHubUserAuthorizationFailureCode, providerError?: string): string {
+    if (code === 'refresh_token_missing')
+      return 'The GitHub access token expired without a refresh token. Reconnect GitHub.';
+    if (code === 'refresh_token_expired')
+      return 'The GitHub refresh token reached its recorded expiry. Reconnect GitHub.';
+    if (code === 'refresh_request_failed')
+      return `GitHub token refresh could not complete${providerError ? ` (${providerError})` : ''}. The stored connection was preserved.`;
+    return `GitHub rejected the refresh token${providerError ? ` (${providerError})` : ''}. Reconnect GitHub.`;
+  }
+
+  private safeOauthError(value: unknown): string | undefined {
+    const candidate = typeof value === 'string' ? value.trim() : '';
+    return /^[a-z][a-z0-9_.-]{0,63}$/i.test(candidate) ? candidate : undefined;
+  }
+
+  private async refreshUserAccessToken(userId: string, accountId: string | undefined, handle: string,
+    forceRefresh: boolean): Promise<string> {
+    const resolved = this.resolvedUserToken(handle);
+    if (!resolved) throw new Error('Connect GitHub on your profile, then try again.');
+    const { raw: observed, value: stored } = resolved;
+    if (!forceRefresh && (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000)) return stored.accessToken;
+
+    const unusable = !stored.refreshToken
+      ? 'refresh_token_missing' as const
+      : stored.refreshExpiresAt && stored.refreshExpiresAt <= Date.now()
+        ? 'refresh_token_expired' as const
+        : undefined;
+    if (unusable) {
+      const replacement = this.replacementUserToken(handle, observed);
+      if (replacement) {
+        this.recordRefreshContentionRecovery(userId, accountId);
+        return replacement;
+      }
+      const deleted = this.deleteUserTokenIfUnchanged(handle, observed);
+      if (!deleted) {
+        const raced = this.replacementUserToken(handle, observed);
+        if (raced) {
+          this.recordRefreshContentionRecovery(userId, accountId);
+          return raced;
+        }
+      }
+      const failure = this.recordUserAuthorizationFailure(userId, accountId, {
+        code: unusable,
+        summary: this.refreshFailureSummary(unusable),
+        disconnected: deleted || !this.broker.hasHandle(handle),
+      });
+      throw new Error(`${failure.summary} [${failure.code}]`);
     }
+
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
     const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] });
-    const value = await this.oauthToken({ client_id: this.options.clientId, client_secret: clientSecret,
-      grant_type: 'refresh_token', refresh_token: stored.refreshToken });
+    let value: any;
+    try {
+      value = await this.oauthToken({ client_id: this.options.clientId, client_secret: clientSecret,
+        grant_type: 'refresh_token', refresh_token: stored.refreshToken! });
+    } catch (error) {
+      const status = error instanceof Error ? error.message.match(/GitHub OAuth failed \((\d{3})\)/)?.[1] : undefined;
+      const providerError = status ? `http_${status}` : 'request_failed';
+      const failure = this.recordUserAuthorizationFailure(userId, accountId, {
+        code: 'refresh_request_failed',
+        summary: this.refreshFailureSummary('refresh_request_failed', providerError),
+        disconnected: false,
+        providerError,
+      });
+      throw new Error(`${failure.summary} [${failure.code}]`);
+    }
     if (!value.access_token) {
-      // The refresh token itself is dead — GitHub returns an OAuth error body
-      // (HTTP 200) rather than a token. Clearing here forces a clean reconnect.
-      this.broker.deleteHandle(handle);
-      throw new Error('Reconnect GitHub on your profile, then try again.');
+      const providerError = this.safeOauthError(value.error);
+      const replacement = this.replacementUserToken(handle, observed);
+      if (replacement) {
+        this.recordRefreshContentionRecovery(userId, accountId, providerError);
+        return replacement;
+      }
+      const deleted = this.deleteUserTokenIfUnchanged(handle, observed);
+      if (!deleted) {
+        const raced = this.replacementUserToken(handle, observed);
+        if (raced) {
+          this.recordRefreshContentionRecovery(userId, accountId, providerError);
+          return raced;
+        }
+      }
+      const failure = this.recordUserAuthorizationFailure(userId, accountId, {
+        code: 'refresh_rejected',
+        summary: this.refreshFailureSummary('refresh_rejected', providerError),
+        disconnected: deleted || !this.broker.hasHandle(handle),
+        ...(providerError ? { providerError } : {}),
+      });
+      throw new Error(`${failure.summary} [${failure.code}]`);
     }
     this.saveTokenHandle(handle, value);
+    this.clearUserAuthorizationFailure(userId, accountId);
+    this.store.appendAudit({
+      principalId: `user:${userId}`,
+      action: 'github.user-authorization.refreshed',
+      scopeKey: `user:${userId}`,
+      detail: { ...(accountId ? { accountId } : {}) },
+    });
     return String(value.access_token);
+  }
+
+  /** Resolve the signed-in person's refreshable GitHub authorization for
+   * user-attributed work (repository creation, pull requests, comments). This
+   * is intentionally distinct from installationToken(): GitHub records actions
+   * made with this token as the person, not as the organization App. Concurrent
+   * callers share one refresh because GitHub refresh tokens are single-use. */
+  async userAccessToken(userId: string, opts: { forceRefresh?: boolean; accountId?: string } = {}): Promise<string> {
+    const accountId = opts.accountId ?? this.activeUserAccountId(userId);
+    const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
+    const resolved = this.resolvedUserToken(handle);
+    if (!resolved) throw new Error('Connect GitHub on your profile, then try again.');
+    if (!opts.forceRefresh && (!resolved.value.expiresAt || resolved.value.expiresAt > Date.now() + 60_000))
+      return resolved.value.accessToken;
+    const inFlight = this.userTokenRefreshes.get(handle);
+    if (inFlight) return inFlight;
+    const refresh = this.refreshUserAccessToken(userId, accountId, handle, opts.forceRefresh === true)
+      .finally(() => this.userTokenRefreshes.delete(handle));
+    this.userTokenRefreshes.set(handle, refresh);
+    return refresh;
   }
 
   /** A user-token GitHub request that self-heals a server-side invalidation: on a

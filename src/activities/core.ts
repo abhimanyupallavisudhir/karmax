@@ -714,7 +714,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // Connected development uses the SAME deployment App in two distinct
     // capacities: its installation owns repository transport, while this
     // per-user OAuth grant makes the PR attributable to the task creator.
-    if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).userAuthorized) {
+    const githubStatus = userId ? deps.githubApp?.status(userId) : undefined;
+    if (userId && repository?.gitConnectionId && githubStatus?.userAuthorized) {
       return new GithubPrApi(
         (options) => deps.githubApp!.userAccessToken(userId, { ...options, ...(accountId ? { accountId } : {}) }),
         deps.githubPr ?? {},
@@ -722,8 +723,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     const token = await githubTokenFor(handle, slug, repository);
     if (!token) {
-      if (userId && repository?.gitConnectionId && deps.githubApp?.status(userId).oauthConfigured) {
-        throw new Error(`GitHub PR identity is not connected for ${slug}. Connect GitHub on your profile so the pull request has a human author, then retry. Repository transport authorization is already separate; this is not a non-fast-forward or local ancestry error.`);
+      if (userId && repository?.gitConnectionId && githubStatus?.oauthConfigured) {
+        const failure = githubStatus.lastAuthorizationFailure;
+        const diagnostic = failure
+          ? ` Last recorded authorization failure: ${failure.summary} [${failure.code}, ${new Date(failure.occurredAt).toISOString()}]`
+          : '';
+        throw new Error(`GitHub PR identity is not connected for ${slug}. Connect GitHub on your profile so the pull request has a human author, then retry.${diagnostic} Repository transport authorization is already separate; this is not a non-fast-forward or local ancestry error.`);
       }
       throw new Error(`GitHub identity/authorization is missing for ${slug}. Grant the acting account access to this repository, then connect or re-authorize GitHub on your profile. This is not a branch-history conflict.`);
     }
