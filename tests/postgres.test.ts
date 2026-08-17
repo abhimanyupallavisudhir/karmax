@@ -102,4 +102,22 @@ integration('PostgreSQL cutover', () => {
     expect(fs.existsSync(sourceFile)).toBe(true);
     fs.rmSync(home, { recursive: true, force: true });
   });
+
+  it('disambiguates legacy organization names before PostgreSQL import', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-org-names-'));
+    const sourceFile = path.join(home, 'karmax.db');
+    const source = new Store(sourceFile);
+    const oldest = source.createOrganization({ name: 'Acme' });
+    source.db.exec('DROP INDEX idx_organizations_name_nocase');
+    source.db.prepare(`INSERT INTO organizations (id, name, slug, kind, createdAt)
+      VALUES ('org_duplicate', 'ACME', 'acme-2', 'team', ?)`).run(oldest.createdAt + 1);
+    source.close();
+
+    const opened = openStore(sourceFile, url!);
+    expect(opened.migration).toMatchObject({ imported: true });
+    expect(opened.store.getOrganization(oldest.id)?.name).toBe('Acme');
+    expect(opened.store.getOrganization('org_duplicate')?.name).toBe('acme-2');
+    opened.store.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
 });

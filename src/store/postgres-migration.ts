@@ -58,7 +58,11 @@ function dependencyOrder(tables: string[], target: SqlDatabase): string[] {
  * while a durable marker makes every later boot a constant-time no-op.
  */
 export function importSqliteDatabase(sourceFile: string, target: SqlDatabase, scope: string,
-  options: { sentinelTable: string; allowedSeedRows?: number } = { sentinelTable: 'tasks' }): SqliteImportResult {
+  options: {
+    sentinelTable: string;
+    allowedSeedRows?: number;
+    transformRows?: (table: string, rows: Record<string, unknown>[]) => Record<string, unknown>[];
+  } = { sentinelTable: 'tasks' }): SqliteImportResult {
   if (target.dialect !== 'postgres') throw new Error('SQLite import target must be PostgreSQL');
   target.exec(`CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
     key TEXT PRIMARY KEY, completed_at BIGINT NOT NULL, source TEXT NOT NULL,
@@ -100,7 +104,9 @@ export function importSqliteDatabase(sourceFile: string, target: SqlDatabase, sc
               .map((column) => [String(column.name), String(column.dataType)]));
             const columns = sourceColumns.filter((column) => targetColumns.has(column));
             if (!columns.length) continue;
-            const rows = source.prepare(`SELECT ${columns.map(quote).join(',')} FROM ${quote(table)}`).all() as any[];
+            const sourceRows = source.prepare(`SELECT ${columns.map(quote).join(',')} FROM ${quote(table)}`)
+              .all() as unknown as Record<string, unknown>[];
+            const rows = options.transformRows?.(table, sourceRows) ?? sourceRows;
             const placeholders = columns.map(() => '?').join(',');
             const insert = target.prepare(`INSERT INTO ${quote(table)} (${columns.map(quote).join(',')})
               VALUES (${placeholders}) ON CONFLICT DO NOTHING`);

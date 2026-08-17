@@ -318,6 +318,34 @@ describe('Store', () => {
     expect(store.createOrganization({ name: 'Alice', kind: 'personal', ownerUserId: 'alice' }).name).toBe('Alice');
   });
 
+  it('disambiguates organization names that predate the unique-name index', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-org-name-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    try {
+      const legacy = new Store(dbPath);
+      const oldest = legacy.createOrganization({ name: 'Acme' });
+      legacy.db.exec('DROP INDEX idx_organizations_name_nocase');
+      legacy.db.prepare(`INSERT INTO organizations (id, name, slug, kind, createdAt)
+        VALUES ('org_duplicate', 'ACME', 'acme-2', 'team', ?)`).run(oldest.createdAt + 1);
+      const project = legacy.createProject('Legacy project', {}, 'org_duplicate');
+      legacy.close();
+
+      const migrated = new Store(dbPath);
+      expect(migrated.getOrganization(oldest.id)?.name).toBe('Acme');
+      expect(migrated.getOrganization('org_duplicate')?.name).toBe('acme-2');
+      expect(migrated.getProject(project.id)?.organizationId).toBe('org_duplicate');
+      expect(migrated.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_organizations_name_nocase'").get())
+        .toBeTruthy();
+      migrated.close();
+
+      const reopened = new Store(dbPath);
+      expect(reopened.getOrganization('org_duplicate')?.name).toBe('acme-2');
+      reopened.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('creates and lists tasks in order', () => {
     const p = store.createProject('Acme');
     const t1 = store.createTask({

@@ -43,6 +43,25 @@ describe('organization and collaboration domain', () => {
     expect(store.getOrganization('org_personal')?.name).toBe("Alice's workspace");
   });
 
+  it('migrates legacy user-organization name collisions without changing organization identity', () => {
+    const store = new Store(':memory:');
+    const user = { id: 'alice', name: 'alice@example.com' };
+    const organization = store.createOrganization({ name: user.name, ownerUserId: user.id });
+    const project = store.createProject('Legacy project', {}, organization.id);
+    store.connectUserNames(() => [user]);
+
+    expect(store.migrateLegacyAccountNameCollisions([user])).toBe(1);
+    expect(store.getOrganization(organization.id)).toMatchObject({
+      id: organization.id, name: 'alice-example-com', slug: 'alice-example-com',
+    });
+    expect(store.organizationMembership(organization.id, user.id)?.role).toBe('owner');
+    expect(store.getProject(project.id)?.organizationId).toBe(organization.id);
+    expect(store.claimPersonalOrganization(user.id, user.name)).toMatchObject({
+      id: 'org_personal', name: user.name,
+    });
+    expect(store.migrateLegacyAccountNameCollisions([user])).toBe(0);
+  });
+
   it('keeps a per-user default organization initialized to the owned personal workspace', () => {
     const store = new Store(':memory:');
     const personal = store.createOrganization({ name: "Alice's workspace", kind: 'personal', ownerUserId: 'alice' });

@@ -318,8 +318,6 @@ export class Store {
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
         kind TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free', createdAt INTEGER NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_name_nocase
-        ON organizations(name COLLATE NOCASE);
       CREATE TABLE IF NOT EXISTS organization_memberships (
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (organizationId, userId)
@@ -721,6 +719,29 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_subscription_billing_requests_org
         ON subscription_billing_requests(organizationId, createdAt);
     `);
+    // Organization names became a shared, case-insensitive account namespace
+    // after organizations had already shipped. Old builds allowed duplicates,
+    // so creating the index in the schema batch made those installs fail before
+    // any compatibility migration could run. Preserve the oldest label and give
+    // each later collision its already-unique slug; ids and every foreign-key-like
+    // reference remain unchanged. Do the repair and index creation atomically so
+    // a failed migration never leaves a partially renamed install.
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_organizations_name_nocase'").get()) {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const organizations = this.db.prepare(`SELECT id, name, slug, createdAt FROM organizations
+          ORDER BY createdAt, id`).all() as LegacyOrganizationNameRow[];
+        const rename = this.db.prepare('UPDATE organizations SET name=? WHERE id=?');
+        const originalNames = new Map(organizations.map((organization) => [organization.id, organization.name]));
+        for (const organization of disambiguateLegacyOrganizationNames(organizations))
+          if (organization.name !== originalNames.get(organization.id)) rename.run(organization.name, organization.id);
+        this.db.exec(`CREATE UNIQUE INDEX idx_organizations_name_nocase
+          ON organizations(name COLLATE NOCASE); COMMIT`);
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    }
     // Free-form human notes, added after the initial schema. Guarded so existing
     // installs pick it up without a re-create.
     const cols = this.db.prepare('PRAGMA table_info(tasks)').all() as any[];
@@ -1271,6 +1292,58 @@ export class Store {
         try { listener(organizationId); } catch { /* a periodic reconciler retries */ }
       }
     });
+  }
+
+  /**
+   * One-time bridge for installations that created users and organizations
+   * before they shared an account-name namespace. A user's registered name wins;
+   * a colliding organization keeps its identity and stable slug but adopts that
+   * slug as its display name. The one valid overlap is a user's own personal
+   * organization. Later writes go through the connected cross-store guards, so
+   * this migration is deliberately marked complete instead of silently repairing
+   * new corruption on every boot.
+   */
+  migrateLegacyAccountNameCollisions(users: Array<{ id: string; name: string }>): number {
+    const marker = 'migration:account-name-namespace-v1';
+    if (this.db.prepare('SELECT 1 FROM kv WHERE k=?').get(marker)) return 0;
+    let changed = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const usersByName = new Map<string, string>();
+      for (const user of users) {
+        const key = canonicalAccountName(user.name);
+        const existing = usersByName.get(key);
+        if (existing && existing !== user.id)
+          throw new Error(`user name "${user.name.trim()}" is already used by another user`);
+        usersByName.set(key, user.id);
+      }
+      const organizations = this.listOrganizations();
+      const occupied = new Set([
+        ...usersByName.keys(),
+        ...organizations.map((organization) => canonicalAccountName(organization.name)),
+      ]);
+      for (const organization of organizations) {
+        const userId = usersByName.get(canonicalAccountName(organization.name));
+        if (!userId) continue;
+        const isOwnersPersonalName = organization.kind === 'personal'
+          && this.organizationMembership(organization.id, userId)?.role === 'owner';
+        if (isOwnersPersonalName) continue;
+        const base = organization.slug.trim() || 'organization';
+        let candidate = base;
+        for (let suffix = 2; occupied.has(canonicalAccountName(candidate)); suffix++)
+          candidate = `${base}-${suffix}`;
+        this.db.prepare('UPDATE organizations SET name=? WHERE id=?').run(candidate, organization.id);
+        occupied.add(canonicalAccountName(candidate));
+        changed++;
+      }
+      this.validateAccountNameNamespace(users);
+      this.db.prepare('INSERT INTO kv (k, v) VALUES (?, ?)').run(marker, String(Date.now()));
+      this.db.exec('COMMIT');
+      return changed;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   private assertOrganizationNameAvailable(name: string, options: {
@@ -5655,13 +5728,52 @@ export function openStore(sqliteFile: string, databaseUrl?: string,
   if (!databaseUrl) return { store: new Store(sqliteFile, options) };
   const store = new Store(databaseUrl, options);
   try {
-    const migration = importSqliteDatabase(sqliteFile, store.db, 'store', { sentinelTable: 'tasks' });
+    const migration = importSqliteDatabase(sqliteFile, store.db, 'store', {
+      sentinelTable: 'tasks',
+      transformRows: (table, rows) => table === 'organizations'
+        ? disambiguateLegacyOrganizationNames(rows as LegacyOrganizationNameRow[])
+        : rows,
+    });
     if (migration.imported) store.finishLegacyImport();
     return { store, migration };
   } catch (error) {
     store.close();
     throw error;
   }
+}
+
+interface LegacyOrganizationNameRow extends Record<string, unknown> {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt: number;
+}
+
+/** Normalize legacy duplicate labels before a unique index or import can reject
+ * them. Returning copies keeps the read-only SQLite cutover source untouched. */
+function disambiguateLegacyOrganizationNames<T extends LegacyOrganizationNameRow>(organizations: T[]): T[] {
+  const ordered = [...organizations].sort((left, right) => Number(left.createdAt) - Number(right.createdAt)
+    || left.id.localeCompare(right.id));
+  const occupied = new Set(ordered.map((organization) => canonicalAccountName(organization.name)));
+  const preserved = new Set<string>();
+  const renamed = new Map<string, string>();
+  for (const organization of ordered) {
+    const key = canonicalAccountName(organization.name);
+    if (!preserved.has(key)) {
+      preserved.add(key);
+      continue;
+    }
+    const base = organization.slug.trim() || 'organization';
+    let candidate = base;
+    for (let suffix = 2; occupied.has(canonicalAccountName(candidate)); suffix++)
+      candidate = `${base}-${suffix}`;
+    renamed.set(organization.id, candidate);
+    occupied.add(canonicalAccountName(candidate));
+    preserved.add(canonicalAccountName(candidate));
+  }
+  return organizations.map((organization) => renamed.has(organization.id)
+    ? { ...organization, name: renamed.get(organization.id)! }
+    : organization);
 }
 
 function cardRow(r: any) {

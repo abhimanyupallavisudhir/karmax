@@ -205,6 +205,7 @@ async function main() {
     console.log(`  • Imported ${identity.migration.rows} identity rows from SQLite`);
   identity.connectOrganizationNames(() => store.organizationNameReservations());
   store.connectUserNames(() => identity.listUsers());
+  store.migrateLegacyAccountNameCollisions(identity.listUsers());
   const installationOwner = identity.listUsers()[0];
   if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
   store.migratePersonalOrganizationNames(identity.listUsers());
