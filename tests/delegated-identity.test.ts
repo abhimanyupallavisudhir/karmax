@@ -86,6 +86,26 @@ describe('delegated human identity authority', () => {
       parentTokenId: bobParent.record.id, delegationId: aliceChild.id })).toThrow(/does not descend/i);
   });
 
+  it('widens only an interactive human after durable authorization has been verified', () => {
+    const human = tokens.mintPrincipal('user:alice', ['task:create'], 'p1', 60_000, 'o1');
+    expect(() => tokens.delegateHuman(human.token, {
+      taskId: 'admin-task', organizationId: 'o1',
+    })).toThrow(/scoped to project p1/i);
+
+    const delegation = tokens.delegateAuthorizedInteractiveHuman(human.token, {
+      taskId: 'admin-task', organizationId: 'o1',
+    })!;
+    const agent = tokens.mint({
+      taskId: 'admin-task', profileId: 'do', role: 'do', principal: 'user:alice', organizationId: 'o1',
+      ceiling: ['task:read'], grantorCaps: ['task:read'], delegationId: delegation.id,
+    });
+    expect(agent.record.humanSubject).toMatchObject({ userId: 'alice', presence: 'delegated' });
+
+    expect(() => tokens.delegateAuthorizedInteractiveHuman(agent.token, {
+      taskId: 'forged-child', organizationId: 'o1',
+    })).toThrow(/requires an interactive human/i);
+  });
+
   it('attenuates derived tokens and invalidates them with parent revocation or delegation expiry', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
