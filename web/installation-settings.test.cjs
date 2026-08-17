@@ -23,8 +23,14 @@ const project = slice('function settingsView(proj)', 'function cloudEnvironmentC
 
 for (const marker of [
   'installation-appearance', 'installation-capacity', 'installation-github',
-  'installation-stripe', 'installation-email', 'installation-access', 'installation-recovery',
+  'installation-paid-launch', 'installation-stripe', 'installation-email', 'installation-access', 'installation-recovery',
 ]) ok(installation.includes(`id="${marker}"`), `Installation includes #${marker}`);
+
+ok(src.includes("api('/api/settings/paid-launch')"), 'Paid launch loads persisted installation configuration');
+ok(src.includes("method: 'PUT'"), 'Paid launch saves configuration through the installation API');
+ok(src.includes('No paid-launch environment variables are required'), 'Paid launch explains that environment variables are unnecessary');
+ok(src.includes('Real-world founder checklist'), 'Paid launch includes the founder checklist');
+ok(src.includes('SaaS subscription billing, separate from Stripe Connect'), 'Paid launch distinguishes subscriptions from agent cards');
 
 for (const marker of ['appearance-card', 'resilience-card', 'outbound-email-card', 'phone-access-card'])
   ok(!organization.includes(`id="${marker}"`), `Organization omits #${marker}`);

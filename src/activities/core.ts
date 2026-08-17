@@ -972,7 +972,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
       const remote = isRemote(args.kind);
-      if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote)
+      if (store.hosted && !remote)
         throw new Error(`hosted deployments cannot run task code in the control plane (${args.kind}); select a remote runner`);
       record(args.taskId, 'world.provisioning', { provider: args.kind });
       const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
@@ -1261,6 +1261,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       accountCredentialKind?: 'login' | 'ambient' | 'key';
       accountCredentialProvider?: string;
     }): Promise<boolean> {
+      // Hosted plans cap every active agent run, including subscription CLIs
+      // executing inside a remote world. The coordinator activity resolves this
+      // request to an organization-scoped entitlement queue; private installs
+      // retain the host-resource-only behavior below.
+      if (store.hosted) return true;
       if (!isRemote(args.worldHandle.kind)) return true;
       if (args.accountCredentialKind === 'key') return true;
       if (args.accountCredentialKind === 'login' || args.accountCredentialKind === 'ambient') return false;
@@ -1584,11 +1589,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
       }
+      const installationModelProvider = canonicalModelProvider(credentialProvider(profile));
+      const usagePolicy = store.getOrganizationUsagePolicy(organizationId);
+      const managedInstallationRail = store.hosted
+        && !!usagePolicy.managedSpendCapMicros
+        && usagePolicy.managedModelProviders.includes(installationModelProvider)
+        && !!managedModelCostCeiling(installationModelProvider, profile.model)
+        && ((profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+          || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+          || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(installationModelProvider)]));
       if (
         organizationId !== 'org_personal'
         && profile.provider !== 'mock'
         && !args.accountConfigHome
         && !args.accountApiKeyHandle
+        && !managedInstallationRail
       ) {
         throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
@@ -1889,6 +1904,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
       let result;
+      let usageAdmissionId: string | undefined;
+      let usageAdmissionFinished = false;
+      const fundingSource: 'managed' | 'byok' | 'customer' = store.hosted
+        ? ((args.accountApiKeyHandle || args.accountConfigHome || args.accountCredentialKind === 'login') ? 'byok' : 'managed')
+        : 'customer';
+      const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
+      const managedReservationMicros = fundingSource === 'managed'
+        ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
       try {
         const signalTurnState = async (
           state: 'running' | 'waiting-host',
@@ -1917,6 +1940,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           lastPressureDetail = detail;
           await signalTurnState('waiting-host', detail);
         };
+        // Trusted model admission: this runs inside the activity, immediately
+        // before any provider process/API request. The stable turn id makes the
+        // reservation retry-safe and binds every request to its org/project/task.
+        if (profile.provider !== 'mock') {
+          usageAdmissionId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}:${activityAttempt}`;
+          store.admitAgentUsage({ id: usageAdmissionId, organizationId, projectId: args.task.projectId,
+            taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
+            reservedCostMicros: managedReservationMicros });
+          // Record the admitted request immediately, before the provider call. Its
+          // stable id makes retries/duplicate delivery a no-op. The hard-cap debit
+          // remains only on the active admission row; it is not incurred cost.
+          store.recordUsage({ id: `usage:request:${usageAdmissionId}`, organizationId,
+            projectId: args.task.projectId, taskId: args.taskId, worldId: args.worldHandle.id,
+            provider: modelProvider, kind: 'agent.request', quantity: 1, unit: 'request',
+            costMicros: 0, fundingSource, costClassification: 'none', startedAt: Date.now(), endedAt: Date.now(),
+            metadata: { role: args.role, model: profile.model, costBasis: 'request-count-only' } });
+        }
         // Remote subscription CLIs consume provider-world CPU/RAM, not host
         // capacity. API rails and local subprocesses retain the host admission
         // queue; account-level concurrency is enforced separately for every rail.
@@ -2145,6 +2185,34 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
         }
+        if (usageAdmissionId) {
+          const usage = result.usage;
+          const completedUsageEvents: any[] = [];
+          if (usage) {
+            const quantity = usage.totalTokens ?? usage.inputTokens + usage.outputTokens;
+            completedUsageEvents.push({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource, costClassification: 'none',
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+                cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
+          }
+          if (fundingSource === 'managed') {
+            const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
+            completedUsageEvents.push({ id: `usage:cost:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
+              taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
+              kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
+              fundingSource, costClassification: actualized.classification,
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+                ...actualized.metadata } });
+          }
+          // Completion and incurred/estimated cost actualization commit together:
+          // no concurrent admission can observe the reservation released before
+          // its durable replacement exists, and a duplicate retry sees completed.
+          store.finishUsageAdmission(usageAdmissionId, true, Date.now(), completedUsageEvents);
+          usageAdmissionFinished = true;
+        }
         if (result.output?.trim() && finalActivity) {
           result.finalActivity = finalActivity;
         }
@@ -2167,6 +2235,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         throw classifyTurnError(err, profile.provider);
       } finally {
+        if (usageAdmissionId && !usageAdmissionFinished) store.finishUsageAdmission(usageAdmissionId, false);
         await releaseSlot();
         releaseConfirm();
         publishLegacyAgentState(undefined);
@@ -4433,6 +4502,70 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return newId('task');
     },
   };
+}
+
+/** Installation-side authorization boundary for platform-funded model calls.
+ * Values are worst-case micro-dollar debits per admitted request, keyed by
+ * `provider/model`, `provider/*`, or `provider`. Invalid/absent configuration
+ * fails managed admission closed and never affects BYOK. */
+function managedModelCostCeiling(provider: string, model?: string): number | undefined {
+  const raw = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
+  if (!raw) return undefined;
+  let values: Record<string, unknown>;
+  try { values = JSON.parse(raw) as Record<string, unknown>; } catch { return undefined; }
+  const value = values[`${provider}/${model ?? '*'}`] ?? values[`${provider}/*`] ?? values[provider];
+  const amount = Number(value);
+  return Number.isSafeInteger(amount) && amount > 0 ? amount : undefined;
+}
+
+type PriceableUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  inputTokensIncludeCacheRead?: boolean;
+} | undefined;
+
+/** Actualize an active managed reservation from provider token counters. If the
+ * installation has no complete price for the counters returned, retain the
+ * admission ceiling as an explicitly estimated charge so completed requests
+ * can never bypass the monthly hard cap. */
+function managedModelActualCost(provider: string, model: string | undefined, usage: PriceableUsage,
+  reservationMicros: number): { costMicros: number; classification: 'incurred' | 'estimated'; metadata: Record<string, unknown> } {
+  const raw = process.env.KARMAX_MANAGED_MODEL_PRICING;
+  let values: Record<string, unknown> = {};
+  try { values = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch { /* estimate below */ }
+  const keys = [`${provider}/${model ?? '*'}`, `${provider}/*`, provider];
+  const pricingKey = keys.find((key) => values[key] && typeof values[key] === 'object');
+  const pricing = pricingKey ? values[pricingKey] as Record<string, unknown> : undefined;
+  if (usage && pricing) {
+    const cacheReadTokens = Math.max(0, Number(usage.cacheReadTokens ?? 0));
+    const cacheWriteTokens = Math.max(0, Number(usage.cacheWriteTokens ?? 0));
+    const inputTokens = Math.max(0, Number(usage.inputTokens ?? 0));
+    const outputTokens = Math.max(0, Number(usage.outputTokens ?? 0));
+    const uncachedInputTokens = usage.inputTokensIncludeCacheRead
+      ? Math.max(0, inputTokens - cacheReadTokens) : inputTokens;
+    const rate = (name: string, tokens: number): number | undefined => {
+      if (!tokens) return 0;
+      const value = Number(pricing[name]);
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    };
+    const inputRate = rate('inputMicrosPerMillionTokens', uncachedInputTokens);
+    const outputRate = rate('outputMicrosPerMillionTokens', outputTokens);
+    const cacheReadRate = rate('cacheReadMicrosPerMillionTokens', cacheReadTokens);
+    const cacheWriteRate = rate('cacheWriteMicrosPerMillionTokens', cacheWriteTokens);
+    if ([inputRate, outputRate, cacheReadRate, cacheWriteRate].every((value) => value != null)) {
+      const costMicros = Math.ceil((uncachedInputTokens * inputRate! + outputTokens * outputRate!
+        + cacheReadTokens * cacheReadRate! + cacheWriteTokens * cacheWriteRate!) / 1_000_000);
+      if (Number.isSafeInteger(costMicros)) return { costMicros, classification: 'incurred', metadata: {
+        costBasis: 'configured-provider-token-pricing', pricingKey, uncachedInputTokens, outputTokens,
+        cacheReadTokens, cacheWriteTokens,
+      } };
+    }
+  }
+  return { costMicros: reservationMicros, classification: 'estimated', metadata: {
+    costBasis: 'admission-ceiling-estimate', estimateReason: usage ? 'incomplete-model-pricing' : 'provider-usage-unavailable',
+  } };
 }
 
 export type coreActivities = ReturnType<typeof makeCoreActivities>;

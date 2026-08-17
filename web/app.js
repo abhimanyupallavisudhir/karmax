@@ -107,6 +107,8 @@ const S = {
   inviteNotice: null,
   installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
   installationInfo: null,
+  onboarding: null, // hosted-only, server-derived setup progress for the selected organization
+  launch: null,
 };
 
 // ── immediate action feedback ───────────────────────────────────────────────
@@ -498,6 +500,8 @@ async function applyRoute() {
       if (organizationChanged) {
         S.organizationId = org.id;
         S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        renderOnboarding();
+        refreshOnboarding();
         renderRouteLoadingPage(org.name, 'Switching organization…');
       }
       syncOrganizationSwitcher();
@@ -566,6 +570,8 @@ async function applyRoute() {
   S.organizationId = proj.organizationId || S.organizationId;
   syncOrganizationSwitcher();
   if (S.organizationId !== previousOrganizationId) {
+    renderOnboarding();
+    refreshOnboarding();
     await loadCollaboration().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -1873,6 +1879,11 @@ async function api(path, opts = {}) {
     if (body && typeof body === 'object') Object.assign(error, body);
     throw error;
   }
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET' && S.meta?.hosted && (
+    /^\/api\/organizations\/[^/]+\/(?:accounts|world-providers|git-connections|github|projects)(?:[/?]|$)/.test(path)
+    || /^\/api\/(?:vault|cards)(?:[/?]|$)/.test(path)
+  )) queueMicrotask(() => refreshOnboarding());
   return body;
 }
 
@@ -2434,6 +2445,11 @@ function watchConsoleRevision() {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  S.launch = S.launch || await (await feedbackFetch('/api/launch')).json();
+  const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
+  if (legalSlug) return renderLegalPage(legalSlug);
+  if (location.pathname === '/legal') return renderLegalIndex();
+  if (location.pathname === '/pricing') return renderPricing();
   // The emailed password-reset link lands here unauthenticated; handle it before
   // any session/setup gating so a signed-out user can actually reset.
   if (location.pathname === '/reset-password') {
@@ -2462,6 +2478,7 @@ async function boot() {
   S.google = session.google || false;
   S.github = session.github || false;
   if (session.setupRequired) return renderSetup();
+  if (session.policyAcceptanceRequired) return renderPolicyCompletion();
   // An invite link opened while signed out: keep the token in the URL (boot
   // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
   // card that a pending invitation is waiting, so a brand-new invitee knows to
@@ -2533,6 +2550,7 @@ async function boot() {
     S.catalogOrganizationId = S.organizationId;
     if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
+  await refreshOnboarding();
   connectWs();
   renderShell();
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
@@ -3121,6 +3139,94 @@ function brandMark() {
   return `<img class="mark" src="/brand/icon-192.png${brandVersion ? `?v=${brandVersion}` : ''}" alt="" />`;
 }
 
+async function refreshOnboarding() {
+  const organizationId = S.organizationId;
+  if (!S.meta?.hosted || !organizationId || !S.user) {
+    S.onboarding = null;
+    renderOnboarding();
+    return;
+  }
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
+  try {
+    const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
+    S.onboarding = status;
+  } catch {
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
+    S.onboarding = null;
+  }
+  renderOnboarding();
+}
+
+async function setOnboardingDisplay(display) {
+  if (!S.organizationId) return;
+  try {
+    S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
+      method: 'PUT', body: JSON.stringify({ display }),
+    });
+    renderOnboarding();
+  } catch (error) { toast(error.message, true); }
+}
+
+function onboardingStep(number, key, title, detail, action) {
+  const step = S.onboarding?.steps?.[key] || {};
+  return `<li class="onboarding-step ${step.complete ? 'complete' : ''}">
+    <span class="onboarding-check" aria-hidden="true">${step.complete ? '✓' : number}</span>
+    <div class="onboarding-step-copy"><div class="onboarding-step-title">${esc(title)}${key === 'optional' ? '<span class="onboarding-optional">Optional</span>' : ''}</div>
+      <p>${detail}</p>${action}</div>
+  </li>`;
+}
+
+function pollOnboarding() {
+  clearTimeout(S.onboardingTimer);
+  S.onboardingTimer = setTimeout(() => {
+    if (document.hidden) return pollOnboarding();
+    refreshOnboarding();
+  }, 4_000);
+}
+
+function renderOnboarding() {
+  const host = $('#hosted-onboarding');
+  if (!host) return;
+  const state = S.onboarding;
+  if (!state?.visible || state.organizationId !== S.organizationId) {
+    clearTimeout(S.onboardingTimer);
+    S.onboardingTimer = null;
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+  host.hidden = false;
+  pollOnboarding();
+  if (state.display === 'minimized') {
+    host.innerHTML = `<button class="onboarding-minimized" id="onboarding-expand" type="button" aria-label="Open setup guide">
+      <span class="onboarding-minimized-mark" aria-hidden="true">✓</span>
+      <span><b>Finish setup</b><small>${state.completedRequired} of ${state.totalRequired} required steps</small></span>
+    </button>`;
+    $('#onboarding-expand')?.addEventListener('click', () => setOnboardingDisplay('expanded'));
+    return;
+  }
+  const settings = globalRoute('organization');
+  const optional = state.steps.optional || {};
+  host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
+    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get krmax ready</h2></div>
+      <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
+    <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
+    <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
+    <ol class="onboarding-list">
+      ${onboardingStep(1, 'github', 'Connect GitHub', 'Import repositories and let krmax work through reviewed pull requests.', `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
+      ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Add an E2B API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-compute">${state.steps.e2b.complete ? 'Manage E2B' : 'Set up E2B'}</a>`)}
+      ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
+      ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
+    </ol>
+    <div class="onboarding-foot"><span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+  </section>`;
+  $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
+  $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
+  $('#onboarding-new-project')?.addEventListener('click', newProject);
+}
+
 /** Re-point the favicon and every on-screen mark so a switch shows up at once,
  * without a reload — the URLs are unchanged, so only the cache needs busting. */
 function refreshBrandAssets() {
@@ -3156,7 +3262,8 @@ function renderShell() {
       <div class="rail" id="rail"></div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
-    </div>`;
+    </div>
+    <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
   // Project-scoped query/filtering lives in the task list. The topbar finder is
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
@@ -3184,6 +3291,7 @@ function renderShell() {
     const route = organizationLandingRoute(e.target.value);
     return route ? go(route) : syncOrganizationSwitcher();
   });
+  renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }
@@ -11081,7 +11189,7 @@ async function hydrateExecutionProviders(proj) {
     <div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
     <button class="btn sm primary" id="project-execution-save">Save</button>`;
     const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
-    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Organization BYOK default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
     $('#project-execution-network')?.addEventListener('change', (event) => {
       $('#project-network-restrictions').open = event.target.value === 'restricted';
     });
@@ -11579,6 +11687,107 @@ async function wireStripePlatformCard() {
       toast('Stripe platform setup saved');
       await wireStripePlatformCard();
     } catch (error) { toast(error.message, true); }
+  });
+}
+
+function paidLaunchCard() {
+  return '<div class="card" id="paid-launch-card"><div class="task-sub">Loading paid-launch setup…</div></div>';
+}
+
+async function wirePaidLaunchCard() {
+  const box = $('#paid-launch-card');
+  if (!box) return;
+  let state;
+  try { state = await api('/api/settings/paid-launch'); }
+  catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
+  const contacts = state.contacts || {};
+  const stripe = state.stripe || {};
+  const completed = new Set(state.completedTasks || []);
+  const groups = [...new Set((state.tasks || []).map((task) => task.group))];
+  const readiness = state.paidLaunch
+    ? '<span class="chip" style="color:var(--ok,#4ec9a3)">paid checkout live</span>'
+    : state.canEnable ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready to enable</span>'
+      : '<span class="chip">setup incomplete</span>';
+  const missing = [...(state.missing || []), ...(stripe.missing || [])];
+  const taskMarkup = groups.map((group) => `<div class="section-h" style="margin-top:18px">${esc(group)}</div>${(state.tasks || [])
+    .filter((task) => task.group === group).map((task) => `<label class="card" style="display:flex;gap:10px;padding:12px;margin:8px 0;cursor:pointer">
+      <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
+      <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
+  box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
+    <p class="task-sub">This is the control center for selling krmax.io subscriptions. Values are saved with the installation; Stripe secrets are encrypted in the krmax vault and are never returned to the browser. No paid-launch environment variables are required.</p>
+    ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
+
+    <div class="section-h" style="margin-top:18px">Stripe Billing</div>
+    <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. krmax uses hosted Stripe Checkout, so it does not need a publishable key.</p>
+    <ol class="task-sub"><li>Create the live recurring products/prices described in the founder checklist below.</li><li>Create a webhook endpoint at <span class="mono">${esc(stripe.webhookUrl || '')}</span> and subscribe to customer.subscription and invoice lifecycle events.</li><li>Paste the live secret key, webhook signing secret, and IDs here. Blank secret fields keep the encrypted values already saved.</li><li>Configure and test the Stripe customer portal, then exercise the full lifecycle in test mode before enabling checkout.</li></ol>
+    <div class="settings-grid">
+      <label class="form-row">Stripe secret key<input class="paid-stripe-secret" type="password" autocomplete="new-password" placeholder="${stripe.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_live_…'}" /></label>
+      <label class="form-row">Webhook signing secret<input class="paid-stripe-webhook" type="password" autocomplete="new-password" placeholder="${stripe.webhookSecretConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
+      <label class="form-row">Individual $9 price ID<input class="paid-stripe-individual-price" value="${esc(stripe.individualPriceId || '')}" placeholder="price_…" /></label>
+      <label class="form-row">Team $19 base price ID<input class="paid-stripe-team-base-price" value="${esc(stripe.teamBasePriceId || '')}" placeholder="price_…" /></label>
+      <label class="form-row">Team $5 extra-user price ID<input class="paid-stripe-team-seat-price" value="${esc(stripe.teamSeatPriceId || '')}" placeholder="price_…" /></label>
+      <label class="form-row">Individual product ID (optional)<input class="paid-stripe-individual-product" value="${esc(stripe.individualProductId || '')}" placeholder="prod_…" /></label>
+      <label class="form-row">Team product ID (optional)<input class="paid-stripe-team-product" value="${esc(stripe.teamProductId || '')}" placeholder="prod_…" /></label>
+      <label class="form-row">Webhook destination<input value="${esc(stripe.webhookUrl || '')}" readonly /></label>
+    </div>
+
+    <div class="section-h" style="margin-top:18px">Legal operator and public contacts</div>
+    <p class="task-sub">Use the contracting entity’s exact details. These values populate public policies and support/deletion flows. Ask qualified counsel to review the supplied policy drafts for the business, jurisdiction, data flows, and customers.</p>
+    <div class="settings-grid">
+      <label class="form-row">Legal entity name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" /></label>
+      <label class="form-row">Country of establishment<input class="paid-operator-country" value="${esc(state.operatorCountry || '')}" /></label>
+      <label class="form-row">Governing law and courts<input class="paid-governing-law" value="${esc(state.governingLaw || '')}" placeholder="e.g. laws of …; courts of …" /></label>
+      <label class="form-row">Legal notice address<textarea class="paid-legal-address" rows="3">${esc(state.legalNoticeAddress || '')}</textarea></label>
+      <label class="form-row">Legal email<input class="paid-email-legal" type="email" value="${esc(contacts.legal || '')}" /></label>
+      <label class="form-row">Privacy email<input class="paid-email-privacy" type="email" value="${esc(contacts.privacy || '')}" /></label>
+      <label class="form-row">Security email<input class="paid-email-security" type="email" value="${esc(contacts.security || '')}" /></label>
+      <label class="form-row">Incident email<input class="paid-email-incident" type="email" value="${esc(contacts.incident || '')}" /></label>
+      <label class="form-row">DPA email<input class="paid-email-dpa" type="email" value="${esc(contacts.dpa || '')}" /></label>
+      <label class="form-row">Billing email<input class="paid-email-billing" type="email" value="${esc(contacts.billing || '')}" /></label>
+    </div>
+    <label class="card" style="display:flex;gap:10px;padding:12px;margin-top:14px"><input type="checkbox" class="paid-founder-reviewed" ${state.founderReviewed ? 'checked' : ''} /><span><b>I reviewed and approved policy version ${esc(state.policyVersion)}</b><span class="task-sub" style="display:block">This records founder approval; it is not a substitute for legal advice.</span></span></label>
+
+    <div class="section-h" style="margin-top:22px">Real-world founder checklist</div>
+    <p class="task-sub">These items happen outside krmax. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that krmax verified the work.</p>
+    ${taskMarkup}
+
+    <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
+      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Only turn this on after the legal and Stripe configuration is complete. Disabling it immediately closes new paid checkout without deleting subscriptions or settings.</span></span></label>
+    </div>
+    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
+    ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
+  box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
+    try {
+      await api('/api/settings/paid-launch', { method: 'PUT', body: JSON.stringify({
+        paidLaunch: box.querySelector('.paid-launch-enabled').checked,
+        founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
+        operatorName: box.querySelector('.paid-operator-name').value,
+        operatorCountry: box.querySelector('.paid-operator-country').value,
+        governingLaw: box.querySelector('.paid-governing-law').value,
+        legalNoticeAddress: box.querySelector('.paid-legal-address').value,
+        contacts: {
+          legal: box.querySelector('.paid-email-legal').value,
+          privacy: box.querySelector('.paid-email-privacy').value,
+          security: box.querySelector('.paid-email-security').value,
+          incident: box.querySelector('.paid-email-incident').value,
+          dpa: box.querySelector('.paid-email-dpa').value,
+          billing: box.querySelector('.paid-email-billing').value,
+        },
+        stripe: {
+          secretKey: box.querySelector('.paid-stripe-secret').value || undefined,
+          webhookSecret: box.querySelector('.paid-stripe-webhook').value || undefined,
+          individualPriceId: box.querySelector('.paid-stripe-individual-price').value,
+          teamBasePriceId: box.querySelector('.paid-stripe-team-base-price').value,
+          teamSeatPriceId: box.querySelector('.paid-stripe-team-seat-price').value,
+          individualProductId: box.querySelector('.paid-stripe-individual-product').value,
+          teamProductId: box.querySelector('.paid-stripe-team-product').value,
+        },
+        completedTasks: [...box.querySelectorAll('.paid-launch-task:checked')].map((input) => input.value),
+      }) });
+      toast('Paid-launch setup saved');
+      S.launch = await api('/api/launch');
+      await wirePaidLaunchCard();
+    } catch (error) { toast(error.message, true); await wirePaidLaunchCard(); }
   });
 }
 // ── card fields ──────────────────────────────────────────────────────────────
@@ -13484,6 +13693,12 @@ function profileView() {
       </div>
       <button class="btn" id="export-user-data" type="button">Export your data</button>
     </div>
+    <div class="card" id="data-account">
+      <div class="section-h">Data &amp; account</div>
+      <p class="task-sub">Request account deletion online. We’ll verify ownership and any organization or resource transfer, then confirm what will be removed or retained and why.</p>
+      <p class="data-export-note">Cancel an active subscription first. Urgent compromise: ${S.launch?.contacts?.incident ? `<a href="mailto:${esc(S.launch.contacts.incident)}">${esc(S.launch.contacts.incident)}</a>` : '<a href="/legal/security">security contact</a>'}.</p>
+      <button class="btn danger" id="request-account-deletion" type="button">Request account deletion</button>
+    </div>
     <div class="card">
       <div class="section-h">Session</div>
       <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
@@ -13582,6 +13797,13 @@ function wireProfileView() {
   }));
   document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
   $('#profile-resend-confirmation')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
+  $('#request-account-deletion')?.addEventListener('click', async () => {
+    if (!confirm('Request deletion of this krmax account? Cancel any active subscription first. We will verify organization and resource ownership before irreversible deletion.')) return;
+    try {
+      const result = await api('/api/user/account-deletion-request', { method: 'POST', body: '{}' });
+      toast(`Deletion request recorded${result.privacyContact ? `. Questions: ${result.privacyContact}` : '.'}`);
+    } catch (error) { toast(error.message, true); }
+  });
 
   $('#profile-email-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -13812,13 +14034,14 @@ function installationView() {
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
-      <a href="#installation-github">GitHub</a><a href="#installation-stripe">Stripe</a><a href="#installation-email">Email</a>
+      <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>One App, with separate installations owned by each organization</small></div></div>${installationGithubCard()}
-      <div class="settings-section-title" id="installation-stripe"><div>Stripe<small>The shared Connect application; organizations keep separate accounts and funds</small></div></div>${stripePlatformCard()}
+      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
+      <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
@@ -13826,11 +14049,117 @@ function installationView() {
   </div></div>`;
 }
 
+function billingRequestKey() {
+  try { return crypto.randomUUID(); } catch { return `billing-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+}
+
+async function hydrateOrganizationSubscription(organizationId) {
+  const box = $('#org-subscription');
+  if (!box) return;
+  let state;
+  try { state = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/status`); }
+  catch (error) { box.innerHTML = `<p class="task-sub" style="color:var(--danger)">${esc(error.message)}</p>`; return; }
+  if (!$('#org-subscription') || S.organizationId !== organizationId) return;
+  if (!state.managed) {
+    box.innerHTML = `<div class="section-h">Self-hosted <span class="chip">unmetered</span></div>
+      <p class="task-sub">Hosted subscription billing does not apply to this private installation. Your organization plans and agent payment cards remain locally managed.</p>`;
+    return;
+  }
+  const catalog = Object.fromEntries((state.catalog || []).map((plan) => [plan.id, plan]));
+  const names = Object.fromEntries(Object.values(catalog).map((plan) => [plan.id, plan.name]));
+  const price = (cents) => `$${(Number(cents || 0) / 100).toLocaleString(undefined,
+    { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+  const statusNames = { none: 'free', active: 'active', trialing: 'trial', past_due: 'payment failed',
+    unpaid: 'unpaid', incomplete: 'checkout incomplete', incomplete_expired: 'checkout expired',
+    paused: 'paused', canceled: 'canceled' };
+  const problem = ['past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused'].includes(state.status);
+  const period = state.currentPeriodEnd ? new Date(state.currentPeriodEnd).toLocaleDateString() : '';
+  const billedPlan = state.billedPlan || state.plan;
+  const hasSubscription = billedPlan !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
+  const seats = billedPlan === 'team'
+    ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'} · <b>${state.seats}</b> verified billed seat${state.seats === 1 ? '' : 's'}${state.seatDeficit ? ` · <span style="color:var(--danger)">${state.seatDeficit} awaiting reconciliation</span>` : ''}`
+    : `<b>${state.activeUsers}</b> of 1 user`;
+  const grace = state.access === 'grace' && state.graceEndsAt
+    ? ` Access continues through ${new Date(state.graceEndsAt).toLocaleDateString()}.` : '';
+  const checkoutReturn = new URLSearchParams(location.search).get('billing');
+  const checkoutNotice = checkoutReturn === 'success'
+    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for Stripe’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
+    : checkoutReturn === 'canceled'
+      ? '<div class="card" style="margin:12px 0;padding:12px"><b>Checkout canceled</b><p class="task-sub">No plan change was applied.</p></div>' : '';
+  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until Stripe confirms payment.')}${esc(grace)}</p></div>` : '';
+  const individual = catalog.individual || {};
+  const team = catalog.team || {};
+  const ownerDisabled = state.canManage ? '' : 'disabled title="Only an organization owner can administer this subscription"';
+  const checkoutReady = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
+  const teamTotal = Number(team.monthlyBasePriceCents || 0)
+    + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
+      * Number(team.monthlyAdditionalActiveUserPriceCents || 0);
+  const disclosures = S.launch?.checkoutDisclosures || {};
+  const planCards = !hasSubscription ? `<div class="billing-commercial-terms">
+      <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
+      ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
+    <div class="settings-grid" style="margin-top:14px">
+      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
+      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month. Unlimited projects · ${esc(team.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
+      <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
+  const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
+    ? 'disabled title="Remove additional active users first"' : '');
+  const changes = billedPlan === 'individual' && ['active', 'trialing', 'past_due'].includes(state.status)
+    ? `<button class="btn sm billing-change" data-plan="team" ${ownerDisabled}>Upgrade to Team</button>`
+    : billedPlan === 'team' && ['active', 'trialing', 'past_due'].includes(state.status)
+      ? `<button class="btn sm billing-change" data-plan="individual" ${downgradeDisabled}>Downgrade to Individual</button>` : '';
+  const effective = state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
+  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[billedPlan] || billedPlan)} <span class="chip">${esc(statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
+    <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
+    ${checkoutNotice}${alert}${!state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
+    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
+    <p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Plan and seat access changes only after a signed billing event is reconciled. ${policyLinks(['billing'])}</p>`;
+  box.querySelectorAll('.billing-checkout').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const acceptance = readPolicyAcceptance('checkout');
+      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/checkout`, {
+        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({
+          plan: button.dataset.plan, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
+        }),
+      });
+      location.assign(result.url);
+    } catch (error) { button.disabled = false; toast(error.message, true); }
+  }));
+  box.querySelector('.billing-portal')?.addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    try { location.assign((await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/portal`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    })).url); } catch (error) { event.currentTarget.disabled = false; toast(error.message, true); }
+  });
+  box.querySelector('.billing-change')?.addEventListener('click', async (event) => {
+    const plan = event.currentTarget.dataset.plan;
+    if (!confirm(`Change this organization to ${names[plan]}? Stripe will prorate the current billing period.`)) return;
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/change`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
+    }); toast('Plan change submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
+    if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    }); toast('Cancellation submitted. Waiting for Stripe confirmation.'); await hydrateOrganizationSubscription(organizationId); }
+    catch (error) { toast(error.message, true); }
+  });
+  box.querySelector('.billing-sync')?.addEventListener('click', async () => {
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/sync-seats`, {
+      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    }); toast('Seat reconciliation submitted.'); } catch (error) { toast(error.message, true); }
+  });
+}
+
 function wireInstallationSettings() {
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();
   wireInstallationGithubCard();
+  wirePaidLaunchCard();
   wireStripePlatformCard();
   wireOutboundEmailCard();
   hydrateResilienceCard();
@@ -13844,8 +14173,13 @@ function organizationView() {
     <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-avatars">Avatars</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-compute">Where tasks run</a><a href="#settings-agents">Codex/Claude</a><a href="#settings-avatars">Avatars</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
+
+    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
+    <div class="card" id="org-plan">Loading…</div>
+    <div class="settings-section-title" id="settings-billing"><div>Subscription billing<small>Hosted subscription and active-user seats—not cards used by agents</small></div></div>
+    <div class="card" id="org-subscription"><p class="task-sub">Loading verified subscription status…</p></div>
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
@@ -13884,6 +14218,28 @@ function pendingInvitationRow(invitation, projects) {
   return `<div class="member-row" data-invitation="${esc(invitation.id)}"><span>${esc(invitation.email)}</span><span class="chip">${esc(authorizationSummary(authorization, projects))}</span></div>`;
 }
 
+function organizationPlanMarkup(entitlements) {
+  if (!entitlements) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
+  if (entitlements.deployment === 'private') return `<div class="section-h">Private installation</div>
+    <p class="task-sub">Hosted plan restrictions are not applied. Users, projects, and active agent runs are limited only by this installation’s own capacity settings.</p>`;
+  const memberCount = Number(entitlements.currentMemberCount ?? entitlements.activeUsers ?? 0);
+  const users = entitlements.maxMembers == null
+    ? `${memberCount} active user${memberCount === 1 ? '' : 's'} · unlimited`
+    : `${memberCount} of ${entitlements.maxMembers} user${entitlements.maxMembers === 1 ? '' : 's'}${entitlements.overMemberLimit ? ' · over limit' : ''}`;
+  const projects = entitlements.unlimitedProjects ? 'Unlimited projects' : `${entitlements.maxProjects} projects`;
+  const runs = `${entitlements.maxActiveAgentRuns} active agent run${entitlements.maxActiveAgentRuns === 1 ? '' : 's'}`;
+  const monthly = Number(entitlements.currentMonthlyPriceCents || 0) / 100;
+  const price = monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
+  const usage = `${entitlements.activeAgentRuns || 0} active · ${entitlements.queuedAgentRuns || 0} queued`;
+  const memberWarning = entitlements.overMemberLimit
+    ? `<div class="card" style="padding:10px;border-color:var(--warn);margin:10px 0"><b>Agent runs are paused</b><div class="task-sub">${esc(entitlements.planName)} allows ${esc(entitlements.maxMembers)} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${esc(memberCount)}. Remove ${esc(memberCount - entitlements.maxMembers)} extra member${memberCount - entitlements.maxMembers === 1 ? '' : 's'} in <a href="#settings-people">People &amp; authorization</a>, or restore Team. Running agents may finish; no new agent run will start until this is resolved.</div></div>`
+    : '';
+  return `<div class="section-h">${esc(entitlements.planName)} <span class="chip">${esc(price)}</span></div>
+    ${memberWarning}
+    <div class="settings-grid"><label class="form-row">People<input value="${esc(users)}" readonly></label><label class="form-row">Projects<input value="${esc(projects)}" readonly></label><label class="form-row">Agent concurrency<input value="${esc(runs)}" readonly></label><label class="form-row">Current agent usage<input value="${esc(usage)}" readonly></label></div>
+    <p class="task-sub">Concurrency is a shared maximum for this organization. Work above the limit waits in queue; it is not reserved capacity.</p>`;
+}
+
 function appendPendingInvitation(invitation, projects) {
   const box = $('#pending-invitations');
   if (!box || !invitation) return;
@@ -13903,6 +14259,7 @@ async function hydrateOrganizationView() {
   wireSettingsNavigation();
   hydrateSettingsAccess({ organizationId });
   hydrateAvatarAvailability('organization', organizationId);
+  hydrateOrganizationSubscription(organizationId);
   await loadCollaboration().catch(() => {});
   if (!renderIsCurrent()) return;
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -13914,7 +14271,8 @@ async function hydrateOrganizationView() {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
     return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
-  const [gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
+  const [entitlements, gitConnections, githubApp, githubIdentity, runners, providerConnections, executionPolicy, usage, usagePolicy, identityPolicy, invitations, teamMembers, storageLocations] = await Promise.all([
+    api(`/api/organizations/${organizationId}/entitlements`).catch(() => null),
     api(`/api/organizations/${organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${organizationId}/github/app`).catch(() => ({ configured: false })),
     api(`/api/organizations/${organizationId}/github/identity`).catch(() => ({ profile: null })),
@@ -13922,12 +14280,14 @@ async function hydrateOrganizationView() {
     api(`/api/organizations/${organizationId}/world-providers`).catch(() => []),
     api(`/api/organizations/${organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
     api(`/api/organizations/${organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${organizationId}/usage-policy`).catch(() => null),
     api(`/api/organizations/${organizationId}/identity-policy`).catch(() => null),
     api(`/api/organizations/${organizationId}/invitations`).catch(() => []),
     Promise.all(S.teams.map((team) => api(`/api/organizations/${organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
     api(`/api/organizations/${organizationId}/storage`).catch(() => []),
   ]);
   if (!renderIsCurrent()) return;
+  $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
   const pendingInvitations = invitations.filter((invitation) => !invitation.acceptedAt);
   $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
   $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
@@ -13988,8 +14348,8 @@ async function hydrateOrganizationView() {
         : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
-  $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
-    <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select><input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds"><button class="btn sm" id="runner-create">Add pool</button></div>`;
+  $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
+    <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
   $('#org-storage').innerHTML = `<div class="project-help-callout"><span class="callout-mark">i</span><div><b>Managed storage is intentionally bounded.</b> Connect your own bucket for large versioned datasets. For live or frequently changing data, add the bucket as a project Service instead of copying it into krmax.</div></div>
     ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
     <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
@@ -14006,7 +14366,21 @@ async function hydrateOrganizationView() {
   const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
     : coverageFrom > Number(usage?.from || 0)
       ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Provider-reconciled compute · ${usagePeriod} · ${usage.events} completed executions${usageSyncLabel}</div></div>` : 'Usage unavailable.';
+  const usageFunding = usage?.byFundingSource || {};
+  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
+    <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>
+    <p class="task-sub">Managed $${((usageFunding.managed || 0) / 1e6).toFixed(2)} (${usage.requests?.managed || 0} model requests) · BYOK $${((usageFunding.byok || 0) / 1e6).toFixed(2)} (${usage.requests?.byok || 0} model requests) · active: ${usage.active?.agentTurns || 0} model turns, ${usage.active?.worlds || 0} worlds, ${usage.active?.executions || 0} commands</p>
+    ${usagePolicy ? `<details class="settings-disclosure compact"><summary><b>Usage guardrails</b></summary><div class="settings-grid">
+      <label class="form-row">Managed spend cap (USD/month)<input id="usage-managed-cap" type="number" min="0.01" step="0.01" value="${usagePolicy.managedSpendCapMicros == null ? '' : esc(usagePolicy.managedSpendCapMicros / 1e6)}" placeholder="Disabled" /></label>
+      <label class="form-row">Managed model providers<input id="usage-managed-providers" value="${esc((usagePolicy.managedModelProviders || []).join(', '))}" placeholder="Disabled" /></label>
+      <label class="form-row">Allowed model providers<input id="usage-allowed-providers" value="${esc((usagePolicy.allowedModelProviders || []).join(', '))}" placeholder="All connected BYOK providers" /></label>
+      <label class="form-row">Allowed models<input id="usage-allowed-models" value="${esc((usagePolicy.allowedModels || []).join(', '))}" placeholder="All models" /></label>
+      <label class="form-row">Model starts / minute<input id="usage-agent-rate" type="number" min="1" value="${esc(usagePolicy.maxAgentStartsPerMinute)}" /></label>
+      <label class="form-row">Sandbox starts / minute<input id="usage-world-rate" type="number" min="1" value="${esc(usagePolicy.maxRemoteStartsPerMinute)}" /></label>
+      <label class="form-row">Optional tighter model concurrency<input id="usage-agent-active" type="number" min="1" max="${esc(entitlements?.maxActiveAgentRuns || 1000000)}" value="${usagePolicy.maxActiveAgentTurns == null ? '' : esc(usagePolicy.maxActiveAgentTurns)}" placeholder="Plan limit: ${esc(usagePolicy.effectiveMaxActiveAgentTurns)}" /></label>
+      ${hostLocal() ? `<label class="form-row">Concurrent remote worlds<input id="usage-world-active" type="number" min="1" value="${esc(usagePolicy.maxActiveWorlds)}" /></label>`
+        : `<div class="form-row"><span>Concurrent remote worlds</span><b>Same as agent concurrency: ${esc(usagePolicy.maxActiveWorlds)}</b></div>`}
+    </div><p class="task-sub">The plan admits ${esc(entitlements?.maxActiveAgentRuns || usagePolicy.effectiveMaxActiveAgentTurns)} shared active agent runs; an owner may only set a tighter cap here. Managed model use is off until an owner sets a spend cap and explicitly enables a provider. BYOK remains separately attributed. Remote sandboxes use the organization’s own provider account.</p><button class="btn sm primary" id="usage-policy-save">Save usage guardrails</button></details>` : ''}` : 'Usage unavailable.';
   if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
     <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
@@ -14079,9 +14453,9 @@ async function hydrateOrganizationView() {
       catch (error) { toast(error.message, true); }
     });
   });
-  $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  $('#runner-create')?.addEventListener('click', async () => { try { const worlds = $('#runner-worlds')?.value; await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, ...(worlds == null ? {} : { capacity: { activeWorlds: Number(worlds) } }) }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
-  $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+  $('#org-execution-pool').innerHTML = `<option value="">Organization BYOK default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
   $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
   $('#org-execution-save')?.addEventListener('click', async () => {
     const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
@@ -14095,6 +14469,22 @@ async function hydrateOrganizationView() {
         monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
       } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); }
+  });
+  $('#usage-policy-save')?.addEventListener('click', async () => {
+    const list = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+    const cap = $('#usage-managed-cap').value.trim();
+    const agentCap = $('#usage-agent-active').value.trim();
+    try {
+      const policy = {
+        managedSpendCapMicros: cap === '' ? null : Math.round(Number(cap) * 1e6),
+        managedModelProviders: list('#usage-managed-providers'), allowedModelProviders: list('#usage-allowed-providers'),
+        allowedModels: list('#usage-allowed-models'), maxAgentStartsPerMinute: Number($('#usage-agent-rate').value),
+        maxRemoteStartsPerMinute: Number($('#usage-world-rate').value),
+        maxActiveAgentTurns: agentCap === '' ? null : Number(agentCap),
+        ...(hostLocal() ? { maxActiveWorlds: Number($('#usage-world-active').value) } : {}),
+      };
+      await api(`/api/organizations/${S.organizationId}/usage-policy`, { method: 'PUT', body: JSON.stringify({ policy }) }); toast('Usage guardrails saved'); await hydrateOrganizationView();
     } catch (error) { toast(error.message, true); }
   });
   $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
@@ -14161,6 +14551,7 @@ async function createOrganization() {
     S.organizationId = organization.id;
     S.projectId = null;
     await loadCollaboration().catch(() => {});
+    await refreshOnboarding();
     renderShell();
     await go(globalRoute('organization'));
   } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }
@@ -14855,9 +15246,15 @@ function socialSignInError(params) {
   return SOCIAL_SIGN_IN_ERRORS[code] ?? `${provider} sign-in failed (${code}).`;
 }
 
-function wireSocialBtn(id, provider, errSelector) {
+function wireSocialBtn(id, provider, errSelector, requireAcceptance = false) {
   $(`#${id}`)?.addEventListener('click', async () => {
     try {
+      if (requireAcceptance) {
+        const acceptance = readPolicyAcceptance('signup');
+        const accepted = await feedbackFetch('/api/legal/preaccept', { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(acceptance) });
+        if (!accepted.ok) throw new Error((await accepted.json().catch(() => ({}))).error || 'Accept the current policies to create an account.');
+      }
       // errorCallbackURL keeps a rejected sign-in on karmax's own card: Better
       // Auth appends `?error=<code>`, which boot() reads back on the way in.
       const back = new URL(location.href);
@@ -14877,6 +15274,95 @@ function wireSocialBtn(id, provider, errSelector) {
 
 // ── public landing ──────────────────────────────────────────────────────────
 
+function policyLinks(slugs) {
+  const bySlug = new Map((S.launch?.policies || []).map((policy) => [policy.slug, policy]));
+  return slugs.map((slug) => {
+    const policy = bySlug.get(slug);
+    return `<a href="/legal/${slug}" target="_blank" rel="noopener">${esc(policy?.title || slug)} <span class="mono">v${esc(policy?.version || S.launch?.policyVersion || '')}</span></a>`;
+  }).join(', ');
+}
+
+function policyAcceptanceMarkup(context, id) {
+  const slugs = Object.keys(S.launch?.acceptance?.[context] || {});
+  return `<label class="policy-acceptance" for="${id}"><input type="checkbox" id="${id}" />
+    <span>I agree to the current ${policyLinks(slugs)}.</span></label>`;
+}
+
+function readPolicyAcceptance(context) {
+  const box = $(`#${context}-policy-acceptance`);
+  if (!box?.checked) throw new Error('Accept the current policies to continue.');
+  return { accepted: true, versions: S.launch?.acceptance?.[context] || {} };
+}
+
+function legalFooter() {
+  return `<footer class="legal-footer"><a href="/">krmax</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
+    <a href="/legal/security">Security</a><a href="/legal/dpa">DPA requests</a></footer>`;
+}
+
+async function renderLegalPage(slug) {
+  document.body.classList.remove('landing-active');
+  const response = await feedbackFetch(`/api/legal/${encodeURIComponent(slug)}`);
+  if (!response.ok) { history.replaceState({}, '', '/legal'); return renderLegalIndex(); }
+  const policy = await response.json();
+  document.title = `${policy.title} · krmax`;
+  const contactRows = Object.entries(policy.contacts || {}).filter(([, email]) => email)
+    .map(([kind, email]) => `<a href="mailto:${esc(email)}">${esc(kind)}: ${esc(email)}</a>`).join('');
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/legal">All policies</a></header>
+    <main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
+    <h1>${esc(policy.title)}</h1><p class="legal-summary">${esc(policy.summary)}</p>
+    <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>
+    ${policy.operator ? `<p class="legal-operator"><b>Configured operator:</b> ${esc(policy.operator.name)}${policy.operator.country ? ` · ${esc(policy.operator.country)}` : ''}${policy.operator.governingLaw ? `<br><b>Governing law:</b> ${esc(policy.operator.governingLaw)}` : ''}${policy.operator.legalNoticeAddress ? `<br><b>Legal notices:</b> ${esc(policy.operator.legalNoticeAddress)}` : ''}</p>`
+      : '<p class="legal-unresolved"><b>Launch configuration incomplete:</b> the contracting entity and jurisdiction fields are intentionally not represented.</p>'}
+    ${policy.sections.map((section) => `<section><h2>${esc(section.heading)}</h2>${section.paragraphs.map((text) => `<p>${esc(text)}</p>`).join('')}
+      ${section.bullets?.length ? `<ul>${section.bullets.map((text) => `<li>${esc(text)}</li>`).join('')}</ul>` : ''}</section>`).join('')}
+    ${contactRows ? `<div class="legal-contacts">${contactRows}</div>` : ''}</main>${legalFooter()}</div>`;
+  window.onpopstate = () => boot();
+}
+
+function renderLegalIndex() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Policies · krmax';
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/pricing">Pricing</a></header>
+    <main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
+    <p class="legal-summary">Versioned product, billing, privacy, and operational disclosures for the initial paid launch.</p>
+    <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch?.draftNotice)}</span></div>
+    <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}"><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
+    </main>${legalFooter()}</div>`;
+  window.onpopstate = () => boot();
+}
+
+function formatCatalogPrice(cents, currency = 'usd') {
+  return new Intl.NumberFormat(undefined, { style: 'currency', currency: currency.toUpperCase(),
+    minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(Number(cents || 0) / 100);
+}
+
+function renderPricing() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Pricing · krmax';
+  const catalog = S.launch?.pricingCatalog || [];
+  const checkoutReady = S.launch?.paidLaunch && S.launch?.ready;
+  const team = catalog.find((plan) => plan.id === 'team');
+  const cards = catalog.map((plan) => {
+    const price = formatCatalogPrice(plan.monthlyBasePriceCents, plan.currency);
+    const users = plan.id === 'team'
+      ? `First active user included, then ${formatCatalogPrice(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per additional active user per month`
+      : `${plan.maxMembers} user`;
+    const priceLine = plan.id === 'free' ? price : `${price}<small> / month</small>`;
+    return `<article class="price-card" data-plan="${esc(plan.id)}"><div class="price-name">${esc(plan.name)}</div>
+      <div class="price-value">${priceLine}</div><p>${esc(users)}</p><ul><li>Unlimited projects</li>
+      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ' shared across the organization' : ''}</li></ul>
+      ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
+  }).join('');
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/login">Sign in</a></header>
+    <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
+      <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
+      <div class="pricing-grid">${cards}</div>
+      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Payments are non-refundable except where law requires or checkout expressly states otherwise.</p>
+      ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
+      <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>${legalFooter()}</div>`;
+  window.onpopstate = () => boot();
+}
+
 function openPublicAuth(path, render) {
   history.pushState({ kx: 1 }, '', path);
   render();
@@ -14890,6 +15376,7 @@ function renderLanding() {
     <header class="landing-nav" aria-label="Primary navigation">
       <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
       <div class="landing-nav-actions">
+        <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
         <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
@@ -14998,7 +15485,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
@@ -15139,6 +15626,7 @@ function renderSignup() {
     <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
+    ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
     ${googleBtn('signup-google-btn')}
     ${githubBtn('signup-github-btn')}
@@ -15149,6 +15637,7 @@ function renderSignup() {
     const name = $('#signup-name').value.trim();
     const email = $('#signup-email').value.trim();
     const password = $('#signup-pw').value;
+    let acceptance;
     const invalidEmail = !email || !$('#signup-email').checkValidity();
     const validationError = !name ? 'Enter your name.'
       : invalidEmail ? 'Enter a valid email address.'
@@ -15158,10 +15647,12 @@ function renderSignup() {
       (!name ? $('#signup-name') : invalidEmail ? $('#signup-email') : $('#signup-pw')).focus();
       return;
     }
+    try { acceptance = readPolicyAcceptance('signup'); }
+    catch (error) { $('#signup-err').textContent = error.message; $('#signup-policy-acceptance').focus(); return; }
     $('#signup-err').textContent = '';
     try {
       const res = await feedbackFetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-        name, email, password,
+        name, email, password, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
       }) });
       if (res.ok) return boot();
       const body = await res.json().catch(() => ({}));
@@ -15180,10 +15671,31 @@ function renderSignup() {
     }
   };
   $('#signup-btn').addEventListener('click', go);
-  wireSocialBtn('signup-google-btn', 'google', '#signup-err');
-  wireSocialBtn('signup-github-btn', 'github', '#signup-err');
+  wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
+  wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
   $('#signup-back').addEventListener('click', () => openPublicAuth('/login', renderLogin));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+function renderPolicyCompletion() {
+  document.body.classList.remove('landing-active');
+  document.title = 'Review policies · krmax';
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Finish account setup</div>
+    <p class="task-sub">Review and accept the current launch policies before using this paid service.</p>
+    ${policyAcceptanceMarkup('signup', 'signup-policy-acceptance')}
+    <button class="btn primary" id="complete-policy-acceptance" style="width:100%">Accept and continue</button>
+    <div id="policy-completion-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  $('#complete-policy-acceptance').addEventListener('click', async () => {
+    try {
+      const acceptance = readPolicyAcceptance('signup');
+      const response = await feedbackFetch('/api/legal/complete-signup', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(acceptance) });
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Could not record acceptance.');
+      await boot();
+    } catch (error) { $('#policy-completion-err').textContent = error.message; }
+  });
 }
 
 function renderAccessPending() {

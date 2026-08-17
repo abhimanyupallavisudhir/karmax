@@ -84,6 +84,8 @@ export const PLATFORM_REQUEST_EXCLUDED_PATHS = [
   '/api/setup',
   '/api/signup',
   '/api/session',
+  '/api/launch', // public policy/version + central hosted-plan catalog
+  '/api/legal/', // public policy documents and pre-OAuth acceptance handoff
   '/api/sso/start',
   '/api/agent-mail/ingest', // inbound mail webhook, authenticated by a minted secret
   '/api/payments/stripe/', // Stripe OAuth callback + signature-verified webhook

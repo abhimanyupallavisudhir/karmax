@@ -28,6 +28,10 @@ services:
       # Included physical snapshot storage per organization. 0 disables the
       # ceiling; public SaaS operators should keep a finite value.
       KARMAX_MANAGED_STORAGE_QUOTA_BYTES: ${KARMAX_MANAGED_STORAGE_QUOTA_BYTES:-5368709120}
+      # Optional installation authorization boundary for platform-funded model
+      # rails. Empty keeps managed model admission disabled regardless of org UI.
+      KARMAX_MANAGED_MODEL_REQUEST_CEILINGS: ${KARMAX_MANAGED_MODEL_REQUEST_CEILINGS:-}
+      KARMAX_MANAGED_MODEL_PRICING: ${KARMAX_MANAGED_MODEL_PRICING:-}
       KARMAX_S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key
       KARMAX_S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_key
       KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
@@ -41,6 +45,7 @@ services:
       KARMAX_OIDC_DISCOVERY_URL: ${KARMAX_OIDC_DISCOVERY_URL:-}
       KARMAX_OIDC_CLIENT_ID: ${KARMAX_OIDC_CLIENT_ID:-}
       KARMAX_OIDC_CLIENT_SECRET: ${KARMAX_OIDC_CLIENT_SECRET:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
     secrets:
       - auth_secret
       - vault_key

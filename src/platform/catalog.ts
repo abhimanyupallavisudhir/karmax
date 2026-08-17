@@ -17,11 +17,13 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
     ],
     interactiveHuman: [
-      'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'POST /api/invitations/accept',
+      'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding',
+      'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
       'DELETE /api/organizations/:organizationId',
       'POST /api/users', 'DELETE /api/users/:userId',
       'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
       'GET|POST|PUT|DELETE /api/user/github-accounts|git-profiles',
+      'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (owner only)',
       'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize',
       'POST /api/organizations/:organizationId/payments/connect',
       'POST /api/vault/items/:itemId/reveal',
@@ -55,10 +57,12 @@ export const PLATFORM_API_CATALOG = {
   ],
   organizations: [
     'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
+    'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display preference)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     'GET /api/settings/installation (global operator-only Installation page probe)',
     'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
     'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
+    'GET /api/organizations/:organizationId/entitlements (current hosted plan, limits, and live usage; private installs are unlimited)',
     'GET /api/organizations/:organizationId/export (full-tenant dump; organization:edit)',
     'GET /api/organizations/:organizationId/usage (spend + token usage for the tenant)',
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',
@@ -148,6 +152,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/skills', 'POST /api/safe-mode',
   ],
   installation: [
+    'GET|PUT /api/settings/paid-launch (installation operator: persisted legal entity, Stripe Billing catalog/secrets, paid-checkout gate, and founder task checklist)',
     'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
     'GET /api/email', 'POST /api/email/connect|test',
     'GET|POST /api/remote-access',
@@ -211,6 +216,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/projects/:projectId/wiki/refs (filterable branch/task views; pass taskId= or branch= to reads)',
   ],
   payments: [
+    'GET /api/organizations/:organizationId/subscription/status (hosted SaaS plan and verified seat/payment state; self-hosted reports unmetered)',
+    'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (owner-only hosted SaaS billing; mutation calls require Idempotency-Key; checkout body also requires {plan,acceptedPolicies:true,policyVersions})',
     'GET /api/organizations/:organizationId/payments/providers',
     'POST /api/organizations/:organizationId/payments/connect',
     'DELETE /api/organizations/:organizationId/payments/connections/:provider',
@@ -225,6 +232,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   administration: [
     'GET /api/user/export (human identity only; all data directly linked to the signed-in user)',
+    'POST /api/user/account-deletion-request (human identity only; records a verified deletion/offboarding request)',
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',

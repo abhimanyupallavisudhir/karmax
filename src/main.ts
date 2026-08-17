@@ -45,6 +45,7 @@ import { WorldAccessService } from './world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.js';
 import { sweepOrphanedServiceContainers } from './world/services.js';
 import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-restart.js';
+import { EntitlementQueueReconciler } from './platform/entitlement-queue-reconciler.js';
 import type { WorldHandle } from './world/types.js';
 
 const VERSION = '1.0.0';
@@ -121,7 +122,8 @@ async function main() {
   const { client, close: closeClient } = await makeClient(conn);
 
   // ── Core services ──
-  const openedStore = openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL);
+  const openedStore = openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
+    { hosted: deployment.hosted });
   const store = openedStore.store;
   if (process.env.KARMAX_DATABASE_URL) {
     const migrated = openedStore.migration?.imported
@@ -131,6 +133,8 @@ async function main() {
   }
   const authorization = new AuthorizationService(store);
   const broker = new CredentialBroker(new Vault(p.vault));
+  const { PaidLaunchSettingsService } = await import('./launch/settings.js');
+  const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
   if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
     broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
   if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
@@ -282,6 +286,12 @@ async function main() {
   // own issuer. Registered before Stripe Issuing, which needs a business account.
   paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
+  // Hosted-plan billing is deliberately a different provider and ledger from
+  // the agent card registry above. Self-hosted installs construct the service so
+  // status calls can report "unmetered", but it never contacts Stripe there.
+  const { StripeSubscriptionProvider, SubscriptionBillingService } = await import('./billing/subscriptions.js');
+  const subscriptionBilling = new SubscriptionBillingService(store,
+    new StripeSubscriptionProvider(() => paidLaunchSettings.subscriptionConfig(), fetch), deployment.hosted);
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
   const configHomes = new ConfigHomeManager();
@@ -354,6 +364,32 @@ async function main() {
   const retentionTimer = setInterval(sweepRetention, 3600_000);
   retentionTimer.unref();
 
+  // Re-derive effective plans from the last signed provider state at boot and
+  // throughout the process lifetime. In particular, this closes past-due grace
+  // even when Stripe sends no later event.
+  const reconcileSubscriptionEntitlements = () => {
+    try { subscriptionBilling.reconcileEntitlements(); }
+    catch (error) {
+      console.warn('  • Subscription entitlement reconciliation failed:',
+        error instanceof Error ? error.message : String(error));
+    }
+  };
+  reconcileSubscriptionEntitlements();
+  const subscriptionEntitlementTimer = setInterval(reconcileSubscriptionEntitlements, 60_000);
+  subscriptionEntitlementTimer.unref();
+
+  // Membership hooks submit seat changes immediately; this bounded sweep makes
+  // provider quantity reconciliation eventual after an outage or process crash.
+  const syncSubscriptionSeats = () => {
+    for (const organization of store.listOrganizations())
+      void subscriptionBilling.syncSeats(organization.id).catch((error) =>
+        console.warn(`  • Subscription seat sync failed for ${organization.id}:`,
+          error instanceof Error ? error.message : String(error)));
+  };
+  syncSubscriptionSeats();
+  const subscriptionSeatTimer = setInterval(syncSubscriptionSeats, 5 * 60_000);
+  subscriptionSeatTimer.unref();
+
   // Repair coordinator singletons whose history this build can no longer replay.
   // Runs before task reconciliation so a merge queue that self-heals here is
   // already answering by the time tasks waiting on it are examined.
@@ -364,6 +400,18 @@ async function main() {
     console.log(`  • Rebuilt ${health.rebuilt.length} unreplayable coordinator(s)`);
   for (const { workflowId, reason } of health.reported)
     console.warn(`  ! Coordinator ${workflowId} is wedged; left alone: ${reason}`);
+
+  // Hosted plan/member writes are synchronous database boundaries, while the
+  // organization agent queue is durable Temporal state. Reconcile immediately
+  // after each write, at boot, and periodically so queued work recovers without
+  // waiting for another admission/release/cancel side effect.
+  const entitlementQueues = new EntitlementQueueReconciler({
+    store,
+    client,
+    intervalMs: RECONCILE_INTERVAL_MS,
+    log: (message) => console.warn(`  • ${message}`),
+  });
+  entitlementQueues.start();
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
@@ -551,6 +599,8 @@ async function main() {
     worldAccess,
     objects: objectStore,
     resources,
+    subscriptions: subscriptionBilling,
+    paidLaunchSettings,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,
@@ -640,6 +690,7 @@ async function main() {
     clearInterval(orphanSweep);
     clearInterval(reconcileSweep);
     clearInterval(deploymentSweep);
+    entitlementQueues.stop();
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();

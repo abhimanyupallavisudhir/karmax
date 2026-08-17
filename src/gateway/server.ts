@@ -20,7 +20,8 @@ import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
-import { accountCoordinatorId } from '../coordinators/names.js';
+import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
+import { hostedMonthlyPriceCents } from '../domain/entitlements.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -66,6 +67,10 @@ import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireIntera
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
+import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
+  type HostedOnboardingDisplay } from './hosted-onboarding.js';
+import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
+  policyDocument, publicLaunchInfo } from '../launch/legal.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -97,6 +102,8 @@ export interface GatewayDeps {
   worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
   resources?: import('../world/resources.js').ProjectResourceService;
+  subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
+  paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -130,7 +137,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export' || p === '/api/user/default-organization') return 'none';
+  if (p === '/api/user/export' || p === '/api/user/default-organization'
+    || p === '/api/user/onboarding' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -141,7 +149,12 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/usage-policy/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats)$/.test(p))
+    return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -202,6 +215,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
+  if (p === '/api/subscriptions/webhook') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return read ? 'settings:read' : 'safe-mode:write';
   // Installation-wide outbound email is operator configuration (settings:write),
@@ -528,6 +542,7 @@ export class Gateway {
   private wikiRemoteRetryAfter = new Map<string, number>();
   /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
+  private pendingPolicyAcceptances = new Map<string, { versions: Record<string, string>; expiresAt: number }>();
 
   constructor(private deps: GatewayDeps) {
     if (deps.identity) {
@@ -1024,6 +1039,13 @@ export class Gateway {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
         if (current) {
+          this.consumeSignupPolicyAcceptance(req, current.user.id, current.user.email);
+          if ((this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).paidLaunch && !this.deps.store.policyAcceptances(current.user.id)
+            .some((acceptance) => acceptance.context === 'signup')) {
+            return this.json(res, 200, { authRequired: true, authenticated: false, policyAcceptanceRequired: true,
+              user: current.user, sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
+              google: this.deps.identity.googleEnabled, github: this.deps.identity.githubEnabled });
+          }
           const onboardingKey = `git:onboarding:${current.user.id}`;
           // Better Auth creates social-login users inside its callback route,
           // bypassing /api/signup. Complete the same karmax-side provisioning on
@@ -1058,7 +1080,50 @@ export class Gateway {
       }
       return this.json(res, 200, { authRequired: true });
     }
+    if (p === '/api/launch' && method === 'GET')
+      return this.json(res, 200, this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo());
+    const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
+    if (legalMatch && method === 'GET') {
+      const document = this.deps.paidLaunchSettings?.policyDocument(legalMatch[1]!) ?? policyDocument(legalMatch[1]!);
+      return document ? this.json(res, 200, document) : this.json(res, 404, { error: 'policy not found' });
+    }
+    if (p === '/api/legal/preaccept' && method === 'POST') {
+      try {
+        const body = await this.body(req);
+        const versions = assertPolicyAcceptance('signup', body.accepted, body.versions);
+        const token = crypto.randomBytes(32).toString('base64url');
+        const hash = crypto.createHash('sha256').update(token).digest('hex');
+        const now = Date.now();
+        for (const [key, pending] of this.pendingPolicyAcceptances) {
+          if (pending.expiresAt < now) this.pendingPolicyAcceptances.delete(key);
+        }
+        if (this.pendingPolicyAcceptances.size >= 10_000)
+          return this.json(res, 429, { error: 'too many pending signup attempts; try again shortly' });
+        this.pendingPolicyAcceptances.set(hash, { versions, expiresAt: now + 15 * 60_000 });
+        res.setHeader('set-cookie', `krmax_policy_acceptance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=900${this.deps.hosted ? '; Secure' : ''}`);
+        return this.json(res, 200, { ok: true, versions });
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (p === '/api/legal/complete-signup' && method === 'POST' && this.deps.identity) {
+      const current = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!current) return this.json(res, 401, { error: 'sign in before completing policy acceptance' });
+      try {
+        const body = await this.body(req);
+        const versions = assertPolicyAcceptance('signup', body.accepted, body.versions);
+        this.deps.store.recordPolicyAcceptance({ userId: current.user.id, email: current.user.email,
+          context: 'signup', versions });
+        return this.json(res, 200, { ok: true, versions });
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     if (p.startsWith('/api/auth/') && this.deps.identity) {
+      // Public account creation goes through /api/signup, where the immutable
+      // policy-version evidence is validated and recorded. Better Auth's direct
+      // sign-up route would otherwise be an undocumented acceptance bypass.
+      if (p === '/api/auth/sign-up/email') return this.json(res, 404, { error: 'use /api/signup to create an account' });
       const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim();
       const origin = process.env.KARMAX_PUBLIC_URL || `${forwardedProto || 'http'}://${req.headers.host || 'localhost'}`;
       const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, 2 * 1024 * 1024);
@@ -1085,6 +1150,20 @@ export class Gateway {
           'x-karmax-cell': this.deps.cellId ?? 'local',
         });
         return void res.end(body);
+      } catch (error) {
+        return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    // SaaS subscription billing has its own secret, provider, and ledger. Keep
+    // this pre-auth raw-body route separate from the Stripe Issuing webhook
+    // above so customer subscription events can never authorize agent spend.
+    if (p === '/api/subscriptions/webhook' && method === 'POST') {
+      try {
+        if (!this.deps.subscriptions) return this.json(res, 503, { error: 'subscription billing is unavailable' });
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const result = this.deps.subscriptions.handleWebhook(raw,
+          typeof req.headers['stripe-signature'] === 'string' ? req.headers['stripe-signature'] : undefined);
+        return this.json(res, 200, { received: true, ...result });
       } catch (error) {
         return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
@@ -1311,6 +1390,7 @@ export class Gateway {
         this.deps.authorization?.bootstrapAdministrator(user.id);
         this.deps.store.claimPersonalOrganization(user.id, user.name);
         this.deps.store.kvSet(`git:onboarding:${user.id}`, 'pending');
+        if (this.deps.hosted) this.enableHostedOnboarding(user.id, 'org_personal');
         for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
           this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user.id }, 'owner');
         }
@@ -1325,6 +1405,7 @@ export class Gateway {
       if (!this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'set up the first administrator before signing up' });
       const b = await this.body(req);
       try {
+        const versions = assertPolicyAcceptance('signup', b.acceptedPolicies, b.policyVersions);
         const response = await this.deps.identity.signUp(
           { name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') },
           requestHeaders(req.headers),
@@ -1344,6 +1425,8 @@ export class Gateway {
         if (userId) {
           this.provisionPersonalWorkspace(userId, String(created?.user?.name ?? b.name ?? ''));
           this.deps.store.kvSet(`git:onboarding:${userId}`, 'pending');
+          this.deps.store.recordPolicyAcceptance({ userId, email: String(created?.user?.email ?? b.email ?? ''),
+            context: 'signup', versions });
         }
         return this.sendWebResponse(res, response);
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
@@ -1484,6 +1567,19 @@ export class Gateway {
         if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
         return this.json(res, 200, { ok: true });
       }
+      if (p === '/api/user/account-deletion-request' && method === 'POST') {
+        const subject = requireInteractiveHuman(callerIdentity);
+        const privacyContact = (this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).contacts.privacy;
+        const request = { requestedAt: Date.now(), userId: subject.userId, email: session.email };
+        store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request));
+        if (privacyContact && this.deps.email?.configured()) {
+          await this.deps.email.send({ to: privacyContact, subject: 'krmax account deletion request',
+            text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${session.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
+            .catch((error) => console.error('[privacy] deletion-request notification failed:', error instanceof Error ? error.message : error));
+        }
+        return this.json(res, 202, { ...request, privacyContact: privacyContact ?? null,
+          next: 'We will verify ownership and organization/resource transfer needs before irreversible deletion.' });
+      }
       if (p === '/api/user/default-organization' && (method === 'GET' || method === 'PUT')) {
         const subject = requireInteractiveHuman(callerIdentity);
         if (method === 'GET') {
@@ -1497,6 +1593,59 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
+        const subject = requireInteractiveHuman(callerIdentity);
+        const organizationId = String(url.searchParams.get('organizationId')
+          ?? store.defaultOrganization(subject.userId)?.id ?? '');
+        if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
+          return this.json(res, 404, { error: 'organization not found' });
+        const key = hostedOnboardingKey(subject.userId, organizationId);
+        let record = parseHostedOnboardingRecord(store.kvGet(key));
+        if (method === 'PUT') {
+          if (!this.deps.hosted || !record)
+            return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
+          const b = await this.body(req);
+          const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
+          record = { ...record, display };
+          store.kvSet(key, JSON.stringify(record));
+        }
+        const credentials = enumerateCredentials(gatherCredentialSources({
+          configHomes: this.deps.configHomes,
+          broker: this.deps.broker,
+          organizationId,
+        })).filter((credential) => !this.deps.hosted
+          || credential.kind === 'login' || Boolean(credential.apiKeyHandle));
+        const enabledCredentials = resolveCredentials(credentials, {
+          global: parsePolicy(store.kvGet(credPolicyKey.organization(organizationId))),
+        });
+        const e2b = store.getWorldProviderConnection(organizationId, 'e2b');
+        const facts = {
+          github: Boolean(this.deps.identity?.providersForUser(subject.userId).includes('github')
+            || this.deps.githubApp?.status(subject.userId).userAuthorized
+            || store.listGitConnections(organizationId).some((connection) => !connection.suspendedAt)),
+          agentLogin: enabledCredentials.length > 0,
+          e2b: Boolean(e2b?.enabled && this.deps.broker?.hasHandle(e2b.credentialHandle)),
+          vault: new VaultItems(store, this.deps.broker, undefined, organizationId).list()
+            .some((item) => item.type === 'login' && item.fields.includes('password')),
+          card: store.listOrganizationCards(organizationId).length > 0,
+          project: store.listProjects().some((project) => project.organizationId === organizationId),
+        };
+        let status = hostedOnboardingStatus({
+          hosted: this.deps.hosted === true,
+          organizationId,
+          record,
+          facts,
+        });
+        // Completion is sticky. Once all required live facts have been observed,
+        // removing a provider later is maintenance, not a reason to onboard an
+        // established account again.
+        if (status.complete && record && !record.completedAt) {
+          record = { ...record, completedAt: Date.now() };
+          store.kvSet(key, JSON.stringify(record));
+          status = hostedOnboardingStatus({ hosted: true, organizationId, record, facts });
+        }
+        return this.json(res, 200, status);
       }
       if (p === '/api/user/export' && method === 'GET') {
         // Broad task-agent capabilities never imply ownership of a human's
@@ -1517,6 +1666,7 @@ export class Gateway {
           authentication: identityData.authentication,
           git: { defaultProfile: gitProfiles.defaultProfile() ?? null, profiles: gitProfiles.list() },
           security,
+          policyAcceptances: store.policyAcceptances(subject.userId),
           ...linkedData,
         };
         const label = String(identityData.profile.email ?? identityData.profile.name ?? 'user')
@@ -1540,6 +1690,25 @@ export class Gateway {
       if (p === '/api/settings/installation' && method === 'GET') {
         return this.json(res, 200, { canManage: this.deps.tokens.check(token, 'settings:write').ok,
           hostLocal: this.hostLocal });
+      }
+      if (p === '/api/settings/paid-launch') {
+        if (!this.deps.paidLaunchSettings)
+          return this.json(res, 503, { error: 'paid-launch settings are unavailable' });
+        const publicUrl = this.publicUrl(req);
+        if (method === 'GET') return this.json(res, 200, {
+          ...this.deps.paidLaunchSettings.status(publicUrl),
+          canManage: this.deps.tokens.check(token, 'settings:write').ok,
+        });
+        if (method === 'PUT') {
+          if (!this.deps.tokens.check(token, 'settings:write').ok)
+            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure paid launch' });
+          try {
+            return this.json(res, 200, { ...this.deps.paidLaunchSettings.configure(await this.body(req), publicUrl),
+              canManage: true });
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
@@ -1585,6 +1754,8 @@ export class Gateway {
             slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: subject.userId });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id);
+        this.deps.resources?.storageLocationService()?.ensureManaged(organization.id);
+        if (this.deps.hosted) this.enableHostedOnboarding(subject.userId, organization.id);
         return this.json(res, 200, organization);
       }
       if (p === '/api/invitations/accept' && method === 'POST') {
@@ -1592,9 +1763,13 @@ export class Gateway {
         if (!session.email) return this.json(res, 400, { error: 'a verified account is required' });
         const b = await this.body(req);
         try {
-          const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), subject.userId, session.email);
+          const invitationToken = String(b.token ?? '');
+          const invited = store.organizationInvitationForToken(invitationToken);
+          const membership = store.acceptOrganizationInvitation(invitationToken, subject.userId, session.email);
           this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']);
+          void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
+            console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
           return this.json(res, 200, membership);
         } catch (e) {
           // Expired / already-used / wrong-email are user-facing, not 500s.
@@ -1604,6 +1779,93 @@ export class Gateway {
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationEntitlementsMatch = p.match(/^\/api\/organizations\/([^/]+)\/entitlements$/);
+      if (organizationEntitlementsMatch && method === 'GET') {
+        const organizationId = organizationEntitlementsMatch[1]!;
+        if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
+        const entitlements = store.organizationEntitlements(organizationId);
+        const activeUsers = store.listOrganizationMemberships(organizationId).length;
+        let activeAgentRuns = 0;
+        let queuedAgentRuns = 0;
+        if (entitlements.deployment === 'hosted') {
+          try {
+            const queue = await this.deps.client.workflow.getHandle(agentQueueId(organizationId))
+              .query(QRY_AGENT_QUEUE) as { current: unknown[]; queue: unknown[] };
+            activeAgentRuns = queue.current.length;
+            queuedAgentRuns = queue.queue.length;
+          } catch { /* The organization has not run an agent yet. */ }
+        }
+        return this.json(res, 200, {
+          ...entitlements,
+          activeUsers,
+          currentMonthlyPriceCents: entitlements.plan
+            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers)
+            : null,
+          activeAgentRuns,
+          queuedAgentRuns,
+        });
+      }
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats)$/);
+      if (subscription) {
+        const organizationId = subscription[1]!;
+        const action = subscription[2]!;
+        if (!store.getOrganization(organizationId)) return this.json(res, 404, { error: 'organization not found' });
+        const billing = this.deps.subscriptions;
+        if (!billing) return this.json(res, 503, { error: 'subscription billing is unavailable' });
+        if (action === 'status') {
+          if (method !== 'GET') return this.json(res, 405, { error: 'method not allowed' });
+          const interactiveUserId = callerIdentity.actor.kind === 'interactive-human'
+            ? callerIdentity.humanSubject?.userId : undefined;
+          const canManage = Boolean(interactiveUserId
+            && store.organizationMembership(organizationId, interactiveUserId)?.role === 'owner');
+          return this.json(res, 200, { ...billing.current(organizationId), canManage });
+        }
+        if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        // Agent-card administration is delegable through payment:write. Paying
+        // for the SaaS itself is not: require live browser presence and the
+        // durable owner membership even after the ordinary capability gate.
+        const billingSubject = requireInteractiveHuman(callerIdentity);
+        if (store.organizationMembership(organizationId, billingSubject.userId)?.role !== 'owner')
+          return this.json(res, 403, { error: 'organization owner access is required to administer its subscription' });
+        const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
+        const settingsBase = `${this.publicUrl(req)}${organizationSettingsPath(store, organizationId)}`;
+        const settingsUrl = `${settingsBase}#settings-billing`;
+        try {
+          if (action === 'checkout') {
+            const body = await this.body(req);
+            const plan = String(body.plan ?? '');
+            if (this.deps.paidLaunchSettings) this.deps.paidLaunchSettings.assertReady();
+            else assertPaidLaunchReady();
+            const versions = assertPolicyAcceptance('checkout', body.acceptedPolicies, body.policyVersions);
+            const result = await billing.checkout(organizationId, plan,
+              { success: `${settingsBase}?billing=success#settings-billing`,
+                cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
+            store.recordPolicyAcceptance({
+              userId: billingSubject.userId,
+              email: session.email,
+              organizationId,
+              context: 'checkout',
+              versions,
+              checkoutRequestReference: result.checkoutRequestReference,
+              checkoutSessionReference: result.checkoutSessionReference,
+              commercialTerms: { ...result.commercialTerms, ...CHECKOUT_DISCLOSURES,
+                checkoutProvider: result.checkoutProvider },
+            });
+            return this.json(res, 200, result);
+          }
+          if (action === 'portal') return this.json(res, 200, await billing.portal(organizationId, settingsUrl, idempotencyKey));
+          if (action === 'change') {
+            const body = await this.body(req);
+            return this.json(res, 202, await billing.changePlan(organizationId,
+              String(body.plan ?? ''), idempotencyKey));
+          }
+          if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
+          await billing.syncSeats(organizationId);
+          return this.json(res, 202, { syncing: true });
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const organizationStorage = p.match(/^\/api\/organizations\/([^/]+)\/storage(?:\/([^/]+))?(?:\/(test|default))?$/);
       if (organizationStorage) {
         const organizationId = organizationStorage[1]!;
@@ -1690,6 +1952,10 @@ export class Gateway {
         const b = await this.body(req);
         if (String(b.confirmSlug ?? '') !== organization.slug)
           return this.json(res, 400, { error: `type the organization slug (${organization.slug}) to confirm deletion` });
+        try { this.deps.subscriptions?.assertOrganizationDeletionAllowed(organizationId); }
+        catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
 
         // External resources go first. These operations are idempotent, so an
         // outage never commits a deceptively successful partial deletion.
@@ -1755,6 +2021,8 @@ export class Gateway {
           this.deps.authorization?.replacePrincipalAuthorization(actorPrincipal(callerIdentity.actor),
             `user:${membership.userId}`, organizationId, authorization,
             authRecord?.kind === 'human' ? undefined : authRecord?.caps);
+          void this.deps.subscriptions?.syncSeats(organizationId).catch((error) =>
+            console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
           return this.json(res, 200, { ...membership, authorization });
         }
       }
@@ -1762,6 +2030,8 @@ export class Gateway {
       if (organizationMember && method === 'DELETE') {
         store.deprovisionOrganizationUser(organizationMember[1]!, organizationMember[2]!);
         this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`);
+        void this.deps.subscriptions?.syncSeats(organizationMember[1]!).catch((error) =>
+          console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
         return this.json(res, 200, { ok: true });
       }
       const invitations = p.match(/^\/api\/organizations\/([^/]+)\/invitations$/);
@@ -2028,10 +2298,18 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listRunnerPools(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
+          if (b.mode === 'managed') return this.json(res, 400, {
+            error: 'centrally funded remote runner pools require a separate installation authorization boundary; organization BYOK is the supported default',
+          });
+          const provider = String(b.provider ?? 'e2b');
+          const hostedCustomerWorld = this.deps.hosted === true
+            && !['worktree', 'container', 'memory'].includes(provider);
           return this.json(res, 200, store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
-            provider: String(b.provider ?? 'e2b'), region: b.region ? String(b.region) : undefined,
-            mode: b.mode === 'customer' ? 'customer' : 'managed', enabled: b.enabled !== false,
-            capacity: { activeWorlds: Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
+            provider, region: b.region ? String(b.region) : undefined,
+            mode: b.mode === 'managed' ? 'managed' : 'customer', enabled: b.enabled !== false,
+            capacity: { activeWorlds: hostedCustomerWorld
+              ? store.getOrganizationUsagePolicy(organizationId).maxActiveWorlds
+              : Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
               cpu: Math.max(1, Number(b.capacity?.cpu ?? 40)), memoryMb: Math.max(128, Number(b.capacity?.memoryMb ?? 81920)),
               gpu: Math.max(0, Number(b.capacity?.gpu ?? 0)) } }));
         }
@@ -2043,12 +2321,16 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
+            const hostedCustomerWorld = this.deps.hosted === true && current.mode === 'customer'
+              && !['worktree', 'container', 'memory'].includes(current.provider);
             return this.json(res, 200, store.createRunnerPool({ ...current,
               name: b.name == null ? current.name : String(b.name),
               region: b.region === null ? undefined : b.region == null ? current.region : String(b.region),
               enabled: b.enabled == null ? current.enabled : Boolean(b.enabled),
               capacity: b.capacity && typeof b.capacity === 'object' ? {
-                activeWorlds: Math.max(1, Number(b.capacity.activeWorlds ?? current.capacity.activeWorlds)),
+                activeWorlds: hostedCustomerWorld
+                  ? store.getOrganizationUsagePolicy(current.organizationId).maxActiveWorlds
+                  : Math.max(1, Number(b.capacity.activeWorlds ?? current.capacity.activeWorlds)),
                 cpu: Math.max(1, Number(b.capacity.cpu ?? current.capacity.cpu)),
                 memoryMb: Math.max(128, Number(b.capacity.memoryMb ?? current.capacity.memoryMb)),
                 gpu: Math.max(0, Number(b.capacity.gpu ?? current.capacity.gpu)),
@@ -2103,6 +2385,35 @@ export class Gateway {
           catch { return { provider: connection.provider, status: 'pending' }; }
         });
         return this.json(res, 200, { ...store.usageSummary(usage[1]!, from, to), from, to, sync });
+      }
+      const usagePolicy = p.match(/^\/api\/organizations\/([^/]+)\/usage-policy$/);
+      if (usagePolicy) {
+        const organizationId = usagePolicy[1]!;
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationUsagePolicy(organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
+          const currentPolicy = store.getOrganizationUsagePolicy(organizationId);
+          const normalizedManagedProviders = (value: unknown): string[] | undefined => Array.isArray(value)
+            ? [...new Set(value.map((provider) => String(provider).trim()).filter(Boolean))].sort()
+            : undefined;
+          const requestedManagedProviders = normalizedManagedProviders((policy as any).managedModelProviders);
+          const managedProvidersChanged = Object.prototype.hasOwnProperty.call(policy, 'managedModelProviders')
+            && (requestedManagedProviders == null || JSON.stringify(requestedManagedProviders)
+              !== JSON.stringify(normalizedManagedProviders(currentPolicy.managedModelProviders)));
+          const ownerOnlyChange = ([
+            ['managedSpendCapMicros', currentPolicy.managedSpendCapMicros ?? null],
+            ['maxActiveAgentTurns', currentPolicy.maxActiveAgentTurns ?? null],
+          ] as const).some(([key, current]) => Object.prototype.hasOwnProperty.call(policy, key)
+            && (policy as any)[key] !== current) || managedProvidersChanged;
+          if (ownerOnlyChange) {
+            const subject = requireInteractiveHuman(callerIdentity);
+            if (store.organizationMembership(organizationId, subject.userId)?.role !== 'owner')
+              return this.json(res, 403, { error: 'only an organization owner can change managed funding or agent concurrency guardrails' });
+          }
+          try { return this.json(res, 200, store.setOrganizationUsagePolicy(organizationId, policy)); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
       }
 
       if (p === '/api/inbox' && method === 'GET') {
@@ -3976,11 +4287,25 @@ export class Gateway {
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
           const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
           const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
-          await this.deps.objects.put(objectKey, data, mediaType);
+          const managedStorage = store.listStorageLocations(project.organizationId).find((location) => location.kind === 'managed');
+          if (managedStorage) store.reserveStorageUpload(`artifact:${id}`, project.organizationId, managedStorage.id,
+            data.length, Date.now() + 60 * 60_000);
+          try { await this.deps.objects.put(objectKey, data, mediaType); }
+          catch (error) { if (managedStorage) store.releaseStorageUpload(`artifact:${id}`); throw error; }
           const ttlMs = b.ttlMs == null ? undefined : Math.max(60_000, Math.min(Number(b.ttlMs), 365 * 24 * 60 * 60 * 1000));
-          const artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
-            taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
-            mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+          let artifact: ReturnType<Store['savePromotedArtifact']>;
+          try {
+            artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
+              taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
+              mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+            store.recordUsage({ id: `usage:artifact:${id}`, organizationId: project.organizationId,
+              projectId: project.id, taskId, worldId: handle.id, provider: 'managed-object-store',
+              kind: 'resource.storage', quantity: data.length, unit: 'byte', costMicros: 0, fundingSource: 'managed',
+              startedAt: artifact.createdAt, endedAt: artifact.createdAt, metadata: { artifactId: id, mediaType } });
+          } catch (error) {
+            await this.deps.objects.delete(objectKey).catch(() => undefined);
+            throw error;
+          } finally { if (managedStorage) store.releaseStorageUpload(`artifact:${id}`); }
           return this.json(res, 200, artifact);
         } finally { await access?.release(); }
       }
@@ -6514,6 +6839,7 @@ export class Gateway {
           this.deps.authorization?.grant('system:scim', { principalId: `user:${user.id}`,
             scopeKey: `organization:${organizationId}`, profileId: 'developer',
             capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] });
+          void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           return this.scimJson(res, 201, scimUser(user));
         }
         if ((method === 'PATCH' || method === 'PUT') && id) {
@@ -6522,13 +6848,17 @@ export class Gateway {
           if (!active) {
             this.deps.store.deprovisionOrganizationUser(organizationId, id);
             this.deps.identity.revokeUserSessions(id);
-          } else if (!this.deps.store.organizationMembership(organizationId, id)) this.deps.store.setOrganizationMembership(organizationId, id, 'member');
+          } else if (!this.deps.store.organizationMembership(organizationId, id)) {
+            this.deps.store.setOrganizationMembership(organizationId, id, 'member');
+          }
+          void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
           return this.scimJson(res, 200, user ? scimUser(user, active) : { id, active });
         }
         if (method === 'DELETE' && id) {
           this.deps.store.deprovisionOrganizationUser(organizationId, id);
           this.deps.identity.revokeUserSessions(id);
+          void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           res.writeHead(204); return void res.end();
         }
       }
@@ -6726,6 +7056,8 @@ export class Gateway {
     if (!this.deps.identity) return undefined;
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
+    if ((this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo()).paidLaunch && !this.deps.store.policyAcceptances(identity.user.id)
+      .some((acceptance) => acceptance.context === 'signup')) return undefined;
     const principal = `user:${identity.user.id}`;
     const resolvedOrganizationId = organizationId ?? (projectId ? this.deps.store.getProject(projectId)?.organizationId : undefined);
     if (resolvedOrganizationId) {
@@ -6773,12 +7105,39 @@ export class Gateway {
         name: label || 'Personal', kind: 'personal', ownerUserId: userId });
       this.deps.store.setDefaultOrganization(userId, organization.id);
       this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id);
+      this.deps.resources?.storageLocationService()?.ensureManaged(organization.id);
       inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId);
+      if (this.deps.hosted) this.enableHostedOnboarding(userId, organization.id);
       return true;
     } catch (e) {
       console.error('[signup] personal workspace provisioning failed:', e instanceof Error ? e.message : e);
       return false;
     }
+  }
+
+  private enableHostedOnboarding(userId: string, organizationId: string): void {
+    const key = hostedOnboardingKey(userId, organizationId);
+    if (!this.deps.store.kvGet(key))
+      this.deps.store.kvSet(key, JSON.stringify({ display: 'expanded' }));
+  }
+
+  /** Bind the pre-OAuth affirmative click to the identity returned by the social
+   * provider. The opaque, short-lived HttpOnly cookie contains no policy data or
+   * user identifier; the server consumes its hashed one-time record here. */
+  private consumeSignupPolicyAcceptance(req: http.IncomingMessage, userId: string, email: string): void {
+    const cookie = String(req.headers.cookie ?? '').split(';').map((part) => part.trim())
+      .find((part) => part.startsWith('krmax_policy_acceptance='));
+    const token = cookie?.slice(cookie.indexOf('=') + 1);
+    if (!token) return;
+    const hash = crypto.createHash('sha256').update(token).digest('hex');
+    const pending = this.pendingPolicyAcceptances.get(hash);
+    if (!pending) return;
+    this.pendingPolicyAcceptances.delete(hash);
+    try {
+      if (Number(pending.expiresAt) < Date.now()) return;
+      const versions = assertPolicyAcceptance('signup', true, pending.versions);
+      this.deps.store.recordPolicyAcceptance({ userId, email, context: 'signup', versions });
+    } catch { /* malformed/expired evidence is deliberately not recorded */ }
   }
 
   /** Installation-wide outbound email config (single row; operator-managed). */

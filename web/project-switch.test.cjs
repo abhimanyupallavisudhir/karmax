@@ -40,6 +40,8 @@ global.loadCollaboration = async () => { calls.push(`loadCollaboration:${S.organ
 global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
 global.renderRail = () => { calls.push('renderRail'); };
 global.renderMain = () => { calls.push('renderMain'); };
+global.renderOnboarding = () => { calls.push(`renderOnboarding:${S.organizationId}`); };
+global.refreshOnboarding = () => { calls.push(`refreshOnboarding:${S.organizationId}`); };
 global.renderRouteLoadingPage = (title, label) => { calls.push(`renderRouteLoadingPage:${title}:${label}`); };
 global.seedActivity = () => {};
 global.seedQueue = () => {};
@@ -170,6 +172,20 @@ const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('
   ok(S.organizationId === 'org_globex', 'the project URL selects its owning organization');
   ok(calls.includes('syncOrganizationSwitcher:org_globex'), 'the top-left organization picker follows the project URL');
   ok(calls.includes('loadCollaboration:org_globex'), 'organization-scoped data reloads after cross-organization navigation');
+  ok(calls.includes('renderOnboarding:org_globex'), 'cross-organization project navigation hides stale onboarding state immediately');
+  ok(calls.includes('refreshOnboarding:org_globex'), 'cross-organization project navigation refreshes onboarding for the selected organization');
+
+  // Organization-level routes use the same live onboarding contract even when
+  // there is no project transition to cause it incidentally.
+  calls = [];
+  location.pathname = '/initech/dashboard';
+  S.projects = [{ id: 'C', name: 'C', organizationId: 'org_initech' }];
+  global.parseRoute = () => ({ name: 'global', org: 'initech', tab: 'dashboard' });
+  global.organizationBySlug = (slug) => slug === 'initech' ? { id: 'org_initech', slug, name: 'Initech' } : null;
+  await applyRoute();
+  ok(S.organizationId === 'org_initech', 'the organization URL selects its organization');
+  ok(calls.includes('renderOnboarding:org_initech'), 'organization navigation hides stale onboarding state immediately');
+  ok(calls.includes('refreshOnboarding:org_initech'), 'organization navigation refreshes onboarding for the selected organization');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

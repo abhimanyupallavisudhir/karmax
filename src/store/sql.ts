@@ -22,6 +22,7 @@ export interface SqlDatabase {
   readonly native?: unknown;
   prepare(sql: string): SqlStatement;
   exec(sql: string): void;
+  inTransaction(): boolean;
   close(): void;
 }
 
@@ -36,6 +37,7 @@ class SqliteDatabase implements SqlDatabase {
 
   prepare(sql: string): SqlStatement { return this.raw.prepare(sql) as SqlStatement; }
   exec(sql: string): void { this.raw.exec(sql); }
+  inTransaction(): boolean { return this.raw.isTransaction; }
   close(): void { this.raw.close(); }
 }
 
@@ -65,6 +67,7 @@ class PostgresDatabase implements SqlDatabase {
   private readonly payload = new Uint8Array(new SharedArrayBuffer(4 * 1024 * 1024));
   private requestId = 0;
   private closed = false;
+  private transactionOpen = false;
 
   constructor(connectionString: string) {
     const channel = new MessageChannel();
@@ -89,7 +92,13 @@ class PostgresDatabase implements SqlDatabase {
     };
   }
 
-  exec(sql: string): void { this.call('exec', { sql }); }
+  exec(sql: string): void {
+    this.call('exec', { sql });
+    const command = sql.trimStart().toUpperCase();
+    if (command.startsWith('BEGIN')) this.transactionOpen = true;
+    else if (command.startsWith('COMMIT') || command.startsWith('ROLLBACK')) this.transactionOpen = false;
+  }
+  inTransaction(): boolean { return this.transactionOpen; }
 
   close(): void {
     if (this.closed) return;

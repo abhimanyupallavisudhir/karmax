@@ -30,6 +30,8 @@ file an operator setting lives only as long as the shell that exported it, and
 | `KARMAX_AUTH_SECRET`, `KARMAX_VAULT_KEY`, `KARMAX_WORLD_REF_KEY` | operator | Stable keys. Hosted startup refuses to boot without all three at ≥ 32 chars. |
 | `KARMAX_DATABASE_URL`, `KARMAX_TEMPORAL_*`, `KARMAX_OBJECT_STORE`, `KARMAX_S3_*` | operator | Durability. Hosted requires PostgreSQL and a real Temporal address; managed cells require S3. |
 | `KARMAX_MANAGED_STORAGE_QUOTA_BYTES` | operator | Hard physical snapshot-byte allowance per organization. Hosted defaults to 5 GiB; `0` means unlimited and is unsuitable for open registration. |
+| `KARMAX_MANAGED_MODEL_REQUEST_CEILINGS` | operator | Optional JSON map of `provider/model` (or `provider/*`) to a conservative per-request micro-dollar ceiling. Empty means BYOK-only. It authorizes bounded admission, not provider credits. |
+| `KARMAX_MANAGED_MODEL_PRICING` | operator | Optional JSON map using the same keys and `{inputMicrosPerMillionTokens, outputMicrosPerMillionTokens, cacheReadMicrosPerMillionTokens, cacheWriteMicrosPerMillionTokens}`. Complete provider-reported counters become incurred cost; otherwise the request ceiling is retained and shown explicitly as an estimate. |
 | `KARMAX_OIDC_*` | operator | Optional enterprise SSO (PKCE and issuer validation enforced). |
 | `KARMAX_GOOGLE_CLIENT_ID`, `KARMAX_GOOGLE_CLIENT_SECRET` | operator | Optional "Continue with Google". Separate from `KARMAX_OIDC_*` deliberately: that slot holds exactly one provider, so an install pointed at its company IdP would otherwise have to choose between the two. Set both or neither — the button appears only when both are non-empty. Register `https://<your-karmax-origin>/api/auth/callback/google` as the authorized redirect URI in the Google Cloud console; Better Auth serves that path itself, so it must match `KARMAX_PUBLIC_URL` exactly. Only the default `openid`/`email`/`profile` scopes are requested and no refresh token is asked for: karmax wants an identity, not access to the user's Google data, and an unused refresh token is only a long-lived secret to leak. A Google login on an address that already has a **verified** email+password account links into it rather than creating a duplicate; on an *unverified* one it is refused (the sign-in card explains why), because karmax's signup never proved that account owns the address. Read the comment in `src/auth/identity.ts` before relaxing either half of that. |
 | `KARMAX_MAX_WFT` / `_ACT` / `_CACHED_WORKFLOWS`, `KARMAX_AGENT_*` | operator | Worker and host-admission capacity. |
@@ -133,6 +135,14 @@ knowing:
   accounting. The hosted default is 5 GiB per organization. Wiki/metadata growth
   remains small-row database traffic and should still be covered by deployment
   disk monitoring and abuse controls.
+- **Platform-funded model use is opt-in, never a balance.** A hosted organization
+  cannot use an installation model credential until an owner sets a monthly
+  managed-spend cap and explicitly enables that model provider, and the operator
+  has configured a worst-case request debit for that model. The cap is a hard
+  admission guard over incurred/estimated ledger cost plus active reservations;
+  reservations are never displayed as incurred provider cost. The cap is not presented as OpenAI,
+  Anthropic, E2B, or transferable "credits". Organization API keys and subscription
+  logins remain BYOK and are reported separately from managed usage.
 - **Email addresses are unverified.** `emailVerification.sendOnSignUp` is on, but
   `requireEmailVerification` is not set, so an account is usable immediately and
   the address may be junk. Turning it on is a one-line change in
@@ -165,6 +175,103 @@ is billed by the customer and therefore has no krmax managed-storage ceiling.
 This is for large *versioned* data. A live bucket, database, or API should instead
 be configured as a project Service so tasks access it directly and krmax stores
 no snapshot copy.
+
+## Hosted SaaS subscription billing
+
+Subscription billing is enabled only when `KARMAX_DEPLOYMENT=hosted`. Private and
+self-hosted installations remain unmetered and do not contact the subscription
+provider. This billing domain pays for krmax.io itself; it is deliberately
+separate from the customer-owned cards that agents use under **Passwords &
+payments** and from the optional Stripe Issuing Connect application below.
+
+Create recurring monthly USD prices in the platform's Stripe Billing account:
+
+| Plan component | Amount |
+|---|---:|
+| Individual | $9 / month |
+| Team base (includes first active user) | $19 / month |
+| Team additional active user | $5 / month |
+
+Open **Installation settings → Paid launch** and follow the guided setup. Price
+and optional product IDs are persisted installation configuration; the Stripe
+secret key and webhook signing secret are stored in the encrypted vault. No
+subscription-billing environment variables are required. Enterprise is
+intentionally absent from self-service checkout. Register the distinct webhook
+endpoint shown on that page (normally):
+
+`https://<krmax-origin>/api/subscriptions/webhook`
+
+Subscribe it to `checkout.session.completed`, `customer.subscription.created`,
+`customer.subscription.updated`, `customer.subscription.deleted`,
+`invoice.paid`, and `invoice.payment_failed`. The gateway verifies Stripe's raw
+payload signature before parsing it. Checkout and API responses never grant a
+plan: the signed subscription event's configured price IDs are the only source
+of billed plan and seat state. Reconciliation writes effective access through
+the central organization-entitlement Store boundary. Duplicate event IDs and
+user retries are durably idempotent. Only an interactive organization owner can
+start checkout, open the portal, change or cancel a plan, or request a seat sync;
+an agent holding `payment:write` cannot administer the SaaS subscription.
+
+The canonical checkout seam is
+`POST /api/organizations/:organizationId/subscription/checkout`, backed by
+`SubscriptionBillingService.checkout`. Its response includes the server-derived
+plan and commercial snapshot, the durable local idempotency/request reference,
+and the provider checkout-session reference. Policy acceptance is deliberately
+not owned by billing; callers that require it can wrap this owner-only seam and
+persist their versioned acceptance record alongside the returned commercial
+snapshot without trusting prices submitted by the browser.
+
+Webhook reconciliation persists both the provider timestamp and a deterministic
+same-second precedence. Signed subscription snapshots outrank invoice summaries,
+terminal deletion/cancellation is sticky, and `invoice.paid` outranks an
+equal-time `invoice.payment_failed`; a strictly newer event can still recover or
+start a replacement subscription. Organization deletion is refused whenever a
+mapped provider subscription is nonterminal—even if effective access is Free.
+Only signed `canceled`/deleted or `incomplete_expired` state is terminal; an
+account with no associated provider subscription is also safe to remove.
+
+Active and trialing subscriptions grant the verified plan. Past-due
+organizations retain it for seven days and receive a billing portal recovery
+action. A process-level sweep runs every minute and returns the organization to
+Free after that grace deadline even when Stripe sends no later webhook.
+Canceled/deleted, unpaid, paused, incomplete, and expired subscriptions also
+return to Free. Existing members are not deleted when a downgrade leaves an
+organization over its member limit; the entitlement layer restricts new
+admission until the owner upgrades or reduces membership.
+
+For local test-mode setup, use Stripe test keys and forward events with the
+Stripe CLI:
+
+```bash
+stripe listen --forward-to localhost:4505/api/subscriptions/webhook
+```
+
+Copy the CLI's `whsec_...` value into Installation settings → Paid launch, use
+test-mode price IDs there, and start with `KARMAX_DEPLOYMENT=hosted`. The
+automated suite does not use the CLI,
+network, or paid calls: `FakeSubscriptionProvider` drives signed-event-equivalent
+fixtures against an in-memory database.
+
+## Organization usage admission
+
+Organization settings exposes current-month incurred cost, explicitly estimated
+cost, active reservations, and provider-reported token or request quantities,
+split into managed and BYOK funding, plus active model turns,
+remote worlds, and commands. Provider/model allowlists, per-minute model and
+sandbox start limits, and concurrent turn/world limits are enforced immediately
+before the trusted provider boundary. Hosted concurrency defaults to the central
+Free/Individual/Team entitlement (1/5/10 shared active agent runs); the usage
+policy can only supply an owner-selected tighter cap. Admission rows use the durable agent-turn
+id, and provider lifecycle rows use provider execution ids, so activity retries
+and reconciliation/webhook duplication cannot reserve or count the same work
+twice.
+
+Remote E2B and Daytona launch remains organization BYOK. Runner pools control
+capacity; they do not confer provider balance. The organization API refuses a
+centrally funded remote pool, and the execution boundary rejects legacy managed
+remote pools on hosted deployments. Centrally resold E2B would require a separate
+installation authorization and billing boundary that this deployment does not
+implement.
 
 ## Payment rails
 
