@@ -56,6 +56,13 @@ describe('GitHub re-authorization affordance', () => {
     expect(gatewaySource).toContain("pending.returnTo === 'profile'");
     expect(gatewaySource).toContain('userProfilePath(this.deps.store, pending.organizationId)');
   });
+
+  it('shows the preserved secret-free authorization failure on the profile', () => {
+    expect(source).toContain('data.githubApp?.lastAuthorizationFailure');
+    expect(source).toContain('GitHub identity disconnected');
+    expect(source).toContain('also preserved in the audit log');
+    expect(source).toContain('failure.code');
+  });
 });
 
 describe('GitHub merge authorization UX', () => {

@@ -13331,7 +13331,13 @@ async function hydrateProfileGithub() {
   catch (error) { if (renderIsCurrent()) paneError(box, error, hydrateProfileGithub); return; }
   if (!renderIsCurrent()) return;
   const accounts = data.accounts || [];
-  box.innerHTML = `<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
+  const failure = data.githubApp?.lastAuthorizationFailure;
+  const failureDetail = failure ? `<div class="card" style="padding:10px;border-color:var(--warn);margin-bottom:10px">
+    <b>${failure.disconnected ? 'GitHub identity disconnected' : 'GitHub identity refresh failed'}</b>
+    <div class="task-sub" style="margin-top:4px">${esc(failure.summary)} <span class="chip">${esc(failure.code)}</span></div>
+    <div class="task-sub" style="margin-top:3px">Recorded ${esc(new Date(failure.occurredAt).toLocaleString())}. The diagnostic is secret-free and is also preserved in the audit log.</div>
+  </div>` : '';
+  box.innerHTML = `${failureDetail}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
     <span class="github-account-label">${githubMark()}<b>${esc(account.login)}</b>${account.active ? '<span class="chip">Active</span>' : ''}</span>
     <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
   </div>`).join('')}</div>

@@ -1708,7 +1708,14 @@ describe('PR stage (remote policy "pr")', () => {
     const repo = await repoWithGithubOrigin('missing-human');
     const transport = vi.fn(async () => ({ env: {} }));
     const core = await coreFor(gh, {
-      status: () => ({ configured: true, oauthConfigured: true, userAuthorized: false }),
+      status: () => ({ configured: true, oauthConfigured: true, userAuthorized: false,
+        lastAuthorizationFailure: {
+          code: 'refresh_rejected',
+          summary: 'GitHub rejected the refresh token (bad_refresh_token). Reconnect GitHub.',
+          occurredAt: Date.parse('2026-08-17T06:30:00.000Z'),
+          disconnected: true,
+          providerError: 'bad_refresh_token',
+        } }),
       activeUserAccountId: () => undefined,
       repositoryCloneToken: async () => 'clone-token',
       brokerCredentials: transport,
@@ -1730,7 +1737,7 @@ describe('PR stage (remote policy "pr")', () => {
     await git(handle.root, ['commit', '-q', '-m', 'change']);
 
     await expect(core.openPr(handle, 'main', {})).rejects.toThrow(
-      /GitHub PR identity is not connected.*Connect GitHub on your profile.*not a non-fast-forward or local ancestry error/i,
+      /GitHub PR identity is not connected.*Last recorded authorization failure:.*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a non-fast-forward or local ancestry error/i,
     );
     expect(transport).not.toHaveBeenCalled();
     await core.destroyWorld(handle);
