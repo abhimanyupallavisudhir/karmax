@@ -1,7 +1,7 @@
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
-import { TokenAuthority, type ScopedToken } from './tokens.js';
+import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, allows } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
@@ -1052,7 +1052,7 @@ export class KarmaxApi {
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
-    const delegation = this.deps.tokens.delegateHuman(token, {
+    const delegation = this.delegateTaskHuman(token, caller, {
       taskId: task.id,
       projectId: authorizationScope.scope ? undefined : task.projectId,
       projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
@@ -1777,7 +1777,7 @@ export class KarmaxApi {
         : caller.humanSubject
           ? this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)
           : undefined);
-    const delegation = this.deps.tokens.delegateHuman(token, {
+    const delegation = this.delegateTaskHuman(token, caller, {
       taskId,
       projectId: authorizationScope.scope ? undefined : task.projectId,
       projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
@@ -1839,6 +1839,16 @@ export class KarmaxApi {
       throw new CapabilityError('this token cannot delegate global access');
     }
     return caller.caps;
+  }
+
+  /** `taskGrant` has already checked an interactive human's durable grants for
+   * the selected scope. Preserve that wider authorization when the browser's
+   * short-lived API token is intentionally narrowed to the current route's
+   * project; non-human callers still attenuate strictly from their bearer. */
+  private delegateTaskHuman(token: string, caller: ScopedToken, args: HumanDelegationArgs) {
+    return this.deps.authorization && caller.kind === 'human' && caller.principal.startsWith('user:')
+      ? this.deps.tokens.delegateAuthorizedInteractiveHuman(token, args)
+      : this.deps.tokens.delegateHuman(token, args);
   }
 
   /**
