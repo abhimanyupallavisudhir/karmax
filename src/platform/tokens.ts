@@ -35,6 +35,15 @@ export interface HumanDelegation {
   expiresAt: number;
 }
 
+export interface HumanDelegationArgs {
+  taskId: string;
+  projectId?: string;
+  projectIds?: string[];
+  organizationId?: string;
+  externalIdentities?: ExternalIdentityClaims;
+  ttlMs?: number;
+}
+
 /**
  * Workflow-minted scoped tokens (SPEC §8.3). The workflow mints the agent's
  * credential when it spawns the agent — it alone knows the task, the profile,
@@ -166,10 +175,7 @@ export class TokenAuthority {
   /** Pin a human subject to a task from an already verified bearer. For an
    * interactive human, the external identity was selected by trusted host code;
    * an agent may only inherit its existing pinned identity unchanged. */
-  delegateHuman(token: string, args: {
-    taskId: string; projectId?: string; projectIds?: string[]; organizationId?: string;
-    externalIdentities?: ExternalIdentityClaims; ttlMs?: number;
-  }): HumanDelegation | undefined {
+  delegateHuman(token: string, args: HumanDelegationArgs): HumanDelegation | undefined {
     const parent = this.verify(token);
     if (!parent?.humanSubject) return undefined;
     this.assertScopeWithin(parent, args);
@@ -179,6 +185,22 @@ export class TokenAuthority {
       externalIdentities: args.externalIdentities ?? parent.externalIdentities,
       parentDelegationId: parent.delegationId,
       maxExpiresAt: parent.delegationId ? this.delegation(parent.delegationId)?.expiresAt : undefined });
+  }
+
+  /** Pin the subject of a live human session to a scope already authorized by
+   * the durable authorization service. Browser API tokens are narrowed to the
+   * project in the current route, so their resource scope cannot also be used as
+   * the authority boundary for an explicitly verified multi-project,
+   * organization, or global task grant. This trusted path deliberately accepts
+   * only an interactive human — delegated agents must keep using
+   * `delegateHuman`, which enforces strict scope attenuation. */
+  delegateAuthorizedInteractiveHuman(token: string, args: HumanDelegationArgs): HumanDelegation | undefined {
+    const parent = this.verify(token);
+    if (!parent?.humanSubject) return undefined;
+    if (parent.kind !== 'human' || parent.humanSubject.presence !== 'interactive')
+      throw new Error('authorized delegation requires an interactive human');
+    return this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
+      externalIdentities: args.externalIdentities ?? parent.externalIdentities });
   }
 
   /** Derive a child-task delegation from durable parent provenance. This is used

@@ -286,7 +286,7 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     expect(autonomousRetry.record.humanSubject).toBeUndefined();
   });
 
-  it('refreshes project-scoped human delegation when a draft is promoted to Administrator', async () => {
+  it('uses durable Administrator scope beyond a project-bound browser token', async () => {
     const organizationId = store.getProject(mine)!.organizationId!;
     const authorization = new AuthorizationService(store);
     authorization.grant('root', {
@@ -296,7 +296,9 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
       store, client: {} as any, taskQueue: 'karmax', tokens, contentDir,
       worlds: new WorldRegistry(), authorization,
     });
-    const human = tokens.mintPrincipal('user:a', ['*'], undefined, 60_000, organizationId);
+    // Browser requests are deliberately pinned to the project in the current
+    // route even when the signed-in human has a durable organization grant.
+    const human = tokens.mintPrincipal('user:a', ['*'], mine, 60_000, organizationId);
     const draft = await delegatedApi.createTask(human.token, {
       projectId: mine, title: 'Cross-project investigation', prompt: 'inspect a sibling project', draft: true,
       authorization: { level: 'developer', scope: 'projects', projectIds: [mine] },
@@ -317,6 +319,18 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
       taskId: draft.id, profileId: 'do', role: 'do', principal: 'user:a', organizationId,
       ceiling: ['task:read'], grantorCaps: administratorAuthorization.capabilities,
       delegationId: administratorAuthorization.delegationId,
+    })).not.toThrow();
+
+    const direct = await delegatedApi.createTask(human.token, {
+      projectId: mine, title: 'Direct Administrator task', prompt: 'inspect a sibling project', draft: true,
+      authorization: { level: 'administrator', scope: 'organization' },
+    });
+    const directAuthorization = direct.params._authorization as any;
+    expect(directAuthorization.delegationId).toMatch(/^dlg_/);
+    expect(() => tokens.mint({
+      taskId: direct.id, profileId: 'do', role: 'do', principal: 'user:a', organizationId,
+      ceiling: ['task:read'], grantorCaps: directAuthorization.capabilities,
+      delegationId: directAuthorization.delegationId,
     })).not.toThrow();
   });
 
