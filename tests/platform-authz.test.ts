@@ -148,6 +148,35 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     await denied(() => api.setAgentCapacity(reader, 4));
   });
 
+  it('uses the caller organization queue and entitlement capacity on hosted deployments', async () => {
+    const hostedStore = new Store(':memory:', { hosted: true });
+    const hostedTokens = new TokenAuthority();
+    const ownOrg = hostedStore.createOrganization({ name: 'Hosted mine', ownerUserId: 'owner' });
+    const otherOrg = hostedStore.createOrganization({ name: 'Hosted other', ownerUserId: 'other' });
+    hostedStore.setOrganizationPlan(ownOrg.id, 'team');
+    const project = hostedStore.createProject('Hosted project', {}, ownOrg.id);
+    const handles: string[] = [];
+    const signals: string[] = [];
+    const hostedApi = new KarmaxApi({
+      store: hostedStore, tokens: hostedTokens, taskQueue: 'karmax', contentDir, worlds: new WorldRegistry(),
+      client: { workflow: { getHandle: (workflowId: string) => {
+        handles.push(workflowId);
+        return {
+          query: async () => ({ capacity: 10, queue: [], current: [] }),
+          signal: async () => { signals.push(workflowId); },
+        };
+      } } } as any,
+    });
+    const hostedToken = hostedTokens.mintPrincipal('user:owner', ['queue:read', 'queue:write'],
+      project.id, 60_000, ownOrg.id).token;
+
+    await expect(hostedApi.agentQueueView(hostedToken)).resolves.toMatchObject({ capacity: 10 });
+    expect(handles).toEqual([`agent-queue:${ownOrg.id}`]);
+    await expect(hostedApi.agentQueueView(hostedToken, otherOrg.id)).rejects.toBeInstanceOf(CapabilityError);
+    await hostedApi.moveAgentQueueItem(hostedToken, 'turn-1');
+    expect(signals).toEqual([`agent-queue:${ownOrg.id}`]);
+  });
+
   /** A merge-queue domain spans projects; an unscoped read leaked their ids. */
   it('filters the merge queue to the token’s project when none is named', async () => {
     const ours = store.createTask({ projectId: mine, title: 'Ours', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });

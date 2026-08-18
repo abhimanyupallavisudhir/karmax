@@ -7223,7 +7223,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
-    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
+    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
   const agentForks = agentForksSection(v);
@@ -8115,6 +8115,17 @@ function waitingText(w) {
   return `Waiting for ${label}`;
 }
 
+// The durable wait detail is actionable when admission itself is blocked (for
+// example by a plan/member mismatch). Do not replace that diagnosis with the
+// generic host-slot label in the adjacent agent-turn card.
+function agentTurnStateText(v) {
+  if (v?.agentTurn?.state === 'running') return 'running';
+  const detail = v?.waitingFor?.kind === 'agentSlot' && typeof v.waitingFor.detail === 'string'
+    ? v.waitingFor.detail.trim()
+    : '';
+  return detail || 'waiting for an agent slot';
+}
+
 // A targeted human hold carries the actual question a person must answer. Keep
 // compact labels stable via waitingText(), but never hide this detail on the task
 // page—the agent may have used its final tool call to deliver the findings and
@@ -8884,6 +8895,11 @@ function taskMergeDomains(view) {
   return state.mergeDomain ? [state.mergeDomain] : [];
 }
 
+function agentQueueApi(path = '') {
+  const organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+  return `/api/agent-queue${path}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`;
+}
+
 async function seedQueue() {
   const projectId = S.projectId;
   const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
@@ -8899,7 +8915,7 @@ async function seedQueue() {
     }),
   );
   let agentQueue = S.agentQueue;
-  try { agentQueue = await api('/api/agent-queue'); } catch {}
+  try { agentQueue = await api(agentQueueApi()); } catch {}
   if (S.queueLoadEpoch !== epoch || S.projectId !== projectId) return;
   S.queueOrders = orders;
   S.agentQueue = agentQueue;
@@ -9086,7 +9102,7 @@ function wireQueueView() {
       renderMain();
       const beforeTurnId = b.dataset.agentMove === 'top' ? rest[0]?.turnId : undefined;
       try {
-        await api('/api/agent-queue/move', { method: 'POST', body: JSON.stringify({ turnId, beforeTurnId }) });
+        await api(agentQueueApi('/move'), { method: 'POST', body: JSON.stringify({ turnId, beforeTurnId }) });
         toast(b.dataset.agentMove === 'top' ? 'Moved to top' : 'Moved to bottom');
         setTimeout(seedQueue, 300);
       } catch (e) { toast(e.message, true); seedQueue(); }
@@ -9125,7 +9141,7 @@ function wireAgentQueueDrag(list) {
     const byId = new Map((S.agentQueue.queue || []).map((x) => [x.turnId, x]));
     S.agentQueue.queue = rows.map((r) => byId.get(r.dataset.agentTurn)).filter(Boolean);
     try {
-      await api('/api/agent-queue/move', { method: 'POST', body: JSON.stringify({ turnId, beforeTurnId }) });
+      await api(agentQueueApi('/move'), { method: 'POST', body: JSON.stringify({ turnId, beforeTurnId }) });
       setTimeout(seedQueue, 300);
     } catch (err) { toast(err.message, true); seedQueue(); }
   });

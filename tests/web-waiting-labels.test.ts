@@ -31,6 +31,7 @@ vm.runInContext(
     extractFunction('pendingCancellationView'),
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
+    extractFunction('agentTurnStateText'),
     extractFunction('humanWaitDetail'),
     extractFunction('conversationTextKey'),
     extractFunction('conversationInputRequest'),
@@ -44,6 +45,7 @@ vm.runInContext(
 
 const stageLabel = context.stageLabel as (view: Record<string, any>) => string;
 const waitingText = context.waitingText as (wait: Record<string, any>) => string;
+const agentTurnStateText = context.agentTurnStateText as (view: Record<string, any>) => string;
 const humanWaitDetail = context.humanWaitDetail as (view: Record<string, any>) => string;
 const conversationInputRequest = context.conversationInputRequest as (
   view: Record<string, any>,
@@ -132,6 +134,19 @@ describe('waiting labels in task summaries', () => {
       kind: 'responder',
       detail: 'The response agent is answering the working agent',
     })).toBe('Waiting for responder');
+  });
+
+  it('keeps an actionable admission failure in the agent-turn card', () => {
+    expect(agentTurnStateText({
+      agentTurn: { state: 'waiting-slot' },
+      waitingFor: {
+        kind: 'agentSlot',
+        detail: 'Free allows 1 organization user, but this organization has 2.',
+      },
+    })).toBe('Free allows 1 organization user, but this organization has 2.');
+    expect(agentTurnStateText({ agentTurn: { state: 'waiting-slot' } }))
+      .toBe('waiting for an agent slot');
+    expect(agentTurnStateText({ agentTurn: { state: 'running' } })).toBe('running');
   });
 
   it('retains the concrete question for a targeted human hold', () => {

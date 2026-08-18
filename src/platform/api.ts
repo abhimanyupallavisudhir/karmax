@@ -4393,11 +4393,31 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     }
   }
 
-  async agentQueueView(token: string): Promise<{ capacity: number; queue: any[]; current: any[] }> {
+  async agentQueueView(token: string, requestedOrganizationId?: string): Promise<{ capacity: number; queue: any[]; current: any[] }> {
     // The host agent-queue is a queue surface, not a task read: bind it to the
     // same `queue:read`/`queue:write` pair the gateway route uses, so a
     // maintainer (queue:*) is not refused by one layer and allowed by the other.
-    this.require(token, 'queue:read');
+    const caller = this.require(token, 'queue:read', requestedOrganizationId
+      ? { organizationId: requestedOrganizationId }
+      : undefined);
+    const organizationId = requestedOrganizationId
+      ?? caller.organizationId
+      ?? (caller.projectId ? this.deps.store.getProject(caller.projectId)?.organizationId : undefined);
+    if (this.deps.store.hosted && !organizationId)
+      throw new CapabilityError('hosted agent queues require an organization scope');
+    if (organizationId && !requestedOrganizationId)
+      this.require(token, 'queue:read', { organizationId });
+    if (this.deps.store.hosted) {
+      const entitlements = this.deps.store.organizationEntitlements(organizationId!);
+      const fallback = entitlements.agentRunAdmissionAllowed
+        ? entitlements.maxActiveAgentRuns ?? 0
+        : 0;
+      try {
+        return (await this.deps.client.workflow.getHandle(agentQueueId(organizationId)).query(QRY_AGENT_QUEUE)) as any;
+      } catch {
+        return { capacity: fallback, queue: [], current: [] };
+      }
+    }
     const saved = Number(this.deps.store.getSettings('global', 'agent-queue')?.capacity);
     const fallback = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3;
     try {
@@ -4407,9 +4427,20 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     }
   }
 
-  async moveAgentQueueItem(token: string, turnId: string, beforeTurnId?: string): Promise<void> {
-    this.require(token, 'reorder_queue');
-    await this.deps.client.workflow.getHandle(agentQueueId()).signal(SIG_REORDER, { turnId, beforeTurnId });
+  async moveAgentQueueItem(token: string, turnId: string, beforeTurnId?: string,
+    requestedOrganizationId?: string): Promise<void> {
+    const caller = this.require(token, 'reorder_queue', requestedOrganizationId
+      ? { organizationId: requestedOrganizationId }
+      : undefined);
+    const organizationId = requestedOrganizationId
+      ?? caller.organizationId
+      ?? (caller.projectId ? this.deps.store.getProject(caller.projectId)?.organizationId : undefined);
+    if (this.deps.store.hosted && !organizationId)
+      throw new CapabilityError('hosted agent queues require an organization scope');
+    if (organizationId && !requestedOrganizationId)
+      this.require(token, 'reorder_queue', { organizationId });
+    await this.deps.client.workflow.getHandle(agentQueueId(this.deps.store.hosted ? organizationId : undefined))
+      .signal(SIG_REORDER, { turnId, beforeTurnId });
   }
 
   /** Host-wide concurrent agent turns. Installation configuration, so it takes

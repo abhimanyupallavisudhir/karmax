@@ -4609,11 +4609,13 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/agent-queue' && method === 'GET') {
-        return this.json(res, 200, await api.agentQueueView(token));
+        return this.json(res, 200, await api.agentQueueView(token,
+          url.searchParams.get('organizationId') ?? undefined));
       }
       if (p === '/api/agent-queue/move' && method === 'POST') {
         const b = await this.body(req);
-        await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined);
+        await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined,
+          url.searchParams.get('organizationId') ?? undefined);
         return this.json(res, 200, { ok: true });
       }
       // Wiki — org/project skills, memories, and general prompts. One route

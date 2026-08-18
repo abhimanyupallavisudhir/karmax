@@ -79,6 +79,12 @@ describe('hosted plan organization UI', () => {
     expect(hydration).toContain('organizationPlanMarkup(entitlements)');
   });
 
+  it('loads the selected organization agent queue instead of the legacy global queue', () => {
+    const endpoint = extractFunction('agentQueueApi');
+    expect(endpoint).toContain('projectById(S.projectId)?.organizationId');
+    expect(endpoint).toContain('?organizationId=');
+  });
+
   it('renders subscription prices and owner controls from server-derived state', () => {
     const subscription = extractFunction('hydrateOrganizationSubscription');
     expect(subscription).toContain('monthlyBasePriceCents');
