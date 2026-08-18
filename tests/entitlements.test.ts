@@ -221,6 +221,88 @@ describe('hosted agent-run admission integration', () => {
     expect(Number((store.db.prepare('SELECT COUNT(*) n FROM usage_admissions').get() as any).n)).toBe(0);
   });
 
+  it('reclaims stale queue and trusted-admission turns without evicting live owners', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Recovered capacity', ownerUserId: 'owner' });
+    const project = store.createProject('Product', {}, organization.id);
+    const stale = store.createTask({ projectId: project.id, title: 'Interrupted', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } });
+    const live = store.createTask({ projectId: project.id, title: 'Live', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } });
+    const staleTurn = `${stale.id}#0`;
+    const liveTurn = `${live.id}#0`;
+    store.admitAgentUsage({ id: staleTurn, organizationId: organization.id,
+      projectId: project.id, taskId: stale.id, provider: 'openai', fundingSource: 'byok' });
+
+    const signals: Array<{ name: string; value: unknown }> = [];
+    const queueHandle = {
+      signal: vi.fn(async (name: string, value: unknown) => { signals.push({ name, value }); }),
+      query: vi.fn(async () => ({ capacity: 1,
+        current: [{ taskId: stale.id, turnId: staleTurn, role: 'do' }],
+        queue: [{ taskId: live.id, turnId: liveTurn, role: 'do' }] })),
+    };
+    const taskViews = new Map([
+      [stale.id, { status: 'active' }],
+      [live.id, { status: 'waiting', agentTurn: { turnId: liveTurn, state: 'waiting-slot' } }],
+    ]);
+    const client = { workflow: { getHandle: vi.fn((id: string) => id === `agent-queue:${organization.id}`
+      ? queueHandle : { query: vi.fn(async () => taskViews.get(id)) }) } } as any;
+    const reconciler = new EntitlementQueueReconciler({ store, client, intervalMs: 0 });
+
+    await reconciler.reconcileOrganization(organization.id);
+
+    expect(signals).toContainEqual({ name: 'setAgentCapacity', value: { capacity: 1 } });
+    expect(signals).toContainEqual({ name: 'releaseAgentSlot',
+      value: { taskId: stale.id, turnId: staleTurn } });
+    expect(signals).not.toContainEqual(expect.objectContaining({ name: 'cancelAgentSlot' }));
+    expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(staleTurn))
+      .toEqual({ state: 'released' });
+  });
+
+  it('preserves queue and usage leases when task ownership cannot be queried', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Conservative recovery', ownerUserId: 'owner' });
+    const project = store.createProject('Product', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Temporarily unreachable', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'Run' } });
+    const turnId = `${task.id}#0`;
+    store.admitAgentUsage({ id: turnId, organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' });
+    const signal = vi.fn(async () => undefined);
+    const queueHandle = { signal, query: vi.fn(async () => ({ capacity: 1,
+      current: [{ taskId: task.id, turnId, role: 'do' }], queue: [] })) };
+    const client = { workflow: { getHandle: vi.fn((id: string) => id === `agent-queue:${organization.id}`
+      ? queueHandle : { query: vi.fn(async () => { throw new Error('temporarily unavailable'); }) }) } } as any;
+
+    await new EntitlementQueueReconciler({ store, client, intervalMs: 0 })
+      .reconcileOrganization(organization.id);
+
+    expect(signal).toHaveBeenCalledTimes(1);
+    expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(turnId))
+      .toEqual({ state: 'active' });
+  });
+
+  it('preserves pre-durable usage admissions whose workflow view has no turn identity', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Historical workflow', ownerUserId: 'owner' });
+    const project = store.createProject('Product', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Legacy', workflow: 'software-dev',
+      workflowVersion: '1.3.0', params: { prompt: 'Run' } });
+    const turnId = `agent:${task.id}:do:1`;
+    store.admitAgentUsage({ id: turnId, organizationId: organization.id,
+      projectId: project.id, taskId: task.id, provider: 'openai', fundingSource: 'byok' });
+    const queueHandle = { signal: vi.fn(async () => undefined),
+      query: vi.fn(async () => ({ capacity: 1, current: [], queue: [] })) };
+    const client = { workflow: { getHandle: vi.fn((id: string) => id === `agent-queue:${organization.id}`
+      ? queueHandle : { query: vi.fn(async () => ({ status: 'active' })) }) } } as any;
+
+    await new EntitlementQueueReconciler({ store, client, intervalMs: 0 })
+      .reconcileOrganization(organization.id);
+
+    expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(turnId))
+      .toEqual({ state: 'active' });
+  });
+
   it('reconciles the durable queue directly from member and billing-plan mutations', async () => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'Reconcile', ownerUserId: 'owner' });

@@ -4957,6 +4957,12 @@ export class Store {
   /** Idempotent model admission. The stable turn id is the retry key: a retry
    * reuses an active reservation, while a completed turn is rejected rather
    * than billed twice after an acknowledgement loss. */
+  activeAgentUsageAdmissions(organizationId: string): Array<{ id: string; taskId: string }> {
+    return this.db.prepare(`SELECT id, taskId FROM usage_admissions
+      WHERE organizationId=? AND kind='agent' AND state='active' ORDER BY createdAt`)
+      .all(organizationId) as Array<{ id: string; taskId: string }>;
+  }
+
   admitAgentUsage(input: { id: string; organizationId: string; projectId: string; taskId: string;
     provider: string; model?: string; fundingSource: 'managed' | 'byok' | 'customer';
     reservedCostMicros?: number; now?: number }): { reused: boolean } {

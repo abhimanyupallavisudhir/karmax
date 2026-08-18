@@ -1,6 +1,34 @@
 import type { Client } from '@temporalio/client';
-import { SIG_SET_AGENT_CAPACITY, agentQueueId } from '../coordinators/names.js';
+import {
+  QRY_AGENT_QUEUE,
+  SIG_CANCEL_AGENT,
+  SIG_RELEASE_AGENT,
+  SIG_SET_AGENT_CAPACITY,
+  agentQueueId,
+} from '../coordinators/names.js';
 import type { Store } from '../store/db.js';
+
+interface AgentQueueItem {
+  taskId: string;
+  turnId: string;
+}
+
+interface AgentQueueView {
+  queue: AgentQueueItem[];
+  current: AgentQueueItem[];
+}
+
+function hasDurableTurnIdentity(store: Store, taskId: string): boolean {
+  const task = store.getTask(taskId);
+  if (!task) return true;
+  const [major = 0, minor = 0] = task.workflowVersion.split('.').map(Number);
+  if (major > 1) return true;
+  if (major < 1) return false;
+  const workflow = task.executionWorkflow ?? task.workflow;
+  if (workflow === 'software-dev' || workflow === 'goal') return minor >= 4;
+  if (workflow === 'just-do' || workflow === 'merge-only') return minor >= 2;
+  return false;
+}
 
 export interface EntitlementQueueReconcilerOptions {
   store: Store;
@@ -89,7 +117,60 @@ export class EntitlementQueueReconciler {
       ? entitlements.maxActiveAgentRuns
       : 0;
     if (capacity == null) return;
-    await this.options.client.workflow.getHandle(agentQueueId(organizationId))
-      .signal(SIG_SET_AGENT_CAPACITY, { capacity });
+    const handle = this.options.client.workflow.getHandle(agentQueueId(organizationId));
+    await handle.signal(SIG_SET_AGENT_CAPACITY, { capacity });
+
+    // Task-level liveness is insufficient: a task can remain alive after one of
+    // its model activities was killed or cancelled. Its workflow view carries
+    // the stable turn id, so reclaim only entries it explicitly no longer owns.
+    // A query failure is conservative and preserves a possibly-live lease.
+    const ownership = new Map<string, Promise<boolean>>();
+    const stillOwned = (taskId: string, turnId: string): Promise<boolean> => {
+      const key = `${taskId}\0${turnId}`;
+      let result = ownership.get(key);
+      if (!result) {
+        result = (async () => {
+          try {
+            const taskView = await this.options.client.workflow.getHandle(taskId).query('view') as {
+              status?: string;
+              agentTurn?: { turnId?: string; state?: string };
+            };
+            return !['done', 'failed', 'cancelled'].includes(taskView.status ?? '')
+              && taskView.agentTurn?.turnId === turnId
+              && (taskView.agentTurn.state === 'waiting-slot' || taskView.agentTurn.state === 'running');
+          } catch {
+            return true;
+          }
+        })();
+        ownership.set(key, result);
+      }
+      return result;
+    };
+
+    // Usage admission is a second, trusted enforcement boundary for historical
+    // and external workflows. It must retain the plan cap, but not dead activity
+    // residue that can otherwise consume Free's only slot forever. Pre-durable
+    // workflow versions did not expose stable turn ownership in their views, so
+    // preserve those admissions rather than mistaking an old shape for staleness.
+    for (const admission of this.options.store.activeAgentUsageAdmissions(organizationId)) {
+      if (hasDurableTurnIdentity(this.options.store, admission.taskId)
+        && !(await stillOwned(admission.taskId, admission.id)))
+        this.options.store.finishUsageAdmission(admission.id, false);
+    }
+
+    let view: AgentQueueView;
+    try {
+      view = await handle.query(QRY_AGENT_QUEUE) as AgentQueueView;
+    } catch {
+      return;
+    }
+    for (const item of view.current) {
+      if (!(await stillOwned(item.taskId, item.turnId)))
+        await handle.signal(SIG_RELEASE_AGENT, { taskId: item.taskId, turnId: item.turnId });
+    }
+    for (const item of view.queue) {
+      if (!(await stillOwned(item.taskId, item.turnId)))
+        await handle.signal(SIG_CANCEL_AGENT, { taskId: item.taskId, turnId: item.turnId });
+    }
   }
 }
