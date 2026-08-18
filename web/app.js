@@ -5418,8 +5418,12 @@ async function openTaskForm(workflow, draft, seedText) {
           const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
           draftId = created.id;
         } else {
-          await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
-          await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+          await Promise.all([
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) }),
+            api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
+          ]);
+          // Authorization is stored inside params, so it must follow the params
+          // replacement. Notes use an independent column and can land alongside it.
           await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, allowAttenuation: true }) });
         }
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
@@ -5483,17 +5487,34 @@ async function openTaskForm(workflow, draft, seedText) {
   // clicking a button still keeps the draft.
   closeForm = () => { clearTimeout(saveTimer); const st = formState(); root.innerHTML = ''; persistDraft(st); };
 
-  const submit = async (draftMode, authorizationDecision) => {
+  let submitInFlight = false;
+  const submit = async (draftMode, authorizationDecision, activeFeedback) => {
+    const ownsFeedback = !activeFeedback;
+    if (ownsFeedback && submitInFlight) return false;
+    const submitButtons = [$('#tf-draft'), $('#tf-queue')].filter(Boolean);
+    const previousDisabled = ownsFeedback ? submitButtons.map((button) => button.disabled) : [];
+    if (ownsFeedback) {
+      submitInFlight = true;
+      activeFeedback = beginActionFeedback(draftMode ? $('#tf-draft') : $('#tf-queue'));
+      submitButtons.forEach((button) => { button.disabled = true; });
+      const saveState = $('#tf-savestate');
+      if (saveState) saveState.textContent = draftMode
+        ? 'Saving draft…'
+        : editInPlace ? 'Saving…' : draft ? 'Queueing task…' : 'Creating task…';
+    }
+    let succeeded = false;
     clearTimeout(saveTimer);
     const st = formState();
     // Drain any in-flight auto-save first: it may still be creating the draft (setting
     // draftId) or PATCHing older text. Waiting lets the branches below see the right
     // draftId and land last, so the explicit save/queue reflects the final form state.
     await saveChain.catch(() => {});
+    const currentStateAlreadySaved = stateSig(st) === lastSaved;
     const attemptCount = Math.max(1, Math.min(8, Number($('#tf-attempt-count')?.value || 1)));
     try {
       let primaryId = draftId || draft?.id || null;
       let createdWithAttempts = false;
+      let knownDraftAttemptIds = [];
       const authorizationOptions = {
         ...(draftMode ? { allowAttenuation: true } : {}),
         ...(authorizationDecision === 'limit' ? { acceptAttenuation: true } : {}),
@@ -5502,15 +5523,27 @@ async function openTaskForm(workflow, draft, seedText) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
-        await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        await Promise.all([
+          api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) }),
+          api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
+        ]);
         await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
-        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
-        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) });
-        if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        // The usual expanded-form path was just persisted by auto-save. Do not
+        // spend another RTT writing identical params and notes before queueing.
+        if (!currentStateAlreadySaved) {
+          await Promise.all([
+            api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) }),
+            api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) }),
+          ]);
+        }
+        await Promise.all([
+          api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, ...authorizationOptions }) }),
+          ...(localCred && hasPolicy()
+            ? [api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) })]
+            : []),
+        ]);
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
         // requested siblings have been materialised.
@@ -5532,14 +5565,26 @@ async function openTaskForm(workflow, draft, seedText) {
       // Auto-save may have created the principal before Submit knew the count.
       // Create every sibling before starting any of them.
       if (!draft && primaryId && !createdWithAttempts) {
-        for (let i = 1; i < attemptCount; i++) await api(`/api/tasks/${primaryId}/attempts`, { method: 'POST', body: '{}' });
+        const alternates = await Promise.all(Array.from({ length: attemptCount - 1 }, () =>
+          api(`/api/tasks/${primaryId}/attempts`, { method: 'POST', body: '{}' })));
+        knownDraftAttemptIds = [primaryId, ...alternates.map((attempt) => attempt.id)];
       }
       if (!draft && primaryId && !draftMode) {
-        const group = await api(`/api/tasks/${primaryId}/attempts`);
-        for (const attempt of group?.attempts || []) {
-          if (attempt.params?.draft) await api(`/api/tasks/${attempt.id}/queue`, { method: 'POST', body: '{}' });
+        // A direct create with draft:false starts the principal and all requested
+        // alternates before its response resolves. Asking for the group just to
+        // discover there is nothing left to queue adds a full redundant RTT.
+        const alreadyStarted = createdWithAttempts && !hasPolicy();
+        if (knownDraftAttemptIds.length) {
+          await Promise.all(knownDraftAttemptIds.map((taskId) =>
+            api(`/api/tasks/${taskId}/queue`, { method: 'POST', body: '{}' })));
+        } else if (!alreadyStarted) {
+          const group = await api(`/api/tasks/${primaryId}/attempts`);
+          await Promise.all((group?.attempts || [])
+            .filter((attempt) => attempt.params?.draft)
+            .map((attempt) => api(`/api/tasks/${attempt.id}/queue`, { method: 'POST', body: '{}' })));
+        }
       }
-      }
+      succeeded = true;
       root.innerHTML = '';
       // Keep the toast in the button's vocabulary. Queuing an EXISTING draft used to
       // say "Task created" — nothing was created, the task already existed, so the
@@ -5553,8 +5598,11 @@ async function openTaskForm(workflow, draft, seedText) {
       if (!draftMode && isAuthorizationGrantGap(e)) {
         try {
           const decision = await chooseAuthorizationGrant(projectId, st.authorization, 'task agent');
-          if (!decision) return;
-          if (decision.action === 'limit') return submit(false, 'limit');
+          if (!decision) return false;
+          if (decision.action === 'limit') {
+            succeeded = await submit(false, 'limit', activeFeedback);
+            return succeeded;
+          }
           let targetId = draftId || draft?.id;
           if (!targetId) {
             const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({
@@ -5578,11 +5626,26 @@ async function openTaskForm(workflow, draft, seedText) {
           root.innerHTML = '';
           toast('Authorization request sent — the task will queue when approved');
           refreshTasks();
-          return;
-        } catch (requestError) { showTaskError(requestError, projectId); return; }
+          succeeded = true;
+          return true;
+        } catch (requestError) { showTaskError(requestError, projectId); return false; }
       }
       showTaskError(e, projectId);
+      return false;
+    } finally {
+      if (ownsFeedback) {
+        submitInFlight = false;
+        finishActionFeedback(activeFeedback, succeeded);
+        submitButtons.forEach((button, index) => {
+          if (button.isConnected) button.disabled = previousDisabled[index];
+        });
+        if (!succeeded) {
+          const saveState = $('#tf-savestate');
+          if (saveState && !/not saved/i.test(saveState.textContent || '')) saveState.textContent = 'Not submitted — ready to retry';
+        }
+      }
     }
+    return succeeded;
   };
   $('#tf-draft').addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));

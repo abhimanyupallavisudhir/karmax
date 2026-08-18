@@ -63,8 +63,22 @@ ok(attrs.get('progress:aria-label') === 'Save changes in progress', 'the progres
 finishActionFeedback(ticket, true);
 setTimeout(() => {
   ok(!classes.has('action-pending') && classes.has('action-succeeded'), 'a successful request resolves to visible completion feedback');
-ok(control.disabled === false && !attrs.has('aria-busy') && !attrs.has('aria-disabled'), 'the control restores its accessibility state without overriding handler-owned disabled state');
+  ok(control.disabled === false && !attrs.has('aria-busy') && !attrs.has('aria-disabled'), 'the control restores its accessibility state without overriding handler-owned disabled state');
   ok(progress.dataset.outcome === 'success', 'the dispatch trace resolves with the request outcome');
+
+  const submitStart = src.indexOf('const submit = async (draftMode, authorizationDecision, activeFeedback)');
+  const beginFeedback = src.indexOf('activeFeedback = beginActionFeedback', submitStart);
+  const drainAutosave = src.indexOf('await saveChain.catch', submitStart);
+  const finishFeedback = src.indexOf('finishActionFeedback(activeFeedback, succeeded)', submitStart);
+  ok(submitStart >= 0 && beginFeedback > submitStart, 'expanded-form submit owns an explicit feedback lifecycle');
+  ok(beginFeedback < drainAutosave, 'expanded-form feedback starts before waiting for auto-save');
+  ok(finishFeedback > drainAutosave, 'expanded-form feedback spans the complete submit operation');
+  ok(src.includes("submitButtons.forEach((button) => { button.disabled = true; })"), 'both expanded-form actions are guarded while posting');
+  ok(src.includes('if (!currentStateAlreadySaved)'), 'submit does not rewrite fields that auto-save already persisted');
+  ok(src.includes('knownDraftAttemptIds = [primaryId, ...alternates.map((attempt) => attempt.id)]'), 'auto-saved tasks retain the exact attempt ids they create');
+  ok(src.includes('Promise.all(knownDraftAttemptIds.map((taskId)'), 'known draft attempts queue directly without a group lookup');
+  ok(src.includes('const alreadyStarted = createdWithAttempts && !hasPolicy()'), 'direct task creation skips the redundant attempt-group reload');
+  ok(src.includes('await Promise.all((group?.attempts || [])'), 'alternate attempts queue in parallel when follow-up queueing is required');
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
