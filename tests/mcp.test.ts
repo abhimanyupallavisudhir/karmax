@@ -66,6 +66,12 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
     expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
+    const fork = tools.find((tool) => tool.name === 'fork_agent') as any;
+    expect(fork.inputSchema.properties).toMatchObject({
+      provider: { enum: expect.arrayContaining(['claude', 'codex', 'opencode']) },
+      model: { type: 'string' },
+      effort: { enum: expect.arrayContaining(['low', 'high', 'xhigh']) },
+    });
   });
 
   it('forwards a task resource proposal without adopting it', async () => {

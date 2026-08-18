@@ -990,7 +990,7 @@ function renderAgentField(f, spec, inherited) {
   const provider = agentProviderChoice(e.provider);
   const model = providerVisible ? e.model : '';
   const effort = providerVisible ? e.effort : '';
-  const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
+  const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId || spec?.resumeFrom?.upload);
   const availableAvatars = (S.avatars || []).filter((avatar) => avatar.callable && avatar.effectiveEnabled
     && (!avatar.roles?.length || avatar.roles.includes(role)));
   if (selectedAvatar && !availableAvatars.some((avatar) => avatar.id === selectedAvatar.id)) availableAvatars.push(selectedAvatar);
@@ -1013,7 +1013,11 @@ function renderAgentField(f, spec, inherited) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <input class="af-resume-session" placeholder="...or paste a provider conversation ID or a ChatGPT/Claude share link to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <div class="af-resume-import-row">
+        <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
+        <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
+      </div>
     </div>
   </div>`;
 }
@@ -1027,15 +1031,22 @@ function resumeChosenInner(rf, task) {
   return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
 }
 
+function resumeUploadInner(upload) {
+  return `${esc(upload.name || 'Conversation')}<button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+}
+
 // Read an agent box's fork/resume choice back out: the picker's {taskId, role}
-// from data-resume, with a pasted provider session id merged on top.
+// from data-resume, a pasted provider id/share link, or one uploaded file.
 function readResume(box) {
   if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
-  let resumeFrom;
-  try { resumeFrom = JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
-  if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
-  return resumeFrom;
+  if (sessionId) return { sessionId };
+  try {
+    const upload = JSON.parse(box.querySelector('.af-resume-uploaded')?.dataset.upload || 'null');
+    if (upload) return { upload };
+  } catch {}
+  try { return JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
+  return undefined;
 }
 
 function readAgentSpec(box) {
@@ -1561,7 +1572,7 @@ function wireCombo(combo, getOptions, onChange) {
   });
 }
 
-// Wire one agent box's controls: provider→model combobox + opt-in fork search.
+// Wire one agent box's controls: provider→model combobox + one fork source.
 function wireAgentBox(box) {
   const combo = box.querySelector('.af-model-combo');
   const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
@@ -1597,29 +1608,30 @@ function wireAgentBox(box) {
   const chosen = box.querySelector('.af-resume-chosen');
   const enabled = box.querySelector('.af-resume-enabled');
   const panel = box.querySelector('.af-resume-panel');
-  const provider = box.querySelector('.af-provider');
+  const sessionInput = box.querySelector('.af-resume-session');
+  const uploadInput = box.querySelector('.af-resume-upload input');
+  const uploaded = box.querySelector('.af-resume-uploaded');
   const syncForkState = () => {
     if (panel) panel.hidden = !enabled?.checked;
-    let taskFork;
-    try { taskFork = enabled?.checked && !!JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { taskFork = false; }
-    // Provider/session identity must match for a native fork. Model and effort are
-    // intentionally left editable: both adapters support retuning those knobs.
-    if (provider) provider.disabled = !!taskFork;
-    box.classList.toggle('af-has-task-fork', !!taskFork);
   };
-  const applySourceAgent = (session) => {
-    if (!session) return;
-    if (session.provider && provider) provider.value = session.provider;
-    if (session.model !== undefined) box.querySelector('.af-model').value = session.model || '';
-    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-    const effort = box.querySelector('.af-effort');
-    if (effort && session.effort && [...effort.options].some((o) => o.value === session.effort)) effort.value = session.effort;
-  };
-  const setResume = (rf, task, session) => {
+  const clearTask = () => {
     if (!chosen) return;
+    chosen.dataset.resume = 'null';
+    chosen.innerHTML = '';
+  };
+  const clearUpload = () => {
+    if (!uploaded) return;
+    uploaded.dataset.upload = 'null';
+    uploaded.innerHTML = '';
+  };
+  const setResume = (rf, task) => {
+    if (!chosen) return;
+    if (rf) {
+      if (sessionInput) sessionInput.value = '';
+      clearUpload();
+    }
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
-    if (rf) applySourceAgent(session);
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -1627,11 +1639,10 @@ function wireAgentBox(box) {
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
       // Turning the feature off is also a real parameter change. Clear the
-      // dormant source so checking it again cannot silently re-lock a provider
-      // the user customized while the fork was off.
+      // dormant source so checking it again cannot revive an old conversation.
       if (chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
-      const session = box.querySelector('.af-resume-session');
-      if (session) session.value = '';
+      if (sessionInput) sessionInput.value = '';
+      clearUpload();
     }
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1642,9 +1653,36 @@ function wireAgentBox(box) {
       hint: 'Archived tasks are included — click a task to fork its agent, or choose one when it has multiple agents.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
+      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
     }),
   );
+  sessionInput?.addEventListener('input', () => {
+    if (!sessionInput.value.trim()) return;
+    clearTask();
+    clearUpload();
+  });
+  uploaded?.addEventListener('click', (e) => {
+    if (!e.target.closest('.af-resume-upload-clear')) return;
+    clearUpload();
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  uploadInput?.addEventListener('change', async () => {
+    const file = uploadInput.files?.[0];
+    uploadInput.value = '';
+    if (!file) return;
+    try {
+      const upload = await uploadConversationFile(file);
+      clearTask();
+      if (sessionInput) sessionInput.value = '';
+      if (uploaded) {
+        uploaded.dataset.upload = JSON.stringify(upload);
+        uploaded.innerHTML = resumeUploadInner(upload);
+      }
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
   syncForkState();
   syncAvatar();
 }
@@ -1901,6 +1939,21 @@ async function uploadImage(file) {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
   return body; // ImageRef
+}
+
+async function uploadConversationFile(file) {
+  const res = await feedbackFetch(`/api/conversation-imports?projectId=${encodeURIComponent(S.projectId)}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'x-file-name': encodeURIComponent(file.name || 'conversation.jsonl'),
+      ...(S.token ? { authorization: `Bearer ${S.token}` } : {}),
+    },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
+  return body;
 }
 
 function attachmentUrl(id) {

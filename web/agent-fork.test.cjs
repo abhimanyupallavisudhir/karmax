@@ -23,6 +23,7 @@ global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
 global.S = { tasks: [] };
 eval(extractFn('resumeChosenInner'));
+eval(extractFn('resumeUploadInner'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('readResume'));
 
@@ -34,6 +35,8 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
+ok(closed.includes('provider conversation ID or a ChatGPT/Claude share link'), 'provider ids and public share links are named in the compact input');
+ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 
 const existing = renderAgentField(
   { role: 'do', name: 'agent:do' },
@@ -58,6 +61,8 @@ const panel = element({ key: 'panel' });
 const chosen = element({ key: 'chosen', dataset: { resume: 'null' } });
 const pick = element({ key: 'pick' });
 const sessionInput = element({ key: 'session', value: '' });
+const uploadInput = element({ key: 'upload-input', files: [] });
+const uploaded = element({ key: 'uploaded', dataset: { upload: 'null' } });
 const classes = new Set();
 const box = {
   querySelector(selector) {
@@ -65,6 +70,7 @@ const box = {
       '.af-model-combo': null, '.af-provider': provider, '.af-model': model,
       '.af-effort': effort, '.af-resume-enabled': enabled, '.af-resume-panel': panel,
       '.af-resume-chosen': chosen, '.af-resume-pick': pick, '.af-resume-session': sessionInput,
+      '.af-resume-upload input': uploadInput, '.af-resume-uploaded': uploaded,
     }[selector];
   },
   classList: { toggle(name, on) { on ? classes.add(name) : classes.delete(name); } },
@@ -87,17 +93,23 @@ picker.onPick({
   task: { id: 'task_source', num: 42, title: 'Source' }, role: 'do',
   session: { id: 'session-1', provider: 'codex', model: 'gpt-source', effort: 'high' },
 });
-ok(provider.value === 'codex' && provider.disabled, 'selection copies and locks the source provider');
-ok(model.value === 'gpt-source' && !model.disabled, 'selection copies the model but leaves it editable');
-ok(effort.value === 'high' && !effort.disabled, 'selection copies reasoning effort but leaves it editable');
+ok(provider.value === 'claude' && !provider.disabled, 'source selection leaves the destination agent editable');
+ok(model.value === '' && effort.value === '', 'source selection does not overwrite destination model settings');
 ok(readResume(box)?.taskId === 'task_source', 'checked selection is collected as a task fork');
+sessionInput.value = 'https://chatgpt.com/share/example';
+listeners.get('session:input')();
+ok(readResume(box)?.sessionId === 'https://chatgpt.com/share/example', 'share links use the provider conversation input');
+ok(chosen.dataset.resume === 'null', 'typing an id or link clears the task source');
+sessionInput.value = '';
+uploaded.dataset.upload = JSON.stringify({ id: 'a'.repeat(64), name: 'session.jsonl', bytes: 42, format: 'codex', projectId: 'project' });
+ok(readResume(box)?.upload?.format === 'codex', 'an uploaded conversation is collected as the sole source');
 enabled.checked = false;
 listeners.get('enabled:change')();
 ok(panel.hidden && !provider.disabled, 'unchecking collapses the panel and unlocks provider customization');
 ok(readResume(box) === undefined, 'unchecked fork is omitted from submitted parameters');
 enabled.checked = true;
 listeners.get('enabled:change')();
-ok(!provider.disabled && readResume(box) === undefined, 'rechecking does not revive a stale source or re-lock the customized provider');
+ok(!provider.disabled && readResume(box) === undefined, 'rechecking does not revive a stale source');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
