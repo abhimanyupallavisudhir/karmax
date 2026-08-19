@@ -310,6 +310,9 @@ export interface KarmaxApiDeps {
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
   bus?: KarmaxBus;
+  /** Revalidate provider-native login health before replaying a credential
+   * escalation. Production supplies this; lightweight API tests may omit it. */
+  refreshCredentialHealth?: (task: TaskRecord, provider?: string) => Promise<void>;
 }
 
 /**
@@ -3792,6 +3795,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     const heldView = scopedTask?.lastView;
+    if (signal === SIG.retry && scopedTask && heldView?.stage === 'escalated'
+      && heldView.status === 'blocked') {
+      const credentialFailure = heldView.error?.match(/No usable\s+([^\s]+)\s+credential\b.*needs attention/i);
+      if (credentialFailure) {
+        // Retry is the user's explicit request to try the credential again. A
+        // stale needs-attention bit must not deny the turn before the provider's
+        // native, non-billable health endpoint gets a chance to clear it.
+        await this.deps.refreshCredentialHealth?.(scopedTask, credentialFailure[1]).catch(() => undefined);
+      }
+    }
     const heldOrigin =
       heldView?.status === 'waiting'
       && heldView.waitingFor?.kind === 'human'

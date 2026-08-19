@@ -19,6 +19,7 @@ import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seed
   spawnRemoteAgentProcess, syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 import { localProviderCli } from './provider-cli.js';
+import { withTimeout } from '../util/timeout.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -427,6 +428,7 @@ export class CodexAdapter implements AgentAdapter {
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     let shuttingDown = false;
+    let modelCredentialHealthy = false;
     const mcpStartup: any[] = [];
     // Codex Apps is a provider-managed, optional MCP. Its OAuth token has a
     // separate lifecycle from the ChatGPT/Codex login in CODEX_HOME. In
@@ -434,12 +436,19 @@ export class CodexAdapter implements AgentAdapter {
     // notification while the model credential remains completely healthy.
     // Never let that nested integration error poison the shared model login.
     const isOptionalAppsMcpError = (blob: string): boolean => {
-      if (!/\bmcp\b/i.test(blob) || !/\bcodex[_ -]?apps\b/i.test(blob)) return false;
-      return mcpStartup.some((event) => {
+      const appsFailed = mcpStartup.some((event) => {
         const name = String(event?.name ?? event?.serverName ?? '');
         const status = String(event?.status ?? event?.state ?? '');
         return /^codex[_ -]?apps$/i.test(name) && /fail|error/i.test(status);
       });
+      if (!appsFailed) return false;
+      if (/\bmcp\b/i.test(blob) && /\bcodex[_ -]?apps\b/i.test(blob)) return true;
+      // Current app-server drops the MCP identity from its subsequent top-level
+      // error notification. Correlate that generic credential-looking 401 only
+      // when this same app-server has just authenticated the main account API.
+      // This is positive provider evidence, not wording-based guesswork.
+      const cls = classifyLimitError(blob, { providerOrigin: true });
+      return modelCredentialHealthy && cls.limited === true && cls.hard === true && cls.kind === 'credential';
     };
     // How many `input.messages` this turn has consumed — the initial delta up to the
     // schedule snapshot, then one more per in-flight follow-up steered/started below.
@@ -610,6 +619,14 @@ export class CodexAdapter implements AgentAdapter {
       await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
+      try {
+        await withTimeout(client.request('account/rateLimits/read', {}), 5_000);
+        modelCredentialHealthy = true;
+      } catch {
+        // Older app-servers may not expose this endpoint. They retain the
+        // explicit MCP-name correlation above, but do not get the stronger
+        // generic-error correlation without positive account proof.
+      }
       if (remote && Object.keys(remoteHome?.browserMcp ?? {}).length) {
         // Dynamic Karmax tools use this control channel and therefore need no
         // sandbox startup probe. Browser MCPs really do launch remotely: ask

@@ -13,7 +13,7 @@ import { sameProposalIdentity } from '../src/workflows/software-dev.js';
 import { lifecycleReplacementKey } from '../src/platform/lifecycle-replacement.js';
 import { RunnerPoolService } from '../src/world/runners.js';
 
-function fixture() {
+function fixture(refreshCredentialHealth?: () => Promise<void>) {
   const store = new Store(':memory:');
   store.claimPersonalOrganization('test');
   const project = store.createProject('Transitions', { repos: ['/tmp'], defaultBase: 'main', defaultTarget: 'main' });
@@ -59,7 +59,8 @@ function fixture() {
     },
   } as any;
   const runners = new RunnerPoolService(store);
-  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, runners });
+  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, runners,
+    refreshCredentialHealth } as any);
   const task = store.createTask({
     projectId: project.id,
     title: 'Move me',
@@ -89,6 +90,24 @@ function fixture() {
 }
 
 describe('task stage transitions', () => {
+  it('rechecks credential health before retrying a credential escalation', async () => {
+    const order: string[] = [];
+    const f = fixture(async () => { order.push('health'); });
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'escalated',
+      status: 'blocked',
+      error: 'No usable codex credential — every allowed login/key needs attention.',
+      actions: [{ name: 'retry', kind: 'signal', label: 'Retry', enabled: true }],
+    });
+    const originalSignal = f.signalled;
+
+    await f.api.signalTask(f.token, f.task.id, 'retry');
+    if (originalSignal.some((item) => item.id === f.task.id && item.signal === 'retry')) order.push('retry');
+
+    expect(order).toEqual(['health', 'retry']);
+  });
+
   it('force-stops a wedged Setup cancellation and releases its runner capacity', async () => {
     const f = fixture();
     f.store.setTaskWorkflowVersion(f.task.id, '1.25.0');

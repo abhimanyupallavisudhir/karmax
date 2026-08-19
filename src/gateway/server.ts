@@ -6464,51 +6464,17 @@ export class Gateway {
   }
 
   /** Probe usage for pollable subscription logins (all, or just `only`) and cache the
-   *  snapshots in kv under `usage:<credKey>`. Drives the dashboard's real %; a probe
-   *  asks the provider's native CLI for account quota without spending a model turn.
-   *  Overlapping rechecks (auto-refresh + button, multiple tabs) share one in-flight
-   *  probe per login rather than spawning duplicate CLIs. */
-  private usageProbes = new Map<string, Promise<unknown>>();
+   *  snapshots in kv under `usage:<credKey>`. Dashboard refreshes and task retries
+   *  share the same in-flight provider probe. */
   private async refreshUsage(only?: string, organizationId = 'org_personal'): Promise<Record<string, unknown>> {
-    const { store } = this.deps;
-    const { probeClaudeUsage, probeCodexUsage, isUsagePollable, usageProvesAvailable } = await import('../agent/usage.js');
-    const creds = enumerateCredentials(gatherCredentialSources({
+    const { refreshCredentialHealth } = await import('../agent/credential-health.js');
+    return refreshCredentialHealth({
+      store: this.deps.store,
+      client: this.deps.client,
+      taskQueue: this.deps.taskQueue,
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
-      organizationId,
-    }))
-      .filter((c) => isUsagePollable(c) && (!only || c.key === only));
-    const out: Record<string, unknown> = {};
-    await Promise.all(creds.map(async (c) => {
-      let probe = this.usageProbes.get(c.key);
-      if (!probe) {
-        // Ambient uses the provider's default home; a managed login uses its own.
-        const configHome = c.kind === 'ambient' ? undefined : c.configHome;
-        probe = (c.provider === 'codex' ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }))
-          .then(async (snap) => {
-            store.kvSet(`usage:${c.key}`, JSON.stringify(snap));
-            // A successful provider-authenticated probe with spare capacity is
-            // stronger evidence than a previous heuristic hard-failure label.
-            // Clear only that automatic quarantine; the coordinator-side compare
-            // guard prevents a racing/manual disable from being overwritten.
-            if (this.deps.client && usageProvesAvailable(snap)) {
-              const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
-              await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue })
-                .setAccountAvailability({
-                  accountId: c.key,
-                  status: 'available',
-                  onlyIfStatus: 'needs-attention',
-                })
-                .catch(() => undefined);
-            }
-            return snap;
-          })
-          .finally(() => this.usageProbes.delete(c.key));
-        this.usageProbes.set(c.key, probe);
-      }
-      out[c.key] = await probe;
-    }));
-    return out;
+    }, { organizationId, only });
   }
 
   private organizationCredentialKeys(organizationId: string): string[] {
