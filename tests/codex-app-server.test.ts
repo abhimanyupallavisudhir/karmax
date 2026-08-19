@@ -31,6 +31,17 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       return;
     }
     if (mode === 'exit') process.exit(0);
+    else if (mode === 'expired-app-token') {
+      const detail = 'Provided authentication token is expired. Please try signing in again.';
+      send({ method: 'mcpServer/startupStatus/updated', params: {
+        name: 'codex_apps', status: 'failed', error: { message: detail, code: 'token_expired', status: 401 },
+      } });
+      send({ method: 'error', params: {
+        error: { message: 'MCP server codex_apps failed to initialize: ' + detail, code: 'token_expired', status: 401 },
+        willRetry: false,
+      } });
+      send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    }
     else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
     else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
     else send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
@@ -142,6 +153,10 @@ describe('CodexAdapter app-server security policy', () => {
 
   it('rejects a failed terminal status even when partial assistant text exists', async () => {
     await expect(run(undefined, 'failed')).rejects.toThrow(/model execution failed/i);
+  });
+
+  it('does not quarantine the Codex login when the optional Apps MCP token expires', async () => {
+    await expect(run(undefined, 'expired-app-token')).resolves.toEqual(expect.any(Array));
   });
 
   it('rejects a process/transport end without a completed terminal event', async () => {

@@ -266,6 +266,24 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('recovers an automatic needs-attention quarantine without overriding a manual disable', async () => {
+    const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', configHome: '/tmp/B' })]);
+    const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await activities.setAccountAvailability({ accountId: 'A', status: 'needs-attention' });
+    await activities.setAccountAvailability({ accountId: 'B', status: 'manual-off' });
+
+    await activities.setAccountAvailability({
+      accountId: 'A', status: 'available', onlyIfStatus: 'needs-attention',
+    });
+    await activities.setAccountAvailability({
+      accountId: 'B', status: 'available', onlyIfStatus: 'needs-attention',
+    });
+
+    expect((await acct('A')).status).toBe('available');
+    expect((await acct('B')).status).toBe('manual-off');
+    await coord.terminate('done');
+  });
+
   it('acknowledges whether a lease actually parked or was granted immediately', async () => {
     const coord = await startCoord([A({ id: 'A' })]);
     const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
