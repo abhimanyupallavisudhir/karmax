@@ -701,7 +701,7 @@ async function main() {
     clearInterval(orphanSweep);
     clearInterval(reconcileSweep);
     clearInterval(deploymentSweep);
-    entitlementQueues.stop();
+    await step(entitlementQueues.stop());
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();

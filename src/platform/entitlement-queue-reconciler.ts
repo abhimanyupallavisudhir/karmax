@@ -70,12 +70,16 @@ export class EntitlementQueueReconciler {
     }
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.requested.clear();
+    // The Temporal client must remain open until a signal/query already in
+    // progress has settled. Otherwise its internal retry timer can fire after
+    // shutdown and surface as an uncaught "Channel has been shut down" error.
+    await this.draining;
   }
 
   private requestAll(): void {

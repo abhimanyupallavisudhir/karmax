@@ -729,7 +729,7 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
           waiting.length - scenario.expectedCapacity,
         ]);
       } finally {
-        reconciler.stop();
+        await reconciler.stop();
         await wf.terminate('test done');
         store.close();
       }
