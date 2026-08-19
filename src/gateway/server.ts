@@ -545,6 +545,7 @@ export class Gateway {
   /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
   private pendingPolicyAcceptances = new Map<string, { versions: Record<string, string>; expiresAt: number }>();
+  private stopLoginPoolSync?: () => void;
 
   constructor(private deps: GatewayDeps) {
     if (deps.identity) {
@@ -553,6 +554,10 @@ export class Gateway {
     }
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
+    // Device OAuth finishes in the provider CLI after `/accounts/connect` has
+    // returned. Refreshing only in that request races the eventual auth.json and
+    // leaves a visibly connected login absent from the runnable coordinator pool.
+    this.stopLoginPoolSync = deps.login?.onStateChange(() => this.refreshLoginPool());
   }
 
   private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
@@ -838,6 +843,8 @@ export class Gateway {
       port,
       close: () =>
         new Promise<void>((resolve) => {
+          this.stopLoginPoolSync?.();
+          this.stopLoginPoolSync = undefined;
           this.reviewActions.stopAll();
           this.fanout.close();
           // `WebSocketServer.close()` does not terminate existing upgraded

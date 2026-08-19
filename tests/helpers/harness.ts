@@ -23,7 +23,7 @@ import { CredentialBroker } from '../../src/autonomy/broker.js';
 import { Vault } from '../../src/autonomy/vault.js';
 import { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
 import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
-import { LoginManager } from '../../src/autonomy/login.js';
+import { LoginManager, type LoginCommand } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/resources.js';
 import { WorldHandoffService } from '../../src/world/handoff.js';
@@ -62,6 +62,7 @@ export interface Harness {
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
   startGateway(opts?: { password?: string;
+    loginCommand?: LoginCommand;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService }): Promise<{
       url: string; internalUrl: string; close: () => Promise<void> }>;
 }
@@ -158,11 +159,11 @@ export async function bootHarness(
     async startGateway(opts) {
       const configHomes = new ConfigHomeManager(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-homes-')));
       // fake login command (no real CLI / OAuth): print a device URL then exit
-      const login = new LoginManager(configHomes, () => ({
+      const login = new LoginManager(configHomes, opts?.loginCommand ?? (() => ({
         cmd: 'bash',
         args: ['-c', 'echo "open https://example.com/dev?code=TEST"; exit 0'],
         env: {} as Record<string, string>,
-      }));
+      })));
       // Production always wires the host↔world handoff service. Keep the HTTP
       // harness at parity so checkout/materialization routes exercise their
       // actual behavior instead of returning the optional-dependency 503.

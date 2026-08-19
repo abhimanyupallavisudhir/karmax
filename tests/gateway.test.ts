@@ -994,6 +994,37 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(typeof login.loggedIn).toBe('boolean');
   });
 
+  it('adds a device login to the runnable pool when OAuth completes after the connect response', async () => {
+    const delayedGateway = await h.startGateway({
+      loginCommand: (_provider, home) => ({
+        cmd: process.execPath,
+        args: ['-e', [
+          "console.log('open https://example.com/device')",
+          "setTimeout(() => {",
+          "  require('node:fs').writeFileSync(require('node:path').join(process.env.LOGIN_HOME, 'auth.json'), '{}')",
+          "}, 350)",
+        ].join(';')],
+        env: { LOGIN_HOME: home },
+      }),
+    });
+    const delayedSession: any = await fetch(`${delayedGateway.url}/api/session`).then((response) => response.json());
+    const delayedAuth = { authorization: `Bearer ${delayedSession.token}`, 'content-type': 'application/json' };
+
+    const connected: any = await fetch(`${delayedGateway.url}/api/accounts/connect`, {
+      method: 'POST',
+      headers: delayedAuth,
+      body: JSON.stringify({ provider: 'codex', account: 'delayed' }),
+    }).then((response) => response.json());
+    expect(connected.status).toBe('awaiting_oauth');
+
+    await expect.poll(async () => {
+      const dashboard: any = await fetch(`${delayedGateway.url}/api/dashboard?organizationId=org_personal`, {
+        headers: delayedAuth,
+      }).then((response) => response.json());
+      return dashboard.accounts.accounts.some((account: any) => account.id === 'login:codex:delayed');
+    }, { timeout: 4_000 }).toBe(true);
+  });
+
   it('attaches redacted resources and completes a resumable binary upload', async () => {
     const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());

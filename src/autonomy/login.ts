@@ -43,6 +43,13 @@ export type LoginCommand = (
   opts: LoginOptions,
 ) => { cmd: string; args: string[]; env: Record<string, string> } | undefined;
 
+export type LoginStateListener = (state: {
+  provider: Provider;
+  account: string;
+  organizationId: string;
+  loggedIn: boolean;
+}) => void | Promise<void>;
+
 export const defaultLoginCommand: LoginCommand = (provider, home, opts) => {
   const env = scrubbedEnv({ provider, configHome: home });
   if (provider === 'claude') {
@@ -74,11 +81,20 @@ export const defaultLoginCommand: LoginCommand = (provider, home, opts) => {
 
 export class LoginManager {
   private pending = new Map<string, { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt> }>();
+  private stateListeners = new Set<LoginStateListener>();
 
   constructor(
     private homes: ConfigHomeManager,
     private loginCommand: LoginCommand = defaultLoginCommand,
   ) {}
+
+  /** Observe the asynchronous end of a provider-owned login flow. Device OAuth
+   * completes after `connect()` has already returned its URL, so consumers that
+   * cache runnable accounts must refresh when the CLI eventually writes auth. */
+  onStateChange(listener: LoginStateListener): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
 
   /** Start (or report) a login for an account. Returns the device URL to open. */
   async connect(provider: Provider, account: string, opts: LoginOptions = {}, organizationId = 'org_personal'): Promise<LoginResult> {
@@ -110,11 +126,15 @@ export class LoginManager {
     }
     const pending: { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt> } = { child };
     this.pending.set(pendingKey, pending);
-    const forget = () => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
       if (this.pending.get(pendingKey)?.child === child) this.pending.delete(pendingKey);
+      this.emitStateChange(provider, account, organizationId, configHome);
     };
-    child.once('exit', forget);
-    child.once('error', forget);
+    child.once('exit', finish);
+    child.once('error', finish);
     // Keep reading the child after the URL: `claude auth login` / `codex login`
     // write the native credential (`.credentials.json` / `auth.json`) directly, so
     // the account reads as signed-in. If someone overrides back to `setup-token`
@@ -146,7 +166,10 @@ export class LoginManager {
         status: 'awaiting_oauth',
       };
     }
-    if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
+    if (isFullyAuthed(provider, configHome)) {
+      this.emitStateChange(provider, account, organizationId, configHome);
+      return { provider, account, configHome, status: 'logged_in' };
+    }
     return { provider, account, configHome, status: 'failed', detail: 'no login URL captured (is the CLI installed?)' };
   }
 
@@ -183,6 +206,18 @@ export class LoginManager {
 
   private pendingKey(provider: Provider, account: string, organizationId: string): string {
     return JSON.stringify([organizationId, provider, account]);
+  }
+
+  private emitStateChange(provider: Provider, account: string, organizationId: string, configHome: string): void {
+    const state = { provider, account, organizationId, loggedIn: isLoggedIn(provider, configHome) };
+    for (const listener of this.stateListeners) {
+      try {
+        void Promise.resolve(listener(state)).catch(() => undefined);
+      } catch {
+        // Login completion must not crash the long-lived gateway because an
+        // observer is shutting down; the next pool refresh/boot reconciles it.
+      }
+    }
   }
 }
 
