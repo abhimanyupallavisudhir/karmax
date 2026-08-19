@@ -187,6 +187,57 @@ describe('cloud Git broker', () => {
       .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
   });
 
+  it('absorbs a remote child merge when checkpoint publication races the parent branch', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-child-race-'));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    const remote = path.join(root, 'remote.git');
+    const worlds = path.join(root, 'worlds');
+    const child = path.join(root, 'child');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(root, ['clone', '-q', '--bare', source, remote]);
+
+    const provider = new WorktreeProvider(worlds);
+    const world = await provider.create({ taskId: 'parent-race', repo: source, base: 'main' });
+    await world.writeFile('parent.txt', 'parent work\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'parent work']);
+
+    const sshRemote = 'git@example:remote.git';
+    world.handle.repo = sshRemote;
+    world.handle.repos![0]!.repo = sshRemote;
+    const env = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'git@example:',
+    };
+    expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+    const parentHead = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+
+    await gitOrThrow(root, ['clone', '-q', remote, child]);
+    await ensureIdentity(child);
+    await gitOrThrow(child, ['switch', '-q', '-c', world.handle.branch, `origin/${world.handle.branch}`]);
+    await gitOrThrow(child, ['switch', '-q', '-c', 'child-change']);
+    fs.writeFileSync(path.join(child, 'child.txt'), 'approved child work\n');
+    await gitOrThrow(child, ['add', '-A']);
+    await gitOrThrow(child, ['commit', '-q', '-m', 'child work']);
+    await gitOrThrow(child, ['switch', '-q', world.handle.branch]);
+    await gitOrThrow(child, ['merge', '--no-ff', '-q', '-m', 'merge child', 'child-change']);
+    await gitOrThrow(child, ['push', '-q', 'origin', world.handle.branch]);
+    const mergedHead = (await git(child, ['rev-parse', 'HEAD'])).stdout.trim();
+    expect(mergedHead).not.toBe(parentHead);
+
+    expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+    expect((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(mergedHead);
+    expect(fs.readFileSync(path.join(world.handle.root, 'child.txt'), 'utf8')).toBe('approved child work\n');
+    expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(mergedHead);
+  });
+
   it('replaces a rebased task branch only when its recorded remote-head lease still matches', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-lease-'));
     cleanups.push(root);
