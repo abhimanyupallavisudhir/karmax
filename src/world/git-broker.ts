@@ -306,8 +306,83 @@ async function pushBranchToOrigin(
         'push', `--force-with-lease=${ref}:${expectedRemoteHead}`, 'origin', `${ref}:${ref}`,
       ], { env });
     }
+    // A child PR merges into its parent's task branch on GitHub. The parent's
+    // parked world can race that merge: its checkpoint push starts first, the
+    // child advances origin a moment later, and the otherwise-clean checkpoint
+    // is rejected as non-fast-forward. If origin contains the complete local
+    // task branch, no judgment-bearing merge is needed and no history can be
+    // lost: mirror that strict fast-forward back into the world. Genuine
+    // divergence still falls through to the diagnostic below.
+    if (result.code !== 0 && NON_FAST_FORWARD.test(result.stderr || result.stdout)) {
+      const reconciled = await fastForwardWorldFromOrigin(world, repo, clone, env);
+      if (reconciled) return;
+    }
     if (result.code !== 0) throw new Error(describeGitPushError(repo, result.stderr || result.stdout || 'push failed'));
   });
+}
+
+/** Mirror a remote-ahead task branch into its sandbox without exposing the
+ * broker credential there. The remote must contain the exact world tip; an
+ * unrelated or rewritten remote branch is never integrated automatically. */
+async function fastForwardWorldFromOrigin(
+  world: World,
+  repo: WorldRepo,
+  clone: string,
+  env: Record<string, string>,
+): Promise<boolean> {
+  const branchRef = `refs/heads/${repo.branch}`;
+  const trackingRef = `refs/remotes/origin/${repo.branch}`;
+  const fetched = await git(clone, [
+    'fetch', '--no-tags', 'origin', `+${branchRef}:${trackingRef}`,
+  ], { env, timeoutMs: 10 * 60_000 });
+  if (fetched.code !== 0)
+    throw new Error(`could not inspect the advanced remote task branch: ${fetched.stderr || fetched.stdout}`);
+
+  const contained = await git(clone, ['merge-base', '--is-ancestor', branchRef, trackingRef]);
+  if (contained.code !== 0) return false;
+
+  const transferRef = `refs/karmax/remote-ahead/${cryptoSafeName(repo.branch)}`;
+  const incomingRef = 'refs/karmax/remote-ahead';
+  const bundleName = `.karmax-remote-ahead-${repo.name.replace(/[^A-Za-z0-9_.-]/g, '-')}.bundle`;
+  const bundleRelative = worldRepos(world.handle).length > 1 ? `${repo.name}/${bundleName}` : bundleName;
+  const bundlePath = path.join(clone, bundleName);
+  try {
+    const staged = await git(clone, ['update-ref', transferRef, trackingRef]);
+    if (staged.code !== 0) throw new Error(staged.stderr || staged.stdout);
+    const bundled = await git(clone, ['bundle', 'create', bundlePath, transferRef]);
+    if (bundled.code !== 0)
+      throw new Error(`could not package the advanced remote task branch: ${bundled.stderr || bundled.stdout}`);
+    if (!world.writeFileBuffer) throw new Error('world provider cannot receive binary Git handoffs');
+    await world.writeFileBuffer(bundleRelative, fs.readFileSync(bundlePath));
+
+    const imported = await world.exec('git', [
+      'fetch', bundleName, `${transferRef}:${incomingRef}`,
+    ], { cwd: repo.root, timeoutMs: 10 * 60_000 });
+    if (imported.code !== 0)
+      throw new Error(`cloud world could not import the advanced task branch: ${imported.stderr || imported.stdout}`);
+    const localTip = await world.exec('git', ['rev-parse', '--verify', branchRef], { cwd: repo.root });
+    if (localTip.code !== 0)
+      throw new Error(`cloud world task branch "${repo.branch}" is unavailable`);
+    const stillContained = await world.exec('git', [
+      'merge-base', '--is-ancestor', branchRef, incomingRef,
+    ], { cwd: repo.root });
+    if (stillContained.code !== 0) return false;
+
+    const current = await world.exec('git', ['symbolic-ref', '--quiet', 'HEAD'], { cwd: repo.root });
+    const advanced = current.code === 0 && current.stdout.trim() === branchRef
+      ? await world.exec('git', ['merge', '--ff-only', incomingRef], { cwd: repo.root })
+      : await world.exec('git', [
+          'update-ref', branchRef, incomingRef, localTip.stdout.trim(),
+        ], { cwd: repo.root });
+    if (advanced.code !== 0)
+      throw new Error(`could not fast-forward cloud task branch "${repo.branch}": ${advanced.stderr || advanced.stdout}`);
+    return true;
+  } finally {
+    await git(clone, ['update-ref', '-d', transferRef]).catch(() => undefined);
+    await world.exec('git', ['update-ref', '-d', incomingRef], { cwd: repo.root }).catch(() => undefined);
+    await world.exec('rm', ['-f', bundleName], { cwd: repo.root }).catch(() => undefined);
+    fs.rmSync(bundlePath, { force: true });
+  }
 }
 
 /** Import the world's task branch into its authoritative local checkout. The
