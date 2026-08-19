@@ -428,6 +428,19 @@ export class CodexAdapter implements AgentAdapter {
     let terminalReason: string | undefined;
     let shuttingDown = false;
     const mcpStartup: any[] = [];
+    // Codex Apps is a provider-managed, optional MCP. Its OAuth token has a
+    // separate lifecycle from the ChatGPT/Codex login in CODEX_HOME. In
+    // particular, an expired Apps token can produce a terminal-looking 401
+    // notification while the model credential remains completely healthy.
+    // Never let that nested integration error poison the shared model login.
+    const isOptionalAppsMcpError = (blob: string): boolean => {
+      if (!/\bmcp\b/i.test(blob) || !/\bcodex[_ -]?apps\b/i.test(blob)) return false;
+      return mcpStartup.some((event) => {
+        const name = String(event?.name ?? event?.serverName ?? '');
+        const status = String(event?.status ?? event?.state ?? '');
+        return /^codex[_ -]?apps$/i.test(name) && /fail|error/i.test(status);
+      });
+    };
     // How many `input.messages` this turn has consumed — the initial delta up to the
     // schedule snapshot, then one more per in-flight follow-up steered/started below.
     let deliveredIndex = input.messages.length;
@@ -535,6 +548,11 @@ export class CodexAdapter implements AgentAdapter {
           break;
         case 'error': {
           const blob = JSON.stringify(params ?? {});
+          // The app-server reports optional Codex Apps startup failures on the
+          // same top-level `error` channel as model failures. It can continue the
+          // model turn without that MCP, so leave the already-emitted MCP status
+          // visible and wait for the real turn terminal event.
+          if (isOptionalAppsMcpError(blob)) break;
           noteLimit(blob);
           turnError = params?.error?.message ?? blob;
           // A retryable error is handled internally by the server; only a terminal one

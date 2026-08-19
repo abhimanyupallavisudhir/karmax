@@ -150,9 +150,9 @@ export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccoun
 /** Ground-truth exhaustion feed (from the reportAccountExhausted activity). */
 export const reportExhaustedSignal = defineSignal<[{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(SIG_REPORT_EXHAUSTED);
 /** Manual availability override (UI/MCP). `resetAt` sets a new reset instant. */
-export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; status: AccountStatus; resetAt?: number }]>(SIG_SET_ACCOUNT_AVAILABILITY);
+export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus }]>(SIG_SET_ACCOUNT_AVAILABILITY);
 export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(UPD_REPORT_EXHAUSTED);
-export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number }]>(UPD_SET_ACCOUNT_AVAILABILITY);
+export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export const accountLeaseQuery = defineQuery<
   { waiting: boolean },
@@ -358,9 +358,15 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     a.inUse = 0;
     log.info(`account ${accountId} exhausted (${window}), resets at ${resetAt}`);
   };
-  const setAvailability = ({ accountId, status, resetAt }: { accountId: string; status: AccountStatus; resetAt?: number }) => {
+  const setAvailability = ({ accountId, status, resetAt, onlyIfStatus }: {
+    accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus;
+  }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (!a) return;
+    // Automated health reconciliation may clear its own quarantine, but it must
+    // never race with and override a user's manual disable (or another newer
+    // state transition). The guard is evaluated atomically in this workflow.
+    if (onlyIfStatus !== undefined && a.status !== onlyIfStatus) return;
     a.status = status;
     if (status === 'available') {
       a.window = undefined;

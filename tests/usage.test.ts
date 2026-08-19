@@ -9,6 +9,7 @@ import {
   labelToEpoch,
   probeClaudeUsage,
   probeCodexUsage,
+  usageProvesAvailable,
   isUsagePollable,
   isUsageStale,
   USAGE_TTL_MS,
@@ -183,6 +184,22 @@ describe('isUsageStale', () => {
     const fail = { ok: false as const, at: NOW, reason: 'probe-failed: boom' };
     expect(isUsageStale(fail, NOW + 60_000)).toBe(false);
     expect(isUsageStale(fail, NOW + USAGE_TTL_MS + 1)).toBe(true);
+  });
+});
+
+describe('usageProvesAvailable', () => {
+  it('requires a successful authenticated probe with capacity in every main window', () => {
+    expect(usageProvesAvailable({
+      ok: true, at: NOW,
+      session: { pct: 12, resetLabel: '' },
+      week: { pct: 34, resetLabel: '' },
+    })).toBe(true);
+    expect(usageProvesAvailable({
+      ok: true, at: NOW,
+      session: { pct: 100, resetLabel: '' },
+      week: { pct: 34, resetLabel: '' },
+    })).toBe(false);
+    expect(usageProvesAvailable({ ok: false, at: NOW, reason: 'probe-failed' })).toBe(false);
   });
 });
 

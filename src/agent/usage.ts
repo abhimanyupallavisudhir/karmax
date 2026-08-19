@@ -205,6 +205,16 @@ export function isUsageStale(snap: UsageResult | undefined, now: number, ttlMs =
   return wins.some((w) => w.resetAt !== undefined && w.resetAt < now);
 }
 
+/** A native quota probe authenticates through the same provider login used for
+ * turns. When every reported main window is below 100%, it is positive evidence
+ * that an earlier auth/billing quarantine is stale and can be cleared. Model-only
+ * buckets are intentionally excluded: they do not describe general turn capacity. */
+export function usageProvesAvailable(snap: UsageResult): boolean {
+  if (!snap.ok) return false;
+  const main = [snap.session, snap.week].filter((w): w is UsageWindow => !!w);
+  return main.length > 0 && main.every((w) => w.pct < 100);
+}
+
 // ── Best-effort reset-instant math (display always uses the raw label) ─────────
 const MONTHS: Record<string, number> = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,

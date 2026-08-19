@@ -317,7 +317,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       return { resetAt };
     },
     /** Manual availability override (UI/MCP): force a login on/off, edit its reset. */
-    async setAccountAvailability(args: { accountId: string; status: AccountStatus; resetAt?: number }): Promise<void> {
+    async setAccountAvailability(args: {
+      accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus;
+    }): Promise<void> {
       await client.workflow.getHandle(accountCoordinatorId()).executeUpdate(UPD_SET_ACCOUNT_AVAILABILITY, { args: [args] });
     },
     /** Full account availability view for the dashboard (empty if not running). */

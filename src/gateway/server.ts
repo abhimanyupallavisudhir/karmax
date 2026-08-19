@@ -6471,7 +6471,7 @@ export class Gateway {
   private usageProbes = new Map<string, Promise<unknown>>();
   private async refreshUsage(only?: string, organizationId = 'org_personal'): Promise<Record<string, unknown>> {
     const { store } = this.deps;
-    const { probeClaudeUsage, probeCodexUsage, isUsagePollable } = await import('../agent/usage.js');
+    const { probeClaudeUsage, probeCodexUsage, isUsagePollable, usageProvesAvailable } = await import('../agent/usage.js');
     const creds = enumerateCredentials(gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
@@ -6485,7 +6485,24 @@ export class Gateway {
         // Ambient uses the provider's default home; a managed login uses its own.
         const configHome = c.kind === 'ambient' ? undefined : c.configHome;
         probe = (c.provider === 'codex' ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }))
-          .then((snap) => { store.kvSet(`usage:${c.key}`, JSON.stringify(snap)); return snap; })
+          .then(async (snap) => {
+            store.kvSet(`usage:${c.key}`, JSON.stringify(snap));
+            // A successful provider-authenticated probe with spare capacity is
+            // stronger evidence than a previous heuristic hard-failure label.
+            // Clear only that automatic quarantine; the coordinator-side compare
+            // guard prevents a racing/manual disable from being overwritten.
+            if (this.deps.client && usageProvesAvailable(snap)) {
+              const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+              await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue })
+                .setAccountAvailability({
+                  accountId: c.key,
+                  status: 'available',
+                  onlyIfStatus: 'needs-attention',
+                })
+                .catch(() => undefined);
+            }
+            return snap;
+          })
           .finally(() => this.usageProbes.delete(c.key));
         this.usageProbes.set(c.key, probe);
       }
