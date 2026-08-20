@@ -56,6 +56,7 @@ describe('GitHub App integration', () => {
       ready: true, missingApp: [], missingInstallation: [],
       permissions: expect.arrayContaining([
         expect.objectContaining({ key: 'actions', required: 'write', app: 'write', installation: 'write', ready: true }),
+        expect.objectContaining({ key: 'actions_variables', required: 'write', app: 'write', installation: 'write', ready: true }),
         expect.objectContaining({ key: 'members', required: 'read', app: 'read', installation: 'read', ready: true }),
       ]),
     });
@@ -170,6 +171,8 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).toHaveProperty('default_permissions.administration', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.merge_queues', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.secrets', 'write');
+    expect(manifest.manifest).toHaveProperty('default_permissions.actions_variables', 'write');
+    expect(manifest.manifest).not.toHaveProperty('default_permissions.variables');
     expect(manifest.manifest).toHaveProperty('default_permissions.security_events', 'read');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');

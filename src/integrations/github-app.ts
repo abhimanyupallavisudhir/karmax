@@ -64,7 +64,7 @@ export const GITHUB_APP_PERMISSIONS = {
   secrets: 'write',
   security_events: 'read',
   statuses: 'write',
-  variables: 'write',
+  actions_variables: 'write',
   vulnerability_alerts: 'read',
   workflows: 'write',
 } as const satisfies Record<string, GitHubAppPermissionLevel>;
@@ -91,7 +91,7 @@ const GITHUB_APP_PERMISSION_LABELS: Record<keyof typeof GITHUB_APP_PERMISSIONS, 
   secrets: 'Actions secrets',
   security_events: 'Security events',
   statuses: 'Commit statuses',
-  variables: 'Actions variables',
+  actions_variables: 'Actions variables',
   vulnerability_alerts: 'Dependabot vulnerability alerts',
   workflows: 'Workflows',
 };
