@@ -302,13 +302,17 @@ describe('probeCodexUsage', () => {
 const readline = require('readline');
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
 let initialized = false;
+let refreshed = false;
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const msg = JSON.parse(line);
   if (msg.method === 'initialize') {
     initialized = true;
     send({ id: msg.id, result: {} });
+  } else if (msg.method === 'account/read') {
+    refreshed = msg.params && msg.params.refreshToken === true;
+    send({ id: msg.id, result: { account: { type: 'chatgpt' } } });
   } else if (msg.method === 'account/rateLimits/read') {
-    if (!initialized || process.env.CODEX_HOME !== process.env.STUB_EXPECTED_CODEX_HOME) {
+    if (!initialized || !refreshed || process.env.CODEX_HOME !== process.env.STUB_EXPECTED_CODEX_HOME) {
       send({ id: msg.id, error: { code: -1, message: 'bad probe environment' } });
     } else {
       send({ id: msg.id, result: ${JSON.stringify(CODEX_LIMITS)} });

@@ -35,9 +35,9 @@ export interface RemoteAgentHome {
 
 /** Seed the leased subscription credentials/config into this task's persistent
  * sandbox. Provider session/cache directories are deliberately left sandbox-
- * local. Most files are copied non-destructively so remote sessions survive;
- * native OAuth files use provider freshness metadata so an explicit host-side
- * re-login replaces an older credential preserved by the task world. */
+ * local. Codex OAuth remains control-plane-owned: every turn replaces the
+ * sandbox projection and withholds its rotating refresh token, so parallel
+ * task worlds cannot fork and revoke one shared login's token family. */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
   session?: string): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
@@ -50,12 +50,14 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   for (const file of configFiles(localHome, provider, session)) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
-    if (!existing.has(target)) {
-      await world.writeFileBuffer(target, file.content);
+    const codexAuth = isCodexAuth(provider, file.relative);
+    const content = codexAuth ? codexRemoteAuthProjection(file.content) : file.content;
+    if (!existing.has(target) || codexAuth) {
+      await world.writeFileBuffer(target, content);
     } else if (authFreshness(provider, file.relative, file.content) !== undefined) {
       const remote = await world.readFileBuffer(target);
       if (authIsNewer(provider, file.relative, file.content, remote))
-        await world.writeFileBuffer(target, file.content);
+        await world.writeFileBuffer(target, content);
     }
   }
   const runtimeBin = await ensureRemoteNode(world);
@@ -100,6 +102,10 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
       ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
       : relative.startsWith('projects/') && relative.endsWith('.jsonl');
     if (!auth.has(relative) && !session) continue;
+    // A remote Codex process receives an access-token-only projection. It is
+    // intentionally never refresh authority and must never overwrite the one
+    // canonical auth.json shared by every task using this login.
+    if (isCodexAuth(provider, relative)) continue;
     const destination = path.join(localHome, ...relative.split('/'));
     const data = await world.readFileBuffer(remoteFile);
     // A task cleanup can race a human re-login on the control plane. Do not let
@@ -120,22 +126,39 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
   }
 }
 
-/** Provider-native monotonic-ish credential freshness. Codex records the time
- * its token set was refreshed; Claude records the access-token expiry, which
- * advances on refresh. Unknown legacy shapes retain the historical direction:
- * seed keeps the remote file, sync exports it back to the control plane. */
-function authFreshness(provider: Provider, relative: string, content: Buffer): number | undefined {
-  const normalized = relative.split(path.sep).join('/');
-  const isCodex = provider === 'codex' && normalized === 'auth.json';
-  const isClaude = provider === 'claude'
-    && (normalized === '.credentials.json' || normalized === '.claude/.credentials.json');
-  if (!isCodex && !isClaude) return undefined;
+function isCodexAuth(provider: Provider, relative: string): boolean {
+  return provider === 'codex' && relative.split(path.sep).join('/') === 'auth.json';
+}
+
+/** Remove every known spelling of the rotating refresh credential while
+ * preserving the access/id tokens and account metadata Codex needs for a turn. */
+function codexRemoteAuthProjection(content: Buffer): Buffer {
   try {
     const parsed = JSON.parse(content.toString('utf8'));
-    if (isCodex) {
-      const timestamp = Date.parse(String(parsed?.last_refresh ?? ''));
-      return Number.isFinite(timestamp) ? timestamp : undefined;
+    if (parsed?.tokens && typeof parsed.tokens === 'object') {
+      delete parsed.tokens.refresh_token;
+      delete parsed.tokens.refreshToken;
     }
+    delete parsed.refresh_token;
+    delete parsed.refreshToken;
+    return Buffer.from(JSON.stringify(parsed));
+  } catch {
+    // Preserve legacy/unrecognized auth shapes rather than corrupting them. A
+    // current native auth.json is JSON and always follows the projection path.
+    return content;
+  }
+}
+
+/** Provider-native monotonic-ish credential freshness for Claude, whose remote
+ * SDK still owns refresh. Codex is deliberately excluded: one canonical host
+ * owns its rotating refresh token, independent of task-local timestamps. */
+function authFreshness(provider: Provider, relative: string, content: Buffer): number | undefined {
+  const normalized = relative.split(path.sep).join('/');
+  const isClaude = provider === 'claude'
+    && (normalized === '.credentials.json' || normalized === '.claude/.credentials.json');
+  if (!isClaude) return undefined;
+  try {
+    const parsed = JSON.parse(content.toString('utf8'));
     const expiry = Number(parsed?.claudeAiOauth?.expiresAt ?? parsed?.oauthAccount?.expiresAt);
     return Number.isFinite(expiry) && expiry > 0 ? expiry : undefined;
   } catch {
