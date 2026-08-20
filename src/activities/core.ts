@@ -3212,10 +3212,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (providerFailure === 'superseded') {
             const key = fallbackIdentityKey;
             fallbackObservation(key, providerFailure);
-            return {
-              status: 'waiting', prs: current, actorUserId,
-              detail: `${summary}\n\nGitHub reports that an equivalent CI request superseded this result. Waiting for exact-head reconciliation instead of reopening the unchanged pull request, releasing its landing position, rerunning it, or asking a human.`,
-            };
+            return externalWait(key,
+              `${summary}\n\nGitHub reports that an equivalent CI request superseded this result. Waiting for exact-head reconciliation without reopening the unchanged pull request or rerunning it; fallback admission is released while the replacement becomes visible.`);
           }
           if (providerFailure === 'retry') {
             fallbackObservation(fallbackIdentityKey, providerFailure);

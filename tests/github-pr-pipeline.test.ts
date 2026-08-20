@@ -11,7 +11,7 @@ import type { AgentAdapter } from '../src/agent/types.js';
 import { worldRepos } from '../src/world/types.js';
 import { mergeQueueId } from '../src/coordinators/names.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
-import { GithubActionsApi } from '../src/integrations/github-actions.js';
+import { GithubActionsApi, githubRequiredCheckKey } from '../src/integrations/github-actions.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -749,7 +749,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       .not.toMatch(/repair it against the newest target/i);
   }, 120_000);
 
-  it('keeps a superseded exact-head cancellation waiting when Actions inspection is forbidden', async () => {
+  it('lands from a newer successful check-rollup duplicate when Actions inspection is forbidden', async () => {
     const repo = await repoWithOrigin('github-actions-forbidden');
     const project = h.store.createProject('Forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' });
     const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -771,20 +771,63 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     actionsInspectionForbidden = true;
     githubReadiness = {
       mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [
+        { __typename: 'CheckRun', databaseId: 98, name: 'unit tests', status: 'COMPLETED', conclusion: 'CANCELLED',
+          startedAt: '2026-08-10T00:00:00Z', completedAt: '2026-08-10T00:01:00Z',
+          detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/98`,
+          checkSuite: { app: { id: 'APP_actions' } } },
+        { __typename: 'CheckRun', databaseId: 99, name: 'unit tests', status: 'COMPLETED', conclusion: 'SUCCESS',
+          startedAt: '2026-08-10T00:02:00Z', completedAt: '2026-08-10T00:03:00Z',
+          detailsUrl: `https://github.com/${SLUG}/actions/runs/43/job/99`,
+          checkSuite: { app: { id: 'APP_actions' } } },
+      ] } },
+    };
+    await handle.signal('confirm');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
+    expect(actionsReruns).toBe(0);
+  }, 120_000);
+
+  it('bounds a superseded cancellation with no visible replacement outside landing admission', async () => {
+    const repo = await repoWithOrigin('github-actions-forbidden-bounded');
+    const project = h.store.createProject('Bound forbidden GitHub Actions inspection', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'forbidden-actions-bounded', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: 'forbidden-repo-bounded',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Bound unavailable Actions inspection', workflow: 'software-dev',
+      workflowVersion: '1.16.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.16.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write bounded.md :: exact proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 25,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsInspectionForbidden = true;
+    githubReadiness = {
+      mergeStateStatus: 'CLEAN',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
         __typename: 'StatusContext', context: 'unit tests', state: 'FAILURE',
-        targetUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+        targetUrl: `https://github.com/${SLUG}/actions/runs/42/job/98`,
         description: 'Canceling since a higher priority waiting request for CI-refs/pull/106/merge exists',
       }] } },
     };
+    const key = githubRequiredCheckKey({ repository: SLUG, pullRequest: 1,
+      headSha: prs[0]!.head.sha, workflowId: 0, check: 'unit tests' });
+    for (let poll = 1; poll < 20; poll++) h.store.appendEvent({
+      taskId: task.id, type: 'github.ci.external-wait', ts: poll,
+      payload: { key, slug: SLUG, number: 1, candidateHead: prs[0]!.head.sha, poll },
+    });
     await handle.signal('confirm');
     await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
-      .toMatch(/equivalent CI request.*waiting.*releasing its landing position/is);
+      .toMatch(/same externally blocked CI state after 20 bounded observations.*owns no admission slot/is);
     const current = await view(handle);
     expect(current.stage).toBe('merge');
-    expect(current.landing?.repairAttempts ?? 0).toBe(0);
-    expect(current.messages.map((message: any) => message.text).join('\n'))
-      .not.toMatch(/repair it against the newest target|Grant the GitHub App/i);
+    expect(current.waitingFor?.kind).toBe('human');
+    expect(current.state?.mergeDomain).toBeUndefined();
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
