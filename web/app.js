@@ -14061,10 +14061,14 @@ function wireSettingsNavigation() {
     // Group each section title + the cards under it, then wrap the groups into
     // panes in nav order (nav order is the canonical SPEC order; the templates
     // may declare sections in any order).
+    const paneIds = new Set(links.map((link) => link.getAttribute('href').slice(1)));
     const groups = new Map();
     let current;
     for (const child of [...content.children]) {
-      if (child.classList.contains('settings-section-title')) current = child.id;
+      // A section title can also be a heading inside a pane (for example,
+      // Subscription billing within Plan & billing). Only titles represented
+      // in the navigation rail start a new pane.
+      if (child.classList.contains('settings-section-title') && paneIds.has(child.id)) current = child.id;
       if (!current) continue;
       if (!groups.has(current)) groups.set(current, []);
       groups.get(current).push(child);
@@ -14081,8 +14085,11 @@ function wireSettingsNavigation() {
   const panes = [...content.querySelectorAll('.settings-pane')];
   const activate = (id) => {
     const visibleLinks = links.filter((link) => !link.hidden);
-    const target = visibleLinks.some((link) => link.getAttribute('href') === `#${id}`)
-      ? id : visibleLinks[0]?.getAttribute('href').slice(1);
+    const nestedPane = id && [...content.querySelectorAll('[id]')]
+      .find((node) => node.id === id)?.closest('.settings-pane')?.dataset.pane;
+    const requestedPane = nestedPane || id;
+    const target = visibleLinks.some((link) => link.getAttribute('href') === `#${requestedPane}`)
+      ? requestedPane : visibleLinks[0]?.getAttribute('href').slice(1);
     panes.forEach((pane) => pane.classList.toggle('active', pane.dataset.pane === target));
     links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${target}`));
   };

@@ -19,6 +19,9 @@ const sections = [...nav.matchAll(/<a\b([^>]*)>([^<]+)<\/a>/g)]
   }))
   .filter(({ id }) => id);
 const phoneIndex = sections.findIndex(({ id }) => id === 'settings-access');
+const navigationStart = src.indexOf('function wireSettingsNavigation()');
+const navigationEnd = src.indexOf('function cycleSettingsPane(', navigationStart);
+const navigation = src.slice(navigationStart, navigationEnd);
 
 let failed = 0;
 function ok(condition, message) {
@@ -32,6 +35,10 @@ ok(sections.some(({ id }) => id === 'settings-people'), 'settings navigation kee
 ok(phoneIndex < 0, 'settings navigation no longer includes installation Phone Access');
 ok(!view.includes('id="appearance-card"') && !view.includes('id="resilience-card"') && !view.includes('id="outbound-email-card"'),
   'organization settings contains no installation-wide cards');
+ok(sections.some(({ id }) => id === 'settings-plan') && !sections.some(({ id }) => id === 'settings-billing'),
+  'Subscription billing is a subsection of Plan & billing, not its own settings page');
+ok(navigation.includes("paneIds.has(child.id)") && navigation.includes("closest('.settings-pane')"),
+  'settings panes start only at navigation entries and nested deep links activate their parent pane');
 
-console.log(`\n${3 - failed} passed, ${failed} failed`);
+console.log(`\n${5 - failed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
