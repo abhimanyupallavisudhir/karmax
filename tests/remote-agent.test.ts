@@ -18,7 +18,9 @@ describe('remote subscription agents', () => {
 
   it('seeds leased credentials/config while removing the obsolete remote platform MCP', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-home-'));
-    fs.writeFileSync(path.join(localHome, 'auth.json'), '{"tokens":{"access_token":"subscription"}}');
+    fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
+      tokens: { access_token: 'subscription', refresh_token: 'host-only-refresh' },
+    }));
     fs.mkdirSync(path.join(localHome, 'skills', 'review'), { recursive: true });
     fs.writeFileSync(path.join(localHome, 'skills', 'review', 'SKILL.md'), 'review skill');
     fs.mkdirSync(path.join(localHome, 'sessions'), { recursive: true });
@@ -36,6 +38,7 @@ describe('remote subscription agents', () => {
 
     expect(seeded.absolute).toBe(`/workspace/${remoteHome}`);
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('subscription');
+    expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).not.toContain('host-only-refresh');
     expect(world.files.get(`${remoteHome}/skills/review/SKILL.md`)?.toString()).toBe('review skill');
     expect(world.files.has(`${remoteHome}/sessions/host-task.jsonl`)).toBe(false);
     expect(world.files.has(`${remoteHome}/logs_2.sqlite`)).toBe(false);
@@ -48,7 +51,7 @@ describe('remote subscription agents', () => {
     expect(world.files.has('.karmax-injection/agent/tools/platform-mcp/karmax-mcp.cjs')).toBe(false);
     world.files.set(`${remoteHome}/auth.json`, Buffer.from('{"tokens":{"access_token":"refreshed-remotely"}}'));
     await seedRemoteAgentHome(world, 'codex', localHome);
-    expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('refreshed-remotely');
+    expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('subscription');
     expect(world.commands.some((command) => command.includes('find') && command.includes('chmod 600'))).toBe(true);
     await seedRemoteAgentHome(world, 'codex', localHome, 'host-task');
     expect(world.files.get(`${remoteHome}/sessions/host-task.jsonl`)?.toString()).toBe('host-only conversation');
@@ -85,7 +88,7 @@ describe('remote subscription agents', () => {
       .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
   });
 
-  it('isolates rotated accounts and exports refreshed auth plus native sessions', async () => {
+  it('isolates accounts and exports native sessions without importing task-local OAuth state', async () => {
     const first = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-a-'));
     const second = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-b-'));
     localHome = first;
@@ -100,12 +103,12 @@ describe('remote subscription agents', () => {
     world.files.set(`${a.relative}/auth.json`, Buffer.from('{"account":"a-refreshed"}'));
     world.files.set(`${a.relative}/sessions/2026/session-a.jsonl`, Buffer.from('durable native session'));
     await syncRemoteAgentHome(world, 'codex', a, first);
-    expect(fs.readFileSync(path.join(first, 'auth.json'), 'utf8')).toContain('a-refreshed');
+    expect(fs.readFileSync(path.join(first, 'auth.json'), 'utf8')).toContain('a-old');
     expect(fs.readFileSync(path.join(first, 'sessions/2026/session-a.jsonl'), 'utf8')).toBe('durable native session');
     fs.rmSync(second, { recursive: true, force: true });
   });
 
-  it('lets a newer control-plane re-login replace stale remote auth without syncing the stale token back', async () => {
+  it('keeps the control plane authoritative even when remote OAuth metadata looks newer', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-reauth-'));
     const localAuth = {
       auth_mode: 'chatgpt', last_refresh: '2026-08-19T22:00:00.000Z',
@@ -115,16 +118,16 @@ describe('remote subscription agents', () => {
     const world = fakeWorld();
     const home = await seedRemoteAgentHome(world, 'codex', localHome);
     world.files.set(`${home.relative}/auth.json`, Buffer.from(JSON.stringify({
-      auth_mode: 'chatgpt', last_refresh: '2026-08-18T22:00:00.000Z',
+      auth_mode: 'chatgpt', last_refresh: '2026-08-20T22:00:00.000Z',
       tokens: { access_token: 'expired-remote', refresh_token: 'expired-refresh' },
     })));
 
     await seedRemoteAgentHome(world, 'codex', localHome);
     expect(world.files.get(`${home.relative}/auth.json`)?.toString()).toContain('fresh-control-plane');
 
-    // A late cleanup from an older world must not undo the user's re-login.
+    // A late cleanup from any world must not become refresh authority.
     world.files.set(`${home.relative}/auth.json`, Buffer.from(JSON.stringify({
-      auth_mode: 'chatgpt', last_refresh: '2026-08-18T22:00:00.000Z',
+      auth_mode: 'chatgpt', last_refresh: '2026-08-21T22:00:00.000Z',
       tokens: { access_token: 'expired-remote', refresh_token: 'expired-refresh' },
     })));
     await syncRemoteAgentHome(world, 'codex', home, localHome);

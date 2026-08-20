@@ -8,6 +8,7 @@ import { trackProcess } from '../util/processes.js';
 import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { localProviderCli } from './provider-cli.js';
+import { createCustodyEnv, killAgent } from './custody.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -361,7 +362,12 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
 async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number): Promise<unknown> {
   const cmd = process.env.KARMAX_CODEX_USAGE_CMD ?? process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
   const env = scrubbedEnv({ provider: 'codex', configHome });
-  const child = spawn(cmd, ['app-server'], { env, stdio: ['pipe', 'pipe', 'ignore'] });
+  const custody = createCustodyEnv(env);
+  const child = spawn(cmd, ['app-server'], {
+    env: custody.env,
+    stdio: ['pipe', 'pipe', 'ignore'],
+    detached: true,
+  });
   const client = new CodexAppServerClient(child.stdin!, child.stdout!);
   let untrack = () => {};
   if (child.pid) {
@@ -375,10 +381,16 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
       capabilities: null,
     }), timeoutMs);
     client.notify('initialized');
+    // The metadata endpoint does not itself refresh an expired access token.
+    // Refresh centrally before reading quota so Retry can heal a stale token
+    // without spending a model turn. This host home is the sole owner of the
+    // rotating refresh credential; remote task projections never receive it.
+    await withTimeout(client.request('account/read', { refreshToken: true }), timeoutMs);
     return await withTimeout(client.request('account/rateLimits/read'), timeoutMs);
   } finally {
     client.close();
-    if (!child.killed) child.kill();
+    if (child.pid) await killAgent(child.pid, 2500, custody.custodyId);
+    else if (!child.killed) child.kill();
   }
 }
 
