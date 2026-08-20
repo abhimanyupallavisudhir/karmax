@@ -55,6 +55,74 @@ export type GithubPullRequestMergeState =
 export type GithubPullRequestReviewDecision = 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED';
 export type GithubStatusCheckState = 'ERROR' | 'EXPECTED' | 'FAILURE' | 'PENDING' | 'SUCCESS';
 
+const FAILED_CHECK_RUN_STATES = new Set([
+  'ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT',
+]);
+
+/** GitHub can retain several CheckRuns for one `(App, context name)` on the
+ * current PR rollup. This happens when Actions concurrency cancels one delivery
+ * in favour of a newer equivalent delivery: the aggregate remains FAILURE even
+ * after the newer run succeeds. Branch protection identifies a check context
+ * by App + name too, so collapse only that exact identity and retain the newest
+ * observation. Legacy StatusContexts are already provider-collapsed and remain
+ * untouched. */
+function effectiveCheckRollup(nodes: any[]): { nodes: any[]; collapsed: boolean } {
+  const checks = new Map<string, { node: any; order: number[] }>();
+  const statuses: any[] = [];
+  let collapsed = false;
+  for (const [index, node] of nodes.entries()) {
+    if (node?.__typename !== 'CheckRun') {
+      statuses.push(node);
+      continue;
+    }
+    const name = String(node.name ?? 'GitHub check');
+    const appId = String(node.checkSuite?.app?.id ?? '').trim();
+    // Without an App identity, two equal names may belong to distinct check
+    // providers. Preserve both rather than manufacturing a supersession.
+    const identity = appId ? `${appId}\0${name}` : `unidentified\0${index}`;
+    const runId = Number(String(node.detailsUrl ?? '').match(/\/actions\/runs\/(\d+)(?:\/|$)/)?.[1] ?? 0);
+    const suiteCreatedAt = Date.parse(String(node.checkSuite?.createdAt ?? '')) || 0;
+    const startedAt = Date.parse(String(node.startedAt ?? '')) || 0;
+    const completedAt = Date.parse(String(node.completedAt ?? '')) || 0;
+    const suiteDatabaseId = Number(node.checkSuite?.databaseId ?? 0) || 0;
+    const databaseId = Number(node.databaseId ?? 0) || 0;
+    // CheckSuite creation is the provider delivery order. CheckRun start time
+    // then distinguishes a later rerun within a reused suite; numeric ids are
+    // stable tie-breakers only.
+    const order = [suiteCreatedAt || startedAt || completedAt, startedAt,
+      suiteDatabaseId, databaseId, runId];
+    const prior = checks.get(identity);
+    if (!prior) {
+      checks.set(identity, { node, order });
+      continue;
+    }
+    collapsed = true;
+    const firstDifference = order.findIndex((value, position) => value !== prior.order[position]);
+    if (firstDifference >= 0 && order[firstDifference]! > (prior.order[firstDifference] ?? 0))
+      checks.set(identity, { node, order });
+  }
+  return { nodes: [...checks.values()].map(({ node }) => node).concat(statuses), collapsed };
+}
+
+function derivedCheckState(nodes: any[]): GithubStatusCheckState {
+  let pending = false;
+  for (const node of nodes) {
+    if (node?.__typename === 'CheckRun') {
+      const status = String(node.status ?? '').toUpperCase();
+      const conclusion = String(node.conclusion ?? '').toUpperCase();
+      if (FAILED_CHECK_RUN_STATES.has(conclusion)) return 'FAILURE';
+      if (status !== 'COMPLETED' || !conclusion) pending = true;
+      continue;
+    }
+    if (node?.__typename === 'StatusContext') {
+      const state = String(node.state ?? '').toUpperCase();
+      if (state === 'ERROR' || state === 'FAILURE') return 'FAILURE';
+      if (state === 'PENDING' || state === 'EXPECTED' || !state) pending = true;
+    }
+  }
+  return pending ? 'PENDING' : 'SUCCESS';
+}
+
 /** One terminally failing context from GitHub's combined check rollup. Check
  * runs and legacy commit statuses have different schemas; this is the small,
  * provider-neutral packet the Do agent needs to identify and inspect the
@@ -316,10 +384,12 @@ export class GithubPrApi {
           ${checkLevel === 'none' ? '' : `statusCheckRollup {
             state
             ${checkLevel === 'details' ? `contexts(first: 50) {
+              pageInfo { hasNextPage }
               nodes {
                 __typename
                 ... on CheckRun {
-                  databaseId name status conclusion detailsUrl
+                  databaseId name status conclusion detailsUrl startedAt completedAt
+                  checkSuite { databaseId createdAt app { id } }
                 }
                 ... on StatusContext { context state targetUrl description }
               }
@@ -373,10 +443,18 @@ export class GithubPrApi {
     }
     const raw = value?.data?.repository?.pullRequest;
     if (!raw) throw new GithubApiError(404, `GitHub pull request ${slug}#${number} was not found`);
-    const failedCheckCandidates = (raw.statusCheckRollup?.contexts?.nodes ?? []).flatMap((node: any) => {
+    const rollupNodes = raw.statusCheckRollup?.contexts?.nodes ?? [];
+    const effectiveRollup = effectiveCheckRollup(rollupNodes);
+    const completeRollup = raw.statusCheckRollup?.contexts?.pageInfo?.hasNextPage !== true;
+    const effectiveCheckState = effectiveRollup.collapsed
+      && completeRollup
+      && raw.statusCheckRollup?.state === 'FAILURE'
+      ? derivedCheckState(effectiveRollup.nodes)
+      : raw.statusCheckRollup?.state;
+    const failedCheckCandidates = (completeRollup ? effectiveRollup.nodes : rollupNodes).flatMap((node: any) => {
       if (node?.__typename === 'CheckRun') {
         const state = String(node.conclusion ?? node.status ?? 'UNKNOWN');
-        if (!['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) return [];
+        if (!FAILED_CHECK_RUN_STATES.has(state)) return [];
         return [{
           name: String(node.name ?? 'GitHub check'), state,
           ...(node.databaseId ? { databaseId: Number(node.databaseId) } : {}),
@@ -407,7 +485,7 @@ export class GithubPrApi {
       mergeable: raw.mergeable as GithubPullRequestMergeable,
       mergeStateStatus: raw.mergeStateStatus as GithubPullRequestMergeState,
       ...(raw.reviewDecision ? { reviewDecision: raw.reviewDecision as GithubPullRequestReviewDecision } : {}),
-      ...(raw.statusCheckRollup?.state ? { checks: raw.statusCheckRollup.state as GithubStatusCheckState } : {}),
+      ...(effectiveCheckState ? { checks: effectiveCheckState as GithubStatusCheckState } : {}),
       ...(checksUnavailable ? { checksUnavailable: true as const } : {}),
       ...(failedChecks.length ? { failedChecks } : {}),
       ...(raw.mergeQueueEntry?.id ? { mergeQueueEntryId: String(raw.mergeQueueEntry.id) } : {}),
@@ -437,7 +515,7 @@ export class GithubPrApi {
     const candidates: Array<GithubFailedCheck & { databaseId?: number }> = [];
     for (const run of runs?.check_runs ?? []) {
       const state = String(run?.conclusion ?? run?.status ?? 'UNKNOWN').toUpperCase();
-      if (!['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) continue;
+      if (!FAILED_CHECK_RUN_STATES.has(state)) continue;
       candidates.push({
         name: String(run?.name ?? 'GitHub check'), state,
         ...(run?.id ? { databaseId: Number(run.id) } : {}),

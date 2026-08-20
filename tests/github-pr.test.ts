@@ -264,6 +264,50 @@ describe('GitHub PR client', () => {
     });
   });
 
+  it('treats a newer successful same-context check run as authoritative over a cancelled duplicate', async () => {
+    let hasNextPage = false;
+    const fetcher = (async () => Response.json({ data: { repository: { pullRequest: {
+      id: 'PR_superseded', url: 'https://github.test/acme/widgets/pull/10', state: 'OPEN', isDraft: false,
+      merged: false, headRefOid: 'same-head', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'FAILURE', contexts: { pageInfo: { hasNextPage }, nodes: [
+        { __typename: 'CheckRun', databaseId: 101, name: 'typecheck + tests', status: 'COMPLETED',
+          conclusion: 'CANCELLED', startedAt: '2026-08-19T23:56:59Z', completedAt: '2026-08-19T23:57:00Z',
+          detailsUrl: 'https://github.com/acme/widgets/actions/runs/32315364360/job/96266354140',
+          checkSuite: { databaseId: 87605644005, createdAt: '2026-08-19T23:56:58Z',
+            app: { id: 'MDM6QXBwNDMxNjQ2Nw==' } } },
+        { __typename: 'CheckRun', databaseId: 102, name: 'typecheck + tests', status: 'COMPLETED',
+          conclusion: 'SUCCESS', startedAt: '2026-08-19T23:57:03Z', completedAt: '2026-08-20T00:11:45Z',
+          detailsUrl: 'https://github.com/acme/widgets/actions/runs/32315365515/job/96266359059',
+          checkSuite: { databaseId: 87605646835, createdAt: '2026-08-19T23:57:00Z',
+            app: { id: 'MDM6QXBwNDMxNjQ2Nw==' } } },
+        { __typename: 'CheckRun', databaseId: 103, name: 'deploy artifacts', status: 'COMPLETED',
+          conclusion: 'CANCELLED', startedAt: '2026-08-19T23:56:59Z', completedAt: '2026-08-19T23:57:00Z',
+          detailsUrl: 'https://github.com/acme/widgets/actions/runs/32315364360/job/96266354015',
+          checkSuite: { databaseId: 87605644005, createdAt: '2026-08-19T23:56:58Z',
+            app: { id: 'MDM6QXBwNDMxNjQ2Nw==' } } },
+        { __typename: 'CheckRun', databaseId: 104, name: 'deploy artifacts', status: 'COMPLETED',
+          conclusion: 'SUCCESS', startedAt: '2026-08-19T23:57:03Z', completedAt: '2026-08-20T00:00:26Z',
+          detailsUrl: 'https://github.com/acme/widgets/actions/runs/32315365515/job/96266359214',
+          checkSuite: { databaseId: 87605646835, createdAt: '2026-08-19T23:57:00Z',
+            app: { id: 'MDM6QXBwNDMxNjQ2Nw==' } } },
+      ] } },
+      viewerCanEnableAutoMerge: false, viewerCanMergeAsAdmin: false,
+    } } } })) as typeof fetch;
+    const api = new GithubPrApi('app-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+
+    const current = await api.readiness(SLUG, 10);
+    expect(current).toMatchObject({
+      checks: 'SUCCESS',
+      mergeStateStatus: 'CLEAN',
+    });
+    expect(current.failedChecks).toBeUndefined();
+
+    // Never turn an aggregate failure green when another failing context may
+    // exist beyond the bounded GraphQL page.
+    hasNextPage = true;
+    await expect(api.readiness(SLUG, 10)).resolves.toMatchObject({ checks: 'FAILURE' });
+  });
+
   it('reports native queue removal and reads failures from the speculative merge-group commit', async () => {
     const fetcher = (async (input: string | URL | Request) => {
       const path = new URL(String(input)).pathname;
@@ -899,8 +943,9 @@ describe('GitHub-authoritative merge activity', () => {
     await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
     expect(reruns).toBe(1);
 
-    // The no-Actions fallback consumes the same classifier and also parks the
-    // unchanged proposal instead of treating the diagnostic as a code failure.
+    // The no-Actions fallback consumes the same classifier and parks the
+    // unchanged proposal outside fallback admission while a replacement is
+    // still becoming visible.
     actionsAvailable = false;
     readiness = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
       statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
@@ -908,12 +953,12 @@ describe('GitHub-authoritative merge activity', () => {
         targetUrl: `https://github.com/${SLUG}/actions/runs/44`, description: cancellation,
       }] } } };
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({
-      status: 'waiting', detail: expect.stringMatching(/equivalent CI request.*waiting.*releasing its landing position/is),
+      status: 'waiting', releaseAdmission: true,
+      detail: expect.stringMatching(/equivalent CI request.*admission is released/is),
     });
     const duplicateFallback = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(duplicateFallback).toMatchObject({ status: 'waiting',
-      detail: expect.stringMatching(/instead of.*releasing its landing position.*asking a human/is) });
-    expect(duplicateFallback).not.toHaveProperty('releaseAdmission');
+    expect(duplicateFallback).toMatchObject({ status: 'waiting', releaseAdmission: true,
+      detail: expect.stringMatching(/admission is released/is) });
 
     // Missing App Actions access is diagnostic metadata, not the owner of the
     // CI disposition. Permission-safe PR evidence still sends deterministic
@@ -939,9 +984,8 @@ describe('GitHub-authoritative merge activity', () => {
 
     readiness.statusCheckRollup.contexts.nodes[0].description = cancellation;
     const forbiddenSuperseded = await core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
-    expect(forbiddenSuperseded).toMatchObject({ status: 'waiting',
-      detail: expect.stringMatching(/equivalent CI request.*waiting.*releasing its landing position/is) });
-    expect(forbiddenSuperseded).not.toHaveProperty('releaseAdmission');
+    expect(forbiddenSuperseded).toMatchObject({ status: 'waiting', releaseAdmission: true,
+      detail: expect.stringMatching(/equivalent CI request.*admission is released/is) });
     expect(forbiddenSuperseded.detail).not.toMatch(/grant the GitHub App/i);
 
     readiness.statusCheckRollup.contexts.nodes[0].description = 'GitHub Actions is disabled for this repository';
