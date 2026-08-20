@@ -14,6 +14,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const msg = JSON.parse(line);
   if (msg.id != null && out) fs.appendFileSync(out, JSON.stringify(msg) + '\\n');
   if (msg.method === 'initialize') send({ id: msg.id, result: { codexHome: process.env.CODEX_HOME } });
+  else if (msg.method === 'account/rateLimits/read') send({ id: msg.id, result: {
+    rateLimits: { primary: { usedPercent: 28, windowDurationMins: 10080, resetsAt: 1999999999 } },
+  } });
   else if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'thread-new' } } });
   else if (msg.method === 'thread/resume') send({ id: msg.id, result: { thread: { id: msg.params.threadId } } });
   else if (msg.method === 'thread/fork') send({ id: msg.id, result: { thread: { id: 'thread-forked' } } });
@@ -37,7 +40,10 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         name: 'codex_apps', status: 'failed', error: { message: detail, code: 'token_expired', status: 401 },
       } });
       send({ method: 'error', params: {
-        error: { message: 'MCP server codex_apps failed to initialize: ' + detail, code: 'token_expired', status: 401 },
+        // The real app-server's top-level error drops the MCP server identity;
+        // correlation must use the preceding startup failure plus positive proof
+        // that the main Codex account endpoint authenticated successfully.
+        error: { message: detail, code: 'token_expired', status: 401 },
         willRetry: false,
       } });
       send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });

@@ -105,6 +105,32 @@ describe('remote subscription agents', () => {
     fs.rmSync(second, { recursive: true, force: true });
   });
 
+  it('lets a newer control-plane re-login replace stale remote auth without syncing the stale token back', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-reauth-'));
+    const localAuth = {
+      auth_mode: 'chatgpt', last_refresh: '2026-08-19T22:00:00.000Z',
+      tokens: { access_token: 'fresh-control-plane', refresh_token: 'fresh-refresh' },
+    };
+    fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify(localAuth));
+    const world = fakeWorld();
+    const home = await seedRemoteAgentHome(world, 'codex', localHome);
+    world.files.set(`${home.relative}/auth.json`, Buffer.from(JSON.stringify({
+      auth_mode: 'chatgpt', last_refresh: '2026-08-18T22:00:00.000Z',
+      tokens: { access_token: 'expired-remote', refresh_token: 'expired-refresh' },
+    })));
+
+    await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(world.files.get(`${home.relative}/auth.json`)?.toString()).toContain('fresh-control-plane');
+
+    // A late cleanup from an older world must not undo the user's re-login.
+    world.files.set(`${home.relative}/auth.json`, Buffer.from(JSON.stringify({
+      auth_mode: 'chatgpt', last_refresh: '2026-08-18T22:00:00.000Z',
+      tokens: { access_token: 'expired-remote', refresh_token: 'expired-refresh' },
+    })));
+    await syncRemoteAgentHome(world, 'codex', home, localHome);
+    expect(fs.readFileSync(path.join(localHome, 'auth.json'), 'utf8')).toContain('fresh-control-plane');
+  });
+
   it('rewrites a selected browser MCP to the probed sandbox-local headless runtime', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-browser-'));
     fs.writeFileSync(path.join(localHome, '.claude.json'), JSON.stringify({ mcpServers: {
@@ -294,6 +320,9 @@ function fakeWorld(appServer = false, browserReady = false): World & {
             const request = JSON.parse(line);
             requests.push(request);
             if (request.method === 'initialize') send({ id: request.id, result: {} });
+            else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: {
+              rateLimits: { primary: { usedPercent: 12, windowDurationMins: 10080, resetsAt: 1999999999 } },
+            } });
             else if (request.method === 'mcpServerStatus/list') send({ id: request.id, result: { data: [], nextCursor: null } });
             else if (request.method === 'thread/start') {
               world.dynamicTools = request.params.dynamicTools;

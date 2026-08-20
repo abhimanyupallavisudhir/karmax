@@ -35,7 +35,9 @@ export interface RemoteAgentHome {
 
 /** Seed the leased subscription credentials/config into this task's persistent
  * sandbox. Provider session/cache directories are deliberately left sandbox-
- * local; files are copied non-destructively, so remote sessions survive turns. */
+ * local. Most files are copied non-destructively so remote sessions survive;
+ * native OAuth files use provider freshness metadata so an explicit host-side
+ * re-login replaces an older credential preserved by the task world. */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
   session?: string): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
@@ -48,9 +50,13 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   for (const file of configFiles(localHome, provider, session)) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
-    // Provider CLIs refresh OAuth state in-place. Never replace a sandbox copy
-    // with the older control-plane copy on a later turn.
-    if (!existing.has(target)) await world.writeFileBuffer(target, file.content);
+    if (!existing.has(target)) {
+      await world.writeFileBuffer(target, file.content);
+    } else if (authFreshness(provider, file.relative, file.content) !== undefined) {
+      const remote = await world.readFileBuffer(target);
+      if (authIsNewer(provider, file.relative, file.content, remote))
+        await world.writeFileBuffer(target, file.content);
+    }
   }
   const runtimeBin = await ensureRemoteNode(world);
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
@@ -96,6 +102,12 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
     if (!auth.has(relative) && !session) continue;
     const destination = path.join(localHome, ...relative.split('/'));
     const data = await world.readFileBuffer(remoteFile);
+    // A task cleanup can race a human re-login on the control plane. Do not let
+    // an older persistent world restore the token the user just replaced.
+    if (auth.has(relative) && fs.existsSync(destination)) {
+      const local = fs.readFileSync(destination);
+      if (authIsNewer(provider, relative, local, data)) continue;
+    }
     fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
     const temp = `${destination}.${crypto.randomBytes(6).toString('hex')}.karmax-tmp`;
     try {
@@ -106,6 +118,35 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
       fs.rmSync(temp, { force: true });
     }
   }
+}
+
+/** Provider-native monotonic-ish credential freshness. Codex records the time
+ * its token set was refreshed; Claude records the access-token expiry, which
+ * advances on refresh. Unknown legacy shapes retain the historical direction:
+ * seed keeps the remote file, sync exports it back to the control plane. */
+function authFreshness(provider: Provider, relative: string, content: Buffer): number | undefined {
+  const normalized = relative.split(path.sep).join('/');
+  const isCodex = provider === 'codex' && normalized === 'auth.json';
+  const isClaude = provider === 'claude'
+    && (normalized === '.credentials.json' || normalized === '.claude/.credentials.json');
+  if (!isCodex && !isClaude) return undefined;
+  try {
+    const parsed = JSON.parse(content.toString('utf8'));
+    if (isCodex) {
+      const timestamp = Date.parse(String(parsed?.last_refresh ?? ''));
+      return Number.isFinite(timestamp) ? timestamp : undefined;
+    }
+    const expiry = Number(parsed?.claudeAiOauth?.expiresAt ?? parsed?.oauthAccount?.expiresAt);
+    return Number.isFinite(expiry) && expiry > 0 ? expiry : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function authIsNewer(provider: Provider, relative: string, candidate: Buffer, current: Buffer): boolean {
+  const next = authFreshness(provider, relative, candidate);
+  const prior = authFreshness(provider, relative, current);
+  return next !== undefined && (prior === undefined || next > prior);
 }
 
 /** Remote auth/session export is a durability enhancement, not the provider

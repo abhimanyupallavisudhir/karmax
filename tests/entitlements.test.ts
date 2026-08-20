@@ -331,7 +331,35 @@ describe('hosted agent-run admission integration', () => {
     store.setOrganizationPlan(organization.id, 'team');
     await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 10 }));
     expect(getHandle).toHaveBeenLastCalledWith(`agent-queue:${organization.id}`);
-    reconciler.stop();
+    await reconciler.stop();
+  });
+
+  it('does not finish stopping while an in-flight queue reconciliation still owns the Temporal client', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Orderly shutdown', ownerUserId: 'owner' });
+    let releaseSignal!: () => void;
+    const signalBlocked = new Promise<void>((resolve) => { releaseSignal = resolve; });
+    const signal = vi.fn(() => signalBlocked);
+    const reconciler = new EntitlementQueueReconciler({
+      store,
+      client: { workflow: { getHandle: vi.fn(() => ({
+        signal,
+        query: vi.fn(async () => ({ current: [], queue: [] })),
+      })) } } as any,
+      intervalMs: 0,
+    });
+    reconciler.start();
+    await vi.waitFor(() => expect(signal).toHaveBeenCalled());
+
+    let stopped = false;
+    const stopping = Promise.resolve(reconciler.stop()).then(() => { stopped = true; });
+    await Promise.resolve();
+    const returnedBeforeRelease = stopped;
+    releaseSignal();
+    await stopping;
+    store.close();
+
+    expect(returnedBeforeRelease).toBe(false);
   });
 
   it('blocks new run admission while over the member limit and reopens after recovery', async () => {

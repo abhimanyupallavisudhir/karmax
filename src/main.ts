@@ -481,7 +481,16 @@ async function main() {
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, providerConnections, worlds,
-    worldAccess, runners, resources, broker, githubApp, bus });
+    worldAccess, runners, resources, broker, githubApp, bus,
+    refreshCredentialHealth: async (task, credentialProvider) => {
+      const organizationId = store.getProject(task.projectId)?.organizationId ?? 'org_personal';
+      const { refreshCredentialHealth } = await import('./agent/credential-health.js');
+      await refreshCredentialHealth({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, {
+        organizationId,
+        provider: credentialProvider,
+      });
+    },
+  });
 
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency prerequisites are met and a schedule/event activates it. Runs
@@ -692,7 +701,7 @@ async function main() {
     clearInterval(orphanSweep);
     clearInterval(reconcileSweep);
     clearInterval(deploymentSweep);
-    entitlementQueues.stop();
+    await step(entitlementQueues.stop());
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     mailPoller.stop();
