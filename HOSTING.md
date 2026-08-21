@@ -102,13 +102,20 @@ persisted because they can contain OAuth tokens and Authorization headers. The
 task's `resolve.auto` event carries the same whitelist, and the account
 coordinator logs the state transition.
 
-Codex remote worlds receive an access-token-only projection of the organization
+Codex remote worlds receive a refresh-token-free projection of the organization
 login; the rotating refresh token stays in the canonical control-plane home.
 Usage/dashboard probes read quota with the current token first and rotate OAuth
 only when that authenticated read fails; a dashboard refresh must never rotate
-credentials out from under live remote turns. If a projection receives a
-terminal expired/unauthorized response, Karmax serializes one forced refresh
-through the host authority, re-projects the result, and resumes the same thread.
+credentials out from under live remote turns. Current Codex also treats that
+projection as logged out when its short-lived ID token expires, even while the
+access token is still valid. Before each remote process Karmax checks the ID-token
+expiry locally (no provider request) and, inside a ten-minute safety window,
+serializes one refresh through the canonical host authority before projection.
+If a long-running projection nevertheless receives a terminal
+expired/unauthorized response — including `codexErrorInfo=other` with an HTTP 401
+"Missing bearer or basic authentication" message — Karmax extracts the safe HTTP
+status/request id, performs one bounded forced refresh, re-projects the result,
+and resumes the same thread. The raw error envelope and tokens are never retained.
 Explicitly invalid/revoked credentials and wrong scopes still quarantine the
 login for a human.
 

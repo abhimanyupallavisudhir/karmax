@@ -126,12 +126,19 @@ export function nativeProviderDiagnostic(
     }
     return undefined;
   };
-  const rawStatus = first('status', 'statusCode', 'httpStatusCode', 'httpStatus', 'http_status');
-  const parsedStatus = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus);
   const message = diagnosticText(first('message', 'detail', 'reason'))
     ?? (typeof root === 'string' ? diagnosticText(root) : undefined);
+  const rawStatus = first('status', 'statusCode', 'httpStatusCode', 'httpStatus', 'http_status');
+  const structuredStatus = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus);
+  // Some current app-server terminal envelopes retain only the rendered HTTP
+  // error in `message` (codexErrorInfo is merely "other"). Recover the same
+  // whitelisted fields without persisting the provider envelope.
+  const messageStatus = message?.match(/\b(?:unexpected\s+)?status\s+([1-5]\d{2})\b/i)
+    ?? message?.match(/\bhttp\s*([1-5]\d{2})\b/i);
+  const parsedStatus = Number.isInteger(structuredStatus) ? structuredStatus : Number(messageStatus?.[1]);
   const code = diagnosticText(first('code', 'errorCode', 'error_code', 'codexErrorInfo'), 120);
-  const requestId = diagnosticText(first('request_id', 'requestId', 'xRequestId', 'x-request-id'), 200);
+  const requestId = diagnosticText(first('request_id', 'requestId', 'xRequestId', 'x-request-id'), 200)
+    ?? diagnosticText(message?.match(/\brequest[ _-]?id\s*:\s*([A-Za-z0-9._-]+)/i)?.[1], 200);
   const model = diagnosticText(context.model, 160);
   const operation = diagnosticText(context.operation, 160);
   const rawWillRetry = first('willRetry', 'will_retry');

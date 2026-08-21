@@ -69,6 +69,9 @@ export type UsageRunner = (configDir: string) => Promise<string>;
 /** Injectable Codex app-server request (tests); returns account/rateLimits/read. */
 export type CodexUsageRunner = () => Promise<unknown>;
 const codexRefreshes = new Map<string, { promise: Promise<unknown>; force: boolean }>();
+/** Leave enough lifetime for sandbox startup and the initial Responses stream.
+ * Long turns remain protected by the bounded terminal-401 recovery in codex.ts. */
+export const CODEX_REMOTE_ID_TOKEN_SAFETY_MS = 10 * 60_000;
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 // Lines look like (the separator is a middle dot · U+00B7):
@@ -384,6 +387,52 @@ export async function refreshCodexLogin(
     });
   codexRefreshes.set(key, { promise: created, force: !!opts.force });
   return created;
+}
+
+/** A refresh-token-free remote Codex home is considered logged out once its
+ * short-lived ID token expires, even when the access token itself remains valid.
+ * Refresh the one canonical host home before projection; the sandbox still never
+ * receives refresh authority. Returns whether a refresh was performed. */
+export async function ensureCodexLoginFresh(
+  opts: {
+    configHome?: string;
+    now?: number;
+    minValidityMs?: number;
+    timeoutMs?: number;
+    run?: CodexUsageRunner;
+    onRefresh?: () => void;
+  } = {},
+): Promise<boolean> {
+  const now = opts.now ?? Date.now();
+  const minValidityMs = opts.minValidityMs ?? CODEX_REMOTE_ID_TOKEN_SAFETY_MS;
+  const expiresAt = codexIdTokenExpiresAt(opts.configHome);
+  if (expiresAt !== undefined && expiresAt - now >= minValidityMs) return false;
+  opts.onRefresh?.();
+  await refreshCodexLogin({
+    configHome: opts.configHome,
+    timeoutMs: opts.timeoutMs,
+    run: opts.run,
+    force: true,
+  });
+  const refreshedExpiry = codexIdTokenExpiresAt(opts.configHome);
+  if (refreshedExpiry === undefined || refreshedExpiry - now < minValidityMs) {
+    throw new Error('Codex login refresh completed without a fresh ID token');
+  }
+  return true;
+}
+
+function codexIdTokenExpiresAt(configHome?: string): number | undefined {
+  try {
+    const auth = JSON.parse(fs.readFileSync(codexCredentialPath(configHome), 'utf8'));
+    const token = auth?.tokens?.id_token ?? auth?.tokens?.idToken ?? auth?.id_token ?? auth?.idToken;
+    if (typeof token !== 'string') return undefined;
+    const payload = token.split('.')[1];
+    if (!payload) return undefined;
+    const exp = Number(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))?.exp);
+    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number, force: boolean): Promise<unknown> {

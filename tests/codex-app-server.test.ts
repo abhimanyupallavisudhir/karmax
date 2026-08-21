@@ -218,6 +218,17 @@ describe('CodexAdapter app-server security policy', () => {
       kind: 'credential', permanence: 'hard', provider: 'codex',
       diagnostic: { message: 'Reconnecting... 5/5', code: 'unauthorized', status: 401 },
     }))).toBe(true);
+    expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('missing projected auth', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: {
+        message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+        code: 'other', status: 401,
+      },
+    }))).toBe(true);
+    expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('unrelated 401', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: { message: 'organization access was denied', code: 'other', status: 401 },
+    }))).toBe(false);
   });
 
   it('rejects a process/transport end without a completed terminal event', async () => {

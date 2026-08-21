@@ -28,7 +28,7 @@ import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seed
 import { worldWorkingDirectory } from '../world/types.js';
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
-import { refreshCodexLogin } from './usage.js';
+import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -62,6 +62,8 @@ export function isRecoverableRemoteCodexCredentialFailure(error: unknown): boole
   if (/^(?:invalid_api_key|revoked|insufficient_scope)$/.test(code)) return false;
   return /^(?:token_expired|expired_token|access_token_expired)$/.test(code)
     || code === 'unauthorized'
+    || (diagnostic?.status === 401 && code === 'other'
+      && /missing bearer or basic authentication(?: in (?:the )?header)?/.test(message))
     || (diagnostic?.status === 401 && /\b(?:access|authentication|oauth)?\s*token\b.*\bexpired\b|\bexpired\b.*\btoken\b/.test(message));
 }
 
@@ -182,8 +184,37 @@ export class CodexAdapter implements AgentAdapter {
         ctx.onSession?.(session);
       },
     };
+    // A remote projection cannot refresh itself and current Codex treats an
+    // expired ID token as logged out even while its access token remains valid.
+    // Revalidate centrally before launching so routine one-hour expiry never
+    // consumes a model turn or quarantines a healthy shared login.
+    let preflightStarted = false;
+    try {
+      const refreshed = await ensureCodexLoginFresh({
+        configHome,
+        onRefresh: () => {
+          preflightStarted = true;
+          ctx.emitActivity({
+            id: 'codex-credential-preflight', kind: 'status', phase: 'started',
+            title: 'Refreshing Codex login before remote turn',
+          });
+        },
+      });
+      if (refreshed) ctx.emitActivity({
+        id: 'codex-credential-preflight', kind: 'status', phase: 'completed',
+        title: 'Codex login refreshed for remote turn',
+      });
+    } catch (error) {
+      if (preflightStarted) ctx.emitActivity({
+        id: 'codex-credential-preflight', kind: 'status', phase: 'failed',
+        title: 'Could not refresh Codex login for remote turn',
+        ...(activityDetail(error instanceof Error ? error.message : error)
+          ? { detail: activityDetail(error instanceof Error ? error.message : error) } : {}),
+      });
+      throw error;
+    }
     // The sandbox intentionally receives no rotating refresh token. If its
-    // access-only projection expires, recover through the canonical home below;
+    // refresh-token-free projection loses auth, recover through the canonical home below;
     // valid turns pay no extra provider process or metadata request.
     try {
       return await this.runCodexAppServer(input, retryCtx);

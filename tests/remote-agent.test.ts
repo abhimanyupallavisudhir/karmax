@@ -8,6 +8,13 @@ import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentComman
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
+const codexIdToken = (expiresAt: number) =>
+  `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1000) })).toString('base64url')}.signature`;
+const freshCodexAuth = () => JSON.stringify({
+  auth_mode: 'chatgpt',
+  tokens: { id_token: codexIdToken(Date.now() + 60 * 60_000), access_token: 'access', refresh_token: 'host-authority' },
+});
+
 describe('remote subscription agents', () => {
   let localHome: string | undefined;
   afterEach(() => {
@@ -175,7 +182,7 @@ describe('remote subscription agents', () => {
 
   it('runs Codex app-server inside the remote PTY with the seeded subscription', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-'));
-    fs.writeFileSync(path.join(localHome, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const world = fakeWorld(true);
     const sessions: string[] = [];
     const platformCalls: string[] = [];
@@ -207,7 +214,7 @@ describe('remote subscription agents', () => {
 
   it('preserves a successful Codex turn when best-effort remote state export times out', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-sync-timeout-'));
-    fs.writeFileSync(path.join(localHome, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const world = fakeWorld(true);
     const exec = world.exec.bind(world);
     let stateListings = 0;
@@ -238,17 +245,23 @@ describe('remote subscription agents', () => {
 
   it('centrally refreshes and resumes once when a remote access-only token expires', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-refresh-'));
-    fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
-      auth_mode: 'chatgpt', tokens: { access_token: 'stale', refresh_token: 'host-authority' },
-    }));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const usageStub = path.join(localHome, 'refresh-stub.cjs');
     fs.writeFileSync(usageStub, `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const request = JSON.parse(line);
   if (request.method === 'initialize') send({ id: request.id, result: {} });
-  else if (request.method === 'account/read') send({ id: request.id, result: { account: { type: 'chatgpt' } } });
+  else if (request.method === 'account/read') {
+    const authPath = path.join(process.env.CODEX_HOME, 'auth.json');
+    const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    auth.tokens.id_token = 'e30.' + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') + '.signature';
+    fs.writeFileSync(authPath, JSON.stringify(auth));
+    send({ id: request.id, result: { account: { type: 'chatgpt' } } });
+  }
   else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: { rateLimits: {} } });
 });`);
     fs.chmodSync(usageStub, 0o755);
@@ -272,12 +285,59 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     }));
   });
 
+  it('refreshes an expired canonical ID token before seeding a remote Codex process', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-preflight-'));
+    const expiredIdToken = codexIdToken(Date.now() - 60_000);
+    fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { id_token: expiredIdToken, access_token: 'still-valid', refresh_token: 'host-authority' },
+    }));
+    const usageStub = path.join(localHome, 'preflight-stub.cjs');
+    fs.writeFileSync(usageStub, `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') send({ id: request.id, result: {} });
+  else if (request.method === 'account/read') {
+    const authPath = path.join(process.env.CODEX_HOME, 'auth.json');
+    const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    auth.tokens.id_token = 'e30.' + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') + '.signature';
+    fs.writeFileSync(authPath, JSON.stringify(auth));
+    send({ id: request.id, result: { account: { type: 'chatgpt' } } });
+  } else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: { rateLimits: {} } });
+});`);
+    fs.chmodSync(usageStub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
+    const world = fakeWorld(true);
+    const activities: any[] = [];
+
+    await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world,
+      messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity: (activity: any) => activities.push(activity),
+      platformRequest: async () => [{ type: 'ok' }] } as any);
+
+    const remoteHome = remoteAgentHomeRelative('codex', localHome);
+    const projected = JSON.parse(world.files.get(`${remoteHome}/auth.json`)!.toString());
+    expect(projected.tokens.id_token).not.toBe(expiredIdToken);
+    expect(projected.tokens.refresh_token).toBeUndefined();
+    expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+    expect(activities).toContainEqual(expect.objectContaining({
+      id: 'codex-credential-preflight', phase: 'completed',
+    }));
+  });
+
   it.each([
     { fork: false, method: 'thread/resume' },
     { fork: true, method: 'thread/fork' },
   ])('adds Karmax tools before native Codex $method of an external session', async ({ fork, method }) => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-external-codex-'));
-    fs.writeFileSync(path.join(localHome, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const session = '019f-external-thread';
     const directory = path.join(localHome, 'sessions', '2026', '07', '19');
     fs.mkdirSync(directory, { recursive: true });
@@ -378,10 +438,14 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
               if (expireFirstTurn && turnStarts === 1) {
-                send({ method: 'error', params: { error: {
-                  message: 'Reconnecting... 5/5', codexErrorInfo: 'unauthorized', httpStatusCode: 401,
-                  request_id: 'req_remote_expired',
-                }, willRetry: false } });
+                // Current Codex can preserve this only on the failed terminal
+                // turn, not as a separate structured `error` notification.
+                send({ method: 'turn/completed', params: { turn: {
+                  id: 'remote-turn', status: 'failed', error: {
+                    message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, request id: req_remote_expired',
+                    codexErrorInfo: 'other',
+                  },
+                } } });
                 continue;
               }
               send({ id: 99, method: 'item/tool/call', params: { threadId: 'remote-thread', turnId: 'remote-turn',

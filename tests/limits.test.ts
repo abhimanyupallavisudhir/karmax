@@ -133,6 +133,24 @@ describe('classifyLimitError', () => {
     });
   });
 
+  it('recovers HTTP metadata embedded only in the current Codex terminal message', () => {
+    expect(nativeProviderDiagnostic({
+      error: {
+        message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: safe-ray, request id: req_missing_bearer',
+        codexErrorInfo: 'other',
+      },
+      willRetry: false,
+    }, { model: 'gpt-5.6-sol', operation: 'turn/completed' })).toEqual({
+      message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: safe-ray, request id: req_missing_bearer',
+      code: 'other',
+      status: 401,
+      requestId: 'req_missing_bearer',
+      model: 'gpt-5.6-sol',
+      operation: 'turn/completed',
+      willRetry: false,
+    });
+  });
+
   it('renders credential rejection truthfully instead of calling it a usage limit', () => {
     const failure = providerFailure('Codex credential rejected', {
       kind: 'credential', permanence: 'hard', provider: 'codex',
