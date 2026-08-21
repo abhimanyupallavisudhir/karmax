@@ -50,15 +50,18 @@ export const RESPONSES_API_TOOLS = TOOL_SCHEMAS.map((t) => ({
   type: 'function', name: t.name, description: t.description, parameters: t.parameters,
 }));
 
-/** Only token expiry is self-healable by the canonical host refresh authority.
- * Invalid keys, revoked grants, wrong scopes, and generic 401s still require a
- * human; blindly retrying those would hide real credential failures. */
+/** A terminal OAuth-expiry/unauthorized signal is revalidated once through the
+ * canonical host authority. Invalid keys, explicitly revoked grants, and wrong
+ * scopes still require a human; the retry is bounded so a persistent 401 is not
+ * hidden. */
 export function isRecoverableRemoteCodexCredentialFailure(error: unknown): boolean {
   if (!(error instanceof ProviderFailure) || error.metadata.kind !== 'credential') return false;
   const diagnostic = error.metadata.diagnostic;
   const code = String(diagnostic?.code ?? '').toLowerCase();
   const message = String(diagnostic?.message ?? error.message).toLowerCase();
+  if (/^(?:invalid_api_key|revoked|insufficient_scope)$/.test(code)) return false;
   return /^(?:token_expired|expired_token|access_token_expired)$/.test(code)
+    || code === 'unauthorized'
     || (diagnostic?.status === 401 && /\b(?:access|authentication|oauth)?\s*token\b.*\bexpired\b|\bexpired\b.*\btoken\b/.test(message));
 }
 
@@ -188,14 +191,14 @@ export class CodexAdapter implements AgentAdapter {
       if (ctx.signal?.aborted || !isRecoverableRemoteCodexCredentialFailure(error)) throw error;
       ctx.emitActivity({
         id: 'codex-credential-recovery', kind: 'status', phase: 'started',
-        title: 'Refreshing expired Codex access token',
+        title: 'Revalidating Codex access token',
       });
       try {
-        await refreshCodexLogin({ configHome });
+        await refreshCodexLogin({ configHome, force: true });
       } catch (refreshError) {
         ctx.emitActivity({
           id: 'codex-credential-recovery', kind: 'status', phase: 'failed',
-          title: 'Could not refresh expired Codex access token',
+          title: 'Could not revalidate Codex access token',
           ...(activityDetail(refreshError instanceof Error ? refreshError.message : refreshError)
             ? { detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) } : {}),
         });
@@ -625,14 +628,31 @@ export class CodexAdapter implements AgentAdapter {
           // model turn without that MCP, so leave the already-emitted MCP status
           // visible and wait for the real turn terminal event.
           if (isOptionalAppsMcpError(blob)) break;
+          // `willRetry=true` is an intermediate Responses-stream notification,
+          // not the terminal result of the turn. Current Codex uses messages such
+          // as "Reconnecting... 2/5" with `codexErrorInfo=unauthorized`; treating
+          // that credential-looking enum as final quarantines a healthy shared
+          // login and aborts Codex before attempts 3–5 can succeed. Surface the
+          // safe diagnostic, but let app-server own its advertised retry loop.
+          if (params?.willRetry === true) {
+            const diagnostic = nativeProviderDiagnostic(params, { model, operation: 'app-server notification' });
+            ctx.emitActivity({
+              id: `codex-provider-retry-${String(currentTurnId ?? threadId ?? 'turn')}`,
+              kind: 'status', phase: 'updated', title: diagnostic?.message ?? 'Codex reconnecting',
+              ...(diagnostic ? { detail: [
+                diagnostic.code,
+                diagnostic.status ? `HTTP ${diagnostic.status}` : undefined,
+                diagnostic.retryAttempt && diagnostic.retryMax
+                  ? `attempt ${diagnostic.retryAttempt}/${diagnostic.retryMax}` : undefined,
+              ].filter(Boolean).join(' · ') } : {}),
+            });
+            break;
+          }
           noteLimit(params, 'app-server notification');
           turnError = params?.error?.message ?? blob;
-          // A retryable error is handled internally by the server; only a terminal one
-          // (or a usage limit) ends the turn from our side.
-          if (limit || params?.willRetry === false) {
-            turnActive = false;
-            settleTurn?.();
-          }
+          // Only terminal notifications reach this path.
+          turnActive = false;
+          settleTurn?.();
           break;
         }
         default:

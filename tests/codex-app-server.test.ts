@@ -59,6 +59,17 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         willRetry: false,
       } });
     }
+    else if (mode === 'reconnect-then-completed') {
+      // Current Codex emits this while its Responses stream is retrying. The
+      // enum is credential-looking, but willRetry=true makes the notification
+      // explicitly non-terminal; karmax must wait for the eventual turn result.
+      send({ method: 'error', params: {
+        error: { message: 'Reconnecting... 2/5', codexErrorInfo: 'unauthorized', httpStatusCode: 401 },
+        willRetry: true,
+      } });
+      send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'recovered' } } });
+      send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    }
     else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
     else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
     else send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
@@ -190,6 +201,10 @@ describe('CodexAdapter app-server security policy', () => {
     });
   });
 
+  it('does not fail or quarantine a turn for an intermediate reconnect notification', async () => {
+    await expect(run(undefined, 'reconnect-then-completed')).resolves.toEqual(expect.any(Array));
+  });
+
   it('retries only an expired remote access token through the central refresh authority', () => {
     expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('expired', {
       kind: 'credential', permanence: 'hard', provider: 'codex',
@@ -199,6 +214,10 @@ describe('CodexAdapter app-server security policy', () => {
       kind: 'credential', permanence: 'hard', provider: 'codex',
       diagnostic: { code: 'invalid_api_key', status: 401 },
     }))).toBe(false);
+    expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('terminal reconnect', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: { message: 'Reconnecting... 5/5', code: 'unauthorized', status: 401 },
+    }))).toBe(true);
   });
 
   it('rejects a process/transport end without a completed terminal event', async () => {
