@@ -40,9 +40,14 @@ export function limitFailureClassification(err: unknown): LimitClassification | 
       limited: true,
       hard: detail.permanence === 'hard' || undefined,
       kind: detail.kind,
+      // Diagnostic is the additive generation marker. Older histories already
+      // recorded autoResolve inputs without provider; adding it during replay
+      // would change a ScheduleActivity command and become nondeterministic.
+      provider: detail.diagnostic ? detail.provider : undefined,
       window: detail.window,
       resetHint: detail.resetHint,
       note: detail.note,
+      diagnostic: detail.diagnostic,
     };
   }
   const legacy = classifyLimitError(cause.message ?? '', { providerOrigin: true });

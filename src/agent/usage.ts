@@ -68,6 +68,7 @@ export type UsageRunner = (configDir: string) => Promise<string>;
 
 /** Injectable Codex app-server request (tests); returns account/rateLimits/read. */
 export type CodexUsageRunner = () => Promise<unknown>;
+const codexRefreshes = new Map<string, Promise<unknown>>();
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 // Lines look like (the separator is a middle dot · U+00B7):
@@ -321,9 +322,11 @@ export async function probeCodexUsage(
     return { ok: false, at: now, reason: opts.configHome ? 'setup-token' : 'logged-out' };
   }
   try {
-    const payload = opts.run
-      ? await opts.run()
-      : await runCodexUsageCli(opts.configHome, opts.timeoutMs ?? 30_000);
+    const payload = await refreshCodexLogin({
+      configHome: opts.configHome,
+      timeoutMs: opts.timeoutMs,
+      run: opts.run,
+    });
     return parseCodexRateLimits(payload, now);
   } catch (e) {
     return { ok: false, at: now, reason: `probe-failed: ${String((e as Error).message ?? e)}` };
@@ -357,6 +360,23 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
     child.once('error', (e) => finish(e as Error));
     child.once('exit', () => finish());
   });
+}
+
+/** Refresh the ONE canonical Codex login and return current limits. Concurrent
+ * callers share a process because OAuth refresh-token rotation is single-writer:
+ * two app-servers refreshing the same token family can revoke each other's result. */
+export async function refreshCodexLogin(
+  opts: { configHome?: string; timeoutMs?: number; run?: CodexUsageRunner } = {},
+): Promise<unknown> {
+  const key = path.resolve(opts.configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'));
+  const existing = codexRefreshes.get(key);
+  if (existing) return existing;
+  const created = (opts.run ? opts.run() : runCodexUsageCli(opts.configHome, opts.timeoutMs ?? 30_000))
+    .finally(() => {
+      if (codexRefreshes.get(key) === created) codexRefreshes.delete(key);
+    });
+  codexRefreshes.set(key, created);
+  return created;
 }
 
 async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number): Promise<unknown> {

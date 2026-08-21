@@ -91,6 +91,31 @@ close it. No flag is needed; it is already closed, twice over:
 The fallback therefore survives only where it is wanted: a local single-user
 install, where the operator's ambient login is the whole point.
 
+### Diagnosing credential incidents
+
+The operator Dashboard distinguishes a timed quota exhaustion from a credential
+that needs attention. For the latest automatic quarantine it retains only a
+secret-safe provider diagnostic (kind, native code, HTTP status, request id,
+model, operation, and bounded message), plus the originating task/activity and
+timestamp. Raw provider envelopes are never persisted because they can contain
+OAuth tokens and Authorization headers. The task's `resolve.auto` event carries
+the same whitelist, and the account coordinator logs the state transition.
+
+Codex remote worlds receive an access-token-only projection of the organization
+login; the rotating refresh token stays in the canonical control-plane home. If
+that projection expires during a turn, Karmax serializes refresh through the one
+host authority, re-projects the result, and resumes the same thread once. Only
+the explicit token-expired family is self-healed. Invalid/revoked credentials,
+wrong scopes, and generic 401 responses still quarantine the login for a human.
+
+The Diagnostics panel also shows the current runtime incarnation. Every start
+and graceful stop is written to the durable audit log as `runtime.started` and
+`runtime.stopped`; a surviving active marker becomes
+`runtime.previous-unclean` on the next boot. This makes a redeploy, crash, or
+SIGKILL visible after the old container and its stdout logs are gone. Correlate
+that timestamp with the task's source activity and native provider request id
+before attributing a failure to quota, billing, authentication, or a restart.
+
 ## Edge rate limiting
 
 Registration is open to the internet, so the edge bounds a stranger's cost

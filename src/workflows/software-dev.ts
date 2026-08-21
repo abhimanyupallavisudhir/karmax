@@ -1818,7 +1818,13 @@ async function softwareDevImpl(
       if (grant && !passthrough && !cancelled && !isCancellation(err)) {
         const cls = limitFailureClassification(err);
         if (cls?.hard) {
-          await coordinator.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
+          await coordinator.setAccountAvailability({
+            accountId: grant.accountId,
+            status: 'needs-attention',
+            ...(cls.diagnostic ? { failure: {
+              kind: cls.kind, provider: cls.provider, diagnostic: cls.diagnostic,
+            } } : {}),
+          }).catch(() => undefined);
         } else if (cls?.limited) {
           // Must use the same version-selected proxy as `setAccountAvailability`
           // above: on the unbounded `coord` this retries forever, and the activity
@@ -1827,7 +1833,15 @@ async function softwareDevImpl(
           // a human. `.catch()` cannot save it; an unlimited-retry activity never
           // rejects, it just never returns.
           await coordinator
-            .reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note })
+            .reportAccountExhausted({
+              accountId: grant.accountId,
+              window: cls.window ?? '5h',
+              resetHint: cls.resetHint,
+              note: cls.note,
+              ...(cls.diagnostic ? { failure: {
+                kind: cls.kind, provider: cls.provider, diagnostic: cls.diagnostic,
+              } } : {}),
+            })
             .catch(() => undefined);
         }
       }

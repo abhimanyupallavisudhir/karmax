@@ -282,9 +282,23 @@ export function createAgentTurnLeaser(
       } catch (err) {
         if (grant && !passthrough && !host.cancelled()) {
           const cls = limitFailureClassification(err);
-          if (cls?.hard) await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
+          if (cls?.hard) await coord.setAccountAvailability({
+            accountId: grant.accountId,
+            status: 'needs-attention',
+            ...(cls.diagnostic ? { failure: {
+              kind: cls.kind, provider: cls.provider, diagnostic: cls.diagnostic,
+            } } : {}),
+          }).catch(() => undefined);
           else if (cls?.limited)
-            await coord.reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note }).catch(() => undefined);
+            await coord.reportAccountExhausted({
+              accountId: grant.accountId,
+              window: cls.window ?? '5h',
+              resetHint: cls.resetHint,
+              note: cls.note,
+              ...(cls.diagnostic ? { failure: {
+                kind: cls.kind, provider: cls.provider, diagnostic: cls.diagnostic,
+              } } : {}),
+            }).catch(() => undefined);
         }
         throw err;
       } finally {

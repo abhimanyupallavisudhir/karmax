@@ -20,6 +20,18 @@ export type LimitWindow = '5h' | 'weekly' | 'model';
 export type ProviderFailureKind = 'quota' | 'credential';
 export type ProviderFailureSource = 'structured' | 'message';
 
+/** Secret-safe subset of a provider's native error envelope. Raw envelopes are
+ * deliberately never persisted: they can contain Authorization headers, OAuth
+ * tokens, request bodies, and account identifiers. */
+export interface ProviderNativeDiagnostic {
+  message?: string;
+  code?: string;
+  status?: number;
+  requestId?: string;
+  model?: string;
+  operation?: string;
+}
+
 export interface LimitClassification {
   limited: boolean;
   window?: LimitWindow;
@@ -34,6 +46,8 @@ export interface LimitClassification {
   /** Why this account is unavailable. Both categories use the same account-rotation
    *  path, but credential failures always need human attention. */
   kind?: ProviderFailureKind;
+  provider?: ProviderFailureMetadata['provider'];
+  diagnostic?: ProviderNativeDiagnostic;
 }
 
 /** Serializable metadata carried through Temporal ApplicationFailure.details.
@@ -46,6 +60,8 @@ export interface ProviderFailureMetadata {
   window?: LimitWindow;
   resetHint?: string;
   note?: string;
+  /** Whitelisted provider-native fields suitable for logs and durable history. */
+  diagnostic?: ProviderNativeDiagnostic;
 }
 
 /** A provider-originated account failure. It remains a normal Error to adapters,
@@ -64,6 +80,88 @@ export interface LimitClassifierOptions {
   /** Enables semantic phrase-family matching. Use only at the provider adapter
    * boundary; arbitrary build/git errors must remain on the Resolve path. */
   providerOrigin?: boolean;
+}
+
+const diagnosticText = (value: unknown, max = 500): string | undefined => {
+  if (value === undefined || value === null) return undefined;
+  // Provider diagnostics can themselves contain key=value credentials. Keep this
+  // last line of defence local so limits.ts remains usable in every adapter.
+  const text = String(value)
+    .replace(/\b(authorization|access[_-]?token|refresh[_-]?token|api[_-]?key|password|secret)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:Bearer\s+)?\S+)/gi, '$1=[redacted]')
+    .trim();
+  return text ? (text.length > max ? `${text.slice(0, max)}…` : text) : undefined;
+};
+
+/** Extract only actionable, explicitly whitelisted fields from a provider error.
+ * This is intentionally not a generic sanitizer or JSON snapshot: unknown fields
+ * are discarded, which makes it safe to carry the result through Temporal and the
+ * dashboard even when a provider adds new secret-bearing fields later. */
+export function nativeProviderDiagnostic(
+  value: unknown,
+  context: Pick<ProviderNativeDiagnostic, 'model' | 'operation'> = {},
+): ProviderNativeDiagnostic | undefined {
+  let root = value;
+  if (typeof root === 'string') {
+    try { root = JSON.parse(root); } catch { /* a plain provider message */ }
+  }
+  const records: Record<string, unknown>[] = [];
+  const seen = new Set<unknown>();
+  const visit = (candidate: unknown, depth: number): void => {
+    if (!candidate || typeof candidate !== 'object' || depth > 4 || seen.has(candidate)) return;
+    seen.add(candidate);
+    const record = candidate as Record<string, unknown>;
+    // Prefer the canonical nested error/response/cause before wrapper fields.
+    for (const key of ['error', 'cause', 'response', 'data']) visit(record[key], depth + 1);
+    records.push(record);
+  };
+  visit(root, 0);
+
+  const first = (...keys: string[]): unknown => {
+    for (const record of records) {
+      for (const key of keys) if (record[key] !== undefined && record[key] !== null) return record[key];
+    }
+    return undefined;
+  };
+  const rawStatus = first('status', 'statusCode', 'httpStatus', 'http_status');
+  const parsedStatus = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus);
+  const message = diagnosticText(first('message', 'detail', 'reason'))
+    ?? (typeof root === 'string' ? diagnosticText(root) : undefined);
+  const code = diagnosticText(first('code', 'errorCode', 'error_code'), 120);
+  const requestId = diagnosticText(first('request_id', 'requestId', 'xRequestId', 'x-request-id'), 200);
+  const model = diagnosticText(context.model, 160);
+  const operation = diagnosticText(context.operation, 160);
+  const diagnostic: ProviderNativeDiagnostic = {
+    ...(message ? { message } : {}),
+    ...(code ? { code } : {}),
+    ...(Number.isInteger(parsedStatus) && parsedStatus >= 100 && parsedStatus <= 599 ? { status: parsedStatus } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(model ? { model } : {}),
+    ...(operation ? { operation } : {}),
+  };
+  return Object.keys(diagnostic).length ? diagnostic : undefined;
+}
+
+/** Stable operator-facing summary built from typed metadata, not guessed prose. */
+export function providerFailureDisplay(metadata: ProviderFailureMetadata, fallback?: string): string {
+  const provider = metadata.provider
+    ? metadata.provider.charAt(0).toUpperCase() + metadata.provider.slice(1)
+    : 'Provider';
+  const title = metadata.kind === 'credential'
+    ? `${provider} credential rejected`
+    : metadata.permanence === 'hard'
+      ? `${provider} billing/quota unavailable`
+      : `${provider} usage limit reached`;
+  const diagnostic = metadata.diagnostic;
+  const facts = [
+    diagnostic?.code,
+    diagnostic?.status ? `HTTP ${diagnostic.status}` : undefined,
+    diagnostic?.model ? `model ${diagnostic.model}` : undefined,
+    diagnostic?.operation,
+    diagnostic?.requestId ? `request ${diagnostic.requestId}` : undefined,
+    metadata.resetHint ? `resets ${metadata.resetHint}` : undefined,
+  ].filter((part): part is string => !!part);
+  const message = diagnostic?.message ?? diagnosticText(fallback);
+  return `${title}${facts.length ? ` · ${facts.join(' · ')}` : ''}${message ? `: ${message}` : ''}`;
 }
 
 const words = (text: string): string[] => text.toLowerCase().match(/[a-z0-9_]+/g) ?? [];
@@ -225,6 +323,7 @@ export function providerErrorFromMessage(
 ): Error {
   const cls = classifyLimitError(message, { providerOrigin: true });
   if (!cls.limited) return new Error(message);
+  const diagnostic = nativeProviderDiagnostic(message);
   return new ProviderFailure(message, {
     kind: cls.kind ?? 'quota',
     permanence: cls.hard ? 'hard' : 'transient',
@@ -233,6 +332,7 @@ export function providerErrorFromMessage(
     ...(cls.window ? { window: cls.window } : {}),
     ...(cls.resetHint ? { resetHint: cls.resetHint } : {}),
     ...(cls.note ? { note: cls.note } : {}),
+    ...(diagnostic ? { diagnostic } : {}),
   });
 }
 
@@ -257,9 +357,11 @@ export function classifyProviderTurnError(
         limited: true,
         hard: m.permanence === 'hard' || undefined,
         kind: m.kind,
+        provider: m.provider,
         window: m.window,
         resetHint: m.resetHint,
         note: m.note,
+        diagnostic: m.diagnostic,
       },
       metadata: m,
     };
@@ -267,6 +369,7 @@ export function classifyProviderTurnError(
   const message = err instanceof Error ? err.message : String(err);
   const classification = classifyLimitError(message, { providerOrigin: true });
   if (!classification.limited) return { classification };
+  const diagnostic = nativeProviderDiagnostic(message);
   return {
     classification,
     metadata: {
@@ -277,6 +380,7 @@ export function classifyProviderTurnError(
       ...(classification.window ? { window: classification.window } : {}),
       ...(classification.resetHint ? { resetHint: classification.resetHint } : {}),
       ...(classification.note ? { note: classification.note } : {}),
+      ...(diagnostic ? { diagnostic } : {}),
     },
   };
 }

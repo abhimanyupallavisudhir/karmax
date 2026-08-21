@@ -2510,6 +2510,7 @@ export class Gateway {
       // src/activities/agent-slots.ts (same process as the worker).
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
+        const { runtimeAuditTrail } = await import('../util/runtime-lifecycle.js');
         const safety = agentSlotStats();
         // The panel needs only counts. `agentQueueView` is bound to `queue:read`
         // (it is a queue surface), so a principal holding `diagnostic:read`
@@ -2522,6 +2523,7 @@ export class Gateway {
           host: hostStats(),
           agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
           controlPlane: store.operationalSnapshot(),
+          runtimeLifecycle: runtimeAuditTrail(store),
           providers: this.deps.worlds.catalog(),
           ts: Date.now(),
         });
@@ -6538,6 +6540,21 @@ export class Gateway {
     if (includeHost) {
       try {
         accounts = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000);
+        const view = accounts as { accounts?: Array<Record<string, any>>; waiting?: number };
+        accounts = {
+          ...view,
+          accounts: (view.accounts ?? []).map((account) => {
+            const sourceTaskId = account.lastTransition?.sourceTaskId;
+            const task = sourceTaskId ? this.deps.store.getTask(sourceTaskId) : undefined;
+            return {
+              ...account,
+              ...(task ? { lastTransition: {
+                ...account.lastTransition,
+                sourceTask: { id: task.id, num: task.num, title: task.title, projectId: task.projectId },
+              } } : {}),
+            };
+          }),
+        };
       } catch {
         /* coordinator not running or wedged — show empty rather than hang */
       }

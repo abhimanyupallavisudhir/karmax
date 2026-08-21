@@ -52,6 +52,25 @@ export type AccountProvider = string;
 export type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
 export type LimitWindow = '5h' | 'weekly' | 'model';
 
+/** Secret-safe provenance for the most recent automatic credential quarantine.
+ * Raw provider payloads must never enter workflow history. */
+export interface AccountTransition {
+  source: 'provider-failure' | 'usage-recheck' | 'manual';
+  sourceTaskId?: string;
+  sourceActivityId?: string;
+  kind?: 'quota' | 'credential';
+  provider?: string;
+  at: number;
+  diagnostic?: {
+    message?: string;
+    code?: string;
+    status?: number;
+    requestId?: string;
+    model?: string;
+    operation?: string;
+  };
+}
+
 export type CredKind = 'login' | 'ambient' | 'key';
 
 export interface AccountState {
@@ -76,6 +95,9 @@ export interface AccountState {
   weeklyResetAt?: number;
   /** Human note, e.g. "Opus limit". */
   note?: string;
+  /** Latest automatic failure that quarantined this credential. Retained after a
+   * successful recheck so an operator can explain an intermittent incident. */
+  lastTransition?: AccountTransition;
 }
 
 /**
@@ -125,6 +147,7 @@ export interface AccountView {
   resetAt?: number;
   weeklyResetAt?: number;
   note?: string;
+  lastTransition?: AccountTransition;
 }
 
 export interface AccountsView {
@@ -148,11 +171,11 @@ export const returnAccountSignal =
   defineSignal<[{ accountId: string; taskId?: string; turnId?: string }]>(SIG_RETURN_ACCOUNT);
 export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccount[] }]>(SIG_REGISTER_ACCOUNTS);
 /** Ground-truth exhaustion feed (from the reportAccountExhausted activity). */
-export const reportExhaustedSignal = defineSignal<[{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(SIG_REPORT_EXHAUSTED);
+export const reportExhaustedSignal = defineSignal<[{ accountId: string; window: LimitWindow; resetAt: number; note?: string; transition?: AccountTransition }]>(SIG_REPORT_EXHAUSTED);
 /** Manual availability override (UI/MCP). `resetAt` sets a new reset instant. */
-export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus }]>(SIG_SET_ACCOUNT_AVAILABILITY);
-export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(UPD_REPORT_EXHAUSTED);
-export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus }]>(UPD_SET_ACCOUNT_AVAILABILITY);
+export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(SIG_SET_ACCOUNT_AVAILABILITY);
+export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; window: LimitWindow; resetAt: number; note?: string; transition?: AccountTransition }]>(UPD_REPORT_EXHAUSTED);
+export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export const accountLeaseQuery = defineQuery<
   { waiting: boolean },
@@ -345,7 +368,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // has already been given back. Leave both `inUse` and the ledger alone rather
     // than refunding twice or evicting someone else's lease.
   });
-  const reportExhausted = ({ accountId, window, resetAt, note }: { accountId: string; window: LimitWindow; resetAt: number; note?: string }) => {
+  const reportExhausted = ({ accountId, window, resetAt, note, transition }: {
+    accountId: string; window: LimitWindow; resetAt: number; note?: string; transition?: AccountTransition;
+  }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (!a) return;
     a.status = 'exhausted';
@@ -353,13 +378,16 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     a.resetAt = resetAt;
     if (window === 'weekly') a.weeklyResetAt = resetAt;
     if (note) a.note = note;
+    if (transition) a.lastTransition = transition;
     // Its in-flight turn already failed on the limit; free its slots so the count
     // is accurate while it cools down.
     a.inUse = 0;
-    log.info(`account ${accountId} exhausted (${window}), resets at ${resetAt}`);
+    log.warn(`account ${accountId} exhausted (${window}), resets at ${resetAt}`, {
+      transition: transition ?? 'legacy report without provenance',
+    });
   };
-  const setAvailability = ({ accountId, status, resetAt, onlyIfStatus }: {
-    accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus;
+  const setAvailability = ({ accountId, status, resetAt, onlyIfStatus, transition }: {
+    accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition;
   }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (!a) return;
@@ -368,6 +396,10 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // state transition). The guard is evaluated atomically in this workflow.
     if (onlyIfStatus !== undefined && a.status !== onlyIfStatus) return;
     a.status = status;
+    if (status !== 'available' && transition) {
+      a.lastTransition = transition;
+      log.warn(`account ${accountId} changed to ${status}`, { transition });
+    }
     if (status === 'available') {
       a.window = undefined;
       a.resetAt = undefined;
@@ -395,6 +427,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       resetAt: a.resetAt,
       weeklyResetAt: a.weeklyResetAt,
       note: a.note,
+      lastTransition: a.lastTransition,
     })),
     waiting: queue.length,
   }));
