@@ -4562,6 +4562,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         resolved: r.resolved,
         action: r.action,
         source: args.limit?.limited ? 'provider-metadata' : 'message-rule',
+        ...(args.limit?.kind ? { failureKind: args.limit.kind } : {}),
+        ...(args.limit?.provider ? { provider: args.limit.provider } : {}),
+        ...(args.limit?.window ? { window: args.limit.window } : {}),
+        ...(args.limit?.resetHint ? { resetHint: args.limit.resetHint } : {}),
+        ...(args.limit?.diagnostic ? { diagnostic: args.limit.diagnostic } : {}),
       });
       return r;
     },

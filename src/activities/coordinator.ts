@@ -1,4 +1,6 @@
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { Context } from '@temporalio/activity';
+import type { ProviderNativeDiagnostic } from '../agent/limits.js';
 import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
@@ -29,6 +31,32 @@ type AccountProvider = string;
 type CredKind = 'login' | 'ambient' | 'key';
 type LimitWindow = '5h' | 'weekly' | 'model';
 type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
+type FailureTransitionInput = {
+  kind?: 'quota' | 'credential';
+  provider?: string;
+  diagnostic?: ProviderNativeDiagnostic;
+};
+
+function transitionProvenance(failure?: FailureTransitionInput) {
+  let sourceTaskId: string | undefined;
+  let sourceActivityId: string | undefined;
+  try {
+    const info = Context.current().info;
+    sourceTaskId = info.workflowExecution?.workflowId;
+    sourceActivityId = String(info.activityId);
+  } catch {
+    // Gateway/operator calls run outside a Temporal activity context.
+  }
+  return {
+    source: failure || sourceTaskId ? 'provider-failure' as const : 'manual' as const,
+    ...(sourceTaskId ? { sourceTaskId } : {}),
+    ...(sourceActivityId ? { sourceActivityId } : {}),
+    ...(failure?.kind ? { kind: failure.kind } : {}),
+    ...(failure?.provider ? { provider: failure.provider } : {}),
+    ...(failure?.diagnostic ? { diagnostic: failure.diagnostic } : {}),
+    at: Date.now(),
+  };
+}
 
 export interface CoordinatorActivityDeps {
   client: Client;
@@ -303,7 +331,9 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
      * a human-readable "resets 3:45pm" hint into an absolute instant lives here (a
      * side-effecting activity), not in the deterministic coordinator.
      */
-    async reportAccountExhausted(args: { accountId: string; window: LimitWindow; resetHint?: string; note?: string }): Promise<{ resetAt: number }> {
+    async reportAccountExhausted(args: {
+      accountId: string; window: LimitWindow; resetHint?: string; note?: string; failure?: FailureTransitionInput;
+    }): Promise<{ resetAt: number }> {
       const { resetAtFromHint } = await import('../agent/limits.js');
       const resetAt = resetAtFromHint(args.resetHint, args.window, Date.now());
       await client.workflow.getHandle(accountCoordinatorId()).executeUpdate(UPD_REPORT_EXHAUSTED, {
@@ -312,6 +342,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
           window: args.window,
           resetAt,
           ...(args.note ? { note: args.note } : {}),
+          transition: transitionProvenance(args.failure ?? { kind: 'quota' }),
         }],
       });
       return { resetAt };
@@ -319,8 +350,15 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     /** Manual availability override (UI/MCP): force a login on/off, edit its reset. */
     async setAccountAvailability(args: {
       accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus;
+      failure?: FailureTransitionInput;
     }): Promise<void> {
-      await client.workflow.getHandle(accountCoordinatorId()).executeUpdate(UPD_SET_ACCOUNT_AVAILABILITY, { args: [args] });
+      const { failure, ...availability } = args;
+      await client.workflow.getHandle(accountCoordinatorId()).executeUpdate(UPD_SET_ACCOUNT_AVAILABILITY, {
+        args: [{
+          ...availability,
+          ...(args.status !== 'available' ? { transition: transitionProvenance(failure) } : {}),
+        }],
+      });
     },
     /** Full account availability view for the dashboard (empty if not running). */
     async accountsView(): Promise<{ accounts: unknown[]; waiting: number }> {

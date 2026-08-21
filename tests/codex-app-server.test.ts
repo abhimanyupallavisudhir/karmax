@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CodexAdapter } from '../src/agent/codex.js';
+import { CodexAdapter, isRecoverableRemoteCodexCredentialFailure } from '../src/agent/codex.js';
+import { providerFailure } from '../src/agent/limits.js';
 import { SDK_CONTROL_TOOL_NAMES } from '../src/agent/tools.js';
 
 const STUB = `#!/usr/bin/env node
@@ -47,6 +48,16 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         willRetry: false,
       } });
       send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    }
+    else if (mode === 'expired-model-token') {
+      send({ method: 'error', params: {
+        error: {
+          message: 'The access token expired while starting the model turn.',
+          code: 'token_expired', status: 401, request_id: 'req_model_auth',
+          authorization: 'Bearer must-never-be-archived',
+        },
+        willRetry: false,
+      } });
     }
     else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
     else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
@@ -163,6 +174,31 @@ describe('CodexAdapter app-server security policy', () => {
 
   it('does not quarantine the Codex login when the optional Apps MCP token expires', async () => {
     await expect(run(undefined, 'expired-app-token')).resolves.toEqual(expect.any(Array));
+  });
+
+  it('preserves safe native diagnostics for a model credential rejection', async () => {
+    await expect(run(undefined, 'expired-model-token')).rejects.toMatchObject({
+      message: expect.stringMatching(/Codex credential rejected.*token_expired.*HTTP 401.*req_model_auth/i),
+      metadata: {
+        kind: 'credential', permanence: 'hard', provider: 'codex', source: 'structured',
+        diagnostic: {
+          message: 'The access token expired while starting the model turn.',
+          code: 'token_expired', status: 401, requestId: 'req_model_auth',
+          model: 'gpt-5.5', operation: 'app-server notification',
+        },
+      },
+    });
+  });
+
+  it('retries only an expired remote access token through the central refresh authority', () => {
+    expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('expired', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: { code: 'token_expired', status: 401 },
+    }))).toBe(true);
+    expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('bad key', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: { code: 'invalid_api_key', status: 401 },
+    }))).toBe(false);
   });
 
   it('rejects a process/transport end without a completed terminal event', async () => {

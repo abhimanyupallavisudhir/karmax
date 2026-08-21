@@ -12,6 +12,7 @@ describe('remote subscription agents', () => {
   let localHome: string | undefined;
   afterEach(() => {
     delete process.env.KARMAX_REMOTE_GATEWAY_URL;
+    delete process.env.KARMAX_CODEX_USAGE_CMD;
     if (localHome) fs.rmSync(localHome, { recursive: true, force: true });
     localHome = undefined;
   });
@@ -235,6 +236,42 @@ describe('remote subscription agents', () => {
     }));
   });
 
+  it('centrally refreshes and resumes once when a remote access-only token expires', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-refresh-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt', tokens: { access_token: 'stale', refresh_token: 'host-authority' },
+    }));
+    const usageStub = path.join(localHome, 'refresh-stub.cjs');
+    fs.writeFileSync(usageStub, `#!/usr/bin/env node
+const readline = require('readline');
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') send({ id: request.id, result: {} });
+  else if (request.method === 'account/read') send({ id: request.id, result: { account: { type: 'chatgpt' } } });
+  else if (request.method === 'account/rateLimits/read') send({ id: request.id, result: { rateLimits: {} } });
+});`);
+    fs.chmodSync(usageStub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
+    const world = fakeWorld(true, false, true);
+    const activities: any[] = [];
+
+    const result = await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world,
+      messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity: (activity: any) => activities.push(activity),
+      platformRequest: async () => [{ type: 'ok' }] } as any);
+
+    expect(result).toMatchObject({ termination: { kind: 'success' }, session: 'remote-thread' });
+    expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
+    expect(activities).toContainEqual(expect.objectContaining({
+      id: 'codex-credential-recovery', phase: 'completed',
+      title: expect.stringMatching(/resuming turn/i),
+    }));
+  });
+
   it.each([
     { fork: false, method: 'thread/resume' },
     { fork: true, method: 'thread/fork' },
@@ -270,12 +307,13 @@ describe('remote subscription agents', () => {
   });
 });
 
-function fakeWorld(appServer = false, browserReady = false): World & {
+function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = false): World & {
   files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
 } {
   const files = new Map<string, Buffer>();
   const commands: string[] = [];
   const requests: any[] = [];
+  let turnStarts = 0;
   const world: World & { files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[] } = {
     files, commands, requests,
     handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'task', root: '/workspace', branch: 'task', base: 'main' },
@@ -336,8 +374,16 @@ function fakeWorld(appServer = false, browserReady = false): World & {
             else if (request.method === 'thread/fork')
               send({ id: request.id, result: { thread: { id: 'forked-remote-thread' } } });
             else if (request.method === 'turn/start') {
+              turnStarts++;
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
+              if (expireFirstTurn && turnStarts === 1) {
+                send({ method: 'error', params: { error: {
+                  message: 'The access token expired.', code: 'token_expired', status: 401,
+                  request_id: 'req_remote_expired',
+                }, willRetry: false } });
+                continue;
+              }
               send({ id: 99, method: 'item/tool/call', params: { threadId: 'remote-thread', turnId: 'remote-turn',
                 callId: 'call-1', namespace: null, tool: 'list_events', arguments: { task_id: 'task', since: 0 } } });
             } else if (request.id === 99 && request.result?.success) {

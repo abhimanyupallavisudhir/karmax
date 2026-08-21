@@ -9,6 +9,7 @@ import {
   labelToEpoch,
   probeClaudeUsage,
   probeCodexUsage,
+  refreshCodexLogin,
   usageProvesAvailable,
   isUsagePollable,
   isUsageStale,
@@ -288,6 +289,25 @@ describe('probeCodexUsage', () => {
       const r = await probeCodexUsage({ configHome: home, now: NOW, run: async () => CODEX_LIMITS });
       expect(r.ok).toBe(true);
       expect(r.ok && r.session?.pct).toBe(12);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes refresh-token rotation for concurrent remote turns', async () => {
+    const home = mkHome(true);
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const run = async () => { calls++; await gate; return CODEX_LIMITS; };
+    try {
+      const first = refreshCodexLogin({ configHome: home, run });
+      const second = refreshCodexLogin({ configHome: home, run });
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      release();
+      await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+      expect(calls).toBe(1);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }

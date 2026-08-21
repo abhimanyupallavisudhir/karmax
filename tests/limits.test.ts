@@ -4,6 +4,8 @@ import {
   classifyLimitError,
   isTransportError,
   isResourceKill,
+  nativeProviderDiagnostic,
+  providerFailureDisplay,
   providerErrorFromMessage,
   providerFailure,
   resetAtFromHint,
@@ -83,6 +85,47 @@ describe('classifyLimitError', () => {
     expect(structured.metadata).toMatchObject({
       kind: 'quota', permanence: 'transient', provider: 'codex', source: 'structured', resetHint: 'in 90s',
     });
+  });
+
+  it('retains only safe, actionable native provider diagnostics', () => {
+    const diagnostic = nativeProviderDiagnostic({
+      error: {
+        message: 'The access token expired while starting the model turn.',
+        code: 'token_expired',
+        status: 401,
+        request_id: 'req_01HSAFE',
+        authorization: 'Bearer must-never-be-archived',
+      },
+      access_token: 'must-never-be-archived',
+    }, { model: 'gpt-5.6-sol', operation: 'turn/start' });
+
+    expect(diagnostic).toEqual({
+      message: 'The access token expired while starting the model turn.',
+      code: 'token_expired',
+      status: 401,
+      requestId: 'req_01HSAFE',
+      model: 'gpt-5.6-sol',
+      operation: 'turn/start',
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain('must-never-be-archived');
+    expect(nativeProviderDiagnostic('request rejected; authorization: Bearer deeply-secret')).toEqual({
+      message: 'request rejected; authorization=[redacted]',
+    });
+  });
+
+  it('renders credential rejection truthfully instead of calling it a usage limit', () => {
+    const failure = providerFailure('Codex credential rejected', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: {
+        message: 'The access token expired.', code: 'token_expired', status: 401,
+        requestId: 'req_01HSAFE', model: 'gpt-5.6-sol', operation: 'turn/start',
+      },
+    });
+
+    expect(providerFailureDisplay(failure.metadata)).toBe(
+      'Codex credential rejected · token_expired · HTTP 401 · model gpt-5.6-sol · turn/start · request req_01HSAFE: The access token expired.',
+    );
+    expect(providerFailureDisplay(failure.metadata)).not.toMatch(/usage limit/i);
   });
 
   it('a plain rate-limit is transient, not hard', () => {

@@ -46,6 +46,7 @@ import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.
 import { sweepOrphanedServiceContainers } from './world/services.js';
 import { spawnReplacementProcess, worldLandedInCheckout } from './util/live-restart.js';
 import { EntitlementQueueReconciler } from './platform/entitlement-queue-reconciler.js';
+import { beginRuntimeLifecycle, endRuntimeLifecycle } from './util/runtime-lifecycle.js';
 import type { WorldHandle } from './world/types.js';
 
 const VERSION = '1.0.0';
@@ -132,6 +133,18 @@ async function main() {
     console.log(`  • PostgreSQL application database${migrated}`);
   }
   const authorization = new AuthorizationService(store);
+  const runtime = beginRuntimeLifecycle(store, {
+    runtimeId: `runtime-${Date.now()}-${process.pid}`,
+    startedAt: Date.now(),
+    pid: process.pid,
+    version: VERSION,
+    node: process.version,
+    ...([process.env.KARMAX_BUILD_REVISION, process.env.GITHUB_SHA, process.env.SOURCE_VERSION]
+      .map((value) => value?.trim()).find(Boolean)
+      ? { buildRevision: [process.env.KARMAX_BUILD_REVISION, process.env.GITHUB_SHA, process.env.SOURCE_VERSION]
+        .map((value) => value?.trim()).find(Boolean)! }
+      : {}),
+  });
   const broker = new CredentialBroker(new Vault(p.vault));
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
@@ -676,7 +689,7 @@ async function main() {
 
   let shuttingDown = false;
   let replacementStarted = false;
-  const shutdown = async (restart = false) => {
+  const shutdown = async (restart = false, reason = 'shutdown') => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(restart ? '\n  merged source changed; restarting…' : '\n  shutting down…');
@@ -711,6 +724,7 @@ async function main() {
     await step(workerManager.stop());
     await step(closeClient());
     await step(identity.close());
+    endRuntimeLifecycle(store, runtime, { stoppedAt: Date.now(), reason, restart });
     store.close();
     if (server) {
       await step(server.stop()); // no-op for the shared server — it persists for a fast restart
@@ -718,8 +732,8 @@ async function main() {
     }
     exit();
   };
-  process.on('SIGINT', () => { void shutdown(); });
-  process.on('SIGTERM', () => { void shutdown(); });
+  process.on('SIGINT', () => { void shutdown(false, 'SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown(false, 'SIGTERM'); });
 
   // `npm start` intentionally has no source watcher. When Karmax merges a task
   // into the very checkout this process loaded, hand off to an identical fresh
@@ -738,7 +752,7 @@ async function main() {
     if (!worldLandedInCheckout(handle, process.cwd())) return;
     sourceRestartScheduled = true;
     console.log(`  • Task ${event.taskId} updated the live checkout; scheduling a graceful restart`);
-    setTimeout(() => { void shutdown(true); }, 1500).unref();
+    setTimeout(() => { void shutdown(true, `live-source-merge:${event.taskId}`); }, 1500).unref();
   });
 }
 

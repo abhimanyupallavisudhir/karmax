@@ -266,6 +266,28 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('retains the source and safe reason for the latest automatic quarantine', async () => {
+    const coord = await startCoord([A({ id: 'A' })]);
+    await coord.signal('setAccountAvailability', {
+      accountId: 'A', status: 'needs-attention',
+      transition: {
+        source: 'provider-failure', sourceTaskId: 'task_source', sourceActivityId: '17',
+        kind: 'credential', provider: 'codex', at: Date.now(),
+        diagnostic: { code: 'token_expired', status: 401, requestId: 'req_safe' },
+      },
+    });
+
+    expect(await acct('A')).toMatchObject({
+      status: 'needs-attention',
+      lastTransition: {
+        source: 'provider-failure', sourceTaskId: 'task_source', sourceActivityId: '17',
+        kind: 'credential', provider: 'codex',
+        diagnostic: { code: 'token_expired', status: 401, requestId: 'req_safe' },
+      },
+    });
+    await coord.terminate('done');
+  });
+
   it('recovers an automatic needs-attention quarantine without overriding a manual disable', async () => {
     const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', configHome: '/tmp/B' })]);
     const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });

@@ -9290,6 +9290,12 @@ function hostDiagHtml(diag) {
   const gate = gates.length
     ? `<span class="chip waiting">⏸ holding new agent leases — ${esc(gates.join(' + '))}</span>`
     : `<span class="chip done">admitting agent turns</span>`;
+  const lifecycle = diag.runtimeLifecycle || [];
+  const started = [...lifecycle].reverse().find((event) => event.action === 'runtime.started');
+  const unclean = [...lifecycle].reverse().find((event) => event.action === 'runtime.previous-unclean');
+  const runtimeLine = started
+    ? `Runtime started ${esc(new Date(started.ts).toLocaleString())}${started.detail?.buildRevision ? ` · build ${esc(started.detail.buildRevision)}` : ''}${unclean && unclean.ts === started.ts ? ' · ⚠ previous runtime ended uncleanly' : ''}`
+    : 'Runtime lifecycle record unavailable';
   return `
     <div class="stat-grid">
       <div class="stat"><div class="n"${loadStyle}>${esc(load || '—')}</div><div class="l">Load avg · 1 / 5 / 15 min</div></div>
@@ -9297,7 +9303,8 @@ function hostDiagHtml(diag) {
       <div class="stat"><div class="n"${memStyle}>${freeG}G</div><div class="l">Free RAM · of ${totG}G (${esc(String(h.usedMemPct ?? '?'))}% used)</div></div>
       <div class="stat"><div class="n">${esc(String(s.inUse ?? '?'))}/${esc(String(s.capacity ?? '?'))}${s.waiting ? ` +${esc(String(s.waiting))}` : ''}</div><div class="l">Agent slots in use${s.waiting ? ` · ${esc(String(s.waiting))} waiting` : ''}</div></div>
     </div>
-    <div class="task-sub" style="margin-top:8px">${gate}</div>`;
+    <div class="task-sub" style="margin-top:8px">${gate}</div>
+    <div class="task-sub" style="margin-top:6px;color:var(--ink-3)"><b>Runtime lifecycle:</b> ${runtimeLine}</div>`;
 }
 
 // Live-refresh just the host panel every 5s while the Dashboard is open. Self-
@@ -9466,7 +9473,9 @@ async function renderDashboard() {
               ? '🟢 available'
               : status === 'manual-off'
                 ? '⏸ off (manual)'
-                : `🔴 ${esc(a.window || 'exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
+                : status === 'needs-attention'
+                  ? '🔴 needs attention (funding or re-authentication)'
+                  : `🟠 ${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
             const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
             return `<div class="card">
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -9476,6 +9485,7 @@ async function renderDashboard() {
                 <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent}</span>
               </div>
               ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
+              ${accountIncidentHtml(a)}
               <div class="task-sub" style="gap:6px;margin-top:6px;align-items:center">
                 ${status === 'available'
                   ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
@@ -9540,6 +9550,31 @@ async function renderDashboard() {
   } catch (e) {
     if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
+}
+
+function accountIncidentHtml(account) {
+  const incident = account.lastTransition;
+  if (!incident) return '';
+  const diagnostic = incident.diagnostic || {};
+  const facts = [
+    incident.kind,
+    incident.provider,
+    diagnostic.code,
+    diagnostic.status ? `HTTP ${diagnostic.status}` : '',
+    diagnostic.model ? `model ${diagnostic.model}` : '',
+    diagnostic.operation,
+    diagnostic.requestId ? `request ${diagnostic.requestId}` : '',
+  ].filter(Boolean).map(esc).join(' · ');
+  const sourceTask = incident.sourceTask;
+  const source = sourceTask
+    ? `<a data-spa href="${esc(taskUrl(sourceTask.id))}">Task #${esc(sourceTask.num ?? sourceTask.id)} — ${esc(sourceTask.title || sourceTask.id)}</a>`
+    : incident.sourceTaskId ? `<span class="mono">${esc(incident.sourceTaskId)}</span>` : esc(incident.source || 'unknown source');
+  return `<div style="margin-top:8px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg-2)">
+    <div style="font-size:12px;font-weight:600">Credential incident</div>
+    ${facts ? `<div class="task-sub" style="margin-top:3px">${facts}</div>` : ''}
+    ${diagnostic.message ? `<div style="font-size:12px;margin-top:4px">${esc(diagnostic.message)}</div>` : ''}
+    <div class="task-sub" style="margin-top:4px;color:var(--ink-3)">Source: ${source}${incident.at ? ` · ${esc(new Date(incident.at).toLocaleString())}` : ''}</div>
+  </div>`;
 }
 
 // Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,

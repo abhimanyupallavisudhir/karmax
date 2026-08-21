@@ -12,7 +12,15 @@ import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
-import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
+import {
+  classifyLimitError,
+  nativeProviderDiagnostic,
+  providerErrorFromMessage,
+  providerFailure,
+  providerFailureDisplay,
+  ProviderFailure,
+  type ProviderFailureMetadata,
+} from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity, toolActivityDetail } from './activity.js';
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
@@ -20,6 +28,7 @@ import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seed
 import { worldWorkingDirectory } from '../world/types.js';
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
+import { refreshCodexLogin } from './usage.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -40,6 +49,18 @@ import { withTimeout } from '../util/timeout.js';
 export const RESPONSES_API_TOOLS = TOOL_SCHEMAS.map((t) => ({
   type: 'function', name: t.name, description: t.description, parameters: t.parameters,
 }));
+
+/** Only token expiry is self-healable by the canonical host refresh authority.
+ * Invalid keys, revoked grants, wrong scopes, and generic 401s still require a
+ * human; blindly retrying those would hide real credential failures. */
+export function isRecoverableRemoteCodexCredentialFailure(error: unknown): boolean {
+  if (!(error instanceof ProviderFailure) || error.metadata.kind !== 'credential') return false;
+  const diagnostic = error.metadata.diagnostic;
+  const code = String(diagnostic?.code ?? '').toLowerCase();
+  const message = String(diagnostic?.message ?? error.message).toLowerCase();
+  return /^(?:token_expired|expired_token|access_token_expired)$/.test(code)
+    || (diagnostic?.status === 401 && /\b(?:access|authentication|oauth)?\s*token\b.*\bexpired\b|\bexpired\b.*\btoken\b/.test(message));
+}
 
 /**
  * The app-server `dynamicTools` registration — tools the server asks US to
@@ -144,9 +165,48 @@ export class CodexAdapter implements AgentAdapter {
 
   /** The ChatGPT-subscription rail: the app-server (live, steerable) by default, or
    *  the legacy one-shot `codex exec` when forced via `KARMAX_CODEX_USE_EXEC`. */
-  private runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+  private async runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world)) return this.runCodexExec(input, ctx);
-    return this.runCodexAppServer(input, ctx);
+    const remote = isRemoteAgentWorld(input.world);
+    const configHome = input.resolvedAuth?.configHome;
+    if (!remote || !configHome) return this.runCodexAppServer(input, ctx);
+
+    let latestSession = input.session;
+    const retryCtx: PlatformToolContext = {
+      ...ctx,
+      onSession: (session) => {
+        latestSession = session;
+        ctx.onSession?.(session);
+      },
+    };
+    // The sandbox intentionally receives no rotating refresh token. If its
+    // access-only projection expires, recover through the canonical home below;
+    // valid turns pay no extra provider process or metadata request.
+    try {
+      return await this.runCodexAppServer(input, retryCtx);
+    } catch (error) {
+      if (ctx.signal?.aborted || !isRecoverableRemoteCodexCredentialFailure(error)) throw error;
+      ctx.emitActivity({
+        id: 'codex-credential-recovery', kind: 'status', phase: 'started',
+        title: 'Refreshing expired Codex access token',
+      });
+      try {
+        await refreshCodexLogin({ configHome });
+      } catch (refreshError) {
+        ctx.emitActivity({
+          id: 'codex-credential-recovery', kind: 'status', phase: 'failed',
+          title: 'Could not refresh expired Codex access token',
+          ...(activityDetail(refreshError instanceof Error ? refreshError.message : refreshError)
+            ? { detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) } : {}),
+        });
+        throw error;
+      }
+      ctx.emitActivity({
+        id: 'codex-credential-recovery', kind: 'status', phase: 'completed',
+        title: 'Refreshed Codex access token; resuming turn',
+      });
+      return this.runCodexAppServer({ ...input, ...(latestSession ? { session: latestSession } : {}) }, retryCtx);
+    }
   }
 
   // ─── OpenAI Responses API (API key, metered) ────────────────────────────────
@@ -472,11 +532,13 @@ export class CodexAdapter implements AgentAdapter {
       settleTurn?.();
     });
 
-    const noteLimit = (blob: string) => {
+    const noteLimit = (native: unknown, operation = 'app-server notification') => {
+      const blob = typeof native === 'string' ? native : JSON.stringify(native ?? {});
       const cls = classifyLimitError(blob, { providerOrigin: true });
       if (!cls.limited) return;
       const m = blob.match(/"?(?:resets_in_seconds|resetInSeconds|retry_after|retryAfter)"?\s*[:=]\s*(\d+)/);
       const resetHint = m ? `in ${Number(m[1])}s` : cls.resetHint;
+      const diagnostic = nativeProviderDiagnostic(native, { model, operation });
       limit = {
         kind: cls.kind ?? 'quota',
         permanence: cls.hard ? 'hard' : 'transient',
@@ -485,6 +547,7 @@ export class CodexAdapter implements AgentAdapter {
         ...(cls.window ? { window: cls.window } : {}),
         ...(resetHint ? { resetHint } : {}),
         ...(cls.note ? { note: cls.note } : {}),
+        ...(diagnostic ? { diagnostic } : {}),
       };
     };
 
@@ -550,7 +613,7 @@ export class CodexAdapter implements AgentAdapter {
             // A usage limit can surface on a failed turn (not only an `error` notif) —
             // classify it here too so the workflow re-leases the login rather than
             // burning a Resolve turn (parity with the codex-exec blob scan).
-            noteLimit(JSON.stringify(params?.turn?.error ?? params?.turn ?? {}));
+            noteLimit(params?.turn?.error ?? params?.turn ?? {}, 'turn/completed');
           }
           turnActive = false;
           settleTurn?.();
@@ -562,7 +625,7 @@ export class CodexAdapter implements AgentAdapter {
           // model turn without that MCP, so leave the already-emitted MCP status
           // visible and wait for the real turn terminal event.
           if (isOptionalAppsMcpError(blob)) break;
-          noteLimit(blob);
+          noteLimit(params, 'app-server notification');
           turnError = params?.error?.message ?? blob;
           // A retryable error is handled internally by the server; only a terminal one
           // (or a usage limit) ends the turn from our side.
@@ -745,7 +808,10 @@ export class CodexAdapter implements AgentAdapter {
       // Record it (unless we're cancelling, where a rejection is expected) so the checks
       // below classify a limit and rotate the login, or surface a partial result instead
       // of discarding output already produced (mirrors the exec/SDK error tolerance).
-      if (!ctx.signal?.aborted) turnError = turnError ?? String((e as Error)?.message ?? e);
+      if (!ctx.signal?.aborted) {
+        noteLimit(e, 'app-server request');
+        turnError = turnError ?? String((e as Error)?.message ?? e);
+      }
     } finally {
       shuttingDown = true;
       if (hb) clearInterval(hb);
@@ -766,14 +832,11 @@ export class CodexAdapter implements AgentAdapter {
 
     // A limit can also arrive as a rejected request (handshake/turn) or a subprocess
     // death recorded in `turnError` — scan it so those paths rotate the login too.
-    if (turnError && !limit) noteLimit(turnError);
+    if (turnError && !limit) noteLimit(turnError, 'app-server turn');
     if (limit) {
       // Same shape as the exec path so limits.ts computes the refresh instant and the
       // workflow rotates to another login (RESOLVE-PLAN §2.4).
-      throw providerFailure(
-        `Codex usage limit reached${limit.resetHint ? ` · resets ${limit.resetHint}` : ''}`,
-        limit,
-      );
+      throw providerFailure(providerFailureDisplay(limit), limit);
     }
     if (turnError) {
       throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderr.slice(0, 300)}` : ''}`);
@@ -931,6 +994,7 @@ export class CodexAdapter implements AgentAdapter {
       if (cls.limited) {
         const secs = ev.error?.resets_in_seconds ?? ev.resets_in_seconds ?? ev.error?.retry_after ?? ev.retry_after;
         const resetHint = typeof secs === 'number' ? `in ${secs}s` : cls.resetHint;
+        const diagnostic = nativeProviderDiagnostic(ev, { model, operation: 'codex exec event' });
         limit = {
           kind: cls.kind ?? 'quota',
           permanence: cls.hard ? 'hard' : 'transient',
@@ -939,6 +1003,7 @@ export class CodexAdapter implements AgentAdapter {
           ...(cls.window ? { window: cls.window } : {}),
           ...(resetHint ? { resetHint } : {}),
           ...(cls.note ? { note: cls.note } : {}),
+          ...(diagnostic ? { diagnostic } : {}),
         };
       }
     };
@@ -980,10 +1045,7 @@ export class CodexAdapter implements AgentAdapter {
       // Throw so the workflow's quota handling marks THIS login exhausted and
       // re-leases another (RESOLVE-PLAN §2.4). Encode the reset so limits.ts can
       // compute the refresh instant precisely.
-      throw providerFailure(
-        `Codex usage limit reached${limit.resetHint ? ` · resets ${limit.resetHint}` : ''}`,
-        limit,
-      );
+      throw providerFailure(providerFailureDisplay(limit), limit);
     }
     if (exited.spawnError) {
       throw new Error(`codex exec spawn failed: ${exited.spawnError}`);

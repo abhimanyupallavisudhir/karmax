@@ -3938,6 +3938,22 @@ export class Store {
       .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
   }
 
+  /** Newest audit rows, returned chronologically. Operational diagnostics should
+   * not scan from seq 0: a long-lived hosted deployment can have millions of rows. */
+  auditRecent(limit = 100): any[] {
+    return (this.db.prepare('SELECT * FROM audit_log ORDER BY seq DESC LIMIT ?').all(Math.max(1, Math.min(limit, 2000))) as any[])
+      .reverse()
+      .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+  }
+
+  auditRecentByActionPrefix(prefix: string, limit = 100): any[] {
+    return (this.db.prepare(
+      'SELECT * FROM audit_log WHERE substr(action, 1, length(?)) = ? ORDER BY seq DESC LIMIT ?',
+    ).all(prefix, prefix, Math.max(1, Math.min(limit, 2000))) as any[])
+      .reverse()
+      .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+  }
+
   grantAttachment(attachmentId: string, projectId: string): void {
     this.db.prepare('INSERT OR IGNORE INTO attachment_scopes (attachmentId, projectId) VALUES (?, ?)').run(attachmentId, projectId);
   }
