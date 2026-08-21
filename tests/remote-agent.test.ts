@@ -379,7 +379,7 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
               if (expireFirstTurn && turnStarts === 1) {
                 send({ method: 'error', params: { error: {
-                  message: 'The access token expired.', code: 'token_expired', status: 401,
+                  message: 'Reconnecting... 5/5', codexErrorInfo: 'unauthorized', httpStatusCode: 401,
                   request_id: 'req_remote_expired',
                 }, willRetry: false } });
                 continue;

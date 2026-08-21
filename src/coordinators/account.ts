@@ -68,6 +68,9 @@ export interface AccountTransition {
     requestId?: string;
     model?: string;
     operation?: string;
+    willRetry?: boolean;
+    retryAttempt?: number;
+    retryMax?: number;
   };
 }
 

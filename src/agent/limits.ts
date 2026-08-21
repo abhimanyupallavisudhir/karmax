@@ -30,6 +30,10 @@ export interface ProviderNativeDiagnostic {
   requestId?: string;
   model?: string;
   operation?: string;
+  /** App-server explicitly says this notification is non-terminal. */
+  willRetry?: boolean;
+  retryAttempt?: number;
+  retryMax?: number;
 }
 
 export interface LimitClassification {
@@ -122,14 +126,17 @@ export function nativeProviderDiagnostic(
     }
     return undefined;
   };
-  const rawStatus = first('status', 'statusCode', 'httpStatus', 'http_status');
+  const rawStatus = first('status', 'statusCode', 'httpStatusCode', 'httpStatus', 'http_status');
   const parsedStatus = typeof rawStatus === 'number' ? rawStatus : Number(rawStatus);
   const message = diagnosticText(first('message', 'detail', 'reason'))
     ?? (typeof root === 'string' ? diagnosticText(root) : undefined);
-  const code = diagnosticText(first('code', 'errorCode', 'error_code'), 120);
+  const code = diagnosticText(first('code', 'errorCode', 'error_code', 'codexErrorInfo'), 120);
   const requestId = diagnosticText(first('request_id', 'requestId', 'xRequestId', 'x-request-id'), 200);
   const model = diagnosticText(context.model, 160);
   const operation = diagnosticText(context.operation, 160);
+  const rawWillRetry = first('willRetry', 'will_retry');
+  const willRetry = typeof rawWillRetry === 'boolean' ? rawWillRetry : undefined;
+  const retry = message?.match(/\breconnecting(?:\.{3}|\s)*\s*(\d+)\s*\/\s*(\d+)\b/i);
   const diagnostic: ProviderNativeDiagnostic = {
     ...(message ? { message } : {}),
     ...(code ? { code } : {}),
@@ -137,6 +144,8 @@ export function nativeProviderDiagnostic(
     ...(requestId ? { requestId } : {}),
     ...(model ? { model } : {}),
     ...(operation ? { operation } : {}),
+    ...(willRetry !== undefined ? { willRetry } : {}),
+    ...(retry ? { retryAttempt: Number(retry[1]), retryMax: Number(retry[2]) } : {}),
   };
   return Object.keys(diagnostic).length ? diagnostic : undefined;
 }
@@ -158,6 +167,9 @@ export function providerFailureDisplay(metadata: ProviderFailureMetadata, fallba
     diagnostic?.model ? `model ${diagnostic.model}` : undefined,
     diagnostic?.operation,
     diagnostic?.requestId ? `request ${diagnostic.requestId}` : undefined,
+    diagnostic?.retryAttempt && diagnostic.retryMax
+      ? `retry ${diagnostic.retryAttempt}/${diagnostic.retryMax}`
+      : undefined,
     metadata.resetHint ? `resets ${metadata.resetHint}` : undefined,
   ].filter((part): part is string => !!part);
   const message = diagnostic?.message ?? diagnosticText(fallback);

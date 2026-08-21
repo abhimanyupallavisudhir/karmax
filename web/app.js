@@ -9564,6 +9564,7 @@ function accountIncidentHtml(account) {
     diagnostic.model ? `model ${diagnostic.model}` : '',
     diagnostic.operation,
     diagnostic.requestId ? `request ${diagnostic.requestId}` : '',
+    diagnostic.retryAttempt && diagnostic.retryMax ? `retry ${diagnostic.retryAttempt}/${diagnostic.retryMax}` : '',
   ].filter(Boolean).map(esc).join(' · ');
   const sourceTask = incident.sourceTask;
   const source = sourceTask

@@ -113,6 +113,26 @@ describe('classifyLimitError', () => {
     });
   });
 
+  it('captures current Codex app-server error enum and HTTP field spellings', () => {
+    expect(nativeProviderDiagnostic({
+      error: {
+        message: 'Reconnecting... 2/5',
+        codexErrorInfo: 'unauthorized',
+        httpStatusCode: 401,
+      },
+      willRetry: true,
+    }, { model: 'gpt-5.6-sol', operation: 'app-server notification' })).toEqual({
+      message: 'Reconnecting... 2/5',
+      code: 'unauthorized',
+      status: 401,
+      model: 'gpt-5.6-sol',
+      operation: 'app-server notification',
+      willRetry: true,
+      retryAttempt: 2,
+      retryMax: 5,
+    });
+  });
+
   it('renders credential rejection truthfully instead of calling it a usage limit', () => {
     const failure = providerFailure('Codex credential rejected', {
       kind: 'credential', permanence: 'hard', provider: 'codex',
