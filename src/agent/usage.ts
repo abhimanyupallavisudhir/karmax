@@ -68,7 +68,7 @@ export type UsageRunner = (configDir: string) => Promise<string>;
 
 /** Injectable Codex app-server request (tests); returns account/rateLimits/read. */
 export type CodexUsageRunner = () => Promise<unknown>;
-const codexRefreshes = new Map<string, Promise<unknown>>();
+const codexRefreshes = new Map<string, { promise: Promise<unknown>; force: boolean }>();
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 // Lines look like (the separator is a middle dot · U+00B7):
@@ -366,20 +366,27 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
  * callers share a process because OAuth refresh-token rotation is single-writer:
  * two app-servers refreshing the same token family can revoke each other's result. */
 export async function refreshCodexLogin(
-  opts: { configHome?: string; timeoutMs?: number; run?: CodexUsageRunner } = {},
+  opts: { configHome?: string; timeoutMs?: number; run?: CodexUsageRunner; force?: boolean } = {},
 ): Promise<unknown> {
   const key = path.resolve(opts.configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'));
   const existing = codexRefreshes.get(key);
-  if (existing) return existing;
-  const created = (opts.run ? opts.run() : runCodexUsageCli(opts.configHome, opts.timeoutMs ?? 30_000))
+  if (existing) {
+    // A passive usage read may join an already-forced refresh. A forced recovery
+    // must not join a passive read that did not rotate the stale remote token;
+    // serialize behind it and then perform the requested refresh.
+    if (!opts.force || existing.force) return existing.promise;
+    await existing.promise.catch(() => undefined);
+    return refreshCodexLogin(opts);
+  }
+  const created = (opts.run ? opts.run() : runCodexUsageCli(opts.configHome, opts.timeoutMs ?? 30_000, !!opts.force))
     .finally(() => {
-      if (codexRefreshes.get(key) === created) codexRefreshes.delete(key);
+      if (codexRefreshes.get(key)?.promise === created) codexRefreshes.delete(key);
     });
-  codexRefreshes.set(key, created);
+  codexRefreshes.set(key, { promise: created, force: !!opts.force });
   return created;
 }
 
-async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number): Promise<unknown> {
+async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number, force: boolean): Promise<unknown> {
   const cmd = process.env.KARMAX_CODEX_USAGE_CMD ?? process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
   const env = scrubbedEnv({ provider: 'codex', configHome });
   const custody = createCustodyEnv(env);
@@ -401,10 +408,23 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
       capabilities: null,
     }), timeoutMs);
     client.notify('initialized');
-    // The metadata endpoint does not itself refresh an expired access token.
-    // Refresh centrally before reading quota so Retry can heal a stale token
-    // without spending a model turn. This host home is the sole owner of the
-    // rotating refresh credential; remote task projections never receive it.
+    // A dashboard/staleness probe is read-only while the current access token is
+    // healthy. Previously every dashboard view forced OAuth rotation, which could
+    // invalidate access-only projections already running in remote task worlds.
+    if (!force) {
+      try {
+        return await withTimeout(client.request('account/rateLimits/read'), timeoutMs);
+      } catch (error) {
+        const message = String(error instanceof Error ? error.message : error).toLowerCase();
+        if (!(/\b401\b|unauthorized|access denied|not logged in|authentication required|\btoken\b.*\bexpired\b|\bexpired\b.*\btoken\b/.test(message))) {
+          // A timeout, transport break, or provider 5xx says nothing about the
+          // credential. Report the probe failure without rotating OAuth.
+          throw error;
+        }
+      }
+    }
+    // This host home is the sole owner of the rotating refresh credential;
+    // remote task projections never receive it.
     await withTimeout(client.request('account/read', { refreshToken: true }), timeoutMs);
     return await withTimeout(client.request('account/rateLimits/read'), timeoutMs);
   } finally {

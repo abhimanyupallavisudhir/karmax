@@ -313,7 +313,34 @@ describe('probeCodexUsage', () => {
     }
   });
 
-  it('performs the initialize + account/rateLimits/read app-server handshake', async () => {
+  it('does not let a forced recovery disappear into an in-flight passive probe', async () => {
+    const home = mkHome(true);
+    let passiveCalls = 0;
+    let forcedCalls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const passive = refreshCodexLogin({ configHome: home, run: async () => {
+        passiveCalls++;
+        await gate;
+        return CODEX_LIMITS;
+      } });
+      const forced = refreshCodexLogin({ configHome: home, force: true, run: async () => {
+        forcedCalls++;
+        return CODEX_LIMITS;
+      } });
+      await Promise.resolve();
+      expect(passiveCalls).toBe(1);
+      expect(forcedCalls).toBe(0);
+      release();
+      await expect(Promise.all([passive, forced])).resolves.toHaveLength(2);
+      expect(forcedCalls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reads usage without rotating a still-valid Codex credential', async () => {
     const home = mkHome(true);
     const stub = path.join(home, 'codex-usage-stub.cjs');
     const oldCmd = process.env.KARMAX_CODEX_USAGE_CMD;
@@ -322,17 +349,17 @@ describe('probeCodexUsage', () => {
 const readline = require('readline');
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
 let initialized = false;
-let refreshed = false;
+let refreshCalls = 0;
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const msg = JSON.parse(line);
   if (msg.method === 'initialize') {
     initialized = true;
     send({ id: msg.id, result: {} });
   } else if (msg.method === 'account/read') {
-    refreshed = msg.params && msg.params.refreshToken === true;
+    if (msg.params && msg.params.refreshToken === true) refreshCalls++;
     send({ id: msg.id, result: { account: { type: 'chatgpt' } } });
   } else if (msg.method === 'account/rateLimits/read') {
-    if (!initialized || !refreshed || process.env.CODEX_HOME !== process.env.STUB_EXPECTED_CODEX_HOME) {
+    if (!initialized || refreshCalls !== 0 || process.env.CODEX_HOME !== process.env.STUB_EXPECTED_CODEX_HOME) {
       send({ id: msg.id, error: { code: -1, message: 'bad probe environment' } });
     } else {
       send({ id: msg.id, result: ${JSON.stringify(CODEX_LIMITS)} });
@@ -351,6 +378,75 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       else process.env.KARMAX_CODEX_USAGE_CMD = oldCmd;
       if (oldExpected === undefined) delete process.env.STUB_EXPECTED_CODEX_HOME;
       else process.env.STUB_EXPECTED_CODEX_HOME = oldExpected;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes once only after a usage read proves the access token stale', async () => {
+    const home = mkHome(true);
+    const stub = path.join(home, 'codex-usage-refresh-stub.cjs');
+    const oldCmd = process.env.KARMAX_CODEX_USAGE_CMD;
+    fs.writeFileSync(stub, `#!/usr/bin/env node
+const readline = require('readline');
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+let refreshed = false;
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} });
+  else if (msg.method === 'account/rateLimits/read') {
+    if (!refreshed) send({ id: msg.id, error: { code: -32001, message: 'token expired' } });
+    else send({ id: msg.id, result: ${JSON.stringify(CODEX_LIMITS)} });
+  } else if (msg.method === 'account/read') {
+    refreshed = msg.params && msg.params.refreshToken === true;
+    send({ id: msg.id, result: { account: { type: 'chatgpt' } } });
+  }
+});
+`);
+    fs.chmodSync(stub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = stub;
+    try {
+      const r = await probeCodexUsage({ configHome: home, now: NOW, timeoutMs: 2_000 });
+      expect(r.ok && r.week?.pct).toBe(34);
+    } finally {
+      if (oldCmd === undefined) delete process.env.KARMAX_CODEX_USAGE_CMD;
+      else process.env.KARMAX_CODEX_USAGE_CMD = oldCmd;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not rotate OAuth when a passive usage probe fails for infrastructure', async () => {
+    const home = mkHome(true);
+    const stub = path.join(home, 'codex-usage-infra-stub.cjs');
+    const marker = path.join(home, 'unexpected-refresh');
+    const oldCmd = process.env.KARMAX_CODEX_USAGE_CMD;
+    const oldMarker = process.env.STUB_REFRESH_MARKER;
+    fs.writeFileSync(stub, `#!/usr/bin/env node
+const fs = require('fs');
+const readline = require('readline');
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} });
+  else if (msg.method === 'account/rateLimits/read')
+    send({ id: msg.id, error: { code: -32000, message: 'internal server error' } });
+  else if (msg.method === 'account/read') {
+    fs.writeFileSync(process.env.STUB_REFRESH_MARKER, 'rotated');
+    send({ id: msg.id, result: {} });
+  }
+});
+`);
+    fs.chmodSync(stub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = stub;
+    process.env.STUB_REFRESH_MARKER = marker;
+    try {
+      const r = await probeCodexUsage({ configHome: home, now: NOW, timeoutMs: 2_000 });
+      expect(r.ok).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      if (oldCmd === undefined) delete process.env.KARMAX_CODEX_USAGE_CMD;
+      else process.env.KARMAX_CODEX_USAGE_CMD = oldCmd;
+      if (oldMarker === undefined) delete process.env.STUB_REFRESH_MARKER;
+      else process.env.STUB_REFRESH_MARKER = oldMarker;
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
