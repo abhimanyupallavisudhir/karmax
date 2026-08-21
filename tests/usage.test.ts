@@ -9,6 +9,7 @@ import {
   labelToEpoch,
   probeClaudeUsage,
   probeCodexUsage,
+  ensureCodexLoginFresh,
   refreshCodexLogin,
   usageProvesAvailable,
   isUsagePollable,
@@ -335,6 +336,81 @@ describe('probeCodexUsage', () => {
       release();
       await expect(Promise.all([passive, forced])).resolves.toHaveLength(2);
       expect(forcedCalls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes an expired Codex ID token before projecting a remote login', async () => {
+    const home = mkHome(false);
+    const jwt = (exp: number) => `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
+    fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { id_token: jwt(Math.floor(NOW / 1000) - 1), access_token: 'still-valid', refresh_token: 'host-only' },
+    }));
+    let calls = 0;
+    try {
+      await ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
+        calls++;
+        const auth = JSON.parse(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'));
+        auth.tokens.id_token = jwt(Math.floor((NOW + 60 * 60_000) / 1000));
+        fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify(auth));
+        return CODEX_LIMITS;
+      } });
+      expect(calls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('shares one ID-token refresh across concurrent remote preflights', async () => {
+    const home = mkHome(false);
+    const jwt = (exp: number) => `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
+    fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({
+      tokens: { id_token: jwt(Math.floor(NOW / 1000) - 1), refresh_token: 'host-only' },
+    }));
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const run = async () => {
+      calls++;
+      await gate;
+      const auth = JSON.parse(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'));
+      auth.tokens.id_token = jwt(Math.floor((NOW + 60 * 60_000) / 1000));
+      fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify(auth));
+      return CODEX_LIMITS;
+    };
+    try {
+      const first = ensureCodexLoginFresh({ configHome: home, now: NOW, run });
+      const second = ensureCodexLoginFresh({ configHome: home, now: NOW, run });
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      release();
+      await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+      expect(calls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not rotate a Codex login whose ID token covers the safety window', async () => {
+    const home = mkHome(false);
+    const idToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor((NOW + 30 * 60_000) / 1000) })).toString('base64url')}.signature`;
+    fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({ tokens: { id_token: idToken } }));
+    try {
+      await ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => {
+        throw new Error('fresh login must not rotate');
+      } });
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a refresh that leaves the projected Codex ID token stale', async () => {
+    const home = mkHome(true);
+    try {
+      await expect(ensureCodexLoginFresh({ configHome: home, now: NOW, run: async () => CODEX_LIMITS }))
+        .rejects.toThrow(/fresh ID token/i);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
