@@ -105,6 +105,23 @@ describe('Project settings browser source', () => {
     expect(source).toContain('uv run python manage.py migrate');
   });
 
+  it('opens GitHub repository creation from a button beside Save repositories', () => {
+    const access = source.slice(source.indexOf('async function hydrateProjectAccess('), source.indexOf('async function hydrateWorkflowPins('));
+    const dialog = source.slice(source.indexOf('function openNewGithubRepositoryDialog('), source.indexOf('async function hydrateProjectAccess('));
+    const save = access.indexOf('>Save repositories</button>');
+    const open = access.indexOf('>New repository...</button>');
+
+    expect(save).toBeGreaterThan(-1);
+    expect(open).toBeGreaterThan(save);
+    expect(access.slice(save, open)).not.toContain('</div>');
+    expect(access).not.toContain('<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b>');
+    expect(access).toContain("openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget)");
+    for (const label of ['GitHub account', 'Repository name', 'Description', 'Private repository']) expect(dialog).toContain(label);
+    expect(dialog).toContain('role="dialog" aria-modal="true"');
+    expect(dialog).toContain("if (event.key === 'Escape') close()");
+    expect(dialog).toContain("opener?.focus?.()");
+  });
+
   it('resets the actual scroll container when switching settings panes', () => {
     expect(source).toContain("$('#main')?.closest('.main')?.scrollTo?.(0, 0)");
   });
