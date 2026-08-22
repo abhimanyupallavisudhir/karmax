@@ -5,7 +5,8 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
 import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
-  remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
+  remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
+  CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
 const codexIdToken = (expiresAt: number) =>
@@ -47,6 +48,8 @@ describe('remote subscription agents', () => {
     expect(seeded.absolute).toBe(`/workspace/${remoteHome}`);
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('subscription');
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).not.toContain('host-only-refresh');
+    expect(JSON.parse(world.files.get(`${remoteHome}/auth.json`)!.toString()).tokens.refresh_token)
+      .toBe(CODEX_REMOTE_REFRESH_SENTINEL);
     expect(world.files.get(`${remoteHome}/skills/review/SKILL.md`)?.toString()).toBe('review skill');
     expect(world.files.has(`${remoteHome}/sessions/host-task.jsonl`)).toBe(false);
     expect(world.files.has(`${remoteHome}/logs_2.sqlite`)).toBe(false);
@@ -325,7 +328,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
     const projected = JSON.parse(world.files.get(`${remoteHome}/auth.json`)!.toString());
     expect(projected.tokens.id_token).not.toBe(expiredIdToken);
-    expect(projected.tokens.refresh_token).toBeUndefined();
+    expect(projected.tokens.refresh_token).toBe(CODEX_REMOTE_REFRESH_SENTINEL);
     expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
     expect(activities).toContainEqual(expect.objectContaining({
       id: 'codex-credential-preflight', phase: 'completed',

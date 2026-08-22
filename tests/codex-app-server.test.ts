@@ -229,6 +229,10 @@ describe('CodexAdapter app-server security policy', () => {
       kind: 'credential', permanence: 'hard', provider: 'codex',
       diagnostic: { message: 'organization access was denied', code: 'other', status: 401 },
     }))).toBe(false);
+    expect(isRecoverableRemoteCodexCredentialFailure(providerFailure('remote sentinel cannot rotate', {
+      kind: 'credential', permanence: 'hard', provider: 'codex',
+      diagnostic: { message: 'OAuth refresh failed: invalid grant', code: 'invalid_grant', status: 401 },
+    }))).toBe(true);
   });
 
   it('rejects a process/transport end without a completed terminal event', async () => {
