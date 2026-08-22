@@ -1116,14 +1116,7 @@ export class Store {
     delete persisted.effectiveMaxActiveAgentTurns;
     if (this.hosted) delete persisted.maxActiveWorlds;
     this.kvSet(`organization-usage-policy:${organizationId}`, JSON.stringify(persisted));
-    if (this.hosted) {
-      const activeWorlds = this.getOrganizationUsagePolicy(organizationId).maxActiveWorlds;
-      for (const pool of this.listRunnerPools(organizationId)) {
-        if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
-          this.createRunnerPool({ ...pool, capacity: { ...pool.capacity, activeWorlds } });
-      }
-      this.reconcileWorldLeaseCapacity(organizationId);
-    }
+    this.reconcileHostedUsageCapacity(organizationId);
     return this.getOrganizationUsagePolicy(organizationId);
   }
 
@@ -1294,6 +1287,19 @@ export class Store {
     });
   }
 
+  /** Keep hosted customer-world admission aligned with plan/member concurrency.
+   * Agent queues are reconciled by EntitlementQueueReconciler through the
+   * notification above; world leases are store-owned and can refresh here. */
+  private reconcileHostedUsageCapacity(organizationId: string): void {
+    if (!this.hosted || !this.getOrganization(organizationId)) return;
+    const activeWorlds = this.getOrganizationUsagePolicy(organizationId).maxActiveWorlds;
+    for (const pool of this.listRunnerPools(organizationId)) {
+      if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
+        this.createRunnerPool({ ...pool, capacity: { ...pool.capacity, activeWorlds } });
+    }
+    this.reconcileWorldLeaseCapacity(organizationId);
+  }
+
   /**
    * One-time bridge for installations that created users and organizations
    * before they shared an account-name namespace. A user's registered name wins;
@@ -1395,14 +1401,7 @@ export class Store {
     if (!isHostedPlanId(plan)) throw new Error(`unknown hosted plan ${String(plan)}`);
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
     this.db.prepare('UPDATE organizations SET plan=? WHERE id=?').run(plan, organizationId);
-    if (this.hosted) {
-      const activeWorlds = this.getOrganizationUsagePolicy(organizationId).maxActiveWorlds;
-      for (const pool of this.listRunnerPools(organizationId)) {
-        if (pool.mode === 'customer' && !['worktree', 'container', 'memory'].includes(pool.provider))
-          this.createRunnerPool({ ...pool, capacity: { ...pool.capacity, activeWorlds } });
-      }
-      this.reconcileWorldLeaseCapacity(organizationId);
-    }
+    this.reconcileHostedUsageCapacity(organizationId);
     this.notifyOrganizationEntitlementsChanged(organizationId);
     return this.getOrganization(organizationId)!;
   }
@@ -1938,7 +1937,10 @@ export class Store {
     const joinedAt = Date.now();
     this.db.prepare(`INSERT INTO organization_memberships (organizationId, userId, role, joinedAt)
       VALUES (?, ?, ?, ?) ON CONFLICT(organizationId, userId) DO UPDATE SET role=excluded.role`).run(organizationId, userId, role, joinedAt);
-    if (!existing) this.notifyOrganizationEntitlementsChanged(organizationId);
+    if (!existing) {
+      this.reconcileHostedUsageCapacity(organizationId);
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+    }
     return { organizationId, userId, role, joinedAt };
   }
 
@@ -1959,7 +1961,10 @@ export class Store {
     }
     this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId);
     this.db.prepare('DELETE FROM user_preferences WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId);
-    if (membership) this.notifyOrganizationEntitlementsChanged(organizationId);
+    if (membership) {
+      this.reconcileHostedUsageCapacity(organizationId);
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+    }
   }
 
   getOrganizationIdentityPolicy(organizationId: string): OrganizationIdentityPolicy {

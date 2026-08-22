@@ -73,12 +73,15 @@ describe('paid-launch policies', () => {
   it('publishes the central Free, Individual, and Team catalog exactly', () => {
     expect(publicLaunchInfo({}).pricingCatalog).toEqual([
       expect.objectContaining({ id: 'free', monthlyBasePriceCents: 0, maxMembers: 1,
-        unlimitedProjects: true, maxActiveAgentRuns: 1, currency: 'usd', billingInterval: 'month' }),
+        unlimitedProjects: true, maxActiveAgentRuns: 5, additionalActiveUserAgentRuns: 0,
+        currency: 'usd', billingInterval: 'month' }),
       expect.objectContaining({ id: 'individual', monthlyBasePriceCents: 900, maxMembers: 1,
-        unlimitedProjects: true, maxActiveAgentRuns: 5, currency: 'usd', billingInterval: 'month' }),
+        unlimitedProjects: true, maxActiveAgentRuns: 10, additionalActiveUserAgentRuns: 0,
+        currency: 'usd', billingInterval: 'month' }),
       expect.objectContaining({ id: 'team', monthlyBasePriceCents: 1900, includedActiveUsers: 1,
         monthlyAdditionalActiveUserPriceCents: 500, maxMembers: null, unlimitedProjects: true,
-        maxActiveAgentRuns: 10, currency: 'usd', billingInterval: 'month' }),
+        maxActiveAgentRuns: 20, additionalActiveUserAgentRuns: 5,
+        currency: 'usd', billingInterval: 'month' }),
     ]);
   });
 });

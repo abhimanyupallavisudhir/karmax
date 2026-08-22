@@ -349,7 +349,7 @@ describe('runner capacity and world lifecycle', () => {
         capacity: { activeWorlds: 1, cpu: 40, memoryMb: 81920, gpu: 0 }, enabled: true });
       const pool = runners.ensureDefaultPool(project, 'e2b');
       expect(pool).toMatchObject({ mode: 'customer', provider: 'e2b', name: 'E2B · organization BYOK' });
-      store.setOrganizationUsagePolicy(organization.id, { maxRemoteStartsPerMinute: 1 });
+      store.setOrganizationUsagePolicy(organization.id, { maxRemoteStartsPerMinute: 1, maxActiveAgentTurns: 1 });
       const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
       const queuedTask = createTask(store, project.id, 'Queued');
       const queued = store.requestWorldLease({ runnerPoolId: pool.id, organizationId: organization.id,
@@ -382,30 +382,51 @@ describe('runner capacity and world lifecycle', () => {
         projectId: project.id, taskId: task.id, worldId: task.id, cpu: 8, memoryMb: 16_384, gpu: 1 });
     };
 
-    const first = lease('Free active');
-    const second = lease('Free queued');
-    expect(first.acquired).toBe(true);
-    expect(second.acquired).toBe(false);
+    const freeActive = Array.from({ length: 5 }, (_, index) => lease(`Free active ${index + 1}`));
+    const freeQueued = lease('Free queued');
+    expect(freeActive.every((candidate) => candidate.acquired)).toBe(true);
+    expect(freeQueued.acquired).toBe(false);
 
     store.setOrganizationPlan(organization.id, 'individual');
-    expect(store.getRunnerPool('customer-e2b')?.capacity.activeWorlds).toBe(5);
-    expect(store.worldLease(second.id).state).toBe('active');
-    const third = lease('Individual 3');
-    const fourth = lease('Individual 4');
-    const fifth = lease('Individual 5');
+    expect(store.getRunnerPool('customer-e2b')?.capacity.activeWorlds).toBe(10);
+    expect(store.worldLease(freeQueued.id).state).toBe('active');
+    const individualActive = Array.from({ length: 4 }, (_, index) => lease(`Individual active ${index + 7}`));
     const overflow = lease('Individual queued');
-    expect([third, fourth, fifth].every((candidate) => candidate.acquired)).toBe(true);
+    expect(individualActive.every((candidate) => candidate.acquired)).toBe(true);
     expect(overflow.acquired).toBe(false);
 
     // A downgrade does not destroy running customer sandboxes. The queued world
     // stays queued until enough existing work parks or finishes.
     store.setOrganizationPlan(organization.id, 'free');
-    expect(store.getRunnerPool('customer-e2b')?.capacity.activeWorlds).toBe(1);
+    expect(store.getRunnerPool('customer-e2b')?.capacity.activeWorlds).toBe(5);
     expect(store.worldLease(overflow.id).state).toBe('queued');
-    for (const active of [first, second, third, fourth]) store.releaseWorldLease(active.id);
+    for (const active of freeActive) store.releaseWorldLease(active.id);
     expect(store.worldLease(overflow.id).state).toBe('queued');
-    store.releaseWorldLease(fifth.id);
+    store.releaseWorldLease(freeQueued.id);
     expect(store.worldLease(overflow.id).state).toBe('active');
+  });
+
+  it('adds five hosted Team world slots when an additional user joins', () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Growing Team', ownerUserId: 'owner' });
+    store.setOrganizationPlan(organization.id, 'team');
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    store.createRunnerPool({ id: 'team-e2b', organizationId: organization.id, name: 'Team E2B', provider: 'e2b',
+      mode: 'customer', capacity: { activeWorlds: 20, cpu: 1, memoryMb: 128, gpu: 0 }, enabled: true });
+    const lease = (index: number) => {
+      const task = createTask(store, project.id, `World ${index}`);
+      return store.requestWorldLease({ runnerPoolId: 'team-e2b', organizationId: organization.id,
+        projectId: project.id, taskId: task.id, worldId: task.id });
+    };
+
+    const initial = Array.from({ length: 21 }, (_, index) => lease(index));
+    expect(initial.slice(0, 20).every((candidate) => candidate.acquired)).toBe(true);
+    expect(initial[20]!.acquired).toBe(false);
+
+    store.setOrganizationMembership(organization.id, 'second', 'member');
+    expect(store.organizationEntitlements(organization.id).maxActiveAgentRuns).toBe(25);
+    expect(store.getRunnerPool('team-e2b')?.capacity.activeWorlds).toBe(25);
+    expect(store.worldLease(initial[20]!.id).state).toBe('active');
   });
 
   it('accounts non-workflow access and reparks a remote world when the last accessor leaves', async () => {
