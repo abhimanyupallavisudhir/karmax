@@ -61,6 +61,9 @@ export function isRecoverableRemoteCodexCredentialFailure(error: unknown): boole
   const message = String(diagnostic?.message ?? error.message).toLowerCase();
   if (/^(?:invalid_api_key|revoked|insufficient_scope)$/.test(code)) return false;
   return /^(?:token_expired|expired_token|access_token_expired)$/.test(code)
+    // A remote process can only attempt to rotate Karmax's inert marker. The
+    // canonical host may still refresh successfully, so revalidate there once.
+    || code === 'invalid_grant'
     || code === 'unauthorized'
     || (diagnostic?.status === 401 && code === 'other'
       && /missing bearer or basic authentication(?: in (?:the )?header)?/.test(message))
@@ -213,8 +216,9 @@ export class CodexAdapter implements AgentAdapter {
       });
       throw error;
     }
-    // The sandbox intentionally receives no rotating refresh token. If its
-    // refresh-token-free projection loses auth, recover through the canonical home below;
+    // The sandbox intentionally receives no rotating refresh token (only an
+    // inert login-state marker). If its projection loses auth, recover through
+    // the canonical home below;
     // valid turns pay no extra provider process or metadata request.
     try {
       return await this.runCodexAppServer(input, retryCtx);

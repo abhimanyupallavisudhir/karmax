@@ -17,6 +17,10 @@ const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? '@openai/codex@
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? '22.16.0';
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? '10.9.2';
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
+/** Current Codex treats refresh-token *presence* as the ChatGPT login marker,
+ * even with fresh ID/access tokens. Remote worlds receive this inert value so
+ * the real rotating credential remains exclusively host-owned. */
+export const CODEX_REMOTE_REFRESH_SENTINEL = 'karmax-host-managed-refresh';
 
 /** A V2 provider world is the execution boundary: native agent subprocesses must
  * run there, not on the control-plane host against a virtual cwd. */
@@ -102,8 +106,8 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
       ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
       : relative.startsWith('projects/') && relative.endsWith('.jsonl');
     if (!auth.has(relative) && !session) continue;
-    // A remote Codex process receives an access-token-only projection. It is
-    // intentionally never refresh authority and must never overwrite the one
+    // A remote Codex process receives a projection with an inert refresh marker.
+    // It is intentionally never refresh authority and must never overwrite the one
     // canonical auth.json shared by every task using this login.
     if (isCodexAuth(provider, relative)) continue;
     const destination = path.join(localHome, ...relative.split('/'));
@@ -130,13 +134,15 @@ function isCodexAuth(provider: Provider, relative: string): boolean {
   return provider === 'codex' && relative.split(path.sep).join('/') === 'auth.json';
 }
 
-/** Remove every known spelling of the rotating refresh credential while
- * preserving the access/id tokens and account metadata Codex needs for a turn. */
+/** Replace the rotating refresh credential with an inert presence marker while
+ * preserving the access/id tokens and account metadata Codex needs for a turn.
+ * Removing the field entirely makes current app-server silently discard the
+ * otherwise-valid access token and send Responses requests without a bearer. */
 function codexRemoteAuthProjection(content: Buffer): Buffer {
   try {
     const parsed = JSON.parse(content.toString('utf8'));
     if (parsed?.tokens && typeof parsed.tokens === 'object') {
-      delete parsed.tokens.refresh_token;
+      parsed.tokens.refresh_token = CODEX_REMOTE_REFRESH_SENTINEL;
       delete parsed.tokens.refreshToken;
     }
     delete parsed.refresh_token;

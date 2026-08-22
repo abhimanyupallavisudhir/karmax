@@ -389,10 +389,10 @@ export async function refreshCodexLogin(
   return created;
 }
 
-/** A refresh-token-free remote Codex home is considered logged out once its
- * short-lived ID token expires, even when the access token itself remains valid.
- * Refresh the one canonical host home before projection; the sandbox still never
- * receives refresh authority. Returns whether a refresh was performed. */
+/** A remote Codex projection has no usable refresh credential, so ensure its
+ * short-lived ID token remains valid before launch. Refresh the one canonical
+ * host home before projection; the sandbox still never receives refresh
+ * authority. Returns whether a refresh was performed. */
 export async function ensureCodexLoginFresh(
   opts: {
     configHome?: string;

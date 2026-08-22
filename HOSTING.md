@@ -102,8 +102,13 @@ persisted because they can contain OAuth tokens and Authorization headers. The
 task's `resolve.auto` event carries the same whitelist, and the account
 coordinator logs the state transition.
 
-Codex remote worlds receive a refresh-token-free projection of the organization
-login; the rotating refresh token stays in the canonical control-plane home.
+Codex remote worlds receive the organization's current ID/access tokens plus a
+fixed, non-secret `karmax-host-managed-refresh` marker; the rotating refresh token
+stays in the canonical control-plane home. The marker is required because current
+Codex treats refresh-token presence as its login-state flag: deleting the field
+makes it discard an otherwise-valid access token and call Responses without a
+bearer header. The marker cannot refresh OAuth and remote auth is never imported
+back into the canonical home.
 Usage/dashboard probes read quota with the current token first and rotate OAuth
 only when that authenticated read fails; a dashboard refresh must never rotate
 credentials out from under live remote turns. Current Codex also treats that
