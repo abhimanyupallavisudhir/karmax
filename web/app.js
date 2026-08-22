@@ -11189,6 +11189,47 @@ function arrayBufferToBase64(buffer) {
   for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
   return btoa(binary);
 }
+function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
+    <div class="new-repository-head"><b id="new-repository-title">New GitHub repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
+    <div class="new-repository-identity">
+      <label class="form-row"><span>GitHub account</span><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select></label>
+      <span class="new-repository-slash" aria-hidden="true">/</span>
+      <label class="form-row"><span>Repository name</span><input id="project-new-repo-name" placeholder="new-repository" required autocomplete="off"></label>
+    </div>
+    <label class="form-row"><span>Description <span class="task-sub">optional</span></span><input id="project-new-repo-description"></label>
+    <label class="switch new-repository-private"><input id="project-new-repo-private" type="checkbox" checked><span>Private repository</span></label>
+    <div class="new-repository-actions"><button class="btn new-repository-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Create and attach</button></div>
+  </form></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); host.remove(); opener?.focus?.(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.new-repository-close').addEventListener('click', close);
+  host.querySelector('.new-repository-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = event.submitter;
+    const name = host.querySelector('#project-new-repo-name').value.trim();
+    if (!name) return toast('Repository name is required', true);
+    if (button) { button.disabled = true; button.textContent = 'Creating…'; }
+    try {
+      const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({
+        gitConnectionId: host.querySelector('#project-new-repo-connection').value,
+        name,
+        description: host.querySelector('#project-new-repo-description').value,
+        private: host.querySelector('#project-new-repo-private').checked,
+      }) });
+      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
+      close(); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
+    } catch (error) {
+      toast(error.message, true);
+      if (button) { button.disabled = false; button.textContent = 'Create and attach'; }
+    }
+  });
+  $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
+  host.querySelector('#project-new-repo-name').focus();
+}
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
@@ -11215,13 +11256,12 @@ async function hydrateProjectAccess(proj) {
     repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
-      <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
+      <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
       ${!githubApp.configured ? `<div class="inline-form">${S.installationAccess
         ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
         : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>
-          ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
+        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>`}`;
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
@@ -11231,10 +11271,10 @@ async function hydrateProjectAccess(proj) {
     wireRepositoryRemoves();
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
+    $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
-    $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
   } catch (error) {
     if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
   }
