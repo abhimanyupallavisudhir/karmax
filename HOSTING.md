@@ -303,8 +303,9 @@ split into managed and BYOK funding, plus active model turns,
 remote worlds, and commands. Provider/model allowlists, per-minute model and
 sandbox start limits, and concurrent turn/world limits are enforced immediately
 before the trusted provider boundary. Hosted concurrency defaults to the central
-Free/Individual/Team entitlement (1/5/10 shared active agent runs); the usage
-policy can only supply an owner-selected tighter cap. Admission rows use the durable agent-turn
+Free/Individual/Team entitlement (5/10/20 shared active agent runs, with Team
+adding 5 for every active user after the first); the usage policy can only
+supply an owner-selected tighter cap. Admission rows use the durable agent-turn
 id, and provider lifecycle rows use provider execution ids, so activity retries
 and reconciliation/webhook duplication cannot reserve or count the same work
 twice.
@@ -315,6 +316,12 @@ centrally funded remote pool, and the execution boundary rejects legacy managed
 remote pools on hosted deployments. Centrally resold E2B would require a separate
 installation authorization and billing boundary that this deployment does not
 implement.
+
+The hosted worker's default activity envelope is deliberately high (1,000), so
+the generic Temporal pool does not silently replace these per-organization
+entitlements with the private-install default of 8. Operators may set
+`KARMAX_MAX_ACT` as an explicit fleet-capacity guard and scale workers when
+aggregate tenant demand approaches it.
 
 ## Payment rails
 

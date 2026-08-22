@@ -679,17 +679,17 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
   it('promotes an existing hosted queue when member or plan recovery restores capacity', async () => {
     const { agentQueueId } = await import('../src/coordinators/names.js');
     const scenarios = [
-      { name: 'free member removal', plan: 'free' as const, expectedCapacity: 1,
+      { name: 'free member removal', plan: 'free' as const, expectedCapacity: 5,
         recover: (store: Store, organizationId: string) => {
           store.removeOrganizationMembership(organizationId, 'second');
           store.removeOrganizationMembership(organizationId, 'third');
         } },
-      { name: 'individual member removal', plan: 'individual' as const, expectedCapacity: 5,
+      { name: 'individual member removal', plan: 'individual' as const, expectedCapacity: 10,
         recover: (store: Store, organizationId: string) => {
           store.removeOrganizationMembership(organizationId, 'second');
           store.removeOrganizationMembership(organizationId, 'third');
         } },
-      { name: 'Team plan restoration', plan: 'free' as const, expectedCapacity: 10,
+      { name: 'Team plan restoration', plan: 'free' as const, expectedCapacity: 30,
         recover: (store: Store, organizationId: string) => {
           store.setOrganizationPlan(organizationId, 'team');
         } },
@@ -702,7 +702,7 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
       store.setOrganizationMembership(organization.id, 'second', 'member');
       store.setOrganizationMembership(organization.id, 'third', 'member');
       store.setOrganizationPlan(organization.id, scenario.plan);
-      const waiting = Array.from({ length: 10 }, (_, index) => ({
+      const waiting = Array.from({ length: 35 }, (_, index) => ({
         taskId: `${scenario.name}-${index}`,
         turnId: `${scenario.name}-${index}#0`,
         role: 'do',

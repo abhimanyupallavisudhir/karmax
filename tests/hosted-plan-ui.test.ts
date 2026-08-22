@@ -22,7 +22,7 @@ describe('hosted plan organization UI', () => {
   it('shows plan limits and explains shared queued concurrency', () => {
     const free = markup({
       deployment: 'hosted', planName: 'Free', currentMonthlyPriceCents: 0,
-      maxMembers: 1, unlimitedProjects: true, maxActiveAgentRuns: 1,
+      maxMembers: 1, unlimitedProjects: true, maxActiveAgentRuns: 5,
       currentMemberCount: 1, overMemberLimit: false,
       activeAgentRuns: 1, queuedAgentRuns: 2,
     });
@@ -30,7 +30,7 @@ describe('hosted plan organization UI', () => {
     expect(free).toContain('$0/month');
     expect(free).toContain('1 user');
     expect(free).toContain('Unlimited projects');
-    expect(free).toContain('1 active agent run');
+    expect(free).toContain('5 active agent runs');
     expect(free).toContain('1 active · 2 queued');
     expect(free).toContain('shared maximum');
     expect(free).toContain('waits in queue');
@@ -39,21 +39,21 @@ describe('hosted plan organization UI', () => {
   it('renders Team per-active-user pricing returned by the server', () => {
     const team = markup({
       deployment: 'hosted', planName: 'Team', currentMonthlyPriceCents: 2_900,
-      maxMembers: null, unlimitedProjects: true, maxActiveAgentRuns: 10,
+      maxMembers: null, unlimitedProjects: true, maxActiveAgentRuns: 30,
       currentMemberCount: 3, overMemberLimit: false,
       activeAgentRuns: 3, queuedAgentRuns: 0,
     });
     expect(team).toContain('Team');
     expect(team).toContain('$29/month');
     expect(team).toContain('3 active users · unlimited');
-    expect(team).toContain('10 active agent runs');
+    expect(team).toContain('30 active agent runs');
   });
 
   it('shows an actionable paused state after an over-member downgrade', () => {
     const overLimit = markup({
       deployment: 'hosted', planName: 'Free', currentMonthlyPriceCents: 0,
       currentMemberCount: 3, maxMembers: 1, overMemberLimit: true,
-      unlimitedProjects: true, maxActiveAgentRuns: 1, activeAgentRuns: 1, queuedAgentRuns: 2,
+      unlimitedProjects: true, maxActiveAgentRuns: 5, activeAgentRuns: 1, queuedAgentRuns: 2,
     });
     expect(overLimit).toContain('3 of 1 user · over limit');
     expect(overLimit).toContain('Agent runs are paused');
@@ -106,6 +106,7 @@ describe('hosted plan organization UI', () => {
     expect(pricing).toContain('Unlimited projects');
     expect(pricing).toContain('maxActiveAgentRuns');
     expect(pricing).toContain('monthlyAdditionalActiveUserPriceCents');
+    expect(pricing).toContain('additionalActiveUserAgentRuns');
     expect(pricing).toContain('Cancel online from Organization settings');
     expect(pricing).not.toContain('Simple subscription');
     expect(pricing).not.toContain('S.launch?.subscription');

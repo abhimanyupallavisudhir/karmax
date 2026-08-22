@@ -5,6 +5,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   HOSTED_PLANS,
+  hostedActiveAgentRuns,
   hostedMonthlyPriceCents,
   organizationEntitlements,
 } from '../src/domain/entitlements.js';
@@ -18,19 +19,26 @@ import { EntitlementQueueReconciler } from '../src/platform/entitlement-queue-re
 describe('hosted plan entitlements', () => {
   it('keeps launch pricing and limits in one billing-safe catalog', () => {
     expect(HOSTED_PLANS.free).toMatchObject({
-      monthlyBasePriceCents: 0, maxMembers: 1, maxActiveAgentRuns: 1, unlimitedProjects: true,
+      monthlyBasePriceCents: 0, maxMembers: 1, maxActiveAgentRuns: 5,
+      additionalActiveUserAgentRuns: 0, unlimitedProjects: true,
     });
     expect(HOSTED_PLANS.individual).toMatchObject({
-      monthlyBasePriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 5, unlimitedProjects: true,
+      monthlyBasePriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 10,
+      additionalActiveUserAgentRuns: 0, unlimitedProjects: true,
     });
     expect(HOSTED_PLANS.team).toMatchObject({
       monthlyBasePriceCents: 1_900, includedActiveUsers: 1,
       monthlyAdditionalActiveUserPriceCents: 500, maxMembers: null,
-      maxActiveAgentRuns: 10, unlimitedProjects: true,
+      maxActiveAgentRuns: 20, additionalActiveUserAgentRuns: 5, unlimitedProjects: true,
     });
     expect(hostedMonthlyPriceCents('team', 0)).toBe(1_900);
     expect(hostedMonthlyPriceCents('team', 1)).toBe(1_900);
     expect(hostedMonthlyPriceCents('team', 4)).toBe(3_400);
+    expect(hostedActiveAgentRuns('free', 1)).toBe(5);
+    expect(hostedActiveAgentRuns('individual', 1)).toBe(10);
+    expect(hostedActiveAgentRuns('team', 0)).toBe(20);
+    expect(hostedActiveAgentRuns('team', 1)).toBe(20);
+    expect(hostedActiveAgentRuns('team', 4)).toBe(35);
   });
 
   it('does not apply hosted monetization limits to private installations', () => {
@@ -81,7 +89,7 @@ describe('hosted plan entitlements', () => {
     store.setOrganizationMembership(organization.id, 'second', 'member');
     store.setOrganizationMembership(organization.id, 'third', 'member');
     expect(store.listOrganizationMemberships(organization.id)).toHaveLength(3);
-    expect(store.organizationEntitlements(organization.id).maxActiveAgentRuns).toBe(10);
+    expect(store.organizationEntitlements(organization.id).maxActiveAgentRuns).toBe(30);
   });
 
   it('re-checks the member limit when an already-issued invitation is accepted', () => {
@@ -152,9 +160,9 @@ describe('hosted plan entitlements', () => {
 
 describe('hosted agent-run admission integration', () => {
   it.each([
-    ['free', 1],
-    ['individual', 5],
-    ['team', 10],
+    ['free', 5],
+    ['individual', 10],
+    ['team', 20],
   ] as const)('uses the central %s plan limit of %i at model admission without a second default', (plan, limit) => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: `Usage ${plan}`, ownerUserId: 'owner' });
@@ -187,23 +195,23 @@ describe('hosted agent-run admission integration', () => {
       maxActiveAgentTurns: 3, effectiveMaxActiveAgentTurns: 3, maxActiveWorlds: 3,
     });
     expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: 99 })).toMatchObject({
-      maxActiveAgentTurns: 10, effectiveMaxActiveAgentTurns: 10, maxActiveWorlds: 10,
+      maxActiveAgentTurns: 20, effectiveMaxActiveAgentTurns: 20, maxActiveWorlds: 20,
     });
     const restored = store.setOrganizationUsagePolicy(organization.id, { maxActiveAgentTurns: undefined });
     expect(restored.maxActiveAgentTurns).toBeUndefined();
-    expect(restored.effectiveMaxActiveAgentTurns).toBe(10);
+    expect(restored.effectiveMaxActiveAgentTurns).toBe(20);
   });
 
   it('does not retain a second hosted remote-world limit outside the plan', () => {
     const store = new Store(':memory:', { hosted: true });
     const organization = store.createOrganization({ name: 'One capacity', ownerUserId: 'owner' });
-    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveWorlds: 999 }).maxActiveWorlds).toBe(1);
+    expect(store.setOrganizationUsagePolicy(organization.id, { maxActiveWorlds: 999 }).maxActiveWorlds).toBe(5);
     expect(JSON.parse(store.kvGet(`organization-usage-policy:${organization.id}`) ?? '{}'))
       .not.toHaveProperty('maxActiveWorlds');
     store.setOrganizationPlan(organization.id, 'individual');
-    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(5);
-    store.setOrganizationPlan(organization.id, 'team');
     expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(10);
+    store.setOrganizationPlan(organization.id, 'team');
+    expect(store.getOrganizationUsagePolicy(organization.id).maxActiveWorlds).toBe(20);
   });
 
   it('blocks over-member organizations at the final model boundary before any provider spend', () => {
@@ -251,7 +259,7 @@ describe('hosted agent-run admission integration', () => {
 
     await reconciler.reconcileOrganization(organization.id);
 
-    expect(signals).toContainEqual({ name: 'setAgentCapacity', value: { capacity: 1 } });
+    expect(signals).toContainEqual({ name: 'setAgentCapacity', value: { capacity: 5 } });
     expect(signals).toContainEqual({ name: 'releaseAgentSlot',
       value: { taskId: stale.id, turnId: staleTurn } });
     expect(signals).not.toContainEqual(expect.objectContaining({ name: 'cancelAgentSlot' }));
@@ -325,11 +333,11 @@ describe('hosted agent-run admission integration', () => {
     await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 0 }));
     signal.mockClear();
     store.removeOrganizationMembership(organization.id, 'third');
-    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 1 }));
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 5 }));
 
     signal.mockClear();
     store.setOrganizationPlan(organization.id, 'team');
-    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 10 }));
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledWith('setAgentCapacity', { capacity: 20 }));
     expect(getHandle).toHaveBeenLastCalledWith(`agent-queue:${organization.id}`);
     await reconciler.stop();
   });
@@ -373,7 +381,7 @@ describe('hosted agent-run admission integration', () => {
       projectId: project.id, title: 'Blocked', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Run' },
     });
     store.setOrganizationPlan(organization.id, 'free');
-    const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 1 }));
+    const executeUpdate = vi.fn(async () => ({ granted: true, position: 0, capacity: 5 }));
     const signalWithStart = vi.fn(async () => undefined);
     const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {
       workflow: { signalWithStart, getHandle: vi.fn(() => ({ executeUpdate, signal: vi.fn(async () => undefined) })) },
@@ -397,7 +405,7 @@ describe('hosted agent-run admission integration', () => {
     await expect(activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
     })).resolves.toMatchObject({
-      granted: true, capacity: 1, queueId: `agent-queue:${organization.id}`,
+      granted: true, capacity: 5, queueId: `agent-queue:${organization.id}`,
     });
     expect(executeUpdate).toHaveBeenCalledOnce();
   });
@@ -410,7 +418,7 @@ describe('hosted agent-run admission integration', () => {
     const task = store.createTask({
       projectId: project.id, title: 'Ship', workflow: 'software-dev', workflowVersion: '1.20.0', params: { prompt: 'Ship' },
     });
-    const executeUpdate = vi.fn(async () => ({ granted: false, position: 1, capacity: 5 }));
+    const executeUpdate = vi.fn(async () => ({ granted: false, position: 1, capacity: 10 }));
     const signal = vi.fn(async () => undefined);
     const getHandle = vi.fn(() => ({ executeUpdate, signal }));
     const signalWithStart = vi.fn(async () => undefined);
@@ -423,25 +431,25 @@ describe('hosted agent-run admission integration', () => {
     await expect(activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#0`, role: 'do', projectId: project.id,
     })).resolves.toMatchObject({
-      granted: false, capacity: 5,
-      detail: 'Waiting for Individual plan capacity (5 active agent runs)',
+      granted: false, capacity: 10,
+      detail: 'Waiting for Individual plan capacity (10 active agent runs)',
     });
     expect(signalWithStart).toHaveBeenLastCalledWith('agentQueue', expect.objectContaining({
       workflowId: `agent-queue:${organization.id}`,
-      args: [{ capacity: 5 }],
+      args: [{ capacity: 10 }],
       signal: 'setAgentCapacity',
-      signalArgs: [{ capacity: 5 }],
+      signalArgs: [{ capacity: 10 }],
     }));
 
     store.setOrganizationPlan(organization.id, 'team');
-    executeUpdate.mockResolvedValueOnce({ granted: true, position: 0, capacity: 10 });
+    executeUpdate.mockResolvedValueOnce({ granted: true, position: 0, capacity: 20 });
     await expect(activities.requestAgentSlot({
       taskId: task.id, turnId: `${task.id}#1`, role: 'confirm', projectId: project.id,
-    })).resolves.toMatchObject({ granted: true, capacity: 10 });
+    })).resolves.toMatchObject({ granted: true, capacity: 20 });
     expect(signalWithStart).toHaveBeenLastCalledWith('agentQueue', expect.objectContaining({
       workflowId: `agent-queue:${organization.id}`,
-      args: [{ capacity: 10 }],
-      signalArgs: [{ capacity: 10 }],
+      args: [{ capacity: 20 }],
+      signalArgs: [{ capacity: 20 }],
     }));
 
     await activities.releaseAgentSlot(task.id, `${task.id}#1`);
@@ -462,8 +470,8 @@ describe('hosted agent-run admission integration', () => {
     });
     const signal = vi.fn(async () => undefined);
     const executeUpdate = vi.fn()
-      .mockResolvedValueOnce({ granted: true, position: 0, capacity: 5 })
-      .mockResolvedValueOnce({ granted: false, position: 1, capacity: 5 });
+      .mockResolvedValueOnce({ granted: true, position: 0, capacity: 10 })
+      .mockResolvedValueOnce({ granted: false, position: 1, capacity: 10 });
     const getHandle = vi.fn(() => ({ executeUpdate, signal }));
     const activities = makeCoordinatorActivities({ store, taskQueue: 'test', client: {
       workflow: { signalWithStart: vi.fn(async () => undefined), getHandle },

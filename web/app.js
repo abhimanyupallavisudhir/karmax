@@ -14351,13 +14351,16 @@ async function hydrateOrganizationSubscription(organizationId) {
   const teamTotal = Number(team.monthlyBasePriceCents || 0)
     + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
       * Number(team.monthlyAdditionalActiveUserPriceCents || 0);
+  const teamConcurrency = Number(team.maxActiveAgentRuns || 0)
+    + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
+      * Number(team.additionalActiveUserAgentRuns || 0);
   const disclosures = S.launch?.checkoutDisclosures || {};
   const planCards = !hasSubscription ? `<div class="billing-commercial-terms">
       <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
       ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
     <div class="settings-grid" style="margin-top:14px">
       <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
-      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month. Unlimited projects · ${esc(team.maxActiveAgentRuns)} shared concurrent agent runs.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
+      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month and ${esc(teamConcurrency)} shared concurrent agent runs. Unlimited projects · ${esc(team.maxActiveAgentRuns)} base concurrency + ${esc(team.additionalActiveUserAgentRuns)} per additional active user.</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
       <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
   const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
     ? 'disabled title="Remove additional active users first"' : '');
@@ -15607,7 +15610,7 @@ function renderPricing() {
     const priceLine = plan.id === 'free' ? price : `${price}<small> / month</small>`;
     return `<article class="price-card" data-plan="${esc(plan.id)}"><div class="price-name">${esc(plan.name)}</div>
       <div class="price-value">${priceLine}</div><p>${esc(users)}</p><ul><li>Unlimited projects</li>
-      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ' shared across the organization' : ''}</li></ul>
+      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ` shared across the organization + ${esc(plan.additionalActiveUserAgentRuns)} per additional active user` : ''}</li></ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
   $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/login">Sign in</a></header>

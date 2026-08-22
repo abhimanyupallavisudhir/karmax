@@ -26,6 +26,14 @@ function ensureQuietRuntime() {
   runtimeInstalled = true;
 }
 
+/** Generic worker envelope, separate from per-organization agent admission.
+ * Hosted tenant queues and trusted usage admission are the concurrency
+ * authority, so hosted must not inherit the private machine's conservative 8. */
+export function activityTaskConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  return env.KARMAX_MAX_ACT ? Number(env.KARMAX_MAX_ACT)
+    : env.KARMAX_DEPLOYMENT === 'hosted' ? 1_000 : 8;
+}
+
 export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, opts: WorkerOpts = {}): Promise<WorkerHandle> {
   ensureQuietRuntime();
   const connection = await NativeConnection.connect({ address: conn.address, apiKey: conn.apiKey, tls: conn.tls });
@@ -47,7 +55,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     activities: buildActivities(deps),
     maxCachedWorkflows: num(process.env.KARMAX_MAX_CACHED_WORKFLOWS, 20),
     maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
-    maxConcurrentActivityTaskExecutions: num(process.env.KARMAX_MAX_ACT, 8),
+    maxConcurrentActivityTaskExecutions: activityTaskConcurrency(),
     // Agent activities heartbeat once a second so Temporal can deliver a pending
     // cancellation to their AbortSignal promptly. The SDK otherwise throttles
     // heartbeats for these 2-minute-timeout activities for up to 60 seconds,
