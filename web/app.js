@@ -5005,6 +5005,18 @@ function initialTaskFormSavedSignature(draft, seedText, signature) {
   return draft || !seedText ? signature : null;
 }
 
+// The expanded form is rendered in an overlay, but some of its editors replace
+// their focused DOM node after a change (priority/tags are one example). Focus
+// then briefly falls back to <body>, so a listener on #tf-page cannot see the
+// next keydown. Resolve the page shortcut independently of the event target;
+// secondary modals still get first ownership of their own keyboard interactions.
+function taskFormKeyAction(e, secondaryModalOpen) {
+  if (secondaryModalOpen) return null;
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) return 'submit';
+  if (e.key === 'Escape') return 'close';
+  return null;
+}
+
 // Resolving task defaults can invoke defaultBranch on the server (a git
 // subprocess), so begin it while the quick composer is merely visible. The map
 // holds only a one-shot request: opening the form consumes and removes it, which
@@ -5045,7 +5057,10 @@ function taskFormLoadingPage(project, draft) {
 // tell it has been superseded and bail — otherwise its timer fires against the new
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
+let activeTaskFormKeyController = null;
 async function openTaskForm(workflow, draft, seedText) {
+  activeTaskFormKeyController?.abort();
+  activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
   // The shell (topbar/rail) stays live behind the page, so the user can navigate
   // mid-edit. Pin the project NOW: every later write (auto-save flush, submit)
@@ -5170,8 +5185,15 @@ async function openTaskForm(workflow, draft, seedText) {
         </div>
       </footer>
     </div>`;
+  const formKeyController = new AbortController();
+  activeTaskFormKeyController = formKeyController;
+  const releaseFormKeys = () => {
+    formKeyController.abort();
+    if (activeTaskFormKeyController === formKeyController) activeTaskFormKeyController = null;
+    if (activeFormToken === formToken) activeFormToken = null;
+  };
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
-  let closeForm = () => (root.innerHTML = '');
+  let closeForm = () => { releaseFormKeys(); root.innerHTML = ''; };
   $('#tf-wf')?.addEventListener('change', async () => {
     const select = $('#tf-wf');
     const nextWorkflow = select.value;
@@ -5485,7 +5507,7 @@ async function openTaskForm(workflow, draft, seedText) {
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
-  closeForm = () => { clearTimeout(saveTimer); const st = formState(); root.innerHTML = ''; persistDraft(st); };
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); };
 
   let submitInFlight = false;
   const submit = async (draftMode, authorizationDecision, activeFeedback) => {
@@ -5585,6 +5607,7 @@ async function openTaskForm(workflow, draft, seedText) {
         }
       }
       succeeded = true;
+      releaseFormKeys();
       root.innerHTML = '';
       // Keep the toast in the button's vocabulary. Queuing an EXISTING draft used to
       // say "Task created" — nothing was created, the task already existed, so the
@@ -5623,6 +5646,7 @@ async function openTaskForm(workflow, draft, seedText) {
             projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true },
             authorization: st.authorization, audience: decision.audience, reason: decision.reason,
           }) });
+          releaseFormKeys();
           root.innerHTML = '';
           toast('Authorization request sent — the task will queue when approved');
           refreshTasks();
@@ -5649,14 +5673,32 @@ async function openTaskForm(workflow, draft, seedText) {
   };
   $('#tf-draft').addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));
-  // Keyboard on the expanded form (fires before the global handler, which would
-  // otherwise only blur the focused field on Escape). ⌘/Ctrl-Enter = Add task /
-  // Queue; Escape closes — and closeForm() flushes the draft on the way out, so
-  // dismissing with the keyboard saves just like clicking away does.
-  $('#tf-page').addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); submit(false); }
-    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeForm(); }
-  });
+  // Capture at the document boundary so this still works after an editor
+  // re-renders its focused control and focus falls back to <body>. A secondary
+  // modal (tag picker, vault picker, authorization prompt, …) owns its keys until
+  // it closes. The AbortController keeps this listener scoped to this form mount.
+  const taskFormKeydown = (e) => {
+    // Most pickers portal into #modal-root; security/vault decision dialogs are
+    // direct body children. Both sit above the task form and must receive Escape
+    // (and any modified Enter) without dismissing or submitting the form below.
+    const secondaryModalOpen = $('#modal-root').childElementCount > 0
+      || !!document.querySelector('body > .modal-overlay');
+    // The shell stays interactive above this page. Most shell actions close the
+    // form through #tf-close, but guard against any surface that directly
+    // replaces #overlay-root: a document listener must never submit a detached
+    // form instance.
+    if (activeFormToken !== formToken || !root.querySelector('#tf-page')) {
+      releaseFormKeys();
+      return;
+    }
+    const action = taskFormKeyAction(e, secondaryModalOpen);
+    if (!action) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (action === 'submit') submit(false);
+    else closeForm();
+  };
+  document.addEventListener('keydown', taskFormKeydown, { capture: true, signal: formKeyController.signal });
 }
 
 // ── task page ─────────────────────────────────────────────────────────────────

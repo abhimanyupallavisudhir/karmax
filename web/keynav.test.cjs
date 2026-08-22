@@ -43,6 +43,7 @@ eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='
 eval(extractFn('quickTaskSubmitMode'));
 eval(extractFn('quickTaskPayload'));
 eval(extractFn('initialTaskFormSavedSignature'));
+eval(extractFn('taskFormKeyAction'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -186,6 +187,26 @@ ok(initialTaskFormSavedSignature(undefined, '', 'empty-state') === 'empty-state'
   'opening an empty expanded form does not make it dirty');
 ok(initialTaskFormSavedSignature({ id: 'draft-1' }, 'ignored seed', 'stored-state') === 'stored-state',
   'opening an existing draft keeps its loaded state as the saved baseline');
+
+// Editors such as priority/tags replace their focused node after a change. The
+// expanded form shortcut must therefore be page-scoped, not depend on the
+// keydown bubbling through #tf-page from the formerly focused control.
+ok(taskFormKeyAction(ev('Enter', { ctrlKey: true }), false) === 'submit',
+  'Ctrl+Enter submits the expanded form regardless of which form control last had focus');
+ok(taskFormKeyAction(ev('Enter', { metaKey: true }), false) === 'submit',
+  'Cmd+Enter submits the expanded form regardless of focus');
+ok(taskFormKeyAction(ev('Escape'), false) === 'close',
+  'Escape closes the expanded form when no secondary modal is open');
+ok(taskFormKeyAction(ev('Enter', { ctrlKey: true }), true) === null && taskFormKeyAction(ev('Escape'), true) === null,
+  'secondary modals retain ownership of Ctrl+Enter and Escape');
+ok(openTaskFormSource.includes("document.addEventListener('keydown', taskFormKeydown, { capture: true, signal: formKeyController.signal })"),
+  'expanded-form shortcuts are captured at the document boundary when focus falls back to body');
+ok(openTaskFormSource.includes("document.querySelector('body > .modal-overlay')"),
+  'body-level decision dialogs retain keyboard ownership above the expanded form');
+ok(openTaskFormSource.includes('activeTaskFormKeyController?.abort()') && openTaskFormSource.includes('formKeyController.abort()'),
+  'the expanded-form document listener is removed when the form is replaced or dismissed');
+ok(openTaskFormSource.includes("activeFormToken !== formToken || !root.querySelector('#tf-page')"),
+  'a detached form cannot retain a live document-level submit shortcut');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
