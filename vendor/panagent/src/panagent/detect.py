@@ -21,6 +21,27 @@ FORMAT_ALIASES = {
     "md": "markdown",
 }
 
+# Claude Code transcripts are append-only logs. Current clients commonly put
+# metadata before the first user/assistant message (and add new metadata kinds
+# without changing the transcript container), so detection must inspect the
+# stream rather than assume the first record is a message.
+CLAUDE_TRANSCRIPT_TYPES = {
+    "agent-name",
+    "ai-title",
+    "assistant",
+    "attachment",
+    "custom-title",
+    "file-history-snapshot",
+    "last-prompt",
+    "mode",
+    "permission-mode",
+    "progress",
+    "queue-operation",
+    "summary",
+    "system",
+    "user",
+}
+
 
 def canonical_format(name: str) -> str:
     try:
@@ -61,18 +82,42 @@ def detect_text(text: str, path: Path | None = None) -> str:
             return "chatgpt-share"
         if "claude" in lowered or "anthropic" in lowered or "challenge-platform" in lowered:
             return "claude-share"
-    first = next((line for line in stripped.splitlines() if line.strip()), "")
-    try:
-        obj = json.loads(first)
-    except json.JSONDecodeError as exc:
-        suffix = f" ({path})" if path else ""
-        raise FormatError(f"could not detect input format{suffix}") from exc
-    if not isinstance(obj, dict):
-        raise FormatError("JSONL records must be objects")
-    if obj.get("type") == "session_meta" or "payload" in obj and obj.get("type") in {"response_item", "event_msg"}:
+    records: list[dict[str, Any]] = []
+    for index, line in enumerate(stripped.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.lstrip("\ufeff"))
+        except json.JSONDecodeError as exc:
+            suffix = f" ({path})" if path else ""
+            raise FormatError(f"invalid JSONL at line {index + 1}{suffix}: {exc.msg}") from exc
+        if not isinstance(obj, dict):
+            raise FormatError(f"JSONL line {index + 1} is not an object")
+        records.append(obj)
+
+    # session_meta is the canonical identity record in real Codex rollouts.
+    # Search all records so ordinalized or otherwise prefixed exports remain
+    # ingestible, while still requiring the provider-specific payload shape.
+    if any(
+        record.get("type") == "session_meta"
+        and isinstance(record.get("payload"), dict)
+        and bool(record["payload"].get("id") or record["payload"].get("session_id"))
+        for record in records
+    ):
         return "codex"
-    if obj.get("type") in {"user", "assistant", "system", "summary", "file-history-snapshot"} and (
-        "message" in obj or "sessionId" in obj
+
+    # A Claude Code project transcript record has a sessionId plus a typed
+    # message/metadata entry. ~/.claude/history.jsonl also has sessionId, but no
+    # record type, and intentionally must not be mistaken for a resumable chat.
+    if any(
+        isinstance(record.get("sessionId"), str)
+        and bool(record["sessionId"])
+        and isinstance(record.get("type"), str)
+        and (
+            record["type"] in CLAUDE_TRANSCRIPT_TYPES
+            or isinstance(record.get("message"), dict)
+        )
+        for record in records
     ):
         return "claude-code"
     raise FormatError("could not detect JSON or JSONL input format")

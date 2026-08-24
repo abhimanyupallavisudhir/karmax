@@ -14,6 +14,17 @@ import { LocalObjectStore } from '../src/store/objects.js';
 const SOURCE_SESSION = '11111111-1111-4111-8111-111111111111';
 const CLAUDE_JSONL = [
   {
+    type: 'file-history-snapshot', messageId: 'snapshot-before-first-message',
+    snapshot: { trackedFileBackups: {} },
+  },
+  {
+    type: 'attachment', sessionId: SOURCE_SESSION,
+    attachment: { type: 'hook_success', hookName: 'SessionStart:startup' },
+  },
+  {
+    type: 'ai-title', sessionId: SOURCE_SESSION, aiTitle: 'Importer design',
+  },
+  {
     parentUuid: null, isSidechain: false, userType: 'external', cwd: '/tmp/source',
     sessionId: SOURCE_SESSION, version: '2.1.0', gitBranch: 'main', type: 'user',
     message: { role: 'user', content: 'Design the importer.' },
@@ -70,8 +81,15 @@ describe('conversation import storage', () => {
   });
 
   it('recognizes Codex JSONL and pretty-printed Claude exports', () => {
-    expect(detectConversationImport(Buffer.from(CODEX_JSONL))).toBe('codex');
+    expect(detectConversationImport(Buffer.from(`\uFEFF${CODEX_JSONL}`))).toBe('codex');
     expect(detectConversationImport(Buffer.from(JSON.stringify({ chat_messages: [] }, null, 2)))).toBe('claude-export');
+  });
+
+  it('does not mistake Claude prompt history for a resumable transcript', () => {
+    const history = JSON.stringify({
+      display: 'Only a prompt', project: '/tmp/source', sessionId: SOURCE_SESSION, timestamp: 1,
+    });
+    expect(() => detectConversationImport(Buffer.from(history))).toThrow('not a recognized Codex or Claude conversation');
   });
 });
 

@@ -27,7 +27,7 @@ def jsonl_records(text: str) -> Iterable[tuple[int, dict[str, Any]]]:
         if not line.strip():
             continue
         try:
-            value = json.loads(line)
+            value = json.loads(line.lstrip("\ufeff"))
         except json.JSONDecodeError as exc:
             raise FormatError(f"invalid JSONL at line {index + 1}: {exc.msg}") from exc
         if not isinstance(value, dict):
@@ -60,6 +60,10 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
         session_id = record.get("sessionId")
         if isinstance(session_id, str) and session_id not in session_ids:
             session_ids.append(session_id)
+        if record_type in {"ai-title", "custom-title"}:
+            title = record.get("aiTitle") or record.get("customTitle") or record.get("title")
+            if isinstance(title, str) and title.strip():
+                conv["title"] = title.strip()
         if record_type not in {"user", "assistant", "system"} or not isinstance(record.get("message"), dict):
             if record_type in {"file-history-snapshot", "summary", "progress"}:
                 warning(
@@ -68,7 +72,17 @@ def read_claude_code(text: str, *, source_uri: str | None = None, **_: Any) -> d
                     f"Claude Code {record_type!r} state has no portable equivalent and was not represented.",
                     path=f"records[{index}]",
                 )
-            elif record_type not in {"queue-operation", None}:
+            elif record_type not in {
+                "agent-name",
+                "ai-title",
+                "attachment",
+                "custom-title",
+                "last-prompt",
+                "mode",
+                "permission-mode",
+                "queue-operation",
+                None,
+            }:
                 warning(
                     conv,
                     "claude_unknown_record",
