@@ -31,6 +31,8 @@ ok(src.includes("method: 'PUT'"), 'Paid launch saves configuration through the i
 ok(src.includes('No paid-launch environment variables are required'), 'Paid launch explains that environment variables are unnecessary');
 ok(src.includes('Real-world founder checklist'), 'Paid launch includes the founder checklist');
 ok(src.includes('SaaS subscription billing, separate from Stripe Connect'), 'Paid launch distinguishes subscriptions from agent cards');
+ok(src.includes('stripe.apiVersion'), 'Paid launch shows the supported Stripe API version');
+ok(src.includes('stripe.webhookEvents'), 'Paid launch shows the exact Stripe webhook events');
 
 for (const marker of ['appearance-card', 'resilience-card', 'outbound-email-card', 'phone-access-card'])
   ok(!organization.includes(`id="${marker}"`), `Organization omits #${marker}`);

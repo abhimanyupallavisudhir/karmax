@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Store } from '../src/store/db.js';
 import { FakeSubscriptionProvider, StripeSubscriptionProvider,
   PAST_DUE_GRACE_MS, SubscriptionBillingService } from '../src/billing/subscriptions.js';
+import { STRIPE_BILLING_API_VERSION } from '../src/billing/stripe-contract.js';
 import { Gateway } from '../src/gateway/server.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -284,6 +285,7 @@ describe('Stripe subscription provider', () => {
   it('uses configured price IDs and a distinct Billing credential namespace', async () => {
     const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
       expect((init?.headers as any).authorization).toBe('Bearer sk_test_billing');
+      expect((init?.headers as any)['stripe-version']).toBe(STRIPE_BILLING_API_VERSION);
       return new Response(JSON.stringify({ id: 'cs_1', url: 'https://checkout.stripe.test/cs_1' }),
         { status: 200, headers: { 'content-type': 'application/json' } });
     });
@@ -305,6 +307,33 @@ describe('Stripe subscription provider', () => {
       .update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
     expect(provider.verifyWebhook(raw, `t=${timestamp},v1=${digest}`).id).toBe('evt_signed');
     expect(() => provider.verifyWebhook(raw, `t=${timestamp},v1=bad`)).toThrow('invalid subscription webhook signature');
+  });
+
+  it('reconciles Dahlia item periods and invoice parent references', async () => {
+    const store = new Store(':memory:', { hosted: true });
+    const organization = store.createOrganization({ name: 'Dahlia', ownerUserId: 'owner' });
+    const billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
+    await billing.checkout(organization.id, 'team',
+      { success: 'https://krmax.test/success', cancel: 'https://krmax.test/cancel' }, 'checkout-dahlia');
+    billing.handleWebhook(event('evt_dahlia_subscription', 'customer.subscription.updated', {
+      id: 'sub_dahlia', customer: `cus_${organization.id}`, status: 'active', cancel_at_period_end: false,
+      items: { data: [
+        { id: 'si_base', price: { id: 'price_team_base' }, quantity: 1, current_period_end: 2_000 },
+        { id: 'si_seat', price: { id: 'price_team_seat' }, quantity: 2, current_period_end: 2_000 },
+      ] },
+    }, 100));
+    expect(billing.current(organization.id)).toMatchObject({
+      plan: 'team', status: 'active', seats: 3, currentPeriodEnd: 2_000_000,
+    });
+
+    // Dahlia invoices no longer expose invoice.subscription. Omit customer as
+    // well so this proves reconciliation follows the new parent reference.
+    billing.handleWebhook(event('evt_dahlia_failed', 'invoice.payment_failed', {
+      id: 'in_dahlia', parent: { type: 'subscription_details',
+        subscription_details: { subscription: 'sub_dahlia' } },
+    }, 110));
+    expect(billing.current(organization.id)).toMatchObject({ status: 'past_due', access: 'grace' });
+    store.close();
   });
 });
 

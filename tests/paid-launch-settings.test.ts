@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { StripeSubscriptionProvider } from '../src/billing/subscriptions.js';
+import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../src/billing/stripe-contract.js';
 import { POLICY_VERSION } from '../src/launch/legal.js';
 import { FOUNDER_TASKS, PAID_LAUNCH_SETTINGS_KEY, PaidLaunchSettingsService,
   SUBSCRIPTION_STRIPE_SECRET_HANDLE, SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE } from '../src/launch/settings.js';
@@ -41,7 +42,8 @@ describe('installation paid-launch settings', () => {
     expect(result).toMatchObject({ paidLaunch: true, ready: true, canEnable: true,
       founderReviewed: true, completedTasks: ['business-structure', 'stripe-account'],
       stripe: { configured: true, secretKeyConfigured: true, webhookSecretConfigured: true,
-        webhookUrl: 'https://krmax.test/api/subscriptions/webhook' } });
+        webhookUrl: 'https://krmax.test/api/subscriptions/webhook', apiVersion: STRIPE_BILLING_API_VERSION,
+        webhookEvents: STRIPE_BILLING_WEBHOOK_EVENTS } });
     expect(result.tasks).toHaveLength(FOUNDER_TASKS.length);
     expect(store.kvGet(PAID_LAUNCH_SETTINGS_KEY)).not.toContain('sk_live_billing');
     expect(store.kvGet(PAID_LAUNCH_SETTINGS_KEY)).not.toContain('whsec_billing');

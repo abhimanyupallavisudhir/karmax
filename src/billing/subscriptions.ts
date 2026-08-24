@@ -3,6 +3,7 @@ import type { Store } from '../store/db.js';
 import { HOSTED_PLANS, hostedMonthlyPriceCents, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
 import type { SubscriptionRuntimeConfig } from '../launch/settings.js';
+import { STRIPE_BILLING_API_VERSION } from './stripe-contract.js';
 
 export type PaidHostedPlanId = Exclude<HostedPlanId, 'free'>;
 const isPaidHostedPlanId = (value: unknown): value is PaidHostedPlanId =>
@@ -220,7 +221,7 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     for (const [name, value] of Object.entries(params)) body.set(name, String(value));
     const response = await this.fetcher(`https://api.stripe.com${path}`, { method: 'POST', body,
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/x-www-form-urlencoded',
-        'idempotency-key': idempotencyKey } });
+        'idempotency-key': idempotencyKey, 'stripe-version': STRIPE_BILLING_API_VERSION } });
     const payload = await response.json().catch(() => ({})) as any;
     if (!response.ok) throw new Error(payload?.error?.message || `Stripe Billing returned HTTP ${response.status}`);
     return payload;
@@ -379,7 +380,8 @@ export class SubscriptionBillingService {
     const object = event.data.object;
     const customerId = stringId(object.customer);
     const subscriptionId = event.type.startsWith('customer.subscription.') ? String(object.id)
-      : stringId(object.subscription);
+      : event.type.startsWith('invoice.') ? invoiceSubscriptionId(object)
+        : stringId(object.subscription);
     const account = customerId ? this.accountByCustomer(customerId) : subscriptionId ? this.accountBySubscription(subscriptionId) : undefined;
     if (!account) return; // Never adopt a tenant association from provider metadata.
     const eventAt = event.created * 1000;
@@ -399,7 +401,7 @@ export class SubscriptionBillingService {
         if (!shouldApplyBillingTransition(account, eventAt, rank, next)) return;
         const updated = this.patchAccount(account.organizationId, { subscriptionId, status: 'canceled',
           seats: HOSTED_PLANS[account.plan].includedActiveUsers,
-          items: {}, cancelAtPeriodEnd: false, currentPeriodEnd: epochMs(object.current_period_end),
+          items: {}, cancelAtPeriodEnd: false, currentPeriodEnd: subscriptionPeriodEnd(object),
           lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now(), pastDueAt: undefined });
         this.reconcileAccount(updated);
         return;
@@ -412,7 +414,7 @@ export class SubscriptionBillingService {
         { status, plan: mapped.plan, seats: mapped.seats, cancelAtPeriodEnd })) return;
       const updated = this.patchAccount(account.organizationId, { subscriptionId: String(object.id), ...mapped,
         status, cancelAtPeriodEnd,
-        currentPeriodEnd: epochMs(object.current_period_end), lastEventAt: eventAt, lastEventRank: rank,
+        currentPeriodEnd: subscriptionPeriodEnd(object), lastEventAt: eventAt, lastEventRank: rank,
         verifiedAt: Date.now(), pastDueAt: status === 'past_due' ? account.pastDueAt ?? Date.now() : undefined,
         lastError: undefined });
       this.reconcileAccount(updated);
@@ -591,6 +593,22 @@ function rowAccount(row: any): BillingAccount | undefined {
 }
 function stringId(value: any): string | undefined { return typeof value === 'string' ? value : value?.id ? String(value.id) : undefined; }
 function epochMs(value: any): number | undefined { const n = Number(value); return Number.isFinite(n) && n > 0 ? n * 1000 : undefined; }
+function invoiceSubscriptionId(invoice: any): string | undefined {
+  if (invoice?.parent?.type === 'subscription_details')
+    return stringId(invoice.parent.subscription_details?.subscription);
+  return stringId(invoice?.subscription);
+}
+function subscriptionPeriodEnd(subscription: any): number | undefined {
+  const legacy = epochMs(subscription?.current_period_end);
+  if (legacy) return legacy;
+  const itemEnds = (subscription?.items?.data ?? [])
+    .map((item: any) => epochMs(item?.current_period_end))
+    .filter((value: number | undefined): value is number => value !== undefined);
+  // cancel_at_period_end resolves at the earliest item period when Stripe is
+  // ever configured with mixed intervals. Krmax's current prices are aligned
+  // monthly, but using the same boundary keeps the stored access date safe.
+  return itemEnds.length ? Math.min(...itemEnds) : undefined;
+}
 function normalizeStatus(value: any): SubscriptionStatus {
   const status = String(value || 'incomplete') as SubscriptionStatus;
   return ['none', 'trialing', 'active', 'past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused', 'canceled'].includes(status)
