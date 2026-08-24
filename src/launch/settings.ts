@@ -1,4 +1,5 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
+import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../billing/stripe-contract.js';
 import type { Store } from '../store/db.js';
 import { POLICY_VERSION, assertPaidLaunchReady, launchConfig, policyDocument, publicLaunchInfo,
   type StoredLaunchConfig } from './legal.js';
@@ -49,7 +50,7 @@ export const FOUNDER_TASKS = [
     instructions: 'Allow payment-method updates, invoice viewing, and cancellation. Make the portal cancellation behavior match the Billing Policy and the in-app “cancel at period end” behavior.',
     href: 'https://dashboard.stripe.com/settings/billing/portal' },
   { id: 'stripe-webhook', group: 'Stripe Billing', title: 'Create the live webhook endpoint',
-    instructions: 'Add the webhook URL shown below in Stripe Workbench, subscribe to customer.subscription and invoice lifecycle events, then copy its whsec_ signing secret below.',
+    instructions: 'Add the webhook URL shown below in Stripe Workbench using the API version and exact snapshot events listed in the Stripe Billing section, then copy its whsec_ signing secret below.',
     href: 'https://dashboard.stripe.com/workbench/webhooks' },
   { id: 'legal-review', group: 'Legal & privacy', title: 'Have launch policies reviewed',
     instructions: 'Replace assumptions and placeholders in Terms, Acceptable Use, Privacy, Billing, Security, Data, DPA, and Subprocessors with advice for the entity, jurisdiction, customers, data flows, and refund position. The included drafts are not legal advice.' },
@@ -135,7 +136,9 @@ export class PaidLaunchSettingsService {
         teamSeatPriceId: stripe.teamSeatPriceId, individualProductId: stripe.individualProductId,
         teamProductId: stripe.teamProductId, secretKeyConfigured: Boolean(stripe.secretKey),
         webhookSecretConfigured: Boolean(stripe.webhookSecret), configured: billingMissing.length === 0,
-        webhookUrl: `${publicUrl.replace(/\/$/, '')}/api/subscriptions/webhook`, missing: billingMissing,
+        webhookUrl: `${publicUrl.replace(/\/$/, '')}/api/subscriptions/webhook`,
+        apiVersion: STRIPE_BILLING_API_VERSION, webhookEvents: STRIPE_BILLING_WEBHOOK_EVENTS,
+        missing: billingMissing,
       },
       completedTasks: (stored.completedTasks ?? []).filter((id) => taskIds.has(id)),
       tasks: FOUNDER_TASKS,
