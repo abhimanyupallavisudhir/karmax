@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { AttachmentStore, AttachmentError, sniffImageType } from '../src/store/attachments.js';
+import { AttachmentStore, AttachmentError, sanitizeAttachmentName, sniffImageType } from '../src/store/attachments.js';
 import {
   anthropicUserContent,
   openaiUserContent,
@@ -11,6 +11,8 @@ import {
   hasImages,
 } from '../src/agent/images.js';
 import { Message } from '../src/domain/types.js';
+import { fileAttachmentText, materializeFileAttachments, worldAttachmentRelative } from '../src/agent/files.js';
+import { MemoryWorldProvider } from '../src/world/memory.js';
 
 // A real 1x1 PNG (valid magic bytes + minimal chunks).
 const PNG = Buffer.from(
@@ -89,6 +91,21 @@ describe('AttachmentStore', () => {
     expect(sniffImageType(JPEG)).toBe('image/jpeg');
     expect(sniffImageType(Buffer.from('hello'))).toBeUndefined();
   });
+
+  it('stores arbitrary files content-addressed with a portable basename', () => {
+    const data = Buffer.from('%PDF-1.7\nexample');
+    const ref = store.putFile(data, '../reports\\quarterly?.pdf', 'application/pdf; charset=binary');
+    expect(ref.name).toBe('quarterly_.pdf');
+    expect(ref.mediaType).toBe('application/pdf');
+    expect(store.read(ref.id)?.buf.equals(data)).toBe(true);
+    expect(store.putFile(data, 'renamed.pdf').id).toBe(ref.id);
+    expect(fs.readdirSync(path.join(home, 'attachments'))).toEqual([`${ref.id}.file`]);
+  });
+
+  it('sanitizes empty, traversal, control, and shell-active file names', () => {
+    expect(sanitizeAttachmentName('../')).toBe('attachment');
+    expect(sanitizeAttachmentName('a\u0000b`$?.txt')).toBe('ab___.txt');
+  });
 });
 
 describe('image adapter helpers', () => {
@@ -145,5 +162,44 @@ describe('image adapter helpers', () => {
   it('materialize is a no-op with no images', () => {
     const { files } = materializeImageFiles([{ id: 'm', role: 'user', text: 'x', ts: 0 }]);
     expect(files).toEqual([]);
+  });
+});
+
+describe('ordinary file attachment materialization', () => {
+  it('copies durable bytes into the world and annotates only the delivered copy', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fileh-'));
+    process.env.KARMAX_HOME = home;
+    const data = Buffer.from('source,data\n1,2\n');
+    const ref = new AttachmentStore({ home }).putFile(data, 'source data.csv', 'text/csv');
+    const original: Message = { id: 'm', role: 'user', text: 'Summarize this.', ts: 0, files: [ref] };
+    const world = await new MemoryWorldProvider().create({ taskId: 'files', base: 'main' });
+
+    const delivered = await materializeFileAttachments(world, [original]);
+    const relative = worldAttachmentRelative(ref);
+    expect(await world.readFileBuffer(relative)).toEqual(data);
+    expect(delivered[0]?.text).toContain(`Summarize this.\n\nAttached files`);
+    expect(delivered[0]?.text).toContain(path.posix.join(world.handle.root, relative));
+    expect(original.text).toBe('Summarize this.');
+    expect(fileAttachmentText([ref], world.handle.root)).toContain('source data.csv');
+
+    // A later turn repairs a modified world copy at the same stable path rather
+    // than trusting mutable sandbox state or inventing a provider identity.
+    fs.chmodSync(path.join(world.handle.root, relative), 0o644);
+    fs.writeFileSync(path.join(world.handle.root, relative), 'modified by prior turn');
+    const again = await materializeFileAttachments(world, [original]);
+    expect(again[0]?.text).toBe(delivered[0]?.text);
+    expect(await world.readFileBuffer(relative)).toEqual(data);
+    await world.destroy();
+  });
+
+  it('fails loudly when a durable reference is dangling', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-file-missing-'));
+    process.env.KARMAX_HOME = home;
+    const world = await new MemoryWorldProvider().create({ taskId: 'missing-files', base: 'main' });
+    const message: Message = { id: 'm', role: 'user', text: '', ts: 0, files: [{
+      id: 'f'.repeat(64), name: 'gone.txt', mediaType: 'text/plain', bytes: 4,
+    }] };
+    await expect(materializeFileAttachments(world, [message])).rejects.toThrow('no longer available');
+    await world.destroy();
   });
 });

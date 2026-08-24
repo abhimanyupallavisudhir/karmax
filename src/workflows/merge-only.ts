@@ -157,8 +157,8 @@ async function mergeOnlyImpl(
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt || input.images?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}) }]
+  const msgs: Message[] = input.prompt || input.images?.length || input.files?.length
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
     : [];
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let target = input.target ?? input.project.defaultTarget ?? base;

@@ -22,7 +22,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -33,6 +33,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
+import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, sanitizeAttachmentName } from '../store/attachments.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
@@ -838,6 +839,45 @@ export class KarmaxApi {
     }
   }
 
+  /** Carry file handles across task-agent forks. A provider session remembers the
+   * old prompt text, including old world paths; copying the refs onto the new task
+   * lets every generation rematerialize them at its own current path. */
+  private inheritedResumeFiles(params: Record<string, unknown> | undefined): FileRef[] {
+    const files: FileRef[] = [];
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const resumeFrom = (value as Record<string, any>).resumeFrom;
+      if (!resumeFrom?.taskId) continue;
+      const source = this.deps.store.getTask(String(resumeFrom.taskId));
+      if (!source) continue;
+      files.push(...((source.params.files as FileRef[] | undefined) ?? []));
+      const view = source.lastView;
+      if (!view) continue;
+      const role = String(resumeFrom.role ?? key.slice('agent:'.length));
+      const messages = role === 'do'
+        ? view.messages
+        : view.transcripts?.find((transcript) => transcript.role === role)?.messages ?? [];
+      for (const message of messages) files.push(...(message.files ?? []));
+    }
+    return uniqueFileRefs(files);
+  }
+
+  private validatePromptFiles(projectId: string, files: FileRef[]): void {
+    if (files.length > MAX_FILES_PER_MESSAGE) throw new Error(`a prompt can attach at most ${MAX_FILES_PER_MESSAGE} files`);
+    const total = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
+    if (total > MAX_FILES_BYTES_PER_MESSAGE)
+      throw new Error(`attached files exceed the ${MAX_FILES_BYTES_PER_MESSAGE / 1024 / 1024} MiB prompt limit`);
+    for (const file of files) {
+      if (!file || !/^[a-f0-9]{64}$/.test(String(file.id)) || typeof file.name !== 'string'
+        || sanitizeAttachmentName(file.name) !== file.name || typeof file.mediaType !== 'string'
+        || !/^[a-z0-9][a-z0-9!#$&^_.+\-]*\/[a-z0-9][a-z0-9!#$&^_.+\-]*$/.test(file.mediaType)
+        || !Number.isInteger(file.bytes) || file.bytes <= 0 || file.bytes > MAX_FILE_BYTES)
+        throw new Error('invalid file attachment reference');
+      if (!this.deps.store.attachmentAllowed(file.id, projectId))
+        throw new Error(`file attachment is not available in this project: ${file.name}`);
+    }
+  }
+
   /** Validate configured repository selections without making repositories a
    * prerequisite. An empty effective list is the supported zero-repo form of a
    * workflow; hosted repository enrollment applies only when a repo was chosen. */
@@ -897,6 +937,8 @@ export class KarmaxApi {
       prompt?: string;
       /** Images attached to the initial prompt (references, never inline bytes). */
       images?: ImageRef[];
+      /** Files attached to the initial prompt (references, never inline bytes). */
+      files?: FileRef[];
       /** Wiki context to inline, as `[[proj:…]]`/`[[org:…]]` references (see TaskParams.wikiContext). */
       wikiContext?: string[];
       workflow?: string;
@@ -978,12 +1020,25 @@ export class KarmaxApi {
     // Image attachments ride alongside the prompt but aren't a manifest param, so
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
+    if (args.files?.length && taskOverrides.files === undefined) taskOverrides.files = args.files;
     // Wiki context (which pages to inline) isn't a manifest param either; a
     // top-level arg (MCP/API) is folded in like the form sends it via `params`.
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     this.authorizeResumeSources(token, taskOverrides);
+    const inheritedFiles = this.inheritedResumeFiles(taskOverrides);
+    // Resume authorization above grants conversation-read authority. Extend each
+    // inherited content hash into the destination project before validating it.
+    for (const file of inheritedFiles) this.deps.store.grantAttachment(file.id, args.projectId);
+    const promptFiles = uniqueFileRefs([
+      ...((taskOverrides.files as FileRef[] | undefined) ?? []),
+      ...inheritedFiles,
+    ]);
+    if (promptFiles.length) {
+      this.validatePromptFiles(args.projectId, promptFiles);
+      taskOverrides.files = promptFiles;
+    }
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     const selectedAvatars = this.validateTaskAvatars(caller, project, manifest, resolved);
     for (const { avatar } of selectedAvatars) {
@@ -1220,6 +1275,8 @@ export class KarmaxApi {
     if (args.profiles) input.profiles = args.profiles;
     const initialImages = taskOverrides.images as ImageRef[] | undefined;
     if (initialImages?.length) input.images = initialImages;
+    const initialFiles = taskOverrides.files as FileRef[] | undefined;
+    if (initialFiles?.length) input.files = initialFiles;
 
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
@@ -1462,7 +1519,7 @@ export class KarmaxApi {
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
-    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization,
+    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, files, _authorization,
       _discardProgress, _workflowRunId, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     if (caller) this.validateTaskAvatars(caller, project, manifest, resolved);
@@ -1500,6 +1557,7 @@ export class KarmaxApi {
     input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
+    if ((files as FileRef[] | undefined)?.length) input.files = files as FileRef[];
     if (_discardProgress === true) input.discardProgress = true;
     return { startType, input, version: manifest.version };
   }
@@ -1994,6 +2052,16 @@ export class KarmaxApi {
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
     this.authorizeResumeSources(token, params);
+    const inheritedFiles = this.inheritedResumeFiles(params);
+    for (const file of inheritedFiles) this.deps.store.grantAttachment(file.id, task.projectId);
+    const promptFiles = uniqueFileRefs([
+      ...((params.files as FileRef[] | undefined) ?? []),
+      ...inheritedFiles,
+    ]);
+    if (promptFiles.length) {
+      this.validatePromptFiles(task.projectId, promptFiles);
+      params.files = promptFiles;
+    }
     const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
       ...(archived !== undefined ? { archived } : {}),
@@ -3791,9 +3859,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<Message | undefined> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[]): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
+    if (files?.length && scopedTask) this.validatePromptFiles(scopedTask.projectId, files);
     const heldView = scopedTask?.lastView;
     if (signal === SIG.retry && scopedTask && heldView?.stage === 'escalated'
       && heldView.status === 'blocked') {
@@ -3883,7 +3952,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
       if (signal === SIG.followUp) {
         const now = Date.now();
-        const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}) };
+        const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) };
         const messages = terminal.messages.map((m) => ({ ...m }));
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
@@ -3949,6 +4018,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         text: text ?? '',
         ts: now,
         ...(images?.length ? { images } : {}),
+        ...(files?.length ? { files } : {}),
       };
       const nextView = this.withConversationMessage(heldView, holdRole, followUp);
       await this.stopTaskActivity(scopedTask, heldView, `Human supplied input for the ${stageName(heldOrigin)} hold`);
@@ -4042,6 +4112,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           text: text ?? '',
           ts: now,
           ...(images?.length ? { images } : {}),
+          ...(files?.length ? { files } : {}),
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
@@ -5003,6 +5074,16 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args, organizationId);
   }
+}
+
+function uniqueFileRefs(files: FileRef[]): FileRef[] {
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    const key = `${file?.id ?? ''}\0${file?.name ?? ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 const EXECUTION_POLICY_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;

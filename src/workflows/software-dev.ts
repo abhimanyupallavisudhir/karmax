@@ -607,8 +607,8 @@ async function softwareDevImpl(
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = recovery
     ? recovery.messages.map((m) => ({ ...m }))
-    : input.prompt || input.images?.length
-      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    : input.prompt || input.images?.length || input.files?.length
+      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';

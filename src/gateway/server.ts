@@ -9,7 +9,7 @@ import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js'
 import type { TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
-import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
+import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
@@ -231,7 +231,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   }
   if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search/fields') return 'task:read';
-  if (p === '/api/attachments') return 'task:create';
+  if (p === '/api/attachments' || p === '/api/files') return 'task:create';
   if (p === '/api/conversation-imports') return 'task:create';
   // Reading one back is a read of the task content it belongs to. The exact match
   // above does not cover `/api/attachments/:id`, which therefore fell through to the
@@ -1501,6 +1501,10 @@ export class Gateway {
       res.writeHead(200, {
         'content-type': got.mediaType,
         'cache-control': 'private, max-age=31536000, immutable',
+        ...(url.searchParams.get('name')
+          ? { 'content-disposition': `attachment; filename="attachment"; filename*=UTF-8''${encodeURIComponent(url.searchParams.get('name')!)}` }
+          : {}),
+        'x-content-type-options': 'nosniff',
       });
       return void res.end(got.buf);
     }
@@ -2571,6 +2575,25 @@ export class Gateway {
         } catch (e) {
           if (e instanceof AttachmentError) return this.json(res, 400, { error: e.message });
           throw e;
+        }
+      }
+
+      // Ordinary prompt files use the same durable, content-addressed store as
+      // images but are not sent to a model API. Agent turns materialize them into
+      // `.karmax-injection/attachments/` inside the task world.
+      if (p === '/api/files' && method === 'POST') {
+        if (!requestedScope.projectId) return this.json(res, 400, { error: 'projectId is required' });
+        try {
+          const data = await this.rawBody(req, MAX_FILE_BYTES);
+          let name = 'attachment';
+          try { name = decodeURIComponent(String(req.headers['x-file-name'] || name)); } catch { /* use default */ }
+          const ref = this.attachments.putFile(data, name, String(req.headers['content-type'] ?? ''));
+          store.grantAttachment(ref.id, requestedScope.projectId);
+          return this.json(res, 200, ref);
+        } catch (error) {
+          if (error instanceof AttachmentError)
+            return this.json(res, /too large/i.test(error.message) ? 413 : 400, { error: error.message });
+          throw error;
         }
       }
 
@@ -3862,7 +3885,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const escalateMatch = p.match(/^\/api\/tasks\/([^/]+)\/escalate$/);

@@ -987,6 +987,8 @@ export interface TaskParams {
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
+  /** Files made available in the task world (references, never inline bytes). */
+  files?: FileRef[];
   /**
    * Wiki pages inlined into this task's agent context, as `[[proj:…]]`/`[[org:…]]`
    * references (a page, a whole `[[proj:tag:<label>]]`, or a folder
@@ -1174,6 +1176,21 @@ export interface ImageRef {
   bytes: number;
 }
 
+/**
+ * A durable reference to an ordinary user upload. The bytes live in Karmax's
+ * content-addressed attachment store and are copied into each task world before
+ * an agent turn. Keeping the original name here makes the world path useful to
+ * humans while the hash keeps storage deduplicated and immutable.
+ */
+export interface FileRef {
+  /** Content hash (sha256, hex) — also the storage filename stem. */
+  id: string;
+  /** Sanitized basename supplied by the uploader. */
+  name: string;
+  mediaType: string;
+  bytes: number;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'agent' | 'system';
@@ -1181,6 +1198,8 @@ export interface Message {
   ts: number;
   /** User-attached images (references, never inline bytes). Absent ⇒ text-only. */
   images?: ImageRef[];
+  /** User-attached files materialized into the task world before delivery. */
+  files?: FileRef[];
   /**
    * The provider timeline item which already renders this agent reply. Agent
    * output is kept in `Message[]` so a resumed model receives its conversation,
@@ -1582,6 +1601,8 @@ export interface TaskInput {
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
+  /** Files attached to the initial prompt (references, never inline bytes). */
+  files?: FileRef[];
   base?: string;
   target?: string;
   /** Existing branch to merge (merge-only workflow). */

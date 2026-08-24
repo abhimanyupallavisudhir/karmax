@@ -24,7 +24,7 @@ global.markdownEnabled = () => false;
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
 global.hostLocal = () => true;
-global.ICON = { more: '<svg></svg>' };
+global.ICON = { more: '<svg></svg>', form: '<svg data-icon="file"></svg>' };
 global.taskRecord = () => ({ projectId: 'project-1' });
 global.projectById = () => ({ id: 'project-1', organizationId: 'org-1' });
 global.organizationById = () => ({ id: 'org-1' });
@@ -38,6 +38,8 @@ global.localStorage = {
   setItem: (key, value) => preferences.set(key, value),
 };
 global.S = {
+  projectId: 'project-1',
+  token: 'session-token',
   user: { id: 'user-1' },
   view: { taskId: 'task-1', worldPath: '/work/task-1' },
   taskEvents: [
@@ -52,7 +54,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'explanationModelLabel', 'explainMessageAffordance', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -60,7 +62,8 @@ const ok = (condition, message) => condition ? pass++ : (fail++, console.error('
 const transcript = {
   role: 'do',
   messages: [
-    { id: 'u1', role: 'user', text: 'Please run the tests', ts: 1710000000000 },
+    { id: 'u1', role: 'user', text: 'Please run the tests', ts: 1710000000000,
+      files: [{ id: 'a'.repeat(64), name: 'brief.pdf', mediaType: 'application/pdf', bytes: 2048 }] },
     { id: 'a1', role: 'agent', text: 'The workflow copy need not text-match', ts: 2,
       sourceActivity: { turnId: 'turn-1', id: 'reply', attempt: 1 } },
   ],
@@ -72,6 +75,7 @@ ok(entries.find((e) => e.activity?.id === 'cmd')?.activity.phase === 'completed'
 ok(entries[0].message?.role === 'user', 'the real user prompt stays first');
 const html = entries.map(renderConversationEntry).join('');
 ok(html.includes('You') && html.includes('Please run the tests'), 'user message is visibly attributed');
+ok(html.includes('brief.pdf') && html.includes('2 KB'), 'ordinary file attachments render with their name and size');
 ok(html.includes('npm test') && html.includes('completed'), 'agent action and its state are visible');
 ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
