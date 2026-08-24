@@ -265,6 +265,7 @@ a { color: var(--accent); text-decoration: none; }
   background: var(--surface); cursor: pointer;
 }
 .composer .btn.icon-only { width: 42px; padding-left: 0; padding-right: 0; justify-content: center; flex: none; }
+.composer .attach-composer { cursor: pointer; }
 .composer .btn.icon-only svg { display: block; }
 
 /* ── task row ───────────────────────────────────────────────── */
@@ -1676,7 +1677,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tabs { overflow-x:auto; scrollbar-width:none; }
   .tabs::-webkit-scrollbar { display:none; }
   .tab { flex:none; white-space:nowrap; }
-  .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(3, 42px); }
+  .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(4, 42px); }
   .composer input.title-in { grid-column:1 / -1; min-width:0; width:100%; }
   .composer select { min-width:0; width:100%; }
   .tp-head > * { padding: 0 16px; }
@@ -1876,6 +1877,14 @@ html[data-theme="dark"] .github-signin-btn:active,
 .prompt-field > textarea,
 .prompt-field > .wiki-ref-editor > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
 .prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
+.prompt-attach-row { display: flex; align-items: center; gap: 9px; padding: 0 12px 8px; color: var(--ink-3); font-size: 11px; }
+.attach-file-button {
+  display: inline-flex; align-items: center; width: max-content; cursor: pointer;
+  color: var(--accent); font-size: 12px; font-weight: 600;
+}
+.attach-file-button:hover { text-decoration: underline; text-underline-offset: 2px; }
+.attach-file-button:focus,
+.attach-file-button:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
 /* The prompt's clean bottom row: the "wiki context" field — no border, just a
    faint hairline separating it from the prompt text above. */
 .prompt-context-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 12px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
@@ -1924,11 +1933,33 @@ html[data-theme="dark"] .github-signin-btn:active,
   color: var(--ink-3); font-size: 11px; line-height: 1; cursor: pointer; padding: 0;
 }
 .img-chip-x:hover { color: var(--accent); border-color: var(--accent); }
+.file-chip {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 280px;
+  height: 34px; padding: 0 7px; border: 1px solid var(--line-strong);
+  border-radius: 7px; background: var(--surface-2); color: var(--ink-2); font-size: 12px;
+}
+.file-chip-icon { color: var(--accent); font-weight: 700; }
+.file-chip-icon svg { display: block; width: 14px; height: 14px; }
+.file-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-chip-size { flex: none; color: var(--ink-3); font-size: 10px; }
+.file-chip-x { flex: none; border: 0; padding: 2px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.file-chip-x:hover { color: var(--danger); }
 .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .msg-images img {
   max-width: 180px; max-height: 180px; object-fit: contain;
   border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2);
 }
+.msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.msg-file {
+  display: inline-flex; align-items: center; gap: 7px; min-width: 0; max-width: 320px;
+  padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
+  color: var(--ink-2); background: var(--surface-2); text-decoration: none;
+}
+.msg-file > span:nth-child(1) { color: var(--accent); font-weight: 700; }
+.msg-file > span:nth-child(1) svg { display: block; width: 14px; height: 14px; }
+.msg-file > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-file small { color: var(--ink-3); white-space: nowrap; }
+.msg-file:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ── task search & organization (views bar, query toolbar, tags) ───────────── */
 /* The task-list "organizer" panel: search box + saved views + query toolbar, grouped

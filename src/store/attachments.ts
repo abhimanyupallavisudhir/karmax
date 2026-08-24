@@ -2,14 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { paths } from '../config/paths.js';
-import { ImageRef } from '../domain/types.js';
+import { FileRef, ImageRef } from '../domain/types.js';
 
 /**
- * Content-addressed store for user-attached images (image prompts;
- * PLAN_IMAGE_PROMPTS.md). Bytes live on disk under `$KARMAX_HOME/attachments/`,
- * keyed by sha256 — the ONLY place in karmax that touches raw image bytes.
- * Everything downstream (domain types, Temporal signals/history) carries only
- * the lightweight {@link ImageRef} handle; the adapter re-hydrates bytes here.
+ * Content-addressed store for user prompt attachments. Bytes live on disk under
+ * `$KARMAX_HOME/attachments/`, keyed by sha256. Everything downstream (domain
+ * types, Temporal signals/history) carries only lightweight {@link ImageRef} or
+ * {@link FileRef} handles; the activity boundary re-hydrates bytes here.
  *
  * Storing out-of-band (not in Temporal input/signals) is deliberate: the initial
  * prompt is workflow input and follow-ups are signals, both of which persist in
@@ -30,6 +29,11 @@ export const ALLOWED_IMAGE_TYPES: Record<string, string> = {
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MiB
 /** Max images per message — providers reject long image lists. */
 export const MAX_IMAGES_PER_MESSAGE = 8;
+/** Ordinary files stay out of provider payloads, but still cross the gateway and
+ * remote-world boundary once. Keep each upload and each prompt deliberately bounded. */
+export const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25 MiB
+export const MAX_FILES_PER_MESSAGE = 8;
+export const MAX_FILES_BYTES_PER_MESSAGE = 50 * 1024 * 1024; // 50 MiB
 
 /** Sniff the media type from magic bytes; returns undefined if not a known image. */
 export function sniffImageType(buf: Buffer): string | undefined {
@@ -90,6 +94,19 @@ export class AttachmentStore {
     return this.put(buf, declaredType);
   }
 
+  /** Persist an arbitrary user file. Unlike images, its media type is only
+   * descriptive: agents inspect the bytes with their normal world tools. */
+  putFile(buf: Buffer, name: string, declaredType?: string): FileRef {
+    if (!buf.length) throw new AttachmentError('empty file');
+    if (buf.length > MAX_FILE_BYTES)
+      throw new AttachmentError(`file too large (${buf.length} > ${MAX_FILE_BYTES} bytes)`);
+    const safeName = sanitizeAttachmentName(name);
+    const id = crypto.createHash('sha256').update(buf).digest('hex');
+    const file = path.join(this.dir, `${id}.file`);
+    if (!fs.existsSync(file)) fs.writeFileSync(file, buf);
+    return { id, name: safeName, mediaType: normalizeMediaType(declaredType), bytes: buf.length };
+  }
+
   /** Resolve an id to its on-disk path, or undefined if absent. */
   resolve(id: string): { path: string; mediaType: string } | undefined {
     if (!/^[a-f0-9]{64}$/.test(id)) return undefined; // guard against path traversal
@@ -97,6 +114,8 @@ export class AttachmentStore {
       const p = this.pathFor(id, mediaType, ext);
       if (fs.existsSync(p)) return { path: p, mediaType };
     }
+    const file = path.join(this.dir, `${id}.file`);
+    if (fs.existsSync(file)) return { path: file, mediaType: 'application/octet-stream' };
     return undefined;
   }
 
@@ -128,3 +147,18 @@ export class AttachmentStore {
 }
 
 export class AttachmentError extends Error {}
+
+/** Reduce an uploaded path to a portable basename suitable for a task world. */
+export function sanitizeAttachmentName(value: string): string {
+  const basename = path.posix.basename(String(value || '').replace(/\\/g, '/')).trim();
+  const cleaned = basename.replace(/[\u0000-\u001f\u007f]/g, '').replace(/[^\p{L}\p{N} ._()\-+@]/gu, '_');
+  if (!cleaned || cleaned === '.' || cleaned === '..') return 'attachment';
+  return [...cleaned].slice(0, 180).join('');
+}
+
+function normalizeMediaType(value?: string): string {
+  const mediaType = String(value || '').split(';', 1)[0]!.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+\-]*\/[a-z0-9][a-z0-9!#$&^_.+\-]*$/.test(mediaType)
+    ? mediaType
+    : 'application/octet-stream';
+}

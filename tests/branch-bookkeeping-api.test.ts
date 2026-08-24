@@ -37,6 +37,24 @@ describe('task branch policy persistence', () => {
     store.close();
   });
 
+  it('carries durable file references through repeated agent forks', async () => {
+    const { store, project, token, api } = setup();
+    const file = { id: 'a'.repeat(64), name: 'requirements.pdf', mediaType: 'application/pdf', bytes: 2048 };
+    store.grantAttachment(file.id, project.id);
+    const source = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'source', files: [file] } });
+    store.kvSet(`session:${source.id}:do`, 'source-session');
+
+    const first = await api.forkTaskAgent(token, { taskId: source.id, message: 'continue once' });
+    store.kvSet(`session:${first.id}:do`, 'first-session');
+    const second = await api.forkTaskAgent(token, { taskId: first.id, message: 'continue twice' });
+
+    expect(first.params.files).toEqual([file]);
+    expect(second.params.files).toEqual([file]);
+    expect(store.attachmentAllowed(file.id, project.id)).toBe(true);
+    store.close();
+  });
+
   it('keeps an independent fork coherent when it is immediately retargeted before lock', async () => {
     const { store, project, token, api } = setup();
     const source = store.createTask({ projectId: project.id, title: 'Source', workflow: 'software-dev',

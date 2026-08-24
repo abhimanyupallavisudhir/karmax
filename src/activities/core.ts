@@ -64,6 +64,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
+import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -1889,7 +1890,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               try {
                 const handle = deps.client!.workflow.getHandle(args.taskId);
                 const out = (await handle.query('pendingMessages', args.role, fromIndex)) as Message[] | undefined;
-                return Array.isArray(out) ? out : [];
+                return Array.isArray(out) ? await materializeFileAttachments(world, out) : [];
               } catch {
                 return []; // query not registered / workflow gone / transient — no injection
               }
@@ -2067,10 +2068,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // only admission itself can truthfully report that the model is now running.
         await signalTurnState('running');
         publishLegacyAgentState('running');
+        // File bytes never enter Temporal history or a provider attachment API.
+        // Recreate their stable world paths immediately before every turn so a
+        // restored cloud sandbox or a repeatedly-forked session can still read them.
+        const turnMessages = await materializeFileAttachments(world, messages);
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
-          messages,
+          messages: turnMessages,
           session,
           deliveredMessages,
           fork,

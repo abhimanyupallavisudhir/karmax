@@ -22,7 +22,7 @@ export interface KarmaxPaths {
   vault: string; // credential broker storage
   temporal: string; // temporal dev-server db
   overlays: string; // user/project overlays (safe-mode resolution)
-  attachments: string; // content-addressed user image attachments (image prompts)
+  attachments: string; // content-addressed user prompt attachments (images + files)
   objects: string; // encrypted checkpoints and promoted artifacts
   backups: string; // operator-created, integrity-checked control-plane snapshots
 }

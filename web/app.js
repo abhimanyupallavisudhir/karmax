@@ -28,6 +28,7 @@ const ICON = {
   more: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
 const DEFAULT_EXPLANATION_SETTINGS = {
@@ -926,9 +927,8 @@ function renderField(f, own, inherited, withChips, alt) {
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'responder') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderResponderField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
-    // The prompt field (withChips) also carries the wiki-reference affordance, so its
-    // placeholder advertises both image paste and wiki tagging.
-    const placeholder = withChips ? 'Describe the task (paste an image to attach, type [[ to add context from the wiki)' : (f.placeholder || '');
+    // The prompt field also carries durable uploads and wiki context.
+    const placeholder = withChips ? 'Describe the task (drop files here, type [[ to add wiki context)' : (f.placeholder || '');
     const ta = `<textarea ${attrs} rows="4" placeholder="${esc(placeholder)}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
     // growing it as needed — rather than in a separate "Images" section.
@@ -936,7 +936,8 @@ function renderField(f, own, inherited, withChips, alt) {
       // The prompt box's clean bottom row: a borderless "wiki context" field,
       // seeded elsewhere with the default [[proj:tag:default]] / [[org:tag:default]] so
       // the user sees (and can backspace away) what's inlined by default.
-      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div>
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
+        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels ([[…:tag:…]]), or folders ([[…/*]]) inlined into this task's context. Type [[ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
@@ -1925,11 +1926,10 @@ async function api(path, opts = {}) {
   return body;
 }
 
-// ─── Image attachments (paste / drag-drop an image into a prompt field) ───────
-// Bytes are uploaded to the content-addressed store immediately, so the task /
-// follow-up payloads carry only the returned lightweight { id, mediaType, bytes }
-// reference. Thumbnails are served back via /api/attachments/:id?token=… (an
-// <img> can't send a Bearer header, so the session token rides in the query).
+// ─── Prompt attachments (paste, choose, or drag into a prompt field) ─────────
+// Bytes are uploaded to the content-addressed store immediately, so task and
+// follow-up payloads carry only lightweight references. Images are provider-
+// native and previewable; ordinary files are materialized into the task world.
 async function uploadImage(file) {
   const res = await feedbackFetch(`/api/attachments?projectId=${encodeURIComponent(S.projectId)}`, {
     method: 'POST',
@@ -1939,6 +1939,21 @@ async function uploadImage(file) {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
   return body; // ImageRef
+}
+
+async function uploadPromptFile(file) {
+  const res = await feedbackFetch(`/api/files?projectId=${encodeURIComponent(S.projectId)}`, {
+    method: 'POST',
+    headers: {
+      'content-type': file.type || 'application/octet-stream',
+      'x-file-name': encodeURIComponent(file.name || 'attachment'),
+      ...(S.token ? { authorization: `Bearer ${S.token}` } : {}),
+    },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
+  return body; // FileRef
 }
 
 async function uploadConversationFile(file) {
@@ -1956,40 +1971,68 @@ async function uploadConversationFile(file) {
   return body;
 }
 
-function attachmentUrl(id) {
-  return `/api/attachments/${encodeURIComponent(id)}?projectId=${encodeURIComponent(S.projectId)}&token=${encodeURIComponent(S.token || '')}`;
+function attachmentUrl(id, name) {
+  const query = new URLSearchParams({ projectId: S.projectId, token: S.token || '' });
+  if (name) query.set('name', name);
+  return `/api/attachments/${encodeURIComponent(id)}?${query}`;
 }
 
-function renderImageChips(container, store, onChange) {
+function formatAttachmentBytes(bytes) {
+  const n = Number(bytes || 0);
+  return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(n >= 10 * 1024 * 1024 ? 0 : 1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+function assertCanAttachFile(file, current) {
+  const maxFile = 25 * 1024 * 1024;
+  const maxPrompt = 50 * 1024 * 1024;
+  if (file.size > maxFile) throw new Error(`${file.name} is larger than the 25 MB file limit`);
+  if (current.length >= 8) throw new Error('A prompt can attach at most 8 files');
+  if (current.reduce((sum, ref) => sum + Number(ref.bytes || 0), 0) + file.size > maxPrompt)
+    throw new Error('Attached files would exceed the 50 MB prompt limit');
+}
+
+function renderAttachmentChips(container, images = [], files = [], onChange) {
   if (!container) return;
-  container.innerHTML = (store || [])
+  container.innerHTML = images
     .map(
       (ref, i) =>
         `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
     )
-    .join('');
-  container.style.display = (store || []).length ? 'flex' : 'none';
+    .join('') + files.map((ref, i) =>
+      `<span class="file-chip" title="${esc(ref.mediaType)} · ${formatAttachmentBytes(ref.bytes)}"><span class="file-chip-icon" aria-hidden="true">${ICON.form}</span><span class="file-chip-name">${esc(ref.name)}</span><span class="file-chip-size">${formatAttachmentBytes(ref.bytes)}</span><button class="file-chip-x" data-file-i="${i}" title="Remove ${esc(ref.name)}">✕</button></span>`,
+    ).join('');
+  container.style.display = images.length || files.length ? 'flex' : 'none';
   container.querySelectorAll('.img-chip-x').forEach((b) =>
     b.addEventListener('click', () => {
-      store.splice(Number(b.dataset.i), 1);
-      renderImageChips(container, store, onChange);
+      images.splice(Number(b.dataset.i), 1);
+      renderAttachmentChips(container, images, files, onChange);
+      if (onChange) onChange();
+    }),
+  );
+  container.querySelectorAll('.file-chip-x').forEach((b) =>
+    b.addEventListener('click', () => {
+      files.splice(Number(b.dataset.fileI), 1);
+      renderAttachmentChips(container, images, files, onChange);
       if (onChange) onChange();
     }),
   );
 }
 
-// Wire paste + drag-drop image capture onto a text input. `getStore` returns the
-// live ImageRef array; `onChange` re-renders the chips. Idempotent per element.
-function wireImagePaste(inputEl, getStore, onChange) {
+// Paste and drop accept both images and ordinary files. Images retain their
+// native preview/provider path; other uploads become files in the task world.
+function wirePromptAttachments(inputEl, getImages, getFiles, onChange) {
   if (!inputEl || inputEl._imgWired) return;
   inputEl._imgWired = true;
   const ingest = async (files) => {
-    const imgs = [...files].filter((f) => f && f.type && f.type.startsWith('image/'));
-    if (!imgs.length) return false;
-    for (const file of imgs) {
+    const selected = [...files].filter(Boolean);
+    if (!selected.length) return false;
+    for (const file of selected) {
       try {
-        const ref = await uploadImage(file);
-        getStore().push(ref);
+        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file));
+        else {
+          assertCanAttachFile(file, getFiles());
+          getFiles().push(await uploadPromptFile(file));
+        }
         onChange();
       } catch (e) {
         toast(e.message, true);
@@ -1999,19 +2042,43 @@ function wireImagePaste(inputEl, getStore, onChange) {
   };
   inputEl.addEventListener('paste', (e) => {
     const items = [...(e.clipboardData?.items || [])];
-    const files = items.filter((i) => i.kind === 'file' && i.type.startsWith('image/')).map((i) => i.getAsFile());
+    const files = items.filter((i) => i.kind === 'file').map((i) => i.getAsFile());
     if (!files.length) return; // let normal text paste through
     e.preventDefault();
     ingest(files);
   });
   inputEl.addEventListener('dragover', (e) => {
-    if ([...(e.dataTransfer?.items || [])].some((i) => i.type && i.type.startsWith('image/'))) e.preventDefault();
+    if ([...(e.dataTransfer?.items || [])].some((i) => i.kind === 'file')) e.preventDefault();
   });
   inputEl.addEventListener('drop', (e) => {
     const files = [...(e.dataTransfer?.files || [])];
-    if (files.some((f) => f.type && f.type.startsWith('image/'))) {
+    if (files.length) {
       e.preventDefault();
       ingest(files);
+    }
+  });
+}
+
+function wireAttachmentPicker(input, getImages, getFiles, onChange) {
+  if (!input || input._attachmentWired) return;
+  input._attachmentWired = true;
+  input.closest('label')?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    input.click();
+  });
+  input.addEventListener('change', async () => {
+    const selected = [...(input.files || [])];
+    input.value = '';
+    for (const file of selected) {
+      try {
+        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file));
+        else {
+          assertCanAttachFile(file, getFiles());
+          getFiles().push(await uploadPromptFile(file));
+        }
+        onChange();
+      } catch (error) { toast(error.message, true); }
     }
   });
 }
@@ -2022,6 +2089,13 @@ function renderMessageImages(images) {
   return `<div class="msg-images">${images
     .map((ref) => `<a href="${attachmentUrl(ref.id)}" target="_blank" rel="noopener"><img src="${attachmentUrl(ref.id)}" alt="attachment"/></a>`)
     .join('')}</div>`;
+}
+
+function renderMessageFiles(files) {
+  if (!files?.length) return '';
+  return `<div class="msg-files">${files.map((ref) =>
+    `<a class="msg-file" href="${attachmentUrl(ref.id, ref.name)}"><span aria-hidden="true">${ICON.form}</span><span>${esc(ref.name)}</span><small>${formatAttachmentBytes(ref.bytes)}</small></a>`,
+  ).join('')}</div>`;
 }
 
 // ── conversation rendering: markdown + math ──────────────────────────────────
@@ -3832,11 +3906,12 @@ function tasksView() {
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send · Ctrl+V to paste image · (n)" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
+      <label class="btn icon-only attach-composer" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
       <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
       <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
-    <div class="img-chips" id="new-task-chips" style="display:none"></div>
+    <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
@@ -4630,24 +4705,26 @@ function wireTasksView() {
     const input = $('#new-task');
     const title = input.value.trim();
     const images = S.newTaskImages || [];
-    if (!title && !images.length) return;
+    const files = S.newTaskFiles || [];
+    if (!title && !images.length && !files.length) return;
     const workflow = $('#new-wf').value;
     const composer = input.closest('.composer');
     if (composer?.classList.contains('busy')) return;
     const setBusy = (busy) => {
       composer?.classList.toggle('busy', busy);
       composer?.setAttribute('aria-busy', String(busy));
-      composer?.querySelectorAll('button,select').forEach((control) => { control.disabled = busy; });
+      composer?.querySelectorAll('button,select,input').forEach((control) => { control.disabled = busy; });
     };
     setBusy(true);
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify(quickTaskPayload(title, workflow, images, draft)),
+        body: JSON.stringify(quickTaskPayload(title, workflow, images, draft, files)),
       });
       input.value = '';
       S.newTaskImages = [];
-      renderImageChips($('#new-task-chips'), S.newTaskImages);
+      S.newTaskFiles = [];
+      renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
       toast(draft ? 'Draft saved' : 'Task created');
       await refreshTasks();
     } catch (e) {
@@ -4674,10 +4751,13 @@ function wireTasksView() {
     else if (mode === 'add') add(false);
     else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
   });
-  // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
+  // Paste, choose, or drag files into the quick-add box.
   if (!S.newTaskImages) S.newTaskImages = [];
-  wireImagePaste($('#new-task'), () => S.newTaskImages, () => renderImageChips($('#new-task-chips'), S.newTaskImages));
-  renderImageChips($('#new-task-chips'), S.newTaskImages);
+  if (!S.newTaskFiles) S.newTaskFiles = [];
+  const paintQuickAttachments = () => renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
+  wirePromptAttachments($('#new-task'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments);
+  wireAttachmentPicker($('#new-task-files'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments);
+  paintQuickAttachments();
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
@@ -4706,7 +4786,7 @@ function quickTaskSubmitMode(e) {
 
 // The quick composer has two submission modes (start now / save draft), but both
 // must use the exact same sparse quick-defaults payload.
-function quickTaskPayload(title, workflow, images, draft = false) {
+function quickTaskPayload(title, workflow, images, draft = false, files = []) {
   return {
     title: firstLine(title || 'Image task'),
     prompt: title,
@@ -4715,6 +4795,7 @@ function quickTaskPayload(title, workflow, images, draft = false) {
     quick: true,
     ...(draft ? { draft: true } : {}),
     ...(images.length ? { images } : {}),
+    ...(files.length ? { files } : {}),
   };
 }
 
@@ -5138,9 +5219,10 @@ async function openTaskForm(workflow, draft, seedText) {
             ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
             ${restFields.length ? `<div class="section-h">Parameters</div>${renderFields(restFields, values, inherited)}` : ''}
             ${promptField ? '' : `<div class="form-row" data-row="__images">
-              <div class="label-row"><label>Images</label></div>
-              <div class="img-chips" id="tf-chips" style="display:none"></div>
-              <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
+              <div class="label-row"><label>Attachments</label></div>
+              <div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
+              <label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label>
+              <span style="color:var(--ink-3);font-size:12px">Drop files into a text field above, or choose up to 8 files (25 MB each, 50 MB total).</span>
             </div>`}
             ${triggersSection(values, draft?.id)}
             ${repeatableToggleHtml(values)}
@@ -5274,16 +5356,17 @@ async function openTaskForm(workflow, draft, seedText) {
       if (event.target.closest?.('.confirmer-field')) paintEligibility();
     });
   }
-  // Image attachments for the full task form: pasting/dropping an image into any
-  // text field attaches it to the prompt. State is local to this form instance.
+  // Prompt attachments are form-local handles; their bytes are already durable.
   const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
-  // Repaint chips and (unless first paint) auto-save — pasting an image fires no
+  const formFiles = Array.isArray(draft?.params?.files) ? [...draft.params.files] : [];
+  // Repaint chips and (unless first paint) auto-save — attaching a file fires no
   // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
   // `autoSaveSoon` is a hoisted declaration further down this same scope.
-  const paintFormChips = (save) => { renderImageChips($('#tf-chips'), formImages, () => autoSaveSoon()); if (save) autoSaveSoon(); };
+  const paintFormChips = (save) => { renderAttachmentChips($('#tf-chips'), formImages, formFiles, () => autoSaveSoon()); if (save) autoSaveSoon(); };
   $('#tf-body')
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
-    .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
+    .forEach((el) => wirePromptAttachments(el, () => formImages, () => formFiles, () => paintFormChips(true)));
+  wireAttachmentPicker($('#tf-files'), () => formImages, () => formFiles, () => paintFormChips(true));
   // Typing "[[" in the prompt references wiki pages/labels/folders in the task context.
   const promptTa = $('#tf-body')?.querySelector('textarea[data-field="prompt"]');
   if (promptTa) wireWikiMention(promptTa, projectId);
@@ -5364,11 +5447,12 @@ async function openTaskForm(workflow, draft, seedText) {
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
   const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
-  // Prompt image attachments ride inside `params` (references only), so they flow
+  // Prompt attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
   const formState = () => {
     const body = collectForm($('#tf-body'), fields);
     if (formImages.length) body.images = [...formImages];
+    if (formFiles.length) body.files = [...formFiles];
     // Triggers + repeatable are generic (workflow-agnostic) params, not part of the
     // manifest schema, so they're collected separately and merged onto params —
     // this way they ride through auto-save, draft, and queue like the prompt does.
@@ -5399,6 +5483,7 @@ async function openTaskForm(workflow, draft, seedText) {
     return notes.trim() !== '' ||
       hasPolicy() ||
       formImages.length > 0 ||
+      formFiles.length > 0 ||
       Object.values(rest).some((v) =>
         Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
   };
@@ -7466,8 +7551,9 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type [[ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
-          <div class="img-chips followup-chips" style="display:none"></div>
+          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
+          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
       </div></div>`
@@ -7817,7 +7903,7 @@ function renderConversationEntry(entry, v = S.view) {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
     const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
@@ -8886,6 +8972,7 @@ function wireActions(v) {
 // agent role it addresses, so a follow-up is delivered to the right agent.
 function wireFollowups(v) {
   if (!S.followupImages) S.followupImages = {};
+  if (!S.followupFiles) S.followupFiles = {};
   $('#main').querySelectorAll('.followup-box').forEach((box) => {
     const role = box.dataset.role;
     const ta = box.querySelector('.followup-input');
@@ -8895,25 +8982,28 @@ function wireFollowups(v) {
     // follow-up survives the page's frequent WS-driven re-renders and switching
     // between check-in panes (which destroys the textarea's DOM).
     const key = `${v.taskId}/${role}`;
-    const store = (S.followupImages[key] ||= []);
+    const images = (S.followupImages[key] ||= []);
+    const files = (S.followupFiles[key] ||= []);
     ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
     const chips = box.querySelector('.followup-chips');
-    const paint = () => renderImageChips(chips, store);
-    wireImagePaste(ta, () => store, paint);
+    const paint = () => renderAttachmentChips(chips, images, files);
+    wirePromptAttachments(ta, () => images, () => files, paint);
+    wireAttachmentPicker(box.querySelector('.followup-files'), () => images, () => files, paint);
     // Wiki references in follow-ups use the same picker and backend scanner as
     // the task prompt.
     wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
     paint();
     const send = async () => {
       const text = ta.value.trim();
-      if (!text && !store.length) return;
+      if (!text && !images.length && !files.length) return;
       if (btn.disabled) return;
       btn.disabled = true;
       box.setAttribute('aria-busy', 'true');
       try {
         const result = await api(`/api/tasks/${v.taskId}/signal`, {
           method: 'POST',
-          body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
+          body: JSON.stringify({ signal: 'followUp', text, role,
+            ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }),
         });
         // Render immediately even if this browser's event WebSocket is reconnecting.
         // The durable WS copy is de-duplicated by conversationEntries once it lands.
@@ -8925,7 +9015,8 @@ function wireFollowups(v) {
         // content is sourced from S.followupDrafts on every render, so this — not
         // touching the DOM — is what actually empties it.
         delete S.followupDrafts[key];
-        store.length = 0;
+        images.length = 0;
+        files.length = 0;
         // The captured `ta`/`chips` may be detached if a background WS refresh
         // swapped the page during the await above, in which case clearing `ta`
         // would leave the *live* box untouched. Clear the current DOM textarea by

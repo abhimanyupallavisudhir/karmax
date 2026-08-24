@@ -65,6 +65,40 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect((await invalid.json() as any).error).toContain('Codex or Claude');
   });
 
+  it('uploads ordinary prompt files with project scope and durable task references', async () => {
+    const project = h.store.createProject('Prompt files');
+    const other = h.store.createProject('Other prompt files');
+    const data = Buffer.from('customer,value\nAda,42\n');
+    const uploaded = await fetch(`${base}/api/files?projectId=${project.id}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'text/csv; charset=utf-8',
+        'x-file-name': encodeURIComponent('../customer?.csv') },
+      body: data,
+    });
+    expect(uploaded.status).toBe(200);
+    const ref: any = await uploaded.json();
+    expect(ref).toMatchObject({ name: 'customer_.csv', mediaType: 'text/csv', bytes: data.length });
+
+    const download = await fetch(`${base}/api/attachments/${ref.id}?projectId=${project.id}&name=${encodeURIComponent(ref.name)}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(download.status).toBe(200);
+    expect(Buffer.from(await download.arrayBuffer())).toEqual(data);
+    expect(download.headers.get('content-disposition')).toContain("filename*=UTF-8''customer_.csv");
+    expect(download.headers.get('x-content-type-options')).toBe('nosniff');
+
+    const hidden = await fetch(`${base}/api/attachments/${ref.id}?projectId=${other.id}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(hidden.status).toBe(404);
+
+    const task = await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ title: 'Read CSV', prompt: 'Inspect it', files: [ref], draft: true }),
+    });
+    expect(task.status).toBe(200);
+    expect((await task.json() as any).params.files).toEqual([ref]);
+  });
+
   it('reports private-install entitlements without hosted restrictions', async () => {
     const organizationId = h.store.getProject(h.store.listProjects()[0]?.id ?? '')?.organizationId ?? 'org_personal';
     const currentMemberCount = h.store.listOrganizationMemberships(organizationId).length;
