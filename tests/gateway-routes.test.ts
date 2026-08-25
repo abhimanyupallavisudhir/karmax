@@ -101,6 +101,10 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/projects/p1/checkout')).toBe('repository:read');
   });
 
+  it('protects native conversation downloads as conversation reads', () => {
+    expect(cap('GET', '/api/tasks/t1/conversation.jsonl')).toBe('task:conversation:read');
+  });
+
   it('treats a person’s Git identity as authenticated self-service, not an organization credential grant', () => {
     expect(cap('GET', '/api/user/export')).toBe('none');
     expect(cap('GET', '/api/user/default-organization')).toBe('none');

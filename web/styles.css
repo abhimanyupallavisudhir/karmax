@@ -730,6 +730,19 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .ck-term .term-screen { flex: 1; height: auto; max-height: none; outline: none; }
 .ck-term .empty { margin: auto; }
 
+/* A native session handoff is a small bundle: identity, exact bytes, then the
+   command that consumes them. Keep each role together when a task has several
+   agent conversations so the wrong JSONL cannot be paired with a command. */
+.local-agent-forks { display: grid; gap: 10px; }
+.local-agent-fork { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.local-agent-fork-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.local-agent-fork-head > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.local-agent-fork .raw { margin: 0 0 8px; background: var(--surface); }
+@media (max-width: 560px) {
+  .local-agent-fork-head { align-items: stretch; flex-direction: column; }
+  .local-agent-fork-head .btn { text-align: center; }
+}
+
 .section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 18px 0 8px; }
 .section-h:first-child { margin-top: 0; }
 
