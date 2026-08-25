@@ -19,6 +19,7 @@ import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
+import { exportConversationWithPanagent } from '../agent/panagent.js';
 import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
@@ -304,6 +305,55 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (explicit) return explicit === 'none' ? undefined : explicit;
   // Uncataloged routes fail toward broad-read / admin-write rather than open.
   return method === 'GET' ? 'project:read' : 'settings:write';
+}
+
+type DownloadableProvider = 'claude' | 'codex';
+
+function downloadableProvider(value: unknown): DownloadableProvider | undefined {
+  return value === 'claude' || value === 'codex' ? value : undefined;
+}
+
+/** Stable UUID for a generated native history. Keeping it stable means repeated
+ * downloads produce the same install/fork command and overwrite the same local
+ * session file instead of littering the CLI history on every click. */
+function conversationExportSessionId(taskId: string, role: string, provider: DownloadableProvider): string {
+  const hex = crypto.createHash('sha256').update(`karmax-conversation/${taskId}/${role}/${provider}`).digest('hex').slice(0, 32).split('');
+  hex[12] = '4';
+  hex[16] = ['8', '9', 'a', 'b'][Number.parseInt(hex[16]!, 16) % 4]!;
+  const value = hex.join('');
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+function providerHomeFromSessionFile(provider: DownloadableProvider, filename: string): string | undefined {
+  const marker = `${path.sep}${provider === 'codex' ? 'sessions' : 'projects'}${path.sep}`;
+  const at = filename.indexOf(marker);
+  return at > 0 ? filename.slice(0, at) : undefined;
+}
+
+/** Resolve newer session metadata and metadata-poor historical tasks alike.
+ * Native files are searched only inside provider history roots by
+ * findProviderSession; a task's opaque session id can never become an arbitrary
+ * host filesystem read. */
+function storedConversationSession(store: Store, taskId: string, intentId: string | undefined, role: string,
+  providerHint?: unknown): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
+  const sessionTaskId = role === 'confirm' ? (intentId ?? taskId) : taskId;
+  const id = store.kvGet(`session:${sessionTaskId}:${role}`) || undefined;
+  let home: string | undefined;
+  let metadataProvider: DownloadableProvider | undefined;
+  try {
+    const meta = JSON.parse(store.kvGet(`sessionmeta:${sessionTaskId}:${role}`) ?? '{}');
+    home = meta.home ? String(meta.home) : undefined;
+    metadataProvider = downloadableProvider(meta.provider);
+  } catch { /* legacy metadata can be incomplete or malformed */ }
+  const hinted = downloadableProvider(providerHint);
+  if (!id) return { provider: hinted ?? metadataProvider, home };
+  const candidates = [...new Set([hinted, metadataProvider, 'codex', 'claude'])]
+    .filter((provider): provider is DownloadableProvider => provider === 'codex' || provider === 'claude');
+  for (const provider of candidates) {
+    const source = findProviderSession({ provider, session: id, srcHome: home });
+    if (source) return { id, provider, home: home ?? providerHomeFromSessionFile(provider, source), source };
+  }
+  return { id, provider: hinted ?? metadataProvider, home };
 }
 
 function requestHeaders(headers: Record<string, string | string[] | undefined>): Headers {
@@ -4489,22 +4539,23 @@ export class Gateway {
         // Keep the raw native file behind the same service-level authorization as
         // the ordinary conversation API. Native JSONL is what the provider CLI
         // can actually fork; a re-serialized UI transcript is not resumable.
-        await api.taskConversation(token, taskId, requestedRole);
-        const sessionTaskId = requestedRole === 'confirm' ? (task.intentId ?? taskId) : taskId;
-        const sessionId = store.kvGet(`session:${sessionTaskId}:${requestedRole}`);
-        let provider = '';
-        let home: string | undefined;
+        const conversation = await api.taskConversation(token, taskId, requestedRole);
+        const view = await api.getTaskView(token, taskId).catch(() => task.lastView);
+        const stored = storedConversationSession(store, taskId, task.intentId, requestedRole,
+          view?.agents?.[requestedRole]?.provider);
+        const provider = stored.provider;
+        if (!provider || (!stored.source && !conversation.messages.length))
+          return this.json(res, 404, { error: 'this agent does not have a downloadable conversation' });
+        const sessionId = stored.source && stored.id
+          ? stored.id
+          : conversationExportSessionId(taskId, requestedRole, provider);
         try {
-          const meta = JSON.parse(store.kvGet(`sessionmeta:${sessionTaskId}:${requestedRole}`) ?? '{}');
-          provider = String(meta.provider ?? '');
-          home = meta.home ? String(meta.home) : undefined;
-        } catch { /* malformed legacy metadata is simply not downloadable */ }
-        if (!sessionId || !['claude', 'codex'].includes(provider))
-          return this.json(res, 404, { error: 'this agent does not have a downloadable native conversation' });
-        const source = findProviderSession({ provider, session: sessionId, srcHome: home });
-        if (!source) return this.json(res, 404, { error: 'the native conversation file is no longer available' });
-        try {
-          const data = await fs.promises.readFile(source);
+          const data = stored.source
+            ? await fs.promises.readFile(stored.source)
+            : await exportConversationWithPanagent({
+                messages: conversation.messages, provider, sessionId, title: `${task.title} · ${requestedRole}`,
+                cwd: view?.worldPath,
+              });
           const filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
           res.writeHead(200, {
             'content-type': 'application/x-ndjson; charset=utf-8',
@@ -4512,11 +4563,14 @@ export class Gateway {
             'content-length': String(data.length),
             'cache-control': 'private, no-store',
             'x-content-type-options': 'nosniff',
+            'x-karmax-conversation-source': stored.source ? 'native' : 'generated',
             'x-karmax-cell': this.deps.cellId ?? 'local',
           });
           return void res.end(data);
-        } catch {
-          return this.json(res, 404, { error: 'the native conversation file is no longer available' });
+        } catch (error) {
+          return this.json(res, stored.source ? 404 : 502, { error: stored.source
+            ? 'the native conversation file is no longer available'
+            : `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
         }
       }
       const explanationMatch = p.match(/^\/api\/tasks\/([^/]+)\/explanations$/);
@@ -4617,12 +4671,15 @@ export class Gateway {
         // kept current after an accepted in-flight retune). Besides powering the
         // CLI fork command, the expanded task form uses this to prefill a newly
         // selected fork with the source agent's provider/model/effort.
-        const agents = (await api.getTaskView(token, id).catch(() => undefined))?.agents;
-        const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'] }> = {};
-        for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
+        const view = await api.getTaskView(token, id).catch(() => undefined);
+        const agents = view?.agents;
+        const transcriptRoles = (view?.transcripts ?? []).map((transcript) => transcript.role);
+        const roles = [...new Set(['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm', ...transcriptRoles])];
+        const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'];
+          exportId?: string; downloadable?: boolean; generated?: boolean }> = {};
+        for (const role of roles) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
-          if (!s) continue;
           let home: string | undefined;
           let provider: string | undefined;
           let model: string | undefined;
@@ -4638,12 +4695,23 @@ export class Gateway {
             } catch { /* ignore */ }
           }
           const spec = agents?.[role];
+          const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
+          const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
+          const transcript = role === 'do'
+            ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
+            : (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? []);
+          const generated = !stored.source && !!downloadableProvider(resolvedProvider) && transcript.length > 0;
+          const exportId = stored.source && stored.id
+            ? stored.id
+            : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
+          if (!s && !exportId) continue;
           out[role] = {
-            id: s,
-            ...(home ? { home } : {}),
-            ...(spec?.provider || provider ? { provider: spec?.provider ?? provider } : {}),
+            id: s ?? exportId!,
+            ...((stored.home ?? home) ? { home: stored.home ?? home } : {}),
+            ...(resolvedProvider ? { provider: resolvedProvider } : {}),
             ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
             ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
+            ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
           };
         }
         return this.json(res, 200, out);

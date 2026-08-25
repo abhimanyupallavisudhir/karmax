@@ -30,6 +30,8 @@ ok(task.includes("S.meta?.hosted"), 'task action is hosted-only');
 ok(!terminal.includes('id="local-checkout"'), 'terminal pane does not duplicate the task action');
 ok(taskModal.includes('Download conversation'), 'task handoff offers a native conversation download');
 ok(taskModal.includes('/conversation.jsonl?role='), 'download is scoped to the selected agent role');
+ok(!taskModal.includes('session?.home &&'), 'API-backed conversations are not hidden when they lack a config home');
+ok(taskModal.includes('session?.downloadable'), 'server-confirmed generated or retained histories are offered');
 ok(taskModal.includes('codex fork') && taskModal.includes('--fork-session'), 'hosted handoff includes Codex and Claude fork commands');
 ok(taskModal.includes('localConversationHandoff(v,'), 'hosted task checkout renders agent handoffs');
 ok(projectModal.includes('/checkout`'), 'project action loads a server-generated checkout plan');

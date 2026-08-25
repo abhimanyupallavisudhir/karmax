@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { importWithPanagent, publicConversationShare } from '../src/agent/panagent.js';
+import { exportConversationWithPanagent, importWithPanagent, publicConversationShare } from '../src/agent/panagent.js';
 import {
   ConversationImportError,
   conversationImportObjectKey,
@@ -94,6 +94,23 @@ describe('conversation import storage', () => {
 });
 
 describe('Krmax panagent bridge', () => {
+  it.each(['codex', 'claude'] as const)('exports a durable Karmax transcript as resumable %s JSONL', async (provider) => {
+    const sessionId = provider === 'codex'
+      ? '33333333-3333-4333-8333-333333333333'
+      : '44444444-4444-4444-8444-444444444444';
+    const data = await exportConversationWithPanagent({
+      provider, sessionId, title: 'Existing API conversation', cwd: '/tmp/exported',
+      messages: [
+        { id: 'user-1', role: 'user', text: 'Keep this context.', ts: Date.parse('2026-08-25T10:00:00Z') },
+        { id: 'agent-1', role: 'agent', text: 'Context preserved.', ts: Date.parse('2026-08-25T10:00:01Z') },
+      ],
+    });
+    expect(detectConversationImport(data)).toBe(provider === 'codex' ? 'codex' : 'claude-code');
+    const records = data.toString('utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(provider === 'codex' ? records[0].payload.id : records[0].sessionId).toBe(sessionId);
+    expect(data.toString('utf8')).toContain('Context preserved.');
+  });
+
   it('converts an uploaded Claude history into a fresh resumable Codex session', async () => {
     const home = temporary('karmax-panagent-codex-');
     try {

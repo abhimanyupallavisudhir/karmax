@@ -8042,7 +8042,7 @@ function wireCheckinSidebar(v) {
 }
 
 function nativeConversationFilename(session) {
-  return `${session.provider}-${session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return `${session.provider}-${session.exportId || session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
 
 // A downloaded native history becomes locally forkable once it is placed where
@@ -8051,20 +8051,21 @@ function nativeConversationFilename(session) {
 // developer's laptop.
 function portableForkCommandFor(session, cwd) {
   const filename = nativeConversationFilename(session);
+  const sessionId = session.exportId || session.id;
   const source = `$HOME/Downloads/${filename}`;
   if (session.provider === 'codex') return [
     'mkdir -p "$HOME/.codex/sessions/karmax"',
-    `cp "${source}" "$HOME/.codex/sessions/karmax/rollout-karmax-${session.id}.jsonl"`,
+    `cp "${source}" "$HOME/.codex/sessions/karmax/rollout-karmax-${sessionId}.jsonl"`,
     `cd ${JSON.stringify(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" codex fork ${JSON.stringify(session.id)}`,
+    `CODEX_HOME="$HOME/.codex" codex fork ${JSON.stringify(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `krmax_cwd="$(cd ${JSON.stringify(cwd)} && pwd -P)"`,
     `krmax_slug="$(printf '%s' "$krmax_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
     'mkdir -p "$HOME/.claude/projects/$krmax_slug"',
-    `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${session.id}.jsonl"`,
+    `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${sessionId}.jsonl"`,
     'cd "$krmax_cwd"',
-    `CLAUDE_CONFIG_DIR="$HOME/.claude" claude --resume ${JSON.stringify(session.id)} --fork-session`,
+    `CLAUDE_CONFIG_DIR="$HOME/.claude" claude --resume ${JSON.stringify(sessionId)} --fork-session`,
   ].join('\n');
   return '';
 }
@@ -8100,14 +8101,18 @@ async function downloadNativeConversation(button) {
 function localConversationHandoff(v, cwd, portable = false) {
   const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
   const sessions = Object.entries(S.sessions || {})
-    .filter(([, session]) => session?.id && session?.home && ['codex', 'claude'].includes(session.provider))
-    .map(([role, session]) => ({ role, session, command: portable
-      ? portableForkCommandFor(session, cwd)
-      : forkCommandFor(session, cwd) }))
+    .filter(([, session]) => session?.id && session?.downloadable && ['codex', 'claude'].includes(session.provider))
+    .map(([role, session]) => {
+      const installDownloaded = portable || !session.home || session.generated;
+      return { role, session, installDownloaded, command: installDownloaded
+        ? portableForkCommandFor(session, cwd)
+        : forkCommandFor({ ...session, id: session.exportId || session.id }, cwd) };
+    })
     .filter((item) => item.command);
   if (!sessions.length) return '';
+  const installsDownload = sessions.some((item) => item.installDownloaded);
   return `<div class="section-h" style="margin-top:18px">Fork an agent locally</div>
-    <p class="task-sub">Download the provider's native JSONL, then install and fork it without changing the cloud conversation.${portable ? ' Commands expect the browser download in <span class="mono">~/Downloads</span>; replace that path if you saved it elsewhere.' : ''}</p>
+    <p class="task-sub">Download a native JSONL, then fork it without changing the cloud conversation.${installsDownload ? ' Commands expect the browser download in <span class="mono">~/Downloads</span>; replace that path if you saved it elsewhere.' : ''}</p>
     <div class="local-agent-forks">${sessions.map(({ role, session, command }) => {
       const label = transcripts.get(role) || role;
       const href = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation.jsonl?role=${encodeURIComponent(role)}`;

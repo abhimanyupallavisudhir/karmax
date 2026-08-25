@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
+import { detectConversationImport } from '../src/store/conversation-imports.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -84,17 +85,56 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     fs.mkdirSync(sessionDir, { recursive: true });
     fs.writeFileSync(path.join(sessionDir, `rollout-2026-08-25T00-00-00-${sessionId}.jsonl`), nativeHistory);
     h.store.kvSet(`session:${task.id}:do`, sessionId);
-    h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ provider: 'codex', home: nativeHome }));
+    // Historical tasks may predate provider-in-sessionmeta. The gateway should
+    // infer it from the retained native file instead of hiding the handoff.
+    h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: nativeHome }));
     try {
+      const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
+      expect(sessions.do).toMatchObject({ id: sessionId, exportId: sessionId, provider: 'codex', downloadable: true });
       const response = await fetch(`${base}/api/tasks/${task.id}/conversation.jsonl?role=do`, { headers: auth() });
       expect(response.status).toBe(200);
       expect(response.headers.get('content-type')).toContain('application/x-ndjson');
       expect(response.headers.get('content-disposition')).toContain(`codex-${sessionId}.jsonl`);
       expect(response.headers.get('cache-control')).toBe('private, no-store');
+      expect(response.headers.get('x-karmax-conversation-source')).toBe('native');
       expect(Buffer.from(await response.arrayBuffer())).toEqual(nativeHistory);
     } finally {
       fs.rmSync(nativeHome, { recursive: true, force: true });
     }
+  });
+
+  it('generates forkable JSONL for a new API-backed conversation with no config home', async () => {
+    const project = h.store.createProject('Generated conversation export');
+    const task = h.store.createTask({
+      projectId: project.id, title: 'API-backed agent', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'Export the durable transcript', draft: true },
+    });
+    h.store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'done', actions: [],
+      agents: { do: { provider: 'codex' } },
+      messages: [
+        { id: 'u1', role: 'user', text: 'This came through the API rail.', ts: Date.parse('2026-08-25T11:00:00Z') },
+        { id: 'a1', role: 'agent', text: 'It is still portable.', ts: Date.parse('2026-08-25T11:00:01Z') },
+      ],
+      transcripts: [{ role: 'do', label: 'Agent', messages: [
+        { id: 'u1', role: 'user', text: 'This came through the API rail.', ts: Date.parse('2026-08-25T11:00:00Z') },
+        { id: 'a1', role: 'agent', text: 'It is still portable.', ts: Date.parse('2026-08-25T11:00:01Z') },
+      ] }],
+    } as any);
+
+    const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
+    expect(sessions.do).toMatchObject({ provider: 'codex', downloadable: true, generated: true });
+    expect(sessions.do.exportId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(sessions.do.home).toBeUndefined();
+
+    const response = await fetch(`${base}/api/tasks/${task.id}/conversation.jsonl?role=do`, { headers: auth() });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-karmax-conversation-source')).toBe('generated');
+    expect(response.headers.get('content-disposition')).toContain(`codex-${sessions.do.exportId}.jsonl`);
+    const data = Buffer.from(await response.arrayBuffer());
+    expect(detectConversationImport(data)).toBe('codex');
+    expect(data.toString('utf8')).toContain('It is still portable.');
+    expect(JSON.parse(data.toString('utf8').split('\n')[0]!).payload.id).toBe(sessions.do.exportId);
   });
 
   it('uploads ordinary prompt files with project scope and durable task references', async () => {
