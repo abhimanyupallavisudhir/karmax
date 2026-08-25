@@ -29,6 +29,61 @@ export type PanagentImportResult =
   | { kind: 'native'; sessionId: string }
   | { kind: 'context'; message: Message };
 
+/** Render Karmax's durable, provider-neutral transcript as a resumable native
+ * CLI history. API-backed conversations have no file to copy, so this is the
+ * portability fallback used by the Work locally download. */
+export async function exportConversationWithPanagent(opts: {
+  messages: Message[];
+  provider: 'claude' | 'codex';
+  sessionId: string;
+  title: string;
+  cwd?: string;
+}): Promise<Buffer> {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-export-'));
+  try {
+    const input = path.join(temporary, 'conversation.agent.json');
+    const output = path.join(temporary, `${opts.sessionId}.jsonl`);
+    const timestamps = opts.messages.map((message) => Number(message.ts)).filter((value) => value > 100_000_000_000);
+    const createdAt = timestamps.length ? new Date(Math.min(...timestamps)).toISOString() : new Date().toISOString();
+    const ir = {
+      schema: 'https://panagent.dev/schema/conversation/v1',
+      id: opts.sessionId,
+      title: opts.title,
+      created_at: createdAt,
+      updated_at: timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : createdAt,
+      source: {
+        format: 'karmax-transcript', provider: 'karmax', kind: 'durable-task-conversation',
+        conversation_id: opts.sessionId, acquired_at: new Date().toISOString(),
+      },
+      environment: { cwd: opts.cwd ?? '.' },
+      messages: opts.messages.map((message, index) => ({
+        id: message.id || `message-${index + 1}`,
+        role: message.role === 'agent' ? 'assistant' : message.role === 'system' ? 'system' : 'user',
+        ...(Number(message.ts) > 100_000_000_000 ? { created_at: new Date(Number(message.ts)).toISOString() } : {}),
+        content: [{ type: 'text', text: message.text ?? '' }],
+        provenance: { source_format: 'karmax-transcript', source_message_id: message.id || undefined,
+          source_record_index: index },
+        metadata: {},
+      })),
+      capabilities: {
+        source: ['visible_messages'], represented: ['ordered_messages', 'text', 'timestamps', 'provenance'],
+        unavailable: ['provider_continuation_state', 'hidden_reasoning', 'provider_tool_state'],
+      },
+      warnings: [{ code: 'karmax_transcript_export', severity: 'info',
+        message: 'Generated from Karmax durable messages because no native provider history was available.' }],
+    };
+    fs.writeFileSync(input, JSON.stringify(ir), { mode: 0o600 });
+    await runPanagent([
+      'convert', input, '--to', opts.provider === 'claude' ? 'claude-code' : 'codex',
+      '--mode', 'transcript', '--session-id', opts.sessionId, '--cwd', opts.cwd ?? '.',
+      '--browser', 'never', '--quiet', '-o', output,
+    ]);
+    return fs.readFileSync(output);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 export function publicConversationShare(value: string): string | undefined {
   let url: URL;
   try { url = new URL(value); } catch { return undefined; }
