@@ -18,6 +18,7 @@ import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
+import { findProviderSession } from '../agent/fork.js';
 import { defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
@@ -266,7 +267,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
-  if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
+  if (/\/(sessions|agents|conversation(?:\.jsonl)?)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
@@ -4478,6 +4479,46 @@ export class Gateway {
       if (agentsMatch && method === 'GET') return this.json(res, 200, await api.listTaskAgents(token, agentsMatch[1]!));
       const conversationMatch = p.match(/^\/api\/tasks\/([^/]+)\/conversation$/);
       if (conversationMatch && method === 'GET') return this.json(res, 200, await api.taskConversation(token, conversationMatch[1]!, url.searchParams.get('role') ?? 'do'));
+      const conversationDownloadMatch = p.match(/^\/api\/tasks\/([^/]+)\/conversation\.jsonl$/);
+      if (conversationDownloadMatch && method === 'GET') {
+        const taskId = conversationDownloadMatch[1]!;
+        const task = store.getTask(taskId);
+        if (!task) return this.json(res, 404, { error: 'task not found' });
+        const requestedRole = url.searchParams.get('role') ?? 'do';
+        if (!/^[a-z0-9_-]+$/i.test(requestedRole)) return this.json(res, 400, { error: 'invalid agent role' });
+        // Keep the raw native file behind the same service-level authorization as
+        // the ordinary conversation API. Native JSONL is what the provider CLI
+        // can actually fork; a re-serialized UI transcript is not resumable.
+        await api.taskConversation(token, taskId, requestedRole);
+        const sessionTaskId = requestedRole === 'confirm' ? (task.intentId ?? taskId) : taskId;
+        const sessionId = store.kvGet(`session:${sessionTaskId}:${requestedRole}`);
+        let provider = '';
+        let home: string | undefined;
+        try {
+          const meta = JSON.parse(store.kvGet(`sessionmeta:${sessionTaskId}:${requestedRole}`) ?? '{}');
+          provider = String(meta.provider ?? '');
+          home = meta.home ? String(meta.home) : undefined;
+        } catch { /* malformed legacy metadata is simply not downloadable */ }
+        if (!sessionId || !['claude', 'codex'].includes(provider))
+          return this.json(res, 404, { error: 'this agent does not have a downloadable native conversation' });
+        const source = findProviderSession({ provider, session: sessionId, srcHome: home });
+        if (!source) return this.json(res, 404, { error: 'the native conversation file is no longer available' });
+        try {
+          const data = await fs.promises.readFile(source);
+          const filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+          res.writeHead(200, {
+            'content-type': 'application/x-ndjson; charset=utf-8',
+            'content-disposition': `attachment; filename="${filename}"`,
+            'content-length': String(data.length),
+            'cache-control': 'private, no-store',
+            'x-content-type-options': 'nosniff',
+            'x-karmax-cell': this.deps.cellId ?? 'local',
+          });
+          return void res.end(data);
+        } catch {
+          return this.json(res, 404, { error: 'the native conversation file is no longer available' });
+        }
+      }
       const explanationMatch = p.match(/^\/api\/tasks\/([^/]+)\/explanations$/);
       if (explanationMatch) {
         const taskId = explanationMatch[1]!;

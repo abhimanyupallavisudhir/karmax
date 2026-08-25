@@ -8039,6 +8039,84 @@ function wireCheckinSidebar(v) {
   });
 }
 
+function nativeConversationFilename(session) {
+  return `${session.provider}-${session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+}
+
+// A downloaded native history becomes locally forkable once it is placed where
+// the provider CLI discovers sessions. Hosted handoffs use the ordinary default
+// CLI homes because the control-plane config-home path has no meaning on the
+// developer's laptop.
+function portableForkCommandFor(session, cwd) {
+  const filename = nativeConversationFilename(session);
+  const source = `$HOME/Downloads/${filename}`;
+  if (session.provider === 'codex') return [
+    'mkdir -p "$HOME/.codex/sessions/karmax"',
+    `cp "${source}" "$HOME/.codex/sessions/karmax/rollout-karmax-${session.id}.jsonl"`,
+    `cd ${JSON.stringify(cwd)}`,
+    `CODEX_HOME="$HOME/.codex" codex fork ${JSON.stringify(session.id)}`,
+  ].join('\n');
+  if (session.provider === 'claude') return [
+    `krmax_cwd="$(cd ${JSON.stringify(cwd)} && pwd -P)"`,
+    `krmax_slug="$(printf '%s' "$krmax_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
+    'mkdir -p "$HOME/.claude/projects/$krmax_slug"',
+    `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${session.id}.jsonl"`,
+    'cd "$krmax_cwd"',
+    `CLAUDE_CONFIG_DIR="$HOME/.claude" claude --resume ${JSON.stringify(session.id)} --fork-session`,
+  ].join('\n');
+  return '';
+}
+
+async function downloadNativeConversation(button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Downloading…';
+  try {
+    const response = await feedbackFetch(button.dataset.url, {
+      headers: S.token ? { authorization: `Bearer ${S.token}` } : {},
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `download failed (HTTP ${response.status})`);
+    }
+    const href = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.download = button.dataset.filename || 'conversation.jsonl';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 60_000);
+    button.textContent = '✓ Downloaded';
+    setTimeout(() => { if (button.isConnected) button.textContent = label; }, 1200);
+  } catch (error) {
+    button.textContent = label;
+    toast(error.message, true);
+  } finally { button.disabled = false; }
+}
+
+function localConversationHandoff(v, cwd, portable = false) {
+  const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
+  const sessions = Object.entries(S.sessions || {})
+    .filter(([, session]) => session?.id && session?.home && ['codex', 'claude'].includes(session.provider))
+    .map(([role, session]) => ({ role, session, command: portable
+      ? portableForkCommandFor(session, cwd)
+      : forkCommandFor(session, cwd) }))
+    .filter((item) => item.command);
+  if (!sessions.length) return '';
+  return `<div class="section-h" style="margin-top:18px">Fork an agent locally</div>
+    <p class="task-sub">Download the provider's native JSONL, then install and fork it without changing the cloud conversation.${portable ? ' Commands expect the browser download in <span class="mono">~/Downloads</span>; replace that path if you saved it elsewhere.' : ''}</p>
+    <div class="local-agent-forks">${sessions.map(({ role, session, command }) => {
+      const label = transcripts.get(role) || role;
+      const href = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation.jsonl?role=${encodeURIComponent(role)}`;
+      return `<div class="local-agent-fork">
+        <div class="local-agent-fork-head"><div><b>${esc(label)}</b><span class="chip">${esc(session.provider)}</span></div><button type="button" class="btn sm native-conversation-download" data-url="${esc(href)}" data-filename="${esc(nativeConversationFilename(session))}">Download conversation</button></div>
+        <pre class="raw">${esc(command)}</pre>
+        <button class="btn sm local-copy" data-value="${esc(command)}">Copy fork commands</button>
+      </div>`;
+    }).join('')}</div>`;
+}
+
 async function openLocalCheckout(v) {
   if (hostLocal()) return materializeLocalCheckout(v);
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
@@ -8061,6 +8139,7 @@ async function openLocalCheckout(v) {
     <p class="task-sub">The task branch is the handoff boundary. krmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
+    ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
     <p class="task-sub">krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
@@ -8070,6 +8149,8 @@ async function openLocalCheckout(v) {
   host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
     const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
   })));
+  host.querySelectorAll('.native-conversation-download').forEach((button) =>
+    button.addEventListener('click', () => downloadNativeConversation(button)));
   $('#local-refresh', host)?.addEventListener('click', async (event) => {
     const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
     try {
@@ -8108,7 +8189,7 @@ async function openProjectCheckout(project) {
   })));
 }
 
-async function materializeLocalCheckout(v, session) {
+async function materializeLocalCheckout(v) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
@@ -8121,13 +8202,12 @@ async function materializeLocalCheckout(v, session) {
     checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
   } catch (error) { host.remove(); toast(error.message, true); return null; }
   if (!host.isConnected) return null;
-  const fork = session ? forkCommandFor(session, checkout.cwd) : '';
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
     <p class="task-sub">krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
-    ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
+    ${localConversationHandoff(v, checkout.cwd)}
     <div class="section-h" style="margin-top:14px">Repositories</div>
     <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
   </div></div>`;
@@ -8136,6 +8216,8 @@ async function materializeLocalCheckout(v, session) {
   host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
     const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
   })));
+  host.querySelectorAll('.native-conversation-download').forEach((button) =>
+    button.addEventListener('click', () => downloadNativeConversation(button)));
   return checkout;
 }
 
@@ -8143,7 +8225,7 @@ async function forkCloudSessionLocally(v, button) {
   button.disabled = true;
   button.textContent = 'Materializing…';
   const session = { provider: button.dataset.provider, id: button.dataset.session, home: button.dataset.home };
-  const checkout = await materializeLocalCheckout(v, session);
+  const checkout = await materializeLocalCheckout(v);
   if (checkout) await copyToClipboard(forkCommandFor(session, checkout.cwd)).then(() => toast('Fork command copied'));
   button.disabled = false;
   button.textContent = '⑂ fork locally';

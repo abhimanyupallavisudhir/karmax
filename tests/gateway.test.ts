@@ -65,6 +65,38 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect((await invalid.json() as any).error).toContain('Codex or Claude');
   });
 
+  it('downloads the exact native provider conversation as JSONL', async () => {
+    const project = h.store.createProject('Native conversation export');
+    const task = h.store.createTask({
+      projectId: project.id, title: 'Export this agent', workflow: 'software-dev', workflowVersion: '1.0.0',
+      params: { prompt: 'Keep the native history', draft: true },
+    });
+    h.store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do', status: 'active',
+      messages: [{ id: 'm1', role: 'agent', text: 'Visible reply', ts: 1 }],
+      transcripts: [{ role: 'do', label: 'Agent', messages: [{ id: 'm1', role: 'agent', text: 'Visible reply', ts: 1 }] }],
+      actions: [],
+    } as any);
+    const sessionId = '22222222-2222-4222-8222-222222222222';
+    const nativeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-native-download-'));
+    const sessionDir = path.join(nativeHome, 'sessions', '2026', '08', '25');
+    const nativeHistory = Buffer.from('{"type":"session_meta","payload":{"id":"22222222-2222-4222-8222-222222222222"}}\n{"type":"response_item","payload":{"role":"assistant"}}\n');
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionDir, `rollout-2026-08-25T00-00-00-${sessionId}.jsonl`), nativeHistory);
+    h.store.kvSet(`session:${task.id}:do`, sessionId);
+    h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ provider: 'codex', home: nativeHome }));
+    try {
+      const response = await fetch(`${base}/api/tasks/${task.id}/conversation.jsonl?role=do`, { headers: auth() });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('application/x-ndjson');
+      expect(response.headers.get('content-disposition')).toContain(`codex-${sessionId}.jsonl`);
+      expect(response.headers.get('cache-control')).toBe('private, no-store');
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(nativeHistory);
+    } finally {
+      fs.rmSync(nativeHome, { recursive: true, force: true });
+    }
+  });
+
   it('uploads ordinary prompt files with project scope and durable task references', async () => {
     const project = h.store.createProject('Prompt files');
     const other = h.store.createProject('Other prompt files');
