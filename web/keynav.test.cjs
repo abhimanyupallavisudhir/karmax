@@ -51,8 +51,14 @@ const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: f
 
 // ── Quick-add guidance ──
 ok(
-  src.includes('placeholder="New Task · ↵ for full task form · Ctrl+↵ to send · Ctrl+V to paste image · (n)"'),
-  'quick-add placeholder explains its keyboard and paste shortcuts',
+  src.includes('placeholder="New Task · ↵ for full task form · Ctrl+↵ to send"'),
+  'quick-add placeholder explains only its primary submit shortcuts',
+);
+ok(!src.includes('Ctrl+V to paste image') && !src.includes(' · (n)"'), 'quick-add placeholder omits paste and bare-key hints');
+ok(
+  src.includes('class="quick-task-field"')
+    && src.includes('class="btn soft icon-only attach-composer quick-task-attach"'),
+  'quick-add attachment picker is a soft button inside the task field',
 );
 
 // The Activity feed is an internal debugging page. Its direct route remains

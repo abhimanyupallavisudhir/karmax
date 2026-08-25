@@ -255,17 +255,23 @@ a { color: var(--accent); text-decoration: none; }
 /* new-task composer */
 .composer { display: flex; gap: 8px; margin-bottom: 18px; }
 .composer.busy { opacity: .68; cursor: progress; }
-.composer input.title-in {
-  flex: 1; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r);
-  background: var(--surface); outline: none; box-shadow: var(--shadow);
+.quick-task-field {
+  display: flex; align-items: center; flex: 1; min-width: 0;
+  border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--surface); box-shadow: var(--shadow);
 }
-.composer input.title-in:focus { border-color: var(--accent); }
+.quick-task-field:focus-within { border-color: var(--accent); }
+.composer input.title-in {
+  flex: 1; min-width: 0; padding: 11px 14px; border: 0;
+  background: transparent; outline: none; box-shadow: none;
+}
 .composer select {
   padding: 0 12px; border: 1px solid var(--line); border-radius: var(--r);
   background: var(--surface); cursor: pointer;
 }
 .composer .btn.icon-only { width: 42px; padding-left: 0; padding-right: 0; justify-content: center; flex: none; }
 .composer .attach-composer { cursor: pointer; }
+.composer .quick-task-attach { width: 34px; height: 34px; margin-right: 4px; }
 .composer .btn.icon-only svg { display: block; }
 
 /* ── task row ───────────────────────────────────────────────── */
@@ -521,6 +527,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 }
 .btn:hover { border-color: var(--line-strong); background: var(--surface-2); }
 .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.soft { border-color: transparent; background: var(--surface-2); color: var(--ink-2); }
+.btn.soft:hover { border-color: transparent; background: var(--accent-weak); color: var(--accent); }
 .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 .btn.primary:hover { filter: brightness(1.07); }
 .btn.danger { color: var(--danger); border-color: var(--danger-weak); }
@@ -1690,8 +1698,9 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tabs { overflow-x:auto; scrollbar-width:none; }
   .tabs::-webkit-scrollbar { display:none; }
   .tab { flex:none; white-space:nowrap; }
-  .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(4, 42px); }
-  .composer input.title-in { grid-column:1 / -1; min-width:0; width:100%; }
+  .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(3, 42px); }
+  .quick-task-field { grid-column:1 / -1; width:100%; }
+  .composer input.title-in { min-width:0; width:100%; }
   .composer select { min-width:0; width:100%; }
   .tp-head > * { padding: 0 16px; }
   .tp-tabs { padding: 0 2px; }
