@@ -8,6 +8,7 @@ import {
   parseCodexRateLimits,
   labelToEpoch,
   probeClaudeUsage,
+  refreshClaudeAccessToken,
   probeCodexUsage,
   ensureCodexLoginFresh,
   refreshCodexLogin,
@@ -270,6 +271,36 @@ describe('probeClaudeUsage', () => {
       const r = await probeClaudeUsage({ configHome: home, now: NOW, run: async () => { throw new Error('boom'); } });
       expect(r.ok).toBe(false);
       expect(!r.ok && r.reason).toContain('probe-failed');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes canonical Claude refreshes and returns the newly persisted access token', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'expired-access', refreshToken: 'single-use-refresh', expiresAt: NOW - 1,
+    } }));
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const run = async (canonicalHome: string) => {
+      calls++;
+      expect(canonicalHome).toBe(home);
+      await gate;
+      fs.writeFileSync(path.join(canonicalHome, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+        accessToken: 'fresh-access', refreshToken: 'rotated-refresh', expiresAt: Date.now() + 60_000,
+      } }));
+      return FULL_PANEL;
+    };
+    try {
+      const first = refreshClaudeAccessToken({ configHome: home, run });
+      const second = refreshClaudeAccessToken({ configHome: home, run });
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      release();
+      await expect(Promise.all([first, second])).resolves.toEqual(['fresh-access', 'fresh-access']);
+      expect(calls).toBe(1);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }

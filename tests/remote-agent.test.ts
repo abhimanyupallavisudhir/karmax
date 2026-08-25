@@ -68,6 +68,37 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${remoteHome}/sessions/host-task.jsonl`)?.toString()).toBe('host-only conversation');
   });
 
+  it('keeps Claude refresh authority on the control plane across parallel worlds', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-auth-'));
+    const credential = {
+      claudeAiOauth: {
+        accessToken: 'shared-access', refreshToken: 'single-use-refresh',
+        expiresAt: Date.now() + 60_000, refreshTokenExpiresAt: Date.now() + 86_400_000,
+      },
+    };
+    fs.writeFileSync(path.join(localHome, '.credentials.json'), JSON.stringify(credential));
+    const first = fakeWorld();
+    const second = fakeWorld();
+
+    const [a, b] = await Promise.all([
+      seedRemoteAgentHome(first, 'claude', localHome),
+      seedRemoteAgentHome(second, 'claude', localHome),
+    ]);
+    for (const [world, home] of [[first, a], [second, b]] as const) {
+      const projected = JSON.parse(world.files.get(`${home.relative}/.credentials.json`)!.toString());
+      expect(projected.claudeAiOauth.accessToken).toBe('shared-access');
+      expect(projected.claudeAiOauth.refreshToken).toBeUndefined();
+      expect(projected.claudeAiOauth.refreshTokenExpiresAt).toBeUndefined();
+    }
+
+    // A stale task-local credential can never replace the canonical login later.
+    first.files.set(`${a.relative}/.credentials.json`, Buffer.from(JSON.stringify({
+      claudeAiOauth: { accessToken: 'task-local', refreshToken: 'task-local-refresh', expiresAt: Date.now() + 120_000 },
+    })));
+    await syncRemoteAgentHome(first, 'claude', a, localHome);
+    expect(fs.readFileSync(path.join(localHome, '.credentials.json'), 'utf8')).toBe(JSON.stringify(credential));
+  });
+
   it('passes only the remote home and explicit turn-scoped environment', () => {
     expect(remoteAgentEnv('claude', '/workspace/.karmax-injection/agent/claude', {
       PATH: '/host/bin', HOME: '/host/home', OPENAI_API_KEY: 'wrong-account',
