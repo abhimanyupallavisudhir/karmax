@@ -3,7 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { hasClaudeNativeCredential, scrubbedEnv } from '../autonomy/config-homes.js';
+import {
+  claudeAccessToken,
+  claudeAccessTokenExpiresAt,
+  hasClaudeNativeCredential,
+  scrubbedEnv,
+} from '../autonomy/config-homes.js';
 import { trackProcess } from '../util/processes.js';
 import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
@@ -69,6 +74,7 @@ export type UsageRunner = (configDir: string) => Promise<string>;
 /** Injectable Codex app-server request (tests); returns account/rateLimits/read. */
 export type CodexUsageRunner = () => Promise<unknown>;
 const codexRefreshes = new Map<string, { promise: Promise<unknown>; force: boolean }>();
+const claudeRefreshes = new Map<string, Promise<string>>();
 /** Leave enough lifetime for sandbox startup and the initial Responses stream.
  * Long turns remain protected by the bounded terminal-401 recovery in codex.ts. */
 export const CODEX_REMOTE_ID_TOKEN_SAFETY_MS = 10 * 60_000;
@@ -363,6 +369,32 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
     child.once('error', (e) => finish(e as Error));
     child.once('exit', () => finish());
   });
+}
+
+/** Refresh the ONE canonical Claude login and return its current access token.
+ * Remote turns call this through the Agent SDK's host OAuth-refresh callback;
+ * their sandbox projections never receive the rotating refresh token. Concurrent
+ * callbacks share one provider process so a refresh-token family has one writer. */
+export async function refreshClaudeAccessToken(
+  opts: { configHome: string; timeoutMs?: number; run?: UsageRunner },
+): Promise<string> {
+  const key = path.resolve(opts.configHome);
+  const existing = claudeRefreshes.get(key);
+  if (existing) return existing;
+  const created = (async () => {
+    if (opts.run) await opts.run(key);
+    else await runUsageCli(key, opts.timeoutMs ?? 30_000);
+    const token = claudeAccessToken(key);
+    if (!token) throw new Error('Claude OAuth refresh completed without a fresh access token');
+    const expiresAt = claudeAccessTokenExpiresAt(key);
+    if (expiresAt !== undefined && expiresAt <= Date.now())
+      throw new Error('Claude OAuth refresh left the canonical access token expired');
+    return token;
+  })().finally(() => {
+    if (claudeRefreshes.get(key) === created) claudeRefreshes.delete(key);
+  });
+  claudeRefreshes.set(key, created);
+  return created;
 }
 
 /** Refresh the ONE canonical Codex login and return current limits. Concurrent

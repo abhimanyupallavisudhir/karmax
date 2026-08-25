@@ -363,6 +363,21 @@ export function claudeAccessToken(home: string): string | undefined {
   return undefined;
 }
 
+/** Recorded expiry of Claude's native OAuth access token, when present. Kept
+ * separate from claudeAccessToken() so callers never need the refresh-bearing
+ * credential object just to validate an access-token refresh. */
+export function claudeAccessTokenExpiresAt(home: string): number | undefined {
+  for (const rel of ['.credentials.json', '.claude/.credentials.json']) {
+    try {
+      const value = Number(JSON.parse(fs.readFileSync(path.join(home, rel), 'utf8'))?.claudeAiOauth?.expiresAt);
+      if (Number.isFinite(value) && value > 0) return value;
+    } catch {
+      /* try the other native credential location */
+    }
+  }
+  return undefined;
+}
+
 /** Claude leaves a structurally valid but empty `.credentials.json` behind after
  * logout. File existence alone therefore makes a logged-out account look connected
  * and prevents Connect from launching OAuth again. A refresh token remains useful

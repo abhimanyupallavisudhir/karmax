@@ -39,9 +39,9 @@ export interface RemoteAgentHome {
 
 /** Seed the leased subscription credentials/config into this task's persistent
  * sandbox. Provider session/cache directories are deliberately left sandbox-
- * local. Codex OAuth remains control-plane-owned: every turn replaces the
- * sandbox projection and withholds its rotating refresh token, so parallel
- * task worlds cannot fork and revoke one shared login's token family. */
+ * local. OAuth remains control-plane-owned: every turn replaces the sandbox
+ * projection and withholds rotating refresh tokens, so parallel task worlds
+ * cannot fork and revoke one shared login's token family. */
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
   session?: string): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
@@ -54,9 +54,9 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   for (const file of configFiles(localHome, provider, session)) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
-    const codexAuth = isCodexAuth(provider, file.relative);
-    const content = codexAuth ? codexRemoteAuthProjection(file.content) : file.content;
-    if (!existing.has(target) || codexAuth) {
+    const controlledAuth = isControlPlaneAuth(provider, file.relative);
+    const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
+    if (!existing.has(target) || controlledAuth) {
       await world.writeFileBuffer(target, content);
     } else if (authFreshness(provider, file.relative, file.content) !== undefined) {
       const remote = await world.readFileBuffer(target);
@@ -106,10 +106,10 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
       ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
       : relative.startsWith('projects/') && relative.endsWith('.jsonl');
     if (!auth.has(relative) && !session) continue;
-    // A remote Codex process receives a projection with an inert refresh marker.
-    // It is intentionally never refresh authority and must never overwrite the one
-    // canonical auth.json shared by every task using this login.
-    if (isCodexAuth(provider, relative)) continue;
+    // Remote provider processes receive refresh-token-free projections. They are
+    // intentionally never refresh authority and must never overwrite the one
+    // canonical credential shared by every task using this login.
+    if (isControlPlaneAuth(provider, relative)) continue;
     const destination = path.join(localHome, ...relative.split('/'));
     const data = await world.readFileBuffer(remoteFile);
     // A task cleanup can race a human re-login on the control plane. Do not let
@@ -130,23 +130,37 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
   }
 }
 
-function isCodexAuth(provider: Provider, relative: string): boolean {
-  return provider === 'codex' && relative.split(path.sep).join('/') === 'auth.json';
+function isControlPlaneAuth(provider: Provider, relative: string): boolean {
+  const normalized = relative.split(path.sep).join('/');
+  return provider === 'codex'
+    ? normalized === 'auth.json'
+    : provider === 'claude'
+      && (normalized === '.credentials.json' || normalized === '.claude/.credentials.json');
 }
 
-/** Replace the rotating refresh credential with an inert presence marker while
- * preserving the access/id tokens and account metadata Codex needs for a turn.
- * Removing the field entirely makes current app-server silently discard the
- * otherwise-valid access token and send Responses requests without a bearer. */
-function codexRemoteAuthProjection(content: Buffer): Buffer {
+/** Replace rotating refresh credentials with access-only sandbox projections.
+ * Codex needs an inert presence marker or current app-server silently discards
+ * its otherwise-valid access token. Claude's SDK has an explicit host refresh
+ * callback, so its refresh token is removed completely. */
+function remoteAuthProjection(provider: Provider, relative: string, content: Buffer): Buffer {
   try {
     const parsed = JSON.parse(content.toString('utf8'));
-    if (parsed?.tokens && typeof parsed.tokens === 'object') {
-      parsed.tokens.refresh_token = CODEX_REMOTE_REFRESH_SENTINEL;
-      delete parsed.tokens.refreshToken;
+    if (provider === 'codex' && isControlPlaneAuth(provider, relative)) {
+      if (parsed?.tokens && typeof parsed.tokens === 'object') {
+        parsed.tokens.refresh_token = CODEX_REMOTE_REFRESH_SENTINEL;
+        delete parsed.tokens.refreshToken;
+      }
+      delete parsed.refresh_token;
+      delete parsed.refreshToken;
+    } else if (provider === 'claude' && isControlPlaneAuth(provider, relative)) {
+      for (const oauth of [parsed?.claudeAiOauth, parsed?.oauthAccount]) {
+        if (!oauth || typeof oauth !== 'object') continue;
+        delete oauth.refreshToken;
+        delete oauth.refreshTokenExpiresAt;
+        delete oauth.refresh_token;
+        delete oauth.refresh_token_expires_at;
+      }
     }
-    delete parsed.refresh_token;
-    delete parsed.refreshToken;
     return Buffer.from(JSON.stringify(parsed));
   } catch {
     // Preserve legacy/unrecognized auth shapes rather than corrupting them. A
