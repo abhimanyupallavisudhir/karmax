@@ -484,6 +484,17 @@ export class ClaudeAdapter implements AgentAdapter {
         },
         strictMcpConfig: true,
         env,
+        // Remote worlds receive an access-only credential projection. If Claude
+        // needs to refresh it, the SDK relays this callback over its bidirectional
+        // control channel and Karmax rotates the ONE canonical host credential.
+        // This prevents parallel sandboxes from consuming the same single-use
+        // refresh token and revoking each other (takehomev2 tasks 24/25).
+        ...(remote && input.resolvedAuth?.configHome && hasClaudeNativeCredential(input.resolvedAuth.configHome)
+          ? { getOAuthToken: async () => {
+              const { refreshClaudeAccessToken } = await import('./usage.js');
+              return refreshClaudeAccessToken({ configHome: input.resolvedAuth!.configHome! });
+            } }
+          : {}),
         // Spawn the agent harness ourselves (same call the SDK makes internally:
         // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
         // subprocess pid is visible to karmax. That buys the two things the SDK's

@@ -113,7 +113,9 @@ describe('Claude Agent SDK terminal outcome contract', () => {
 
   it('selects the remote Claude spawn rail and keeps all platform tools available', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-'));
-    fs.writeFileSync(path.join(home, '.credentials.json'), '{"oauth":"subscription"}');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'subscription', refreshToken: 'host-only-refresh', expiresAt: Date.now() + 60_000 },
+    }));
     const files = new Map<string, Buffer>();
     const world: any = {
       handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'remote',
@@ -132,10 +134,12 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     try {
       await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx);
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
+      expect(sdkState.options.getOAuthToken).toBeTypeOf('function');
       expect(sdkState.options.mcpServers.karmax).toBeUndefined();
       expect(sdkState.options.mcpServers.karmax_control.tools.map((tool: any) => tool.name))
         .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource']));
       expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).toContain('subscription');
+      expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).not.toContain('host-only-refresh');
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
