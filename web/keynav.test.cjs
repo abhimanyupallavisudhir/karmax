@@ -40,6 +40,7 @@ eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
 eval(extractFn('adjacentCheckinPane'));
 eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
+eval(extractConst('QUICK_TASK_WORKFLOW').replace('const QUICK_TASK_WORKFLOW =', 'global.QUICK_TASK_WORKFLOW ='));
 eval(extractFn('quickTaskSubmitMode'));
 eval(extractFn('quickTaskPayload'));
 eval(extractFn('initialTaskFormSavedSignature'));
@@ -175,9 +176,10 @@ ok(quickTaskSubmitMode(ev('Enter', { metaKey: true })) === 'add', 'Cmd/Ctrl+Ente
 ok(quickTaskSubmitMode(ev('Enter', { ctrlKey: true })) === 'add', 'Ctrl+Enter starts the task');
 ok(quickTaskSubmitMode(ev('Enter', { altKey: true })) === 'draft', 'Alt+Enter saves a draft');
 ok(quickTaskSubmitMode(ev('x', { altKey: true })) === null, 'non-Enter keys do not submit the quick task');
-const sent = quickTaskPayload('run it', 'script-exec', [], false);
-const draft = quickTaskPayload('save it', 'software-dev', ['image-1'], true);
-ok(sent.quick === true && sent.command === 'run it' && sent.draft === undefined, 'quick send starts immediately');
+ok(!src.includes('id="new-wf"'), 'quick-add does not show a workflow selector');
+const sent = quickTaskPayload('run it', [], false);
+const draft = quickTaskPayload('save it', ['image-1'], true);
+ok(sent.quick === true && sent.workflow === 'software-dev' && sent.draft === undefined, 'quick send starts immediately with the software-dev workflow');
 ok(draft.quick === true && draft.draft === true && draft.images[0] === 'image-1', 'quick draft uses the same payload plus draft=true');
 
 // The text carried by Enter into the full form has never been persisted. Closing

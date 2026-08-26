@@ -3908,7 +3908,6 @@ function tasksView() {
         <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       </div>
-      <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
       <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
       <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
@@ -4709,7 +4708,6 @@ function wireTasksView() {
     const images = S.newTaskImages || [];
     const files = S.newTaskFiles || [];
     if (!title && !images.length && !files.length) return;
-    const workflow = $('#new-wf').value;
     const composer = input.closest('.composer');
     if (composer?.classList.contains('busy')) return;
     const setBusy = (busy) => {
@@ -4721,7 +4719,7 @@ function wireTasksView() {
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify(quickTaskPayload(title, workflow, images, draft, files)),
+        body: JSON.stringify(quickTaskPayload(title, images, draft, files)),
       });
       input.value = '';
       S.newTaskImages = [];
@@ -4751,7 +4749,7 @@ function wireTasksView() {
     e.stopPropagation();
     if (mode === 'draft') add(true);
     else if (mode === 'add') add(false);
-    else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
+    else openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim());
   });
   // Paste, choose, or drag files into the quick-add box.
   if (!S.newTaskImages) S.newTaskImages = [];
@@ -4761,21 +4759,17 @@ function wireTasksView() {
   wireAttachmentPicker($('#new-task-files'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments);
   paintQuickAttachments();
   // Opening the full form via "More" carries over whatever was typed in the
-  // quick-add box into the field that consumes it (Prompt, Command, …).
-  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
+  // quick-add box into the software-dev prompt.
+  $('#expand-task')?.addEventListener('click', () => openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim()));
   // Hide the defaultBranch/settings round-trip behind the time the user spends
-  // reading or typing in the quick composer. Changing the workflow starts the
-  // corresponding one-shot preload as well.
-  const quickWorkflow = $('#new-wf');
-  if (quickWorkflow) {
-    requestTaskFormDefaults(S.projectId, quickWorkflow.value);
-    quickWorkflow.addEventListener('change', () => requestTaskFormDefaults(S.projectId, quickWorkflow.value));
-  }
+  // reading or typing in the quick composer.
+  requestTaskFormDefaults(S.projectId, QUICK_TASK_WORKFLOW);
   // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
   applyCursor();
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+const QUICK_TASK_WORKFLOW = 'software-dev';
 
 // Keyboard modes for the quick composer. Keep this separate from the event
 // listener so the shortcut behavior stays easy to verify without a browser.
@@ -4788,12 +4782,11 @@ function quickTaskSubmitMode(e) {
 
 // The quick composer has two submission modes (start now / save draft), but both
 // must use the exact same sparse quick-defaults payload.
-function quickTaskPayload(title, workflow, images, draft = false, files = []) {
+function quickTaskPayload(title, images, draft = false, files = []) {
   return {
     title: firstLine(title || 'Image task'),
     prompt: title,
-    command: workflow === 'script-exec' ? title : undefined,
-    workflow,
+    workflow: QUICK_TASK_WORKFLOW,
     quick: true,
     ...(draft ? { draft: true } : {}),
     ...(images.length ? { images } : {}),
@@ -4803,7 +4796,8 @@ function quickTaskPayload(title, workflow, images, draft = false, files = []) {
 
 // The task-scope field that consumes the quick-add "Describe a task" text: the
 // workflow's prompt field, else its primary required text/string input (e.g.
-// script-exec's Command). Mirrors how add() maps that text to prompt/command.
+// script-exec's Command). This keeps the seed text intact if the workflow is
+// changed inside the expanded form.
 function consumingField(fields) {
   return (
     fields.find((f) => f.bind === 'prompt') ||
@@ -15114,7 +15108,7 @@ const HOST_COMMANDS = [
   { id: 'nav.globalSearch', title: 'Search everything', key: 'meta+shift+F', run: () => openGlobalSearch() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
-  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
+  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task')?.value.trim()); } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
