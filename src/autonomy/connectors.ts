@@ -700,6 +700,18 @@ export class GitPassConnector implements CredentialConnector {
     }
   }
 
+  /** A GitHub push may refresh this connector only when it names the exact
+   *  attached repository. Match canonical owner/name across SSH and HTTPS
+   *  transports instead of making the webhook depend on the URL spelling. */
+  matchesRepository(repository: Repository): boolean {
+    try {
+      return repository.provider === 'github'
+        && githubRepositorySlug(this.connection().repositoryUrl) === `${repository.owner}/${repository.name}`.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
   async list(): Promise<ExternalItem[]> {
     return this.inRepository(async (_connection, _checkout, store, _env) =>
       this.entries(store).map((entry) => this.metadata(store, entry)));
@@ -1002,6 +1014,31 @@ function isRemoteGitUrl(value: string): boolean {
     || /^(?:[^@\s]+@)?[^:\s/]+:[^\s]+$/.test(value);
 }
 
+function githubRepositorySlug(value: string): string | undefined {
+  const trimmed = value.trim().replace(/\/$/, '');
+  let pathname: string | undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.toLowerCase() !== 'github.com') return undefined;
+    pathname = parsed.pathname;
+  } catch {
+    const scp = trimmed.match(/^(?:[^@\s]+@)?github\.com:([^\s]+)$/i);
+    if (scp) pathname = `/${scp[1]}`;
+  }
+  const parts = pathname?.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '').split('/');
+  return parts?.length === 2 && parts.every(Boolean) ? `${parts[0]}/${parts[1]}`.toLowerCase() : undefined;
+}
+
+function gitPassRepositoryIdentity(secret: string | undefined): string | undefined {
+  if (!secret) return undefined;
+  try {
+    const repositoryUrl = String(JSON.parse(secret)?.repositoryUrl ?? '').trim().replace(/\/$/, '');
+    return (githubRepositorySlug(repositoryUrl) ?? repositoryUrl) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function redactedRepository(value: string): string {
   try {
     const url = new URL(value);
@@ -1062,10 +1099,29 @@ const floorMs = (value: number | undefined): number | undefined =>
 export interface ConnectorConfig {
   /** Opt-in write-back of agent-created items. */
   writeBack?: boolean;
+  /** Durable selective mirror subscription. `importNew` is the broader mode:
+   *  it always implies `enabled` and refreshes the complete external store. */
+  autoSync?: {
+    enabled: true;
+    importNew: boolean;
+    externalIds: string[];
+    /** Applied only when automatic discovery creates a new vault item. */
+    policy?: Partial<VaultItemPolicy>;
+  };
   /** Last successful sync (epoch ms) + how many of its items the vault now
    *  mirrors. The count is the running total, not this batch's share, so a
    *  big import split into batches still reports what the user has. */
   lastSync?: { at: number; count: number };
+  /** Operational visibility for webhook/backstop refreshes. */
+  lastAutoSync?: {
+    at: number;
+    reason: 'github-push' | 'backstop';
+    count: number;
+    skipped: number;
+    failures: number;
+    revision?: string;
+    error?: string;
+  };
 }
 
 /** The outcome of one `sync` batch. */
@@ -1083,6 +1139,7 @@ export interface ConnectorStore {
   kvGet(k: string): string | undefined;
   kvSet(k: string, v: string): void;
   findRepositoryBySshUrl?(organizationId: string, sshUrl: string): Repository | undefined;
+  listRepositories?(organizationId: string): Repository[];
 }
 
 export interface ConnectorGithubApp {
@@ -1093,7 +1150,10 @@ export interface ConnectorGithubApp {
  * Never substitutes a user/profile credential based on availability. */
 export async function attachedRepositoryCredential(store: ConnectorStore, githubApp: ConnectorGithubApp | undefined,
   organizationId: string, repositoryUrl: string): Promise<GitCredential | undefined> {
-  const repository = store.findRepositoryBySshUrl?.(organizationId, repositoryUrl);
+  const slug = githubRepositorySlug(repositoryUrl);
+  const repository = store.findRepositoryBySshUrl?.(organizationId, repositoryUrl)
+    ?? (slug ? store.listRepositories?.(organizationId).find((candidate) =>
+      candidate.provider === 'github' && `${candidate.owner}/${candidate.name}`.toLowerCase() === slug) : undefined);
   return repository && githubApp ? githubApp.brokerCredentials(repository) : undefined;
 }
 
@@ -1130,6 +1190,61 @@ export class Connectors {
     return next;
   }
 
+  /** Persist a selective refresh subscription. The server, not just the UI,
+   *  enforces that importing future entries means tracking the whole store. */
+  setAutoSync(name: string, input: { keepUpdated?: boolean; importNew?: boolean;
+    externalIds?: string[]; policy?: Partial<VaultItemPolicy> }): ConnectorConfig {
+    if (!this.get(name)) throw new Error(`no connector "${name}"`);
+    const importNew = input.importNew === true;
+    const enabled = importNew || input.keepUpdated === true;
+    if (!enabled) return this.setConfig(name, { autoSync: undefined });
+    const externalIds = [...new Set((input.externalIds ?? []).map(String).map((id) => id.trim()).filter(Boolean))];
+    if (externalIds.length > 100_000) throw new Error('automatic sync selection is too large');
+    if (input.policy?.use !== undefined && !['auto', 'ask'].includes(input.policy.use))
+      throw new Error('automatic sync blind-use policy must be auto or ask');
+    if (input.policy?.reveal !== undefined && !['auto', 'ask', 'never'].includes(input.policy.reveal))
+      throw new Error('automatic sync reveal policy must be auto, ask, or never');
+    return this.setConfig(name, {
+      autoSync: { enabled: true, importNew, externalIds, ...(input.policy ? { policy: input.policy } : {}) },
+    });
+  }
+
+  /** Refresh one durable subscription. `importNew` lists the store on every
+   *  run, so entries added since the last import join the selected mirror. */
+  async autoSync(name: string, reason: 'github-push' | 'backstop', revision?: string): Promise<SyncResult | undefined> {
+    const config = this.config(name);
+    const subscription = config.autoSync;
+    if (!subscription?.enabled) return undefined;
+    const connector = this.get(name);
+    if (!connector) return undefined;
+    try {
+      const externalIds = subscription.importNew
+        ? (await connector.list()).map((item) => item.externalId)
+        : subscription.externalIds;
+      const result = await this.sync(name, externalIds, { policy: subscription.policy });
+      // Remember newly discovered ids as well. This keeps the UI truthful if
+      // the operator later turns off import-new but leaves keep-updated on.
+      if (subscription.importNew) this.setAutoSync(name, { keepUpdated: true, importNew: true,
+        externalIds, policy: subscription.policy });
+      this.setConfig(name, { lastAutoSync: { at: Date.now(), reason, count: result.count,
+        skipped: result.skipped, failures: result.failures.length, ...(revision ? { revision } : {}),
+        ...(result.failures[0] ? { error: result.failures[0].error } : {}) } });
+      return result;
+    } catch (error) {
+      this.setConfig(name, { lastAutoSync: { at: Date.now(), reason, count: 0, skipped: 0, failures: 0,
+        ...(revision ? { revision } : {}), error: error instanceof Error ? error.message : String(error) } });
+      throw error;
+    }
+  }
+
+  /** Route a GitHub push to this organization's Git-backed pass connector only
+   *  when both its durable subscription and exact repository binding match. */
+  async autoSyncGitPush(repository: Repository, revision?: string): Promise<SyncResult | undefined> {
+    const connector = this.get('pass-git');
+    if (!(connector instanceof GitPassConnector) || !connector.matchesRepository(repository)) return undefined;
+    return this.autoSync('pass-git', 'github-push', revision);
+  }
+
   /** Validate a connector secret before keeping it. A failed replacement restores
    *  the previous working secret, so clicking Connect can never manufacture a
    *  false-positive connection or break an existing one. */
@@ -1145,10 +1260,15 @@ export class Connectors {
 
     const handle = connectorAuthHandle(this.organizationId, name);
     const previous = this.secretFor(name);
+    const replacedGitPassStore = name === 'pass-git' && previous !== undefined
+      && gitPassRepositoryIdentity(previous) !== gitPassRepositoryIdentity(value);
     this.broker.registerHandle(handle, value);
     try {
       const info = await connector.describe();
       if (!info.available) throw new Error(info.detail);
+      // A selection and write-back consent belong to one external store. Never
+      // carry them silently to a different repository during reconfiguration.
+      if (replacedGitPassStore) this.store.kvSet(kvConfig(this.organizationId, name), '{}');
       return info;
     } catch (error) {
       if (previous === undefined) this.broker.deleteHandle(handle);
@@ -1186,16 +1306,22 @@ export class Connectors {
     if (!connector) throw new Error(`no connector "${name}"`);
     if (opts.writeBack !== undefined) this.setConfig(name, { writeBack: opts.writeBack });
     const source = `connector:${name}`;
-    const mirrored = new Map(this.items.list()
+    const vaultItems = this.items.list();
+    const mirrored = new Map(vaultItems
       .filter((i) => i.provenance.source === source && i.provenance.externalId)
       .map((i) => [i.provenance.externalId!, i]));
+    // An agent-created item written back to this connector is already present
+    // in the vault. Import-new must not mirror its external entry back as a
+    // duplicate connector item when the resulting Git push wakes auto-sync.
+    const writtenBack = new Set(vaultItems.map((item) => item.provenance.externalIds?.[name])
+      .filter((id): id is string => !!id));
 
     // Only ask the store when something might be skippable (a first import has
     // nothing to compare against, and `list()` is itself a CLI round-trip).
-    let wanted = externalIds;
+    let wanted = externalIds.filter((id) => !writtenBack.has(id));
     if (mirrored.size) {
       const changedAt = new Map((await connector.list()).map((i) => [i.externalId, i.changedAt]));
-      wanted = externalIds.filter((id) => {
+      wanted = wanted.filter((id) => {
         // Whole milliseconds on BOTH sides. A source's change marker can be
         // finer-grained than the mirror clock it is compared against — a file
         // mtime carries sub-millisecond precision while `Date.now()` does not —

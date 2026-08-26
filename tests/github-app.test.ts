@@ -163,7 +163,7 @@ describe('GitHub App integration', () => {
       ], default_permissions: { emails: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
-    expect(manifest.manifest.default_events).toEqual(['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run']);
+    expect(manifest.manifest.default_events).toEqual(['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run']);
     expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.actions', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.workflows', 'write');
@@ -632,6 +632,16 @@ describe('GitHub App integration', () => {
         head_branch: 'main', head_sha: 'validated-sha', html_url: 'https://github.com/acme/app/actions/runs/702' },
     });
     expect(successfulCi).toMatchObject({ accepted: true });
+    const passwordStorePush = await deliver('push', 'push-main', {
+      installation: { id: 42 }, ref: 'refs/heads/main', after: 'store-sha-2',
+      repository: { id: 99, full_name: 'acme/app' },
+    });
+    expect(passwordStorePush.vaultPushes).toEqual([{ organizationId: organization.id,
+      repositoryId: repository.id, revision: 'store-sha-2' }]);
+    expect(await deliver('push', 'push-feature', {
+      installation: { id: 42 }, ref: 'refs/heads/feature', after: 'feature-sha',
+      repository: { id: 99, full_name: 'acme/app' },
+    })).toEqual({ accepted: true });
     expect(store.kvEntries('github:deployment-expectation:')).toHaveLength(1);
     // Presence, not completion, satisfies the expectation. A protected
     // environment can leave a perfectly real deployment waiting for approval.
