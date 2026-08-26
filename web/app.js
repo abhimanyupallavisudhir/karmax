@@ -13131,7 +13131,7 @@ async function wireVaultCards(organizationId) {
     try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
-        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
+        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
@@ -13170,9 +13170,11 @@ async function wireVaultCards(organizationId) {
       </div>
       <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between">
         <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
-          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
-          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option ${conn?.config?.autoSync?.policy?.use !== 'ask' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.use === 'ask' ? 'selected' : ''}>ask</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option ${!conn?.config?.autoSync?.policy?.reveal || conn.config.autoSync.policy.reveal === 'ask' ? 'selected' : ''}>ask</option><option ${conn?.config?.autoSync?.policy?.reveal === 'auto' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.reveal === 'never' ? 'selected' : ''}>never</option></select></label>
           ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+          ${name === 'pass-git' ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Refresh the credentials selected above after password-store changes"><input type="checkbox" class="imp-keep" ${conn?.config?.autoSync?.enabled ? 'checked' : ''}/> Keep selected credentials updated</label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Select the entire store now and automatically import credentials added later"><input type="checkbox" class="imp-new" ${conn?.config?.autoSync?.importNew ? 'checked' : ''}/> Import new credentials automatically</label>` : ''}
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn sm" data-imp-cancel>Cancel</button>
@@ -13189,21 +13191,40 @@ async function wireVaultCards(organizationId) {
     let ext = [];
     try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
     catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
-    if (!ext.length) { tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import.</span>'; return; }
+    if (!ext.length) tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import yet.</span>';
     const folders = {};
     ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
-    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
+    const subscribedIds = new Set(conn?.config?.autoSync?.externalIds || []);
+    if (ext.length) tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
       ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px;margin:2px 0"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
       <div style="margin-left:${f ? '18px' : '0'}">${folders[f].map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0">
-        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}"/> ${esc(i.label)}
+        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}" ${(conn?.config?.autoSync?.importNew || subscribedIds.has(i.externalId)) ? 'checked' : ''}/> ${esc(i.label)}
         <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div></div>`).join('');
-    overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
+    const all = overlay.querySelector('.imp-all');
+    const keepUpdated = overlay.querySelector('.imp-keep');
+    const importNew = overlay.querySelector('.imp-new');
+    const selectAll = (checked) => {
+      all.checked = checked;
+      tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = checked));
+      refreshCount();
+    };
+    const enforceImportNew = () => {
+      const forced = !!importNew?.checked;
+      if (forced) { keepUpdated.checked = true; selectAll(true); }
+      if (keepUpdated) keepUpdated.disabled = forced;
+      all.disabled = forced || !ext.length;
+      tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((control) => { control.disabled = forced; });
+    };
+    all.addEventListener('change', (e) => selectAll(e.target.checked));
     tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
     tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
+    importNew?.addEventListener('change', enforceImportNew);
+    enforceImportNew();
+    refreshCount();
     const go = overlay.querySelector('[data-imp-go]');
     go.addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
-      if (!externalIds.length) { toast('Select at least one', true); return; }
+      if (!externalIds.length && !importNew?.checked) { toast('Select at least one', true); return; }
       const sync = (batch) => api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
         externalIds: batch,
         policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
@@ -13211,12 +13232,20 @@ async function wireVaultCards(organizationId) {
       }) });
       go.disabled = true;
       try {
-        const r = await importFromConnector(sync, externalIds, (p) => {
+        const r = externalIds.length ? await importFromConnector(sync, externalIds, (p) => {
           go.textContent = `Importing ${p.done}/${p.total}…`;
           countEl.textContent = `· ${p.imported} imported${p.skipped ? `, ${p.skipped} unchanged` : ''}`;
+        }) : { imported: 0, skipped: 0, failures: [], done: 0, total: 0 };
+        if (name === 'pass-git') await api(`/api/vault/connectors/${name}/config${oq}`, {
+          method: 'POST', body: JSON.stringify({
+            ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+            autoSync: { keepUpdated: !!keepUpdated?.checked, importNew: !!importNew?.checked, externalIds,
+              policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value } },
+          }),
         });
         const summary = [`Imported ${r.imported} item(s)`, r.skipped ? `${r.skipped} already up to date` : '',
-          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : ''].filter(Boolean).join(' · ');
+          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : '',
+          importNew?.checked ? 'Automatic import enabled' : keepUpdated?.checked ? 'Automatic updates enabled' : ''].filter(Boolean).join(' · ');
         toast(summary, r.failures.length > 0);
         close();
         renderItems();

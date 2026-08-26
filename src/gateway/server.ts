@@ -51,7 +51,8 @@ import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
-import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent } from '../integrations/github-app.js';
+import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
+  type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
@@ -486,6 +487,7 @@ export function toPublicPayload(value: unknown): unknown {
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
  *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
 export const DEFAULT_GATEWAY_PORT = 4505;
+const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -597,6 +599,10 @@ export class Gateway {
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
   private pendingPolicyAcceptances = new Map<string, { versions: Record<string, string>; expiresAt: number }>();
   private stopLoginPoolSync?: () => void;
+  private gitPassAutoSyncTimer?: NodeJS.Timeout;
+  /** Preserve every observed push while keeping one Git/GPG operation per
+   *  organization in flight. A push arriving mid-sync queues one more refresh. */
+  private gitPassAutoSyncRuns = new Map<string, Promise<void>>();
 
   constructor(private deps: GatewayDeps) {
     if (deps.identity) {
@@ -739,6 +745,42 @@ export class Gateway {
     const session: Session = { user, userId: user, apiToken };
     this.sessions.set(sid, session);
     return { sid, session };
+  }
+
+  private enqueueGitPassAutoSync(organizationId: string, work: () => Promise<void>): void {
+    const prior = this.gitPassAutoSyncRuns.get(organizationId) ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(work).catch((error) => {
+      console.warn(`[vault] Git-backed pass automatic sync failed for ${organizationId}: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      if (this.gitPassAutoSyncRuns.get(organizationId) === next) this.gitPassAutoSyncRuns.delete(organizationId);
+    });
+    this.gitPassAutoSyncRuns.set(organizationId, next);
+  }
+
+  private enqueueGitPassPush(event: GithubVaultPushEvent): void {
+    if (!this.deps.broker || !this.deps.githubApp) return;
+    const repository = this.deps.store.getRepository(event.repositoryId);
+    if (!repository || repository.organizationId !== event.organizationId) return;
+    this.enqueueGitPassAutoSync(event.organizationId, async () => {
+      const { defaultConnectors } = await import('../autonomy/connectors.js');
+      const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, event.organizationId);
+      await defaultConnectors(this.deps.store, vault, this.deps.broker, event.organizationId,
+        { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
+        .autoSyncGitPush(repository, event.revision);
+    });
+  }
+
+  private enqueueGitPassBackstop(): void {
+    if (!this.deps.broker) return;
+    for (const { id: organizationId } of this.deps.store.listOrganizations()) {
+      this.enqueueGitPassAutoSync(organizationId, async () => {
+        const { defaultConnectors } = await import('../autonomy/connectors.js');
+        const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId);
+        await defaultConnectors(this.deps.store, vault, this.deps.broker, organizationId,
+          { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
+          .autoSync('pass-git', 'backstop');
+      });
+    }
   }
 
   /** Route both terminal GitHub runs and "no run was created" incidents through
@@ -888,6 +930,11 @@ export class Gateway {
     const internalUrl = `http://127.0.0.1:${port}`;
     const directHost = bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : bindHost;
     const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
+    // Webhooks give GitHub-backed stores low latency; this durable-state scan is
+    // the recovery rail for missed deliveries, restarts, and non-GitHub remotes.
+    this.enqueueGitPassBackstop();
+    this.gitPassAutoSyncTimer = setInterval(() => this.enqueueGitPassBackstop(), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
+    this.gitPassAutoSyncTimer.unref();
     return {
       url: publicUrl,
       internalUrl,
@@ -896,6 +943,8 @@ export class Gateway {
         new Promise<void>((resolve) => {
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
+          if (this.gitPassAutoSyncTimer) clearInterval(this.gitPassAutoSyncTimer);
+          this.gitPassAutoSyncTimer = undefined;
           this.reviewActions.stopAll();
           this.fanout.close();
           // `WebSocketServer.close()` does not terminate existing upgraded
@@ -1265,7 +1314,7 @@ export class Gateway {
         // timeline and `event` triggers see it like any other happening (SPEC §5.4).
         // The service already resolved each event to a task of the installing
         // organization, so dispatch is unconditional here.
-        const { events, projectEvents, ...body } = result;
+        const { events, projectEvents, vaultPushes, ...body } = result;
         for (const event of events ?? []) {
           this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
           const task = this.deps.store.getTask(event.taskId);
@@ -1283,9 +1332,11 @@ export class Gateway {
           this.deps.store.releaseGithubDelivery(deliveryId);
           throw error;
         }
+        for (const event of vaultPushes ?? []) this.enqueueGitPassPush(event);
         return this.json(res, 200, { ...body,
           ...(events?.length ? { dispatched: events.length } : {}),
           ...(recoveries ? { recoveries } : {}),
+          ...(vaultPushes?.length ? { vaultSyncsQueued: vaultPushes.length } : {}),
         });
       } catch (error) {
         // Only a genuine signature failure is a 401. Answering 401 for ANY
@@ -5432,7 +5483,18 @@ export class Gateway {
                 const connector = await connectors.connect(connName[1]!, String(b.secret ?? ''));
                 return this.json(res, 200, { connected: true, connector });
               }
-              if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
+              if (action === 'config') {
+                let config = typeof b.writeBack === 'boolean'
+                  ? connectors.setConfig(connName[1]!, { writeBack: b.writeBack })
+                  : connectors.config(connName[1]!);
+                if (b.autoSync && typeof b.autoSync === 'object') config = connectors.setAutoSync(connName[1]!, {
+                  keepUpdated: b.autoSync.keepUpdated === true,
+                  importNew: b.autoSync.importNew === true,
+                  externalIds: Array.isArray(b.autoSync.externalIds) ? b.autoSync.externalIds.map(String) : [],
+                  policy: b.autoSync.policy,
+                });
+                return this.json(res, 200, config);
+              }
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
               if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
                 { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));

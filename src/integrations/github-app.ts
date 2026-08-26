@@ -229,6 +229,23 @@ export interface GithubProjectWebhookEvent {
   };
 }
 
+/** A default-branch repository change that may refresh an opted-in Git-backed
+ * password store. The gateway performs the expensive Git/GPG work after the
+ * webhook has been acknowledged. */
+export interface GithubVaultPushEvent {
+  organizationId: string;
+  repositoryId: string;
+  revision: string;
+}
+
+export interface GithubWebhookResult {
+  accepted: boolean;
+  reconciled?: number;
+  events?: GithubPrWebhookEvent[];
+  projectEvents?: GithubProjectWebhookEvent[];
+  vaultPushes?: GithubVaultPushEvent[];
+}
+
 export type GitHubRepositoryFileStatus =
   | { status: 'present'; bytes: number }
   | { status: 'missing' }
@@ -435,7 +452,7 @@ export class GitHubAppService {
       manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
       // PR/check/merge-group lifecycle turns provider progress for a Karmax task
       // into durable events and wakes its reconciliation loop (SPEC §5.4).
-      manifest.default_events = ['pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run'];
+      manifest.default_events = ['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run'];
     }
     return {
       action: 'https://github.com/settings/apps/new',
@@ -842,7 +859,7 @@ export class GitHubAppService {
   }
 
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
-  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[]; projectEvents?: GithubProjectWebhookEvent[] }> {
+  Promise<GithubWebhookResult> {
     if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
     // The delivery id is CLAIMED here (so two concurrent copies of one delivery
     // cannot both reconcile) but the claim is provisional: `dispatchWebhook` does
@@ -863,7 +880,7 @@ export class GitHubAppService {
   }
 
   private async dispatchWebhook(event: string, raw: Buffer):
-  Promise<{ accepted: boolean; reconciled?: number; events?: GithubPrWebhookEvent[]; projectEvents?: GithubProjectWebhookEvent[] }> {
+  Promise<GithubWebhookResult> {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
     if (!installationId) return { accepted: true };
@@ -890,6 +907,17 @@ export class GitHubAppService {
       this.tokenCache.delete(saved.id);
       const repositories = await this.reconcile(saved);
       return { accepted: true, reconciled: repositories.length };
+    }
+    if (event === 'push' && payload.deleted !== true) {
+      const repositoryPayload = payload.repository;
+      const repository = this.store.listRepositories(connection.organizationId).find((candidate) =>
+        (repositoryPayload?.id && candidate.providerId === String(repositoryPayload.id))
+        || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload?.full_name ?? '').toLowerCase());
+      if (repository && payload.ref === `refs/heads/${repository.defaultBranch}`) {
+        return { accepted: true, vaultPushes: [{ organizationId: connection.organizationId,
+          repositoryId: repository.id, revision: String(payload.after ?? '') }] };
+      }
+      return { accepted: true };
     }
     const projectEvents = this.failedDefaultBranchWorkflowEvents(event, payload, connection.organizationId);
     if (event === 'workflow_run') {

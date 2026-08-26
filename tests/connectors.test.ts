@@ -332,13 +332,14 @@ describe('the default registry follows where karmax is served', () => {
 
 describe('Git-backed pass repository authentication', () => {
   it('uses only the exact organization repository attachment', async () => {
-    const repository = { id: 'repo_attached', organizationId: 'org_a',
-      sshUrl: 'git@github.com:acme/passwords.git' } as any;
+    const repository = { id: 'repo_attached', organizationId: 'org_a', provider: 'github',
+      owner: 'acme', name: 'passwords', sshUrl: 'git@github.com:acme/passwords.git' } as any;
     const calls: string[] = [];
     const store = {
       ...memStore(),
       findRepositoryBySshUrl: (organizationId: string, sshUrl: string) =>
         organizationId === repository.organizationId && sshUrl === repository.sshUrl ? repository : undefined,
+      listRepositories: (organizationId: string) => organizationId === repository.organizationId ? [repository] : [],
     };
     const githubApp = {
       brokerCredentials: async (matched: any) => {
@@ -349,11 +350,13 @@ describe('Git-backed pass repository authentication', () => {
 
     await expect(attachedRepositoryCredential(store, githubApp, 'org_a', repository.sshUrl))
       .resolves.toMatchObject({ httpsToken: 'installation-token' });
+    await expect(attachedRepositoryCredential(store, githubApp, 'org_a', 'https://github.com/acme/passwords.git'))
+      .resolves.toMatchObject({ httpsToken: 'installation-token' });
     await expect(attachedRepositoryCredential(store, githubApp, 'org_b', repository.sshUrl))
       .resolves.toBeUndefined();
     await expect(attachedRepositoryCredential(store, githubApp, 'org_a', 'git@github.com:other/passwords.git'))
       .resolves.toBeUndefined();
-    expect(calls).toEqual(['repo_attached']);
+    expect(calls).toEqual(['repo_attached', 'repo_attached']);
   });
 });
 
@@ -380,6 +383,75 @@ describe('Connectors sync into the vault (§9)', () => {
     const second = await connectors.sync('bitwarden', ['bw1']);
     expect(second.itemIds).toEqual(first.itemIds); // same item id, updated in place
     expect(items.list().filter((i) => i.provenance.externalId === 'bw1')).toHaveLength(1);
+  });
+
+  it('keeps a selective subscription and broadens import-new to the whole store', async () => {
+    const { items, store, broker } = makeVault();
+    let revision = 1;
+    const records = new Map([
+      ['one', { password: 'one-v1' }],
+      ['two', { password: 'two-v1' }],
+    ]);
+    const pulled: string[][] = [];
+    const connector = {
+      name: 'test',
+      describe: async () => ({ name: 'test', label: 'Test', available: true, canPush: false, detail: 'ready' }),
+      list: async () => [...records].map(([externalId]) => ({ externalId, type: 'login' as const,
+        label: externalId, fields: ['password' as const], changedAt: revision })),
+      pull: async (externalIds: string[]) => {
+        pulled.push(externalIds);
+        return { items: externalIds.flatMap((externalId) => {
+          const secrets = records.get(externalId);
+          return secrets ? [{ externalId, type: 'login' as const, label: externalId,
+            fields: ['password' as const], changedAt: revision, secrets }] : [];
+        }), failures: [] };
+      },
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+
+    connectors.setAutoSync('test', { keepUpdated: true, externalIds: ['one'],
+      policy: { use: 'ask', reveal: 'never' } });
+    await connectors.autoSync('test', 'backstop');
+    expect(pulled).toEqual([['one']]);
+    expect(items.list().map((item) => item.provenance.externalId)).toEqual(['one']);
+    expect(items.list()[0]!.policy).toEqual({ use: 'ask', reveal: 'never' });
+
+    revision++;
+    records.set('three', { password: 'three-v1' });
+    connectors.setAutoSync('test', { importNew: true, externalIds: ['one'] });
+    expect(connectors.config('test').autoSync).toMatchObject({ enabled: true, importNew: true });
+    await connectors.autoSync('test', 'github-push', 'commit-2');
+    expect(new Set(items.list().map((item) => item.provenance.externalId))).toEqual(new Set(['one', 'two', 'three']));
+    expect(connectors.config('test').autoSync?.externalIds).toEqual(['one', 'two', 'three']);
+    expect(connectors.config('test').lastAutoSync).toMatchObject({ reason: 'github-push', revision: 'commit-2' });
+
+    connectors.setAutoSync('test', { keepUpdated: false, importNew: false, externalIds: ['one'] });
+    expect(connectors.config('test').autoSync).toBeUndefined();
+  });
+
+  it('does not import an agent-created item back as a duplicate after write-back', async () => {
+    const { items, store, broker } = makeVault();
+    const connector = {
+      name: 'test',
+      describe: async () => ({ name: 'test', label: 'Test', available: true, canPush: false, detail: 'ready' }),
+      list: async () => [{ externalId: 'karmax/created', type: 'login' as const, label: 'Created',
+        fields: ['password' as const], changedAt: 2 }],
+      pull: async (externalIds: string[]) => ({ items: externalIds.map((externalId) => ({ externalId,
+        type: 'login' as const, label: 'Created', fields: ['password' as const], changedAt: 2,
+        secrets: { password: 'generated' } })), failures: [] }),
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    const created = items.save({ type: 'login', label: 'Created', secrets: { password: 'generated' },
+      provenance: { source: 'task:signup', taskId: 'signup' } });
+    items.setExternalId(created.id, 'test', 'karmax/created');
+    connectors.setAutoSync('test', { importNew: true });
+
+    const result = await connectors.autoSync('test', 'github-push');
+    expect(result).toMatchObject({ count: 0, skipped: 1 });
+    expect(items.list()).toHaveLength(1);
+    expect(items.get(created.id)?.provenance.externalIds).toEqual({ test: 'karmax/created' });
   });
 
   /** A `pass` store on disk + an exec that "decrypts" by reading the file, so
