@@ -5157,6 +5157,21 @@ export class Gateway {
             return this.json(res, status, { error: e instanceof Error ? e.message : String(e) });
           }
         }
+        if (p === '/api/vault/available' && method === 'GET') {
+          if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required' });
+          return this.json(res, 200, vault.list()
+            .filter((item) => vault.covered(caps, callerTaskId, item))
+            .map((item) => ({
+              id: item.id,
+              type: item.type,
+              label: item.label,
+              ...(item.domains?.length ? { domains: item.domains } : {}),
+              ...(item.username ? { username: item.username } : {}),
+              ...(item.envVar ? { envVar: item.envVar } : {}),
+              fields: item.fields,
+              policy: vault.effectivePolicy(callerTaskId, item),
+            })));
+        }
         if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);

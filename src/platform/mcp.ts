@@ -547,10 +547,19 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   // platform_request. Available on the gateway-backed bridge; the in-process
   // apiOps embedding reports the same platform_request limitation.
   server.registerTool(
+    'list_credentials',
+    {
+      description:
+        'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
+      inputSchema: {},
+    },
+    async () => wrap(() => ops.platformRequest('GET', '/api/vault/available')),
+  );
+  server.registerTool(
     'request_credential',
     {
       description:
-        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) this task was not granted, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
+        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) that list_credentials does not show, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string(), urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/requests', a)),

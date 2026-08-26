@@ -235,13 +235,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'list_credentials',
+    description:
+      'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
+    parameters: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
     name: 'request_credential',
     description:
-      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
+      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that list_credentials does not show, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human and this turn may stop — karmax automatically resumes the task with the decision), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends the reset code, then karmax resumes the task.',
     parameters: {
       type: 'object',
       properties: {
-        item_id: { type: 'string', description: 'A vault item id (list them via platform_request GET /api/vault/items).' },
+        item_id: { type: 'string', description: 'A vault item id. Use list_credentials to inspect credentials already granted to this task.' },
         domain: { type: 'string', description: 'The site this credential is for, e.g. "github.com" — used when you do not know the item id.' },
         mode: { type: 'string', enum: ['use', 'reveal'], description: 'use = fill/inject without seeing the secret (default); reveal = you need the plaintext.' },
         kind: { type: 'string', enum: ['access', 'reset'], description: 'reset = the stored secret appears invalid; always parks for the human.' },
@@ -952,6 +961,9 @@ export function platformToolHandlers(
           country: args?.country_selector ? String(args.country_selector) : undefined,
         },
       }));
+    },
+    async list_credentials() {
+      return JSON.stringify(await platformRequest('GET', '/api/vault/available'));
     },
     async request_credential(args) {
       const r: any = await platformRequest('POST', '/api/vault/requests', {

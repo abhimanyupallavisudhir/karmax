@@ -1486,6 +1486,40 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(after.map((i: any) => i.id)).not.toContain(created.id);
   });
 
+  it('lists only non-secret credential metadata granted to the calling task', async () => {
+    const granted: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'Amazon UK', domains: 'www.amazon.co.uk', username: 'buyer@example.com',
+      policy: { use: 'auto', reveal: 'never' }, secrets: { password: 'granted-secret' },
+    }) })).json();
+    const hidden: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'Hidden account', domains: 'hidden.example.com', secrets: { password: 'hidden-secret' },
+    }) })).json();
+    const taskToken = h.tokens.mint({
+      taskId: 'task_credential_inventory', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'],
+      grantorCaps: ['credential:read', `use-credential:item:${granted.id}`],
+    });
+    const response = await fetch(`${base}/api/vault/available`, {
+      headers: { authorization: `Bearer ${taskToken.token}` },
+    });
+    expect(response.status).toBe(200);
+    const available: any = await response.json();
+    expect(available).toEqual([{
+      id: granted.id,
+      type: 'login',
+      label: 'Amazon UK',
+      domains: ['www.amazon.co.uk'],
+      username: 'buyer@example.com',
+      fields: ['password'],
+      policy: { use: 'auto', reveal: 'never' },
+    }]);
+    expect(JSON.stringify(available)).not.toContain('granted-secret');
+    expect(available.map((item: any) => item.id)).not.toContain(hidden.id);
+
+    const humanResponse = await fetch(`${base}/api/vault/available`, { headers: auth() });
+    expect(humanResponse.status).toBe(400);
+  });
+
   it('agent pull model: needs_approval → human grants for the task → retry succeeds', async () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'api-key', label: 'Service key', policy: { use: 'auto', reveal: 'auto' }, secrets: { secret: 'sk-999' },
