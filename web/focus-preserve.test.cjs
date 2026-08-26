@@ -100,12 +100,12 @@ ROOT._active = outside; // contains() returns false for it
 ok(captureFocus(ROOT) === null, 'focus outside #main is not captured');
 
 // ── Scenario: a SELECT keeps its own re-rendered value (not overwritten) ──
-const oldSel = makeEl('SELECT', 'new-wf');
+const oldSel = makeEl('SELECT', 'filter-mode');
 oldSel.value = 'software-dev';
 ROOT._active = oldSel;
 ROOT.contains = (el) => el === oldSel || el === ROOT._newSel;
 const selSt = captureFocus(ROOT);
-const newSel = makeEl('SELECT', 'new-wf');
+const newSel = makeEl('SELECT', 'filter-mode');
 newSel.value = 'software-dev';
 ROOT._newSel = newSel;
 ROOT.querySelector = () => ROOT._newSel;

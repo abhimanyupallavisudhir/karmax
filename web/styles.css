@@ -265,10 +265,6 @@ a { color: var(--accent); text-decoration: none; }
   flex: 1; min-width: 0; padding: 11px 14px; border: 0;
   background: transparent; outline: none; box-shadow: none;
 }
-.composer select {
-  padding: 0 12px; border: 1px solid var(--line); border-radius: var(--r);
-  background: var(--surface); cursor: pointer;
-}
 .composer .btn.icon-only { width: 42px; padding-left: 0; padding-right: 0; justify-content: center; flex: none; }
 .composer .attach-composer { cursor: pointer; }
 .composer .quick-task-attach { width: 34px; height: 34px; margin-right: 4px; }
@@ -1700,8 +1696,8 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tab { flex:none; white-space:nowrap; }
   .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(3, 42px); }
   .quick-task-field { grid-column:1 / -1; width:100%; }
+  .composer #draft-task { grid-column:2; }
   .composer input.title-in { min-width:0; width:100%; }
-  .composer select { min-width:0; width:100%; }
   .tp-head > * { padding: 0 16px; }
   .tp-tabs { padding: 0 2px; }
   .tp-content { padding: 16px 16px 40px; }
