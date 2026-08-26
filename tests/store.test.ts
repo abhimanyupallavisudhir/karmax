@@ -259,6 +259,30 @@ describe('Store', () => {
     expect(() => store.reorderProject('proj_nope')).toThrow(/no project/);
   });
 
+  it('files projects into implicit sidebar folders', () => {
+    const [a, b] = ['A', 'B'].map((n) => store.createProject(n));
+    // A folder is nothing but a path a project names — no entity to create.
+    expect(store.setProjectFolder(a!.id, 'Work/Clients').folder).toBe('Work/Clients');
+    expect(store.getProject(a!.id)!.folder).toBe('Work/Clients');
+    // Paths are canonicalized: segments trimmed, empty segments dropped.
+    expect(store.setProjectFolder(a!.id, '  Work / Clients / ').folder).toBe('Work/Clients');
+    // Clearing returns the project to the top level, with no folder key at all.
+    expect(store.setProjectFolder(a!.id, '')).not.toHaveProperty('folder');
+    expect(store.getProject(a!.id)!.folder).toBeUndefined();
+    expect(() => store.setProjectFolder('proj_nope', 'X')).toThrow(/no project/);
+
+    // A drop can move and re-file in one gesture; the returned order carries it.
+    const moved = store.reorderProject(b!.id, a!.id, 'Work');
+    expect(moved.find((p) => p.id === b!.id)!.folder).toBe('Work');
+    expect(store.getProject(b!.id)!.folder).toBe('Work');
+    // …and folder '' on a reorder is an explicit move back to the top level,
+    // while an omitted folder leaves it alone.
+    store.reorderProject(b!.id, a!.id);
+    expect(store.getProject(b!.id)!.folder).toBe('Work');
+    store.reorderProject(b!.id, a!.id, '');
+    expect(store.getProject(b!.id)!.folder).toBeUndefined();
+  });
+
   it('keeps creation order for projects that predate the sidebar ordering column', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-ord-mig-'));
     const dbPath = path.join(dir, 'karmax.db');

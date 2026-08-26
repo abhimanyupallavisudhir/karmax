@@ -491,6 +491,10 @@ export interface Project {
   /** Hand-picked sidebar position within the organization (drag to reorder).
    * Optional only while reading historical fixtures, where creation order rules. */
   order?: number;
+  /** Sidebar folder as a `/`-separated path ("Work/Clients"). Folders are
+   * implicit — one exists exactly while a project names it — so there is no
+   * folder entity to create, rename, or garbage-collect. Absent = top level. */
+  folder?: string;
 }
 
 export interface ProjectConfig {

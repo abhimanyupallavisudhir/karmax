@@ -3426,10 +3426,13 @@ function renderShell() {
 // Move project `id` so it sits immediately before `beforeId`, or last among its own
 // organization's projects when `beforeId` is omitted. Every other organization's
 // projects keep their relative position, so a drag in one organization's rail can
-// never disturb another's. Mirrors Store.reorderProject on the server.
-function reorderProjects(projects, id, beforeId) {
-  const moving = projects.find((p) => p.id === id);
-  if (!moving) return projects;
+// never disturb another's. A drop can also name the folder the row landed in
+// ('' = top level); the moved entry is copied, never mutated, so a failed save
+// can repaint from the server's truth. Mirrors Store.reorderProject.
+function reorderProjects(projects, id, beforeId, folder) {
+  const found = projects.find((p) => p.id === id);
+  if (!found) return projects;
+  const moving = folder === undefined ? found : { ...found, folder: folder || undefined };
   const org = (p) => p.organizationId || 'org_personal';
   const rest = projects.filter((p) => p.id !== id);
   // A neighbour in another organization is not a position we can honour — the
@@ -3445,6 +3448,56 @@ function reorderProjects(projects, id, beforeId) {
 // refresh that swapped the rail's innerHTML mid-drag would destroy this element.
 let draggingProject = null;
 
+// Which sidebar folders are folded shut. A per-browser display choice, like the
+// theme, so it lives in localStorage — keyed per organization because the rail
+// shows one organization's projects at a time.
+function railCollapsedFolders() {
+  try { return new Set(JSON.parse(localStorage.getItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`) || '[]')); }
+  catch { return new Set(); }
+}
+function toggleRailFolder(path) {
+  const folded = railCollapsedFolders();
+  if (!folded.delete(path)) folded.add(path);
+  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...folded])); } catch {}
+  renderRail();
+}
+
+// The rail's project rows: the organization's projects grouped into their
+// folders. A folder is implicit — it exists exactly while a project names it
+// (`p.folder`, a `/`-separated path), nests by that path, and sits where its
+// first project sits, so dragging orders folders and loose projects alike.
+// Nesting is the --depth custom property, not DOM structure: the rail stays a
+// flat list the drag logic can walk. A collapsed folder still shows the open
+// project, so navigating into a tucked-away project never blanks the selection.
+function railProjectRows(projectScoped) {
+  const projects = S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId);
+  const root = { path: '', children: [] };
+  const nodes = new Map([['', root]]);
+  const dir = (path) => {
+    let node = nodes.get(path);
+    if (!node) {
+      node = { path, name: path.slice(path.lastIndexOf('/') + 1), children: [] };
+      nodes.set(path, node);
+      dir(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '').children.push(node);
+    }
+    return node;
+  };
+  for (const p of projects) dir(p.folder || '').children.push(p);
+  const folded = railCollapsedFolders();
+  const row = (p, depth) => `<a class="proj ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" tabindex="0" draggable="true" title="Drag to reorder">
+          <span class="glyph">◇</span> <span>${esc(p.name)}</span>
+        </a>`;
+  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}" tabindex="0" role="button" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'} folder"><span class="glyph">${open ? '▾' : '▸'}</span> <span>${esc(node.name)}</span></div>`;
+  const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
+  const walk = (node, depth) => node.children.map((child) => {
+    if (child.id) return row(child, depth);
+    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
+    return header(child, depth, false) + (active ? row(active, depth + 1) : '');
+  }).join('');
+  return walk(root, 0);
+}
+
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
@@ -3456,17 +3509,14 @@ function renderRail() {
   // them. Snapshot the focused row's stable identity and re-focus the matching row.
   const active = document.activeElement;
   const focusedKey = active && rail.contains(active)
-    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]` : active.id ? `#${active.id}` : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
+    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]`
+      : active.id ? `#${active.id}`
+      : active.classList.contains('folder') && active.dataset.folder != null ? `.folder[data-folder="${CSS.escape(active.dataset.folder)}"]`
+      : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
   rail.innerHTML = `
     <div class="label">Projects</div>
-    ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
-      .map(
-        (p) => `<a class="proj ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0" draggable="true" title="Drag to reorder">
-          <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </a>`,
-      )
-      .join('')}
+    ${railProjectRows(projectScoped)}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Organization</div>
@@ -3478,6 +3528,16 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
+  // Folder headers toggle their fold; Enter/Space mirrors the click for the
+  // rail's keyboard walk (g p → j/k), where a header is a row like any other.
+  for (const head of rail.querySelectorAll('.proj.folder')) {
+    head.addEventListener('click', () => toggleRailFolder(head.dataset.folder));
+    head.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      toggleRailFolder(head.dataset.folder);
+    });
+  }
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
@@ -3489,6 +3549,9 @@ function renderRail() {
 // element survives every repaint, so listeners would otherwise pile up.
 function wireProjectDrag(rail) {
   const projects = () => [...rail.querySelectorAll('.proj[draggable="true"]')];
+  // Rows a drag can land against: projects and folder headers. Dropping just
+  // above a header means "above that folder", i.e. in the folder's parent.
+  const anchors = () => [...rail.querySelectorAll('.proj[draggable="true"], .proj.folder')];
   const rows = projects();
   if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
   const end = $('#new-project');
@@ -3510,7 +3573,7 @@ function wireProjectDrag(rail) {
   rail.ondragover = (e) => {
     if (!draggingProject) return;
     e.preventDefault();
-    const before = projects().find((row) => {
+    const before = anchors().find((row) => {
       const box = row.getBoundingClientRect();
       return row !== draggingProject && e.clientY < box.top + box.height / 2;
     });
@@ -3524,12 +3587,29 @@ function wireProjectDrag(rail) {
     draggingProject = null;
     const ids = projects().map((r) => r.dataset.id);
     const before = ids[ids.indexOf(row.dataset.id) + 1];
-    S.projects = reorderProjects(S.projects, row.dataset.id, before);
+    const folder = dropFolder(row);
+    S.projects = reorderProjects(S.projects, row.dataset.id, before, folder);
     renderRail();
     try {
-      await api(`/api/projects/${row.dataset.id}/reorder`, { method: 'POST', body: JSON.stringify({ before }) });
+      await api(`/api/projects/${row.dataset.id}/reorder`, { method: 'POST', body: JSON.stringify({ before, folder }) });
     } catch (err) { toast(err.message, true); await loadProjects(); renderRail(); }
   };
+}
+
+// The folder a dropped row landed in, read off its new neighbours. The row now
+// below it speaks for the slot — a project names its own folder, a header opens
+// its parent's territory — and when the drop landed last, the row above does:
+// an open header adopts the drop as its first child, a collapsed one keeps it
+// out (its contents are hidden, so "inside" would be an invisible landing).
+function dropFolder(row) {
+  const parent = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+  const nx = row.nextElementSibling;
+  if (nx?.dataset.id) return nx.dataset.folder || '';
+  if (nx?.classList.contains('folder')) return parent(nx.dataset.folder);
+  const pv = row.previousElementSibling;
+  if (pv?.dataset.id) return pv.dataset.folder || '';
+  if (pv?.classList.contains('folder')) return pv.classList.contains('open') ? pv.dataset.folder : parent(pv.dataset.folder);
+  return '';
 }
 
 function switchTab(tab) {
@@ -10961,8 +11041,8 @@ function settingsView(proj) {
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden>
-      <div class="section-h" data-settings-access="project" hidden>Project name</div>
-      <div class="inline-form"><input id="project-name" value="${esc(proj.name)}" aria-label="Project name" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save name</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
+      <div class="section-h" data-settings-access="project" hidden>Project name &amp; sidebar folder</div>
+      <div class="inline-form"><input id="project-name" value="${esc(proj.name)}" aria-label="Project name" data-settings-access="project" hidden><input id="project-folder" value="${esc(proj.folder || '')}" placeholder="Folder — optional, nest with /" aria-label="Sidebar folder" list="project-folder-options" data-settings-access="project" hidden><datalist id="project-folder-options">${[...new Set(S.projects.filter((p) => p.organizationId === proj.organizationId && p.folder).map((p) => p.folder))].map((f) => `<option value="${esc(f)}">`).join('')}</datalist><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
     </div></div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
@@ -11533,17 +11613,19 @@ function wireSettingsView(proj) {
   const renameProject = async () => {
     const name = $('#project-name')?.value.trim();
     if (!name) return toast('Project name is required', true);
+    const folder = $('#project-folder')?.value.trim() ?? '';
     try {
-      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name, folder }) });
       await loadProjects();
-      toast('Project renamed');
+      toast('Project saved');
       await go(`${projectRoute(proj.id, 'settings')}${location.hash}`, { replace: true });
     } catch (e) { toast(e.message, true); }
   };
   $('#rename-project')?.addEventListener('click', renameProject);
-  $('#project-name')?.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
-  });
+  for (const field of ['#project-name', '#project-folder'])
+    $(field)?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
+    });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {

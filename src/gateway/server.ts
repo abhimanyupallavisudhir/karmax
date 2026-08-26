@@ -2922,11 +2922,19 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
-            if (Object.prototype.hasOwnProperty.call(b, 'name')) {
-              if (typeof b.name !== 'string') throw new Error('project name is required');
+            // Name and sidebar folder ride together (the settings form saves
+            // both with one button), but never alongside config.
+            if (Object.prototype.hasOwnProperty.call(b, 'name') || Object.prototype.hasOwnProperty.call(b, 'folder')) {
               if (Object.prototype.hasOwnProperty.call(b, 'config'))
                 throw new Error('update the project name and configuration separately');
-              return this.json(res, 200, store.renameProject(id, b.name));
+              let project;
+              if (Object.prototype.hasOwnProperty.call(b, 'name')) {
+                if (typeof b.name !== 'string') throw new Error('project name is required');
+                project = store.renameProject(id, b.name);
+              }
+              if (Object.prototype.hasOwnProperty.call(b, 'folder'))
+                project = store.setProjectFolder(id, String(b.folder ?? ''));
+              return this.json(res, 200, project);
             }
             const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = store.getProject(id);
@@ -2955,11 +2963,14 @@ export class Gateway {
       // above (`before`); omitting it means "last". Sending the neighbour rather
       // than an absolute index keeps a drag correct against a list that changed
       // under the user, and the store re-densifies the organization's positions.
+      // A drop may also land in a folder: `folder` carries the destination path
+      // ('' = top level) so the one gesture persists as one request.
       const projReorder = p.match(/^\/api\/projects\/([^/]+)\/reorder$/);
       if (projReorder && method === 'POST') {
         const b = await this.body(req);
         try {
-          return this.json(res, 200, store.reorderProject(projReorder[1]!, b.before ?? undefined));
+          return this.json(res, 200, store.reorderProject(projReorder[1]!, b.before ?? undefined,
+            typeof b.folder === 'string' ? b.folder : undefined));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);

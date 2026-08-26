@@ -807,6 +807,7 @@ export class Store {
     // createdAt` then reproduces exactly the creation order they had before —
     // so no backfill pass is needed; the first drag densifies that organization.
     if (!projectCols.some((c) => c.name === 'ord')) this.db.exec('ALTER TABLE projects ADD COLUMN ord INTEGER NOT NULL DEFAULT 0');
+    if (!projectCols.some((c) => c.name === 'folder')) this.db.exec('ALTER TABLE projects ADD COLUMN folder TEXT');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
     // Legacy rows become single-attempt intents. Alternate attempts already point
@@ -975,13 +976,28 @@ export class Store {
     return { ...existing, name: nextName };
   }
 
+  /** Put a project in a sidebar folder ("Work/Clients"), or at the top level
+   * when the path is empty. The folder needs no other existence: it appears in
+   * the sidebar while a project names it and vanishes when the last one leaves. */
+  setProjectFolder(id: string, folder: string): Project {
+    const existing = this.getProject(id);
+    if (!existing) throw new Error(`no project ${id}`);
+    const next = normalizeFolder(folder);
+    this.db.prepare('UPDATE projects SET folder = ? WHERE id = ?').run(next ?? null, id);
+    const { folder: _, ...rest } = existing;
+    return next ? { ...rest, folder: next } : rest;
+  }
+
   /** Move a project so it sits immediately before `beforeProjectId` in the sidebar,
    * or last when that is omitted/unknown. Only the moved project's own organization
    * is touched, and its rows are re-densified to 0…n-1 so repeated drags stay stable.
-   * Returns that organization's projects in their new order. */
-  reorderProject(id: string, beforeProjectId?: string): Project[] {
-    const moving = this.getProject(id);
+   * A drop can also carry the folder the project now sits in — position and folder
+   * are one gesture, so they persist as one move. Returns that organization's
+   * projects in their new order. */
+  reorderProject(id: string, beforeProjectId?: string, folder?: string): Project[] {
+    let moving = this.getProject(id);
     if (!moving) throw new Error(`no project ${id}`);
+    if (folder !== undefined) moving = this.setProjectFolder(id, folder);
     const organizationId = moving.organizationId ?? 'org_personal';
     const siblings = this.listProjects()
       .filter((p) => (p.organizationId ?? 'org_personal') === organizationId && p.id !== id);
@@ -6156,7 +6172,14 @@ function writableProjectConfig(config: ProjectConfig): ProjectConfig {
 }
 
 function rowToProject(r: any): Project {
-  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0 };
+  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0, ...(r.folder ? { folder: r.folder } : {}) };
+}
+
+/** Canonical form of a sidebar folder path: segments trimmed, empties dropped,
+ * so "  Work / Clients /" and "Work/Clients" are the same folder. Undefined
+ * means top level — the column stores NULL, never ''. */
+function normalizeFolder(folder: unknown): string | undefined {
+  return String(folder ?? '').split('/').map((s) => s.trim()).filter(Boolean).join('/') || undefined;
 }
 function rowToTag(r: any): Tag {
   return {
