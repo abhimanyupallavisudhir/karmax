@@ -330,10 +330,9 @@ function providerHomeFromSessionFile(provider: DownloadableProvider, filename: s
   return at > 0 ? filename.slice(0, at) : undefined;
 }
 
-/** Resolve newer session metadata and metadata-poor historical tasks alike.
- * Native files are searched only inside provider history roots by
- * findProviderSession; a task's opaque session id can never become an arbitrary
- * host filesystem read. */
+/** Resolve stored session metadata without searching other config homes. A task
+ * with legacy metadata that lacks its source home falls back to a generated
+ * transcript export instead of sweeping the installation by opaque id. */
 function storedConversationSession(store: Store, taskId: string, intentId: string | undefined, role: string,
   providerHint?: unknown): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
   const sessionTaskId = role === 'confirm' ? (intentId ?? taskId) : taskId;

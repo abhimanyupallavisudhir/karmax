@@ -1014,7 +1014,7 @@ function renderAgentField(f, spec, inherited) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="...or paste a provider conversation ID or a ChatGPT/Claude share link to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <input class="af-resume-session" placeholder="...or paste a public ChatGPT/Claude share link" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
         <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
@@ -1036,8 +1036,8 @@ function resumeUploadInner(upload) {
   return `${esc(upload.name || 'Conversation')}<button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
 }
 
-// Read an agent box's fork/resume choice back out: the picker's {taskId, role}
-// from data-resume, a pasted provider id/share link, or one uploaded file.
+// Read an agent box's fork/resume choice back out: the picker's {taskId, role},
+// a public share link, or one uploaded file.
 function readResume(box) {
   if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();

@@ -1361,12 +1361,13 @@ export interface AgentSpec {
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  /** Fork prior context from a task agent, a provider conversation id/public
-   * share link, or a project-scoped uploaded Codex/Claude conversation file. */
+  /** Fork prior context from a task agent, a public share link, or a
+   * project-scoped uploaded Codex/Claude conversation file. */
   resumeFrom?: {
     taskId?: string;
     role?: string;
-    /** Native provider id, or a public chatgpt.com/share / claude.ai/share URL. */
+    /** A public chatgpt.com/share / claude.ai/share URL. The historical member
+     * name remains on the wire for replay compatibility. */
     sessionId?: string;
     upload?: {
       id: string;

@@ -35,7 +35,8 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
-ok(closed.includes('provider conversation ID or a ChatGPT/Claude share link'), 'provider ids and public share links are named in the compact input');
+ok(closed.includes('paste a public ChatGPT/Claude share link'), 'only public share links are named in the compact input');
+ok(!closed.includes('provider conversation ID'), 'the compact input does not advertise inaccessible provider ids');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 
 const existing = renderAgentField(

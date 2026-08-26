@@ -93,15 +93,6 @@ export function publicConversationShare(value: string): string | undefined {
   return supported && url.protocol === 'https:' ? url.toString() : undefined;
 }
 
-export function looksLikeConversationUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
 /** Acquire/normalize with panagent, then either install a native session or emit safe context. */
 export async function importWithPanagent(opts: PanagentImportOptions): Promise<PanagentImportResult> {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-'));

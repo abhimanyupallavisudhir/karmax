@@ -352,17 +352,15 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     await poll(inherited.id, 'done');
   });
 
-  it('CONTINUES (not forks) when given a raw pasted session id', async () => {
-    const b = await post(`/api/projects/${projectId}/tasks`, {
+  it('rejects raw provider session ids before creating a task', async () => {
+    const response = await fetch(`${base}/api/projects/${projectId}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
       title: 'Raw resume',
       workflow: 'software-dev',
       params: { prompt: '@write r.txt :: r\n@review r', 'agent:do': { provider: 'mock', resumeFrom: { sessionId: 'sess-explicit-123' } } },
+      }),
     });
-    await poll(b.id, 'review');
-    const events = await get(`/api/tasks/${b.id}/events?since=0`);
-    expect(events.some((e: any) => e.type === 'session.resumed')).toBe(true);
-    expect(events.some((e: any) => e.type === 'session.forked')).toBe(false);
-    await post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' });
-    await poll(b.id, 'done');
+    expect(response.status).toBe(400);
+    expect((await J(response)).error).toContain('provider conversation IDs are not supported');
   });
 });

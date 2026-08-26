@@ -37,6 +37,7 @@ import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, san
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
+import { publicConversationShare } from '../agent/panagent.js';
 import { AuthorizationGrantError, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
@@ -814,8 +815,10 @@ export class KarmaxApi {
   }
 
   /**
-   * Authorize every `agent:<role>.resumeFrom.taskId` in a task's params against
-   * the **source** task, not just the task being created/edited.
+   * Validate each agent resume source, then authorize every
+   * `agent:<role>.resumeFrom.taskId` against the **source** task, not just the
+   * task being created/edited. A `sessionId` is accepted only when it is a
+   * supported public share URL; opaque provider ids cannot initiate host search.
    *
    * `resumeFrom` makes the activity runtime (`src/activities/core.ts`) load
    * another task's provider session and splice its transcript into the new
@@ -826,11 +829,14 @@ export class KarmaxApi {
    * already models the intended check; this closes the same door on the raw
    * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
    */
-  private authorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
+  private validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
     for (const [key, value] of Object.entries(params ?? {})) {
       if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const resumeFrom = (value as Record<string, unknown>).resumeFrom;
       if (!resumeFrom || typeof resumeFrom !== 'object' || Array.isArray(resumeFrom)) continue;
+      const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
+      if (sessionId !== undefined && (typeof sessionId !== 'string' || !publicConversationShare(sessionId)))
+        throw new Error('provider conversation IDs are not supported; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = this.deps.store.getTask(sourceId);
@@ -1026,7 +1032,7 @@ export class KarmaxApi {
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
-    this.authorizeResumeSources(token, taskOverrides);
+    this.validateAndAuthorizeResumeSources(token, taskOverrides);
     const inheritedFiles = this.inheritedResumeFiles(taskOverrides);
     // Resume authorization above grants conversation-read authority. Extend each
     // inherited content hash into the destination project before validating it.
@@ -2051,7 +2057,7 @@ export class KarmaxApi {
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
-    this.authorizeResumeSources(token, params);
+    this.validateAndAuthorizeResumeSources(token, params);
     const inheritedFiles = this.inheritedResumeFiles(params);
     for (const file of inheritedFiles) this.deps.store.grantAttachment(file.id, task.projectId);
     const promptFiles = uniqueFileRefs([

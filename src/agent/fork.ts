@@ -1,7 +1,5 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { paths } from '../config/paths.js';
 
 /**
  * Fork a prior agent's session (SPEC §10.5) — branch a NEW conversation from the
@@ -18,16 +16,14 @@ import { paths } from '../config/paths.js';
  *    (new session id, source untouched). Works across logins — a `.jsonl` is pure
  *    conversation history, no auth. Survives world cleanup (the file lives in the home).
  *  - Codex: a rollout under `<CODEX_HOME>/sessions/<date>/rollout-…-<id>.jsonl`, resolved
- *    by id regardless of cwd. If the rollout isn't already in this turn's home, we sweep
- *    every config-home (a raw pasted id carries no source home) and copy it in; the
- *    adapter runs `codex exec resume <id>` with `-C <world>`.
+ *    by id regardless of cwd. If the rollout isn't already in this turn's home, we copy
+ *    it from the source task's recorded home. The adapter then resumes/forks it.
  *
- * Used by both resume paths in the turn activity: forking a source task's agent (branches
- * a NEW id via the adapter) and resuming a raw pasted session id (keeps the SAME id — this
- * copy is what lets a home/world-mismatched id resolve at all).
+ * Used for task-to-task forks. Raw provider ids are deliberately unsupported: an
+ * opaque id must never trigger a search across the Karmax installation's histories.
  *
- * Returns true if the source session was found and made resumable here; false → the
- * caller falls back to transcript replay (fork) or best-effort pass-through (raw id).
+ * Returns true if the source session was found and made resumable here; false lets
+ * the task-fork caller fall back to its stored visible transcript.
  */
 export function materializeFork(opts: {
   provider: string;
@@ -56,13 +52,10 @@ function claudeHomeCandidates(srcHome?: string, forkHome?: string): string[] {
   const add = (h?: string) => { if (h && !homes.includes(h)) homes.push(h); };
   add(srcHome);
   add(forkHome); // the destination home — so an already-in-place session resolves too
-  const base = paths().configHomes;
-  try { for (const d of fs.readdirSync(base)) add(path.join(base, d)); } catch { /* none */ }
-  add(path.join(os.homedir(), '.claude')); // ambient login
   return homes;
 }
 
-/** Find a Claude session `.jsonl` by id, searching srcHome/forkHome first, then all homes. */
+/** Find a Claude session `.jsonl` only in the explicitly selected homes. */
 function findClaudeSession(session: string, srcHome?: string, forkHome?: string): string | undefined {
   for (const home of claudeHomeCandidates(srcHome, forkHome)) {
     const projects = path.join(home, 'projects');
@@ -76,9 +69,8 @@ function findClaudeSession(session: string, srcHome?: string, forkHome?: string)
   return undefined;
 }
 
-/** Resolve a native Codex/Claude session for cross-provider panagent conversion.
- * Search is intentionally limited to provider history roots; callers cannot turn
- * a pasted id into an arbitrary host-filesystem read. */
+/** Resolve a native Codex/Claude session for a known task source. Search is
+ * intentionally limited to explicit homes; opaque ids never sweep the host. */
 export function findProviderSession(opts: {
   provider: string;
   session: string;
@@ -95,7 +87,7 @@ export function findProviderSession(opts: {
       const local = findCodexRollout(opts.session, opts.forkHome);
       if (local) return local;
     }
-    return findCodexRolloutAnywhere(opts.session, opts.srcHome);
+    return opts.srcHome ? findCodexRollout(opts.session, opts.srcHome) : undefined;
   }
   return undefined;
 }
@@ -113,16 +105,6 @@ function materializeClaude(opts: { session: string; forkHome: string; worldPath:
 }
 
 // ── Codex ────────────────────────────────────────────────────────────────────
-function codexHomeCandidates(srcHome?: string): string[] {
-  const homes: string[] = [];
-  const add = (h?: string) => { if (h && !homes.includes(h)) homes.push(h); };
-  add(srcHome);
-  const base = paths().configHomes;
-  try { for (const d of fs.readdirSync(base)) add(path.join(base, d)); } catch { /* none */ }
-  add(path.join(os.homedir(), '.codex')); // ambient login
-  return homes;
-}
-
 /** Find a Codex rollout file by session id under a home's sessions tree. */
 function findCodexRollout(session: string, home: string): string | undefined {
   const root = path.join(home, 'sessions');
@@ -140,23 +122,12 @@ function findCodexRollout(session: string, home: string): string | undefined {
   return undefined;
 }
 
-/** Find a Codex rollout by id, searching srcHome first, then all config-homes.
- *  A raw pasted id carries no source home, so we must sweep every home (mirrors
- *  Claude's `findClaudeSession`) rather than only trusting a provided `srcHome`. */
-function findCodexRolloutAnywhere(session: string, srcHome?: string): string | undefined {
-  for (const home of codexHomeCandidates(srcHome)) {
-    const hit = findCodexRollout(session, home);
-    if (hit) return hit;
-  }
-  return undefined;
-}
-
 function materializeCodex(opts: { session: string; forkHome: string; srcHome?: string }): boolean {
   // Already resolvable in this turn's home? (codex resumes by id, cwd-independent.)
   if (findCodexRollout(opts.session, opts.forkHome)) return true;
-  // Otherwise locate the source rollout in ANY home and copy it into this one so
-  // `codex exec resume <id>` finds it. Non-mutating (read-only on the source).
-  const src = findCodexRolloutAnywhere(opts.session, opts.srcHome);
+  // Otherwise copy it only from the source task's recorded home. Non-mutating
+  // (read-only on the source); never scan other users' connected histories.
+  const src = opts.srcHome ? findCodexRollout(opts.session, opts.srcHome) : undefined;
   if (!src) return false;
   const destDir = path.join(opts.forkHome, 'sessions', 'forked');
   fs.mkdirSync(destDir, { recursive: true });

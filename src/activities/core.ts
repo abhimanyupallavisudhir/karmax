@@ -62,7 +62,7 @@ import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
-import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
@@ -1653,9 +1653,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
         const upload = spec.resumeFrom.upload;
         const share = spec.resumeFrom.sessionId ? publicConversationShare(spec.resumeFrom.sessionId) : undefined;
-        if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
+        if (spec.resumeFrom.sessionId && !share) {
           throw ApplicationFailure.create({
-            message: 'Use a public HTTPS ChatGPT or Claude share link, or paste a provider conversation ID.',
+            message: 'Provider conversation IDs are not supported. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.',
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -1670,50 +1670,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         } else if (share) {
           const kind = await applyPanagent({ url: share }, 'context');
           record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind });
-        } else if (spec.resumeFrom.sessionId) {
-          // A raw pasted provider session id = "continue THIS exact session" (resume,
-          // not fork). Materialize it into this turn's (home × world) so the provider
-          // resolves it even when the id was minted under a DIFFERENT config home or
-          // world — Claude keys sessions by (home × cwd), Codex by id across homes, so
-          // a bare pass-through silently missed both. The copy is non-mutating, so the
-          // source is never disturbed; `fork` stays false to keep the same session id.
-          session = spec.resumeFrom.sessionId;
-          // The mock provider is hermetic — it has no on-disk session, so materialize is
-          // meaningless; pass the id straight through. Real providers (claude/codex) key
-          // a session to a file; make it visible in this turn's (home × world) or fail.
-          let materialized =
-            profile.provider === 'mock' || apiRail
-              || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
-              ? true
-              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
-          // A local id may belong to the other native provider. Convert it into a
-          // new independent destination session instead of rejecting the id merely
-          // because the user selected a different agent above the source control.
-          if (!materialized && (profile.provider === 'claude' || profile.provider === 'codex')) {
-            const sourceProvider = profile.provider === 'claude' ? 'codex' : 'claude';
-            const sourceFile = findProviderSession({ provider: sourceProvider, session });
-            if (sourceFile) {
-              const kind = await applyPanagent({ path: sourceFile }, 'transcript');
-              materialized = true;
-              record(args.taskId, 'session.imported', { source: 'local-id', sourceProvider, provider: profile.provider, kind });
-            }
-          }
-          if (!materialized) {
-            // The id resolves in NO config home for this provider. Fail loudly instead
-            // of handing an unknown id to the adapter, which would silently start a
-            // FRESH conversation — the user asked to continue a specific one, and would
-            // otherwise never learn it was lost. Permanent (nonRetryable): retrying can't
-            // conjure the session. Covers a typo, a cleaned session, or a cross-provider
-            // id (we run under this profile's provider).
-            record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
-            throw ApplicationFailure.create({
-              message: `Cannot find conversation "${session}" in any connected Codex or Claude history. Check the provider conversation ID and try again.`,
-              type: 'agent-error',
-              nonRetryable: true,
-            });
-          }
-          if (session === spec.resumeFrom.sessionId)
-            record(args.taskId, 'session.resumed', { session, materialized });
         } else if (spec.resumeFrom.taskId) {
           const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
           let srcHome: string | undefined;
