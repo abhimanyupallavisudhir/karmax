@@ -1,5 +1,6 @@
 // Verifies drag-to-reorder for the sidebar's project list (app.js): the pure
-// order computation (reorderProjects) and the drag wiring (wireProjectDrag).
+// order computation (reorderProjects), the drag wiring (wireProjectDrag), and
+// the folder a drop lands in (dropFolder).
 //
 // The traps this pins, each of which looks fine until you have a second
 // organization or drag to the bottom of the rail:
@@ -49,12 +50,17 @@ class El {
     const top = this.parent.children.indexOf(this) * ROW_H;
     return { top, height: ROW_H, bottom: top + ROW_H };
   }
+  // dropFolder reads the dropped row's neighbours to learn its new folder.
+  get nextElementSibling() { const k = this.parent.children; return k[k.indexOf(this) + 1] || null; }
+  get previousElementSibling() { const k = this.parent.children; return k[k.indexOf(this) - 1] || null; }
 }
 class Rail {
   constructor(children) { this.children = children; children.forEach((c) => { c.parent = this; }); }
   querySelectorAll(sel) {
-    if (sel !== '.proj[draggable="true"]') throw new Error(`unexpected selector ${sel}`);
-    return this.children.filter((c) => c.cls.has('proj') && c.dataset.id);
+    if (sel === '.proj[draggable="true"]') return this.children.filter((c) => c.cls.has('proj') && c.dataset.id != null);
+    if (sel === '.proj[draggable="true"], .proj.folder')
+      return this.children.filter((c) => (c.cls.has('proj') && c.dataset.id != null) || c.cls.has('folder'));
+    throw new Error(`unexpected selector ${sel}`);
   }
   insertBefore(node, ref) {
     this.children.splice(this.children.indexOf(node), 1);
@@ -80,6 +86,7 @@ let newProjectRow = new El('proj add');
 
 eval(extractFn('reorderProjects'));
 eval(extractFn('wireProjectDrag'));
+eval(extractFn('dropFolder'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -186,6 +193,60 @@ const proj = (id, organizationId = 'o1') => ({ id, name: id.toUpperCase(), organ
     wireProjectDrag(rail);
     await drag(rail, rows[2], 1);
     ok(posted.length === 1, 're-wiring the rail does not multiply the drop handler');
+  }
+
+  // ── folders: a drop also names the folder it landed in ─────────────────────
+  const folderProj = (id, folder) => ({ ...proj(id), ...(folder ? { folder } : {}) });
+  {
+    const three = [proj('a'), proj('b'), proj('c')];
+    const moved = reorderProjects(three, 'c', 'a', 'work');
+    ok(moved.find((p) => p.id === 'c').folder === 'work', 'a folder rides the move into the cache');
+    ok(three.find((p) => p.id === 'c').folder === undefined, 'the original entry is not mutated');
+    ok(reorderProjects(three, 'c', 'a', '').find((p) => p.id === 'c').folder === undefined,
+      "'' means top level — the folder key is dropped, not stored empty");
+  }
+
+  // The rail with one open folder: [header work] [a, b in work] [c at top level].
+  function mountFolders() {
+    newProjectRow = new El('proj add');
+    const header = new El('proj folder open', { folder: 'work' });
+    const rows = [new El('proj', { id: 'a', folder: 'work' }), new El('proj', { id: 'b', folder: 'work' }),
+      new El('proj', { id: 'c', folder: '' })];
+    const rail = new Rail([header, ...rows, newProjectRow, new El('nav-item')]);
+    global.S.projects = [folderProj('a', 'work'), folderProj('b', 'work'), folderProj('c')];
+    posted = []; repaints = 0; toasts = []; global.draggingProject = null; global.api = record;
+    wireProjectDrag(rail);
+    return { rail, rows };
+  }
+
+  { // Dropped between two folder members → it joins their folder.
+    const { rail, rows } = mountFolders();
+    await drag(rail, rows[2], ROW_H + 1); // the top half of a's row, just under the header
+    ok(posted[0].body.before === 'a' && posted[0].body.folder === 'work',
+      'a drop between folder members carries the folder');
+    ok(global.S.projects.find((p) => p.id === 'c').folder === 'work', 'the cache adopts the folder optimistically');
+  }
+
+  { // Dropped above the folder header → out of the folder, same `before` project.
+    const { rail, rows } = mountFolders();
+    await drag(rail, rows[0], 1);
+    ok(posted[0].body.before === 'b' && posted[0].body.folder === '',
+      'a drop above the header leaves the folder even though `before` stays inside it');
+    ok(global.S.projects.find((p) => p.id === 'a').folder === undefined, 'the cache clears the folder');
+  }
+
+  { // dropFolder reads the row's neighbours directly — the collapsed cases.
+    const below = (header) => {
+      const row = new El('proj', { id: 'x', folder: '' });
+      new Rail([header, row, new El('proj add')]);
+      return dropFolder(row);
+    };
+    ok(below(new El('proj folder', { folder: 'work' })) === '',
+      'below a collapsed folder the drop stays outside it — its inside is hidden');
+    ok(below(new El('proj folder', { folder: 'work/clients' })) === 'work',
+      'below a collapsed subfolder the drop lands in the visible parent');
+    ok(below(new El('proj folder open', { folder: 'work' })) === 'work',
+      'right under an open header the drop becomes its first child');
   }
 
   console.log(`${pass} passed, ${fail} failed`);

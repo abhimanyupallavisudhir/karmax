@@ -215,11 +215,16 @@ a { color: var(--accent); text-decoration: none; }
 .rail .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); padding: 8px 10px 4px; font-weight: 600; }
 .rail .proj {
   display: flex; align-items: center; gap: 9px;
-  padding: 8px 10px; border-radius: 7px; cursor: pointer; color: var(--ink-2);
+  padding: 8px 10px 8px calc(10px + 14px * var(--depth, 0));
+  border-radius: 7px; cursor: pointer; color: var(--ink-2);
 }
 .rail .proj:hover { background: var(--surface-2); color: var(--ink); }
 .rail .proj.active { background: var(--accent-weak); color: var(--ink); font-weight: 600; }
 .rail .proj .glyph { color: var(--accent); }
+/* Folder rows group the projects beneath them. Nesting depth is the --depth
+   custom property, not DOM structure — the rail stays a flat drag list. */
+.rail .proj.folder { font-weight: 600; }
+.rail .proj.folder .glyph { color: var(--ink-3); font-size: 10px; width: 11px; text-align: center; }
 .rail .proj .count { margin-left: auto; font-size: 11px; color: var(--ink-3); font-family: var(--font-mono); }
 /* Drag a project up or down to set the sidebar order. The row itself is the
    handle — the list is short and every row is a link, so an extra grip glyph

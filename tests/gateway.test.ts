@@ -652,6 +652,19 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       body: JSON.stringify({ before: one.id }) });
     expect(await listed()).toEqual(['Ord two', 'Ord one', 'Ord three']);
 
+    // A drop can also carry the sidebar folder the row landed in…
+    const filed = async () => ((await (await fetch(`${base}/api/projects`, { headers: auth() })).json()) as any[])
+      .find((p) => p.id === two.id);
+    await fetch(`${base}/api/projects/${two.id}/reorder`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ before: one.id, folder: 'Ops/Internal' }) });
+    expect((await filed()).folder).toBe('Ops/Internal');
+    // …and the settings form saves name and folder together; '' re-files the
+    // project at the top level.
+    const patched = await fetch(`${base}/api/projects/${two.id}`, { method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ name: 'Ord two', folder: '' }) });
+    expect(patched.status).toBe(200);
+    expect((await filed()).folder).toBeUndefined();
+
     const missing = await fetch(`${base}/api/projects/proj_nope/reorder`, { method: 'POST', headers: auth(),
       body: JSON.stringify({}) });
     expect(missing.status).toBe(400);
