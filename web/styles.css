@@ -449,6 +449,16 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .new-repository-slash { padding-bottom:10px; color:var(--ink-3); font:600 14px var(--font-mono); }
 .new-repository-private { width:max-content; margin:2px 0 18px; font-size:13px; }
 .new-repository-actions { display:flex; justify-content:flex-end; gap:8px; padding-top:14px; border-top:1px solid var(--line); }
+.new-project-dialog { width:min(460px,calc(100vw - 28px)); }
+.new-project-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin:-4px 0 18px; }
+.new-project-head > div { display:grid; gap:4px; }
+.new-project-head b { font-size:16px; letter-spacing:-.01em; }
+.new-project-head span, .new-project-preview { color:var(--ink-3); font-size:12px; line-height:1.45; }
+.new-project-dialog .form-row > span { color:var(--ink-2); font-size:12px; font-weight:600; }
+.new-project-dialog .form-row input { width:100%; box-sizing:border-box; }
+.new-project-preview { margin:8px 0 2px; }
+.new-project-error { margin-top:10px; color:var(--danger); font-size:12px; }
+.new-project-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:18px; padding-top:14px; border-top:1px solid var(--line); }
 .btn.saved { color:var(--ok, #4ec9a3); border-color:currentColor; }
 .settings-divider { height:1px; background:var(--line); margin:22px 0 18px; }
 .proposal-card { margin:10px 0; padding:12px; display:flex; align-items:center; gap:12px; border:1px solid var(--accent); border-radius:10px; background:var(--accent-weak); }

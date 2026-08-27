@@ -219,12 +219,31 @@ describe('Store', () => {
   });
 
   it('creates a project with a default task list', () => {
-    const p = store.createProject('Acme', { defaultBase: 'main' });
+    const p = store.createProject(' Work / Clients / Acme ', { defaultBase: 'main' });
     expect(p.id).toMatch(/^proj_/);
+    expect(p).toMatchObject({ name: 'Acme', folder: 'Work/Clients' });
     const lists = store.listLists(p.id);
     expect(lists).toHaveLength(1);
     expect(lists[0]!.name).toBe('Tasks');
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
+  });
+
+  it('keeps the final project name unique within its organization', () => {
+    const other = store.createOrganization({ name: 'Other org' });
+    const first = store.createProject('Work/Clients/Web Site');
+    expect(first).toMatchObject({ name: 'Web Site', folder: 'Work/Clients' });
+    // Folder paths do not enter the URL, so the leaf slug is the unique key.
+    expect(() => store.createProject('Personal/web site')).toThrow(/already exists/i);
+    expect(() => store.createProject('Other/Web-site')).toThrow(/already exists/i);
+    expect(() => store.createProject('')).toThrow(/required/i);
+    // The same leaf is valid in a different organization.
+    expect(store.createProject('Archive/Web Site', {}, other.id)).toMatchObject({ name: 'Web Site', folder: 'Archive' });
+
+    const second = store.createProject('Second');
+    expect(() => store.renameProject(second.id, 'New/Web Site')).toThrow(/already exists/i);
+    expect(store.getProject(second.id)).toMatchObject({ name: 'Second' });
+    expect(store.renameProject(second.id, 'New/Console')).toMatchObject({ name: 'Console', folder: 'New' });
+    expect(store.renameProject(second.id, 'Console')).not.toHaveProperty('folder');
   });
 
   it('reorders projects in the sidebar, per organization', () => {
@@ -318,13 +337,13 @@ describe('Store', () => {
     const organization = store.createOrganization({ name: 'Acme' });
     const project = store.createProject('Website', {}, organization.id);
 
-    expect(store.renameProject(project.id, '  Storefront  ')).toMatchObject({
-      id: project.id, organizationId: organization.id, name: 'Storefront',
+    expect(store.renameProject(project.id, '  Commerce / Storefront  ')).toMatchObject({
+      id: project.id, organizationId: organization.id, name: 'Storefront', folder: 'Commerce',
     });
     expect(store.renameOrganization(organization.id, '  Acme Labs  ')).toMatchObject({
       id: organization.id, name: 'Acme Labs', slug: organization.slug,
     });
-    expect(store.getProject(project.id)?.name).toBe('Storefront');
+    expect(store.getProject(project.id)).toMatchObject({ name: 'Storefront', folder: 'Commerce' });
     expect(store.getOrganization(organization.id)?.name).toBe('Acme Labs');
     expect(() => store.renameProject(project.id, 'settings')).toThrow(/reserved/i);
     expect(() => store.renameProject(project.id, '   ')).toThrow(/required/i);

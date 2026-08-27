@@ -940,16 +940,19 @@ export class Store {
 
   createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Project {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
-    assertRoutableName('project', name);
+    const path = parseProjectPath(name);
+    assertRoutableName('project', path.name);
+    this.assertUniqueProjectName(organizationId, path.name);
     config = writableProjectConfig(config);
     validateProjectExecutionConfig(config);
     const ord = (this.db
       .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
       .get(organizationId) as any).m + 1;
-    const p: Project = { id: newId('proj'), organizationId, name, createdAt: Date.now(), config, order: ord };
+    const p: Project = { id: newId('proj'), organizationId, name: path.name, createdAt: Date.now(), config, order: ord,
+      ...(path.folder ? { folder: path.folder } : {}) };
     this.db
-      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord);
+      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord, folder) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null);
     // every project gets a default task list
     this.createList(p.id, 'Tasks');
     return p;
@@ -969,11 +972,21 @@ export class Store {
   renameProject(id: string, name: string): Project {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`no project ${id}`);
-    const nextName = name.trim();
-    if (!nextName) throw new Error('project name is required');
-    assertRoutableName('project', nextName);
-    this.db.prepare('UPDATE projects SET name = ? WHERE id = ?').run(nextName, id);
-    return { ...existing, name: nextName };
+    const path = parseProjectPath(name);
+    assertRoutableName('project', path.name);
+    this.assertUniqueProjectName(existing.organizationId ?? 'org_personal', path.name, id);
+    this.db.prepare('UPDATE projects SET name = ?, folder = ? WHERE id = ?').run(path.name, path.folder ?? null, id);
+    const { folder: _, ...rest } = existing;
+    return { ...rest, name: path.name, ...(path.folder ? { folder: path.folder } : {}) };
+  }
+
+  /** Project URLs use the leaf name only, so the leaf's slug must be unique in
+   * its organization even when projects live in different sidebar folders. */
+  private assertUniqueProjectName(organizationId: string, name: string, exceptId?: string): void {
+    const wanted = slugify(name);
+    const conflict = this.listProjects().find((project) => project.id !== exceptId
+      && (project.organizationId ?? 'org_personal') === organizationId && slugify(project.name) === wanted);
+    if (conflict) throw new Error(`A project named "${name}" already exists in this organization.`);
   }
 
   /** Put a project in a sidebar folder ("Work/Clients"), or at the top level
@@ -6180,6 +6193,17 @@ function rowToProject(r: any): Project {
  * means top level — the column stores NULL, never ''. */
 function normalizeFolder(folder: unknown): string | undefined {
   return String(folder ?? '').split('/').map((s) => s.trim()).filter(Boolean).join('/') || undefined;
+}
+
+/** Split the one user-facing project path into its routable leaf name and its
+ * implicit sidebar folder. Empty path segments are harmless, matching folder
+ * normalization used by drag-and-drop. */
+function parseProjectPath(value: unknown): { name: string; folder?: string } {
+  const parts = String(value ?? '').split('/').map((part) => part.trim()).filter(Boolean);
+  const name = parts.pop();
+  if (!name) throw new Error('project name is required');
+  const folder = normalizeFolder(parts.join('/'));
+  return { name, ...(folder ? { folder } : {}) };
 }
 function rowToTag(r: any): Tag {
   return {

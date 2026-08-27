@@ -32,12 +32,27 @@ describe('Project settings browser source', () => {
     const organizationWiring = extractFunction('hydrateOrganizationView');
 
     expect(project).toContain('id="project-name"');
+    expect(project).toContain('value="${esc(projectPath(proj))}"');
+    expect(project).not.toContain('id="project-folder"');
     expect(project).toContain('id="rename-project"');
     expect(project).toContain('data-settings-access="projectDelete"');
     expect(organization).toContain('id="organization-name"');
     expect(organization).toContain('id="rename-organization"');
     expect(projectWiring).toContain("method: 'PATCH'");
+    expect(projectWiring).toContain('JSON.stringify({ name })');
+    expect(projectWiring).not.toContain('JSON.stringify({ name, folder })');
     expect(organizationWiring).toContain("method: 'PATCH'");
+  });
+
+  it('creates projects in a native escapable path dialog', () => {
+    const dialog = extractFunction('newProject');
+    expect(dialog).toContain('class="modal-card new-project-dialog"');
+    expect(dialog).toContain('role="dialog" aria-modal="true"');
+    expect(dialog).toContain('placeholder="e.g. Work/Clients/Website"');
+    expect(dialog).toContain("if (event.key === 'Escape') close()");
+    expect(dialog).toContain("if (event.target === event.currentTarget) close()");
+    expect(dialog).toContain("$('#modal-root').appendChild(host)");
+    expect(dialog).not.toContain("prompt('Project name')");
   });
 
   it('keeps the post-delete fallback inside the deleted project’s organization', () => {

@@ -262,6 +262,7 @@ function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
+function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
 function firstProjectForOrganization(organizationId) {
   return (S.projects || []).find((p) => p.organizationId === organizationId);
@@ -11035,8 +11036,8 @@ function settingsView(proj) {
       <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden>
-      <div class="section-h" data-settings-access="project" hidden>Project name &amp; sidebar folder</div>
-      <div class="inline-form"><input id="project-name" value="${esc(proj.name)}" aria-label="Project name" data-settings-access="project" hidden><input id="project-folder" value="${esc(proj.folder || '')}" placeholder="Folder — optional, nest with /" aria-label="Sidebar folder" list="project-folder-options" data-settings-access="project" hidden><datalist id="project-folder-options">${[...new Set(S.projects.filter((p) => p.organizationId === proj.organizationId && p.folder).map((p) => p.folder))].map((f) => `<option value="${esc(f)}">`).join('')}</datalist><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
+      <div class="section-h" data-settings-access="project" hidden>Project name</div>
+      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
     </div></div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
@@ -11607,19 +11608,17 @@ function wireSettingsView(proj) {
   const renameProject = async () => {
     const name = $('#project-name')?.value.trim();
     if (!name) return toast('Project name is required', true);
-    const folder = $('#project-folder')?.value.trim() ?? '';
     try {
-      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name, folder }) });
+      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
       await loadProjects();
       toast('Project saved');
       await go(`${projectRoute(proj.id, 'settings')}${location.hash}`, { replace: true });
     } catch (e) { toast(e.message, true); }
   };
   $('#rename-project')?.addEventListener('click', renameProject);
-  for (const field of ['#project-name', '#project-folder'])
-    $(field)?.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
-    });
+  $('#project-name')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); renameProject(); }
+  });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -15116,24 +15115,60 @@ function toggleTheme() {
 })();
 
 // ── projects ─────────────────────────────────────────────────────────────────
-async function newProject() {
-  const name = prompt('Project name');
-  if (!name) return;
-  try {
-    // Create with an EMPTY config so branches (and every other field) inherit
-    // from global settings. Hardcoding defaultBase/defaultTarget here would bake
-    // a project-scope override that shadows the global default (e.g. "master"),
-    // which is exactly the inheritance bug this avoids.
-    const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
-    const p = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }) });
-    await loadProjects();
-    // Route into the new project so its tasks, tags, saved views and search all
-    // load fresh — setting S.projectId + re-rendering alone leaves the previous
-    // project's tasks/views on screen (applyRoute does the loading on switch).
-    // Land on Project settings: a freshly created project has no tasks yet, and
-    // configuring it (branches, agent, budget…) is the first thing to do.
-    await go(projectRoute(p.id, 'settings'));
-  } catch (e) { toast(e.message, true); }
+function newProject() {
+  const opener = document.activeElement;
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
+    <div class="new-project-head"><div><b id="new-project-title">New project</b><span>Use slashes to organize it into folders.</span></div><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Project name</span><input id="new-project-name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false"></label>
+    <div class="new-project-preview" aria-live="polite">The final segment is the project name; everything before it becomes its sidebar folder.</div>
+    <div class="form-error new-project-error" role="alert" hidden></div>
+    <div class="new-project-actions"><button class="btn new-project-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Create project</button></div>
+  </form></div>`;
+  const controller = new AbortController();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    controller.abort();
+    document.removeEventListener('keydown', keydown);
+    host.remove();
+    opener?.focus?.();
+  };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.new-project-close').addEventListener('click', close);
+  host.querySelector('.new-project-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = host.querySelector('#new-project-name').value.trim();
+    const error = host.querySelector('.new-project-error');
+    const button = event.submitter;
+    if (!name) return;
+    error.hidden = true;
+    if (button) { button.disabled = true; button.textContent = 'Creating…'; }
+    try {
+      // Create with an EMPTY config so every field inherits from global settings.
+      const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
+      const project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }), signal: controller.signal });
+      if (closed) return;
+      document.removeEventListener('keydown', keydown);
+      host.remove();
+      closed = true;
+      await loadProjects();
+      // A fresh project has no tasks, so Project settings remains the useful landing.
+      await go(projectRoute(project.id, 'settings'));
+    } catch (cause) {
+      if (closed || cause?.name === 'AbortError') return;
+      error.textContent = cause.message;
+      error.hidden = false;
+      if (button) { button.disabled = false; button.textContent = 'Create project'; }
+      host.querySelector('#new-project-name').focus();
+    }
+  });
+  $('#modal-root').appendChild(host);
+  document.addEventListener('keydown', keydown);
+  host.querySelector('#new-project-name').focus();
 }
 
 // ── keyboard navigation / command registry (SPEC §10.1) ─────────────────────

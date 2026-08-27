@@ -658,12 +658,17 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await fetch(`${base}/api/projects/${two.id}/reorder`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ before: one.id, folder: 'Ops/Internal' }) });
     expect((await filed()).folder).toBe('Ops/Internal');
-    // …and the settings form saves name and folder together; '' re-files the
-    // project at the top level.
+    // …and the settings form sends one path; the store infers both fields.
     const patched = await fetch(`${base}/api/projects/${two.id}`, { method: 'PATCH', headers: auth(),
-      body: JSON.stringify({ name: 'Ord two', folder: '' }) });
+      body: JSON.stringify({ name: 'Archive/Ord two' }) });
     expect(patched.status).toBe(200);
-    expect((await filed()).folder).toBeUndefined();
+    expect(await filed()).toMatchObject({ name: 'Ord two', folder: 'Archive' });
+
+    // The leaf name remains unique across folders in the same organization.
+    const duplicate = await fetch(`${base}/api/projects/${two.id}`, { method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ name: 'Elsewhere/Ord one' }) });
+    expect(duplicate.status).toBe(400);
+    expect(((await duplicate.json()) as any).error).toMatch(/already exists/i);
 
     const missing = await fetch(`${base}/api/projects/proj_nope/reorder`, { method: 'POST', headers: auth(),
       body: JSON.stringify({}) });
@@ -1267,7 +1272,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
     const prepTitle = 'Make this project krmax-ready';
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
-      const project: any = await post(path, { name: `Fresh via ${path}` });
+      const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
+      const project: any = await post(path, { name });
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
       const prep = tasks.find((t: any) => t.title === prepTitle);
       expect(prep, `new project via ${path} should get the prep task`).toBeTruthy();
