@@ -37,7 +37,8 @@ import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, san
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
-import { publicConversationShare } from '../agent/panagent.js';
+import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
+import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
@@ -297,6 +298,8 @@ export interface KarmaxApiDeps {
   defaultAgentProvider?: Provider;
   /** Enforce hosted control-plane invariants without consulting mutable ambient env. */
   hosted?: boolean;
+  /** Gate host-filesystem affordances without consulting mutable ambient env. */
+  hostLocal?: boolean;
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
@@ -818,7 +821,8 @@ export class KarmaxApi {
    * Validate each agent resume source, then authorize every
    * `agent:<role>.resumeFrom.taskId` against the **source** task, not just the
    * task being created/edited. A `sessionId` is accepted only when it is a
-   * supported public share URL; opaque provider ids cannot initiate host search.
+   * supported public share URL, unless this is a host-local install where the
+   * browser and provider histories intentionally share one machine.
    *
    * `resumeFrom` makes the activity runtime (`src/activities/core.ts`) load
    * another task's provider session and splice its transcript into the new
@@ -835,8 +839,12 @@ export class KarmaxApi {
       const resumeFrom = (value as Record<string, unknown>).resumeFrom;
       if (!resumeFrom || typeof resumeFrom !== 'object' || Array.isArray(resumeFrom)) continue;
       const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
-      if (sessionId !== undefined && (typeof sessionId !== 'string' || !publicConversationShare(sessionId)))
-        throw new Error('provider conversation IDs are not supported; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
+      if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId.trim()
+        || (looksLikeConversationUrl(sessionId) && !publicConversationShare(sessionId))))
+        throw new ValidationError('use a public HTTPS ChatGPT/Claude share link or upload a conversation file');
+      if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
+        && !(this.deps.hostLocal ?? deploymentHostLocal()))
+        throw new ValidationError('provider conversation IDs are available only on a host-local Karmax; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = this.deps.store.getTask(sourceId);

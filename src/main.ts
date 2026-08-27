@@ -338,6 +338,7 @@ async function main() {
     resources,
     objects: objectStore,
     contentDir: p.content,
+    hostLocal: deployment.hostLocal,
     taskQueue: TASK_QUEUE,
   });
   await workerManager.start();
@@ -493,7 +494,8 @@ async function main() {
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
-    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, providerConnections, worlds,
+    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
+    providerConnections, worlds,
     worldAccess, runners, resources, broker, githubApp, bus,
     refreshCredentialHealth: async (task, credentialProvider) => {
       const organizationId = store.getProject(task.projectId)?.organizationId ?? 'org_personal';

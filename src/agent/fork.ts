@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { paths } from '../config/paths.js';
 
 /**
  * Fork a prior agent's session (SPEC §10.5) — branch a NEW conversation from the
@@ -17,10 +19,11 @@ import path from 'node:path';
  *    conversation history, no auth. Survives world cleanup (the file lives in the home).
  *  - Codex: a rollout under `<CODEX_HOME>/sessions/<date>/rollout-…-<id>.jsonl`, resolved
  *    by id regardless of cwd. If the rollout isn't already in this turn's home, we copy
- *    it from the source task's recorded home. The adapter then resumes/forks it.
+ *    it from the source task's recorded home, or (only with host-local admission) from
+ *    another installation config home. The adapter then resumes/forks it.
  *
- * Used for task-to-task forks. Raw provider ids are deliberately unsupported: an
- * opaque id must never trigger a search across the Karmax installation's histories.
+ * Used for task-to-task forks. A host-local install may explicitly opt into an
+ * installation search for a pasted provider id; remote/hosted callers never do.
  *
  * Returns true if the source session was found and made resumable here; false lets
  * the task-fork caller fall back to its stored visible transcript.
@@ -31,6 +34,7 @@ export function materializeFork(opts: {
   forkHome: string;
   worldPath: string;
   srcHome?: string;
+  searchInstallation?: boolean;
 }): boolean {
   try {
     if (!validNativeSessionId(opts.session)) return false;
@@ -47,17 +51,23 @@ const validNativeSessionId = (value: string): boolean => /^[a-zA-Z0-9_-]{8,160}$
 /** Claude's cwd-slug: the world path with every non-alphanumeric char turned to '-'. */
 export const claudeCwdSlug = (worldPath: string) => worldPath.replace(/[^a-zA-Z0-9]/g, '-');
 
-function claudeHomeCandidates(srcHome?: string, forkHome?: string): string[] {
+function claudeHomeCandidates(srcHome?: string, forkHome?: string, searchInstallation = false): string[] {
   const homes: string[] = [];
   const add = (h?: string) => { if (h && !homes.includes(h)) homes.push(h); };
   add(srcHome);
   add(forkHome); // the destination home — so an already-in-place session resolves too
+  if (searchInstallation) {
+    const base = paths().configHomes;
+    try { for (const d of fs.readdirSync(base)) add(path.join(base, d)); } catch { /* none */ }
+    add(path.join(os.homedir(), '.claude')); // ambient login
+  }
   return homes;
 }
 
 /** Find a Claude session `.jsonl` only in the explicitly selected homes. */
-function findClaudeSession(session: string, srcHome?: string, forkHome?: string): string | undefined {
-  for (const home of claudeHomeCandidates(srcHome, forkHome)) {
+function findClaudeSession(session: string, srcHome?: string, forkHome?: string,
+  searchInstallation = false): string | undefined {
+  for (const home of claudeHomeCandidates(srcHome, forkHome, searchInstallation)) {
     const projects = path.join(home, 'projects');
     let dirs: string[];
     try { dirs = fs.readdirSync(projects); } catch { continue; }
@@ -69,31 +79,45 @@ function findClaudeSession(session: string, srcHome?: string, forkHome?: string)
   return undefined;
 }
 
-/** Resolve a native Codex/Claude session for a known task source. Search is
- * intentionally limited to explicit homes; opaque ids never sweep the host. */
+/** Resolve a native Codex/Claude session. Search is limited to explicit homes
+ * unless a host-local caller deliberately sets `searchInstallation`. */
 export function findProviderSession(opts: {
   provider: string;
   session: string;
   srcHome?: string;
   forkHome?: string;
+  searchInstallation?: boolean;
 }): string | undefined {
   // Provider ids are opaque, but current Claude/Codex ids are UUID-like. A
   // minimum length prevents a vague substring (for example `.` or `abc`) from
   // selecting the first unrelated Codex rollout whose filename happens to match.
   if (!validNativeSessionId(opts.session)) return undefined;
-  if (opts.provider === 'claude') return findClaudeSession(opts.session, opts.srcHome, opts.forkHome);
+  if (opts.provider === 'claude')
+    return findClaudeSession(opts.session, opts.srcHome, opts.forkHome, opts.searchInstallation);
   if (opts.provider === 'codex') {
     if (opts.forkHome) {
       const local = findCodexRollout(opts.session, opts.forkHome);
       if (local) return local;
     }
-    return opts.srcHome ? findCodexRollout(opts.session, opts.srcHome) : undefined;
+    if (opts.srcHome) {
+      const source = findCodexRollout(opts.session, opts.srcHome);
+      if (source) return source;
+    }
+    if (opts.searchInstallation) {
+      for (const home of codexInstallationHomes()) {
+        if (home === opts.srcHome || home === opts.forkHome) continue;
+        const source = findCodexRollout(opts.session, home);
+        if (source) return source;
+      }
+    }
+    return undefined;
   }
   return undefined;
 }
 
-function materializeClaude(opts: { session: string; forkHome: string; worldPath: string; srcHome?: string }): boolean {
-  const src = findClaudeSession(opts.session, opts.srcHome, opts.forkHome);
+function materializeClaude(opts: { session: string; forkHome: string; worldPath: string; srcHome?: string;
+  searchInstallation?: boolean }): boolean {
+  const src = findClaudeSession(opts.session, opts.srcHome, opts.forkHome, opts.searchInstallation);
   if (!src) return false;
   const destDir = path.join(opts.forkHome, 'projects', claudeCwdSlug(opts.worldPath));
   const dest = path.join(destDir, `${opts.session}.jsonl`);
@@ -105,6 +129,15 @@ function materializeClaude(opts: { session: string; forkHome: string; worldPath:
 }
 
 // ── Codex ────────────────────────────────────────────────────────────────────
+function codexInstallationHomes(): string[] {
+  const homes: string[] = [];
+  const add = (home?: string) => { if (home && !homes.includes(home)) homes.push(home); };
+  const base = paths().configHomes;
+  try { for (const d of fs.readdirSync(base)) add(path.join(base, d)); } catch { /* none */ }
+  add(path.join(os.homedir(), '.codex'));
+  return homes;
+}
+
 /** Find a Codex rollout file by session id under a home's sessions tree. */
 function findCodexRollout(session: string, home: string): string | undefined {
   const root = path.join(home, 'sessions');
@@ -122,12 +155,14 @@ function findCodexRollout(session: string, home: string): string | undefined {
   return undefined;
 }
 
-function materializeCodex(opts: { session: string; forkHome: string; srcHome?: string }): boolean {
+function materializeCodex(opts: { session: string; forkHome: string; srcHome?: string;
+  searchInstallation?: boolean }): boolean {
   // Already resolvable in this turn's home? (codex resumes by id, cwd-independent.)
   if (findCodexRollout(opts.session, opts.forkHome)) return true;
-  // Otherwise copy it only from the source task's recorded home. Non-mutating
-  // (read-only on the source); never scan other users' connected histories.
-  const src = opts.srcHome ? findCodexRollout(opts.session, opts.srcHome) : undefined;
+  // Otherwise copy it from the source task's recorded home, or from the local
+  // installation only when the caller has explicitly admitted host search.
+  const src = findProviderSession({ provider: 'codex', session: opts.session, srcHome: opts.srcHome,
+    forkHome: opts.forkHome, searchInstallation: opts.searchInstallation });
   if (!src) return false;
   const destDir = path.join(opts.forkHome, 'sessions', 'forked');
   fs.mkdirSync(destDir, { recursive: true });

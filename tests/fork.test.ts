@@ -82,7 +82,7 @@ describe('materializeFork — Codex (by id in the home)', () => {
     }
   });
 
-  it('does not search other config homes when no source home is given', () => {
+  it('searches other Codex config homes only with host-local admission', () => {
     const dataHome = tmp('karmax-forkhome-');
     const priorHome = process.env.KARMAX_HOME;
     process.env.KARMAX_HOME = dataHome;
@@ -97,6 +97,8 @@ describe('materializeFork — Codex (by id in the home)', () => {
       fs.writeFileSync(path.join(day, `rollout-2026-07-05T00-00-00-${session}.jsonl`), '{}\n');
       expect(materializeFork({ provider: 'codex', session, forkHome, worldPath: '/tmp/w' })).toBe(false);
       expect(fs.existsSync(path.join(forkHome, 'sessions', 'forked', `rollout-2026-07-05T00-00-00-${session}.jsonl`))).toBe(false);
+      expect(materializeFork({ provider: 'codex', session, forkHome, worldPath: '/tmp/w', searchInstallation: true })).toBe(true);
+      expect(fs.existsSync(path.join(forkHome, 'sessions', 'forked', `rollout-2026-07-05T00-00-00-${session}.jsonl`))).toBe(true);
     } finally {
       if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
       fs.rmSync(dataHome, { recursive: true, force: true });
@@ -104,7 +106,7 @@ describe('materializeFork — Codex (by id in the home)', () => {
     }
   });
 
-  it('does not search other Claude config homes without an explicit source', () => {
+  it('searches other Claude config homes only with host-local admission', () => {
     const dataHome = tmp('karmax-forkhome-cl-');
     const priorHome = process.env.KARMAX_HOME;
     process.env.KARMAX_HOME = dataHome;
@@ -117,6 +119,8 @@ describe('materializeFork — Codex (by id in the home)', () => {
       fs.writeFileSync(path.join(projects, `${session}.jsonl`), '{}\n');
       expect(materializeFork({ provider: 'claude', session, forkHome, worldPath: '/tmp/w' })).toBe(false);
       expect(fs.existsSync(path.join(forkHome, 'projects', claudeCwdSlug('/tmp/w'), `${session}.jsonl`))).toBe(false);
+      expect(materializeFork({ provider: 'claude', session, forkHome, worldPath: '/tmp/w', searchInstallation: true })).toBe(true);
+      expect(fs.existsSync(path.join(forkHome, 'projects', claudeCwdSlug('/tmp/w'), `${session}.jsonl`))).toBe(true);
     } finally {
       if (priorHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = priorHome;
       fs.rmSync(dataHome, { recursive: true, force: true });

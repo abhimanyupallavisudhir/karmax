@@ -352,15 +352,37 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     await poll(inherited.id, 'done');
   });
 
-  it('rejects raw provider session ids before creating a task', async () => {
-    const response = await fetch(`${base}/api/projects/${projectId}/tasks`, {
-      method: 'POST', headers: auth(), body: JSON.stringify({
+  it('CONTINUES (not forks) when a host-local install receives a raw session id', async () => {
+    const b = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Raw resume',
       workflow: 'software-dev',
       params: { prompt: '@write r.txt :: r\n@review r', 'agent:do': { provider: 'mock', resumeFrom: { sessionId: 'sess-explicit-123' } } },
-      }),
     });
+    await poll(b.id, 'review');
+    const events = await get(`/api/tasks/${b.id}/events?since=0`);
+    expect(events.some((e: any) => e.type === 'session.resumed')).toBe(true);
+    expect(events.some((e: any) => e.type === 'session.forked')).toBe(false);
+    await post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' });
+    await poll(b.id, 'done');
+  });
+
+  it('rejects raw provider session ids when the console is not host-local', async () => {
+    const previous = process.env.KARMAX_HOST_LOCAL;
+    process.env.KARMAX_HOST_LOCAL = '0';
+    let response: Response;
+    try {
+      response = await fetch(`${base}/api/projects/${projectId}/tasks`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({
+          title: 'Remote raw resume',
+          workflow: 'software-dev',
+          params: { prompt: 'Do not create this task', 'agent:do': { provider: 'mock', resumeFrom: { sessionId: 'sess-explicit-123' } } },
+        }),
+      });
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_HOST_LOCAL;
+      else process.env.KARMAX_HOST_LOCAL = previous;
+    }
     expect(response.status).toBe(400);
-    expect((await J(response)).error).toContain('provider conversation IDs are not supported');
+    expect((await J(response)).error).toContain('only on a host-local Karmax');
   });
 });

@@ -62,7 +62,7 @@ import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
-import { importWithPanagent, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
@@ -70,6 +70,7 @@ import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { paths } from '../config/paths.js';
+import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
@@ -233,6 +234,8 @@ export interface CoreActivityDeps {
   resources?: import('../world/resources.js').ProjectResourceService;
   objects?: ObjectStore;
   contentDir?: string;
+  /** Snapshot of whether this console is running on the user's own machine. */
+  hostLocal?: boolean;
 }
 
 /** What the PR stage puts on the pull request it opens for the task. */
@@ -1653,9 +1656,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
         const upload = spec.resumeFrom.upload;
         const share = spec.resumeFrom.sessionId ? publicConversationShare(spec.resumeFrom.sessionId) : undefined;
-        if (spec.resumeFrom.sessionId && !share) {
+        const allowProviderId = deps.hostLocal ?? deploymentHostLocal();
+        if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
           throw ApplicationFailure.create({
-            message: 'Provider conversation IDs are not supported. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.',
+            message: 'Use a public HTTPS ChatGPT or Claude share link, or upload a conversation file.',
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+        }
+        if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
+          throw ApplicationFailure.create({
+            message: 'Provider conversation IDs are available only on a host-local Karmax. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.',
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -1670,6 +1681,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         } else if (share) {
           const kind = await applyPanagent({ url: share }, 'context');
           record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind });
+        } else if (spec.resumeFrom.sessionId) {
+          // A raw id is meaningful only on a host-local install, where the UI and
+          // provider histories share one machine. Continue that exact session
+          // (rather than branching it), copying its native file into the selected
+          // config home/world when necessary.
+          session = spec.resumeFrom.sessionId;
+          let materialized =
+            profile.provider === 'mock' || apiRail
+              || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
+              ? true
+              : materializeFork({ provider: profile.provider, session, forkHome,
+                worldPath: worldWorkingDirectory(world.handle), searchInstallation: true });
+          // A local id may belong to the other native provider. Convert it into a
+          // new independent destination session instead of rejecting the id merely
+          // because the user selected a different agent above the source control.
+          if (!materialized && (profile.provider === 'claude' || profile.provider === 'codex')) {
+            const sourceProvider = profile.provider === 'claude' ? 'codex' : 'claude';
+            const sourceFile = findProviderSession({ provider: sourceProvider, session, searchInstallation: true });
+            if (sourceFile) {
+              const kind = await applyPanagent({ path: sourceFile }, 'transcript');
+              materialized = true;
+              record(args.taskId, 'session.imported', { source: 'local-id', sourceProvider, provider: profile.provider, kind });
+            }
+          }
+          if (!materialized) {
+            record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
+            throw ApplicationFailure.create({
+              message: `Cannot find conversation "${session}" in this Karmax installation's Codex or Claude history. Check the provider conversation ID and try again.`,
+              type: 'agent-error',
+              nonRetryable: true,
+            });
+          }
+          record(args.taskId, 'session.resumed', { session, materialized });
         } else if (spec.resumeFrom.taskId) {
           const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
           let srcHome: string | undefined;
