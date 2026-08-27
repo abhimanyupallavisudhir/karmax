@@ -21,7 +21,8 @@ global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
 global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
-global.S = { tasks: [] };
+global.S = { tasks: [], meta: { hostLocal: true } };
+global.hostLocal = () => S.meta?.hostLocal !== false;
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('renderAgentField'));
@@ -35,8 +36,14 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
-ok(closed.includes('provider conversation ID or a ChatGPT/Claude share link'), 'provider ids and public share links are named in the compact input');
+ok(closed.includes('provider conversation ID or public ChatGPT/Claude share link'), 'a local console advertises provider ids and public share links');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
+
+S.meta.hostLocal = false;
+const hosted = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
+ok(hosted.includes('paste a public ChatGPT/Claude share link'), 'a nonlocal console still advertises public share links');
+ok(!hosted.includes('provider conversation ID'), 'a nonlocal console does not advertise inaccessible provider ids');
+S.meta.hostLocal = true;
 
 const existing = renderAgentField(
   { role: 'do', name: 'agent:do' },

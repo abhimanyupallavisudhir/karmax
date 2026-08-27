@@ -1365,12 +1365,13 @@ export interface AgentSpec {
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  /** Fork prior context from a task agent, a provider conversation id/public
-   * share link, or a project-scoped uploaded Codex/Claude conversation file. */
+  /** Fork prior context from a task agent, a public share link, a host-local
+   * provider conversation id, or an uploaded Codex/Claude conversation file. */
   resumeFrom?: {
     taskId?: string;
     role?: string;
-    /** Native provider id, or a public chatgpt.com/share / claude.ai/share URL. */
+    /** A public chatgpt.com/share / claude.ai/share URL, or a native provider id
+     * when the Karmax console is host-local. */
     sessionId?: string;
     upload?: {
       id: string;
