@@ -2972,19 +2972,19 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
-            // Name and sidebar folder ride together (the settings form saves
-            // both with one button), but never alongside config.
+            // A project name may be a full sidebar path ("Work/Clients/Site").
+            // The store atomically derives folder=Work/Clients and name=Site.
+            // Folder-only PATCH remains for API clients that mirror drag moves.
             if (Object.prototype.hasOwnProperty.call(b, 'name') || Object.prototype.hasOwnProperty.call(b, 'folder')) {
               if (Object.prototype.hasOwnProperty.call(b, 'config'))
                 throw new Error('update the project name and configuration separately');
-              let project;
               if (Object.prototype.hasOwnProperty.call(b, 'name')) {
                 if (typeof b.name !== 'string') throw new Error('project name is required');
-                project = store.renameProject(id, b.name);
+                if (Object.prototype.hasOwnProperty.call(b, 'folder'))
+                  throw new Error('include the folder in the project name, for example "Work/Project"');
+                return this.json(res, 200, store.renameProject(id, b.name));
               }
-              if (Object.prototype.hasOwnProperty.call(b, 'folder'))
-                project = store.setProjectFolder(id, String(b.folder ?? ''));
-              return this.json(res, 200, project);
+              return this.json(res, 200, store.setProjectFolder(id, String(b.folder ?? '')));
             }
             const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = store.getProject(id);
