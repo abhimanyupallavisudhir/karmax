@@ -7,6 +7,7 @@ import { CodexAdapter } from '../src/agent/codex.js';
 import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
   CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
+import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
 const codexIdToken = (expiresAt: number) =>
@@ -97,6 +98,30 @@ describe('remote subscription agents', () => {
     })));
     await syncRemoteAgentHome(first, 'claude', a, localHome);
     expect(fs.readFileSync(path.join(localHome, '.credentials.json'), 'utf8')).toBe(JSON.stringify(credential));
+  });
+
+  it('refreshes the canonical Claude login before projecting it without refresh authority', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-preflight-'));
+    fs.writeFileSync(path.join(localHome, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'expired-access', refreshToken: 'canonical-refresh', expiresAt: Date.now() - 1,
+    } }));
+    await ensureClaudeAccessTokenFresh({
+      configHome: localHome,
+      minValidityMs: 60_000,
+      run: async () => {
+        fs.writeFileSync(path.join(localHome!, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+          accessToken: 'fresh-access', refreshToken: 'rotated-canonical-refresh',
+          expiresAt: Date.now() + 3_600_000,
+        } }));
+        return '';
+      },
+    });
+
+    const world = fakeWorld();
+    const seeded = await seedRemoteAgentHome(world, 'claude', localHome);
+    const projected = JSON.parse(world.files.get(`${seeded.relative}/.credentials.json`)!.toString());
+    expect(projected.claudeAiOauth.accessToken).toBe('fresh-access');
+    expect(projected.claudeAiOauth.refreshToken).toBeUndefined();
   });
 
   it('passes only the remote home and explicit turn-scoped environment', () => {

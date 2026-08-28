@@ -114,7 +114,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
   it('selects the remote Claude spawn rail and keeps all platform tools available', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-'));
     fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
-      claudeAiOauth: { accessToken: 'subscription', refreshToken: 'host-only-refresh', expiresAt: Date.now() + 60_000 },
+      claudeAiOauth: { accessToken: 'subscription', refreshToken: 'host-only-refresh', expiresAt: Date.now() + 60 * 60_000 },
     }));
     const files = new Map<string, Buffer>();
     const world: any = {

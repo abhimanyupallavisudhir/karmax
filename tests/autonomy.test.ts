@@ -225,6 +225,50 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('can force provider OAuth when an existing native credential is stale', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-force-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'work');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'stale' } }));
+    let launches = 0;
+    const login = new LoginManager(homes, () => {
+      launches++;
+      return {
+        cmd: 'bash', args: ['-c', 'echo "Visit https://example.com/reauth"; sleep 1'],
+        env: {} as Record<string, string>,
+      };
+    });
+    try {
+      await expect(login.connect('claude', 'work')).resolves.toMatchObject({ status: 'logged_in' });
+      expect(launches).toBe(0);
+      await expect(login.connect('claude', 'work', { force: true, urlTimeoutMs: 500 }))
+        .resolves.toMatchObject({ status: 'awaiting_oauth', loginUrl: 'https://example.com/reauth' });
+      expect(launches).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mistake the predecessor credential for a successful forced authorization code', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-force-reject-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'work');
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'stale' } }));
+    const login = new LoginManager(homes, () => ({
+      cmd: 'bash',
+      args: ['-c', "printf 'Visit https://example.com/reauth\\nPaste code here > '; IFS= read -r code; exit 1"],
+      env: {} as Record<string, string>,
+    }));
+    try {
+      await expect(login.connect('claude', 'work', { force: true, urlTimeoutMs: 500 }))
+        .resolves.toMatchObject({ status: 'awaiting_oauth' });
+      await expect(login.submitAuthorizationCode('claude', 'work', 'rejected-code'))
+        .resolves.toMatchObject({ status: 'failed' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('mints a home and captures the device URL from the provider login', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-'));
     const homes = new ConfigHomeManager(dir);
