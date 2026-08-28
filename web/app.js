@@ -8887,12 +8887,18 @@ function paramsSection(v) {
     return `<div class="section-h">Parameters</div>
       <button class="btn sm" id="edit-draft-params">Edit parameters…</button>`;
   }
-  if (TERMINAL_STAGES.includes(v.stage)) return '';
   const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task'));
   if (!fields.length) return '';
-  const editable = new Set(v.editableParams || []);
+  // Finishing a task freezes its configuration; it does not erase the record of
+  // what ran. Keep terminal-task parameters visible, but defensively ignore any
+  // stale editable window left on an older persisted view.
+  const terminal = TERMINAL_STAGES.includes(v.stage);
+  const editable = new Set(terminal ? [] : (v.editableParams || []));
   const inheritedAll = S.paramDefaults || {};
-  const lock = `<span title="Frozen — this parameter has already been used (send a follow-up to change direction)" style="color:var(--ink-3)">🔒</span>`;
+  const frozenTitle = terminal
+    ? 'Frozen — this task has finished'
+    : 'Frozen — this parameter has already been used (send a follow-up to change direction)';
+  const lock = `<span title="${frozenTitle}" style="color:var(--ink-3)">🔒</span>`;
   const rows = fields
     .map((f) => {
       const own = paramCurrentValue(f, v, rec);
@@ -8905,7 +8911,7 @@ function paramsSection(v) {
         if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${control}</div>`;
         // frozen: same control, disabled (read-only), with a lock in the corner
         return `<div class="form-row" data-row="${esc(f.name)}" style="position:relative">
-          <span style="position:absolute;right:0;top:0" title="Frozen — this agent has already run (send a follow-up to change direction)">🔒</span>
+          <span style="position:absolute;right:0;top:0" title="${frozenTitle}">🔒</span>
           <fieldset disabled style="border:none;padding:0;margin:0;min-inline-size:auto;opacity:.65">${control}</fieldset></div>`;
       }
       if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
@@ -8916,11 +8922,13 @@ function paramsSection(v) {
     .join('');
   const footer = editable.size
     ? `<button class="btn sm primary" id="params-save">Save changes</button>`
-    : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
+    : `<div class="task-sub" style="color:var(--ink-3)">${terminal
+      ? 'This task has finished. Parameters are read-only.'
+      : 'Locked after queue — send a follow-up to change direction.'}</div>`;
   return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
 }
 
-// Best-known current value of a param for a running task (the view carries a few;
+// Best-known current value of a task param (the view carries a few;
 // the task record holds the rest of the user's own overrides).
 function paramCurrentValue(f, v, rec) {
   const own = (rec && rec.params) || {};
