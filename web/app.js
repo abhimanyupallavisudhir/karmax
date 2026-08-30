@@ -13728,7 +13728,10 @@ function wireGlobalSettings(organizationId) {
       const btn = $('#login-connect'); btn.disabled = true;
       const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
         method: 'POST',
-        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod }),
+        // Clicking Connect is an explicit re-authentication request. Without
+        // force, an expired native credential file was mistaken for a healthy
+        // login and the UI misleadingly reported "Already signed in."
+        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod, force: true }),
       });
       btn.disabled = false;
       if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }

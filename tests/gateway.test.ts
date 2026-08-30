@@ -9,6 +9,8 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
 import { detectConversationImport } from '../src/store/conversation-imports.js';
+import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
+import { TASK_QUEUE } from '../src/temporal/config.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -1147,6 +1149,61 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       }).then((response) => response.json());
       return dashboard.accounts.accounts.some((account: any) => account.id === 'login:codex:delayed');
     }, { timeout: 4_000 }).toBe(true);
+  });
+
+  it('validates a completed re-authentication before clearing automatic quarantine', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-health-'));
+    const usage = path.join(dir, 'claude-usage.cjs');
+    fs.writeFileSync(usage, [
+      '#!/usr/bin/env node',
+      "console.log('You are currently using your subscription to power your Claude Code usage')",
+      "console.log('Current session: 1% used · resets Aug 28, 10:30am (UTC)')",
+      "console.log('Current week (all models): 0% used · resets Sep 3, 12pm (UTC)')",
+    ].join('\n'));
+    fs.chmodSync(usage, 0o700);
+    const previousUsageCommand = process.env.KARMAX_CLAUDE_USAGE_CMD;
+    process.env.KARMAX_CLAUDE_USAGE_CMD = usage;
+    try {
+      const reauthGateway = await h.startGateway({
+        loginCommand: (_provider, home) => ({
+          cmd: process.execPath,
+          args: ['-e', [
+            "console.log('open https://example.com/claude-login');",
+            "setTimeout(() => require('node:fs').writeFileSync(",
+            "  require('node:path').join(process.env.LOGIN_HOME, '.credentials.json'),",
+            "  JSON.stringify({ claudeAiOauth: { accessToken: 'fresh', refreshToken: 'canonical', expiresAt: Date.now() + 3600000 } })",
+            '), 250)',
+          ].join(' ')],
+          env: { LOGIN_HOME: home },
+        }),
+      });
+      const session: any = await fetch(`${reauthGateway.url}/api/session`).then((response) => response.json());
+      const headers = { authorization: `Bearer ${session.token}`, 'content-type': 'application/json' };
+      const connect = () => fetch(`${reauthGateway.url}/api/accounts/connect`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ provider: 'claude', account: 'reauth', force: true }),
+      }).then((response) => response.json());
+
+      await expect(connect()).resolves.toMatchObject({ status: 'awaiting_oauth' });
+      await expect.poll(async () => {
+        const dashboard: any = await fetch(`${reauthGateway.url}/api/dashboard?organizationId=org_personal`, { headers })
+          .then((response) => response.json());
+        return dashboard.accounts.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
+      }, { timeout: 5_000 }).toBe('available');
+
+      const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+      await coordinator.setAccountAvailability({ accountId: 'login:claude:reauth', status: 'needs-attention' });
+      await expect(connect()).resolves.toMatchObject({ status: 'awaiting_oauth' });
+      await expect.poll(async () => {
+        const dashboard: any = await fetch(`${reauthGateway.url}/api/dashboard?organizationId=org_personal`, { headers })
+          .then((response) => response.json());
+        return dashboard.accounts.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
+      }, { timeout: 5_000 }).toBe('available');
+    } finally {
+      if (previousUsageCommand === undefined) delete process.env.KARMAX_CLAUDE_USAGE_CMD;
+      else process.env.KARMAX_CLAUDE_USAGE_CMD = previousUsageCommand;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('attaches redacted resources and completes a resumable binary upload', async () => {

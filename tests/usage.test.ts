@@ -9,6 +9,7 @@ import {
   labelToEpoch,
   probeClaudeUsage,
   refreshClaudeAccessToken,
+  ensureClaudeAccessTokenFresh,
   probeCodexUsage,
   ensureCodexLoginFresh,
   refreshCodexLogin,
@@ -301,6 +302,48 @@ describe('probeClaudeUsage', () => {
       release();
       await expect(Promise.all([first, second])).resolves.toEqual(['fresh-access', 'fresh-access']);
       expect(calls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes an expiring Claude token before a remote projection is seeded', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'almost-expired', refreshToken: 'canonical-refresh', expiresAt: NOW + 30_000,
+    } }));
+    let calls = 0;
+    try {
+      await expect(ensureClaudeAccessTokenFresh({
+        configHome: home,
+        now: NOW,
+        minValidityMs: 60_000,
+        run: async () => {
+          calls++;
+          fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+            accessToken: 'fresh-access', refreshToken: 'rotated-refresh', expiresAt: Date.now() + 3_600_000,
+          } }));
+          return FULL_PANEL;
+        },
+      })).resolves.toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not refresh a Claude token with sufficient launch lifetime', async () => {
+    const home = mkHome(false);
+    fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'fresh-access', refreshToken: 'canonical-refresh', expiresAt: NOW + 3_600_000,
+    } }));
+    try {
+      await expect(ensureClaudeAccessTokenFresh({
+        configHome: home,
+        now: NOW,
+        minValidityMs: 60_000,
+        run: async () => { throw new Error('must not run'); },
+      })).resolves.toBe(false);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }

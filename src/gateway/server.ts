@@ -613,7 +613,19 @@ export class Gateway {
     // Device OAuth finishes in the provider CLI after `/accounts/connect` has
     // returned. Refreshing only in that request races the eventual auth.json and
     // leaves a visibly connected login absent from the runnable coordinator pool.
-    this.stopLoginPoolSync = deps.login?.onStateChange(() => this.refreshLoginPool());
+    this.stopLoginPoolSync = deps.login?.onStateChange(async (state) => {
+      await this.refreshLoginPool();
+      if (!state.loggedIn) return;
+      const credential = enumerateCredentials(gatherCredentialSources({
+        configHomes: this.deps.configHomes,
+        broker: this.deps.broker,
+        organizationId: state.organizationId,
+      })).find((candidate) => candidate.provider === state.provider && candidate.account === state.account);
+      // A completed provider login is not enough to clear quarantine on its own:
+      // prove the new credential can read live subscription usage, then let the
+      // coordinator's compare-and-set transition only needs-attention → available.
+      if (credential) await this.refreshUsage(credential.key, state.organizationId).catch(() => undefined);
+    });
   }
 
   private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
@@ -5871,7 +5883,11 @@ export class Gateway {
             return this.json(res, 400, { error: 'OpenCode login requires a valid auth-method label' });
           }
         }
-        const result = await this.deps.login.connect(provider, String(b.account), { modelProvider, authMethod }, resourceOrganizationId);
+        const result = await this.deps.login.connect(provider, String(b.account), {
+          modelProvider,
+          authMethod,
+          force: b.force === true,
+        }, resourceOrganizationId);
         // Seed the config home's MCP baseline (SPEC §7.5/§3.4): the karmax platform
         // MCP (always) + an optional browser MCP. The scoped token is injected at
         // spawn; here we bake in the gateway URL only.
@@ -5884,6 +5900,14 @@ export class Gateway {
           });
         }
         await this.refreshLoginPool();
+        if (result.status === 'logged_in') {
+          const credential = enumerateCredentials(gatherCredentialSources({
+            configHomes: this.deps.configHomes,
+            broker: this.deps.broker,
+            organizationId: resourceOrganizationId,
+          })).find((candidate) => candidate.provider === provider && candidate.account === String(b.account));
+          if (credential) await this.refreshUsage(credential.key, resourceOrganizationId).catch(() => undefined);
+        }
         // strip the absolute configHome path from the response
         const { configHome, ...safe } = result;
         return this.json(res, 200, safe);
