@@ -28,6 +28,7 @@ const ICON = {
   more: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
@@ -3411,6 +3412,7 @@ function renderShell() {
   });
   $('#rail-scrim')?.addEventListener('click', closeMobileNav);
   $('#rail')?.addEventListener('click', (event) => {
+    if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit')) return;
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
@@ -3448,6 +3450,10 @@ function reorderProjects(projects, id, beforeId, folder) {
 // The rail row currently being dragged, if any. Also a repaint lock: a background
 // refresh that swapped the rail's innerHTML mid-drag would destroy this element.
 let draggingProject = null;
+// Background task events repaint the rail frequently. Keep an in-progress name
+// edit stable for the same reason a drag is stable: destroying its input would
+// discard unsaved text and keyboard focus.
+let editingRailItem = null;
 
 // Which sidebar folders are folded shut. A per-browser display choice, like the
 // theme, so it lives in localStorage — keyed per organization because the rail
@@ -3461,6 +3467,127 @@ function toggleRailFolder(path) {
   if (!folded.delete(path)) folded.add(path);
   try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...folded])); } catch {}
   renderRail();
+}
+
+function replaceProjectRouteAfterRename(projectId, previousBase) {
+  const nextBase = projectBase(projectId);
+  if (!previousBase || !nextBase || previousBase === nextBase) return;
+  for (const anchor of document.querySelectorAll('a[href]')) {
+    const href = anchor.getAttribute('href');
+    if (href === previousBase || href?.startsWith(`${previousBase}/`) || href?.startsWith(`${previousBase}?`))
+      anchor.setAttribute('href', `${nextBase}${href.slice(previousBase.length)}`);
+  }
+  if (S.projectId === projectId) {
+    const project = projectById(projectId);
+    if (S.tab === 'settings') $('.page-title', $('#main')).textContent = project.name;
+    if ($('#project-name')) $('#project-name').value = projectPath(project);
+  }
+  if (location.pathname !== previousBase && !location.pathname.startsWith(`${previousBase}/`)) return;
+  const suffix = location.pathname.slice(previousBase.length);
+  history.replaceState(history.state, '', `${nextBase}${suffix}${location.search}${location.hash}`);
+}
+
+function renameCollapsedRailFolder(previous, next) {
+  const folded = [...railCollapsedFolders()].map((path) =>
+    path === previous || path.startsWith(`${previous}/`) ? `${next}${path.slice(previous.length)}` : path);
+  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...new Set(folded)])); } catch {}
+}
+
+// One compact editor serves both project links and folder headers. It deliberately
+// saves only on the check/Enter: clicking elsewhere cannot accidentally move a
+// project or a whole folder tree. Escape restores the original row.
+function beginRailInlineEdit(button, options) {
+  const { value, label, save } = options;
+  if (editingRailItem) return;
+  const row = button.closest('.proj');
+  if (!row) return;
+  const rail = row.closest('#rail');
+  editingRailItem = row;
+  row.classList.add('editing');
+  row.draggable = false;
+  row.innerHTML = `<form class="rail-inline-edit"><input class="rail-edit-input" value="${esc(value)}" aria-label="${esc(label)}" autocomplete="off" spellcheck="false" required><button class="rail-edit-confirm" type="submit" title="Save" aria-label="Save">✓</button><button class="rail-edit-cancel" type="button" title="Cancel" aria-label="Cancel">×</button><span class="rail-edit-error" role="alert" hidden></span></form>`;
+  const form = row.querySelector('form');
+  const input = row.querySelector('input');
+  const error = row.querySelector('.rail-edit-error');
+  const close = (focusSelector) => {
+    editingRailItem = null;
+    renderRail();
+    if (focusSelector) requestAnimationFrame(() => rail.querySelector(focusSelector)?.focus({ preventScroll: true }));
+  };
+  form.addEventListener('click', (event) => event.stopPropagation());
+  form.addEventListener('mousedown', (event) => event.stopPropagation());
+  input.addEventListener('input', () => { input.removeAttribute('aria-invalid'); error.hidden = true; });
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    close();
+  });
+  row.querySelector('.rail-edit-cancel').addEventListener('click', () => close());
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const next = input.value.trim();
+    if (!next) return input.focus();
+    for (const control of form.elements) control.disabled = true;
+    try {
+      const focusSelector = await save(next);
+      close(focusSelector);
+    } catch (cause) {
+      input.setAttribute('aria-invalid', 'true');
+      error.textContent = cause.message;
+      error.hidden = false;
+      for (const control of form.elements) control.disabled = false;
+      input.focus();
+      input.select();
+    }
+  });
+  input.focus();
+  input.select();
+}
+
+function editRailProject(button) {
+  const project = projectById(button.dataset.projectEdit);
+  if (!project) return;
+  const previousBase = projectBase(project.id);
+  beginRailInlineEdit(button, {
+    value: projectPath(project),
+    label: `Project path for ${project.name}`,
+    save: async (name) => {
+      if (name === projectPath(project)) return `.project-link[data-project="${CSS.escape(project.id)}"]`;
+      const updated = await api(`/api/projects/${encodeURIComponent(project.id)}`, {
+        method: 'PATCH', body: JSON.stringify({ name }),
+      });
+      S.projects = S.projects.map((candidate) => candidate.id === updated.id ? updated : candidate);
+      replaceProjectRouteAfterRename(project.id, previousBase);
+      toast('Project renamed');
+      return `.project-link[data-project="${CSS.escape(project.id)}"]`;
+    },
+  });
+}
+
+function editRailFolder(button) {
+  const folder = button.dataset.folderEdit;
+  const inside = (project) => project.folder === folder || project.folder?.startsWith(`${folder}/`);
+  const anchor = S.projects.find((project) =>
+    (!S.organizationId || project.organizationId === S.organizationId) && inside(project));
+  if (!anchor) return;
+  beginRailInlineEdit(button, {
+    value: folder.slice(folder.lastIndexOf('/') + 1),
+    label: `Folder name for ${folder}`,
+    save: async (name) => {
+      if (name === folder.slice(folder.lastIndexOf('/') + 1))
+        return `.folder-toggle[data-folder="${CSS.escape(folder)}"]`;
+      const renamed = await api(`/api/projects/${encodeURIComponent(anchor.id)}/folder`, {
+        method: 'PATCH', body: JSON.stringify({ folder, name }),
+      });
+      const updates = new Map(renamed.projects.map((project) => [project.id, project]));
+      S.projects = S.projects.map((project) => updates.get(project.id) || project);
+      if (updates.has(S.projectId) && $('#project-name')) $('#project-name').value = projectPath(projectById(S.projectId));
+      renameCollapsedRailFolder(folder, renamed.folder);
+      toast('Folder renamed');
+      return `.folder-toggle[data-folder="${CSS.escape(renamed.folder)}"]`;
+    },
+  });
 }
 
 // The rail's project rows: the organization's projects grouped into their
@@ -3485,10 +3612,11 @@ function railProjectRows(projectScoped) {
   };
   for (const p of projects) dir(p.folder || '').children.push(p);
   const folded = railCollapsedFolders();
-  const row = (p, depth) => `<a class="proj ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" tabindex="0" draggable="true" title="Drag to reorder">
-          <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </a>`;
-  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}" tabindex="0" role="button" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'} folder"><span class="glyph">${open ? '▾' : '▸'}</span> <span>${esc(node.name)}</span></div>`;
+  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
+          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="${esc(projectPath(p))}"><span class="glyph">◇</span><span class="rail-name">${esc(p.name)}</span></a>
+          <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
+        </div>`;
+  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'} folder"><span class="glyph">${open ? '▾' : '▸'}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
@@ -3502,7 +3630,7 @@ function railProjectRows(projectScoped) {
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
-  if (draggingProject) return; // never repaint out from under a drag in flight
+  if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
   const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
@@ -3510,9 +3638,9 @@ function renderRail() {
   // them. Snapshot the focused row's stable identity and re-focus the matching row.
   const active = document.activeElement;
   const focusedKey = active && rail.contains(active)
-    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]`
+    ? (active.dataset.project ? `.project-link[data-project="${active.dataset.project}"]`
       : active.id ? `#${active.id}`
-      : active.classList.contains('folder') && active.dataset.folder != null ? `.folder[data-folder="${CSS.escape(active.dataset.folder)}"]`
+      : active.classList.contains('folder-toggle') && active.dataset.folder != null ? `.folder-toggle[data-folder="${CSS.escape(active.dataset.folder)}"]`
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
   rail.innerHTML = `
@@ -3529,16 +3657,17 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
-  // Folder headers toggle their fold; Enter/Space mirrors the click for the
-  // rail's keyboard walk (g p → j/k), where a header is a row like any other.
-  for (const head of rail.querySelectorAll('.proj.folder')) {
+  // Folder headers are native buttons, so click, Enter, and Space all share the
+  // same fold behavior during pointer use and the rail's keyboard walk.
+  for (const head of rail.querySelectorAll('.folder-toggle')) {
     head.addEventListener('click', () => toggleRailFolder(head.dataset.folder));
-    head.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      e.preventDefault();
-      toggleRailFolder(head.dataset.folder);
-    });
   }
+  rail.querySelectorAll('[data-project-edit]').forEach((button) => button.addEventListener('click', (event) => {
+    event.stopPropagation(); editRailProject(button);
+  }));
+  rail.querySelectorAll('[data-folder-edit]').forEach((button) => button.addEventListener('click', (event) => {
+    event.stopPropagation(); editRailFolder(button);
+  }));
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
@@ -3561,7 +3690,8 @@ function wireProjectDrag(rail) {
       draggingProject = row;
       row.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
-      // Without this an <a> drags its href, and the drop lands as a URL elsewhere.
+      // Seed the drag payload explicitly; the visible project link is a child of
+      // this draggable row and must not turn the gesture into a URL drop.
       try { e.dataTransfer.setData('text/plain', row.dataset.id); } catch {}
     });
     row.addEventListener('dragend', () => {
@@ -15455,7 +15585,7 @@ function openAdjacentTask(delta) {
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
-function railRows() { return [...document.querySelectorAll('#rail .proj, #rail .nav-item')]; }
+function railRows() { return [...document.querySelectorAll('#rail .project-link, #rail .folder-toggle, #rail .proj.add, #rail .nav-item')]; }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();

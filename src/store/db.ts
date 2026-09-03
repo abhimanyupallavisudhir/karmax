@@ -1001,6 +1001,62 @@ export class Store {
     return next ? { ...rest, folder: next } : rest;
   }
 
+  /** Projects represented by one implicit sidebar folder, including its nested
+   * folders. `id` anchors the lookup to an organization and must itself live in
+   * the requested folder tree, so a caller cannot use a project from one part of
+   * the sidebar to operate on an unrelated path. */
+  projectFolderProjects(id: string, folder: string): Project[] {
+    const anchor = this.getProject(id);
+    if (!anchor) throw new Error(`no project ${id}`);
+    const path = normalizeFolder(folder);
+    if (!path) throw new Error('folder path is required');
+    const inside = (candidate: Project) => candidate.folder === path || candidate.folder?.startsWith(`${path}/`);
+    if (!inside(anchor)) throw new Error('project does not belong to this folder');
+    const organizationId = anchor.organizationId ?? 'org_personal';
+    return this.listProjects().filter((project) =>
+      (project.organizationId ?? 'org_personal') === organizationId && inside(project));
+  }
+
+  /** Rename one segment of an implicit sidebar folder and carry every nested
+   * project with it in one transaction. A rename never silently merges two
+   * existing trees; moving individual projects remains the drag-and-drop job. */
+  renameProjectFolder(id: string, folder: string, name: string): { folder: string; projects: Project[] } {
+    const source = normalizeFolder(folder);
+    if (!source) throw new Error('folder path is required');
+    const segment = String(name ?? '').trim();
+    if (!segment) throw new Error('folder name is required');
+    if (segment.includes('/')) throw new Error('folder name cannot contain "/"');
+    const projects = this.projectFolderProjects(id, source);
+    const cut = source.lastIndexOf('/');
+    const parent = cut < 0 ? '' : source.slice(0, cut);
+    const target = normalizeFolder([parent, segment].filter(Boolean).join('/'))!;
+    if (target === source) return { folder: source, projects };
+
+    const organizationId = projects[0]!.organizationId ?? 'org_personal';
+    const affected = new Set(projects.map((project) => project.id));
+    const conflicts = this.listProjects().some((project) => {
+      if (affected.has(project.id) || (project.organizationId ?? 'org_personal') !== organizationId) return false;
+      return project.folder === target || project.folder?.startsWith(`${target}/`);
+    });
+    if (conflicts) throw new Error(`A folder named "${segment}" already exists here.`);
+
+    const update = this.db.prepare('UPDATE projects SET folder = ? WHERE id = ?');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const renamed = projects.map((project) => {
+        const suffix = project.folder!.slice(source.length);
+        const nextFolder = `${target}${suffix}`;
+        update.run(nextFolder, project.id);
+        return { ...project, folder: nextFolder };
+      });
+      this.db.exec('COMMIT');
+      return { folder: target, projects: renamed };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   /** Move a project so it sits immediately before `beforeProjectId` in the sidebar,
    * or last when that is omitted/unknown. Only the moved project's own organization
    * is touched, and its rows are re-densified to 0…n-1 so repeated drags stay stable.

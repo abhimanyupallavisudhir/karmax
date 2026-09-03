@@ -249,6 +249,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/folder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/reorder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -3020,6 +3021,25 @@ export class Gateway {
             if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
           return this.json(res, 200, { deleted: true, projectId: id });
         }
+      }
+      // Folder headers are projections of project.folder, not separate records.
+      // Renaming one therefore rewrites every project in that subtree atomically.
+      // The route is anchored to one member project for tenant scoping, then the
+      // explicit loop prevents that one grant from conferring write access to
+      // sibling projects the caller can only read.
+      const projectFolder = p.match(/^\/api\/projects\/([^/]+)\/folder$/);
+      if (projectFolder && method === 'PATCH') {
+        const b = await this.body(req);
+        try {
+          const projects = store.projectFolderProjects(projectFolder[1]!, b.folder);
+          const forbidden = projects.find((project) => !this.deps.tokens.check(token, 'project:edit', {
+            projectId: project.id,
+            organizationId: project.organizationId,
+          }).ok);
+          if (forbidden)
+            return this.json(res, 403, { error: 'Renaming this folder requires edit access to every project it contains.' });
+          return this.json(res, 200, store.renameProjectFolder(projectFolder[1]!, b.folder, b.name));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       // Sidebar order. The drop tells us which project the dragged one now sits
       // above (`before`); omitting it means "last". Sending the neighbour rather

@@ -55,6 +55,24 @@ describe('Project settings browser source', () => {
     expect(dialog).not.toContain("prompt('Project name')");
   });
 
+  it('edits project paths and folder names inline from the sidebar', () => {
+    const rows = extractFunction('railProjectRows');
+    const projectEdit = extractFunction('editRailProject');
+    const folderEdit = extractFunction('editRailFolder');
+    const inlineEdit = extractFunction('beginRailInlineEdit');
+
+    expect(rows).toContain('data-project-edit=');
+    expect(rows).toContain('data-folder-edit=');
+    expect(projectEdit).toContain('value: projectPath(project)');
+    expect(projectEdit).toContain("method: 'PATCH'");
+    expect(projectEdit).toContain('JSON.stringify({ name })');
+    expect(folderEdit).toContain('/folder`');
+    expect(folderEdit).toContain('JSON.stringify({ folder, name })');
+    expect(inlineEdit).toContain("event.key !== 'Escape'");
+    expect(inlineEdit).toContain('class="rail-edit-confirm"');
+    expect(inlineEdit).toContain('class="rail-edit-cancel"');
+  });
+
   it('keeps the post-delete fallback inside the deleted project’s organization', () => {
     const projectWiring = extractFunction('wireSettingsView');
 

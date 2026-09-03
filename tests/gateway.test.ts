@@ -666,6 +666,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(patched.status).toBe(200);
     expect(await filed()).toMatchObject({ name: 'Ord two', folder: 'Archive' });
 
+    // Folder headers rename their whole subtree in one operation.
+    const nested = await make('Archive/Nested/Ord nested');
+    const folderRenamed = await fetch(`${base}/api/projects/${two.id}/folder`, { method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ folder: 'Archive', name: 'Filed' }) });
+    expect(folderRenamed.status).toBe(200);
+    expect(await folderRenamed.json()).toMatchObject({ folder: 'Filed' });
+    expect(await filed()).toMatchObject({ name: 'Ord two', folder: 'Filed' });
+    const afterFolderRename = (await (await fetch(`${base}/api/projects`, { headers: auth() })).json()) as any[];
+    expect(afterFolderRename.find((project) => project.id === nested.id)).toMatchObject({ folder: 'Filed/Nested' });
+
     // The leaf name remains unique across folders in the same organization.
     const duplicate = await fetch(`${base}/api/projects/${two.id}`, { method: 'PATCH', headers: auth(),
       body: JSON.stringify({ name: 'Elsewhere/Ord one' }) });
