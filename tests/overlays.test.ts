@@ -34,11 +34,17 @@ describe('manifest dependency resolution (SPEC §4.6)', () => {
     const prep = manifest('software-dev')!.onActivate!.spawnTask!;
     const local = activationTaskPrompt(prep, false);
     const hosted = activationTaskPrompt(prep, true);
+    const expectedHosted = `## Initial set-up task for krmax-readiness
+1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to krmax's project wiki.
+2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.
+It is important to use the "default" tag on wiki articles that must appear in the context of every new agent.
+Report what you changed.
+[To humans: This is not for you. Just press "Queue" and the agent will do the above.]`;
     expect(local).toContain('Migrate AGENTS.md, CLAUDE.md');
+    expect(local).toContain('compile a new wiki page');
+    expect(local).toContain('use the "default" tag');
     expect(local).toContain('hardcoded resources (e.g. ports)');
     expect(local).not.toContain('Ensure git is initialized');
-    expect(hosted).toContain('Migrate AGENTS.md, CLAUDE.md');
-    expect(hosted).not.toContain('hardcoded resources');
-    expect(hosted).toContain('Report what you changed.');
+    expect(hosted).toBe(expectedHosted);
   });
 });

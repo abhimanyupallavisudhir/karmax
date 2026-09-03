@@ -1336,8 +1336,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       expect(prep, `new project via ${path} should get the prep task`).toBeTruthy();
       expect(prep.workflow).toBe('software-dev');
       expect(prep.params.prompt).toContain('Migrate AGENTS.md, CLAUDE.md');
+      expect(prep.params.prompt).toContain('compile a new wiki page');
+      expect(prep.params.prompt).toContain('use the "default" tag');
       expect(prep.params.prompt).toContain('hardcoded resources (e.g. ports)');
       expect(prep.params.prompt).not.toContain('Ensure git is initialized');
+      expect(prep.params.prompt).toContain('Just press "Queue"');
     }
   });
 
