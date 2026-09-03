@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const source = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
+const styles = fs.readFileSync(path.resolve('web/styles.css'), 'utf8');
 
 function extractFunction(name: string): string {
   const start = source.indexOf(`function ${name}(`);
@@ -71,6 +72,8 @@ describe('Project settings browser source', () => {
     expect(inlineEdit).toContain("event.key !== 'Escape'");
     expect(inlineEdit).toContain('class="rail-edit-confirm"');
     expect(inlineEdit).toContain('class="rail-edit-cancel"');
+    expect(styles).toContain('.rail .project-row .rail-edit-action { opacity: 0; }');
+    expect(styles).toContain('.rail .proj:hover .rail-edit-action');
   });
 
   it('keeps the post-delete fallback inside the deleted project’s organization', () => {
