@@ -35,11 +35,14 @@ global.localStorage = { getItem: () => JSON.stringify(collapsed), setItem() {} }
 global.$ = (selector) => selector === '#rail' ? rail : null;
 global.document = { activeElement: null };
 global.projectRoute = (id) => `/projects/${id}`;
+global.projectPath = (project) => [project.folder, project.name].filter(Boolean).join('/');
 global.globalRoute = (tab) => `/${tab}`;
 global.esc = (value) => String(value);
+global.ICON = { edit: '<svg></svg>' };
 global.wireProjectDrag = () => {};
 global.newProject = () => {};
 global.draggingProject = null;
+global.editingRailItem = null;
 global.S = {
   projectId: 'p1',
   organizationId: 'o1',
@@ -58,7 +61,7 @@ const ok = (condition, message) => {
   else { fail++; console.error('FAIL:', message); }
 };
 
-const projectRow = () => html.match(/<a class="proj ([^"]*)"[^>]*data-id="p1"/)?.[1] || '';
+const projectRow = () => html.match(/<div class="proj project-row ([^"]*)"[^>]*data-id="p1"/)?.[1] || '';
 
 renderRail();
 ok(projectRow().includes('active'), 'the selected project is active on a project page');
@@ -85,6 +88,10 @@ ok(header('work')?.[1] === '0', 'the folder header renders at the top level');
 ok(header('work/clients')?.[1] === '1', 'a nested folder header renders one level deeper');
 ok(/data-id="p3"[^>]*style="--depth:2"/.test(html), 'a project in a subfolder indents below its header');
 ok(!html.includes('p4'), "another organization's projects do not seed folders here");
+ok(html.includes('data-project-edit="p3"') && html.includes('aria-label="Edit work/clients/Gamma"'),
+  'every project row offers an edit action labelled with its full slash path');
+ok(html.includes('data-folder-edit="work/clients"') && html.includes('aria-label="Rename work/clients"'),
+  'every folder header offers its own rename action');
 
 collapsed = ['work'];
 renderRail();

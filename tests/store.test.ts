@@ -302,6 +302,28 @@ describe('Store', () => {
     expect(store.getProject(b!.id)!.folder).toBeUndefined();
   });
 
+  it('renames an implicit sidebar folder and its nested projects atomically', () => {
+    const direct = store.createProject('Work/Clients/Site');
+    const nested = store.createProject('Work/Clients/Internal/Admin');
+    const sibling = store.createProject('Work/Notes');
+
+    expect(store.projectFolderProjects(direct.id, 'Work/Clients').map((project) => project.id))
+      .toEqual([direct.id, nested.id]);
+    const renamed = store.renameProjectFolder(direct.id, 'Work/Clients', 'Customers');
+    expect(renamed.folder).toBe('Work/Customers');
+    expect(renamed.projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: direct.id, folder: 'Work/Customers' }),
+      expect.objectContaining({ id: nested.id, folder: 'Work/Customers/Internal' }),
+    ]));
+    expect(store.getProject(sibling.id)!.folder).toBe('Work');
+
+    store.createProject('Work/Archive/Old');
+    expect(() => store.renameProjectFolder(direct.id, 'Work/Customers', 'Archive')).toThrow(/already exists/i);
+    expect(store.getProject(direct.id)!.folder).toBe('Work/Customers');
+    expect(() => store.renameProjectFolder(direct.id, 'Work/Customers', 'Bad/Name')).toThrow(/cannot contain/i);
+    expect(() => store.projectFolderProjects(sibling.id, 'Work/Customers')).toThrow(/does not belong/i);
+  });
+
   it('keeps creation order for projects that predate the sidebar ordering column', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-ord-mig-'));
     const dbPath = path.join(dir, 'karmax.db');

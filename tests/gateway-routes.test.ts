@@ -101,6 +101,10 @@ describe('gateway route capability binding', () => {
     expect(cap('GET', '/api/projects/p1/checkout')).toBe('repository:read');
   });
 
+  it('gates sidebar folder renames as project edits', () => {
+    expect(cap('PATCH', '/api/projects/p1/folder')).toBe('project:edit');
+  });
+
   it('protects native conversation downloads as conversation reads', () => {
     expect(cap('GET', '/api/tasks/t1/conversation.jsonl')).toBe('task:conversation:read');
   });
