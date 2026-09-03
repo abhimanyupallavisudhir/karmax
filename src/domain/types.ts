@@ -258,10 +258,19 @@ export interface WorldCheckpoint {
   environmentDigest: string;
   repos: Array<{
     repositoryId: string;
+    /** Clone/worktree source pinned at checkpoint time. Older checkpoints omit
+     * this and recover it from the durable world handle or project config. */
+    source?: string;
     checkoutPath: string;
     baseSha: string;
     branch: string;
     headSha?: string;
+    /** Per-checkout branch policy. This matters for platform companions such as
+     * the project wiki, which do not necessarily share the project's default. */
+    base?: string;
+    target?: string;
+    targetPinned?: boolean;
+    role?: 'project-wiki';
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
   resources?: Array<{ attachmentId: string; revisionId: string }>;

@@ -134,6 +134,65 @@ describe('portable world checkpoints', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('restores legacy checkpoints containing a companion checkout that is not project-enrolled', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-checkpoint-companion-'));
+    const makeRepo = async (name: string, branch = 'main') => {
+      const repo = path.join(dir, name);
+      fs.mkdirSync(repo);
+      await gitOrThrow(repo, ['init', '-q', '-b', branch]);
+      await ensureIdentity(repo);
+      fs.writeFileSync(path.join(repo, 'tracked.txt'), `${name}\n`);
+      await git(repo, ['add', '-A']);
+      await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+      return repo;
+    };
+    const development = await makeRepo('development');
+    const wiki = await makeRepo('wiki', 'project-wiki');
+
+    const store = new Store(':memory:');
+    const project = store.createProject('Companion restore', { repos: [development], defaultBase: 'main' });
+    const task = store.createTask({ projectId: project.id, title: 'Task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'test' } });
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const checkpoints = new WorldCheckpointService(store, worlds, objects, broker);
+
+    const world = await worlds.create('worktree', { taskId: task.id, repos: [development, wiki], base: 'main',
+      repositoryBranches: { [wiki]: { base: 'project-wiki', target: 'project-wiki' } } });
+    world.handle.repos![1]!.role = 'project-wiki';
+    world.handle.meta = { projectId: project.id };
+    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
+    await world.writeFile('wiki/unpublished.md', 'portable wiki edit\n');
+    const checkpoint = await checkpoints.checkpoint(world.handle);
+    expect(checkpoint.repos[1]).toMatchObject({ source: wiki, base: 'project-wiki',
+      target: 'project-wiki', role: 'project-wiki' });
+
+    // Re-save the manifest without fields introduced by the source-pinning fix,
+    // reproducing Task 132's already-durable checkpoint. The project's one-item
+    // repo config cannot resolve the companion by array position; recovery must
+    // use the persisted generation's checkout identity.
+    const legacy = { ...checkpoint, id: 'checkpoint-legacy-companion', repos: checkpoint.repos.map((entry) => {
+      const { source: _source, base: _base, target: _target, targetPinned: _targetPinned, role: _role, ...old } = entry;
+      return old;
+    }) };
+    store.saveWorldCheckpoint(legacy);
+    await world.destroy();
+
+    const restoredHandle = await checkpoints.restore(legacy.id, 'worktree');
+    const restoredRepos = restoredHandle.repos!;
+    expect(restoredRepos.map((repo) => repo.role)).toEqual([undefined, 'project-wiki']);
+    expect(restoredRepos[1]!.base).toBe('project-wiki');
+    expect(restoredHandle.workdir).toBe(restoredRepos[0]!.root);
+    const restored = await worlds.open(restoredHandle);
+    expect(await restored.readFile('wiki/unpublished.md')).toBe('portable wiki edit\n');
+
+    await restored.destroy();
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('restores a remote sandbox under a runner lease, so it is budgeted, attributed and releasable', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-lease-'));
     const repo = path.join(dir, 'repo');
