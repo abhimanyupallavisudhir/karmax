@@ -1858,6 +1858,27 @@ html[data-theme="dark"] .github-signin-btn:active,
 .parameter-fields .agent-field .agent-controls select:focus,
 .parameter-fields .agent-field .af-resume-session:focus { border-color: var(--accent); }
 .parameter-fields .agent-field .af-resume { margin: 8px 2px 0 !important; }
+.pf-edit-row {
+  position: relative; margin-left: -12px; padding-left: 10px;
+  border-left: 2px solid transparent; border-radius: 2px;
+  transition: border-color .16s ease, background-color .16s ease;
+}
+.pf-edit-row.param-row-dirty {
+  border-left-color: var(--working);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--working) 8%, transparent), transparent 72%);
+}
+.params-save-bar {
+  position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center;
+  justify-content: space-between; gap: 16px; margin-top: 14px; padding: 12px 0 2px;
+  background: linear-gradient(180deg, transparent, var(--surface) 13px);
+}
+.params-save-status { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 12px; }
+.params-save-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--merged); }
+.params-save-bar[data-save-state="dirty"] .params-save-status { color: var(--working); font-weight: 650; }
+.params-save-bar[data-save-state="dirty"] .params-save-dot {
+  background: var(--working); box-shadow: 0 0 0 3px color-mix(in srgb, var(--working) 15%, transparent);
+}
+.params-save-bar[data-save-state="saving"] .params-save-dot { background: var(--accent); }
 .agent-profile-controls {
   display: grid; grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; gap: 8px;
 }
