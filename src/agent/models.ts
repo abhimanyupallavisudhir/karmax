@@ -30,7 +30,7 @@ export type ModelCatalog = Record<Provider, AvailableModel[]>;
 export const CLAUDE_MODEL_PRESETS: AvailableModel[] = [
   { id: 'default' },
   { id: 'opus[1m]' },
-  { id: 'claude-fable-5[1m]', displayName: 'Fable 5' },
+  { id: 'claude-fable-5-1', displayName: 'Fable 5.1' },
   { id: 'sonnet' },
   { id: 'haiku' },
 ];

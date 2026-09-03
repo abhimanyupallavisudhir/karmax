@@ -16,7 +16,7 @@ describe('provider model discovery', () => {
     ]);
   });
 
-  it('keeps Fable in a successful but partial Claude SDK catalog', () => {
+  it('keeps Fable 5.1 in a successful but partial Claude SDK catalog', () => {
     const catalog = claudeModelCatalog([
       { id: 'default', displayName: 'Default (recommended)' },
       { id: 'sonnet', displayName: 'Sonnet' },
@@ -25,7 +25,7 @@ describe('provider model discovery', () => {
     ]);
 
     expect(catalog.find((model) => model.id === 'default')?.displayName).toBe('Default (recommended)');
-    expect(catalog).toContainEqual({ id: 'claude-fable-5[1m]', displayName: 'Fable 5' });
+    expect(catalog).toContainEqual({ id: 'claude-fable-5-1', displayName: 'Fable 5.1' });
   });
 
   it('classifies model-discovery failures without logging provider secrets', () => {

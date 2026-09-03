@@ -806,7 +806,7 @@ const NODES = [
 // `mock` is a hermetic test adapter, not a user-selectable agent.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-fable-5[1m]', displayName: 'Fable 5' }, 'sonnet', 'haiku'],
+  claude: ['default', 'opus[1m]', { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
