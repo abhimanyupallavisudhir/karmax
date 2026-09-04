@@ -3474,9 +3474,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return { role, session: this.deps.store.kvGet(`session:${taskId}:${role}`) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
   }
 
-  /** Branch a source agent into an independent task/session; the source is never mutated. */
+  /** Branch a source agent into an independent task/session; the source is never mutated.
+   *
+   * `reauthorize` starts the fork from the grants the source task ended with —
+   * its authorization level/scope (including any mid-task elevation a human
+   * approved) plus its vault credential grants and policies — instead of the
+   * project default. The forked conversation usually continues the same work,
+   * so without it every credential the source was approved for is asked again.
+   * The grants go through `createTask`'s ordinary checks: the caller cannot hand
+   * the fork more than it could grant a fresh task, so an over-broad source
+   * fails loudly rather than silently attenuating. */
   async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string;
-    target?: string; authorizationProfile?: string; provider?: Provider; model?: string;
+    target?: string; authorizationProfile?: string; reauthorize?: boolean; provider?: Provider; model?: string;
     effort?: AgentSpec['effort'] }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
@@ -3484,6 +3493,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const role = args.role ?? 'do';
     if (!this.deps.store.kvGet(`session:${args.taskId}:${role}`) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
+    const previous = args.reauthorize ? previousTaskGrants(source) : undefined;
     return this.createTask(token, {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
@@ -3498,7 +3508,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           resumeFrom: { taskId: args.taskId, role },
         },
       },
-      authorizationProfile: args.authorizationProfile,
+      // An explicit profile is the caller's choice; the source's selection only
+      // fills in when none was named.
+      ...(args.authorizationProfile ? { authorizationProfile: args.authorizationProfile }
+        : previous?.authorization ? { authorization: previous.authorization } : {}),
+      ...(previous ? { credentialGrants: previous.credentialGrants, credentialPolicies: previous.credentialPolicies } : {}),
     });
   }
 
@@ -5088,6 +5102,33 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args, organizationId);
   }
+}
+
+/** The grants a task ended with, in the shape a new task is created with: the
+ * stored `_authorization` selection (level/scope/projects — the elevated one if
+ * a human approved a mid-task authorization request), its per-task vault
+ * credential caps and the policies chosen for them. A legacy record that only
+ * carries a `profileId` still maps to a level. */
+export function previousTaskGrants(task: TaskRecord): {
+  authorization?: AuthorizationSelection;
+  credentialGrants: string[];
+  credentialPolicies: VaultTaskPolicyOverrides;
+} {
+  const stored = task.params?._authorization as {
+    level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[];
+    capabilities?: string[]; credentialPolicies?: VaultTaskPolicyOverrides;
+  } | undefined;
+  const level = stored?.level ?? stored?.profileId;
+  return {
+    ...(level ? { authorization: {
+      level,
+      scope: stored?.scope ?? 'projects',
+      ...(stored?.scope === 'organization' || stored?.scope === 'global' ? {}
+        : { projectIds: stored?.projectIds?.length ? stored.projectIds : [task.projectId] }),
+    } } : {}),
+    credentialGrants: (stored?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
+    credentialPolicies: stored?.credentialPolicies ?? {},
+  };
 }
 
 function uniqueFileRefs(files: FileRef[]): FileRef[] {
