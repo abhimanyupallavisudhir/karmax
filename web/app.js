@@ -80,6 +80,9 @@ const S = {
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
+  // In-flight parameter edits are deliberately manual-save. Keep their working
+  // values outside the DOM so a live task refresh cannot silently erase them.
+  paramEditDrafts: {}, // taskId -> { saved, values, dirtyNames }
   activity: [],
   search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
   // Task organization (PLAN-search-views): a view IS a saved query.
@@ -9024,6 +9027,7 @@ function paramsSection(v) {
   // stale editable window left on an older persisted view.
   const terminal = TERMINAL_STAGES.includes(v.stage);
   const editable = new Set(terminal ? [] : (v.editableParams || []));
+  const editDraft = S.paramEditDrafts?.[v.taskId];
   const inheritedAll = S.paramDefaults || {};
   const frozenTitle = terminal
     ? 'Frozen — this task has finished'
@@ -9031,9 +9035,14 @@ function paramsSection(v) {
   const lock = `<span title="${frozenTitle}" style="color:var(--ink-3)">🔒</span>`;
   const rows = fields
     .map((f) => {
-      const own = paramCurrentValue(f, v, rec);
-      const inherited = inheritedAll[f.name];
+      // Live workflow events repaint this page frequently. If the operator has
+      // an unsaved value, render that value back into its control instead of
+      // replacing it with the last server snapshot during the repaint.
       const isEditable = editable.has(f.name);
+      const own = isParamDraftField(editDraft, f.name)
+        ? editDraft.values[f.name]
+        : paramCurrentValue(f, v, rec);
+      const inherited = inheritedAll[f.name];
       // Agent fields show the full control (provider · model · effort · resume),
       // exactly like the task form — interactive when editable, disabled when frozen.
       if (f.type === 'agent') {
@@ -9051,11 +9060,21 @@ function paramsSection(v) {
     })
     .join('');
   const footer = editable.size
-    ? `<button class="btn sm primary" id="params-save">Save changes</button>`
+    ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
+        <span class="params-save-status" id="params-save-status" role="status" aria-live="polite">
+          <span class="params-save-dot" aria-hidden="true"></span>
+          <span>${editDraft?.dirtyNames?.length ? 'Unsaved parameter changes' : 'All parameter changes saved'}</span>
+        </span>
+        <button class="btn sm primary" id="params-save" ${editDraft?.dirtyNames?.length ? '' : 'disabled'}>Save parameter changes</button>
+      </div>`
     : `<div class="task-sub" style="color:var(--ink-3)">${terminal
       ? 'This task has finished. Parameters are read-only.'
       : 'Locked after queue — send a follow-up to change direction.'}</div>`;
   return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
+}
+
+function isParamDraftField(draft, name) {
+  return !!draft?.dirtyNames?.includes(name);
 }
 
 // Best-known current value of a task param (the view carries a few;
@@ -9147,6 +9166,22 @@ function collectParamEdits(root, fields) {
   }
   return out;
 }
+
+function paramDirtyNames(saved, current, fields) {
+  return fields.map((field) => field.name).filter((name) => !sameJson(saved[name], current[name]));
+}
+
+function setParamSaveState(root, saveBtn, status, state) {
+  root.dataset.saveState = state;
+  const bar = saveBtn.closest('.params-save-bar');
+  if (bar) bar.dataset.saveState = state;
+  saveBtn.disabled = state !== 'dirty';
+  saveBtn.textContent = state === 'saving' ? 'Saving parameter changes…' : 'Save parameter changes';
+  status.lastElementChild.textContent = state === 'dirty'
+    ? 'Unsaved parameter changes'
+    : state === 'saving' ? 'Saving parameter changes…' : 'All parameter changes saved';
+}
+
 function wireParams(v) {
   const editBtn = document.getElementById('edit-draft-params');
   if (editBtn) {
@@ -9158,16 +9193,54 @@ function wireParams(v) {
   if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
+  const status = document.getElementById('params-save-status');
+  const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+  const existing = S.paramEditDrafts[v.taskId];
+  const currentAtRender = collectParamEdits(root, fields);
+  // Rebase untouched controls onto the newest server render, while preserving
+  // the saved comparison value for fields the operator is actively editing.
+  let saved = { ...currentAtRender };
+  let saving = false;
+  if (existing) {
+    for (const name of existing.dirtyNames) {
+      if (Object.prototype.hasOwnProperty.call(existing.saved, name)) saved[name] = existing.saved[name];
+      else delete saved[name];
+    }
+  }
+  const sync = () => {
+    const current = collectParamEdits(root, fields);
+    const dirtyNames = paramDirtyNames(saved, current, fields);
+    const dirty = dirtyNames.length > 0;
+    for (const field of fields) {
+      const row = root.querySelector(`.pf-edit-row[data-row="${CSS.escape(field.name)}"]`);
+      row?.classList.toggle('param-row-dirty', dirtyNames.includes(field.name));
+    }
+    if (dirty) S.paramEditDrafts[v.taskId] = { saved, values: current, dirtyNames };
+    else delete S.paramEditDrafts[v.taskId];
+    setParamSaveState(root, saveBtn, status, saving ? 'saving' : dirty ? 'dirty' : 'saved');
+    return current;
+  };
+  root.addEventListener('input', sync);
+  root.addEventListener('change', sync);
+  sync();
   saveBtn.addEventListener('click', async () => {
-    const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+    if (saving) return;
     const patch = collectParamEdits(root, fields);
-    if (!Object.keys(patch).length) return toast('No changes');
+    if (!paramDirtyNames(saved, patch, fields).length) return sync();
+    saving = true;
+    setParamSaveState(root, saveBtn, status, 'saving');
     try {
-      await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
-      toast('Parameters updated');
+      const updated = await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
+      saved = patch;
+      if (updated?.view && S.selected === v.taskId) S.view = updated.view;
+      toast('Parameter changes saved');
+      saving = false;
+      sync(); // a value changed while the request was running remains visibly unsaved
       setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) {
+      saving = false;
+      sync();
       toast(e.message, true);
     }
   });
