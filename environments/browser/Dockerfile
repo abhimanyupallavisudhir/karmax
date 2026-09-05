@@ -7,7 +7,7 @@ ARG PLAYWRIGHT_VERSION=1.61.1
 # launch also verifies this version and falls back to the SDK-declared npx pin
 # when a user has not rebuilt an older template yet.
 ARG CLAUDE_CODE_VERSION=2.1.220
-ARG CODEX_VERSION=0.144.5
+ARG CODEX_VERSION=0.153.4
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers \
