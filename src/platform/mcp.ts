@@ -58,7 +58,7 @@ export interface PlatformOps {
   listAgents(taskId: string): Promise<unknown>;
   getConversation(taskId: string, role?: string): Promise<unknown>;
   forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string;
-    target?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<{ id: string }>;
+    reauthorize?: boolean; target?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
   listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
     workflow?: string | number; page?: number; perPage?: number }): Promise<unknown>;
@@ -415,10 +415,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'fork_agent',
     {
-      description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. The source remains untouched. Use message_agent for later back-and-forth with the fork.',
+      description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. The source remains untouched. Use message_agent for later back-and-forth with the fork. reauthorize=true starts the fork with the grants the source task ended with (its authorization level/scope and approved vault credentials) instead of the project default; the grant is checked against your own authority like any new task.',
       inputSchema: {
         taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(),
-        target: z.string().optional(), authorizationProfile: z.string().optional(),
+        target: z.string().optional(), authorizationProfile: z.string().optional(), reauthorize: z.boolean().optional(),
         provider: z.enum(['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock']).optional(),
         model: z.string().optional(), effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
       },

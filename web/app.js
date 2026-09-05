@@ -671,8 +671,8 @@ async function applyRoute() {
 // navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click). It stays
 // free of the list's ?q=: a task link is about the task, and the query you came
 // from is remembered in S.returnRoute (and in the history entry behind you).
-function taskUrl(id) {
-  const rec = taskRecord(id);
+function taskUrl(id, record) {
+  const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
@@ -1030,11 +1030,71 @@ function renderAgentField(f, spec, inherited) {
 
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
+// The task reference is a real permalink to the source (Ctrl/⌘-click opens it
+// beside the form), and a source whose grants are known also offers to
+// re-authorize the fork with them — hidden until a host form claims the option
+// (wireResumeReauthorization), since only a form with Authorization / Vault
+// credentials controls can honour it.
 function resumeChosenInner(rf, task) {
   const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
   const source = !rf.role || rf.role === 'do' ? 'agent' : `${rf.role} agent`;
-  const label = `⑂ forking ${source} of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
-  return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
+  const ref = `${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
+  const link = t && projectById(t.projectId)
+    ? `<a class="af-resume-source" data-spa href="${esc(taskUrl(t.id, t))}" title="Open the source task">${esc(ref)}</a>`
+    : esc(ref);
+  const grants = t ? previousGrantsSummary(t) : '';
+  return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
+    ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+    : ''}`;
+}
+
+// The grants a task ended with, in the task form's own vocabulary: its stored
+// authorization selection (the elevated one, if a mid-task authorization request
+// was approved) plus the vault items it was granted and their policies. This is
+// what "Re-authorize previous grants?" applies to the fork.
+function previousTaskGrants(task) {
+  const stored = task?.params?._authorization;
+  if (!stored) return null;
+  return {
+    authorization: normalizedAuthorization({ level: stored.level || stored.profileId, scope: stored.scope, projectIds: stored.projectIds }, task.projectId),
+    credentialGrantIds: (stored.capabilities || [])
+      .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
+    credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
+  };
+}
+function previousGrantsSummary(task) {
+  const grants = previousTaskGrants(task);
+  if (!grants) return '';
+  const n = grants.credentialGrantIds.length;
+  return `${authorizationSummary(grants.authorization, S.projects)}${n ? ` + ${n} credential${n === 1 ? '' : 's'}` : ''}`;
+}
+
+// Host side of "Re-authorize previous grants?" (announced by wireAgentBox as an
+// `af-reauthorize` event): apply the source task's grants to this form's
+// Authorization editor and vault credential selection, remembering what was
+// there so unchecking — or clearing the fork source — puts it back. Nothing is
+// hidden: the grants land in the same controls the user would otherwise fill by
+// hand, so what will be granted stays visible and editable, and it is persisted
+// exactly like a manual selection.
+function wireResumeReauthorization(root, host) {
+  if (!root) return;
+  root.dataset.reauthorizeHost = '';
+  root.querySelectorAll('.af-resume-reauth[hidden]').forEach((option) => { option.hidden = false; });
+  let stash = null;
+  root.addEventListener('af-reauthorize', (event) => {
+    const { enabled, authorization, credentialGrantIds, credentialPolicies } = event.detail;
+    const editor = host.editor();
+    if (enabled) {
+      stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants() };
+      editor?._setAuthorization?.(authorization);
+      host.setGrants(credentialGrantIds, credentialPolicies);
+    } else if (stash) {
+      editor?._setAuthorization?.(stash.authorization);
+      host.setGrants(stash.ids, stash.policies);
+      stash = null;
+    } else return;
+    host.changed?.();
+  });
 }
 
 function resumeUploadInner(upload) {
@@ -1477,6 +1537,14 @@ function wireAuthorizationEditor(root, projects, onChange) {
     combo.hidden = level.scope !== 'selectable';
     drawChips(); emit();
   });
+  // Programmatic selection (a fork re-authorizing its source's grants), normalized
+  // and announced exactly like a hand-picked level.
+  root._setAuthorization = (next) => {
+    value = normalizedAuthorization(next);
+    levelSelect.value = value.level;
+    combo.hidden = levelOf().scope !== 'selectable';
+    drawChips(); emit();
+  };
   input.addEventListener('focus', show);
   input.addEventListener('input', show);
   input.addEventListener('blur', () => setTimeout(hide, 120));
@@ -1619,9 +1687,35 @@ function wireAgentBox(box) {
   const uploaded = box.querySelector('.af-resume-uploaded');
   const syncForkState = () => {
     if (panel) panel.hidden = !enabled?.checked;
+    // The re-authorize option needs a host with grant controls (task form / task
+    // page); elsewhere the chip stays a plain label.
+    const option = chosen?.querySelector('.af-resume-reauth');
+    if (option) option.hidden = !box.closest('[data-reauthorize-host]');
+  };
+  // "Re-authorize previous grants?" belongs to the agent box but acts on the
+  // hosting form's Authorization / Vault credentials controls, so the box only
+  // announces the choice (see wireResumeReauthorization). The picker's task
+  // record is kept on the chip: an archived source is not in the task list.
+  const sourceTask = () => {
+    try {
+      const rf = JSON.parse(chosen?.dataset.resume || 'null');
+      if (!rf?.taskId) return null;
+      return chosen._sourceTask?.id === rf.taskId ? chosen._sourceTask : (S.tasks || []).find((x) => x.id === rf.taskId);
+    } catch { return null; }
+  };
+  const announceReauthorize = (on) => {
+    const task = sourceTask();
+    const grants = task ? previousTaskGrants(task) : null;
+    if (!grants) return;
+    box.dispatchEvent(new CustomEvent('af-reauthorize', { bubbles: true, detail: { taskId: task.id, enabled: on, ...grants } }));
+  };
+  // Dropping the source also withdraws the grants it brought along.
+  const withdrawReauthorize = () => {
+    if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
   };
   const clearTask = () => {
     if (!chosen) return;
+    withdrawReauthorize();
     chosen.dataset.resume = 'null';
     chosen.innerHTML = '';
   };
@@ -1636,17 +1730,23 @@ function wireAgentBox(box) {
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
+    withdrawReauthorize();
+    chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
   chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+  chosen?.addEventListener('change', (e) => {
+    const option = e.target.closest?.('.af-resume-reauthorize');
+    if (option) announceReauthorize(option.checked);
+  });
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
       // Turning the feature off is also a real parameter change. Clear the
       // dormant source so checking it again cannot revive an old conversation.
-      if (chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
+      clearTask();
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
@@ -5624,6 +5724,19 @@ async function openTaskForm(workflow, draft, seedText) {
   const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies || {}));
+  let refreshVaultCount = () => {};
+  // A fork's "Re-authorize previous grants?" writes into these same controls.
+  wireResumeReauthorization($('#tf-body'), {
+    editor: () => $('#tf-authorization'),
+    grants: () => ({ ids: [...vaultGrantIds], policies: vaultCredentialPolicies }),
+    setGrants: (ids, policies) => {
+      vaultGrantIds.clear();
+      ids.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
+      refreshVaultCount();
+    },
+    changed: () => autoSaveSoon(),
+  });
   (async () => {
     const button = $('#tf-vault-open');
     const count = $('#tf-vault-count');
@@ -5637,6 +5750,7 @@ async function openTaskForm(workflow, draft, seedText) {
       const selected = items.filter((i) => vaultGrantIds.has(i.id)).length;
       count.textContent = `${selected} selected`;
     };
+    refreshVaultCount = refreshCount;
     refreshCount();
     button.disabled = false;
     button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (selected, policies) => {
@@ -8518,12 +8632,26 @@ async function wireTaskAuthorization(v) {
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
   const button = document.getElementById('tp-vault-open');
   const count = document.getElementById('tp-vault-count');
+  let refreshVaultCount = () => {};
+  // An in-flight fork edit can re-authorize its source's grants into these
+  // controls too; "Save authorization" then applies them like a manual change.
+  wireResumeReauthorization(select.closest('.task-page') || document.getElementById('main'), {
+    editor: () => select,
+    grants: () => ({ ids: [...vaultGrantIds], policies: vaultCredentialPolicies }),
+    setGrants: (ids, policies) => {
+      vaultGrantIds.clear();
+      ids.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
+      refreshVaultCount();
+    },
+  });
   const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
   let items = [];
   try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
   catch { button?.closest('[data-row="__vault"]')?.remove(); }
   if (button && count) {
     const refreshCount = () => { count.textContent = `${items.filter((i) => vaultGrantIds.has(i.id)).length} selected`; };
+    refreshVaultCount = refreshCount;
     refreshCount();
     button.disabled = false;
     button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (picked, policies) => {

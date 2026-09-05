@@ -97,5 +97,12 @@ ok(css.includes('.authz-editor .authz-level-select'), 'the level select is style
 ok(css.includes('.authz-editor .authz-scope-input'), 'the scope input is styled from inside the editor');
 ok(/\.authz-scope-field\s*\{[^}]*flex-wrap:\s*wrap/.test(css), 'scope chips wrap inside the field instead of squeezing it');
 
+// A fork re-authorizing its source's grants sets the editor programmatically;
+// that path normalizes and announces the value exactly like a hand-picked level.
+const wired = extractFunction('wireAuthorizationEditor');
+ok(wired.includes('root._setAuthorization = (next) =>') && wired.includes('value = normalizedAuthorization(next);'),
+  'the wired editor exposes a normalizing programmatic setter');
+ok(/_setAuthorization = \(next\) => \{[\s\S]*?drawChips\(\); emit\(\);/.test(wired), 'the setter redraws the chips and announces the change');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
