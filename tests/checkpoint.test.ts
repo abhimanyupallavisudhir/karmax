@@ -212,10 +212,12 @@ describe('portable world checkpoints', () => {
 
     const worlds = new WorldRegistry();
     const worktrees = new WorktreeProvider(path.join(dir, 'worlds'));
+    const createSpecs: Array<Parameters<WorktreeProvider['create']>[0]> = [];
     worlds.register({
       kind: 'sandbox-test', parkable: true,
       capabilities: { remote: true, pty: false, snapshots: true, ports: false, networkPolicy: false },
       async create(spec: Parameters<WorktreeProvider['create']>[0]) {
+        createSpecs.push(spec);
         const w = await worktrees.create(spec);
         w.handle.kind = 'sandbox-test';
         w.handle.provider = 'sandbox-test';
@@ -243,6 +245,7 @@ describe('portable world checkpoints', () => {
     // lease exactly like createWorld does — otherwise the sandbox is invisible to
     // the budget and destroyWorld finds no lease to hand its capacity back.
     const restored = await checkpoints.restore(checkpoint.id, 'sandbox-test');
+    expect(createSpecs[1]).toMatchObject({ organizationId: organization.id, generation: 2 });
     const leaseId = restored.meta?.worldLeaseId as string | undefined;
     expect(typeof leaseId).toBe('string');
     expect(store.worldLease(leaseId!)?.state).toBe('active');

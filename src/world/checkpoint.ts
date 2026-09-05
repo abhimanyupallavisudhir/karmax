@@ -220,7 +220,11 @@ export class WorldCheckpointService {
       : undefined;
     let world: World;
     try {
+      // Recovery is a new provider allocation, just like createWorld: tenant
+      // identity selects the organization-owned credential, while generation
+      // keeps the provider's idempotency lookup away from the vanished sandbox.
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
+        generation: checkpoint.generation + 1, organizationId: project.organizationId,
         repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
         branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
