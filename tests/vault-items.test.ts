@@ -161,6 +161,30 @@ describe('grants + access policy (§§5–6)', () => {
     expect(domainMatches('gist.github.com', 'github.com')).toBe(true);
     expect(domainMatches('evilgithub.com', 'github.com')).toBe(false);
   });
+
+  it('finds conventional www aliases without broadening browser-origin matching', () => {
+    const { items } = makeService();
+    const www = items.save({ type: 'login', label: 'www', domains: ['www.amazon.co.uk'] });
+    expect(items.request({
+      taskId: 't1',
+      caps: [`use-credential:item:${www.id}`],
+      domain: 'amazon.co.uk',
+      mode: 'use',
+    })).toEqual({ status: 'granted', itemId: www.id });
+
+    const broad = items.save({ type: 'login', label: 'broad', domains: ['amazon.co.uk'] });
+    items.save({ type: 'login', label: 'seller', domains: ['sellercentral.amazon.co.uk'] });
+
+    expect(items.findByDomain('amazon.co.uk')).toEqual([broad, www]);
+    expect(items.findByDomain('www.amazon.co.uk')).toEqual([www, broad]);
+    expect(domainMatches('amazon.co.uk', 'www.amazon.co.uk')).toBe(false);
+  });
+
+  it('does not infer arbitrary child domains while searching', () => {
+    const { items } = makeService();
+    items.save({ type: 'login', label: 'seller', domains: ['sellercentral.amazon.co.uk'] });
+    expect(items.findByDomain('amazon.co.uk')).toEqual([]);
+  });
 });
 
 describe('the pull model: requests + human resolutions (§7)', () => {
