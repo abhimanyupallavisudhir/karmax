@@ -88,9 +88,9 @@ export class PaidLaunchSettingsService {
   }
 
   launchConfig() { return launchConfig(this.env, this.stored()); }
-  publicLaunchInfo() { return publicLaunchInfo(this.env, this.stored()); }
+  publicLaunchInfo(siteName?: string) { return publicLaunchInfo(this.env, this.stored(), siteName); }
   assertReady() { return assertPaidLaunchReady(this.env, this.stored()); }
-  policyDocument(slug: string) { return policyDocument(slug, this.env, this.stored()); }
+  policyDocument(slug: string, siteName?: string) { return policyDocument(slug, this.env, this.stored(), siteName); }
 
   subscriptionConfig(): SubscriptionRuntimeConfig {
     const stripe = this.stored().stripe ?? {};

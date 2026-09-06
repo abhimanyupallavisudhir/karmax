@@ -65,6 +65,16 @@ configure() {
   valid_domain "$preview" || die "invalid preview domain: $preview"
   [ "$domain" != "$preview" ] || die 'the preview domain must be different from the application domain'
 
+  legacy=$(env_value KARMAX_LEGACY_DOMAIN)
+  if [ -z "$legacy" ] && [ -n "$existing_domain" ] && [ "$domain" != "$existing_domain" ]; then
+    legacy=$existing_domain
+  fi
+  if [ -n "$legacy" ]; then
+    legacy=$(printf '%s' "$legacy" | tr '[:upper:]' '[:lower:]')
+    valid_domain "$legacy" || die "invalid legacy domain: $legacy"
+    [ "$legacy" != "$domain" ] || legacy=''
+  fi
+
   old_password=$(env_value POSTGRES_PASSWORD)
   password=${old_password:-$(random_hex 32)}
   old_provider=$(env_value KARMAX_CLOUD_WORLD_PROVIDER)
@@ -82,7 +92,7 @@ configure() {
   carried=''
   if [ -f "$ENV_FILE" ]; then
     carried=$(awk '
-      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
+      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_LEGACY_DOMAIN KARMAX_LEGACY_WWW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
         POSTGRES_PASSWORD TEMPORAL_VERSION POSTGRES_VERSION", m, " ")
         for (i in m) managed[m[i]] = 1 }
       /^[A-Za-z_][A-Za-z0-9_]*=/ {
@@ -99,6 +109,10 @@ configure() {
   {
     printf 'KARMAX_DOMAIN=%s\n' "$domain"
     printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
+    if [ -n "$legacy" ]; then
+      printf 'KARMAX_LEGACY_DOMAIN=%s\n' "$legacy"
+      printf 'KARMAX_LEGACY_WWW_DOMAIN=www.%s\n' "$legacy"
+    fi
     printf 'KARMAX_CLOUD_WORLD_PROVIDER=%s\n' "$provider"
     printf 'POSTGRES_PASSWORD=%s\n' "$password"
     printf 'TEMPORAL_VERSION=%s\n' "$temporal"
