@@ -34,6 +34,7 @@ eval(extractFn('authorizationSummary'));
 eval(extractFn('previousTaskGrants'));
 eval(extractFn('previousGrantsSummary'));
 eval(extractFn('wireResumeReauthorization'));
+eval(extractFn('agentRoleLabel'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('renderAgentField'));
