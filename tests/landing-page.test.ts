@@ -17,7 +17,7 @@ describe('public landing page', () => {
   it('carries the product thesis and each promised capability', () => {
     const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
     expect(landing).toContain('<strong>vscode</strong><span>was a fancy <b>text editor.</b>');
-    expect(landing).toContain('<strong>krmax</strong><span>is a fancy <b>to-do list.</b>');
+    expect(landing).toContain('<strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b>');
     expect(landing).toContain('The <em>correct</em> interface');
     expect(landing).toContain('managing agents');
     expect(landing).toContain('manually coding/working');
@@ -25,7 +25,7 @@ describe('public landing page', () => {
     expect(landing).toContain('Yes, gitignored files are handled correctly.');
     expect(landing).toContain('secrets, databases, big files');
     expect(landing).toContain('Bring your own key or OpenAI/Claude subscription');
-    expect(landing).toContain('krmax MCP lets agents access and manage your krmax projects');
+    expect(landing).toContain('${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects');
     expect(landing).toContain('Connect a password vault and a payment card, and let agents Just Do Things.');
     expect(landing).toContain('As human-in-the-loop');
     expect(landing).toContain('<strong>authorization system</strong>');
@@ -38,9 +38,9 @@ describe('public landing page', () => {
     expect(landing).not.toContain('<em>underclass</em>');
   });
 
-  it('uses a faithful krmax task list to advertise implemented features', () => {
-    expect(app).toContain('aria-label="krmax task list showing agents working in parallel"');
-    expect(app).toContain('krmax.io / krmax');
+  it('uses a faithful, installation-branded task list to advertise implemented features', () => {
+    expect(app).toContain('aria-label="${siteNameMarkup()} task list showing agents working in parallel"');
+    expect(app).toContain('${esc(location.host)} / ${siteNameMarkup()}');
     expect(app).toContain('<span>Queues</span><span>Wiki</span><span>Settings</span>');
     expect(app).toContain('Support e2b cloud environments for agents');
     expect(app).toContain('Support Github auto-merge, merge queues in addition to native merge queue');

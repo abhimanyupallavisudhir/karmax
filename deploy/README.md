@@ -36,6 +36,12 @@ manage. You can choose another preview base as the second argument:
 ./deploy/karmax up karmax.example.com previews.example.net
 ```
 
+Running `up` with a different application domain records the previous domain as
+`KARMAX_LEGACY_DOMAIN`. Caddy keeps the old apex and `www` host on HTTPS and
+permanently redirects them to the new canonical origin. Keep both domains'
+DNS records pointed at the VPS. Also update exact callback URLs registered with
+Google, GitHub, or an OIDC provider before relying on sign-in at the new origin.
+
 Open the URL, create the first administrator, then use **Organization settings**
 to:
 

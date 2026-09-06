@@ -73,6 +73,19 @@ www.{$KARMAX_DOMAIN} {
 	redir https://{$KARMAX_DOMAIN}{uri} permanent
 }
 
+# A domain migration keeps old bookmarks, OAuth return paths, and emailed links
+# working while making the new origin canonical. The loopback defaults leave
+# this inert on installations that have never moved.
+{$KARMAX_LEGACY_DOMAIN:http://127.0.0.1:65535} {
+	import karmax_security
+	redir https://{$KARMAX_DOMAIN}{uri} permanent
+}
+
+{$KARMAX_LEGACY_WWW_DOMAIN:http://127.0.0.1:65534} {
+	import karmax_security
+	redir https://{$KARMAX_DOMAIN}{uri} permanent
+}
+
 # Each live preview gets an opaque, isolated origin. Caddy asks Karmax whether
 # the lease is currently valid before obtaining a certificate, so this catch-all
 # cannot be abused to mint certificates for arbitrary names.

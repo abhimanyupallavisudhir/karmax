@@ -194,7 +194,7 @@ describe('manual PR opening', () => {
 
   it('confirms the context-specific action before signaling it', () => {
     expect(app).toContain('Are you sure the agent\'s work here is complete? You could cancel and ask the agent to open the PR itself.');
-    expect(app).toContain('Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.');
+    expect(app).toContain('Return this pull request to Review? ${siteName()} will first verify that the current proposal is clean and committed.');
     expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act, v)) return;');
     expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name, S.view)) return;');
   });
