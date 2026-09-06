@@ -104,9 +104,12 @@ export interface TriggerArmer {
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
+// Human-facing stage names. `do` is the replay-stable internal key; a person
+// reads it as "Working" (the console's stageLabel says the same).
 const stageName = (stage: string) => stage === 'human'
   ? 'Waiting for human input'
-  : stage.charAt(0).toUpperCase() + stage.slice(1);
+  : stage === 'do' ? 'Working'
+    : stage.charAt(0).toUpperCase() + stage.slice(1);
 const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
 const wikiFiles = (root: string): string[] => {
   const out: string[] = [];
@@ -2398,7 +2401,7 @@ export class KarmaxApi {
     };
 
     if (task.params.draft) {
-      add({ target: 'do', label: 'Queue', description: 'Start this draft.' });
+      add({ target: 'do', label: 'Run task', description: 'Start this draft.' });
       add({ target: 'done', label: 'Done', description: 'Mark this draft done without running it.' });
       return result;
     }
@@ -2437,7 +2440,7 @@ export class KarmaxApi {
     }
     if (view.status === 'failed') {
       if (resumable && !view.pointOfNoReturnPassed)
-        add({ target: 'do', label: 'Retry Do', description: 'Recover the preserved work and retry the task.' });
+        add({ target: 'do', label: 'Retry', description: 'Recover the preserved work and retry the task.' });
       if (!jayadratha && !view.pointOfNoReturnPassed)
         add({ target: 'draft', label: 'Draft', description: 'Discard failed progress and start over later.', danger: true });
       add({ target: 'done', label: 'Done', description: 'Stop treating this failure as active work.' });
@@ -2465,12 +2468,12 @@ export class KarmaxApi {
     if (resumable && (view.stage === 'pr' || view.stage === 'review' || view.stage === 'merge') && !origin)
       add({
         target: 'do',
-        label: 'Do',
+        label: 'Back to Working',
         description: view.stage === 'merge'
-          ? 'Return the pending pull request to Do for repair; preserved intent authorization is revalidated automatically unless the repair changes scope.'
+          ? 'Return the pending pull request to the agent for repair; preserved intent authorization is revalidated automatically unless the repair changes scope.'
           : view.stage === 'review'
-            ? 'Return the proposal to Do for repair; the current head approval lapses and the repaired proposal returns through Review.'
-            : 'Stop proposal publication and return the preserved branch to Do.',
+            ? 'Return the proposal to the agent for repair; the current head approval lapses and the repaired proposal returns through Review.'
+            : 'Stop proposal publication and return the preserved branch to the agent.',
       });
     if (!jayadratha && !view.pointOfNoReturnPassed)
       add({ target: 'draft', label: 'Draft', description: 'Discard all execution progress and make the attempt editable.', danger: true });

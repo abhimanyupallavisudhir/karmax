@@ -328,7 +328,7 @@ Your final response is sent back to the working agent as its input. Be concise a
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).
 const SOFTWARE_DEV_STAGES: StageDef[] = [
   { key: 'setup', label: 'Setup' },
-  { key: 'do', label: 'Do', ...(RESOLVE_AGENT_ENABLED ? { aliases: ['resolve'] } : {}) },
+  { key: 'do', label: 'Working', ...(RESOLVE_AGENT_ENABLED ? { aliases: ['resolve'] } : {}) },
   { key: 'pr', label: 'PR' },
   { key: 'review', label: 'Review' },
   // `merge` is the durable key, but Landing can spend an arbitrary time queued
@@ -479,7 +479,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // No merge machinery: do → review → done.
     stages: [
       { key: 'setup', label: 'Setup' },
-      { key: 'do', label: 'Do' },
+      { key: 'do', label: 'Working' },
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
