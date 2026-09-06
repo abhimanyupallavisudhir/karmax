@@ -152,7 +152,7 @@ describe('remote subscription agents', () => {
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
       .toEqual(expect.arrayContaining([`@anthropic-ai/claude-code@${pinned}`, '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
-      .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
+      .toEqual(expect.arrayContaining(['@openai/codex@0.153.4', 'app-server']));
   });
 
   it('isolates accounts and exports native sessions without importing task-local OAuth state', async () => {
@@ -255,7 +255,7 @@ describe('remote subscription agents', () => {
       platformRequest: async (method: string, requestPath: string) => { platformCalls.push(`${method} ${requestPath}`); return [{ type: 'ok' }]; } } as any);
 
     expect(result).toMatchObject({ termination: { kind: 'success', status: 'completed' }, session: 'remote-thread', output: 'done remotely' });
-    expect(world.openedPty?.command).toContain('@openai/codex@0.144.5');
+    expect(world.openedPty?.command).toContain('@openai/codex@0.153.4');
     expect(world.openedPty?.command).toContain('/opt/karmax/bin/codex');
     expect(world.openedPty?.command).toContain('app-server');
     expect(world.openedPty?.command).toContain('stty raw -echo');
