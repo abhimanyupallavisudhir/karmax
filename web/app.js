@@ -3370,6 +3370,7 @@ const BRAND_ICON_CHOICES = [
   { id: 'diamond', label: 'Diamond' },
   { id: 'knot', label: 'Knot' },
   { id: 'check', label: 'Check' },
+  { id: 'check-arrow', label: 'Check arrow' },
   { id: 'clover', label: 'Clover' },
 ];
 

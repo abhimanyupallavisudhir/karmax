@@ -19,7 +19,7 @@ describe('brand icon selection', () => {
   });
 
   it('accepts exactly the known icons', () => {
-    expect(BRAND_ICONS).toEqual(['diamond', 'knot', 'check', 'clover']);
+    expect(BRAND_ICONS).toEqual(['diamond', 'knot', 'check', 'check-arrow', 'clover']);
     for (const icon of BRAND_ICONS) expect(isBrandIcon(icon)).toBe(true);
     expect(isBrandIcon('Diamond')).toBe(false);
     expect(isBrandIcon('../../etc/passwd')).toBe(false);
@@ -29,12 +29,18 @@ describe('brand icon selection', () => {
   it('ships raster assets for every icon, so a switch never leaves a hole', () => {
     for (const icon of BRAND_ICONS) {
       for (const file of BRAND_FILES) {
-        if (file === 'icon.svg') continue; // vector art exists only for the diamond
+        if (file === 'icon.svg') continue; // Vector art is optional per variant.
         const asset = path.join(webDir, 'brand', icon, file);
         expect(fs.existsSync(asset), `${icon}/${file}`).toBe(true);
         expect(fs.statSync(asset).size).toBeGreaterThan(0);
       }
     }
+  });
+
+  it('ships the check-arrow vector source used to render its raster sizes', () => {
+    const svg = fs.readFileSync(path.join(webDir, 'brand', 'check-arrow', 'icon.svg'), 'utf8');
+    expect(svg).toContain('viewBox="0 0 512 512"');
+    expect(svg).toContain('aria-label="Checkmark ending in an arrow"');
   });
 
   it('points the static shell at the setting-resolved /brand path, not a variant', () => {
@@ -49,7 +55,8 @@ describe('brand icon selection', () => {
 
   it('keeps the web picker in step with the server vocabulary', () => {
     const app = fs.readFileSync(path.join(webDir, 'app.js'), 'utf8');
-    const ids = [...app.matchAll(/\{ id: '([a-z]+)', label: '[A-Za-z]+' \}/g)].map((m) => m[1]);
+    const choices = app.match(/const BRAND_ICON_CHOICES = \[([\s\S]*?)\n\];/)?.[1] ?? '';
+    const ids = [...choices.matchAll(/\{ id: '([a-z-]+)', label: '[A-Za-z ]+' \}/g)].map((m) => m[1]);
     expect(ids).toEqual([...BRAND_ICONS]);
   });
 });
