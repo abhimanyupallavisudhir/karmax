@@ -1102,7 +1102,9 @@ export interface ConnectorConfig {
   /** Durable selective mirror subscription. `importNew` is the broader mode:
    *  it always implies `enabled` and refreshes the complete external store. */
   autoSync?: {
-    enabled: true;
+    /** `false` is persisted rather than erased so it is distinguishable from
+     *  a connector imported before automatic subscriptions existed. */
+    enabled: boolean;
     importNew: boolean;
     externalIds: string[];
     /** Applied only when automatic discovery creates a new vault item. */
@@ -1197,7 +1199,6 @@ export class Connectors {
     if (!this.get(name)) throw new Error(`no connector "${name}"`);
     const importNew = input.importNew === true;
     const enabled = importNew || input.keepUpdated === true;
-    if (!enabled) return this.setConfig(name, { autoSync: undefined });
     const externalIds = [...new Set((input.externalIds ?? []).map(String).map((id) => id.trim()).filter(Boolean))];
     if (externalIds.length > 100_000) throw new Error('automatic sync selection is too large');
     if (input.policy?.use !== undefined && !['auto', 'ask'].includes(input.policy.use))
@@ -1205,7 +1206,7 @@ export class Connectors {
     if (input.policy?.reveal !== undefined && !['auto', 'ask', 'never'].includes(input.policy.reveal))
       throw new Error('automatic sync reveal policy must be auto, ask, or never');
     return this.setConfig(name, {
-      autoSync: { enabled: true, importNew, externalIds, ...(input.policy ? { policy: input.policy } : {}) },
+      autoSync: { enabled, importNew, externalIds, ...(input.policy ? { policy: input.policy } : {}) },
     });
   }
 
@@ -1213,7 +1214,19 @@ export class Connectors {
    *  run, so entries added since the last import join the selected mirror. */
   async autoSync(name: string, reason: 'github-push' | 'backstop', revision?: string): Promise<SyncResult | undefined> {
     const config = this.config(name);
-    const subscription = config.autoSync;
+    let subscription = config.autoSync;
+    if (!subscription) {
+      // Automatic Git-backed subscriptions were added after connector imports
+      // already existed in the wild. Missing config therefore means "legacy",
+      // not "disabled": preserve the original selective mirror by tracking
+      // exactly the items it imported, without opting into newly added entries.
+      const externalIds = this.items.list()
+        .filter((item) => item.provenance.source === `connector:${name}` && item.provenance.externalId)
+        .map((item) => item.provenance.externalId!);
+      if (!externalIds.length) return undefined;
+      subscription = { enabled: true, importNew: false, externalIds };
+      this.setConfig(name, { autoSync: subscription });
+    }
     if (!subscription?.enabled) return undefined;
     const connector = this.get(name);
     if (!connector) return undefined;
