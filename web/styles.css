@@ -235,8 +235,7 @@ a { color: var(--accent); text-decoration: none; }
   flex: none; display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 5px;
   background: transparent; color: var(--ink-3); font: 600 14px/1 var(--font-ui); cursor: pointer;
 }
-.rail .rail-edit-action { margin: -3px -4px -3px auto; opacity: .38; transition: opacity .12s, color .12s, background .12s; }
-.rail .project-row .rail-edit-action { opacity: 0; }
+.rail .rail-edit-action { margin: -3px -4px -3px auto; opacity: 0; transition: opacity .12s, color .12s, background .12s; }
 .rail .proj:hover .rail-edit-action, .rail .proj:focus-within .rail-edit-action { opacity: 1; }
 .rail .rail-edit-action:hover, .rail .rail-edit-action:focus-visible,
 .rail .rail-edit-confirm:hover, .rail .rail-edit-confirm:focus-visible,

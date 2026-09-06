@@ -72,7 +72,7 @@ describe('Project settings browser source', () => {
     expect(inlineEdit).toContain("event.key !== 'Escape'");
     expect(inlineEdit).toContain('class="rail-edit-confirm"');
     expect(inlineEdit).toContain('class="rail-edit-cancel"');
-    expect(styles).toContain('.rail .project-row .rail-edit-action { opacity: 0; }');
+    expect(styles).toContain('.rail .rail-edit-action { margin: -3px -4px -3px auto; opacity: 0;');
     expect(styles).toContain('.rail .proj:hover .rail-edit-action');
   });
 
