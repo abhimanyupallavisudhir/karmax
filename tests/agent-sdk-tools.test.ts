@@ -75,6 +75,22 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
   });
 
+  it('offers a dedicated inventory of credentials granted to the task', async () => {
+    const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'list_credentials')!;
+    expect(schema.description).toMatch(/authorized to use/i);
+    expect(schema.description).toMatch(/non-secret metadata/i);
+
+    const sent: any[] = [];
+    const handlers = platformToolHandlers({} as any, {
+      platformRequest: async (method: string, requestPath: string) => {
+        sent.push({ method, requestPath }); return [];
+      },
+      emit() {}, emitActivity() {},
+    } as any);
+    await expect(handlers.list_credentials!({})).resolves.toBe('[]');
+    expect(sent).toEqual([{ method: 'GET', requestPath: '/api/vault/available' }]);
+  });
+
   it('offers urgency on every tool that asks a human for something', () => {
     for (const name of ['escalate_to_human', 'request_permission', 'request_credential']) {
       const schema = TOOL_SCHEMAS.find((tool) => tool.name === name)!;

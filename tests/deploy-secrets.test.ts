@@ -69,6 +69,13 @@ describe('turnkey update deploys an exact validated revision', () => {
     expect(script).toContain('pg_restore -U temporal -d karmax');
     expect(script).toContain('for database in karmax temporal temporal_visibility');
   });
+
+  it('applies a staged domain migration transactionally with the validated update', () => {
+    expect(update).toContain('pending_domain=$(env_value KARMAX_PENDING_DOMAIN)');
+    expect(update).toContain('configure "$pending_domain" "$pending_preview"');
+    expect(update).toContain('restore_migration');
+    expect(script).toContain('KARMAX_LEGACY_DOMAIN');
+  });
 });
 
 describe('turnkey deployment secrets', () => {

@@ -191,6 +191,24 @@ describe('deploy/karmax preserves operator settings across a re-run', () => {
     expect(result.match(/^KARMAX_DOMAIN=/gm)).toHaveLength(1);
   });
 
+  it('consumes a staged domain migration while preserving the former origin', () => {
+    const seeded = [
+      'KARMAX_DOMAIN=krmax.example.com',
+      'KARMAX_PREVIEW_DOMAIN=preview.krmax.example.com',
+      'KARMAX_PENDING_DOMAIN=tavya.example.com',
+      'KARMAX_PENDING_PREVIEW_DOMAIN=preview.tavya.example.com',
+      'POSTGRES_PASSWORD=keep-me',
+      '',
+    ].join('\n');
+    const result = runConfigure(seeded, 'tavya.example.com');
+    expect(result).toContain('KARMAX_DOMAIN=tavya.example.com');
+    expect(result).toContain('KARMAX_PREVIEW_DOMAIN=preview.tavya.example.com');
+    expect(result).toContain('KARMAX_LEGACY_DOMAIN=krmax.example.com');
+    expect(result).toContain('KARMAX_LEGACY_WWW_DOMAIN=www.krmax.example.com');
+    expect(result).not.toContain('KARMAX_PENDING_DOMAIN');
+    expect(result).not.toContain('KARMAX_PENDING_PREVIEW_DOMAIN');
+  });
+
   it('still writes a complete file for a first install', () => {
     const result = runConfigure(undefined);
     expect(result).toContain('KARMAX_DOMAIN=krmax.example.com');

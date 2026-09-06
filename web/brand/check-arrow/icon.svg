@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Checkmark ending in an arrow">
+  <rect x="24" y="24" width="464" height="464" rx="96" fill="#191A20"/>
+  <rect x="25" y="25" width="462" height="462" rx="95" fill="none" stroke="#30313A" stroke-width="2"/>
+  <path d="M112 272L204 360L392 136" fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M312 136H392V216" fill="none" stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

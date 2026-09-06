@@ -30,6 +30,12 @@ const ICON = {
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
   edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
+  // Sidebar tree vocabulary: a plain chevron folds a folder (rotated 90° when
+  // open) and the checklist marks a project — a project is a todo list, so its
+  // icon is one.
+  chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
+  project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
 const DEFAULT_EXPLANATION_SETTINGS = {
@@ -781,8 +787,12 @@ function principalLabel(principal) {
   if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
   if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
   if (principal.kind === 'avatar') return S.avatars?.find((a) => a.id === principal.avatarId)?.name || principal.avatarId;
-  return principal.role === 'do' ? 'Task agent · Agent' : `Task agent · ${principal.role}`;
+  return `Task agent · ${agentRoleLabel(principal.role)}`;
 }
+
+// `do` is the replay-stable internal name of the agent that does the work. A
+// person just sees "Agent"; the other roles keep their descriptive names.
+function agentRoleLabel(role) { return !role || role === 'do' ? 'Agent' : `${role} agent`; }
 
 // The workflows a human may pick when creating a task. INTENDED: `just-do` and
 // `script-exec` are deliberately absent because they are clutter in the picker —
@@ -799,7 +809,7 @@ const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
-  { key: 'do', label: 'Do' },
+  { key: 'do', label: 'Working' },
   { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
   { key: 'merge', label: 'Landing' },
@@ -1037,7 +1047,7 @@ function renderAgentField(f, spec, inherited) {
 // credentials controls can honour it.
 function resumeChosenInner(rf, task) {
   const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
-  const source = !rf.role || rf.role === 'do' ? 'agent' : `${rf.role} agent`;
+  const source = agentRoleLabel(rf.role).toLowerCase();
   const ref = `${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
   const link = t && projectById(t.projectId)
     ? `<a class="af-resume-source" data-spa href="${esc(taskUrl(t.id, t))}" title="Open the source task">${esc(ref)}</a>`
@@ -3363,6 +3373,7 @@ const BRAND_ICON_CHOICES = [
   { id: 'diamond', label: 'Diamond' },
   { id: 'knot', label: 'Knot' },
   { id: 'check', label: 'Check' },
+  { id: 'check-arrow', label: 'Check arrow' },
   { id: 'clover', label: 'Clover' },
 ];
 
@@ -3729,11 +3740,16 @@ function railProjectRows(projectScoped) {
   };
   for (const p of projects) dir(p.folder || '').children.push(p);
   const folded = railCollapsedFolders();
+  // A project row is an item: checklist icon, regular text, a link. A folder
+  // row is a group heading: a chevron and a small uppercase name (styled in
+  // CSS), so it never reads like the bold active project. Each row's tooltip
+  // names its kind for the first-time reader. Folders carry their own "+" so a
+  // project can be created in place.
   const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
-          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="${esc(projectPath(p))}"><span class="glyph">◇</span><span class="rail-name">${esc(p.name)}</span></a>
+          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
-  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'} folder"><span class="glyph">${open ? '▾' : '▸'}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
+  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="Folder · ${esc(node.path)} (click to ${open ? 'collapse' : 'expand'})"><span class="glyph chevron">${ICON.chevron}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-add="${esc(node.path)}" title="New project in this folder" aria-label="New project in ${esc(node.path)}">${ICON.plus}</button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
@@ -3761,10 +3777,9 @@ function renderRail() {
       : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
   rail.innerHTML = `
-    <div class="label">Projects</div>
+    <div class="label rail-heading"><span>Projects</span><button class="rail-add" id="new-project" type="button" title="New project" aria-label="New project">${ICON.plus}</button></div>
     ${railProjectRows(projectScoped)}
-    <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
-    <div class="grow"></div>
+    <div class="grow" id="rail-projects-end"></div>
     <div class="label">Organization</div>
     <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
     <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
@@ -3773,7 +3788,7 @@ function renderRail() {
   // Your profile lives in the top bar (#topbar-user), not the rail. Project +
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
-  $('#new-project')?.addEventListener('click', newProject);
+  $('#new-project')?.addEventListener('click', () => newProject());
   // Folder headers are native buttons, so click, Enter, and Space all share the
   // same fold behavior during pointer use and the rail's keyboard walk.
   for (const head of rail.querySelectorAll('.folder-toggle')) {
@@ -3785,13 +3800,16 @@ function renderRail() {
   rail.querySelectorAll('[data-folder-edit]').forEach((button) => button.addEventListener('click', (event) => {
     event.stopPropagation(); editRailFolder(button);
   }));
+  rail.querySelectorAll('[data-folder-add]').forEach((button) => button.addEventListener('click', (event) => {
+    event.stopPropagation(); newProject({ folder: button.dataset.folderAdd });
+  }));
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
 
 // HTML5 drag-and-drop reordering of the rail's project links. The rail holds more
-// than projects — "New project", then the organization nav — so dropping past the
-// last project means "just above #new-project", never the container's end. The
+// than projects — the spacer, then the organization nav — so dropping past the
+// last project means "just above #rail-projects-end", never the container's end. The
 // container handlers are assigned as properties, not addEventListener: the rail
 // element survives every repaint, so listeners would otherwise pile up.
 function wireProjectDrag(rail) {
@@ -3801,7 +3819,7 @@ function wireProjectDrag(rail) {
   const anchors = () => [...rail.querySelectorAll('.proj[draggable="true"], .proj.folder')];
   const rows = projects();
   if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
-  const end = $('#new-project');
+  const end = $('#rail-projects-end');
   for (const row of rows) {
     row.addEventListener('dragstart', (e) => {
       draggingProject = row;
@@ -4406,7 +4424,7 @@ function taskRow(t, { showTags = true } = {}) {
         <div class="task-sub"><span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
-        <button class="btn sm" data-queue="${t.id}">Queue</button>
+        <button class="btn sm" data-queue="${t.id}">Run task</button>
         <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
       </div>
     </div>`;
@@ -4469,9 +4487,9 @@ function stageLabel(v) {
   // where to resume. Direct provider blockers may supply a concise specific
   // summary; ordinary holds retain the stable "Waiting for input" label.
   if (v.status === 'waiting' && v.waitingFor?.kind === 'human') return waitingText(v.waitingFor);
-  const stage = v.stage || 'setup';
-  if (stage === 'merge') return 'landing';
-  return stage;
+  // `do` and `merge` are the replay-stable workflow keys; a person reads them
+  // as "working" and "landing" and never has to learn the internal names.
+  return { do: 'working', merge: 'landing' }[v.stage || 'setup'] || v.stage || 'setup';
 }
 
 // The stage indicator is also the lifecycle control. The server supplies the
@@ -4781,7 +4799,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       .map((role) => `<div class="pick-row pk-session" data-nav data-task="${t.id}" data-role="${esc(role)}">
         <span class="pk-fork">⑂</span>
         <div class="task-main">
-          <div class="task-title">${esc(role)} agent</div>
+          <div class="task-title">${esc(agentRoleLabel(role))}</div>
           <div class="task-sub">${s[role].provider ? `<span class="wf">${esc(s[role].provider)}</span>` : ''}<span class="mono">${esc(String(s[role].id || '').slice(0, 20))}…</span></div>
         </div>
       </div>`)
@@ -4981,7 +4999,7 @@ function wireTasksView() {
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
   );
   $('#main').querySelectorAll('[data-queue]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { showTaskError(e, taskRecord(b.dataset.queue)?.projectId); } }),
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Task started'); refreshTasks(); } catch (e) { showTaskError(e, taskRecord(b.dataset.queue)?.projectId); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -5587,7 +5605,7 @@ async function openTaskForm(workflow, draft, seedText) {
         <div class="tf-foot-inner">
           <span class="tf-hint">Closing keeps your work as a draft</span>
           <button class="btn" id="tf-draft">Save draft</button>
-          <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+          <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </footer>
     </div>`;
@@ -5945,7 +5963,7 @@ async function openTaskForm(workflow, draft, seedText) {
       const saveState = $('#tf-savestate');
       if (saveState) saveState.textContent = draftMode
         ? 'Saving draft…'
-        : editInPlace ? 'Saving…' : draft ? 'Queueing task…' : 'Creating task…';
+        : editInPlace ? 'Saving…' : 'Starting task…';
     }
     let succeeded = false;
     clearTimeout(saveTimer);
@@ -6032,13 +6050,13 @@ async function openTaskForm(workflow, draft, seedText) {
       succeeded = true;
       releaseFormKeys();
       root.innerHTML = '';
-      // Keep the toast in the button's vocabulary. Queuing an EXISTING draft used to
-      // say "Task created" — nothing was created, the task already existed, so the
-      // user could not tell whether they had just made a duplicate. The draft row's
-      // Queue button already toasts "Queued"; same action, same word.
+      // Keep the toast in the button's vocabulary: "Run task" → "Task started",
+      // whether the task was just written or was an existing draft. Starting an
+      // EXISTING draft used to say "Task created" — nothing was created, so the
+      // user could not tell whether they had just made a duplicate.
       toast(editInPlace
         ? (draftMode ? 'Moved to drafts' : 'Saved')
-        : draftMode ? 'Draft saved' : draft ? 'Queued' : 'Task created');
+        : draftMode ? 'Draft saved' : 'Task started');
       refreshTasks();
     } catch (e) {
       if (!draftMode && isAuthorizationGrantGap(e)) {
@@ -7751,7 +7769,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
-    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${v.agentTurn.role === 'do' ? 'Agent' : `${esc(v.agentTurn.role)} agent`} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
+    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
   const agentForks = agentForksSection(v);
@@ -10105,9 +10123,9 @@ async function renderDashboard() {
       <div class="stat-grid">
         <div class="stat"><div class="n">${d.projects}</div><div class="l">Projects</div></div>
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
-        ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
+        ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(stageLabel({ stage: s }))}</div></div>`).join('')}
       </div>
-      ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use <b>＋ New project</b> in the sidebar to create your first one.</div>` : ''}
+      ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use the <b>+</b> next to <b>Projects</b> in the sidebar to create your first one.</div>` : ''}
       ${!isOperator ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
@@ -10521,7 +10539,7 @@ const quickDefaultsHeader = () => '';
 function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
 function avatarRoleSummary(avatar) {
   if (!avatar.roles?.length) return 'Any role';
-  const labels = { do: 'Do', confirm: 'Review', respond: 'Response', resolve: 'Resolve', merge: 'Merge', authorize: 'Authorize' };
+  const labels = { do: 'Working', confirm: 'Review', respond: 'Response', resolve: 'Resolve', merge: 'Merge', authorize: 'Authorize' };
   return avatar.roles.map((role) => labels[role] || role).join(', ');
 }
 function avatarCallerSummary(avatar) {
@@ -10543,12 +10561,17 @@ async function loadAvatarAuthorizationRequests(avatarId) {
     ? await api(`/api/authorization-requests?organizationId=${encodeURIComponent(project.organizationId)}&avatarId=${encodeURIComponent(avatarId)}`).catch(() => [])
     : [];
 }
+// Shown wherever Avatars are managed. An Avatar acts with a person's delegated
+// authority on whatever it reads, so anything it reads can steer it.
+const AVATAR_RISK_NOTE = '<div class="avatar-risk-note" role="note"><span class="avatar-risk-mark" aria-hidden="true">⚠</span><div><b>NOTE:</b> Avatars are highly risky and subject to prompt injections. Use at your own risk.</div></div>';
+
 function avatarsView(proj) {
   if (!proj) return '<div class="empty">Select a project.</div>';
   const selected = S.avatars.find((avatar) => avatar.id === S.avatarSelected);
   if (selected) return avatarDetailView(selected);
   const disabled = S.avatarAvailability && !S.avatarAvailability.effective;
   return `<div class="avatars-page"><div class="settings-header avatar-list-head"><div><h1 class="page-title">Avatars</h1><p class="settings-intro">Trusted agents with delegated authority.</p></div>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
+    ${AVATAR_RISK_NOTE}
     ${disabled ? '<div class="avatar-disabled card"><div><b>Avatars are disabled for this project.</b><p>Existing Avatars and their history remain visible, but they cannot be called.</p></div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>' : ''}
     <div class="avatar-list">${S.avatars.map((avatar) => `<button class="avatar-row" type="button" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></button>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
 }
@@ -10571,7 +10594,7 @@ async function openAvatarEditor(proj, avatar) {
       <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All ${siteNameMarkup()}, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
       <div id="avatar-restricted" ${avatar?.authorityMode === 'restricted' ? '' : 'hidden'}>${authorizationEditorHtml('avatar-authorization', selectedAuth, S.projects.filter((item) => item.organizationId === proj.organizationId), proj.id)}<button class="btn tf-vault-button" id="avatar-vault" type="button"><span>Vault credentials</span><span id="avatar-vault-count">${selectedCredentialIds.size} selected</span></button></div>${activeGithub ? `<label class="choice-row compact"><input id="avatar-github" type="checkbox" ${avatar?.githubAccountId ? 'checked' : ''}><span><b>Use GitHub account ${esc(activeGithub.login)}</b><small>Delegate this connected account to the Avatar.</small></span></label>` : ''}</div>
       <div class="avatar-custom-section"><div class="section-h">Callable by</div><select id="avatar-call-mode"><option value="me" ${callMode === 'me' ? 'selected' : ''}>Only me</option><option value="project" ${callMode === 'project' ? 'selected' : ''}>Everyone in this project</option><option value="specific" ${callMode === 'specific' ? 'selected' : ''}>Specific people and teams</option></select><input id="avatar-callers" value="${esc(callMode === 'specific' ? avatar.callableBy.join(', ') : '')}" placeholder="user:id, @team:engineering" ${callMode === 'specific' ? '' : 'hidden'}></div>
-      <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Do'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
+      <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Working'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
       <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls"><select id="avatar-provider">${AGENT_PROVIDERS.map((provider) => `<option value="${provider}" ${provider === runtime.provider ? 'selected' : ''}>${provider}</option>`).join('')}</select><input id="avatar-model" value="${esc(runtime.model || '')}" placeholder="Project default model"><select id="avatar-effort"><option value="">Default effort</option>${['low','medium','high','xhigh','max'].map((effort) => `<option ${runtime.effort === effort ? 'selected' : ''}>${effort}</option>`).join('')}</select></div></div></details></div>
     <div class="avatar-editor-actions"><button class="btn avatar-editor-cancel" type="button">Cancel</button><button class="btn primary avatar-editor-save" type="button">${avatar ? 'Save Avatar' : 'Create Avatar'}</button></div>`;
   overlay.querySelector('.avatar-editor-close').addEventListener('click', close); overlay.querySelector('.avatar-editor-cancel').addEventListener('click', close);
@@ -15122,6 +15145,7 @@ function organizationView() {
     <div class="card"><div class="section-h">Task execution</div><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
     <div class="settings-section-title" id="settings-avatars"><div>Avatars<small>Organization-wide availability</small></div></div>
+    ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
 
     ${globalSettingsView(true)}
@@ -15500,12 +15524,15 @@ function toggleTheme() {
 })();
 
 // ── projects ─────────────────────────────────────────────────────────────────
-function newProject() {
+// `folder` (from a folder row's "+") pre-fills the path so the new project
+// lands in that folder; the person can still retype it into any other place.
+function newProject(options) {
+  const folder = options?.folder || '';
   const opener = document.activeElement;
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
     <div class="new-project-head"><div><b id="new-project-title">New project</b><span>Use slashes to organize it into folders.</span></div><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
-    <label class="form-row"><span>Project name</span><input id="new-project-name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false"></label>
+    <label class="form-row"><span>Project name</span><input id="new-project-name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
     <div class="new-project-preview" aria-live="polite">The final segment is the project name; everything before it becomes its sidebar folder.</div>
     <div class="form-error new-project-error" role="alert" hidden></div>
     <div class="new-project-actions"><button class="btn new-project-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Create project</button></div>
@@ -15553,7 +15580,9 @@ function newProject() {
   });
   $('#modal-root').appendChild(host);
   document.addEventListener('keydown', keydown);
-  host.querySelector('#new-project-name').focus();
+  const input = host.querySelector('#new-project-name');
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length); // type the name right after the folder path
 }
 
 // ── keyboard navigation / command registry (SPEC §10.1) ─────────────────────
@@ -15829,7 +15858,7 @@ function openAdjacentTask(delta) {
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
-function railRows() { return [...document.querySelectorAll('#rail .project-link, #rail .folder-toggle, #rail .proj.add, #rail .nav-item')]; }
+function railRows() { return [...document.querySelectorAll('#rail .rail-add, #rail .project-link, #rail .folder-toggle, #rail .nav-item')]; }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();
@@ -16013,7 +16042,7 @@ function openGlobalSearch() {
       // gesture (Ctrl/⌘-click, middle-click, right-click → Open in new tab); a plain
       // click below still opens it in place and dismisses the palette.
       return `${head}<a class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}"${item.href ? ` data-spa href="${esc(item.href)}"` : ''}>
-        <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? '◇' : '□'}</span>
+        <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? ICON.project : '□'}</span>
         <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
       </a>`;
     }).join('');

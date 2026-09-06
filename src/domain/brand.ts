@@ -1,7 +1,7 @@
 /** The instance-wide brand icon. Each id is a directory under `web/brand/`
  * holding the same asset filenames, so switching the setting reskins the
  * favicon, the installed-app icon and the in-app mark from one place. */
-export const BRAND_ICONS = ['diamond', 'knot', 'check', 'clover'] as const;
+export const BRAND_ICONS = ['diamond', 'knot', 'check', 'check-arrow', 'clover'] as const;
 
 export type BrandIcon = (typeof BRAND_ICONS)[number];
 
@@ -12,8 +12,8 @@ export const DEFAULT_BRAND_ICON: BrandIcon = 'diamond';
 export const DEFAULT_SITE_NAME = 'krmax';
 export const MAX_SITE_NAME_LENGTH = 48;
 
-/** Files served under `/brand/`. Not every variant has every file — only the
- * diamond ships an SVG — and a miss falls through to the next `<link>`. */
+/** Files served under `/brand/`. Not every variant has every file, and a miss
+ * falls through to the next `<link>`. */
 export const BRAND_FILES = ['icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'] as const;
 
 export function isBrandIcon(value: unknown): value is BrandIcon {

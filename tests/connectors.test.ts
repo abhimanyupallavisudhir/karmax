@@ -427,7 +427,47 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(connectors.config('test').lastAutoSync).toMatchObject({ reason: 'github-push', revision: 'commit-2' });
 
     connectors.setAutoSync('test', { keepUpdated: false, importNew: false, externalIds: ['one'] });
+    expect(connectors.config('test').autoSync).toEqual({
+      enabled: false, importNew: false, externalIds: ['one'],
+    });
+    pulled.length = 0;
+    expect(await connectors.autoSync('test', 'backstop')).toBeUndefined();
+    expect(pulled).toEqual([]);
+  });
+
+  it('migrates pre-subscription imports to selective automatic updates', async () => {
+    const { items, store, broker } = makeVault();
+    let password = 'old';
+    let revision = Date.now();
+    const pulled: string[][] = [];
+    const connector = {
+      name: 'test',
+      describe: async () => ({ name: 'test', label: 'Test', available: true, canPush: false, detail: 'ready' }),
+      list: async () => [{ externalId: 'existing', type: 'login' as const, label: 'Existing',
+        fields: ['password' as const], changedAt: revision }],
+      pull: async (externalIds: string[]) => {
+        pulled.push(externalIds);
+        return { items: externalIds.map((externalId) => ({ externalId, type: 'login' as const,
+          label: 'Existing', fields: ['password' as const], changedAt: revision,
+          secrets: { password } })), failures: [] };
+      },
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+
+    const imported = await connectors.sync('test', ['existing']);
     expect(connectors.config('test').autoSync).toBeUndefined();
+    password = 'rotated';
+    revision = Date.now() + 5_000;
+
+    await connectors.autoSync('test', 'backstop');
+
+    expect(pulled).toEqual([['existing'], ['existing']]);
+    expect(connectors.config('test').autoSync).toEqual({
+      enabled: true, importNew: false, externalIds: ['existing'],
+    });
+    expect(items.resolveField(items.get(imported.itemIds[0]!)!, 'password', { mode: 'reveal' }))
+      .toBe('rotated');
   });
 
   it('does not import an agent-created item back as a duplicate after write-back', async () => {

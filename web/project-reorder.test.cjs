@@ -4,9 +4,9 @@
 //
 // The traps this pins, each of which looks fine until you have a second
 // organization or drag to the bottom of the rail:
-//   1. The rail is not a list of projects — it also holds "New project" and the
+//   1. The rail is not a list of projects — it also holds the spacer and the
 //      organization nav. Dropping past the last project must insert above
-//      #new-project, never append to the container.
+//      #rail-projects-end, never append to the container.
 //   2. S.projects is every project the user can see, across organizations, while
 //      the rail renders one organization's slice. Reordering must splice within
 //      that slice and leave the other organizations' rows where they were.
@@ -76,13 +76,13 @@ let repaints = 0;
 let toasts = [];
 const record = async (url, opts) => { posted.push({ url, body: JSON.parse(opts.body) }); };
 global.draggingProject = null;
-global.$ = (sel) => (sel === '#new-project' ? newProjectRow : null);
+global.$ = (sel) => (sel === '#rail-projects-end' ? endRow : null);
 global.api = record;
 global.toast = (msg) => { toasts.push(msg); };
 global.renderRail = () => { repaints++; };
 global.loadProjects = async () => {};
 global.S = { projects: [] };
-let newProjectRow = new El('proj add');
+let endRow = new El('grow');
 
 eval(extractFn('reorderProjects'));
 eval(extractFn('wireProjectDrag'));
@@ -122,9 +122,9 @@ const proj = (id, organizationId = 'o1') => ({ id, name: id.toUpperCase(), organ
 
   // ── wireProjectDrag: dragstart → dragover → drop ───────────────────────────
   function mount(ids) {
-    newProjectRow = new El('proj add');
+    endRow = new El('grow');
     const rows = ids.map((id) => new El('proj', { id }));
-    const rail = new Rail([...rows, newProjectRow, new El('nav-item')]);
+    const rail = new Rail([...rows, endRow, new El('nav-item')]);
     global.S.projects = ids.map((id) => proj(id));
     posted = []; repaints = 0; toasts = []; global.draggingProject = null; global.api = record;
     wireProjectDrag(rail);
@@ -147,7 +147,7 @@ const proj = (id, organizationId = 'o1') => ({ id, name: id.toUpperCase(), organ
     await rail.ondrop({ preventDefault() {} });
     await rows[2].fire('dragend');
     ok(!rows[2].cls.has('dragging'), 'the marker is cleared on drop');
-    ok(JSON.stringify(rail.ids()) === '["c","a","b","<proj.add>","<nav-item>"]', 'the dragged row lands first in the DOM');
+    ok(JSON.stringify(rail.ids()) === '["c","a","b","<grow>","<nav-item>"]', 'the dragged row lands first in the DOM');
     ok(posted.length === 1 && posted[0].url === '/api/projects/c/reorder', 'the move is persisted for the dragged project');
     ok(posted[0].body.before === 'a', 'the drop sends the project it now sits above');
     ok(order(global.S.projects) === '["C","A","B"]', 'the cached order is updated optimistically');
@@ -155,11 +155,11 @@ const proj = (id, organizationId = 'o1') => ({ id, name: id.toUpperCase(), organ
     ok(repaints === 1, 'one repaint — the drop itself already moved the DOM');
   }
 
-  { // Trap 1 — dropped below every project. It must stay above "New project".
+  { // Trap 1 — dropped below every project. It must stay above the spacer.
     const { rail, rows } = mount(['a', 'b', 'c']);
     await drag(rail, rows[0], 999);
-    ok(JSON.stringify(rail.ids()) === '["b","c","a","<proj.add>","<nav-item>"]',
-      'a drop past the last project stays above the New project row');
+    ok(JSON.stringify(rail.ids()) === '["b","c","a","<grow>","<nav-item>"]',
+      'a drop past the last project stays above the end-of-projects spacer');
     ok(posted[0].body.before === undefined, 'no `before` is sent when it lands last');
     ok(order(global.S.projects) === '["B","C","A"]', 'the cached order matches the DOM');
   }
@@ -208,11 +208,11 @@ const proj = (id, organizationId = 'o1') => ({ id, name: id.toUpperCase(), organ
 
   // The rail with one open folder: [header work] [a, b in work] [c at top level].
   function mountFolders() {
-    newProjectRow = new El('proj add');
+    endRow = new El('grow');
     const header = new El('proj folder open', { folder: 'work' });
     const rows = [new El('proj', { id: 'a', folder: 'work' }), new El('proj', { id: 'b', folder: 'work' }),
       new El('proj', { id: 'c', folder: '' })];
-    const rail = new Rail([header, ...rows, newProjectRow, new El('nav-item')]);
+    const rail = new Rail([header, ...rows, endRow, new El('nav-item')]);
     global.S.projects = [folderProj('a', 'work'), folderProj('b', 'work'), folderProj('c')];
     posted = []; repaints = 0; toasts = []; global.draggingProject = null; global.api = record;
     wireProjectDrag(rail);
@@ -238,7 +238,7 @@ const proj = (id, organizationId = 'o1') => ({ id, name: id.toUpperCase(), organ
   { // dropFolder reads the row's neighbours directly — the collapsed cases.
     const below = (header) => {
       const row = new El('proj', { id: 'x', folder: '' });
-      new Rail([header, row, new El('proj add')]);
+      new Rail([header, row, new El('grow')]);
       return dropFolder(row);
     };
     ok(below(new El('proj folder', { folder: 'work' })) === '',

@@ -28,7 +28,7 @@ global.S = {
     principalAttemptId: 'attempt-1',
     attempts: [
       { id: 'attempt-1', attemptNumber: 1, params: {}, lastView: { stage: 'do', status: 'active', state: {}, stageTransitions: [{ target: 'human', label: 'Waiting for human input' }, { target: 'done', label: 'Done' }] } },
-      { id: 'attempt-2', attemptNumber: 2, params: { draft: true }, lastView: { stage: 'setup', status: 'waiting', state: { draft: true }, stageTransitions: [{ target: 'do', label: 'Queue' }, { target: 'done', label: 'Done' }] } },
+      { id: 'attempt-2', attemptNumber: 2, params: { draft: true }, lastView: { stage: 'setup', status: 'waiting', state: { draft: true }, stageTransitions: [{ target: 'do', label: 'Run task' }, { target: 'done', label: 'Done' }] } },
     ],
   },
 };
@@ -57,7 +57,7 @@ ok(html.includes('data-attempt-select="attempt-2"'), 'draft can be selected');
 ok(html.includes('attempt-card selected') && html.includes('aria-current="true"'), 'current attempt is visibly and semantically selected');
 ok(!html.includes('<details') && !html.includes('View full attempt'), 'switching needs no expansion or secondary action');
 ok((html.match(/data-stage-move=/g) || []).length === 2, 'every attempt owns its own stage dropdown');
-ok(html.includes('Waiting for human input') && html.includes('Queue'), 'attempt menus render their distinct server-advertised moves');
+ok(html.includes('Waiting for human input') && html.includes('Run task'), 'attempt menus render their distinct server-advertised moves');
 ok(taskRecord('attempt-2')?.params?.draft === true, 'task page resolves non-principal records from the attempt group');
 ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft stage is labelled clearly');
 const archivedDraftRow = taskRow({
