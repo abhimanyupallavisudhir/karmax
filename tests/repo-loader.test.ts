@@ -89,4 +89,25 @@ describe('WorkflowRepoLoader (SPEC §4.2 — a workflow is a git repo of code)',
   it('rejects a package whose manifest name disagrees with how it was loaded', async () => {
     await expect(loader().load({ url: repo, name: 'not-greeter' })).rejects.toThrow(/declares name/);
   });
+  it('rejects an unresolved ref instead of silently installing HEAD', async () => {
+    await expect(loader().load({ url: repo, ref: 'does-not-exist' }))
+      .rejects.toThrow(/does not resolve to a commit/);
+  });
+
+  it('rejects another origin reusing an explicit cache name', async () => {
+    const other = await makePackageRepo('greeter');
+    try {
+      await loader().load({ url: repo, name: 'greeter' });
+      await expect(loader().load({ url: other, name: 'greeter' }))
+        .rejects.toThrow(/different repository/);
+    } finally { fs.rmSync(other, { recursive: true, force: true }); }
+  });
+
+  it('does not reuse stale code when fetching fails', async () => {
+    const source = await makePackageRepo('unreachable');
+    await loader().load({ url: source });
+    fs.rmSync(source, { recursive: true, force: true });
+    await expect(loader().load({ url: source })).rejects.toThrow();
+  });
+
 });

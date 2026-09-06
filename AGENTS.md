@@ -11,7 +11,7 @@ karmax is an agent-orchestration platform centered on a todo list, built on Temp
 karmax is built on three convictions (from the spec's §0):
 
 - **Everything is a todo list.** The development environment of the AI era is a fancy todo list. Every unit of work — a coding change, a script run, a real-world action, even setting up the system itself — is a **task** on a list, assignable to a human or an agent. There is no second organizing abstraction competing with the task list.
-- **Self-healing infrastructure.** Agents do not merely run inside karmax; they can *repair and extend* it. They edit workflows, add error-resolution cases, and save skills — all through the same reviewed, versioned mechanisms a human would use. The system is designed to get more reliable through use.
+- **Self-healing infrastructure.** Agents can repair task code, propose platform changes through ordinary release review, and save skills. Built-in workflows change only with platform releases. External workflow code is a trusted self-hosted extension requiring explicit installation; hosted deployments must never load it into the shared worker. The system is designed to get more reliable through use.
 - **Whatever can be automated, should be.** Human attention is the scarcest resource. Errors are resolved automatically before a human is asked. Agents register accounts, log in, drive browsers, and pay for services within bounded budgets. A human is pulled in only at genuine decision points (review gates, irreversible actions, spending above a threshold) — never for mechanical work the system could do itself.
 
 ## Commands
@@ -52,7 +52,7 @@ Layers around that core:
 - `src/agent/` — provider adapters (Claude Agent SDK + Messages API, Codex/OpenAI, mock) + the per-turn runtime with session resume + prompt assembly. With no credentials, karmax runs the mock agent (auto-detect order: `ANTHROPIC_API_KEY` → Claude Code login → `OPENAI_API_KEY`).
 - `src/world/` — world provider interface; worktree (isolated git worktree per task), container (Docker), memory backends. Merges land through `src/world/merge.ts` and the merge-queue coordinator.
 - `src/platform/` — capability model, workflow-minted scoped tokens, the `KarmaxApi` service layer, and the permission-checked platform MCP server (the single API agents use to act on the system).
-- `src/packages/` — external workflow packages: git repo → validated manifest → code bundled into the worker; installed versions are pinned by commit SHA.
+- `src/packages/` — trusted self-hosted workflow packages: git repo → data-only `manifest.json` → code bundled into the worker; installed versions are pinned by commit SHA. Installation is global authority, not organization authority. Hosted install and restore are disabled; merging an edit never activates code automatically.
 - `src/autonomy/` — credential broker + AES-GCM vault (secrets move as handles, never plaintext), config homes per (account × profile), logins, payments.
 - `src/gateway/` — HTTP/WebSocket gateway translating requests into Temporal signal/query/update calls; the **only** thing the UI talks to.
 - `src/store/` — SQLite metadata index + safe-mode overlays.

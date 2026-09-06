@@ -732,7 +732,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool(
     'propose_workflow_edit',
-    { description: 'Propose an edit to a workflow repo through the reviewed merge-only PR gate.', inputSchema: { projectId: z.string(), title: z.string(), repo: z.string(), branch: z.string(), target: z.string() } },
+    { description: 'Self-hosted only: propose an edit to an external workflow repo through the reviewed merge-only PR gate. Activation requires a separate install. Built-ins change only with platform releases.', inputSchema: { projectId: z.string(), title: z.string(), repo: z.string(), branch: z.string(), target: z.string() } },
     async (a) => wrap(async () => (await ops.proposeWorkflowEdit(a)).id),
   );
   return server;
