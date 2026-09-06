@@ -147,20 +147,6 @@ export function domainMatches(host: string, domain: string): boolean {
   return h === d || h.endsWith(`.${d}`);
 }
 
-/** Rank a human-supplied site lookup without weakening `domainMatches`, which
- * is also the anti-phishing check used before filling a browser page. Exact
- * domains win, then the conventional apex/`www` alias, then parent-domain
- * matches. Arbitrary sibling/subdomain aliases are deliberately not inferred. */
-function domainLookupRank(host: string, domain: string): number | undefined {
-  const h = host.trim().toLowerCase().replace(/\.$/, '');
-  const d = domain.trim().toLowerCase().replace(/^\*\./, '').replace(/\.$/, '');
-  if (h === d) return 0;
-  const withoutWww = (value: string) => value.startsWith('www.') ? value.slice(4) : value;
-  if (withoutWww(h) === withoutWww(d)) return 1;
-  if (h.endsWith(`.${d}`)) return 2;
-  return undefined;
-}
-
 // ── TOTP (RFC 6238, the broker-side code computation of §5B) ─────────────────
 
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -233,19 +219,9 @@ export class VaultItems {
     return this.list().find((i) => i.id === id);
   }
 
-  /** Items matching a site lookup, most specific first. The apex and its
-   * conventional `www` host are treated as aliases for discovery only; live
-   * browser fills still use the directional, security-sensitive matcher. */
+  /** Items whose `domains` cover `host` (subdomains match). */
   findByDomain(host: string): VaultItem[] {
-    return this.list()
-      .map((item, index) => ({
-        item,
-        index,
-        rank: Math.min(...(item.domains ?? []).map((domain) => domainLookupRank(host, domain) ?? Infinity)),
-      }))
-      .filter(({ rank }) => Number.isFinite(rank))
-      .sort((a, b) => a.rank - b.rank || a.index - b.index)
-      .map(({ item }) => item);
+    return this.list().filter((i) => (i.domains ?? []).some((d) => domainMatches(host, d)));
   }
 
   /** The item a connector previously mirrored for `externalId`, if any (§9). */
