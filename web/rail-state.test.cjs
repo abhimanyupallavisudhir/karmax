@@ -38,7 +38,7 @@ global.projectRoute = (id) => `/projects/${id}`;
 global.projectPath = (project) => [project.folder, project.name].filter(Boolean).join('/');
 global.globalRoute = (tab) => `/${tab}`;
 global.esc = (value) => String(value);
-global.ICON = { edit: '<svg></svg>', chevron: '<svg class="i-chevron"></svg>', folder: '<svg class="i-folder"></svg>', folderOpen: '<svg class="i-folder-open"></svg>', project: '<svg class="i-project"></svg>', plus: '<svg class="i-plus"></svg>' };
+global.ICON = { edit: '<svg></svg>', chevron: '<svg class="i-chevron"></svg>', project: '<svg class="i-project"></svg>', plus: '<svg class="i-plus"></svg>' };
 global.wireProjectDrag = () => {};
 global.newProject = () => {};
 global.draggingProject = null;

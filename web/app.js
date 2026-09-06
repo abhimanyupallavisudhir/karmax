@@ -31,11 +31,9 @@ const ICON = {
   edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
   // Sidebar tree vocabulary: a plain chevron folds a folder (rotated 90° when
-  // open), the folder outline marks a folder row, and the checklist marks a
-  // project — a project is a todo list, so its icon is one.
+  // open) and the checklist marks a project — a project is a todo list, so its
+  // icon is one.
   chevron: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
-  folder: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>',
-  folderOpen: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>',
   project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
 };
@@ -3727,15 +3725,16 @@ function railProjectRows(projectScoped) {
   };
   for (const p of projects) dir(p.folder || '').children.push(p);
   const folded = railCollapsedFolders();
-  // Every row says what it is twice — by icon (checklist = project, folder
-  // outline = folder) and by its tooltip — because the first-time reader has
-  // no other way to learn the tree's vocabulary. Folders open with a plain
-  // chevron and carry their own "+" so a project can be created in place.
+  // A project row is an item: checklist icon, regular text, a link. A folder
+  // row is a group heading: a chevron and a small uppercase name (styled in
+  // CSS), so it never reads like the bold active project. Each row's tooltip
+  // names its kind for the first-time reader. Folders carry their own "+" so a
+  // project can be created in place.
   const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
           <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="Project · ${esc(projectPath(p))}"><span class="glyph">${ICON.project}</span><span class="rail-name">${esc(p.name)}</span></a>
           <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
         </div>`;
-  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="Folder · ${esc(node.path)} (click to ${open ? 'collapse' : 'expand'})"><span class="glyph chevron">${ICON.chevron}</span><span class="glyph">${open ? ICON.folderOpen : ICON.folder}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-add="${esc(node.path)}" title="New project in this folder" aria-label="New project in ${esc(node.path)}">${ICON.plus}</button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
+  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="Folder · ${esc(node.path)} (click to ${open ? 'collapse' : 'expand'})"><span class="glyph chevron">${ICON.chevron}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-add="${esc(node.path)}" title="New project in this folder" aria-label="New project in ${esc(node.path)}">${ICON.plus}</button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
   const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
   const walk = (node, depth) => node.children.map((child) => {
     if (child.id) return row(child, depth);
@@ -15488,7 +15487,7 @@ function newProject(options) {
   const opener = document.activeElement;
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
-    <div class="new-project-head"><div><b id="new-project-title">New project</b><span>${folder ? `In the folder <b>${esc(folder)}</b> — edit the path to put it elsewhere.` : 'Use slashes to organize it into folders.'}</span></div><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
+    <div class="new-project-head"><div><b id="new-project-title">New project</b><span>Use slashes to organize it into folders.</span></div><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>Project name</span><input id="new-project-name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
     <div class="new-project-preview" aria-live="polite">The final segment is the project name; everything before it becomes its sidebar folder.</div>
     <div class="form-error new-project-error" role="alert" hidden></div>
