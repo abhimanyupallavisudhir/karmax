@@ -13,7 +13,7 @@ import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
 const REMOTE_ROOT = '.karmax-injection/agent';
-const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? '@openai/codex@0.144.5';
+const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? '@openai/codex@0.153.4';
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? '22.16.0';
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? '10.9.2';
 const READY = '\u001eKARMAX_AGENT_READY\u001e';

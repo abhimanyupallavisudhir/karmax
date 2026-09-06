@@ -28,6 +28,7 @@ const ICON = {
   more: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
@@ -79,6 +80,9 @@ const S = {
   approvalItems: [], // organization vault metadata used to label/bind those requests
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
+  // In-flight parameter edits are deliberately manual-save. Keep their working
+  // values outside the DOM so a live task refresh cannot silently erase them.
+  paramEditDrafts: {}, // taskId -> { saved, values, dirtyNames }
   activity: [],
   search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
   // Task organization (PLAN-search-views): a view IS a saved query.
@@ -262,6 +266,7 @@ function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
+function projectPath(p) { return p ? [p.folder, p.name].filter(Boolean).join('/') : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
 function firstProjectForOrganization(organizationId) {
   return (S.projects || []).find((p) => p.organizationId === organizationId);
@@ -666,8 +671,8 @@ async function applyRoute() {
 // navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click). It stays
 // free of the list's ?q=: a task link is about the task, and the query you came
 // from is remembered in S.returnRoute (and in the history entry behind you).
-function taskUrl(id) {
-  const rec = taskRecord(id);
+function taskUrl(id, record) {
+  const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
@@ -805,7 +810,7 @@ const NODES = [
 // `mock` is a hermetic test adapter, not a user-selectable agent.
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
 const MODELS = {
-  claude: ['default', 'opus[1m]', { id: 'claude-fable-5[1m]', displayName: 'Fable 5' }, 'sonnet', 'haiku'],
+  claude: ['default', 'opus[1m]', { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
@@ -1014,7 +1019,7 @@ function renderAgentField(f, spec, inherited) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="...or paste a provider conversation ID or a ChatGPT/Claude share link to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a provider conversation ID or public ChatGPT/Claude share link' : '...or paste a public ChatGPT/Claude share link'}" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
         <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
@@ -1025,19 +1030,79 @@ function renderAgentField(f, spec, inherited) {
 
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
+// The task reference is a real permalink to the source (Ctrl/⌘-click opens it
+// beside the form), and a source whose grants are known also offers to
+// re-authorize the fork with them — hidden until a host form claims the option
+// (wireResumeReauthorization), since only a form with Authorization / Vault
+// credentials controls can honour it.
 function resumeChosenInner(rf, task) {
   const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
   const source = !rf.role || rf.role === 'do' ? 'agent' : `${rf.role} agent`;
-  const label = `⑂ forking ${source} of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
-  return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
+  const ref = `${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
+  const link = t && projectById(t.projectId)
+    ? `<a class="af-resume-source" data-spa href="${esc(taskUrl(t.id, t))}" title="Open the source task">${esc(ref)}</a>`
+    : esc(ref);
+  const grants = t ? previousGrantsSummary(t) : '';
+  return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
+    ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+    : ''}`;
+}
+
+// The grants a task ended with, in the task form's own vocabulary: its stored
+// authorization selection (the elevated one, if a mid-task authorization request
+// was approved) plus the vault items it was granted and their policies. This is
+// what "Re-authorize previous grants?" applies to the fork.
+function previousTaskGrants(task) {
+  const stored = task?.params?._authorization;
+  if (!stored) return null;
+  return {
+    authorization: normalizedAuthorization({ level: stored.level || stored.profileId, scope: stored.scope, projectIds: stored.projectIds }, task.projectId),
+    credentialGrantIds: (stored.capabilities || [])
+      .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
+    credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
+  };
+}
+function previousGrantsSummary(task) {
+  const grants = previousTaskGrants(task);
+  if (!grants) return '';
+  const n = grants.credentialGrantIds.length;
+  return `${authorizationSummary(grants.authorization, S.projects)}${n ? ` + ${n} credential${n === 1 ? '' : 's'}` : ''}`;
+}
+
+// Host side of "Re-authorize previous grants?" (announced by wireAgentBox as an
+// `af-reauthorize` event): apply the source task's grants to this form's
+// Authorization editor and vault credential selection, remembering what was
+// there so unchecking — or clearing the fork source — puts it back. Nothing is
+// hidden: the grants land in the same controls the user would otherwise fill by
+// hand, so what will be granted stays visible and editable, and it is persisted
+// exactly like a manual selection.
+function wireResumeReauthorization(root, host) {
+  if (!root) return;
+  root.dataset.reauthorizeHost = '';
+  root.querySelectorAll('.af-resume-reauth[hidden]').forEach((option) => { option.hidden = false; });
+  let stash = null;
+  root.addEventListener('af-reauthorize', (event) => {
+    const { enabled, authorization, credentialGrantIds, credentialPolicies } = event.detail;
+    const editor = host.editor();
+    if (enabled) {
+      stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants() };
+      editor?._setAuthorization?.(authorization);
+      host.setGrants(credentialGrantIds, credentialPolicies);
+    } else if (stash) {
+      editor?._setAuthorization?.(stash.authorization);
+      host.setGrants(stash.ids, stash.policies);
+      stash = null;
+    } else return;
+    host.changed?.();
+  });
 }
 
 function resumeUploadInner(upload) {
   return `${esc(upload.name || 'Conversation')}<button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
 }
 
-// Read an agent box's fork/resume choice back out: the picker's {taskId, role}
-// from data-resume, a pasted provider id/share link, or one uploaded file.
+// Read an agent box's fork/resume choice back out: the picker's {taskId, role},
+// a public share link, or one uploaded file.
 function readResume(box) {
   if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
@@ -1472,6 +1537,14 @@ function wireAuthorizationEditor(root, projects, onChange) {
     combo.hidden = level.scope !== 'selectable';
     drawChips(); emit();
   });
+  // Programmatic selection (a fork re-authorizing its source's grants), normalized
+  // and announced exactly like a hand-picked level.
+  root._setAuthorization = (next) => {
+    value = normalizedAuthorization(next);
+    levelSelect.value = value.level;
+    combo.hidden = levelOf().scope !== 'selectable';
+    drawChips(); emit();
+  };
   input.addEventListener('focus', show);
   input.addEventListener('input', show);
   input.addEventListener('blur', () => setTimeout(hide, 120));
@@ -1614,9 +1687,35 @@ function wireAgentBox(box) {
   const uploaded = box.querySelector('.af-resume-uploaded');
   const syncForkState = () => {
     if (panel) panel.hidden = !enabled?.checked;
+    // The re-authorize option needs a host with grant controls (task form / task
+    // page); elsewhere the chip stays a plain label.
+    const option = chosen?.querySelector('.af-resume-reauth');
+    if (option) option.hidden = !box.closest('[data-reauthorize-host]');
+  };
+  // "Re-authorize previous grants?" belongs to the agent box but acts on the
+  // hosting form's Authorization / Vault credentials controls, so the box only
+  // announces the choice (see wireResumeReauthorization). The picker's task
+  // record is kept on the chip: an archived source is not in the task list.
+  const sourceTask = () => {
+    try {
+      const rf = JSON.parse(chosen?.dataset.resume || 'null');
+      if (!rf?.taskId) return null;
+      return chosen._sourceTask?.id === rf.taskId ? chosen._sourceTask : (S.tasks || []).find((x) => x.id === rf.taskId);
+    } catch { return null; }
+  };
+  const announceReauthorize = (on) => {
+    const task = sourceTask();
+    const grants = task ? previousTaskGrants(task) : null;
+    if (!grants) return;
+    box.dispatchEvent(new CustomEvent('af-reauthorize', { bubbles: true, detail: { taskId: task.id, enabled: on, ...grants } }));
+  };
+  // Dropping the source also withdraws the grants it brought along.
+  const withdrawReauthorize = () => {
+    if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
   };
   const clearTask = () => {
     if (!chosen) return;
+    withdrawReauthorize();
     chosen.dataset.resume = 'null';
     chosen.innerHTML = '';
   };
@@ -1631,17 +1730,23 @@ function wireAgentBox(box) {
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
+    withdrawReauthorize();
+    chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
   chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+  chosen?.addEventListener('change', (e) => {
+    const option = e.target.closest?.('.af-resume-reauthorize');
+    if (option) announceReauthorize(option.checked);
+  });
   enabled?.addEventListener('change', () => {
     if (!enabled.checked) {
       // Turning the feature off is also a real parameter change. Clear the
       // dormant source so checking it again cannot revive an old conversation.
-      if (chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
+      clearTask();
       if (sessionInput) sessionInput.value = '';
       clearUpload();
     }
@@ -3410,6 +3515,7 @@ function renderShell() {
   });
   $('#rail-scrim')?.addEventListener('click', closeMobileNav);
   $('#rail')?.addEventListener('click', (event) => {
+    if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit')) return;
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
@@ -3426,10 +3532,13 @@ function renderShell() {
 // Move project `id` so it sits immediately before `beforeId`, or last among its own
 // organization's projects when `beforeId` is omitted. Every other organization's
 // projects keep their relative position, so a drag in one organization's rail can
-// never disturb another's. Mirrors Store.reorderProject on the server.
-function reorderProjects(projects, id, beforeId) {
-  const moving = projects.find((p) => p.id === id);
-  if (!moving) return projects;
+// never disturb another's. A drop can also name the folder the row landed in
+// ('' = top level); the moved entry is copied, never mutated, so a failed save
+// can repaint from the server's truth. Mirrors Store.reorderProject.
+function reorderProjects(projects, id, beforeId, folder) {
+  const found = projects.find((p) => p.id === id);
+  if (!found) return projects;
+  const moving = folder === undefined ? found : { ...found, folder: folder || undefined };
   const org = (p) => p.organizationId || 'org_personal';
   const rest = projects.filter((p) => p.id !== id);
   // A neighbour in another organization is not a position we can honour — the
@@ -3444,11 +3553,187 @@ function reorderProjects(projects, id, beforeId) {
 // The rail row currently being dragged, if any. Also a repaint lock: a background
 // refresh that swapped the rail's innerHTML mid-drag would destroy this element.
 let draggingProject = null;
+// Background task events repaint the rail frequently. Keep an in-progress name
+// edit stable for the same reason a drag is stable: destroying its input would
+// discard unsaved text and keyboard focus.
+let editingRailItem = null;
+
+// Which sidebar folders are folded shut. A per-browser display choice, like the
+// theme, so it lives in localStorage — keyed per organization because the rail
+// shows one organization's projects at a time.
+function railCollapsedFolders() {
+  try { return new Set(JSON.parse(localStorage.getItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`) || '[]')); }
+  catch { return new Set(); }
+}
+function toggleRailFolder(path) {
+  const folded = railCollapsedFolders();
+  if (!folded.delete(path)) folded.add(path);
+  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...folded])); } catch {}
+  renderRail();
+}
+
+function replaceProjectRouteAfterRename(projectId, previousBase) {
+  const nextBase = projectBase(projectId);
+  if (!previousBase || !nextBase || previousBase === nextBase) return;
+  for (const anchor of document.querySelectorAll('a[href]')) {
+    const href = anchor.getAttribute('href');
+    if (href === previousBase || href?.startsWith(`${previousBase}/`) || href?.startsWith(`${previousBase}?`))
+      anchor.setAttribute('href', `${nextBase}${href.slice(previousBase.length)}`);
+  }
+  if (S.projectId === projectId) {
+    const project = projectById(projectId);
+    if (S.tab === 'settings') $('.page-title', $('#main')).textContent = project.name;
+    if ($('#project-name')) $('#project-name').value = projectPath(project);
+  }
+  if (location.pathname !== previousBase && !location.pathname.startsWith(`${previousBase}/`)) return;
+  const suffix = location.pathname.slice(previousBase.length);
+  history.replaceState(history.state, '', `${nextBase}${suffix}${location.search}${location.hash}`);
+}
+
+function renameCollapsedRailFolder(previous, next) {
+  const folded = [...railCollapsedFolders()].map((path) =>
+    path === previous || path.startsWith(`${previous}/`) ? `${next}${path.slice(previous.length)}` : path);
+  try { localStorage.setItem(`karmax-rail-folders:${S.organizationId || 'org_personal'}`, JSON.stringify([...new Set(folded)])); } catch {}
+}
+
+// One compact editor serves both project links and folder headers. It deliberately
+// saves only on the check/Enter: clicking elsewhere cannot accidentally move a
+// project or a whole folder tree. Escape restores the original row.
+function beginRailInlineEdit(button, options) {
+  const { value, label, save } = options;
+  if (editingRailItem) return;
+  const row = button.closest('.proj');
+  if (!row) return;
+  const rail = row.closest('#rail');
+  editingRailItem = row;
+  row.classList.add('editing');
+  row.draggable = false;
+  row.innerHTML = `<form class="rail-inline-edit"><input class="rail-edit-input" value="${esc(value)}" aria-label="${esc(label)}" autocomplete="off" spellcheck="false" required><button class="rail-edit-confirm" type="submit" title="Save" aria-label="Save">✓</button><button class="rail-edit-cancel" type="button" title="Cancel" aria-label="Cancel">×</button><span class="rail-edit-error" role="alert" hidden></span></form>`;
+  const form = row.querySelector('form');
+  const input = row.querySelector('input');
+  const error = row.querySelector('.rail-edit-error');
+  const close = (focusSelector) => {
+    editingRailItem = null;
+    renderRail();
+    if (focusSelector) requestAnimationFrame(() => rail.querySelector(focusSelector)?.focus({ preventScroll: true }));
+  };
+  form.addEventListener('click', (event) => event.stopPropagation());
+  form.addEventListener('mousedown', (event) => event.stopPropagation());
+  input.addEventListener('input', () => { input.removeAttribute('aria-invalid'); error.hidden = true; });
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    close();
+  });
+  row.querySelector('.rail-edit-cancel').addEventListener('click', () => close());
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const next = input.value.trim();
+    if (!next) return input.focus();
+    for (const control of form.elements) control.disabled = true;
+    try {
+      const focusSelector = await save(next);
+      close(focusSelector);
+    } catch (cause) {
+      input.setAttribute('aria-invalid', 'true');
+      error.textContent = cause.message;
+      error.hidden = false;
+      for (const control of form.elements) control.disabled = false;
+      input.focus();
+      input.select();
+    }
+  });
+  input.focus();
+  input.select();
+}
+
+function editRailProject(button) {
+  const project = projectById(button.dataset.projectEdit);
+  if (!project) return;
+  const previousBase = projectBase(project.id);
+  beginRailInlineEdit(button, {
+    value: projectPath(project),
+    label: `Project path for ${project.name}`,
+    save: async (name) => {
+      if (name === projectPath(project)) return `.project-link[data-project="${CSS.escape(project.id)}"]`;
+      const updated = await api(`/api/projects/${encodeURIComponent(project.id)}`, {
+        method: 'PATCH', body: JSON.stringify({ name }),
+      });
+      S.projects = S.projects.map((candidate) => candidate.id === updated.id ? updated : candidate);
+      replaceProjectRouteAfterRename(project.id, previousBase);
+      toast('Project renamed');
+      return `.project-link[data-project="${CSS.escape(project.id)}"]`;
+    },
+  });
+}
+
+function editRailFolder(button) {
+  const folder = button.dataset.folderEdit;
+  const inside = (project) => project.folder === folder || project.folder?.startsWith(`${folder}/`);
+  const anchor = S.projects.find((project) =>
+    (!S.organizationId || project.organizationId === S.organizationId) && inside(project));
+  if (!anchor) return;
+  beginRailInlineEdit(button, {
+    value: folder.slice(folder.lastIndexOf('/') + 1),
+    label: `Folder name for ${folder}`,
+    save: async (name) => {
+      if (name === folder.slice(folder.lastIndexOf('/') + 1))
+        return `.folder-toggle[data-folder="${CSS.escape(folder)}"]`;
+      const renamed = await api(`/api/projects/${encodeURIComponent(anchor.id)}/folder`, {
+        method: 'PATCH', body: JSON.stringify({ folder, name }),
+      });
+      const updates = new Map(renamed.projects.map((project) => [project.id, project]));
+      S.projects = S.projects.map((project) => updates.get(project.id) || project);
+      if (updates.has(S.projectId) && $('#project-name')) $('#project-name').value = projectPath(projectById(S.projectId));
+      renameCollapsedRailFolder(folder, renamed.folder);
+      toast('Folder renamed');
+      return `.folder-toggle[data-folder="${CSS.escape(renamed.folder)}"]`;
+    },
+  });
+}
+
+// The rail's project rows: the organization's projects grouped into their
+// folders. A folder is implicit — it exists exactly while a project names it
+// (`p.folder`, a `/`-separated path), nests by that path, and sits where its
+// first project sits, so dragging orders folders and loose projects alike.
+// Nesting is the --depth custom property, not DOM structure: the rail stays a
+// flat list the drag logic can walk. A collapsed folder still shows the open
+// project, so navigating into a tucked-away project never blanks the selection.
+function railProjectRows(projectScoped) {
+  const projects = S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId);
+  const root = { path: '', children: [] };
+  const nodes = new Map([['', root]]);
+  const dir = (path) => {
+    let node = nodes.get(path);
+    if (!node) {
+      node = { path, name: path.slice(path.lastIndexOf('/') + 1), children: [] };
+      nodes.set(path, node);
+      dir(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '').children.push(node);
+    }
+    return node;
+  };
+  for (const p of projects) dir(p.folder || '').children.push(p);
+  const folded = railCollapsedFolders();
+  const row = (p, depth) => `<div class="proj project-row ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" data-folder="${esc(p.folder || '')}" style="--depth:${depth}" draggable="true" title="Drag to reorder">
+          <a class="project-link" data-spa href="${projectRoute(p.id)}" data-project="${p.id}" tabindex="0" title="${esc(projectPath(p))}"><span class="glyph">◇</span><span class="rail-name">${esc(p.name)}</span></a>
+          <button class="rail-edit-action" type="button" data-project-edit="${p.id}" draggable="false" title="Edit project path" aria-label="Edit ${esc(projectPath(p))}">${ICON.edit}</button>
+        </div>`;
+  const header = (node, depth, open) => `<div class="proj folder ${open ? 'open' : ''}" data-folder="${esc(node.path)}" style="--depth:${depth}"><button class="folder-toggle" type="button" data-folder="${esc(node.path)}" aria-expanded="${open}" title="${open ? 'Collapse' : 'Expand'} folder"><span class="glyph">${open ? '▾' : '▸'}</span><span class="rail-name">${esc(node.name)}</span></button><button class="rail-edit-action" type="button" data-folder-edit="${esc(node.path)}" title="Rename folder" aria-label="Rename ${esc(node.path)}">${ICON.edit}</button></div>`;
+  const inside = (p, path) => (p.folder || '') === path || (p.folder || '').startsWith(path + '/');
+  const walk = (node, depth) => node.children.map((child) => {
+    if (child.id) return row(child, depth);
+    if (!folded.has(child.path)) return header(child, depth, true) + walk(child, depth + 1);
+    const active = projectScoped && projects.find((p) => p.id === S.projectId && inside(p, child.path));
+    return header(child, depth, false) + (active ? row(active, depth + 1) : '');
+  }).join('');
+  return walk(root, 0);
+}
 
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
-  if (draggingProject) return; // never repaint out from under a drag in flight
+  if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
   const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
@@ -3456,17 +3741,14 @@ function renderRail() {
   // them. Snapshot the focused row's stable identity and re-focus the matching row.
   const active = document.activeElement;
   const focusedKey = active && rail.contains(active)
-    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]` : active.id ? `#${active.id}` : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
+    ? (active.dataset.project ? `.project-link[data-project="${active.dataset.project}"]`
+      : active.id ? `#${active.id}`
+      : active.classList.contains('folder-toggle') && active.dataset.folder != null ? `.folder-toggle[data-folder="${CSS.escape(active.dataset.folder)}"]`
+      : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
     : null;
   rail.innerHTML = `
     <div class="label">Projects</div>
-    ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
-      .map(
-        (p) => `<a class="proj ${projectScoped && p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0" draggable="true" title="Drag to reorder">
-          <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </a>`,
-      )
-      .join('')}
+    ${railProjectRows(projectScoped)}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Organization</div>
@@ -3478,6 +3760,17 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
+  // Folder headers are native buttons, so click, Enter, and Space all share the
+  // same fold behavior during pointer use and the rail's keyboard walk.
+  for (const head of rail.querySelectorAll('.folder-toggle')) {
+    head.addEventListener('click', () => toggleRailFolder(head.dataset.folder));
+  }
+  rail.querySelectorAll('[data-project-edit]').forEach((button) => button.addEventListener('click', (event) => {
+    event.stopPropagation(); editRailProject(button);
+  }));
+  rail.querySelectorAll('[data-folder-edit]').forEach((button) => button.addEventListener('click', (event) => {
+    event.stopPropagation(); editRailFolder(button);
+  }));
   wireProjectDrag(rail);
   if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
@@ -3489,6 +3782,9 @@ function renderRail() {
 // element survives every repaint, so listeners would otherwise pile up.
 function wireProjectDrag(rail) {
   const projects = () => [...rail.querySelectorAll('.proj[draggable="true"]')];
+  // Rows a drag can land against: projects and folder headers. Dropping just
+  // above a header means "above that folder", i.e. in the folder's parent.
+  const anchors = () => [...rail.querySelectorAll('.proj[draggable="true"], .proj.folder')];
   const rows = projects();
   if (rows.length < 2) { rail.ondragover = rail.ondrop = null; return; }
   const end = $('#new-project');
@@ -3497,7 +3793,8 @@ function wireProjectDrag(rail) {
       draggingProject = row;
       row.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
-      // Without this an <a> drags its href, and the drop lands as a URL elsewhere.
+      // Seed the drag payload explicitly; the visible project link is a child of
+      // this draggable row and must not turn the gesture into a URL drop.
       try { e.dataTransfer.setData('text/plain', row.dataset.id); } catch {}
     });
     row.addEventListener('dragend', () => {
@@ -3510,7 +3807,7 @@ function wireProjectDrag(rail) {
   rail.ondragover = (e) => {
     if (!draggingProject) return;
     e.preventDefault();
-    const before = projects().find((row) => {
+    const before = anchors().find((row) => {
       const box = row.getBoundingClientRect();
       return row !== draggingProject && e.clientY < box.top + box.height / 2;
     });
@@ -3524,12 +3821,29 @@ function wireProjectDrag(rail) {
     draggingProject = null;
     const ids = projects().map((r) => r.dataset.id);
     const before = ids[ids.indexOf(row.dataset.id) + 1];
-    S.projects = reorderProjects(S.projects, row.dataset.id, before);
+    const folder = dropFolder(row);
+    S.projects = reorderProjects(S.projects, row.dataset.id, before, folder);
     renderRail();
     try {
-      await api(`/api/projects/${row.dataset.id}/reorder`, { method: 'POST', body: JSON.stringify({ before }) });
+      await api(`/api/projects/${row.dataset.id}/reorder`, { method: 'POST', body: JSON.stringify({ before, folder }) });
     } catch (err) { toast(err.message, true); await loadProjects(); renderRail(); }
   };
+}
+
+// The folder a dropped row landed in, read off its new neighbours. The row now
+// below it speaks for the slot — a project names its own folder, a header opens
+// its parent's territory — and when the drop landed last, the row above does:
+// an open header adopts the drop as its first child, a collapsed one keeps it
+// out (its contents are hidden, so "inside" would be an invisible landing).
+function dropFolder(row) {
+  const parent = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+  const nx = row.nextElementSibling;
+  if (nx?.dataset.id) return nx.dataset.folder || '';
+  if (nx?.classList.contains('folder')) return parent(nx.dataset.folder);
+  const pv = row.previousElementSibling;
+  if (pv?.dataset.id) return pv.dataset.folder || '';
+  if (pv?.classList.contains('folder')) return pv.classList.contains('open') ? pv.dataset.folder : parent(pv.dataset.folder);
+  return '';
 }
 
 function switchTab(tab) {
@@ -3908,7 +4222,6 @@ function tasksView() {
         <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       </div>
-      <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
       <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
       <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
@@ -4709,7 +5022,6 @@ function wireTasksView() {
     const images = S.newTaskImages || [];
     const files = S.newTaskFiles || [];
     if (!title && !images.length && !files.length) return;
-    const workflow = $('#new-wf').value;
     const composer = input.closest('.composer');
     if (composer?.classList.contains('busy')) return;
     const setBusy = (busy) => {
@@ -4721,7 +5033,7 @@ function wireTasksView() {
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify(quickTaskPayload(title, workflow, images, draft, files)),
+        body: JSON.stringify(quickTaskPayload(title, images, draft, files)),
       });
       input.value = '';
       S.newTaskImages = [];
@@ -4751,7 +5063,7 @@ function wireTasksView() {
     e.stopPropagation();
     if (mode === 'draft') add(true);
     else if (mode === 'add') add(false);
-    else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
+    else openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim());
   });
   // Paste, choose, or drag files into the quick-add box.
   if (!S.newTaskImages) S.newTaskImages = [];
@@ -4761,21 +5073,17 @@ function wireTasksView() {
   wireAttachmentPicker($('#new-task-files'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments);
   paintQuickAttachments();
   // Opening the full form via "More" carries over whatever was typed in the
-  // quick-add box into the field that consumes it (Prompt, Command, …).
-  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
+  // quick-add box into the software-dev prompt.
+  $('#expand-task')?.addEventListener('click', () => openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim()));
   // Hide the defaultBranch/settings round-trip behind the time the user spends
-  // reading or typing in the quick composer. Changing the workflow starts the
-  // corresponding one-shot preload as well.
-  const quickWorkflow = $('#new-wf');
-  if (quickWorkflow) {
-    requestTaskFormDefaults(S.projectId, quickWorkflow.value);
-    quickWorkflow.addEventListener('change', () => requestTaskFormDefaults(S.projectId, quickWorkflow.value));
-  }
+  // reading or typing in the quick composer.
+  requestTaskFormDefaults(S.projectId, QUICK_TASK_WORKFLOW);
   // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
   applyCursor();
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+const QUICK_TASK_WORKFLOW = 'software-dev';
 
 // Keyboard modes for the quick composer. Keep this separate from the event
 // listener so the shortcut behavior stays easy to verify without a browser.
@@ -4788,12 +5096,11 @@ function quickTaskSubmitMode(e) {
 
 // The quick composer has two submission modes (start now / save draft), but both
 // must use the exact same sparse quick-defaults payload.
-function quickTaskPayload(title, workflow, images, draft = false, files = []) {
+function quickTaskPayload(title, images, draft = false, files = []) {
   return {
     title: firstLine(title || 'Image task'),
     prompt: title,
-    command: workflow === 'script-exec' ? title : undefined,
-    workflow,
+    workflow: QUICK_TASK_WORKFLOW,
     quick: true,
     ...(draft ? { draft: true } : {}),
     ...(images.length ? { images } : {}),
@@ -4803,7 +5110,8 @@ function quickTaskPayload(title, workflow, images, draft = false, files = []) {
 
 // The task-scope field that consumes the quick-add "Describe a task" text: the
 // workflow's prompt field, else its primary required text/string input (e.g.
-// script-exec's Command). Mirrors how add() maps that text to prompt/command.
+// script-exec's Command). This keeps the seed text intact if the workflow is
+// changed inside the expanded form.
 function consumingField(fields) {
   return (
     fields.find((f) => f.bind === 'prompt') ||
@@ -5416,6 +5724,19 @@ async function openTaskForm(workflow, draft, seedText) {
   const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies || {}));
+  let refreshVaultCount = () => {};
+  // A fork's "Re-authorize previous grants?" writes into these same controls.
+  wireResumeReauthorization($('#tf-body'), {
+    editor: () => $('#tf-authorization'),
+    grants: () => ({ ids: [...vaultGrantIds], policies: vaultCredentialPolicies }),
+    setGrants: (ids, policies) => {
+      vaultGrantIds.clear();
+      ids.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
+      refreshVaultCount();
+    },
+    changed: () => autoSaveSoon(),
+  });
   (async () => {
     const button = $('#tf-vault-open');
     const count = $('#tf-vault-count');
@@ -5429,6 +5750,7 @@ async function openTaskForm(workflow, draft, seedText) {
       const selected = items.filter((i) => vaultGrantIds.has(i.id)).length;
       count.textContent = `${selected} selected`;
     };
+    refreshVaultCount = refreshCount;
     refreshCount();
     button.disabled = false;
     button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (selected, policies) => {
@@ -8310,12 +8632,26 @@ async function wireTaskAuthorization(v) {
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
   const button = document.getElementById('tp-vault-open');
   const count = document.getElementById('tp-vault-count');
+  let refreshVaultCount = () => {};
+  // An in-flight fork edit can re-authorize its source's grants into these
+  // controls too; "Save authorization" then applies them like a manual change.
+  wireResumeReauthorization(select.closest('.task-page') || document.getElementById('main'), {
+    editor: () => select,
+    grants: () => ({ ids: [...vaultGrantIds], policies: vaultCredentialPolicies }),
+    setGrants: (ids, policies) => {
+      vaultGrantIds.clear();
+      ids.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
+      refreshVaultCount();
+    },
+  });
   const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
   let items = [];
   try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
   catch { button?.closest('[data-row="__vault"]')?.remove(); }
   if (button && count) {
     const refreshCount = () => { count.textContent = `${items.filter((i) => vaultGrantIds.has(i.id)).length} selected`; };
+    refreshVaultCount = refreshCount;
     refreshCount();
     button.disabled = false;
     button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (picked, policies) => {
@@ -8812,17 +9148,29 @@ function paramsSection(v) {
     return `<div class="section-h">Parameters</div>
       <button class="btn sm" id="edit-draft-params">Edit parameters…</button>`;
   }
-  if (TERMINAL_STAGES.includes(v.stage)) return '';
   const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task'));
   if (!fields.length) return '';
-  const editable = new Set(v.editableParams || []);
+  // Finishing a task freezes its configuration; it does not erase the record of
+  // what ran. Keep terminal-task parameters visible, but defensively ignore any
+  // stale editable window left on an older persisted view.
+  const terminal = TERMINAL_STAGES.includes(v.stage);
+  const editable = new Set(terminal ? [] : (v.editableParams || []));
+  const editDraft = S.paramEditDrafts?.[v.taskId];
   const inheritedAll = S.paramDefaults || {};
-  const lock = `<span title="Frozen — this parameter has already been used (send a follow-up to change direction)" style="color:var(--ink-3)">🔒</span>`;
+  const frozenTitle = terminal
+    ? 'Frozen — this task has finished'
+    : 'Frozen — this parameter has already been used (send a follow-up to change direction)';
+  const lock = `<span title="${frozenTitle}" style="color:var(--ink-3)">🔒</span>`;
   const rows = fields
     .map((f) => {
-      const own = paramCurrentValue(f, v, rec);
-      const inherited = inheritedAll[f.name];
+      // Live workflow events repaint this page frequently. If the operator has
+      // an unsaved value, render that value back into its control instead of
+      // replacing it with the last server snapshot during the repaint.
       const isEditable = editable.has(f.name);
+      const own = isParamDraftField(editDraft, f.name)
+        ? editDraft.values[f.name]
+        : paramCurrentValue(f, v, rec);
+      const inherited = inheritedAll[f.name];
       // Agent fields show the full control (provider · model · effort · resume),
       // exactly like the task form — interactive when editable, disabled when frozen.
       if (f.type === 'agent') {
@@ -8830,7 +9178,7 @@ function paramsSection(v) {
         if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${control}</div>`;
         // frozen: same control, disabled (read-only), with a lock in the corner
         return `<div class="form-row" data-row="${esc(f.name)}" style="position:relative">
-          <span style="position:absolute;right:0;top:0" title="Frozen — this agent has already run (send a follow-up to change direction)">🔒</span>
+          <span style="position:absolute;right:0;top:0" title="${frozenTitle}">🔒</span>
           <fieldset disabled style="border:none;padding:0;margin:0;min-inline-size:auto;opacity:.65">${control}</fieldset></div>`;
       }
       if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
@@ -8840,12 +9188,24 @@ function paramsSection(v) {
     })
     .join('');
   const footer = editable.size
-    ? `<button class="btn sm primary" id="params-save">Save changes</button>`
-    : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
+    ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
+        <span class="params-save-status" id="params-save-status" role="status" aria-live="polite">
+          <span class="params-save-dot" aria-hidden="true"></span>
+          <span>${editDraft?.dirtyNames?.length ? 'Unsaved parameter changes' : 'All parameter changes saved'}</span>
+        </span>
+        <button class="btn sm primary" id="params-save" ${editDraft?.dirtyNames?.length ? '' : 'disabled'}>Save parameter changes</button>
+      </div>`
+    : `<div class="task-sub" style="color:var(--ink-3)">${terminal
+      ? 'This task has finished. Parameters are read-only.'
+      : 'Locked after queue — send a follow-up to change direction.'}</div>`;
   return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
 }
 
-// Best-known current value of a param for a running task (the view carries a few;
+function isParamDraftField(draft, name) {
+  return !!draft?.dirtyNames?.includes(name);
+}
+
+// Best-known current value of a task param (the view carries a few;
 // the task record holds the rest of the user's own overrides).
 function paramCurrentValue(f, v, rec) {
   const own = (rec && rec.params) || {};
@@ -8934,6 +9294,22 @@ function collectParamEdits(root, fields) {
   }
   return out;
 }
+
+function paramDirtyNames(saved, current, fields) {
+  return fields.map((field) => field.name).filter((name) => !sameJson(saved[name], current[name]));
+}
+
+function setParamSaveState(root, saveBtn, status, state) {
+  root.dataset.saveState = state;
+  const bar = saveBtn.closest('.params-save-bar');
+  if (bar) bar.dataset.saveState = state;
+  saveBtn.disabled = state !== 'dirty';
+  saveBtn.textContent = state === 'saving' ? 'Saving parameter changes…' : 'Save parameter changes';
+  status.lastElementChild.textContent = state === 'dirty'
+    ? 'Unsaved parameter changes'
+    : state === 'saving' ? 'Saving parameter changes…' : 'All parameter changes saved';
+}
+
 function wireParams(v) {
   const editBtn = document.getElementById('edit-draft-params');
   if (editBtn) {
@@ -8945,16 +9321,54 @@ function wireParams(v) {
   if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
+  const status = document.getElementById('params-save-status');
+  const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+  const existing = S.paramEditDrafts[v.taskId];
+  const currentAtRender = collectParamEdits(root, fields);
+  // Rebase untouched controls onto the newest server render, while preserving
+  // the saved comparison value for fields the operator is actively editing.
+  let saved = { ...currentAtRender };
+  let saving = false;
+  if (existing) {
+    for (const name of existing.dirtyNames) {
+      if (Object.prototype.hasOwnProperty.call(existing.saved, name)) saved[name] = existing.saved[name];
+      else delete saved[name];
+    }
+  }
+  const sync = () => {
+    const current = collectParamEdits(root, fields);
+    const dirtyNames = paramDirtyNames(saved, current, fields);
+    const dirty = dirtyNames.length > 0;
+    for (const field of fields) {
+      const row = root.querySelector(`.pf-edit-row[data-row="${CSS.escape(field.name)}"]`);
+      row?.classList.toggle('param-row-dirty', dirtyNames.includes(field.name));
+    }
+    if (dirty) S.paramEditDrafts[v.taskId] = { saved, values: current, dirtyNames };
+    else delete S.paramEditDrafts[v.taskId];
+    setParamSaveState(root, saveBtn, status, saving ? 'saving' : dirty ? 'dirty' : 'saved');
+    return current;
+  };
+  root.addEventListener('input', sync);
+  root.addEventListener('change', sync);
+  sync();
   saveBtn.addEventListener('click', async () => {
-    const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+    if (saving) return;
     const patch = collectParamEdits(root, fields);
-    if (!Object.keys(patch).length) return toast('No changes');
+    if (!paramDirtyNames(saved, patch, fields).length) return sync();
+    saving = true;
+    setParamSaveState(root, saveBtn, status, 'saving');
     try {
-      await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
-      toast('Parameters updated');
+      const updated = await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
+      saved = patch;
+      if (updated?.view && S.selected === v.taskId) S.view = updated.view;
+      toast('Parameter changes saved');
+      saving = false;
+      sync(); // a value changed while the request was running remains visibly unsaved
       setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) {
+      saving = false;
+      sync();
       toast(e.message, true);
     }
   });
@@ -10962,7 +11376,7 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden>
       <div class="section-h" data-settings-access="project" hidden>Project name</div>
-      <div class="inline-form"><input id="project-name" value="${esc(proj.name)}" aria-label="Project name" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save name</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
+      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
     </div></div></div></div>`;
 }
 function cloudEnvironmentCard(proj) {
@@ -11536,7 +11950,7 @@ function wireSettingsView(proj) {
     try {
       await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
       await loadProjects();
-      toast('Project renamed');
+      toast('Project saved');
       await go(`${projectRoute(proj.id, 'settings')}${location.hash}`, { replace: true });
     } catch (e) { toast(e.message, true); }
   };
@@ -13137,7 +13551,7 @@ async function wireVaultCards(organizationId) {
     try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
     list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
       <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
-        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
+        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}${c.config?.autoSync?.enabled ? ` · ${c.config.autoSync.importNew ? 'imports new credentials automatically' : 'keeps selected credentials updated'}` : ''}${c.config?.lastAutoSync?.error ? ` · sync error: ${esc(c.config.lastAutoSync.error)}` : ''}</div></div>
       ${c.setup === 'git-pass'
         ? `<button class="btn sm" data-git-pass-connect>${c.available ? 'Reconfigure' : 'Configure'}</button>`
         : c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : '1Password service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
@@ -13176,9 +13590,11 @@ async function wireVaultCards(organizationId) {
       </div>
       <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between">
         <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
-          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
-          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option ${conn?.config?.autoSync?.policy?.use !== 'ask' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.use === 'ask' ? 'selected' : ''}>ask</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option ${!conn?.config?.autoSync?.policy?.reveal || conn.config.autoSync.policy.reveal === 'ask' ? 'selected' : ''}>ask</option><option ${conn?.config?.autoSync?.policy?.reveal === 'auto' ? 'selected' : ''}>auto</option><option ${conn?.config?.autoSync?.policy?.reveal === 'never' ? 'selected' : ''}>never</option></select></label>
           ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+          ${name === 'pass-git' ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Refresh the credentials selected above after password-store changes"><input type="checkbox" class="imp-keep" ${conn?.config?.autoSync?.enabled ? 'checked' : ''}/> Keep selected credentials updated</label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="Select the entire store now and automatically import credentials added later"><input type="checkbox" class="imp-new" ${conn?.config?.autoSync?.importNew ? 'checked' : ''}/> Import new credentials automatically</label>` : ''}
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn sm" data-imp-cancel>Cancel</button>
@@ -13195,21 +13611,40 @@ async function wireVaultCards(organizationId) {
     let ext = [];
     try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
     catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
-    if (!ext.length) { tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import.</span>'; return; }
+    if (!ext.length) tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import yet.</span>';
     const folders = {};
     ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
-    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
+    const subscribedIds = new Set(conn?.config?.autoSync?.externalIds || []);
+    if (ext.length) tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
       ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px;margin:2px 0"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
       <div style="margin-left:${f ? '18px' : '0'}">${folders[f].map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0">
-        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}"/> ${esc(i.label)}
+        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}" ${(conn?.config?.autoSync?.importNew || subscribedIds.has(i.externalId)) ? 'checked' : ''}/> ${esc(i.label)}
         <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div></div>`).join('');
-    overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
+    const all = overlay.querySelector('.imp-all');
+    const keepUpdated = overlay.querySelector('.imp-keep');
+    const importNew = overlay.querySelector('.imp-new');
+    const selectAll = (checked) => {
+      all.checked = checked;
+      tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = checked));
+      refreshCount();
+    };
+    const enforceImportNew = () => {
+      const forced = !!importNew?.checked;
+      if (forced) { keepUpdated.checked = true; selectAll(true); }
+      if (keepUpdated) keepUpdated.disabled = forced;
+      all.disabled = forced || !ext.length;
+      tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((control) => { control.disabled = forced; });
+    };
+    all.addEventListener('change', (e) => selectAll(e.target.checked));
     tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
     tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
+    importNew?.addEventListener('change', enforceImportNew);
+    enforceImportNew();
+    refreshCount();
     const go = overlay.querySelector('[data-imp-go]');
     go.addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
-      if (!externalIds.length) { toast('Select at least one', true); return; }
+      if (!externalIds.length && !importNew?.checked) { toast('Select at least one', true); return; }
       const sync = (batch) => api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
         externalIds: batch,
         policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
@@ -13217,12 +13652,20 @@ async function wireVaultCards(organizationId) {
       }) });
       go.disabled = true;
       try {
-        const r = await importFromConnector(sync, externalIds, (p) => {
+        const r = externalIds.length ? await importFromConnector(sync, externalIds, (p) => {
           go.textContent = `Importing ${p.done}/${p.total}…`;
           countEl.textContent = `· ${p.imported} imported${p.skipped ? `, ${p.skipped} unchanged` : ''}`;
+        }) : { imported: 0, skipped: 0, failures: [], done: 0, total: 0 };
+        if (name === 'pass-git') await api(`/api/vault/connectors/${name}/config${oq}`, {
+          method: 'POST', body: JSON.stringify({
+            ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+            autoSync: { keepUpdated: !!keepUpdated?.checked, importNew: !!importNew?.checked, externalIds,
+              policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value } },
+          }),
         });
         const summary = [`Imported ${r.imported} item(s)`, r.skipped ? `${r.skipped} already up to date` : '',
-          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : ''].filter(Boolean).join(' · ');
+          r.failures.length ? `${r.failures.length} could not be read (${r.failures[0].error})` : '',
+          importNew?.checked ? 'Automatic import enabled' : keepUpdated?.checked ? 'Automatic updates enabled' : ''].filter(Boolean).join(' · ');
         toast(summary, r.failures.length > 0);
         close();
         renderItems();
@@ -13616,7 +14059,10 @@ function wireGlobalSettings(organizationId) {
       const btn = $('#login-connect'); btn.disabled = true;
       const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
         method: 'POST',
-        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod }),
+        // Clicking Connect is an explicit re-authentication request. Without
+        // force, an expired native credential file was mistaken for a healthy
+        // login and the UI misleadingly reported "Already signed in."
+        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod, force: true }),
       });
       btn.disabled = false;
       if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
@@ -15011,24 +15457,60 @@ function toggleTheme() {
 })();
 
 // ── projects ─────────────────────────────────────────────────────────────────
-async function newProject() {
-  const name = prompt('Project name');
-  if (!name) return;
-  try {
-    // Create with an EMPTY config so branches (and every other field) inherit
-    // from global settings. Hardcoding defaultBase/defaultTarget here would bake
-    // a project-scope override that shadows the global default (e.g. "master"),
-    // which is exactly the inheritance bug this avoids.
-    const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
-    const p = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }) });
-    await loadProjects();
-    // Route into the new project so its tasks, tags, saved views and search all
-    // load fresh — setting S.projectId + re-rendering alone leaves the previous
-    // project's tasks/views on screen (applyRoute does the loading on switch).
-    // Land on Project settings: a freshly created project has no tasks yet, and
-    // configuring it (branches, agent, budget…) is the first thing to do.
-    await go(projectRoute(p.id, 'settings'));
-  } catch (e) { toast(e.message, true); }
+function newProject() {
+  const opener = document.activeElement;
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
+    <div class="new-project-head"><div><b id="new-project-title">New project</b><span>Use slashes to organize it into folders.</span></div><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Project name</span><input id="new-project-name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false"></label>
+    <div class="new-project-preview" aria-live="polite">The final segment is the project name; everything before it becomes its sidebar folder.</div>
+    <div class="form-error new-project-error" role="alert" hidden></div>
+    <div class="new-project-actions"><button class="btn new-project-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Create project</button></div>
+  </form></div>`;
+  const controller = new AbortController();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    controller.abort();
+    document.removeEventListener('keydown', keydown);
+    host.remove();
+    opener?.focus?.();
+  };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.new-project-close').addEventListener('click', close);
+  host.querySelector('.new-project-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = host.querySelector('#new-project-name').value.trim();
+    const error = host.querySelector('.new-project-error');
+    const button = event.submitter;
+    if (!name) return;
+    error.hidden = true;
+    if (button) { button.disabled = true; button.textContent = 'Creating…'; }
+    try {
+      // Create with an EMPTY config so every field inherits from global settings.
+      const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
+      const project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }), signal: controller.signal });
+      if (closed) return;
+      document.removeEventListener('keydown', keydown);
+      host.remove();
+      closed = true;
+      await loadProjects();
+      // A fresh project has no tasks, so Project settings remains the useful landing.
+      await go(projectRoute(project.id, 'settings'));
+    } catch (cause) {
+      if (closed || cause?.name === 'AbortError') return;
+      error.textContent = cause.message;
+      error.hidden = false;
+      if (button) { button.disabled = false; button.textContent = 'Create project'; }
+      host.querySelector('#new-project-name').focus();
+    }
+  });
+  $('#modal-root').appendChild(host);
+  document.addEventListener('keydown', keydown);
+  host.querySelector('#new-project-name').focus();
 }
 
 // ── keyboard navigation / command registry (SPEC §10.1) ─────────────────────
@@ -15114,7 +15596,7 @@ const HOST_COMMANDS = [
   { id: 'nav.globalSearch', title: 'Search everything', key: 'meta+shift+F', run: () => openGlobalSearch() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
-  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
+  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task')?.value.trim()); } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
@@ -15304,7 +15786,7 @@ function openAdjacentTask(delta) {
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
-function railRows() { return [...document.querySelectorAll('#rail .proj, #rail .nav-item')]; }
+function railRows() { return [...document.querySelectorAll('#rail .project-link, #rail .folder-toggle, #rail .proj.add, #rail .nav-item')]; }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
   const rows = railRows();

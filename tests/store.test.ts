@@ -219,12 +219,31 @@ describe('Store', () => {
   });
 
   it('creates a project with a default task list', () => {
-    const p = store.createProject('Acme', { defaultBase: 'main' });
+    const p = store.createProject(' Work / Clients / Acme ', { defaultBase: 'main' });
     expect(p.id).toMatch(/^proj_/);
+    expect(p).toMatchObject({ name: 'Acme', folder: 'Work/Clients' });
     const lists = store.listLists(p.id);
     expect(lists).toHaveLength(1);
     expect(lists[0]!.name).toBe('Tasks');
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
+  });
+
+  it('keeps the final project name unique within its organization', () => {
+    const other = store.createOrganization({ name: 'Other org' });
+    const first = store.createProject('Work/Clients/Web Site');
+    expect(first).toMatchObject({ name: 'Web Site', folder: 'Work/Clients' });
+    // Folder paths do not enter the URL, so the leaf slug is the unique key.
+    expect(() => store.createProject('Personal/web site')).toThrow(/already exists/i);
+    expect(() => store.createProject('Other/Web-site')).toThrow(/already exists/i);
+    expect(() => store.createProject('')).toThrow(/required/i);
+    // The same leaf is valid in a different organization.
+    expect(store.createProject('Archive/Web Site', {}, other.id)).toMatchObject({ name: 'Web Site', folder: 'Archive' });
+
+    const second = store.createProject('Second');
+    expect(() => store.renameProject(second.id, 'New/Web Site')).toThrow(/already exists/i);
+    expect(store.getProject(second.id)).toMatchObject({ name: 'Second' });
+    expect(store.renameProject(second.id, 'New/Console')).toMatchObject({ name: 'Console', folder: 'New' });
+    expect(store.renameProject(second.id, 'Console')).not.toHaveProperty('folder');
   });
 
   it('reorders projects in the sidebar, per organization', () => {
@@ -257,6 +276,52 @@ describe('Store', () => {
     store.reorderProject(a!.id, foreign.id);
     expect(order()).toEqual(['B', 'C', 'D', 'A']);
     expect(() => store.reorderProject('proj_nope')).toThrow(/no project/);
+  });
+
+  it('files projects into implicit sidebar folders', () => {
+    const [a, b] = ['A', 'B'].map((n) => store.createProject(n));
+    // A folder is nothing but a path a project names — no entity to create.
+    expect(store.setProjectFolder(a!.id, 'Work/Clients').folder).toBe('Work/Clients');
+    expect(store.getProject(a!.id)!.folder).toBe('Work/Clients');
+    // Paths are canonicalized: segments trimmed, empty segments dropped.
+    expect(store.setProjectFolder(a!.id, '  Work / Clients / ').folder).toBe('Work/Clients');
+    // Clearing returns the project to the top level, with no folder key at all.
+    expect(store.setProjectFolder(a!.id, '')).not.toHaveProperty('folder');
+    expect(store.getProject(a!.id)!.folder).toBeUndefined();
+    expect(() => store.setProjectFolder('proj_nope', 'X')).toThrow(/no project/);
+
+    // A drop can move and re-file in one gesture; the returned order carries it.
+    const moved = store.reorderProject(b!.id, a!.id, 'Work');
+    expect(moved.find((p) => p.id === b!.id)!.folder).toBe('Work');
+    expect(store.getProject(b!.id)!.folder).toBe('Work');
+    // …and folder '' on a reorder is an explicit move back to the top level,
+    // while an omitted folder leaves it alone.
+    store.reorderProject(b!.id, a!.id);
+    expect(store.getProject(b!.id)!.folder).toBe('Work');
+    store.reorderProject(b!.id, a!.id, '');
+    expect(store.getProject(b!.id)!.folder).toBeUndefined();
+  });
+
+  it('renames an implicit sidebar folder and its nested projects atomically', () => {
+    const direct = store.createProject('Work/Clients/Site');
+    const nested = store.createProject('Work/Clients/Internal/Admin');
+    const sibling = store.createProject('Work/Notes');
+
+    expect(store.projectFolderProjects(direct.id, 'Work/Clients').map((project) => project.id))
+      .toEqual([direct.id, nested.id]);
+    const renamed = store.renameProjectFolder(direct.id, 'Work/Clients', 'Customers');
+    expect(renamed.folder).toBe('Work/Customers');
+    expect(renamed.projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: direct.id, folder: 'Work/Customers' }),
+      expect.objectContaining({ id: nested.id, folder: 'Work/Customers/Internal' }),
+    ]));
+    expect(store.getProject(sibling.id)!.folder).toBe('Work');
+
+    store.createProject('Work/Archive/Old');
+    expect(() => store.renameProjectFolder(direct.id, 'Work/Customers', 'Archive')).toThrow(/already exists/i);
+    expect(store.getProject(direct.id)!.folder).toBe('Work/Customers');
+    expect(() => store.renameProjectFolder(direct.id, 'Work/Customers', 'Bad/Name')).toThrow(/cannot contain/i);
+    expect(() => store.projectFolderProjects(sibling.id, 'Work/Customers')).toThrow(/does not belong/i);
   });
 
   it('keeps creation order for projects that predate the sidebar ordering column', () => {
@@ -294,13 +359,13 @@ describe('Store', () => {
     const organization = store.createOrganization({ name: 'Acme' });
     const project = store.createProject('Website', {}, organization.id);
 
-    expect(store.renameProject(project.id, '  Storefront  ')).toMatchObject({
-      id: project.id, organizationId: organization.id, name: 'Storefront',
+    expect(store.renameProject(project.id, '  Commerce / Storefront  ')).toMatchObject({
+      id: project.id, organizationId: organization.id, name: 'Storefront', folder: 'Commerce',
     });
     expect(store.renameOrganization(organization.id, '  Acme Labs  ')).toMatchObject({
       id: organization.id, name: 'Acme Labs', slug: organization.slug,
     });
-    expect(store.getProject(project.id)?.name).toBe('Storefront');
+    expect(store.getProject(project.id)).toMatchObject({ name: 'Storefront', folder: 'Commerce' });
     expect(store.getOrganization(organization.id)?.name).toBe('Acme Labs');
     expect(() => store.renameProject(project.id, 'settings')).toThrow(/reserved/i);
     expect(() => store.renameProject(project.id, '   ')).toThrow(/required/i);

@@ -90,4 +90,13 @@ describe('connector import (web)', () => {
     expect(app).toContain('/git-profiles');
     expect(app).toContain('/api/vault/connectors/pass-git/connect');
   });
+
+  it('offers selective automatic updates and makes automatic discovery select everything', () => {
+    expect(app).toContain('Keep selected credentials updated');
+    expect(app).toContain('Import new credentials automatically');
+    expect(app).toContain("if (forced) { keepUpdated.checked = true; selectAll(true); }");
+    expect(app).toContain('control.disabled = forced');
+    expect(app).toContain('/config${oq}');
+    expect(app).toContain('autoSync: { keepUpdated: !!keepUpdated?.checked, importNew: !!importNew?.checked, externalIds');
+  });
 });

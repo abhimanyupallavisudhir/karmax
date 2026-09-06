@@ -51,7 +51,8 @@ import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
-import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent } from '../integrations/github-app.js';
+import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
+  type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
@@ -248,6 +249,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/folder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/reorder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -330,10 +332,9 @@ function providerHomeFromSessionFile(provider: DownloadableProvider, filename: s
   return at > 0 ? filename.slice(0, at) : undefined;
 }
 
-/** Resolve newer session metadata and metadata-poor historical tasks alike.
- * Native files are searched only inside provider history roots by
- * findProviderSession; a task's opaque session id can never become an arbitrary
- * host filesystem read. */
+/** Resolve stored session metadata without searching other config homes. A task
+ * with legacy metadata that lacks its source home falls back to a generated
+ * transcript export instead of sweeping the installation by opaque id. */
 function storedConversationSession(store: Store, taskId: string, intentId: string | undefined, role: string,
   providerHint?: unknown): { id?: string; provider?: DownloadableProvider; home?: string; source?: string } {
   const sessionTaskId = role === 'confirm' ? (intentId ?? taskId) : taskId;
@@ -486,6 +487,7 @@ export function toPublicPayload(value: unknown): unknown {
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
  *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
 export const DEFAULT_GATEWAY_PORT = 4505;
+const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -597,6 +599,10 @@ export class Gateway {
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
   private pendingPolicyAcceptances = new Map<string, { versions: Record<string, string>; expiresAt: number }>();
   private stopLoginPoolSync?: () => void;
+  private gitPassAutoSyncTimer?: NodeJS.Timeout;
+  /** Preserve every observed push while keeping one Git/GPG operation per
+   *  organization in flight. A push arriving mid-sync queues one more refresh. */
+  private gitPassAutoSyncRuns = new Map<string, Promise<void>>();
 
   constructor(private deps: GatewayDeps) {
     if (deps.identity) {
@@ -608,7 +614,19 @@ export class Gateway {
     // Device OAuth finishes in the provider CLI after `/accounts/connect` has
     // returned. Refreshing only in that request races the eventual auth.json and
     // leaves a visibly connected login absent from the runnable coordinator pool.
-    this.stopLoginPoolSync = deps.login?.onStateChange(() => this.refreshLoginPool());
+    this.stopLoginPoolSync = deps.login?.onStateChange(async (state) => {
+      await this.refreshLoginPool();
+      if (!state.loggedIn) return;
+      const credential = enumerateCredentials(gatherCredentialSources({
+        configHomes: this.deps.configHomes,
+        broker: this.deps.broker,
+        organizationId: state.organizationId,
+      })).find((candidate) => candidate.provider === state.provider && candidate.account === state.account);
+      // A completed provider login is not enough to clear quarantine on its own:
+      // prove the new credential can read live subscription usage, then let the
+      // coordinator's compare-and-set transition only needs-attention → available.
+      if (credential) await this.refreshUsage(credential.key, state.organizationId).catch(() => undefined);
+    });
   }
 
   private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
@@ -739,6 +757,42 @@ export class Gateway {
     const session: Session = { user, userId: user, apiToken };
     this.sessions.set(sid, session);
     return { sid, session };
+  }
+
+  private enqueueGitPassAutoSync(organizationId: string, work: () => Promise<void>): void {
+    const prior = this.gitPassAutoSyncRuns.get(organizationId) ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(work).catch((error) => {
+      console.warn(`[vault] Git-backed pass automatic sync failed for ${organizationId}: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      if (this.gitPassAutoSyncRuns.get(organizationId) === next) this.gitPassAutoSyncRuns.delete(organizationId);
+    });
+    this.gitPassAutoSyncRuns.set(organizationId, next);
+  }
+
+  private enqueueGitPassPush(event: GithubVaultPushEvent): void {
+    if (!this.deps.broker || !this.deps.githubApp) return;
+    const repository = this.deps.store.getRepository(event.repositoryId);
+    if (!repository || repository.organizationId !== event.organizationId) return;
+    this.enqueueGitPassAutoSync(event.organizationId, async () => {
+      const { defaultConnectors } = await import('../autonomy/connectors.js');
+      const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, event.organizationId);
+      await defaultConnectors(this.deps.store, vault, this.deps.broker, event.organizationId,
+        { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
+        .autoSyncGitPush(repository, event.revision);
+    });
+  }
+
+  private enqueueGitPassBackstop(): void {
+    if (!this.deps.broker) return;
+    for (const { id: organizationId } of this.deps.store.listOrganizations()) {
+      this.enqueueGitPassAutoSync(organizationId, async () => {
+        const { defaultConnectors } = await import('../autonomy/connectors.js');
+        const vault = new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId);
+        await defaultConnectors(this.deps.store, vault, this.deps.broker, organizationId,
+          { hostLocal: this.hostLocal, hosted: this.deps.hosted, githubApp: this.deps.githubApp })
+          .autoSync('pass-git', 'backstop');
+      });
+    }
   }
 
   /** Route both terminal GitHub runs and "no run was created" incidents through
@@ -888,6 +942,11 @@ export class Gateway {
     const internalUrl = `http://127.0.0.1:${port}`;
     const directHost = bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : bindHost;
     const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
+    // Webhooks give GitHub-backed stores low latency; this durable-state scan is
+    // the recovery rail for missed deliveries, restarts, and non-GitHub remotes.
+    this.enqueueGitPassBackstop();
+    this.gitPassAutoSyncTimer = setInterval(() => this.enqueueGitPassBackstop(), GIT_PASS_AUTO_SYNC_BACKSTOP_MS);
+    this.gitPassAutoSyncTimer.unref();
     return {
       url: publicUrl,
       internalUrl,
@@ -896,6 +955,8 @@ export class Gateway {
         new Promise<void>((resolve) => {
           this.stopLoginPoolSync?.();
           this.stopLoginPoolSync = undefined;
+          if (this.gitPassAutoSyncTimer) clearInterval(this.gitPassAutoSyncTimer);
+          this.gitPassAutoSyncTimer = undefined;
           this.reviewActions.stopAll();
           this.fanout.close();
           // `WebSocketServer.close()` does not terminate existing upgraded
@@ -1265,7 +1326,7 @@ export class Gateway {
         // timeline and `event` triggers see it like any other happening (SPEC §5.4).
         // The service already resolved each event to a task of the installing
         // organization, so dispatch is unconditional here.
-        const { events, projectEvents, ...body } = result;
+        const { events, projectEvents, vaultPushes, ...body } = result;
         for (const event of events ?? []) {
           this.emitTaskEvent({ taskId: event.taskId, type: event.type, ts: Date.now(), payload: event.payload });
           const task = this.deps.store.getTask(event.taskId);
@@ -1283,9 +1344,11 @@ export class Gateway {
           this.deps.store.releaseGithubDelivery(deliveryId);
           throw error;
         }
+        for (const event of vaultPushes ?? []) this.enqueueGitPassPush(event);
         return this.json(res, 200, { ...body,
           ...(events?.length ? { dispatched: events.length } : {}),
           ...(recoveries ? { recoveries } : {}),
+          ...(vaultPushes?.length ? { vaultSyncsQueued: vaultPushes.length } : {}),
         });
       } catch (error) {
         // Only a genuine signature failure is a 401. Answering 401 for ANY
@@ -2922,11 +2985,19 @@ export class Gateway {
         if (method === 'PATCH') {
           const b = await this.body(req);
           try {
-            if (Object.prototype.hasOwnProperty.call(b, 'name')) {
-              if (typeof b.name !== 'string') throw new Error('project name is required');
+            // A project name may be a full sidebar path ("Work/Clients/Site").
+            // The store atomically derives folder=Work/Clients and name=Site.
+            // Folder-only PATCH remains for API clients that mirror drag moves.
+            if (Object.prototype.hasOwnProperty.call(b, 'name') || Object.prototype.hasOwnProperty.call(b, 'folder')) {
               if (Object.prototype.hasOwnProperty.call(b, 'config'))
                 throw new Error('update the project name and configuration separately');
-              return this.json(res, 200, store.renameProject(id, b.name));
+              if (Object.prototype.hasOwnProperty.call(b, 'name')) {
+                if (typeof b.name !== 'string') throw new Error('project name is required');
+                if (Object.prototype.hasOwnProperty.call(b, 'folder'))
+                  throw new Error('include the folder in the project name, for example "Work/Project"');
+                return this.json(res, 200, store.renameProject(id, b.name));
+              }
+              return this.json(res, 200, store.setProjectFolder(id, String(b.folder ?? '')));
             }
             const config = normalizeConfig(b.config, false, this.deps.hosted === true);
             const project = store.getProject(id);
@@ -2951,15 +3022,37 @@ export class Gateway {
           return this.json(res, 200, { deleted: true, projectId: id });
         }
       }
+      // Folder headers are projections of project.folder, not separate records.
+      // Renaming one therefore rewrites every project in that subtree atomically.
+      // The route is anchored to one member project for tenant scoping, then the
+      // explicit loop prevents that one grant from conferring write access to
+      // sibling projects the caller can only read.
+      const projectFolder = p.match(/^\/api\/projects\/([^/]+)\/folder$/);
+      if (projectFolder && method === 'PATCH') {
+        const b = await this.body(req);
+        try {
+          const projects = store.projectFolderProjects(projectFolder[1]!, b.folder);
+          const forbidden = projects.find((project) => !this.deps.tokens.check(token, 'project:edit', {
+            projectId: project.id,
+            organizationId: project.organizationId,
+          }).ok);
+          if (forbidden)
+            return this.json(res, 403, { error: 'Renaming this folder requires edit access to every project it contains.' });
+          return this.json(res, 200, store.renameProjectFolder(projectFolder[1]!, b.folder, b.name));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       // Sidebar order. The drop tells us which project the dragged one now sits
       // above (`before`); omitting it means "last". Sending the neighbour rather
       // than an absolute index keeps a drag correct against a list that changed
       // under the user, and the store re-densifies the organization's positions.
+      // A drop may also land in a folder: `folder` carries the destination path
+      // ('' = top level) so the one gesture persists as one request.
       const projReorder = p.match(/^\/api\/projects\/([^/]+)\/reorder$/);
       if (projReorder && method === 'POST') {
         const b = await this.body(req);
         try {
-          return this.json(res, 200, store.reorderProject(projReorder[1]!, b.before ?? undefined));
+          return this.json(res, 200, store.reorderProject(projReorder[1]!, b.before ?? undefined,
+            typeof b.folder === 'string' ? b.folder : undefined));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
@@ -5447,7 +5540,18 @@ export class Gateway {
                 const connector = await connectors.connect(connName[1]!, String(b.secret ?? ''));
                 return this.json(res, 200, { connected: true, connector });
               }
-              if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
+              if (action === 'config') {
+                let config = typeof b.writeBack === 'boolean'
+                  ? connectors.setConfig(connName[1]!, { writeBack: b.writeBack })
+                  : connectors.config(connName[1]!);
+                if (b.autoSync && typeof b.autoSync === 'object') config = connectors.setAutoSync(connName[1]!, {
+                  keepUpdated: b.autoSync.keepUpdated === true,
+                  importNew: b.autoSync.importNew === true,
+                  externalIds: Array.isArray(b.autoSync.externalIds) ? b.autoSync.externalIds.map(String) : [],
+                  policy: b.autoSync.policy,
+                });
+                return this.json(res, 200, config);
+              }
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
               if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
                 { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
@@ -5814,7 +5918,11 @@ export class Gateway {
             return this.json(res, 400, { error: 'OpenCode login requires a valid auth-method label' });
           }
         }
-        const result = await this.deps.login.connect(provider, String(b.account), { modelProvider, authMethod }, resourceOrganizationId);
+        const result = await this.deps.login.connect(provider, String(b.account), {
+          modelProvider,
+          authMethod,
+          force: b.force === true,
+        }, resourceOrganizationId);
         // Seed the config home's MCP baseline (SPEC §7.5/§3.4): the karmax platform
         // MCP (always) + an optional browser MCP. The scoped token is injected at
         // spawn; here we bake in the gateway URL only.
@@ -5827,6 +5935,14 @@ export class Gateway {
           });
         }
         await this.refreshLoginPool();
+        if (result.status === 'logged_in') {
+          const credential = enumerateCredentials(gatherCredentialSources({
+            configHomes: this.deps.configHomes,
+            broker: this.deps.broker,
+            organizationId: resourceOrganizationId,
+          })).find((candidate) => candidate.provider === provider && candidate.account === String(b.account));
+          if (credential) await this.refreshUsage(credential.key, resourceOrganizationId).catch(() => undefined);
+        }
         // strip the absolute configHome path from the response
         const { configHome, ...safe } = result;
         return this.json(res, 200, safe);

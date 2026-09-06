@@ -70,6 +70,7 @@ import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { paths } from '../config/paths.js';
+import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
@@ -233,6 +234,8 @@ export interface CoreActivityDeps {
   resources?: import('../world/resources.js').ProjectResourceService;
   objects?: ObjectStore;
   contentDir?: string;
+  /** Snapshot of whether this console is running on the user's own machine. */
+  hostLocal?: boolean;
 }
 
 /** What the PR stage puts on the pull request it opens for the task. */
@@ -1653,9 +1656,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
         const upload = spec.resumeFrom.upload;
         const share = spec.resumeFrom.sessionId ? publicConversationShare(spec.resumeFrom.sessionId) : undefined;
+        const allowProviderId = deps.hostLocal ?? deploymentHostLocal();
         if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
           throw ApplicationFailure.create({
-            message: 'Use a public HTTPS ChatGPT or Claude share link, or paste a provider conversation ID.',
+            message: 'Use a public HTTPS ChatGPT or Claude share link, or upload a conversation file.',
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+        }
+        if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
+          throw ApplicationFailure.create({
+            message: 'Provider conversation IDs are available only on a host-local Karmax. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link.',
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -1671,27 +1682,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const kind = await applyPanagent({ url: share }, 'context');
           record(args.taskId, 'session.imported', { source: 'share', provider: profile.provider, kind });
         } else if (spec.resumeFrom.sessionId) {
-          // A raw pasted provider session id = "continue THIS exact session" (resume,
-          // not fork). Materialize it into this turn's (home × world) so the provider
-          // resolves it even when the id was minted under a DIFFERENT config home or
-          // world — Claude keys sessions by (home × cwd), Codex by id across homes, so
-          // a bare pass-through silently missed both. The copy is non-mutating, so the
-          // source is never disturbed; `fork` stays false to keep the same session id.
+          // A raw id is meaningful only on a host-local install, where the UI and
+          // provider histories share one machine. Continue that exact session
+          // (rather than branching it), copying its native file into the selected
+          // config home/world when necessary.
           session = spec.resumeFrom.sessionId;
-          // The mock provider is hermetic — it has no on-disk session, so materialize is
-          // meaningless; pass the id straight through. Real providers (claude/codex) key
-          // a session to a file; make it visible in this turn's (home × world) or fail.
           let materialized =
             profile.provider === 'mock' || apiRail
               || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
               ? true
-              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
+              : materializeFork({ provider: profile.provider, session, forkHome,
+                worldPath: worldWorkingDirectory(world.handle), searchInstallation: true });
           // A local id may belong to the other native provider. Convert it into a
           // new independent destination session instead of rejecting the id merely
           // because the user selected a different agent above the source control.
           if (!materialized && (profile.provider === 'claude' || profile.provider === 'codex')) {
             const sourceProvider = profile.provider === 'claude' ? 'codex' : 'claude';
-            const sourceFile = findProviderSession({ provider: sourceProvider, session });
+            const sourceFile = findProviderSession({ provider: sourceProvider, session, searchInstallation: true });
             if (sourceFile) {
               const kind = await applyPanagent({ path: sourceFile }, 'transcript');
               materialized = true;
@@ -1699,21 +1706,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           }
           if (!materialized) {
-            // The id resolves in NO config home for this provider. Fail loudly instead
-            // of handing an unknown id to the adapter, which would silently start a
-            // FRESH conversation — the user asked to continue a specific one, and would
-            // otherwise never learn it was lost. Permanent (nonRetryable): retrying can't
-            // conjure the session. Covers a typo, a cleaned session, or a cross-provider
-            // id (we run under this profile's provider).
             record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
             throw ApplicationFailure.create({
-              message: `Cannot find conversation "${session}" in any connected Codex or Claude history. Check the provider conversation ID and try again.`,
+              message: `Cannot find conversation "${session}" in this Karmax installation's Codex or Claude history. Check the provider conversation ID and try again.`,
               type: 'agent-error',
               nonRetryable: true,
             });
           }
-          if (session === spec.resumeFrom.sessionId)
-            record(args.taskId, 'session.resumed', { session, materialized });
+          record(args.taskId, 'session.resumed', { session, materialized });
         } else if (spec.resumeFrom.taskId) {
           const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
           let srcHome: string | undefined;

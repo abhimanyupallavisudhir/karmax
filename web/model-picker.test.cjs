@@ -26,7 +26,7 @@ global.S = {
     }],
   },
 };
-global.MODELS = { claude: ['default', { id: 'claude-fable-5[1m]', displayName: 'Fable 5' }] };
+global.MODELS = { claude: ['default', { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }] };
 eval(extractFn('modelOptions'));
 eval(extractFn('normalizeComboOption'));
 
@@ -36,9 +36,9 @@ const ok = (condition, message) => condition ? pass++ : (fail++, console.error('
 
 const options = modelOptions('claude');
 ok(options[0].id === 'opus[1m]', 'keeps the SDK model object rather than flattening it to an id');
-const fable = options.find((option) => option.id === 'claude-fable-5[1m]');
+const fable = options.find((option) => option.id === 'claude-fable-5-1');
 ok(Boolean(fable), 'fills Fable into a successful but partial SDK catalog');
-ok(normalizeComboOption(fable).label === 'Fable 5', 'shows the filled preset with a human-readable Fable 5 label');
+ok(normalizeComboOption(fable).label === 'Fable 5.1', 'shows the filled preset with a human-readable Fable 5.1 label');
 
 const rendered = normalizeComboOption(options[0]);
 ok(rendered.value === 'opus[1m]', 'uses the provider model id as the submitted value');

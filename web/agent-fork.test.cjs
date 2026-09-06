@@ -16,16 +16,29 @@ function extractFn(name) {
   throw new Error(`unterminated ${name}`);
 }
 
-global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
 global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
-global.S = { tasks: [] };
+global.S = { tasks: [], meta: { hostLocal: true }, projects: [{ id: 'p1', name: 'Website' }, { id: 'p2', name: 'Billing' }] };
+global.hostLocal = () => S.meta?.hostLocal !== false;
+global.projectById = (id) => S.projects.find((p) => p.id === id);
+global.taskUrl = (id, rec) => `/acme/${rec?.projectId || 'p1'}/tasks/${rec?.num ?? id}`;
+if (typeof global.CustomEvent !== 'function') {
+  global.CustomEvent = class CustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; this.bubbles = !!init.bubbles; } };
+}
+eval(extractFn('authorizationLevels'));
+eval(extractFn('normalizedAuthorization'));
+eval(extractFn('authorizationSummary'));
+eval(extractFn('previousTaskGrants'));
+eval(extractFn('previousGrantsSummary'));
+eval(extractFn('wireResumeReauthorization'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('readResume'));
+eval(extractFn('readAuthorizationEditor'));
 
 let pass = 0;
 let fail = 0;
@@ -35,8 +48,14 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details') && !closed.includes('<summary'), 'old details disclosure is gone');
-ok(closed.includes('provider conversation ID or a ChatGPT/Claude share link'), 'provider ids and public share links are named in the compact input');
+ok(closed.includes('provider conversation ID or public ChatGPT/Claude share link'), 'a local console advertises provider ids and public share links');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
+
+S.meta.hostLocal = false;
+const hosted = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
+ok(hosted.includes('paste a public ChatGPT/Claude share link'), 'a nonlocal console still advertises public share links');
+ok(!hosted.includes('provider conversation ID'), 'a nonlocal console does not advertise inaccessible provider ids');
+S.meta.hostLocal = true;
 
 const existing = renderAgentField(
   { role: 'do', name: 'agent:do' },
@@ -46,6 +65,31 @@ const existing = renderAgentField(
 ok(existing.includes('class="af-resume-enabled" checked'), 'an already-selected task fork checks the box');
 ok(existing.includes('class="af-resume-panel" >'), 'an already-selected task fork starts expanded');
 ok(existing.includes('value="gpt-source"'), 'existing fork parameters remain visible');
+
+// ── the chosen-source chip: a permalink to the source + the re-authorize option
+const source = {
+  id: 'task_source', num: 42, title: 'Ship <billing>', projectId: 'p1',
+  params: { _authorization: { level: 'maintainer', scope: 'projects', projectIds: ['p1', 'p2'],
+    capabilities: ['task:*', 'use-credential:item:cred_a', 'use-credential:item:cred_b', 'use-credential:domain:example.com'],
+    credentialPolicies: { cred_a: { use: 'ask' } } } },
+};
+const chip = resumeChosenInner({ taskId: 'task_source', role: 'do' }, source);
+ok(chip.includes('<a class="af-resume-source" data-spa href="/acme/p1/tasks/42"'), 'the "fork of" text links to the source task');
+ok(chip.includes('>#42 Ship &lt;billing&gt;</a>'), 'the link carries the task number and escaped title');
+ok(chip.includes('class="af-resume-clear"'), 'the chip keeps its clear button');
+ok(chip.includes('class="af-resume-reauthorize"') && chip.includes('Re-authorize previous grants?'), 'a source with known grants offers to re-authorize them');
+ok(chip.includes('class="af-resume-reauth" hidden'), 'the option starts hidden until a form with grant controls claims it');
+ok(chip.includes('Project maintainer · Website, Billing + 2 credentials'), 'the option summarizes the level, scope and vault item grants it would apply');
+ok(resumeChosenInner({ taskId: 'task_source', role: 'confirm' }, source).includes('forking confirm agent of'), 'non-do roles are named');
+const noGrants = resumeChosenInner({ taskId: 'task_legacy' }, { id: 'task_legacy', num: 7, title: 'Legacy', projectId: 'p1', params: {} });
+ok(noGrants.includes('href="/acme/p1/tasks/7"') && !noGrants.includes('af-resume-reauthorize'), 'a source without stored grants links but offers nothing to re-authorize');
+const foreign = resumeChosenInner({ taskId: 'task_far' }, { id: 'task_far', num: 3, title: 'Far', projectId: 'p_unknown', params: {} });
+ok(!foreign.includes('<a ') && foreign.includes('#3 Far'), 'a source in an unloaded project stays plain text rather than a dead link');
+ok(resumeChosenInner({ taskId: 'task_gone' }).includes('task_gone') && !resumeChosenInner({ taskId: 'task_gone' }).includes('<a '), 'an unknown source shows its id without a link');
+const grants = previousTaskGrants(source);
+ok(JSON.stringify(grants.authorization) === JSON.stringify({ level: 'maintainer', scope: 'projects', projectIds: ['p1', 'p2'] }), 'previous grants carry the stored selection');
+ok(grants.credentialGrantIds.join() === 'cred_a,cred_b' && grants.credentialPolicies.cred_a.use === 'ask', 'previous grants carry vault item grants + policies (domain/tag caps are not pickable here)');
+ok(previousTaskGrants({ projectId: 'p1', params: { _authorization: { profileId: 'developer' } } }).authorization.projectIds[0] === 'p1', 'a legacy profileId-only record falls back to its own project');
 
 const listeners = new Map();
 const element = (extra = {}) => ({
@@ -58,12 +102,28 @@ const model = element({ key: 'model', value: '' });
 const effort = element({ key: 'effort', value: '', options: [{ value: '' }, { value: 'high' }] });
 const enabled = element({ key: 'enabled' });
 const panel = element({ key: 'panel' });
+// The chip container: its innerHTML is re-rendered by the box, so model the two
+// elements the box later queries inside it (the option label + its checkbox).
 const chosen = element({ key: 'chosen', dataset: { resume: 'null' } });
+chosen.option = { hidden: true };
+chosen.checkbox = { checked: false, closest: (sel) => sel === '.af-resume-reauthorize' ? chosen.checkbox : null };
+let chosenHtml = '';
+Object.defineProperty(chosen, 'innerHTML', {
+  get: () => chosenHtml,
+  set: (html) => { chosenHtml = html; chosen.option.hidden = html.includes('class="af-resume-reauth" hidden'); chosen.checkbox.checked = false; },
+});
+chosen.querySelector = (sel) => !chosenHtml.includes(sel.slice(1)) ? null
+  : sel === '.af-resume-reauth' ? chosen.option : sel === '.af-resume-reauthorize' ? chosen.checkbox : null;
 const pick = element({ key: 'pick' });
 const sessionInput = element({ key: 'session', value: '' });
 const uploadInput = element({ key: 'upload-input', files: [] });
 const uploaded = element({ key: 'uploaded', dataset: { upload: 'null' } });
 const classes = new Set();
+// The hosting form (task form / task page): claims the option and applies grants.
+const hostListeners = new Map();
+const hostRoot = { dataset: {}, querySelectorAll: () => [], addEventListener(type, fn) { hostListeners.set(type, fn); } };
+let hostAttached = false;
+const dispatched = [];
 const box = {
   querySelector(selector) {
     return {
@@ -73,12 +133,14 @@ const box = {
       '.af-resume-upload input': uploadInput, '.af-resume-uploaded': uploaded,
     }[selector];
   },
+  closest: (sel) => sel === '[data-reauthorize-host]' && hostAttached ? hostRoot : null,
   classList: { toggle(name, on) { on ? classes.add(name) : classes.delete(name); } },
-  dispatchEvent() {},
+  dispatchEvent(event) { dispatched.push(event.type); if (event.type === 'af-reauthorize') hostListeners.get('af-reauthorize')?.(event); },
 };
 global.wireCombo = () => {};
 global.modelOptions = () => [];
 global.refreshEffortSelect = () => {};
+global.Event = class Event { constructor(type) { this.type = type; } };
 let picker;
 global.openTaskPicker = (config) => { picker = config; };
 eval(extractFn('wireAgentBox'));
@@ -90,12 +152,14 @@ listeners.get('enabled:change')();
 ok(!panel.hidden && !provider.disabled, 'checking expands before a source agent is selected');
 listeners.get('pick:click')();
 picker.onPick({
-  task: { id: 'task_source', num: 42, title: 'Source' }, role: 'do',
+  task: { id: 'task_source', num: 42, title: 'Source', projectId: 'p1' }, role: 'do',
   session: { id: 'session-1', provider: 'codex', model: 'gpt-source', effort: 'high' },
 });
 ok(provider.value === 'claude' && !provider.disabled, 'source selection leaves the destination agent editable');
 ok(model.value === '' && effort.value === '', 'source selection does not overwrite destination model settings');
 ok(readResume(box)?.taskId === 'task_source', 'checked selection is collected as a task fork');
+ok(chosen.innerHTML.includes('href="/acme/p1/tasks/42"'), 'the picked source renders as a link even when the task list does not hold it');
+ok(!chosen.innerHTML.includes('af-resume-reauthorize'), 'a picked source without grants offers nothing to re-authorize');
 sessionInput.value = 'https://chatgpt.com/share/example';
 listeners.get('session:input')();
 ok(readResume(box)?.sessionId === 'https://chatgpt.com/share/example', 'share links use the provider conversation input');
@@ -110,6 +174,50 @@ ok(readResume(box) === undefined, 'unchecked fork is omitted from submitted para
 enabled.checked = true;
 listeners.get('enabled:change')();
 ok(!provider.disabled && readResume(box) === undefined, 'rechecking does not revive a stale source');
+
+// ── re-authorize: outside a grant-hosting form the option stays hidden
+picker.onPick({ task: source, role: 'do', session: { id: 'session-1', provider: 'codex' } });
+ok(chosen.innerHTML.includes('af-resume-reauthorize') && chosen.option.hidden, 'without a hosting form the option is rendered but hidden');
+ok(readResume(box)?.taskId === 'task_source' && !('reauthorize' in readResume(box)), 'the option is not part of the submitted resume pointer');
+
+// ── re-authorize inside a hosting form: grants land in the form's own controls
+const editorCalls = [];
+const editor = { _authorizationValue: { level: 'developer', scope: 'projects', projectIds: ['p1'] },
+  _setAuthorization(value) { editorCalls.push(value); this._authorizationValue = value; } };
+let formGrants = { ids: [], policies: {} };
+let changed = 0;
+wireResumeReauthorization(hostRoot, {
+  editor: () => editor,
+  grants: () => ({ ids: [...formGrants.ids], policies: formGrants.policies }),
+  setGrants: (ids, policies) => { formGrants = { ids, policies }; },
+  changed: () => changed++,
+});
+ok('reauthorizeHost' in hostRoot.dataset, 'a hosting form claims the option');
+hostAttached = true;
+picker.onPick({ task: source, role: 'do', session: { id: 'session-1', provider: 'codex' } });
+ok(!chosen.option.hidden, 'inside a hosting form the option is shown');
+chosen.checkbox.checked = true;
+listeners.get('chosen:change')({ target: chosen.checkbox });
+ok(editorCalls.length === 1 && editorCalls[0].level === 'maintainer' && editorCalls[0].projectIds.join() === 'p1,p2', 'checking applies the source level + scope to the Authorization editor');
+ok(formGrants.ids.join() === 'cred_a,cred_b' && formGrants.policies.cred_a.use === 'ask', 'checking applies the source vault grants + policies');
+ok(changed === 1, 'the host is told to persist the change');
+chosen.checkbox.checked = false;
+listeners.get('chosen:change')({ target: chosen.checkbox });
+ok(editorCalls.length === 2 && editorCalls[1].level === 'developer' && editorCalls[1].projectIds.join() === 'p1', 'unchecking restores the previous selection');
+ok(formGrants.ids.length === 0 && changed === 2, 'unchecking restores the previous vault grants');
+listeners.get('chosen:change')({ target: chosen.checkbox });
+ok(editorCalls.length === 2 && changed === 2, 'a redundant uncheck is a no-op');
+chosen.checkbox.checked = true;
+listeners.get('chosen:change')({ target: chosen.checkbox });
+ok(formGrants.ids.join() === 'cred_a,cred_b', 'grants can be applied again');
+listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
+ok(chosen.dataset.resume === 'null' && formGrants.ids.length === 0 && editorCalls.at(-1).level === 'developer', 'clearing the source withdraws the grants it brought');
+picker.onPick({ task: source, role: 'do', session: { id: 'session-1', provider: 'codex' } });
+chosen.checkbox.checked = true;
+listeners.get('chosen:change')({ target: chosen.checkbox });
+enabled.checked = false;
+listeners.get('enabled:change')();
+ok(formGrants.ids.length === 0 && editorCalls.at(-1).level === 'developer', 'turning the fork off withdraws re-authorized grants too');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -352,7 +352,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     await poll(inherited.id, 'done');
   });
 
-  it('CONTINUES (not forks) when given a raw pasted session id', async () => {
+  it('CONTINUES (not forks) when a host-local install receives a raw session id', async () => {
     const b = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Raw resume',
       workflow: 'software-dev',
@@ -364,5 +364,25 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(events.some((e: any) => e.type === 'session.forked')).toBe(false);
     await post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' });
     await poll(b.id, 'done');
+  });
+
+  it('rejects raw provider session ids when the console is not host-local', async () => {
+    const previous = process.env.KARMAX_HOST_LOCAL;
+    process.env.KARMAX_HOST_LOCAL = '0';
+    let response: Response;
+    try {
+      response = await fetch(`${base}/api/projects/${projectId}/tasks`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({
+          title: 'Remote raw resume',
+          workflow: 'software-dev',
+          params: { prompt: 'Do not create this task', 'agent:do': { provider: 'mock', resumeFrom: { sessionId: 'sess-explicit-123' } } },
+        }),
+      });
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_HOST_LOCAL;
+      else process.env.KARMAX_HOST_LOCAL = previous;
+    }
+    expect(response.status).toBe(400);
+    expect((await J(response)).error).toContain('only on a host-local Karmax');
   });
 });

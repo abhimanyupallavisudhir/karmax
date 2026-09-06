@@ -37,6 +37,8 @@ import { MAX_FILE_BYTES, MAX_FILES_BYTES_PER_MESSAGE, MAX_FILES_PER_MESSAGE, san
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, roleDefaultProfile } from '../agent/profiles.js';
+import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
+import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
@@ -296,6 +298,8 @@ export interface KarmaxApiDeps {
   defaultAgentProvider?: Provider;
   /** Enforce hosted control-plane invariants without consulting mutable ambient env. */
   hosted?: boolean;
+  /** Gate host-filesystem affordances without consulting mutable ambient env. */
+  hostLocal?: boolean;
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
@@ -814,8 +818,11 @@ export class KarmaxApi {
   }
 
   /**
-   * Authorize every `agent:<role>.resumeFrom.taskId` in a task's params against
-   * the **source** task, not just the task being created/edited.
+   * Validate each agent resume source, then authorize every
+   * `agent:<role>.resumeFrom.taskId` against the **source** task, not just the
+   * task being created/edited. A `sessionId` is accepted only when it is a
+   * supported public share URL, unless this is a host-local install where the
+   * browser and provider histories intentionally share one machine.
    *
    * `resumeFrom` makes the activity runtime (`src/activities/core.ts`) load
    * another task's provider session and splice its transcript into the new
@@ -826,11 +833,18 @@ export class KarmaxApi {
    * already models the intended check; this closes the same door on the raw
    * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
    */
-  private authorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
+  private validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): void {
     for (const [key, value] of Object.entries(params ?? {})) {
       if (!key.startsWith('agent:') || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const resumeFrom = (value as Record<string, unknown>).resumeFrom;
       if (!resumeFrom || typeof resumeFrom !== 'object' || Array.isArray(resumeFrom)) continue;
+      const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
+      if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId.trim()
+        || (looksLikeConversationUrl(sessionId) && !publicConversationShare(sessionId))))
+        throw new ValidationError('use a public HTTPS ChatGPT/Claude share link or upload a conversation file');
+      if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
+        && !(this.deps.hostLocal ?? deploymentHostLocal()))
+        throw new ValidationError('provider conversation IDs are available only on a host-local Karmax; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT/Claude share link');
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = this.deps.store.getTask(sourceId);
@@ -1026,7 +1040,7 @@ export class KarmaxApi {
     if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
-    this.authorizeResumeSources(token, taskOverrides);
+    this.validateAndAuthorizeResumeSources(token, taskOverrides);
     const inheritedFiles = this.inheritedResumeFiles(taskOverrides);
     // Resume authorization above grants conversation-read authority. Extend each
     // inherited content hash into the destination project before validating it.
@@ -2051,7 +2065,7 @@ export class KarmaxApi {
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
-    this.authorizeResumeSources(token, params);
+    this.validateAndAuthorizeResumeSources(token, params);
     const inheritedFiles = this.inheritedResumeFiles(params);
     for (const file of inheritedFiles) this.deps.store.grantAttachment(file.id, task.projectId);
     const promptFiles = uniqueFileRefs([
@@ -3460,9 +3474,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return { role, session: this.deps.store.kvGet(`session:${taskId}:${role}`) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
   }
 
-  /** Branch a source agent into an independent task/session; the source is never mutated. */
+  /** Branch a source agent into an independent task/session; the source is never mutated.
+   *
+   * `reauthorize` starts the fork from the grants the source task ended with —
+   * its authorization level/scope (including any mid-task elevation a human
+   * approved) plus its vault credential grants and policies — instead of the
+   * project default. The forked conversation usually continues the same work,
+   * so without it every credential the source was approved for is asked again.
+   * The grants go through `createTask`'s ordinary checks: the caller cannot hand
+   * the fork more than it could grant a fresh task, so an over-broad source
+   * fails loudly rather than silently attenuating. */
   async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string;
-    target?: string; authorizationProfile?: string; provider?: Provider; model?: string;
+    target?: string; authorizationProfile?: string; reauthorize?: boolean; provider?: Provider; model?: string;
     effort?: AgentSpec['effort'] }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
@@ -3470,6 +3493,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const role = args.role ?? 'do';
     if (!this.deps.store.kvGet(`session:${args.taskId}:${role}`) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
       throw new Error(`the ${role} agent has no conversation to fork`);
+    const previous = args.reauthorize ? previousTaskGrants(source) : undefined;
     return this.createTask(token, {
       projectId: source.projectId,
       title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
@@ -3484,7 +3508,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           resumeFrom: { taskId: args.taskId, role },
         },
       },
-      authorizationProfile: args.authorizationProfile,
+      // An explicit profile is the caller's choice; the source's selection only
+      // fills in when none was named.
+      ...(args.authorizationProfile ? { authorizationProfile: args.authorizationProfile }
+        : previous?.authorization ? { authorization: previous.authorization } : {}),
+      ...(previous ? { credentialGrants: previous.credentialGrants, credentialPolicies: previous.credentialPolicies } : {}),
     });
   }
 
@@ -5074,6 +5102,33 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args, organizationId);
   }
+}
+
+/** The grants a task ended with, in the shape a new task is created with: the
+ * stored `_authorization` selection (level/scope/projects — the elevated one if
+ * a human approved a mid-task authorization request), its per-task vault
+ * credential caps and the policies chosen for them. A legacy record that only
+ * carries a `profileId` still maps to a level. */
+export function previousTaskGrants(task: TaskRecord): {
+  authorization?: AuthorizationSelection;
+  credentialGrants: string[];
+  credentialPolicies: VaultTaskPolicyOverrides;
+} {
+  const stored = task.params?._authorization as {
+    level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[];
+    capabilities?: string[]; credentialPolicies?: VaultTaskPolicyOverrides;
+  } | undefined;
+  const level = stored?.level ?? stored?.profileId;
+  return {
+    ...(level ? { authorization: {
+      level,
+      scope: stored?.scope ?? 'projects',
+      ...(stored?.scope === 'organization' || stored?.scope === 'global' ? {}
+        : { projectIds: stored?.projectIds?.length ? stored.projectIds : [task.projectId] }),
+    } } : {}),
+    credentialGrants: (stored?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
+    credentialPolicies: stored?.credentialPolicies ?? {},
+  };
 }
 
 function uniqueFileRefs(files: FileRef[]): FileRef[] {

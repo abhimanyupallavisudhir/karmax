@@ -77,6 +77,7 @@ export class WorldCheckpointService {
     if (!project?.organizationId) throw new Error('world checkpoint has no owning project');
     const world = await this.worlds.open(handle);
     const linked = this.store.listProjectRepositories(projectId);
+    const organizationRepositories = this.store.listRepositories(project.organizationId);
     const files: DeltaFile[] = [];
     const repos: WorldCheckpoint['repos'] = [];
     const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
@@ -103,10 +104,14 @@ export class WorldCheckpointService {
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
       const source = worldRepoSource(repo);
-      const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository;
-      repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(source)).slice(0, 24)}`,
+      const repository = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source))?.repository
+        ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, source));
+      repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(source)).slice(0, 24)}`, source,
         checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
-        branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined });
+        branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined,
+        base: repo.base, ...(repo.target ? { target: repo.target } : {}),
+        ...(repo.targetPinned !== undefined ? { targetPinned: repo.targetPinned } : {}),
+        ...(repo.role ? { role: repo.role } : {}) });
     }
     const delta: PortableDelta = { version: 1, files };
     const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
@@ -154,21 +159,42 @@ export class WorldCheckpointService {
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
     const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
     if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
-    const repositories = checkpoint.repos.map((repo) => this.store.getRepository(repo.repositoryId));
-    const sources = checkpoint.repos.map((repo, index) => repositories[index]?.sshUrl ?? project.config.repos?.[index]);
+    // A checkpoint must be restorable after its sandbox disappears even when a
+    // checkout is not a normal project enrollment (the project wiki is the
+    // important example), or when project repository settings change later.
+    // New manifests pin their source directly. For manifests written before
+    // that field existed, the durable handle still contains the exact checkout
+    // list used to create the vanished generation; project config is the final
+    // compatibility fallback for still older single-repo handles.
+    const previousHandle = this.store.currentWorld(checkpoint.worldId) as WorldHandle | undefined;
+    const previousRepos = previousHandle ? worldRepos(previousHandle) : [];
+    const previousFor = (repo: WorldCheckpoint['repos'][number], index: number) =>
+      repo.checkoutPath === '.' ? previousRepos[index]
+        : previousRepos.find((candidate) => candidate.name === repo.checkoutPath) ?? previousRepos[index];
+    const sources = checkpoint.repos.map((repo, index) => this.store.getRepository(repo.repositoryId)?.sshUrl
+      ?? repo.source ?? (previousFor(repo, index) ? worldRepoSource(previousFor(repo, index)!) : undefined)
+      ?? project.config.repos?.[index]);
     if (sources.some((source) => !source)) throw new Error('checkpoint repository enrollment is missing');
+    const organizationRepositories = this.store.listRepositories(project.organizationId);
+    const repositories = checkpoint.repos.map((repo, index) => this.store.getRepository(repo.repositoryId)
+      ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, sources[index]!)));
     const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
     const environment = selectProjectEnvironment(this.store, checkpoint.projectId, selected,
       executionConfig.environment, checkpoint.environment);
     const primary = checkpoint.repos[0];
     const linked = this.store.listProjectRepositories(checkpoint.projectId);
-    const repositoryBranches = Object.fromEntries(linked.map((candidate) => {
-      const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
-      return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
+    const repositoryBranches = Object.fromEntries(checkpoint.repos.map((repo, index) => {
+      const source = sources[index]!;
+      const previous = previousFor(repo, index);
+      const enrolled = linked.find((candidate) => sameRepository(candidate.repository.sshUrl, source));
+      const base = repo.base ?? previous?.base ?? enrolled?.baseBranch
+        ?? enrolled?.repository.defaultBranch ?? project.config.defaultBase ?? 'main';
+      return [source, { base, target: repo.target ?? previous?.target ?? enrolled?.targetBranch ?? base }];
     }));
-    const cloneCredentials = this.githubApp && repositories.every(Boolean) ? Object.fromEntries(await Promise.all(
-      repositories.map(async (repository) => [repository!.sshUrl, await this.githubApp!.repositoryCloneToken(repository!)]),
-    )) : undefined;
+    const credentialEntries = this.githubApp ? await Promise.all(repositories.flatMap((repository, index) => repository
+      ? [this.githubApp!.repositoryCloneToken(repository).then((token) => [sources[index]!, token] as const)]
+      : [])) : [];
+    const cloneCredentials = credentialEntries.length ? Object.fromEntries(credentialEntries) : undefined;
     // Restoring PROVISIONS A REAL SANDBOX, so it must pass through the same
     // durable admission as createWorld (activities/core.ts): the runner lease is
     // what enforces the organization/project `monthlyBudgetMicros`, what produces
@@ -194,7 +220,11 @@ export class WorldCheckpointService {
       : undefined;
     let world: World;
     try {
+      // Recovery is a new provider allocation, just like createWorld: tenant
+      // identity selects the organization-owned credential, while generation
+      // keeps the provider's idempotency lookup away from the vanished sandbox.
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
+        generation: checkpoint.generation + 1, organizationId: project.organizationId,
         repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
         branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { httpsTokens: cloneCredentials } } : {}),
         ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
@@ -204,6 +234,16 @@ export class WorldCheckpointService {
       throw error;
     }
     try {
+      for (const [index, restoredRepo] of worldRepos(world.handle).entries()) {
+        const manifestRepo = checkpoint.repos[index];
+        const previous = manifestRepo ? previousFor(manifestRepo, index) : undefined;
+        const role = manifestRepo?.role ?? previous?.role;
+        if (role) restoredRepo.role = role;
+        const targetPinned = manifestRepo?.targetPinned ?? previous?.targetPinned;
+        if (targetPinned !== undefined) restoredRepo.targetPinned = targetPinned;
+      }
+      const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+      world.handle.workdir = developmentRepos.length === 1 ? developmentRepos[0]!.root : world.handle.root;
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,

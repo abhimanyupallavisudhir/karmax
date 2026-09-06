@@ -34,6 +34,8 @@ export interface LoginOptions {
   modelProvider?: string;
   /** Exact OpenCode auth-method label, passed through its documented CLI flag. */
   authMethod?: string;
+  /** Start provider OAuth even when a native credential file already exists. */
+  force?: boolean;
 }
 
 /** Injectable so tests don't depend on the real CLIs / OAuth. */
@@ -80,7 +82,11 @@ export const defaultLoginCommand: LoginCommand = (provider, home, opts) => {
 };
 
 export class LoginManager {
-  private pending = new Map<string, { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt> }>();
+  private pending = new Map<string, {
+    child: ChildProcess;
+    prompt?: ReturnType<typeof parseLoginPrompt>;
+    forced?: boolean;
+  }>();
   private stateListeners = new Set<LoginStateListener>();
 
   constructor(
@@ -104,7 +110,7 @@ export class LoginManager {
     }
     // Skip only if fully authed with a native credential. A setup-token-only home
     // re-runs login here to UPGRADE to a full, usage-pollable credential (#6).
-    if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
+    if (!opts.force && isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
     const pendingKey = this.pendingKey(provider, account, organizationId);
     const existing = this.pending.get(pendingKey);
     if (existing && existing.child.exitCode === null && existing.prompt?.loginUrl) {
@@ -124,7 +130,10 @@ export class LoginManager {
     } catch (e) {
       return { provider, account, configHome, status: 'failed', detail: `could not launch ${spec.cmd}: ${String((e as Error).message ?? e)}` };
     }
-    const pending: { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt> } = { child };
+    const pending: { child: ChildProcess; prompt?: ReturnType<typeof parseLoginPrompt>; forced?: boolean } = {
+      child,
+      forced: opts.force,
+    };
     this.pending.set(pendingKey, pending);
     let finished = false;
     const finish = () => {
@@ -166,7 +175,7 @@ export class LoginManager {
         status: 'awaiting_oauth',
       };
     }
-    if (isFullyAuthed(provider, configHome)) {
+    if (!opts.force && isFullyAuthed(provider, configHome)) {
       this.emitStateChange(provider, account, organizationId, configHome);
       return { provider, account, configHome, status: 'logged_in' };
     }
@@ -190,9 +199,17 @@ export class LoginManager {
     pending.child.stdin.end(`${value}\n`);
 
     const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline && pending.child.exitCode == null && !isFullyAuthed(provider, configHome)) {
+    // A forced re-auth starts with an old native credential still on disk. Do
+    // not mistake that predecessor for proof that the newly-submitted code was
+    // accepted; wait for the provider login process to finish.
+    while (Date.now() < deadline && pending.child.exitCode == null
+      && (pending.forced || !isFullyAuthed(provider, configHome))) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    if (pending.forced && pending.child.exitCode == null)
+      return { provider, account, configHome, status: 'awaiting_oauth', detail: 'authorization code submitted; waiting for the provider' };
+    if (pending.forced && pending.child.exitCode !== 0)
+      return { provider, account, configHome, status: 'failed', detail: 'the provider rejected the authorization code' };
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
     if (pending.child.exitCode != null)
       return { provider, account, configHome, status: 'failed', detail: 'the provider rejected the authorization code' };

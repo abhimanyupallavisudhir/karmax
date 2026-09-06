@@ -807,6 +807,7 @@ export class Store {
     // createdAt` then reproduces exactly the creation order they had before —
     // so no backfill pass is needed; the first drag densifies that organization.
     if (!projectCols.some((c) => c.name === 'ord')) this.db.exec('ALTER TABLE projects ADD COLUMN ord INTEGER NOT NULL DEFAULT 0');
+    if (!projectCols.some((c) => c.name === 'folder')) this.db.exec('ALTER TABLE projects ADD COLUMN folder TEXT');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
     // Legacy rows become single-attempt intents. Alternate attempts already point
@@ -939,16 +940,19 @@ export class Store {
 
   createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Project {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
-    assertRoutableName('project', name);
+    const path = parseProjectPath(name);
+    assertRoutableName('project', path.name);
+    this.assertUniqueProjectName(organizationId, path.name);
     config = writableProjectConfig(config);
     validateProjectExecutionConfig(config);
     const ord = (this.db
       .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM projects WHERE organizationId = ?')
       .get(organizationId) as any).m + 1;
-    const p: Project = { id: newId('proj'), organizationId, name, createdAt: Date.now(), config, order: ord };
+    const p: Project = { id: newId('proj'), organizationId, name: path.name, createdAt: Date.now(), config, order: ord,
+      ...(path.folder ? { folder: path.folder } : {}) };
     this.db
-      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord);
+      .prepare('INSERT INTO projects (id, organizationId, name, createdAt, config, ord, folder) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, organizationId, p.name, p.createdAt, JSON.stringify(p.config), ord, p.folder ?? null);
     // every project gets a default task list
     this.createList(p.id, 'Tasks');
     return p;
@@ -968,20 +972,101 @@ export class Store {
   renameProject(id: string, name: string): Project {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`no project ${id}`);
-    const nextName = name.trim();
-    if (!nextName) throw new Error('project name is required');
-    assertRoutableName('project', nextName);
-    this.db.prepare('UPDATE projects SET name = ? WHERE id = ?').run(nextName, id);
-    return { ...existing, name: nextName };
+    const path = parseProjectPath(name);
+    assertRoutableName('project', path.name);
+    this.assertUniqueProjectName(existing.organizationId ?? 'org_personal', path.name, id);
+    this.db.prepare('UPDATE projects SET name = ?, folder = ? WHERE id = ?').run(path.name, path.folder ?? null, id);
+    const { folder: _, ...rest } = existing;
+    return { ...rest, name: path.name, ...(path.folder ? { folder: path.folder } : {}) };
+  }
+
+  /** Project URLs use the leaf name only, so the leaf's slug must be unique in
+   * its organization even when projects live in different sidebar folders. */
+  private assertUniqueProjectName(organizationId: string, name: string, exceptId?: string): void {
+    const wanted = slugify(name);
+    const conflict = this.listProjects().find((project) => project.id !== exceptId
+      && (project.organizationId ?? 'org_personal') === organizationId && slugify(project.name) === wanted);
+    if (conflict) throw new Error(`A project named "${name}" already exists in this organization.`);
+  }
+
+  /** Put a project in a sidebar folder ("Work/Clients"), or at the top level
+   * when the path is empty. The folder needs no other existence: it appears in
+   * the sidebar while a project names it and vanishes when the last one leaves. */
+  setProjectFolder(id: string, folder: string): Project {
+    const existing = this.getProject(id);
+    if (!existing) throw new Error(`no project ${id}`);
+    const next = normalizeFolder(folder);
+    this.db.prepare('UPDATE projects SET folder = ? WHERE id = ?').run(next ?? null, id);
+    const { folder: _, ...rest } = existing;
+    return next ? { ...rest, folder: next } : rest;
+  }
+
+  /** Projects represented by one implicit sidebar folder, including its nested
+   * folders. `id` anchors the lookup to an organization and must itself live in
+   * the requested folder tree, so a caller cannot use a project from one part of
+   * the sidebar to operate on an unrelated path. */
+  projectFolderProjects(id: string, folder: string): Project[] {
+    const anchor = this.getProject(id);
+    if (!anchor) throw new Error(`no project ${id}`);
+    const path = normalizeFolder(folder);
+    if (!path) throw new Error('folder path is required');
+    const inside = (candidate: Project) => candidate.folder === path || candidate.folder?.startsWith(`${path}/`);
+    if (!inside(anchor)) throw new Error('project does not belong to this folder');
+    const organizationId = anchor.organizationId ?? 'org_personal';
+    return this.listProjects().filter((project) =>
+      (project.organizationId ?? 'org_personal') === organizationId && inside(project));
+  }
+
+  /** Rename one segment of an implicit sidebar folder and carry every nested
+   * project with it in one transaction. A rename never silently merges two
+   * existing trees; moving individual projects remains the drag-and-drop job. */
+  renameProjectFolder(id: string, folder: string, name: string): { folder: string; projects: Project[] } {
+    const source = normalizeFolder(folder);
+    if (!source) throw new Error('folder path is required');
+    const segment = String(name ?? '').trim();
+    if (!segment) throw new Error('folder name is required');
+    if (segment.includes('/')) throw new Error('folder name cannot contain "/"');
+    const projects = this.projectFolderProjects(id, source);
+    const cut = source.lastIndexOf('/');
+    const parent = cut < 0 ? '' : source.slice(0, cut);
+    const target = normalizeFolder([parent, segment].filter(Boolean).join('/'))!;
+    if (target === source) return { folder: source, projects };
+
+    const organizationId = projects[0]!.organizationId ?? 'org_personal';
+    const affected = new Set(projects.map((project) => project.id));
+    const conflicts = this.listProjects().some((project) => {
+      if (affected.has(project.id) || (project.organizationId ?? 'org_personal') !== organizationId) return false;
+      return project.folder === target || project.folder?.startsWith(`${target}/`);
+    });
+    if (conflicts) throw new Error(`A folder named "${segment}" already exists here.`);
+
+    const update = this.db.prepare('UPDATE projects SET folder = ? WHERE id = ?');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const renamed = projects.map((project) => {
+        const suffix = project.folder!.slice(source.length);
+        const nextFolder = `${target}${suffix}`;
+        update.run(nextFolder, project.id);
+        return { ...project, folder: nextFolder };
+      });
+      this.db.exec('COMMIT');
+      return { folder: target, projects: renamed };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /** Move a project so it sits immediately before `beforeProjectId` in the sidebar,
    * or last when that is omitted/unknown. Only the moved project's own organization
    * is touched, and its rows are re-densified to 0…n-1 so repeated drags stay stable.
-   * Returns that organization's projects in their new order. */
-  reorderProject(id: string, beforeProjectId?: string): Project[] {
-    const moving = this.getProject(id);
+   * A drop can also carry the folder the project now sits in — position and folder
+   * are one gesture, so they persist as one move. Returns that organization's
+   * projects in their new order. */
+  reorderProject(id: string, beforeProjectId?: string, folder?: string): Project[] {
+    let moving = this.getProject(id);
     if (!moving) throw new Error(`no project ${id}`);
+    if (folder !== undefined) moving = this.setProjectFolder(id, folder);
     const organizationId = moving.organizationId ?? 'org_personal';
     const siblings = this.listProjects()
       .filter((p) => (p.organizationId ?? 'org_personal') === organizationId && p.id !== id);
@@ -6156,7 +6241,25 @@ function writableProjectConfig(config: ProjectConfig): ProjectConfig {
 }
 
 function rowToProject(r: any): Project {
-  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0 };
+  return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config), order: r.ord ?? 0, ...(r.folder ? { folder: r.folder } : {}) };
+}
+
+/** Canonical form of a sidebar folder path: segments trimmed, empties dropped,
+ * so "  Work / Clients /" and "Work/Clients" are the same folder. Undefined
+ * means top level — the column stores NULL, never ''. */
+function normalizeFolder(folder: unknown): string | undefined {
+  return String(folder ?? '').split('/').map((s) => s.trim()).filter(Boolean).join('/') || undefined;
+}
+
+/** Split the one user-facing project path into its routable leaf name and its
+ * implicit sidebar folder. Empty path segments are harmless, matching folder
+ * normalization used by drag-and-drop. */
+function parseProjectPath(value: unknown): { name: string; folder?: string } {
+  const parts = String(value ?? '').split('/').map((part) => part.trim()).filter(Boolean);
+  const name = parts.pop();
+  if (!name) throw new Error('project name is required');
+  const folder = normalizeFolder(parts.join('/'));
+  return { name, ...(folder ? { folder } : {}) };
 }
 function rowToTag(r: any): Tag {
   return {

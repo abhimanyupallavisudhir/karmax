@@ -25,6 +25,7 @@ import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-h
 import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess,
   syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
+import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -254,8 +255,40 @@ export class ClaudeAdapter implements AgentAdapter {
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx);
     const remote = isRemoteAgentWorld(input.world);
+    const configHome = input.resolvedAuth?.configHome;
+    const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));
+    // The SDK callback below protects a running turn, but Claude can reject an
+    // already-expired projected token before it requests a replacement. Rotate
+    // the canonical host credential first, then copy only its fresh access token.
+    if (remoteNativeLogin) {
+      let preflightStarted = false;
+      try {
+        const refreshed = await ensureClaudeAccessTokenFresh({
+          configHome,
+          onRefresh: () => {
+            preflightStarted = true;
+            ctx.emitActivity({
+              id: 'claude-credential-preflight', kind: 'status', phase: 'started',
+              title: 'Refreshing Claude login before remote turn',
+            });
+          },
+        });
+        if (refreshed) ctx.emitActivity({
+          id: 'claude-credential-preflight', kind: 'status', phase: 'completed',
+          title: 'Claude login refreshed for remote turn',
+        });
+      } catch (error) {
+        if (preflightStarted) ctx.emitActivity({
+          id: 'claude-credential-preflight', kind: 'status', phase: 'failed',
+          title: 'Could not refresh Claude login for remote turn',
+          ...(activityDetail(error instanceof Error ? error.message : error)
+            ? { detail: activityDetail(error instanceof Error ? error.message : error) } : {}),
+        });
+        throw error;
+      }
+    }
     const remoteHome = remote
-      ? await seedRemoteAgentHome(input.world, 'claude', input.resolvedAuth?.configHome ?? '', input.session)
+      ? await seedRemoteAgentHome(input.world, 'claude', configHome ?? '', input.session)
       : undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and
@@ -489,11 +522,8 @@ export class ClaudeAdapter implements AgentAdapter {
         // control channel and Karmax rotates the ONE canonical host credential.
         // This prevents parallel sandboxes from consuming the same single-use
         // refresh token and revoking each other (takehomev2 tasks 24/25).
-        ...(remote && input.resolvedAuth?.configHome && hasClaudeNativeCredential(input.resolvedAuth.configHome)
-          ? { getOAuthToken: async () => {
-              const { refreshClaudeAccessToken } = await import('./usage.js');
-              return refreshClaudeAccessToken({ configHome: input.resolvedAuth!.configHome! });
-            } }
+        ...(remoteNativeLogin
+          ? { getOAuthToken: async () => refreshClaudeAccessToken({ configHome }) }
           : {}),
         // Spawn the agent harness ourselves (same call the SDK makes internally:
         // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the

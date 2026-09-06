@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const source = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
+const styles = fs.readFileSync(path.resolve('web/styles.css'), 'utf8');
 
 function extractFunction(name: string): string {
   const start = source.indexOf(`function ${name}(`);
@@ -32,12 +33,47 @@ describe('Project settings browser source', () => {
     const organizationWiring = extractFunction('hydrateOrganizationView');
 
     expect(project).toContain('id="project-name"');
+    expect(project).toContain('value="${esc(projectPath(proj))}"');
+    expect(project).not.toContain('id="project-folder"');
     expect(project).toContain('id="rename-project"');
     expect(project).toContain('data-settings-access="projectDelete"');
     expect(organization).toContain('id="organization-name"');
     expect(organization).toContain('id="rename-organization"');
     expect(projectWiring).toContain("method: 'PATCH'");
+    expect(projectWiring).toContain('JSON.stringify({ name })');
+    expect(projectWiring).not.toContain('JSON.stringify({ name, folder })');
     expect(organizationWiring).toContain("method: 'PATCH'");
+  });
+
+  it('creates projects in a native escapable path dialog', () => {
+    const dialog = extractFunction('newProject');
+    expect(dialog).toContain('class="modal-card new-project-dialog"');
+    expect(dialog).toContain('role="dialog" aria-modal="true"');
+    expect(dialog).toContain('placeholder="e.g. Work/Clients/Website"');
+    expect(dialog).toContain("if (event.key === 'Escape') close()");
+    expect(dialog).toContain("if (event.target === event.currentTarget) close()");
+    expect(dialog).toContain("$('#modal-root').appendChild(host)");
+    expect(dialog).not.toContain("prompt('Project name')");
+  });
+
+  it('edits project paths and folder names inline from the sidebar', () => {
+    const rows = extractFunction('railProjectRows');
+    const projectEdit = extractFunction('editRailProject');
+    const folderEdit = extractFunction('editRailFolder');
+    const inlineEdit = extractFunction('beginRailInlineEdit');
+
+    expect(rows).toContain('data-project-edit=');
+    expect(rows).toContain('data-folder-edit=');
+    expect(projectEdit).toContain('value: projectPath(project)');
+    expect(projectEdit).toContain("method: 'PATCH'");
+    expect(projectEdit).toContain('JSON.stringify({ name })');
+    expect(folderEdit).toContain('/folder`');
+    expect(folderEdit).toContain('JSON.stringify({ folder, name })');
+    expect(inlineEdit).toContain("event.key !== 'Escape'");
+    expect(inlineEdit).toContain('class="rail-edit-confirm"');
+    expect(inlineEdit).toContain('class="rail-edit-cancel"');
+    expect(styles).toContain('.rail .rail-edit-action { margin: -3px -4px -3px auto; opacity: 0;');
+    expect(styles).toContain('.rail .proj:hover .rail-edit-action');
   });
 
   it('keeps the post-delete fallback inside the deleted project’s organization', () => {

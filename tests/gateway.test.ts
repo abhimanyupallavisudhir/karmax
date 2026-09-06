@@ -9,6 +9,8 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE } from '../src/integrations/github-app.js';
 import { detectConversationImport } from '../src/store/conversation-imports.js';
+import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
+import { TASK_QUEUE } from '../src/temporal/config.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -652,6 +654,34 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       body: JSON.stringify({ before: one.id }) });
     expect(await listed()).toEqual(['Ord two', 'Ord one', 'Ord three']);
 
+    // A drop can also carry the sidebar folder the row landed in…
+    const filed = async () => ((await (await fetch(`${base}/api/projects`, { headers: auth() })).json()) as any[])
+      .find((p) => p.id === two.id);
+    await fetch(`${base}/api/projects/${two.id}/reorder`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ before: one.id, folder: 'Ops/Internal' }) });
+    expect((await filed()).folder).toBe('Ops/Internal');
+    // …and the settings form sends one path; the store infers both fields.
+    const patched = await fetch(`${base}/api/projects/${two.id}`, { method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ name: 'Archive/Ord two' }) });
+    expect(patched.status).toBe(200);
+    expect(await filed()).toMatchObject({ name: 'Ord two', folder: 'Archive' });
+
+    // Folder headers rename their whole subtree in one operation.
+    const nested = await make('Archive/Nested/Ord nested');
+    const folderRenamed = await fetch(`${base}/api/projects/${two.id}/folder`, { method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ folder: 'Archive', name: 'Filed' }) });
+    expect(folderRenamed.status).toBe(200);
+    expect(await folderRenamed.json()).toMatchObject({ folder: 'Filed' });
+    expect(await filed()).toMatchObject({ name: 'Ord two', folder: 'Filed' });
+    const afterFolderRename = (await (await fetch(`${base}/api/projects`, { headers: auth() })).json()) as any[];
+    expect(afterFolderRename.find((project) => project.id === nested.id)).toMatchObject({ folder: 'Filed/Nested' });
+
+    // The leaf name remains unique across folders in the same organization.
+    const duplicate = await fetch(`${base}/api/projects/${two.id}`, { method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ name: 'Elsewhere/Ord one' }) });
+    expect(duplicate.status).toBe(400);
+    expect(((await duplicate.json()) as any).error).toMatch(/already exists/i);
+
     const missing = await fetch(`${base}/api/projects/proj_nope/reorder`, { method: 'POST', headers: auth(),
       body: JSON.stringify({}) });
     expect(missing.status).toBe(400);
@@ -1131,6 +1161,61 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }, { timeout: 4_000 }).toBe(true);
   });
 
+  it('validates a completed re-authentication before clearing automatic quarantine', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-health-'));
+    const usage = path.join(dir, 'claude-usage.cjs');
+    fs.writeFileSync(usage, [
+      '#!/usr/bin/env node',
+      "console.log('You are currently using your subscription to power your Claude Code usage')",
+      "console.log('Current session: 1% used · resets Aug 28, 10:30am (UTC)')",
+      "console.log('Current week (all models): 0% used · resets Sep 3, 12pm (UTC)')",
+    ].join('\n'));
+    fs.chmodSync(usage, 0o700);
+    const previousUsageCommand = process.env.KARMAX_CLAUDE_USAGE_CMD;
+    process.env.KARMAX_CLAUDE_USAGE_CMD = usage;
+    try {
+      const reauthGateway = await h.startGateway({
+        loginCommand: (_provider, home) => ({
+          cmd: process.execPath,
+          args: ['-e', [
+            "console.log('open https://example.com/claude-login');",
+            "setTimeout(() => require('node:fs').writeFileSync(",
+            "  require('node:path').join(process.env.LOGIN_HOME, '.credentials.json'),",
+            "  JSON.stringify({ claudeAiOauth: { accessToken: 'fresh', refreshToken: 'canonical', expiresAt: Date.now() + 3600000 } })",
+            '), 250)',
+          ].join(' ')],
+          env: { LOGIN_HOME: home },
+        }),
+      });
+      const session: any = await fetch(`${reauthGateway.url}/api/session`).then((response) => response.json());
+      const headers = { authorization: `Bearer ${session.token}`, 'content-type': 'application/json' };
+      const connect = () => fetch(`${reauthGateway.url}/api/accounts/connect`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ provider: 'claude', account: 'reauth', force: true }),
+      }).then((response) => response.json());
+
+      await expect(connect()).resolves.toMatchObject({ status: 'awaiting_oauth' });
+      await expect.poll(async () => {
+        const dashboard: any = await fetch(`${reauthGateway.url}/api/dashboard?organizationId=org_personal`, { headers })
+          .then((response) => response.json());
+        return dashboard.accounts.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
+      }, { timeout: 5_000 }).toBe('available');
+
+      const coordinator = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+      await coordinator.setAccountAvailability({ accountId: 'login:claude:reauth', status: 'needs-attention' });
+      await expect(connect()).resolves.toMatchObject({ status: 'awaiting_oauth' });
+      await expect.poll(async () => {
+        const dashboard: any = await fetch(`${reauthGateway.url}/api/dashboard?organizationId=org_personal`, { headers })
+          .then((response) => response.json());
+        return dashboard.accounts.accounts.find((account: any) => account.id === 'login:claude:reauth')?.status;
+      }, { timeout: 5_000 }).toBe('available');
+    } finally {
+      if (previousUsageCommand === undefined) delete process.env.KARMAX_CLAUDE_USAGE_CMD;
+      else process.env.KARMAX_CLAUDE_USAGE_CMD = previousUsageCommand;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('attaches redacted resources and completes a resumable binary upload', async () => {
     const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());
@@ -1254,14 +1339,18 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
     const prepTitle = 'Make this project krmax-ready';
     for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
-      const project: any = await post(path, { name: `Fresh via ${path}` });
+      const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
+      const project: any = await post(path, { name });
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
       const prep = tasks.find((t: any) => t.title === prepTitle);
       expect(prep, `new project via ${path} should get the prep task`).toBeTruthy();
       expect(prep.workflow).toBe('software-dev');
       expect(prep.params.prompt).toContain('Migrate AGENTS.md, CLAUDE.md');
+      expect(prep.params.prompt).toContain('compile a new wiki page');
+      expect(prep.params.prompt).toContain('use the "default" tag');
       expect(prep.params.prompt).toContain('hardcoded resources (e.g. ports)');
       expect(prep.params.prompt).not.toContain('Ensure git is initialized');
+      expect(prep.params.prompt).toContain('Just press "Queue"');
     }
   });
 

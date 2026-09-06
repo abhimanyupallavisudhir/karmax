@@ -7,6 +7,7 @@ import { CodexAdapter } from '../src/agent/codex.js';
 import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
   CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
+import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
 const codexIdToken = (expiresAt: number) =>
@@ -99,6 +100,30 @@ describe('remote subscription agents', () => {
     expect(fs.readFileSync(path.join(localHome, '.credentials.json'), 'utf8')).toBe(JSON.stringify(credential));
   });
 
+  it('refreshes the canonical Claude login before projecting it without refresh authority', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-preflight-'));
+    fs.writeFileSync(path.join(localHome, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: 'expired-access', refreshToken: 'canonical-refresh', expiresAt: Date.now() - 1,
+    } }));
+    await ensureClaudeAccessTokenFresh({
+      configHome: localHome,
+      minValidityMs: 60_000,
+      run: async () => {
+        fs.writeFileSync(path.join(localHome!, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+          accessToken: 'fresh-access', refreshToken: 'rotated-canonical-refresh',
+          expiresAt: Date.now() + 3_600_000,
+        } }));
+        return '';
+      },
+    });
+
+    const world = fakeWorld();
+    const seeded = await seedRemoteAgentHome(world, 'claude', localHome);
+    const projected = JSON.parse(world.files.get(`${seeded.relative}/.credentials.json`)!.toString());
+    expect(projected.claudeAiOauth.accessToken).toBe('fresh-access');
+    expect(projected.claudeAiOauth.refreshToken).toBeUndefined();
+  });
+
   it('passes only the remote home and explicit turn-scoped environment', () => {
     expect(remoteAgentEnv('claude', '/workspace/.karmax-injection/agent/claude', {
       PATH: '/host/bin', HOME: '/host/home', OPENAI_API_KEY: 'wrong-account',
@@ -127,7 +152,7 @@ describe('remote subscription agents', () => {
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
       .toEqual(expect.arrayContaining([`@anthropic-ai/claude-code@${pinned}`, '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
-      .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
+      .toEqual(expect.arrayContaining(['@openai/codex@0.153.4', 'app-server']));
   });
 
   it('isolates accounts and exports native sessions without importing task-local OAuth state', async () => {
@@ -230,7 +255,7 @@ describe('remote subscription agents', () => {
       platformRequest: async (method: string, requestPath: string) => { platformCalls.push(`${method} ${requestPath}`); return [{ type: 'ok' }]; } } as any);
 
     expect(result).toMatchObject({ termination: { kind: 'success', status: 'completed' }, session: 'remote-thread', output: 'done remotely' });
-    expect(world.openedPty?.command).toContain('@openai/codex@0.144.5');
+    expect(world.openedPty?.command).toContain('@openai/codex@0.153.4');
     expect(world.openedPty?.command).toContain('/opt/karmax/bin/codex');
     expect(world.openedPty?.command).toContain('app-server');
     expect(world.openedPty?.command).toContain('stty raw -echo');

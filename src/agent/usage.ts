@@ -78,6 +78,9 @@ const claudeRefreshes = new Map<string, Promise<string>>();
 /** Leave enough lifetime for sandbox startup and the initial Responses stream.
  * Long turns remain protected by the bounded terminal-401 recovery in codex.ts. */
 export const CODEX_REMOTE_ID_TOKEN_SAFETY_MS = 10 * 60_000;
+/** Leave enough access-token lifetime for sandbox startup and the first Claude
+ * request. Mid-turn expiry is still handled by the SDK's host refresh callback. */
+export const CLAUDE_REMOTE_ACCESS_TOKEN_SAFETY_MS = 10 * 60_000;
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 // Lines look like (the separator is a middle dot · U+00B7):
@@ -395,6 +398,40 @@ export async function refreshClaudeAccessToken(
   });
   claudeRefreshes.set(key, created);
   return created;
+}
+
+/** A remote Claude home intentionally has no refresh token. Ensure the canonical
+ * host access token is usable before copying that access-only projection into the
+ * sandbox; otherwise Claude can reject the initial request before asking the SDK
+ * for a replacement token. Returns whether a refresh was performed. */
+export async function ensureClaudeAccessTokenFresh(
+  opts: {
+    configHome: string;
+    now?: number;
+    minValidityMs?: number;
+    timeoutMs?: number;
+    run?: UsageRunner;
+    onRefresh?: () => void;
+  },
+): Promise<boolean> {
+  const now = opts.now ?? Date.now();
+  const minValidityMs = opts.minValidityMs ?? CLAUDE_REMOTE_ACCESS_TOKEN_SAFETY_MS;
+  const accessToken = claudeAccessToken(opts.configHome);
+  const expiresAt = claudeAccessTokenExpiresAt(opts.configHome);
+  if (accessToken && expiresAt !== undefined && expiresAt - now >= minValidityMs) return false;
+
+  opts.onRefresh?.();
+  await refreshClaudeAccessToken({
+    configHome: opts.configHome,
+    timeoutMs: opts.timeoutMs,
+    run: opts.run,
+  });
+  const refreshedToken = claudeAccessToken(opts.configHome);
+  const refreshedExpiry = claudeAccessTokenExpiresAt(opts.configHome);
+  if (!refreshedToken || (refreshedExpiry !== undefined && refreshedExpiry - now < minValidityMs)) {
+    throw new Error('Claude login refresh completed without a sufficiently fresh access token');
+  }
+  return true;
 }
 
 /** Refresh the ONE canonical Codex login and return current limits. Concurrent

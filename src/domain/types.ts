@@ -258,10 +258,19 @@ export interface WorldCheckpoint {
   environmentDigest: string;
   repos: Array<{
     repositoryId: string;
+    /** Clone/worktree source pinned at checkpoint time. Older checkpoints omit
+     * this and recover it from the durable world handle or project config. */
+    source?: string;
     checkoutPath: string;
     baseSha: string;
     branch: string;
     headSha?: string;
+    /** Per-checkout branch policy. This matters for platform companions such as
+     * the project wiki, which do not necessarily share the project's default. */
+    base?: string;
+    target?: string;
+    targetPinned?: boolean;
+    role?: 'project-wiki';
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
   resources?: Array<{ attachmentId: string; revisionId: string }>;
@@ -491,6 +500,10 @@ export interface Project {
   /** Hand-picked sidebar position within the organization (drag to reorder).
    * Optional only while reading historical fixtures, where creation order rules. */
   order?: number;
+  /** Sidebar folder as a `/`-separated path ("Work/Clients"). Folders are
+   * implicit — one exists exactly while a project names it — so there is no
+   * folder entity to create, rename, or garbage-collect. Absent = top level. */
+  folder?: string;
 }
 
 export interface ProjectConfig {
@@ -1361,12 +1374,13 @@ export interface AgentSpec {
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  /** Fork prior context from a task agent, a provider conversation id/public
-   * share link, or a project-scoped uploaded Codex/Claude conversation file. */
+  /** Fork prior context from a task agent, a public share link, a host-local
+   * provider conversation id, or an uploaded Codex/Claude conversation file. */
   resumeFrom?: {
     taskId?: string;
     role?: string;
-    /** Native provider id, or a public chatgpt.com/share / claude.ai/share URL. */
+    /** A public chatgpt.com/share / claude.ai/share URL, or a native provider id
+     * when the Karmax console is host-local. */
     sessionId?: string;
     upload?: {
       id: string;

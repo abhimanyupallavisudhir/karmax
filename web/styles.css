@@ -215,11 +215,40 @@ a { color: var(--accent); text-decoration: none; }
 .rail .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); padding: 8px 10px 4px; font-weight: 600; }
 .rail .proj {
   display: flex; align-items: center; gap: 9px;
-  padding: 8px 10px; border-radius: 7px; cursor: pointer; color: var(--ink-2);
+  padding: 8px 10px 8px calc(10px + 14px * var(--depth, 0));
+  border-radius: 7px; cursor: pointer; color: var(--ink-2);
 }
+.rail .project-link, .rail .folder-toggle {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px;
+  border: 0; padding: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.rail .project-link { text-decoration: none; }
+.rail .rail-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rail .proj:hover { background: var(--surface-2); color: var(--ink); }
 .rail .proj.active { background: var(--accent-weak); color: var(--ink); font-weight: 600; }
 .rail .proj .glyph { color: var(--accent); }
+/* Folder rows group the projects beneath them. Nesting depth is the --depth
+   custom property, not DOM structure — the rail stays a flat drag list. */
+.rail .proj.folder { font-weight: 600; }
+.rail .proj.folder .glyph { color: var(--ink-3); font-size: 10px; width: 11px; text-align: center; }
+.rail .rail-edit-action, .rail .rail-edit-confirm, .rail .rail-edit-cancel {
+  flex: none; display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--ink-3); font: 600 14px/1 var(--font-ui); cursor: pointer;
+}
+.rail .rail-edit-action { margin: -3px -4px -3px auto; opacity: 0; transition: opacity .12s, color .12s, background .12s; }
+.rail .proj:hover .rail-edit-action, .rail .proj:focus-within .rail-edit-action { opacity: 1; }
+.rail .rail-edit-action:hover, .rail .rail-edit-action:focus-visible,
+.rail .rail-edit-confirm:hover, .rail .rail-edit-confirm:focus-visible,
+.rail .rail-edit-cancel:hover, .rail .rail-edit-cancel:focus-visible { background: var(--surface-2); color: var(--ink); outline: none; }
+.rail .proj.editing { align-items: flex-start; padding-top: 5px; padding-bottom: 5px; cursor: default; }
+.rail .rail-inline-edit { flex: 1; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 3px; }
+.rail .rail-edit-input {
+  flex: 1; min-width: 0; height: 28px; padding: 4px 6px; border: 1px solid var(--accent); border-radius: 5px;
+  background: var(--paper); color: var(--ink); font: 12px/1.2 var(--font-ui); outline: 2px solid var(--accent-weak);
+}
+.rail .rail-edit-input[aria-invalid="true"] { border-color: var(--danger); outline-color: var(--danger-weak); }
+.rail .rail-edit-confirm { color: var(--accent); }
+.rail .rail-edit-error { flex-basis: 100%; padding: 2px 0 1px; color: var(--danger); font-size: 10px; line-height: 1.25; }
 .rail .proj .count { margin-left: auto; font-size: 11px; color: var(--ink-3); font-family: var(--font-mono); }
 /* Drag a project up or down to set the sidebar order. The row itself is the
    handle — the list is short and every row is a link, so an extra grip glyph
@@ -235,7 +264,7 @@ a { color: var(--accent); text-decoration: none; }
 .rail .nav-item .count { margin-left: auto; font: 11px var(--font-mono); color: var(--ink-3); }
 /* rail keyboard focus (g p → j/k/↵, Esc leaves). Plain :focus, not :focus-visible —
    moveRail() focuses programmatically and must stay visibly highlighted. */
-.rail .proj:focus, .rail .nav-item:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface-2); }
+.rail .proj:has(> .project-link:focus), .rail .proj:has(> .folder-toggle:focus), .rail .proj.add:focus, .rail .nav-item:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface-2); }
 
 /* ── main ───────────────────────────────────────────────────── */
 .main { overflow-y: auto; padding: 0; }
@@ -264,10 +293,6 @@ a { color: var(--accent); text-decoration: none; }
 .composer input.title-in {
   flex: 1; min-width: 0; padding: 11px 14px; border: 0;
   background: transparent; outline: none; box-shadow: none;
-}
-.composer select {
-  padding: 0 12px; border: 1px solid var(--line); border-radius: var(--r);
-  background: var(--surface); cursor: pointer;
 }
 .composer .btn.icon-only { width: 42px; padding-left: 0; padding-right: 0; justify-content: center; flex: none; }
 .composer .attach-composer { cursor: pointer; }
@@ -448,6 +473,16 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .new-repository-slash { padding-bottom:10px; color:var(--ink-3); font:600 14px var(--font-mono); }
 .new-repository-private { width:max-content; margin:2px 0 18px; font-size:13px; }
 .new-repository-actions { display:flex; justify-content:flex-end; gap:8px; padding-top:14px; border-top:1px solid var(--line); }
+.new-project-dialog { width:min(460px,calc(100vw - 28px)); }
+.new-project-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin:-4px 0 18px; }
+.new-project-head > div { display:grid; gap:4px; }
+.new-project-head b { font-size:16px; letter-spacing:-.01em; }
+.new-project-head span, .new-project-preview { color:var(--ink-3); font-size:12px; line-height:1.45; }
+.new-project-dialog .form-row > span { color:var(--ink-2); font-size:12px; font-weight:600; }
+.new-project-dialog .form-row input { width:100%; box-sizing:border-box; }
+.new-project-preview { margin:8px 0 2px; }
+.new-project-error { margin-top:10px; color:var(--danger); font-size:12px; }
+.new-project-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:18px; padding-top:14px; border-top:1px solid var(--line); }
 .btn.saved { color:var(--ok, #4ec9a3); border-color:currentColor; }
 .settings-divider { height:1px; background:var(--line); margin:22px 0 18px; }
 .proposal-card { margin:10px 0; padding:12px; display:flex; align-items:center; gap:12px; border:1px solid var(--accent); border-radius:10px; background:var(--accent-weak); }
@@ -1700,8 +1735,8 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tab { flex:none; white-space:nowrap; }
   .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(3, 42px); }
   .quick-task-field { grid-column:1 / -1; width:100%; }
+  .composer #draft-task { grid-column:2; }
   .composer input.title-in { min-width:0; width:100%; }
-  .composer select { min-width:0; width:100%; }
   .tp-head > * { padding: 0 16px; }
   .tp-tabs { padding: 0 2px; }
   .tp-content { padding: 16px 16px 40px; }
@@ -1793,8 +1828,19 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-panel { margin: 6px 0 0 22px; }
 .af-resume-panel[hidden] { display: none !important; }
 .af-resume-session { width: 100%; margin-top: 6px; padding: 7px 10px; }
-.af-resume-chosen { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
+.af-resume-chosen { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
 .af-resume-chosen:empty { display: none; }
+.af-resume-label { min-width: 0; }
+.af-resume-source { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
+.af-resume-source:hover { text-decoration-style: solid; }
+/* the fork's "Re-authorize previous grants?" — its own line under the chip */
+.af-resume-reauth {
+  flex-basis: 100%; display: flex; align-items: center; gap: 6px; width: max-content; max-width: 100%;
+  margin-top: 2px; color: var(--ink-3); font-size: 12px; cursor: pointer;
+}
+.af-resume-reauth[hidden] { display: none !important; }
+.af-resume-reauth input { width: auto; margin: 0; }
+.af-resume-reauth-summary { opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .af-resume-clear:hover { color: var(--danger); }
 .af-resume-import-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; min-height: 28px; }
@@ -1823,6 +1869,27 @@ html[data-theme="dark"] .github-signin-btn:active,
 .parameter-fields .agent-field .agent-controls select:focus,
 .parameter-fields .agent-field .af-resume-session:focus { border-color: var(--accent); }
 .parameter-fields .agent-field .af-resume { margin: 8px 2px 0 !important; }
+.pf-edit-row {
+  position: relative; margin-left: -12px; padding-left: 10px;
+  border-left: 2px solid transparent; border-radius: 2px;
+  transition: border-color .16s ease, background-color .16s ease;
+}
+.pf-edit-row.param-row-dirty {
+  border-left-color: var(--working);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--working) 8%, transparent), transparent 72%);
+}
+.params-save-bar {
+  position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center;
+  justify-content: space-between; gap: 16px; margin-top: 14px; padding: 12px 0 2px;
+  background: linear-gradient(180deg, transparent, var(--surface) 13px);
+}
+.params-save-status { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 12px; }
+.params-save-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--merged); }
+.params-save-bar[data-save-state="dirty"] .params-save-status { color: var(--working); font-weight: 650; }
+.params-save-bar[data-save-state="dirty"] .params-save-dot {
+  background: var(--working); box-shadow: 0 0 0 3px color-mix(in srgb, var(--working) 15%, transparent);
+}
+.params-save-bar[data-save-state="saving"] .params-save-dot { background: var(--accent); }
 .agent-profile-controls {
   display: grid; grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; gap: 8px;
 }

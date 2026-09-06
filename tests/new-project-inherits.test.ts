@@ -17,9 +17,11 @@ describe('new projects inherit branch defaults (no baked "main")', () => {
 
   it('the New Project UI creates a project with an empty config', () => {
     const app = read('../web/app.js');
-    const m = app.match(/async function newProject\(\)[\s\S]*?\n}/);
-    expect(m, 'newProject() should exist').toBeTruthy();
-    const fn = m![0];
+    const start = app.search(/(?:async\s+)?function newProject\(\)\s*\{/);
+    expect(start, 'newProject() should exist').toBeGreaterThanOrEqual(0);
+    const end = app.indexOf('// ── keyboard navigation', start);
+    expect(end, 'the projects section should end before keyboard navigation').toBeGreaterThan(start);
+    const fn = app.slice(start, end);
     // It must POST an empty config, never a hardcoded branch default assignment.
     expect(fn).toMatch(/config:\s*\{\s*\}/);
     expect(fn).not.toMatch(/defaultBase\s*:/);

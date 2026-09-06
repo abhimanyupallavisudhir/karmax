@@ -11,7 +11,7 @@ import { defaultModel } from '../src/agent/profiles.js';
 describe('reasoning-effort → provider parameter mapping (SPEC §10.5)', () => {
   describe('Claude Messages API (output_config.effort)', () => {
     it('sends effort on models that support the parameter', () => {
-      expect(claudeMessagesEffort('claude-fable-5', 'max')).toBe('max');
+      expect(claudeMessagesEffort('claude-fable-5-1', 'max')).toBe('max');
       expect(claudeMessagesEffort('claude-opus-4-8', 'high')).toBe('high');
       expect(claudeMessagesEffort('claude-sonnet-4-6', 'medium')).toBe('medium');
       expect(claudeMessagesEffort('claude-opus-4-8', 'xhigh')).toBe('xhigh');
