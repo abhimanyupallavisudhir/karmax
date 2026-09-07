@@ -245,6 +245,95 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');
   }, 120_000);
 
+  it.each([false, true])('manually opens preserved work after Do fails (committed: %s)', async (committed) => {
+    const repo = await h.makeRepo(`manual-error-pr-${committed}`);
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start(committed ? 'softwareDev@1.13.0' : 'softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, resolveAgentEnabled: false,
+        prompt: '@write preserved.txt :: completed before failure\n'
+          + (committed ? '@run git add -A && git commit -qm proposal\n' : '')
+          + '@fail provider crashed',
+      })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    const failed = await view(handle);
+    expect(failed.actions.map((a: any) => a.name)).toContain('openPr');
+    expect(failed.reviewInfo.changedFiles).toContain(committed ? 'preserved.txt' : 'preserved.txt (new)');
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    expect((await git(failed.worldPath, ['status', '--porcelain'])).stdout.trim()).toBe('');
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect((await git(repo, ['show', 'main:preserved.txt'])).stdout).toContain('completed before failure');
+  }, 120_000);
+
+  it('keeps conflicted work escalated when manual publication is refused', async () => {
+    const repo = await h.makeRepo('manual-error-conflict');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, resolveAgentEnabled: false,
+        prompt: '@write conflict.txt :: task version\n@fail provider crashed',
+      })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    const failed = await view(handle);
+    await git(failed.worldPath, ['add', '-A']);
+    await git(failed.worldPath, ['commit', '-qm', 'task version']);
+    fs.writeFileSync(path.join(repo, 'conflict.txt'), 'target version');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-qm', 'target version']);
+    expect((await git(failed.worldPath, ['merge', 'main'])).code).not.toBe(0);
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).error, { timeout: 30_000 })
+      .toContain('Manual recovery failed');
+    expect((await view(handle)).stage).toBe('escalated');
+    expect((await git(failed.worldPath, ['diff', '--name-only', '--diff-filter=U'])).stdout)
+      .toContain('conflict.txt');
+    await handle.signal('cancel');
+    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  it('does not offer manual publication when a failed Do turn left no changes', async () => {
+    const repo = await h.makeRepo('manual-error-empty');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, resolveAgentEnabled: false, prompt: '@fail no work' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    expect((await view(handle)).actions.map((a: any) => a.name)).not.toContain('openPr');
+    await handle.signal('openPr');
+    expect((await view(handle)).stage).toBe('escalated');
+    await handle.signal('cancel');
+    expect(await handle.result()).toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  it('manually confirms a failed reviewer while preserving subsequent review layers', async () => {
+    const repo = await h.makeRepo('manual-error-confirm');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [{ ...input({ taskId, repo, resolveAgentEnabled: false,
+        prompt: '@write reviewed.txt :: completed\n@run git add -A && git commit -qm proposal',
+      }), confirm: { layers: [
+        { kind: 'agent', provider: 'mock', prompt: '@fail reviewer crashed' },
+        { kind: 'human', audience: ['@creator'] },
+      ] } }],
+    });
+    await expect.poll(async () => (await view(handle)).status, { timeout: 30_000 }).toBe('waiting');
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    expect((await view(handle)).actions.map((a: any) => a.name)).toContain('confirm');
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
+      .toBe('confirm layer 2/2');
+    expect((await view(handle)).stage).toBe('review');
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+  }, 120_000);
+
   it('v1.13 returns a raced landing to Do and reviews the repaired proposal again', async () => {
     const repo = await h.makeRepo('explicit-pr-race');
     const taskId = newId('task');

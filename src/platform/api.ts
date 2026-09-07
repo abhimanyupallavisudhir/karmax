@@ -3925,18 +3925,23 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       // decisions — only `confirm`
       // passes the gate, so only `confirm` is journalled as the decision.
       if (signal === SIG.confirm) {
+        // A failed Confirm agent can expose the same human decision from its
+        // escalation frame. Preserve that person's GitHub authorization too.
+        const reviewConfirmation = scopedTask.lastView.stage === 'review'
+          || (scopedTask.lastView.stage === 'escalated'
+            && scopedTask.lastView.actions.some((action) => action.name === 'confirm' && action.enabled));
         this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
           payload: {
             userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
             githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && (scopedTask.lastView.stage === 'review' || scopedTask.lastView.stage === 'merge')),
+              && (reviewConfirmation || scopedTask.lastView.stage === 'merge')),
             // Current software-dev treats a Review confirmation as durable
             // authorization of the task intent, including bounded automated
             // integration repairs. An exceptional Landing confirmation still
             // records the exact current heads below for strict GitHub policy.
             githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
               && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
-              && scopedTask.lastView.stage === 'review'),
+              && reviewConfirmation),
             githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
               slug: ref.slug, number: ref.number, headSha: ref.headSha,
             })),

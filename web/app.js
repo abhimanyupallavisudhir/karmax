@@ -9442,6 +9442,7 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open PR';
   if (action.name === 'openPr')
     return hasOpenPullRequest(v) ? 'Return to Review' : 'Manually Open PR';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
@@ -9494,11 +9495,13 @@ function actionToast(signal, label) {
 }
 
 const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
+const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes and open the PR for review?';
 const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.';
 
 function confirmTaskAction(action, v = S.view) {
-  return action !== 'openPr' || confirm(hasOpenPullRequest(v)
-    ? RETURN_TO_REVIEW_CONFIRMATION
+  return action !== 'openPr' || confirm(v?.stage === 'escalated'
+    ? ERROR_OPEN_PR_CONFIRMATION
+    : hasOpenPullRequest(v) ? RETURN_TO_REVIEW_CONFIRMATION
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
