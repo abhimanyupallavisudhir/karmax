@@ -51,7 +51,12 @@ describe('toasts are reachable', () => {
 
 describe('websocket reconnect', () => {
   it('backfills the open task through the real state key', () => {
-    expect(app).toContain('if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }');
+    const reconnect = handlerAfter('ws.onopen = () => {');
+    expect(reconnect).toContain('if (wsHadDropped)');
+    expect(reconnect).toContain('refreshTasks().catch(() => {})');
+    expect(reconnect).toContain('if (S.selected)');
+    expect(reconnect).toContain('refreshTask().catch(() => {})');
+    expect(reconnect).toContain('refreshTaskHistory(S.selected)');
     // S.taskId never existed — the old guard was permanently false.
     expect(app).not.toMatch(/\bS\.taskId\b/);
   });
@@ -299,7 +304,10 @@ describe('copy', () => {
 
   it('does not leak internal codenames or internal concept names', () => {
     expect(app).not.toContain('jayadratha');
-    expect(app).toContain('title="Selected to merge — the other attempts are stopped.">committed<');
+    // Attempt navigation names the outcome directly instead of exposing the
+    // internal "committed" state as a badge with an explanatory tooltip.
+    expect(app).toContain('<span class="attempt-note">Selected to merge</span>');
+    expect(app).not.toContain('>committed<');
     // "layer" is the internal name for the confirmer stack.
     expect(app).not.toContain('Add layer');
     expect(app).not.toContain('No layers');

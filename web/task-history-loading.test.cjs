@@ -61,6 +61,33 @@ async function main() {
   await first;
   assert.equal(c.S.taskEvents.some(e => e.seq === 9), false, 'late superseded history does not overwrite a newer load');
 
+  // The new attempt links open execution IDs. A → B → A must retain the
+  // latest A transcript even when the first A history arrives last.
+  const staleAttemptHistory = deferred();
+  let attemptReads = 0;
+  c.api = async url => {
+    if (url.endsWith('/events?since=0&limit=300')) {
+      if (url.includes('/attempt-a/') && ++attemptReads === 1) return staleAttemptHistory.promise;
+      return [{ ...event, taskId: url.includes('/attempt-a/') ? 'attempt-a' : 'attempt-b', seq: 30 }];
+    }
+    if (url === '/api/tasks/attempt-a' || url === '/api/tasks/attempt-b')
+      return { ...view, taskId: url.split('/').pop() };
+    if (url.endsWith('/explanation-settings')) return { effective: {} };
+    return [];
+  };
+  const staleAttempt = c.openTask('attempt-a', 'checkin', true);
+  await tick();
+  await c.openTask('attempt-b', 'checkin', true);
+  await c.openTask('attempt-a', 'checkin', true);
+  staleAttemptHistory.resolve([{ ...event, taskId: 'attempt-a', seq: 9 }]);
+  await staleAttempt;
+  assert.equal(c.S.view.taskId, 'attempt-a');
+  assert.equal(c.S.viewingAttempt, 'attempt-a', 'the selected execution remains pinned');
+  assert.equal(c.S.taskEvents.length, 1);
+  assert.equal(c.S.taskEvents[0].seq, 30, 'the reopened attempt keeps its new history');
+  assert.equal(c.S.taskEvents[0].taskId, 'attempt-a', 'another attempt’s conversation does not bleed through');
+  c.S.selected = 'task';
+
   c.api = async () => { throw new Error('offline'); };
   await c.refreshTaskHistory('task');
   assert.equal(c.S.taskHistoryError, 'offline');

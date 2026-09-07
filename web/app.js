@@ -662,7 +662,8 @@ async function applyRoute() {
     const nextTaskFile = r.taskFile || null;
     if (JSON.stringify(S.taskFile) !== JSON.stringify(nextTaskFile)) S.taskFileLoad = null;
     S.taskFile = nextTaskFile;
-    if (S.selected !== taskId) return openTask(taskId, r.taskTab);
+    if (S.selected !== taskId) return openTask(taskId, r.taskTab, r.taskKey === taskId);
+    S.viewingAttempt = r.taskKey === taskId ? taskId : null;
     if (r.taskTab) S.taskTab = r.taskTab;
     return renderTaskPage();
   }
@@ -680,7 +681,7 @@ async function applyRoute() {
 function taskUrl(id, record) {
   const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
-  const keyPart = rec && rec.num != null ? String(rec.num) : id;
+  const keyPart = S.viewingAttempt !== id && rec && rec.num != null ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
@@ -3262,6 +3263,9 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else renderTaskEvents();
     }
+    if (S.selected && ev.taskId !== S.selected
+      && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask();
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
@@ -6264,48 +6268,56 @@ function runPageRow(r) {
   return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
-// One compact selectable row per execution. The list remains one row per intent;
-// switching here replaces the entire task-page projection with that attempt.
+// Attempt links pin the execution id; the numbered task permalink follows the
+// principal. Keep navigation separate from the selected attempt's stage control.
 function taskAttempts(v) {
   const g = S.attemptGroup;
   if (!g?.attempts?.length) return '';
-  const rows = g.attempts.map((a) => {
-    const av = a.lastView || {};
-    const principal = a.id === g.principalAttemptId;
+  const rows = g.attempts.length > 1 ? g.attempts.map((a) => {
+    const av = a.id === v.taskId ? v : a.lastView || {};
     const committed = a.id === g.committedAttemptId;
     const selected = a.id === v.taskId;
-    const status = av.status || (a.params?.draft ? 'waiting' : 'active');
-    return `<div role="button" tabindex="0" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
-      <span class="attempt-check">${selected ? '✓' : ''}</span>
-      <span class="status-dot ${esc(status)}"></span>
-      <b>Attempt ${a.attemptNumber || 1}</b>
-      ${principal ? '<span class="chip">principal</span>' : ''}
-      ${committed ? '<span class="chip done" title="Selected to merge — the other attempts are stopped.">committed</span>' : ''}
-      <span class="attempt-stage">${stageIndicator(a.params?.draft ? { ...av, state: { ...(av.state || {}), draft: true } } : av, a.id, true)}</span>
-    </div>`;
-  }).join('');
-  return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
+    const draft = !!a.params?.draft;
+    const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
+    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
+    return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+      <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
+      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
+      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+    </a>`;
+  }).join('') : '';
+  return `<section class="attempts" aria-label="Task attempts">
+    <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
+      <button type="button" class="btn sm" id="add-attempt" ${g.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>
+    </div>${rows ? `<nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>` : ''}
+  </section>`;
 }
 
 function wireAttempts(v) {
-  document.getElementById('add-attempt')?.addEventListener('click', async () => {
+  document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
+    if (S.addingAttempt) return;
+    S.addingAttempt = true;
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Creating…';
     try {
       const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
       await refreshTasks();
-      await openTask(draft.id, 'parameters', true);
-      openTaskForm(draft.workflow, draft);
+      if (S.selected !== v.taskId) return;
+      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}/parameters`);
+      if (S.selected === draft.id) await openTaskForm(draft.workflow, draft);
     } catch (e) { toast(e.message, true); }
-  });
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', (event) => {
-    if (event?.target?.closest?.('[data-stage-move]')) return;
-    if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
-  }));
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('keydown', (event) => {
-    if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('[data-stage-move]')) {
-      event.preventDefault();
-      if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+    finally {
+      S.addingAttempt = false;
+      button.disabled = false;
+      button.textContent = '＋ New attempt';
+      const current = document.getElementById('add-attempt');
+      if (current) {
+        current.disabled = !!S.attemptGroup?.committedAttemptId;
+        current.textContent = '＋ New attempt';
+      }
     }
-  }));
+  });
 }
 
 function wireStageTransitions(v) {
@@ -6327,6 +6339,7 @@ function wireStageTransitions(v) {
       await api(`/api/tasks/${taskId}/stage`, { method: 'POST', body: JSON.stringify({ target }) });
       toast(`Moved to ${move?.label || target}`);
       await refreshTasks();
+      if (S.selected !== v.taskId) return;
       if (taskId === v.taskId) await refreshTask();
       else {
         S.attemptGroup = await api(`/api/tasks/${v.taskId}/attempts`);
@@ -6384,6 +6397,9 @@ async function refreshTaskHistory(taskId) {
 }
 
 async function openTask(taskId, wantTab, explicitAttempt = false) {
+  const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
+  S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
+  S.taskHistoryEpoch = (S.taskHistoryEpoch || 0) + 1;
   // Leaving another task's page kills its check-in shell (same as closing does).
   if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; }
   // Per-task page state starts fresh: the tab comes from the URL when pinned
@@ -6454,7 +6470,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
-    if (S.selected !== taskId) return;
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     S.view = pendingCancellationView(view, taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
@@ -6463,7 +6479,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     renderTaskPage();
 
     const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
-    if (S.selected !== taskId) return;
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
@@ -6475,7 +6491,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
     toast(e.message, true);
-    if (S.selected === taskId) renderTaskLoadingPage(rec, e.message);
+    if (S.selected === taskId && S.taskOpenEpoch === openEpoch) renderTaskLoadingPage(rec, e.message);
     return;
   }
   renderTaskPage();
@@ -6486,7 +6502,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // once, after the first paint, and repaint only if the user is still here and
   // actually looking at the Parameters tab.
   loadParamDefaults(taskId).then((d) => {
-    if (S.selected !== taskId) return; // navigated away before it landed
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return; // navigated away before it landed
     S.paramDefaults = d;
     if (S.taskTab === 'parameters') renderTaskPage();
   });
@@ -6820,6 +6836,9 @@ function renderTaskPage() {
   const fuState = captureFollowupFocus(main);
   const rec = taskRecord(v.taskId);
   const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
+  const previousAttempts = main.querySelector('.attempts-list');
+  const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
+    ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
   main.innerHTML = `
     <div class="task-page">
@@ -6829,7 +6848,7 @@ function renderTaskPage() {
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
+          ${currentAttempt && S.attemptGroup.attempts.length > 1 ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
           ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
@@ -6858,6 +6877,14 @@ function renderTaskPage() {
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">${taskActions(v)}</div></div>
     </div>`;
+  const attemptList = main.querySelector('.attempts-list');
+  if (attemptList) {
+    if (attemptScroll !== null) attemptList.scrollLeft = attemptScroll;
+    else {
+      const selected = attemptList.querySelector('[aria-current="true"]');
+      if (selected) attemptList.scrollLeft = selected.getBoundingClientRect().left - attemptList.getBoundingClientRect().left;
+    }
+  }
   $('#tp-back').addEventListener('click', closeTask);
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
