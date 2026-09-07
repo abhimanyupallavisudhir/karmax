@@ -7391,6 +7391,11 @@ export class Gateway {
       this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value);
       return value;
     }
+    // A deployment-domain migration is authoritative. The persisted browser
+    // origin belongs to the original manifest setup and otherwise keeps OAuth
+    // callbacks pinned to the retired host forever after a move.
+    const configured = process.env.KARMAX_PUBLIC_URL?.trim();
+    if (configured) return new URL(configured).origin;
     return this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY) ?? this.publicUrl(req);
   }
 
