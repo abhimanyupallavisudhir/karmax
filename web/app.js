@@ -1614,7 +1614,10 @@ function wireCombo(combo, getOptions, onChange) {
   };
   const show = () => { draw(); menu.hidden = false; open = true; };
   const hide = () => { menu.hidden = true; open = false; active = -1; };
-  const choose = (opt) => { input.value = opt.dataset.v; hide(); onChange && onChange(); };
+  const choose = (opt) => {
+    input.value = opt.dataset.v; hide(); onChange && onChange();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
   input.addEventListener('focus', show);
   input.addEventListener('input', () => { show(); onChange && onChange(); });
   input.addEventListener('keydown', (e) => {
@@ -8613,7 +8616,8 @@ function authorizationSection(v) {
   const organizationId = S.projects.find((project) => project.id === rec?.projectId)?.organizationId;
   const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const stored = rec?.params?._authorization || {};
-  const selected = { level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
+  const selected = S.authorizationEdits?.[v.taskId]?.values.authorization || {
+    level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
     projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) };
   return `<div class="section-h">Authorization</div>
     <div id="tp-auth" class="parameter-fields">
@@ -8628,7 +8632,10 @@ function authorizationSection(v) {
           <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
         </button>
       </div>
-      <button class="btn sm primary" id="tp-auth-save">Save authorization</button>
+      <div class="params-save-bar" data-save-state="saved">
+        <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
+        <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
+      </div>
     </div>`;
 }
 
@@ -8643,11 +8650,52 @@ async function wireTaskAuthorization(v) {
   const organizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const auth0 = rec?.params?._authorization || {};
-  wireAuthorizationEditor(select, projects);
+  const edits = S.authorizationEdits ||= {};
+  const previous = edits[v.taskId];
+  let syncAuthorization = () => {};
+  wireAuthorizationEditor(select, projects, () => syncAuthorization());
   // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
   const vaultGrantIds = new Set((auth0.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
+  if (previous) {
+    vaultGrantIds.clear();
+    previous.values.credentialGrants.forEach((grant) => vaultGrantIds.add(grant.slice('use-credential:item:'.length)));
+    vaultCredentialPolicies = structuredClone(previous.values.credentialPolicies);
+  }
+  const read = () => ({
+    authorization: readAuthorizationEditor(select),
+    credentialGrants: [...vaultGrantIds].sort().map((id) => `use-credential:item:${id}`),
+    credentialPolicies: structuredClone(vaultCredentialPolicies),
+  });
+  const draft = previous || { saved: read(), values: read(), saving: false };
+  const status = document.getElementById('tp-auth-status');
+  syncAuthorization = () => {
+    draft.values = read();
+    const dirty = !sameJson(draft.saved, draft.values);
+    if (dirty || draft.saving) edits[v.taskId] = draft;
+    else delete edits[v.taskId];
+    saveBtn.disabled = draft.saving || !dirty;
+    saveBtn.textContent = draft.saving ? 'Saving authorization…' : 'Save authorization';
+    status.textContent = draft.saving ? 'Saving authorization…' : dirty ? 'Unsaved authorization changes' : 'All authorization changes saved';
+    saveBtn.closest('.params-save-bar').dataset.saveState = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+  };
+  draft.sync = syncAuthorization;
+  syncAuthorization();
+  saveBtn.addEventListener('click', async () => {
+    if (draft.saving || sameJson(draft.saved, draft.values)) return;
+    const submitted = structuredClone(draft.values);
+    draft.saving = true; draft.sync();
+    try {
+      const updated = await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(submitted) });
+      const currentRecord = taskRecord(v.taskId);
+      if (currentRecord && updated?.params) currentRecord.params = updated.params;
+      draft.saved = submitted;
+      toast('Authorization saved — applies at the next agent turn');
+      setTimeout(refreshTasks, 400);
+    } catch (e) { toast(e.message, true); }
+    finally { draft.saving = false; draft.sync(); }
+  });
   const button = document.getElementById('tp-vault-open');
   const count = document.getElementById('tp-vault-count');
   let refreshVaultCount = () => {};
@@ -8661,12 +8709,14 @@ async function wireTaskAuthorization(v) {
       ids.forEach((id) => vaultGrantIds.add(id));
       vaultCredentialPolicies = policies;
       refreshVaultCount();
+      syncAuthorization();
     },
   });
   const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
   let items = [];
   try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
   catch { button?.closest('[data-row="__vault"]')?.remove(); }
+  if (!select.isConnected) return;
   if (button && count) {
     const refreshCount = () => { count.textContent = `${items.filter((i) => vaultGrantIds.has(i.id)).length} selected`; };
     refreshVaultCount = refreshCount;
@@ -8677,22 +8727,9 @@ async function wireTaskAuthorization(v) {
       picked.forEach((id) => vaultGrantIds.add(id));
       vaultCredentialPolicies = policies;
       refreshCount();
+      syncAuthorization();
     }));
   }
-  saveBtn.addEventListener('click', async () => {
-    try {
-      await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({
-        authorization: readAuthorizationEditor(select),
-        credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
-        credentialPolicies: vaultCredentialPolicies,
-      }) });
-      toast('Authorization updated — applies at the next agent turn');
-      setTimeout(refreshTask, 250);
-      setTimeout(refreshTasks, 400);
-    } catch (e) {
-      toast(e.message, true);
-    }
-  });
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
@@ -9185,10 +9222,10 @@ function paramsSection(v) {
       // an unsaved value, render that value back into its control instead of
       // replacing it with the last server snapshot during the repaint.
       const isEditable = editable.has(f.name);
-      const own = isParamDraftField(editDraft, f.name)
-        ? editDraft.values[f.name]
+      const own = isEditable && isParamDraftField(editDraft, f.name)
+        ? editDraft.values[f.name] ?? ''
         : paramCurrentValue(f, v, rec);
-      const inherited = inheritedAll[f.name];
+      const inherited = isEditable && isParamDraftField(editDraft, f.name) ? undefined : inheritedAll[f.name];
       // Agent fields show the full control (provider · model · effort · resume),
       // exactly like the task form — interactive when editable, disabled when frozen.
       if (f.type === 'agent') {
@@ -9277,14 +9314,7 @@ function collectParamEdits(root, fields) {
       // form's collectForm produces). Editable agent fields always send a spec.
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
-      const spec = { provider: box.querySelector('.af-provider').value };
-      const model = box.querySelector('.af-model').value.trim();
-      const effort = box.querySelector('.af-effort')?.value;
-      if (model) spec.model = model;
-      if (effort) spec.effort = effort;
-      const resumeFrom = readResume(box);
-      if (resumeFrom) spec.resumeFrom = resumeFrom;
-      out[f.name] = spec;
+      out[f.name] = readAgentSpec(box);
       continue;
     }
     if (f.type === 'confirmer') {
@@ -9346,47 +9376,61 @@ function wireParams(v) {
   // Rebase untouched controls onto the newest server render, while preserving
   // the saved comparison value for fields the operator is actively editing.
   let saved = { ...currentAtRender };
-  let saving = false;
+  const draft = existing || { saved, values: currentAtRender, dirtyNames: [], saving: false };
   if (existing) {
     for (const name of existing.dirtyNames) {
       if (Object.prototype.hasOwnProperty.call(existing.saved, name)) saved[name] = existing.saved[name];
       else delete saved[name];
     }
   }
+  draft.saved = saved;
   const sync = () => {
     const current = collectParamEdits(root, fields);
-    const dirtyNames = paramDirtyNames(saved, current, fields);
+    const dirtyNames = paramDirtyNames(draft.saved, current, fields);
     const dirty = dirtyNames.length > 0;
     for (const field of fields) {
       const row = root.querySelector(`.pf-edit-row[data-row="${CSS.escape(field.name)}"]`);
       row?.classList.toggle('param-row-dirty', dirtyNames.includes(field.name));
     }
-    if (dirty) S.paramEditDrafts[v.taskId] = { saved, values: current, dirtyNames };
+    draft.values = current;
+    draft.dirtyNames = dirtyNames;
+    if (dirty || draft.saving) S.paramEditDrafts[v.taskId] = draft;
     else delete S.paramEditDrafts[v.taskId];
-    setParamSaveState(root, saveBtn, status, saving ? 'saving' : dirty ? 'dirty' : 'saved');
+    setParamSaveState(root, saveBtn, status, draft.saving ? 'saving' : dirty ? 'dirty' : 'saved');
     return current;
   };
+  draft.sync = sync;
   root.addEventListener('input', sync);
   root.addEventListener('change', sync);
   sync();
   saveBtn.addEventListener('click', async () => {
-    if (saving) return;
-    const patch = collectParamEdits(root, fields);
-    if (!paramDirtyNames(saved, patch, fields).length) return sync();
-    saving = true;
+    if (draft.saving) return;
+    const submitted = collectParamEdits(root, fields);
+    const names = paramDirtyNames(draft.saved, submitted, fields);
+    if (!names.length) return sync();
+    // Empty scalar values are omitted by the live patch contract. Do not claim
+    // they were saved when the server would receive no change for that field.
+    const empty = fields.find((field) => names.includes(field.name) && submitted[field.name] === undefined);
+    if (empty) return toast(`${empty.label} cannot be saved empty. Enter a value or restore the saved value.`, true);
+    const patch = Object.fromEntries(names.map((name) => [name, submitted[name]]));
+    draft.saving = true;
     setParamSaveState(root, saveBtn, status, 'saving');
     try {
       const updated = await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
-      saved = patch;
+      Object.assign(draft.saved, patch);
+      const currentRecord = taskRecord(v.taskId);
+      if (currentRecord) currentRecord.params = { ...currentRecord.params, ...patch };
+      const confirmer = fields.find((field) => field.type === 'confirmer' && names.includes(field.name));
+      if (confirmer && S.selected === v.taskId && S.attemptGroup) S.attemptGroup.confirmer = patch[confirmer.name];
       if (updated?.view && S.selected === v.taskId) S.view = updated.view;
       toast('Parameter changes saved');
-      saving = false;
-      sync(); // a value changed while the request was running remains visibly unsaved
+      draft.saving = false;
+      draft.sync(); // use the current form, even when a refresh replaced the submitting DOM
       setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) {
-      saving = false;
-      sync();
+      draft.saving = false;
+      draft.sync();
       toast(e.message, true);
     }
   });
