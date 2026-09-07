@@ -3287,7 +3287,10 @@ function connectWs() {
   ws.onopen = () => {
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
-    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
+    if (wsHadDropped) {
+      refreshTasks().catch(() => {});
+      if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
+    }
     wsHadDropped = false;
   };
   ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
@@ -6337,6 +6340,49 @@ function wireStageTransitions(v) {
   }));
 }
 
+// History is needed to read Check-in, independently of sessions, credentials,
+// widgets, and other secondary panels. Merge a fetched window with events that
+// arrived while it was loading, preserving explanations and durable ordering.
+function mergeTaskHistory(events) {
+  const currentEvents = S.taskEvents || [];
+  const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
+  const ordinary = [
+    ...events.filter((event) => event.type !== 'conversation.explanation'),
+    ...currentEvents.filter((event) => event.type !== 'conversation.explanation'
+      && (event.seq == null || !durableSeqs.has(event.seq))),
+  ].sort((a, b) => (a.seq ?? a.ts) - (b.seq ?? b.ts)).slice(-400);
+  const explanations = new Map();
+  for (const event of [...events, ...currentEvents]) {
+    if (event.type === 'conversation.explanation')
+      explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
+  }
+  S.taskEvents = [...ordinary, ...explanations.values()];
+}
+
+async function refreshTaskHistory(taskId) {
+  const rec = taskRecord(taskId);
+  if (rec?.params?.draft || rec?.params?.repeatable) return [];
+  const epoch = S.taskHistoryEpoch = (S.taskHistoryEpoch || 0) + 1;
+  S.taskHistoryLoading = true;
+  S.taskHistoryError = null;
+  if (S.taskTab === 'checkin') scheduleTaskPageRender();
+  try {
+    const events = await api(`/api/tasks/${taskId}/events?since=0&limit=300`);
+    if (S.selected !== taskId || S.taskHistoryEpoch !== epoch) return [];
+    mergeTaskHistory(events);
+    return events;
+  } catch (error) {
+    if (S.selected === taskId && S.taskHistoryEpoch === epoch)
+      S.taskHistoryError = error.message || 'Unable to load conversation history';
+    return [];
+  } finally {
+    if (S.selected === taskId && S.taskHistoryEpoch === epoch) {
+      S.taskHistoryLoading = false;
+      if (S.taskTab === 'checkin') scheduleTaskPageRender();
+    }
+  }
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
   // Leaving another task's page kills its check-in shell (same as closing does).
   if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; }
@@ -6357,6 +6403,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     return;
   }
   S.taskEvents = [];
+  S.taskHistoryLoading = false;
+  S.taskHistoryError = null;
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
@@ -6393,7 +6441,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     const details = Promise.all([
       // The websocket keeps this window current. Older history remains durable,
       // but opening a task should have a fixed memory and response-size budget.
-      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0&limit=300`).catch(() => []),
+      draft ? Promise.resolve([]) : refreshTaskHistory(taskId),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
@@ -6416,21 +6464,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
 
     const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
     if (S.selected !== taskId) return;
-    // Events may have arrived over the websocket while the bounded durable window
-    // was loading. Preserve those instead of replacing them with the older response.
-    const currentEvents = S.taskEvents;
-    const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
-    const ordinary = [
-      ...events.filter((event) => event.type !== 'conversation.explanation'),
-      ...currentEvents.filter((event) => event.type !== 'conversation.explanation'
-        && (event.seq == null || !durableSeqs.has(event.seq))),
-    ].slice(-400);
-    const explanations = new Map();
-    for (const event of [...explanationEvents, ...events, ...currentEvents]) {
-      if (event.type !== 'conversation.explanation') continue;
-      explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
-    }
-    S.taskEvents = [...ordinary, ...explanations.values()];
+    mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
@@ -7863,7 +7897,13 @@ function checkinTab(v) {
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
-  const msgs = entries.map((entry) => renderConversationEntry(entry, v)).join('') || '<div class="msg system">No messages yet</div>';
+  const historyStatus = S.taskHistoryLoading
+    ? '<div class="msg system" role="status">Loading conversation history…</div>'
+    : S.taskHistoryError
+      ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
+      : '';
+  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
+    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -8371,6 +8411,7 @@ function terminalPane(v) {
 }
 
 function wireCheckinSidebar(v) {
+  $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
     el.addEventListener('click', () => {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
