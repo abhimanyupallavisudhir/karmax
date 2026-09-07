@@ -299,7 +299,10 @@ describe('copy', () => {
 
   it('does not leak internal codenames or internal concept names', () => {
     expect(app).not.toContain('jayadratha');
-    expect(app).toContain('title="Selected to merge — the other attempts are stopped.">committed<');
+    // Attempt navigation names the outcome directly instead of exposing the
+    // internal "committed" state as a badge with an explanatory tooltip.
+    expect(app).toContain('<span class="attempt-note">Selected to merge</span>');
+    expect(app).not.toContain('>committed<');
     // "layer" is the internal name for the confirmer stack.
     expect(app).not.toContain('Add layer');
     expect(app).not.toContain('No layers');
