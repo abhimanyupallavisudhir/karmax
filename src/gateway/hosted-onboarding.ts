@@ -14,8 +14,10 @@ export interface HostedOnboardingRecord {
   completedAt?: number;
 }
 
+export const HOSTED_ONBOARDING_KEY_PREFIX = 'hosted:onboarding:';
+
 export const hostedOnboardingKey = (userId: string, organizationId: string) =>
-  `hosted:onboarding:${userId}:${organizationId}`;
+  `${HOSTED_ONBOARDING_KEY_PREFIX}${userId}:${organizationId}`;
 
 export function parseHostedOnboardingRecord(raw: string | undefined): HostedOnboardingRecord | undefined {
   if (!raw) return undefined;
@@ -28,6 +30,26 @@ export function parseHostedOnboardingRecord(raw: string | undefined): HostedOnbo
   } catch {
     return { display: 'expanded' };
   }
+}
+
+/** Operator reset: forget every enrolled account's sticky completion and
+ * re-open a minimized guide, so the walkthrough shows again on each person's
+ * next visit wherever a required step is genuinely missing. Only the enrollment
+ * records change — an account that was never enrolled stays unburdened, and
+ * nothing anyone built (projects, tasks, connections, settings) is touched.
+ * Returns how many enrollments actually changed. */
+export function resetHostedOnboarding(store: {
+  kvEntries(prefix: string): Array<{ key: string; value: string }>;
+  kvSet(key: string, value: string): void;
+}): number {
+  let changed = 0;
+  for (const { key, value } of store.kvEntries(HOSTED_ONBOARDING_KEY_PREFIX)) {
+    const record = parseHostedOnboardingRecord(value);
+    if (!record || (!record.completedAt && record.display === 'expanded')) continue;
+    store.kvSet(key, JSON.stringify({ display: 'expanded' } satisfies HostedOnboardingRecord));
+    changed++;
+  }
+  return changed;
 }
 
 export function hostedOnboardingStatus(input: {

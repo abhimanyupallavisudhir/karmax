@@ -61,6 +61,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display preference)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
     'GET /api/settings/installation (global operator-only Installation page probe)',
+    'POST /api/settings/installation/onboarding/reset (installation operator, hosted-only: forget every account\'s sticky setup-guide completion so the walkthrough shows again wherever a required step is missing; touches nothing else)',
     'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
     'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
     'GET /api/organizations/:organizationId/entitlements (current hosted plan, limits, and live usage; private installs are unlimited)',

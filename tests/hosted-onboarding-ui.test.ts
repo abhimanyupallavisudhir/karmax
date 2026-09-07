@@ -30,6 +30,18 @@ describe('hosted onboarding UI', () => {
     expect(view).toContain("addEventListener('click', newProject)");
   });
 
+  it('gives the operator a hosted-only Installation card that shows the guide again', () => {
+    const installation = source.slice(source.indexOf('function installationView()'), source.indexOf('function organizationView()'));
+    // Hosted-only: a private installation has no guide and gets neither the nav link nor the card.
+    expect(installation).toContain(`S.meta?.hosted ? '<a href="#installation-onboarding">Setup guide</a>'`);
+    expect(installation).toContain('S.meta?.hosted ? `<div class="settings-section-title" id="installation-onboarding">');
+    expect(installation).toContain('wireOnboardingResetCard()');
+    expect(installation).toContain("api('/api/settings/installation/onboarding/reset', { method: 'POST' })");
+    // It is a whole-installation action behind a confirmation, and it says what it does not touch.
+    expect(installation).toContain('if (!confirm(');
+    expect(installation).toContain('no projects, tasks, connections, or settings');
+  });
+
   it('loads the newly created organization’s onboarding state before repainting the shell', () => {
     const createOrganization = source.slice(source.indexOf('async function createOrganization()'), source.indexOf('// ── theme'));
     expect(createOrganization).toContain('await refreshOnboarding()');

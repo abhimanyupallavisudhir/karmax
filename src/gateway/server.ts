@@ -71,7 +71,7 @@ import { actorPrincipal, identityAuditDetail, requireHumanSubject, requireIntera
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
 import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
-import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
+import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord, resetHostedOnboarding,
   type HostedOnboardingDisplay } from './hosted-onboarding.js';
 import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
   policyDocument, publicLaunchInfo } from '../launch/legal.js';
@@ -1817,6 +1817,13 @@ export class Gateway {
       if (p === '/api/settings/installation' && method === 'GET') {
         return this.json(res, 200, { canManage: this.deps.tokens.check(token, 'settings:write').ok,
           hostLocal: this.hostLocal });
+      }
+      if (p === '/api/settings/installation/onboarding/reset' && method === 'POST') {
+        // Operator lever (settings:write, like every /api/settings write): show
+        // the new-account setup guide again by forgetting its sticky completion
+        // for every account. The guide only exists on the hosted service.
+        if (!this.deps.hosted) return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
+        return this.json(res, 200, { ok: true, reset: resetHostedOnboarding(store) });
       }
       if (p === '/api/settings/paid-launch') {
         if (!this.deps.paidLaunchSettings)

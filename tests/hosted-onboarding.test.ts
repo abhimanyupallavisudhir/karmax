@@ -33,11 +33,12 @@ async function boot(hosted: boolean) {
   tempDirs.push(dir);
   const broker = new CredentialBroker(new Vault(dir));
   const providers = new WorldProviderConnectionService(store, broker);
+  const tokens = new TokenAuthority();
   const gateway = new Gateway({
     api: {} as any,
     store,
     bus: new KarmaxBus(),
-    tokens: new TokenAuthority(),
+    tokens,
     contributions: new ContributionRegistry(),
     overlays: new Overlays(),
     client: {} as any,
@@ -66,7 +67,9 @@ async function boot(hosted: boolean) {
     },
   );
   const request = (method = 'GET', body?: object) => onboarding('org_personal', method, body);
-  return { store, broker, providers, request, onboarding, base: running.url, cookie };
+  const reset = (headers: Record<string, string> = { cookie }) => fetch(
+    `${running.url}/api/settings/installation/onboarding/reset`, { method: 'POST', headers });
+  return { store, broker, providers, tokens, request, onboarding, reset, base: running.url, cookie };
 }
 
 describe('hosted onboarding status API', () => {
@@ -105,6 +108,52 @@ describe('hosted onboarding status API', () => {
       label: 'Workspace card', cap: 10_000, available: 10_000, createdAt: Date.now() });
     const withOptional = await (await request()).json() as any;
     expect(withOptional.steps.optional).toMatchObject({ complete: true, blocking: false, vault: true, card: true });
+  });
+
+  it('lets the operator show the guide again by forgetting sticky completion, and nothing else', async () => {
+    const { store, broker, providers, tokens, request, reset } = await boot(true);
+    store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
+      installationId: 'installation-1', accountLogin: 'alice', accountType: 'User' });
+    broker.registerHandle('openai:first', 'sk-test');
+    providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b-test' });
+    store.createProject('First project', {}, 'org_personal');
+    expect(await (await request()).json() as any).toMatchObject({ visible: false, complete: true });
+
+    // Sticky: undoing a step later does not bring the guide back on its own.
+    providers.delete('org_personal', 'e2b');
+    expect(await (await request()).json() as any).toMatchObject({ visible: false, complete: true });
+
+    // The reset is an installation write: an organization member without
+    // settings:write is refused, and the records are untouched.
+    const tenant = tokens.mintPrincipal('user:tenant', ['project:read', 'project:settings:write', 'task:*']).token;
+    expect((await reset({ authorization: `Bearer ${tenant}` })).status).toBe(403);
+    expect(await (await request()).json() as any).toMatchObject({ visible: false, complete: true });
+
+    const projectsBefore = store.listProjects().map((project) => project.id);
+    const outcome = await reset();
+    expect(outcome.status).toBe(200);
+    expect(await outcome.json()).toEqual({ ok: true, reset: 1 });
+
+    // Completion is now derived from live state again: the missing E2B key
+    // brings the guide back, with the other three steps still ticked.
+    const shown = await (await request()).json() as any;
+    expect(shown).toMatchObject({ visible: true, complete: false, display: 'expanded', completedRequired: 3 });
+    expect(shown.steps.e2b.complete).toBe(false);
+    expect(store.listProjects().map((project) => project.id)).toEqual(projectsBefore);
+    expect(store.listGitConnections('org_personal')).toHaveLength(1);
+
+    // Nothing left to change: the reset reports zero rather than rewriting records.
+    expect(await (await reset()).json()).toEqual({ ok: true, reset: 0 });
+
+    // A minimized guide is opened again by a reset, even before completion.
+    await request('PUT', { display: 'minimized' });
+    expect(await (await reset()).json()).toEqual({ ok: true, reset: 1 });
+    expect((await (await request()).json() as any).display).toBe('expanded');
+  });
+
+  it('has no guide to reset on a private installation', async () => {
+    const { reset } = await boot(false);
+    expect((await reset()).status).toBe(404);
   });
 
   it('never enrolls a self-hosted account into the hosted walkthrough', async () => {

@@ -14989,7 +14989,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      <a href="#installation-access">Phone Access</a>${S.meta?.hosted ? '<a href="#installation-onboarding">Setup guide</a>' : ''}<a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
@@ -14998,6 +14998,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
+      ${S.meta?.hosted ? `<div class="settings-section-title" id="installation-onboarding"><div>Setup guide<small>The walkthrough every new account sees</small></div></div>${onboardingResetCard()}` : ''}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
@@ -15121,6 +15122,37 @@ function wireInstallationSettings() {
   wireOutboundEmailCard();
   hydrateResilienceCard();
   if (hostLocal()) hydratePhoneAccess();
+  wireOnboardingResetCard();
+}
+
+// The new-account setup guide (renderOnboarding) remembers completion for good:
+// once every required step has been seen in place it stays hidden, even if a
+// step is undone later. This is the operator's way to show it again — to
+// everyone, on their next visit — without touching anything anyone has built.
+function onboardingResetCard() {
+  return `<div class="card" id="onboarding-reset-card">
+    <div class="section-h">Show the setup guide again</div>
+    <p class="task-sub">Every new account is walked through connecting GitHub, adding an agent login, adding an E2B key, and creating a first project. Once all four are in place the guide stays hidden for good, even if a step is undone later.</p>
+    <p class="task-sub">Resetting forgets that completion for every account. On each person’s next visit the guide comes back wherever a required step is still missing, and a minimized guide opens again. Nothing else changes: no projects, tasks, connections, or settings.</p>
+    <button class="btn sm" id="onboarding-reset" type="button">Show the setup guide again</button>
+  </div>`;
+}
+
+function wireOnboardingResetCard() {
+  const button = $('#onboarding-reset');
+  if (!button) return;
+  button.addEventListener('click', async () => {
+    if (!confirm('Show the setup guide again to every account on its next visit? No one’s work is affected.')) return;
+    button.disabled = true;
+    try {
+      const result = await api('/api/settings/installation/onboarding/reset', { method: 'POST' });
+      toast(result.reset
+        ? `Setup guide reset for ${result.reset} workspace${result.reset === 1 ? '' : 's'}`
+        : 'Nothing to reset: no setup guide was completed or minimized');
+      refreshOnboarding(); // the operator’s own guide may be among them
+    } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
+  });
 }
 
 function organizationView() {
