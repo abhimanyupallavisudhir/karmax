@@ -19,6 +19,7 @@ import {
   SIG_SET_AGENT_CAPACITY,
   QRY_AGENT_QUEUE,
   QRY_ACCOUNT_TASK_LEASES,
+  QRY_ACCOUNT_LEASE,
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
@@ -2143,8 +2144,23 @@ export class KarmaxApi {
     // Cosmetic notes and the queue-time effective agent snapshot live outside the
     // workflow history, so mirror both onto whichever view we return. Keeping the
     // agent snapshot platform-side avoids changing immutable workflow replay payloads.
-    const enrich = (view: TaskView | undefined): TaskView | undefined => {
+    const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
+      // Existing parked executions recorded only "account". Read the small
+      // coordinator projection to explain that wait without replaying the task
+      // or restarting its agent. New lease results already carry this detail.
+      if (view.waitingFor?.kind === 'account' && !view.waitingFor.detail) {
+        try {
+          const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
+            .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
+              waiting: boolean; earliestResetAt?: number; detail?: string;
+            }>, 500);
+          if (lease.waiting && lease.detail) view = { ...view, waitingFor: {
+            ...view.waitingFor, detail: lease.detail,
+            ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+          } };
+        } catch { /* A coordinator outage must not block reading the task. */ }
+      }
       const agents = this.readAgentSnapshot(taskId);
       const task = this.deps.store.getTask(taskId);
       return {

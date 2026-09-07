@@ -7,6 +7,7 @@ const TERMINAL = ['done', 'failed', 'cancelled'];
 
 /** How long to wait on a describe before assuming the task is fine and moving on. */
 const DESCRIBE_TIMEOUT_MS = 4000;
+const TURN_COLLISION = 'usage admission retry key belongs to different attributed work';
 
 /** A minimal stand-in view for a task that never produced one (orphaned start). */
 function stubView(t: TaskRecord): TaskView {
@@ -57,6 +58,28 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         const desc = await withTimeout(handle.describe(), DESCRIBE_TIMEOUT_MS);
         const name = desc.status.name;
         if (name === 'RUNNING') {
+          // Older executions restarted their turn counter at zero, colliding
+          // with reservations from the previous run. The run-scoped turn IDs
+          // now make a fresh retry safe. Recover only that proven historical
+          // collision, once per run, and never relax admission attribution.
+          if (base.stage === 'escalated' && base.error?.includes(TURN_COLLISION)
+            && !base.pointOfNoReturnPassed && ['software-dev', 'goal'].includes(t.workflow)) {
+            const repairKey = `repair:agent-turn-run-identity:${t.id}:${desc.runId}`;
+            const old = store.db.prepare('SELECT createdAt FROM usage_admissions WHERE id=? AND taskId=? AND projectId=?')
+              .get(`${t.id}#0`, t.id, t.projectId) as { createdAt: number } | undefined;
+            if (old && desc.startTime && old.createdAt < desc.startTime.getTime() && !store.kvGet(repairKey)) {
+              // A failed probe/signal is transient; it must not fall into the
+              // outer workflow-not-found handler and falsely fail this task.
+              try {
+                const live = await withTimeout(handle.query('view') as Promise<TaskView>, DESCRIBE_TIMEOUT_MS);
+                if (live.stage === 'escalated' && live.error?.includes(TURN_COLLISION)
+                  && !live.state.cancelled && !live.pointOfNoReturnPassed) {
+                  await withTimeout(handle.signal('retry'), DESCRIBE_TIMEOUT_MS);
+                  store.kvSet(repairKey, 'requested');
+                }
+              } catch { /* Retry recovery on the next reconciliation sweep. */ }
+            }
+          }
           // software-dev pins before 1.26 accepted Cancel during Setup but did
           // not cancel createWorld. Their live query says cancelled while the
           // persisted projection remains active indefinitely. Recover those

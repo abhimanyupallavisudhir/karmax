@@ -2016,10 +2016,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // before any provider process/API request. The stable turn id makes the
         // reservation retry-safe and binds every request to its org/project/task.
         if (profile.provider !== 'mock') {
-          usageAdmissionId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}:${activityAttempt}`;
-          store.admitAgentUsage({ id: usageAdmissionId, organizationId, projectId: args.task.projectId,
+          const admissionId = args.agentTurnId ?? legacyAgentTurnId ?? `agent:${args.taskId}:${args.role}:${activityAttempt}`;
+          store.admitAgentUsage({ id: admissionId, organizationId, projectId: args.task.projectId,
             taskId: args.taskId, provider: modelProvider, model: profile.model, fundingSource,
             reservedCostMicros: managedReservationMicros });
+          // A rejected admission does not own the existing reservation and must
+          // not release it in finally (it may belong to a different live turn).
+          usageAdmissionId = admissionId;
           // Record the admitted request immediately, before the provider call. Its
           // stable id makes retries/duplicate delivery a no-op. The hard-cap debit
           // remains only on the active admission row; it is not incurred cost.

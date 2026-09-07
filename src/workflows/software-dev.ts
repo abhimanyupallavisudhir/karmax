@@ -50,6 +50,7 @@ import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorl
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
+import { agentTurnId } from './turn-id.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -1742,13 +1743,13 @@ async function softwareDevImpl(
     // admission even when there is no configured account pool.
     if (accountPool <= 0) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
-      return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
+      return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
     const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
     const credentialProvider = typeof prov === 'string' && prov ? prov : undefined;
     if (!credentialProvider) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
-      return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
+      return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
     // Credential-policy allow-list for real providers (precedence + enable/disable,
     // resolved global→project→task); mock uses the coordinator's provider fallback.
@@ -1761,7 +1762,7 @@ async function softwareDevImpl(
       || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
         ? credentialProvider
         : undefined;
-    const turnId = `${taskId}#${turnSeq++}`;
+    const turnId = agentTurnId(taskId, turnSeq++);
     const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
     const priorStatus = status;
     status = 'waiting';
@@ -1770,7 +1771,9 @@ async function softwareDevImpl(
     // keep the historical account-wait state.
     waitingFor = lease?.waiting === false
       ? { kind: 'agentSlot', provider: displayProvider, detail: 'Starting agent' }
-      : { kind: 'account', provider: credentialProvider };
+      : { kind: 'account', provider: credentialProvider,
+          ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+          ...(lease?.detail ? { detail: lease.detail } : {}) };
     await publish();
     if (liveAgentStates) {
       // The coordinator owns refresh timers and signals every grant. An arbitrary

@@ -291,7 +291,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       turnId: string,
       provider?: AccountProvider,
       allowed?: string[],
-    ): Promise<{ waiting: boolean }> {
+    ): Promise<{ waiting: boolean; earliestResetAt?: number; detail?: string }> {
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,
@@ -305,7 +305,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
       return await client.workflow.getHandle(accountCoordinatorId()).query(
         QRY_ACCOUNT_LEASE,
         { taskId, turnId },
-      ) as { waiting: boolean };
+      ) as { waiting: boolean; earliestResetAt?: number; detail?: string };
     },
     /** Remove a not-yet-granted account request when its task/turn is cancelled. */
     async cancelAccount(taskId: string, turnId: string): Promise<void> {

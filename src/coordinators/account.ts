@@ -181,8 +181,8 @@ export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; wi
 export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export const accountLeaseQuery = defineQuery<
-  { waiting: boolean },
-  [{ taskId: string; turnId: string }]
+  { waiting: boolean; earliestResetAt?: number; detail?: string },
+  [{ taskId: string; turnId?: string }]
 >(QRY_ACCOUNT_LEASE);
 export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
 
@@ -434,9 +434,22 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     })),
     waiting: queue.length,
   }));
-  setHandler(accountLeaseQuery, ({ taskId, turnId }) => ({
-    waiting: queue.some((req) => req.taskId === taskId && req.turnId === turnId),
-  }));
+  setHandler(accountLeaseQuery, ({ taskId, turnId }) => {
+    const req = queue.find((r) => r.taskId === taskId && (turnId === undefined || r.turnId === turnId));
+    if (!req) return { waiting: false };
+    const compatible = accounts.filter((a) => req.allowed !== undefined
+      ? req.allowed.includes(a.id) : a.provider === req.provider);
+    if (compatible.some((a) => a.status === 'available'))
+      return { waiting: true, detail: 'Waiting for a free slot on an allowed account' };
+    const resets = compatible.filter((a) => a.status === 'exhausted' && a.resetAt != null)
+      .map((a) => a.resetAt!);
+    if (resets.length) return {
+      waiting: true,
+      earliestResetAt: Math.min(...resets),
+      detail: 'Provider usage limit reached; the task resumes automatically when quota resets',
+    };
+    return { waiting: true, detail: 'Waiting for a usable allowed credential' };
+  });
   // Every turn of `taskId` this coordinator still owes something for — queued
   // requests AND granted leases. Shape stays `string[]` of turnIds so the caller
   // (`stopTaskActivity`) can keep feeding them straight back into
