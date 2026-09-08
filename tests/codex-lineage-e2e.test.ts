@@ -66,7 +66,7 @@ async function turn(client: CodexAppServerClient, threadId: string, text: string
   expect(await completed).toMatchObject({ status: 'completed' });
 }
 
-it('forks, completes turns, exports and resumes nested cloud lineage despite stale host snapshots', async () => {
+it.each(['live source', 'deleted source'])('forks and resumes nested lineage with a %s and stale host snapshots', async (scenario) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-lineage-e2e-'));
   const requests: string[] = [];
   const server = createServer(async (req, res) => {
@@ -106,6 +106,7 @@ it('forks, completes turns, exports and resumes nested cloud lineage despite sta
     });
     const stale = rollouts(host).find((file) => file.endsWith(`${root}.jsonl`))!;
     const staleBytes = fs.readFileSync(stale);
+    let staleParent: Buffer | undefined;
     let parent = root;
     let from = source;
     for (let generation = 0; generation < 2; generation++) {
@@ -114,7 +115,25 @@ it('forks, completes turns, exports and resumes nested cloud lineage despite sta
       // Reproduce an already-failed world's stale dated copy as well as a new world.
       if (generation === 1) await destination.writeFileBuffer!(
         `${relative}/${path.relative(host, stale)}`, staleBytes);
-      expect(await materializeRemoteSession(from, destination, 'codex', parent, host)).toBe(true);
+      if (generation === 1 && scenario === 'deleted source') {
+        // Keep both files and a real persisted Codex index from an earlier
+        // attempt. The source task has now landed, so its sandbox is gone and
+        // only host-cache preparation can repair these existing aliases.
+        for (const file of rollouts(host)) await destination.writeFileBuffer!(
+          `${relative}/${path.relative(host, file)}`, fs.readFileSync(file));
+        const parentFile = rollouts(host).find((file) => file.endsWith(`${parent}.jsonl`))!;
+        await destination.writeFileBuffer!(`${relative}/sessions/forked/${path.basename(parentFile)}`, fs.readFileSync(parentFile));
+        await destination.writeFileBuffer!(`${relative}/${path.relative(host, parentFile)}`, staleParent!);
+        await destination.writeFile(`${relative}/config.toml`, fs.readFileSync(path.join(host, 'config.toml'), 'utf8'));
+        await appServer(path.join(destination.handle.root, relative), async (client) => {
+          await client.request('thread/resume', { threadId: parent,
+            path: path.join(destination.handle.root, relative, 'sessions/forked', path.basename(parentFile)),
+            cwd: destination.handle.root, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        });
+        fs.rmSync(from.handle.root, { recursive: true, force: true });
+      } else {
+        expect(await materializeRemoteSession(from, destination, 'codex', parent, host)).toBe(true);
+      }
       const home = await seedRemoteAgentHome(destination, 'codex', host, parent);
       expect(await ensureRemoteCodexSessionTools(destination, home, parent, codexDynamicTools(true))).toBe(true);
       let child = '';
@@ -126,6 +145,8 @@ it('forks, completes turns, exports and resumes nested cloud lineage despite sta
         expect(requests.at(-1)).toContain('newest-source-marker');
       });
       expect(rollouts(home.absolute).filter((file) => file.endsWith(`${root}.jsonl`))).toHaveLength(1);
+      expect(rollouts(home.absolute).filter((file) => file.endsWith(`${parent}.jsonl`))).toHaveLength(1);
+      staleParent = fs.readFileSync(rollouts(home.absolute).find((file) => file.endsWith(`${child}.jsonl`))!);
       // Restart the real process and resume the fork before exporting it.
       await appServer(home.absolute, async (client) => {
         await client.request('thread/resume', { threadId: child, cwd: destination.handle.root,
@@ -138,6 +159,7 @@ it('forks, completes turns, exports and resumes nested cloud lineage despite sta
     }
     expect(requests).toHaveLength(6);
     expect(requests.at(-1)).toContain('generation-0-marker');
+    expect(requests.at(-1)).toContain('resumed-0-marker');
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));

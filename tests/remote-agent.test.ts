@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
 import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
-  CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
+  reconcileRemoteCodexSessionCopies, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
@@ -280,6 +280,43 @@ describe('remote subscription agents', () => {
     expect(destination.files.size).toBe(0);
   });
 
+  it('repairs prefix-compatible aliases throughout the requested lineage only', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-aliases-'));
+    const world = fakeWorld();
+    const relative = remoteAgentHomeRelative('codex', localHome);
+    const meta = (base?: string) => JSON.stringify({ type: 'session_meta', payload: {
+      ...(base ? { history_base: { thread_id: base } } : {}),
+    } }) + '\n';
+    const leaf = meta('root-session'), root = meta();
+    world.files.set(`${relative}/sessions/forked/rollout-leaf-session.jsonl`, Buffer.from(leaf + '{}\n'));
+    world.files.set(`${relative}/sessions/dated/rollout-leaf-session.jsonl`, Buffer.from(leaf));
+    world.files.set(`${relative}/sessions/forked/rollout-root-session.jsonl`, Buffer.from(root + '{}\n'));
+    world.files.set(`${relative}/archived_sessions/rollout-root-session.jsonl`, Buffer.from(root));
+    world.files.set(`${relative}/sessions/rollout-unrelated-session.jsonl`, Buffer.from('unrelated'));
+    await reconcileRemoteCodexSessionCopies(world, { relative, absolute: `/workspace/${relative}` }, 'leaf-session');
+    expect([...world.files.keys()].sort()).toEqual([
+      `${relative}/sessions/forked/rollout-leaf-session.jsonl`,
+      `${relative}/sessions/forked/rollout-root-session.jsonl`,
+      `${relative}/sessions/rollout-unrelated-session.jsonl`,
+    ].sort());
+  });
+
+  it('preserves all copies when a lineage ancestor contains divergent bytes', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-aliases-'));
+    const world = fakeWorld();
+    const relative = remoteAgentHomeRelative('codex', localHome);
+    const leaf = JSON.stringify({ type: 'session_meta', payload: { history_base: { thread_id: 'root-session' } } });
+    world.files.set(`${relative}/sessions/forked/rollout-leaf-session.jsonl`, Buffer.from(leaf + '\n'));
+    world.files.set(`${relative}/sessions/dated/rollout-leaf-session.jsonl`, Buffer.from(leaf));
+    world.files.set(`${relative}/sessions/forked/rollout-root-session.jsonl`, Buffer.from('{}\nnewer'));
+    world.files.set(`${relative}/sessions/dated/rollout-root-session.jsonl`, Buffer.from('{}\nother'));
+    const before = new Map(world.files);
+    await expect(reconcileRemoteCodexSessionCopies(world, { relative, absolute: `/workspace/${relative}` }, 'leaf-session'))
+      .rejects.toThrow('histories diverge');
+    expect(world.files).toEqual(before);
+    expect(world.commands.some((command) => command.startsWith('rm '))).toBe(false);
+  });
+
   it('runs Codex app-server inside the remote PTY with the seeded subscription', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
@@ -493,6 +530,10 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
       commands.push([command, ...args].join(' '));
       if (command === 'bash' && args[1]?.includes('-type f -print')) {
         return { stdout: [...files.keys()].map((file) => `/workspace/${file}`).join('\n'), stderr: '', code: 0 };
+      }
+      if (command === 'rm' && args[0] === '-f' && args[1] === '--') {
+        for (const file of args.slice(2)) files.delete(file.replace('/workspace/', ''));
+        return { stdout: '', stderr: '', code: 0 };
       }
       if (command === 'node' && args[0] === '-e' && args[1]?.includes('process.versions.node'))
         return { stdout: '', stderr: '', code: 0 };
