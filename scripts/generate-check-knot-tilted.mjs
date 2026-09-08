@@ -41,7 +41,7 @@ const bounds = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...y
 const scaleX = 336 / (bounds[2] - bounds[0]);
 const scaleY = 336 / (bounds[3] - bounds[1]);
 const center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
-function path(polygons) {
+export function path(polygons) {
   return polygons.map(polygon => polygon.map((point, i) => {
     const [x, y] = project(point);
     return `${i ? 'L' : 'M'}${(256 + (x - center[0]) * scaleX).toFixed(3)} ${(256 + (y - center[1]) * scaleY).toFixed(3)}`;
