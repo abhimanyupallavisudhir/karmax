@@ -43,7 +43,7 @@ eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.UR
 eval(extractConst('NOTIFY_BEHAVIOURS').replace('const NOTIFY_BEHAVIOURS =', 'global.NOTIFY_BEHAVIOURS ='));
 eval(extractConst('NOTIFY_DEFAULTS', '\n};').replace('const NOTIFY_DEFAULTS =', 'global.NOTIFY_DEFAULTS ='));
 for (const name of ['urgencyRank', 'notifyPrefs', 'setNotifyPref', 'inboxArrivals', 'announceInbox',
-  'showSystemNotification', 'playNotificationSound', 'inboxRowLabel', 'notificationsCard']) eval(extractFn(name));
+  'showSystemNotification', 'unlockNotificationAudio', 'inboxEventChanges', 'playNotificationSound', 'inboxRowLabel', 'notificationsCard']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -75,6 +75,14 @@ ok(inboxArrivals(null, list).length === 0, 'the FIRST load announces nothing —
 ok(inboxArrivals(new Set(['a']), list).map((x) => x.id).join(',') === 'b', 'only genuinely new asks are announced');
 ok(inboxArrivals(new Set(), [item('c', 'high', false)]).length === 0, 'an already-read ask is not announced');
 
+// A restatement remains quiet, but increasing the same ask's priority alerts.
+const priorities = new Map([['a', urgencyRank('normal')]]);
+ok(inboxArrivals(priorities, [item('a', 'high')]).length === 1, 'priority promotion announces an existing ask');
+ok(inboxArrivals(priorities, [item('a', 'normal')]).length === 0, 'unchanged asks stay quiet');
+for (const type of ['task.escalated', 'view.updated', 'credential.approval-resolved', 'review.requested', 'task.assigned'])
+  ok(inboxEventChanges({ type }), `${type} refreshes delivery`);
+ok(!inboxEventChanges({ type: 'agent.output' }), 'streaming tokens do not reload the inbox');
+
 // ── what announcing does ────────────────────────────────────────────────────
 const shown = [];
 const blips = [];                                   // one entry per tone actually started
@@ -100,6 +108,8 @@ announceInbox([item('a', 'critical'), item('b', 'high'), item('c', 'low')]);
 ok(shown.map((n) => n.title).join(',') === 'Task a,Task b', 'critical and high pop up; low does not');
 ok(shown[0].requireInteraction === true && shown[1].requireInteraction === false,
   'only a critical popup waits to be dismissed');
+ok(shown[0].silent === true, 'native sound cannot override the sound preference');
+ok(shown[0].body.startsWith('CRITICAL'), 'system notification names priority');
 ok(shown[0].tag === 'a', 'a popup is tagged with its ask, so a restatement replaces it');
 shown.length = 0;
 showSystemNotification({ id: 'z', urgency: 'critical', kind: 'escalated' });

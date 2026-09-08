@@ -42,7 +42,7 @@ global.profileRoute = () => '/profile';
 // A `const` inside a direct eval stays in the eval's own scope; hoist it out.
 eval(extractConst('INBOX_TABS').replace('const INBOX_TABS =', 'global.INBOX_TABS ='));
 eval(extractConst('URGENCY_LEVELS').replace('const URGENCY_LEVELS =', 'global.URGENCY_LEVELS ='));
-for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxView']) eval(extractFn(name));
+for (const name of ['urgencyRank', 'inboxShowRead', 'inboxItemMatchesFilter', 'inboxUnreadCount', 'inboxItems', 'inboxTabs', 'inboxRowLabel', 'urgencyChip', 'inboxView', 'updateBell']) eval(extractFn(name));
 
 let pass = 0;
 let fail = 0;
@@ -75,6 +75,12 @@ ok(tabs.find((t) => t.key === 'escalated').unread === 0, 'an empty sub-tab has a
 ok(tabs.find((t) => t.key === 'update').unread === 1, 'Updates counts its unread items');
 ok(tabs.find((t) => t.key === 'all').unread === 2, 'All counts unread asks, not updates');
 
+const badge = { classList: { toggle() {} } };
+global.$ = (selector) => selector === '#bell-badge' ? badge : null;
+S.inboxFilter = 'update';
+updateBell();
+ok(badge.textContent === 2, 'bell matches All even while viewing Updates');
+
 S.inboxFilter = 'approval-requested';
 ok(inboxItems().map((x) => x.id).join(',') === '1', 'the selected sub-tab filters the list');
 S.inboxFilter = 'escalated'; // a filter whose items have all been answered
@@ -90,7 +96,7 @@ ok(inboxRowLabel(item('9', 'update', true)) === 'update', 'and falls back when t
 ok(inboxRowLabel(item('9', 'review-requested', true)) === 'review requested', 'an ask names itself');
 
 // Urgency orders the list: the most urgent ask is at the top whatever its age,
-// and only an above-normal level is chipped (the ordinary case needs no label).
+// and every level has an explicit priority label.
 S.inbox = [
   item('11', 'escalated', true, { urgency: 'high', createdAt: 1 }),
   item('12', 'review-requested', true, { urgency: 'normal', createdAt: 9 }),
@@ -104,7 +110,9 @@ ok(urgencyRank('critical') > urgencyRank('high') && urgencyRank('high') > urgenc
 ok(urgencyRank('nonsense') === urgencyRank('normal'), 'an unknown level reads as normal, not as the floor');
 const urgentHtml = inboxView();
 ok(/urgency-chip critical/.test(urgentHtml) && /urgency-chip high/.test(urgentHtml), 'high and critical rows are chipped');
-ok(!/urgency-chip normal/.test(urgentHtml), 'a normal ask carries no chip');
+ok(/urgency-chip normal/.test(urgentHtml), 'normal priority is labeled too');
+ok(urgencyChip('low').includes('low priority'), 'low priority has an accessible label');
+ok(urgencyChip('invalid').includes('normal priority'), 'unknown priority safely defaults to normal');
 ok(urgentHtml.indexOf('urgency-chip critical') < urgentHtml.indexOf('urgency-chip high'),
   'the critical row is rendered first');
 

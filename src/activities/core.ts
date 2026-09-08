@@ -1,4 +1,5 @@
 import { expectedTaskRemoteHeads } from '../world/publication.js';
+import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
@@ -4375,6 +4376,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       return { pushed, skipped };
+    },
+
+    async confirmManualPr(taskId: string, userId: string): Promise<boolean> {
+      const task = store.getTask(taskId);
+      if (deps.authorization && !allows(deps.authorization.capabilities(
+        `user:${userId}`, task?.projectId), 'task:signal')) return false;
+      const view = task?.lastView;
+      if (view?.stage !== 'review' || view.waitingFor?.kind !== 'human'
+        || !view.actions.some((action) => action.name === 'confirm' && action.enabled)
+        || !store.humanMayAct(taskId, userId)) return false;
+      recordHumanConfirmation(store, taskId, userId);
+      return true;
     },
 
     async publishView(taskId: string, view: TaskView): Promise<void> {

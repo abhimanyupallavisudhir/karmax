@@ -499,12 +499,9 @@ async function main() {
     providerConnections, worlds,
     worldAccess, runners, resources, broker, githubApp, bus,
     refreshCredentialHealth: async (task, credentialProvider) => {
-      const organizationId = store.getProject(task.projectId)?.organizationId ?? 'org_personal';
-      const { refreshCredentialHealth } = await import('./agent/credential-health.js');
-      await refreshCredentialHealth({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, {
-        organizationId,
-        provider: credentialProvider,
-      });
+      if (!credentialProvider) return;
+      const { retryCredentials } = await import('./agent/credential-health.js');
+      await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider);
     },
   });
 
