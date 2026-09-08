@@ -64,7 +64,8 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     // Share ONE V8 context across all cached workflows instead of one isolate per
     // workflow. With up to `maxCachedWorkflows` (20) sticky executions, per-isolate
     // heap dominates the worker's RAM; a shared context is the single biggest memory
-    // lever here and is safe — workflow code is already sandboxed and deterministic.
+    // lever here. All bundled code must be trusted: Temporal determinism and
+    // VM reuse do not provide a security boundary for tenant-supplied code.
     reuseV8Context: true,
     // Prompt shutdown: stop polling at once and, after a short grace, CANCEL
     // in-flight activities (the agent adapters kill their subprocess on abort),
