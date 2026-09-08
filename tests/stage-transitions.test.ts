@@ -595,6 +595,26 @@ describe('task stage transitions', () => {
     expect(recovery.pausedForHuman).toBeUndefined();
   });
 
+  it('records manual confirmation of an escalated reviewer as GitHub merge authorization', async () => {
+    const f = fixture();
+    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
+    f.store.saveView(f.task.id, {
+      ...f.view, stage: 'escalated', status: 'blocked',
+      prs: [{ repo: 'repo', slug: 'owner/repo', number: 52, url: 'https://github.test/owner/repo/pull/52', state: 'open', headSha: 'abc123' }],
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true }],
+    });
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+    expect(f.signalled).toContainEqual({ id: f.task.id, signal: 'confirm', args: [] });
+    expect(f.starts).toHaveLength(0);
+    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'task.confirmation-voted', payload: expect.objectContaining({
+        githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+        githubPrHeads: [{ slug: 'owner/repo', number: 52, headSha: 'abc123' }],
+      }) }),
+    ]));
+  });
+
   it.each(['1.16.0', '1.17.0', '1.18.0', '1.19.0', '1.20.0'])('upgrades a %s task at its successful Review boundary into participant Landing', async (version) => {
     const f = fixture();
     f.store.setTaskWorkflowVersion(f.task.id, version);
