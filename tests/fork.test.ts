@@ -82,6 +82,49 @@ describe('materializeFork — Codex (by id in the home)', () => {
     }
   });
 
+  it('repairs an already-copied leaf with nested and archived history dependencies', () => {
+    const srcHome = tmp('karmax-lineage-src-'), forkHome = tmp('karmax-lineage-dst-');
+    const root = sid(), parent = sid(), session = sid(), unrelated = sid();
+    const rollout = (id: string, base?: string) => JSON.stringify({ type: 'session_meta',
+      payload: { id, history_mode: 'paginated', ...(base ? { history_base: {
+        thread_id: base, end_ordinal_exclusive: 2, end_byte_offset: 300,
+      } } : {}) } }) + '\n';
+    try {
+      fs.mkdirSync(path.join(srcHome, 'archived_sessions'));
+      fs.mkdirSync(path.join(srcHome, 'sessions'));
+      fs.mkdirSync(path.join(forkHome, 'sessions'));
+      fs.writeFileSync(path.join(srcHome, 'archived_sessions', `rollout-${root}.jsonl`), rollout(root));
+      fs.writeFileSync(path.join(srcHome, 'sessions', `rollout-${parent}.jsonl`), rollout(parent, root));
+      fs.writeFileSync(path.join(srcHome, 'sessions', `rollout-${unrelated}.jsonl`), rollout(unrelated));
+      fs.writeFileSync(path.join(forkHome, 'sessions', `rollout-${session}.jsonl`), rollout(session, parent));
+      const opts = { provider: 'codex', session, srcHome, forkHome, worldPath: '/tmp/w' };
+      expect(materializeFork(opts)).toBe(true);
+      expect(fs.readdirSync(path.join(forkHome, 'sessions', 'forked')).sort())
+        .toEqual([`rollout-${root}.jsonl`, `rollout-${parent}.jsonl`].sort());
+      expect(fs.readFileSync(path.join(forkHome, 'sessions', 'forked', `rollout-${root}.jsonl`), 'utf8'))
+        .toBe(rollout(root));
+    } finally {
+      fs.rmSync(srcHome, { recursive: true, force: true });
+      fs.rmSync(forkHome, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['missing', 'cycle'])('rejects a %s ancestor before copying the leaf', (kind) => {
+    const srcHome = tmp('karmax-lineage-src-'), forkHome = tmp('karmax-lineage-dst-');
+    const session = sid();
+    try {
+      fs.mkdirSync(path.join(srcHome, 'sessions'));
+      fs.writeFileSync(path.join(srcHome, 'sessions', `rollout-${session}.jsonl`), JSON.stringify({
+        type: 'session_meta', payload: { history_base: { thread_id: kind === 'cycle' ? session : sid() } },
+      }));
+      expect(materializeFork({ provider: 'codex', session, srcHome, forkHome, worldPath: '/tmp/w' })).toBe(false);
+      expect(fs.readdirSync(forkHome)).toEqual([]);
+    } finally {
+      fs.rmSync(srcHome, { recursive: true, force: true });
+      fs.rmSync(forkHome, { recursive: true, force: true });
+    }
+  });
+
   it('searches other Codex config homes only with host-local admission', () => {
     const dataHome = tmp('karmax-forkhome-');
     const priorHome = process.env.KARMAX_HOME;
