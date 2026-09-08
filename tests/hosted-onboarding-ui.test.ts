@@ -38,7 +38,7 @@ describe('hosted onboarding UI', () => {
 
   it('is hosted-only, server-persisted, live-refreshed, minimizable, and accessible', () => {
     expect(source).toContain("if (!S.meta?.hosted || !organizationId || !S.user)");
-    expect(source).toContain("method: 'PUT', body: JSON.stringify({ display })");
+    expect(source).toContain("method: 'PUT', body: JSON.stringify({ display, finishReplay })");
     expect(source).toContain('queueMicrotask(() => refreshOnboarding())');
     expect(view).toContain('function pollOnboarding()');
     expect(view).toContain('aria-label="Minimize setup guide"');

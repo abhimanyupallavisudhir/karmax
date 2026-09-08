@@ -319,11 +319,32 @@ describe('account coordinator — quota engine', () => {
     const parked = await grantee();
     await expect(activities.leaseAccount(parked.id, 'parked', 'claude')).resolves.toEqual({
       waiting: true,
+      detail: 'Waiting for a free slot on an allowed account',
     });
     expect((await accounts()).waiting).toBe(1);
 
     await immediate.h.signal('finish');
     await parked.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  it('explains quota waits using only the request’s allowed accounts', async () => {
+    const resetAt = Date.now() + 3_600_000;
+    const coord = await startCoord([
+      A({ id: 'allowed', status: 'exhausted', resetAt }),
+      A({ id: 'other-organization' }),
+    ]);
+    const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    const g = await grantee();
+    const expected = { waiting: true, earliestResetAt: resetAt,
+      detail: 'Provider usage limit reached; the task resumes automatically when quota resets' };
+    expect(await activities.leaseAccount(g.id, 'quota', 'claude', ['allowed'])).toEqual(expected);
+    expect(await coord.query('accountLease', { taskId: g.id })).toEqual(expected);
+    expect((await acct('other-organization')).inUse).toBe(0);
+    await coord.signal('setAccountAvailability', { accountId: 'allowed', status: 'available' });
+    await expect.poll(() => coord.query('accountLease', { taskId: g.id }), { timeout: 10_000 })
+      .toEqual({ waiting: false });
+    await g.h.signal('finish');
     await coord.terminate('done');
   });
 

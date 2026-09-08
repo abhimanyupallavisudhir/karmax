@@ -51,7 +51,12 @@ describe('toasts are reachable', () => {
 
 describe('websocket reconnect', () => {
   it('backfills the open task through the real state key', () => {
-    expect(app).toContain('if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }');
+    const reconnect = handlerAfter('ws.onopen = () => {');
+    expect(reconnect).toContain('if (wsHadDropped)');
+    expect(reconnect).toContain('refreshTasks().catch(() => {})');
+    expect(reconnect).toContain('if (S.selected)');
+    expect(reconnect).toContain('refreshTask().catch(() => {})');
+    expect(reconnect).toContain('refreshTaskHistory(S.selected)');
     // S.taskId never existed — the old guard was permanently false.
     expect(app).not.toMatch(/\bS\.taskId\b/);
   });
@@ -186,15 +191,18 @@ describe('manual PR opening', () => {
     };
     const action = { name: 'openPr', label: 'Open PR' };
 
-    expect(helpers.taskActionLabel({}, action)).toBe('Manually Open PR');
-    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Return to Review');
-    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually Open PR');
+    expect(helpers.taskActionLabel({ stage: 'escalated' }, { ...action, label: 'Commit changes, open & confirm PR' }))
+      .toBe('Commit changes, open & confirm PR');
+    expect(helpers.taskActionLabel({}, action)).toBe('Manually Open & Confirm PR');
+    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Return to Review & Confirm');
+    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually Open & Confirm PR');
     expect(helpers.hasOpenPullRequest({ prs: [{ state: 'open', merged: true }] })).toBe(false);
   });
 
   it('confirms the context-specific action before signaling it', () => {
-    expect(app).toContain('Are you sure the agent\'s work here is complete? You could cancel and ask the agent to open the PR itself.');
-    expect(app).toContain('Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.');
+    expect(app).toContain('Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.');
+    expect(app).toContain('Commit all preserved changes, open the PR, and confirm it if you are authorized?');
+    expect(app).toContain('Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.');
     expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act, v)) return;');
     expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name, S.view)) return;');
   });
@@ -299,7 +307,10 @@ describe('copy', () => {
 
   it('does not leak internal codenames or internal concept names', () => {
     expect(app).not.toContain('jayadratha');
-    expect(app).toContain('title="Selected to merge — the other attempts are stopped.">committed<');
+    // Attempt navigation names the outcome directly instead of exposing the
+    // internal "committed" state as a badge with an explanatory tooltip.
+    expect(app).toContain('<span class="attempt-note">Selected to merge</span>');
+    expect(app).not.toContain('>committed<');
     // "layer" is the internal name for the confirmer stack.
     expect(app).not.toContain('Add layer');
     expect(app).not.toContain('No layers');

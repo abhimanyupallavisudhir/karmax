@@ -15,6 +15,29 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
   beforeAll(async () => { h = await bootHarness('mock'); }, 60_000);
   afterAll(async () => { await h?.stop(); });
 
+  it('gives replacement executions distinct turn IDs without changing activity retry identity', async () => {
+    const repo = await h.makeRepo('replacement-turn');
+    const taskId = newId('task');
+    const ids: string[] = [];
+    for (let run = 0; run < 2; run++) {
+      const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+        taskQueue: TASK_QUEUE, workflowId: taskId,
+        args: [{ taskId, projectId: 'p1', title: 'Replacement turn',
+          prompt: 'Do the work.\n@review done', base: 'main', target: 'main',
+          project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } }],
+      });
+      await expect.poll(async () => (await handle.query('view') as any).stage, { timeout: 30_000 }).toBe('review');
+      const history = await handle.fetchHistory();
+      const scheduled = history.events!.find((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'runAgentTurn')!;
+      const input = JSON.parse(Buffer.from(scheduled.activityTaskScheduledEventAttributes!.input!.payloads![0]!.data!).toString());
+      const { runId } = await handle.describe();
+      expect(input.agentTurnId).toBe(`${taskId}:${runId}#0`);
+      ids.push(input.agentTurnId);
+      await handle.terminate('test replacement');
+    }
+    expect(new Set(ids).size).toBe(2);
+  });
+
   it('does not publish a login wait when an account is granted immediately', async () => {
     const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
     const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
@@ -65,7 +88,8 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
     await coord.registerAccounts([{ id: 'mock:only', configHome: '/tmp/mockhome', provider: 'mock', maxConcurrent: 1 }]);
     const cw = h.client.workflow.getHandle(accountCoordinatorId());
     await expect.poll(async () => ((await cw.query('accounts')) as any).accounts.length, { timeout: 10_000 }).toBe(1);
-    await cw.signal('reportExhausted', { accountId: 'mock:only', window: '5h', resetAt: Date.now() + 3_600_000 });
+    const resetAt = Date.now() + 3_600_000;
+    await cw.signal('reportExhausted', { accountId: 'mock:only', window: '5h', resetAt });
 
     const repo = await h.makeRepo('parkme');
     const taskId = newId('task');
@@ -91,6 +115,8 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
     await expect.poll(async () => (await view()).status, { timeout: 20_000 }).toBe('waiting');
     const parked = await view();
     expect(parked.waitingFor?.kind).toBe('account');
+    expect(parked.waitingFor?.earliestResetAt).toBe(resetAt);
+    expect(parked.waitingFor?.detail).toContain('usage limit');
     expect((parked.messages || []).some((m: any) => m.role === 'agent')).toBe(false);
 
     // Capture every published transition after the grant. This remains reliable even

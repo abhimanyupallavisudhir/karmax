@@ -52,7 +52,7 @@ const developer = [
 const maintainer = [
   ...developer, 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
   'project:resource:shared-write',
-  'workflow:install', 'workflow:edit', 'team:write', 'repository:write',
+  'workflow:edit', 'team:write', 'repository:write',
   'github:actions:write',
   // A maintainer's agent may stand in for a human at a Review gate; a
   // developer's may not (it reviews through its own Confirm turn instead).
@@ -77,7 +77,8 @@ const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*',
   'project:resource:shared-write',
-  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
+  // Loading code into the shared worker is installation authority, never tenant authority.
+  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'github:actions:*',
@@ -124,13 +125,19 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [maintainer.filter((capability) => capability !== 'review:approve'),
-    maintainer.filter((capability) => !capability.startsWith('github:actions:') && capability !== 'review:approve'), [
+  maintainer: [
+    // With workflow:install (before it became global authority), with and without `review:approve`…
+    [...maintainer, 'workflow:install'],
+    [...maintainer.filter((capability) => capability !== 'review:approve'), 'workflow:install'],
+    [...maintainer.filter((capability) => !capability.startsWith('github:actions:') && capability !== 'review:approve'), 'workflow:install'],
+    // …and the release just before `review:approve` shipped.
+    maintainer.filter((capability) => capability !== 'review:approve'), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit',
   ]],
+  administrator: [[...ORGANIZATION_GRANT_CEILING, 'workflow:install']],
   operator: [[
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',

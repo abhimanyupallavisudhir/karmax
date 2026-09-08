@@ -345,7 +345,7 @@ function parseRoute(url) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
-  if (seg[0] === 'profile') return { name: 'profile' };
+  if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
   if (seg[0] === 'installation') return { name: 'installation' };
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
@@ -427,7 +427,7 @@ function organizationLandingRoute(organizationId) {
 function installationRoute() { return '/installation'; }
 
 // The profile belongs to the signed-in user, not to the selected organization.
-function profileRoute() { return '/profile'; }
+function profileRoute(userId) { return userId ? `/profile/${encodeURIComponent(userId)}` : '/profile'; }
 
 // The inbox pinned to one kind of notification: /<org>/inbox/<kind> ('all' is
 // the bare route). Which sub-tab you are on is part of the page, so it lives in
@@ -494,6 +494,9 @@ async function applyRoute() {
   if (r.name === 'profile') {
     if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
     closeTaskDom();
+    if (r.userId && r.userId !== S.user?.id && !S.installationAccess)
+      return go(profileRoute(), { replace: true });
+    S.profileUserId = r.userId || null;
     S.tab = 'profile';
     renderRail();
     renderMain();
@@ -666,7 +669,8 @@ async function applyRoute() {
     const nextTaskFile = r.taskFile || null;
     if (JSON.stringify(S.taskFile) !== JSON.stringify(nextTaskFile)) S.taskFileLoad = null;
     S.taskFile = nextTaskFile;
-    if (S.selected !== taskId) return openTask(taskId, r.taskTab);
+    if (S.selected !== taskId) return openTask(taskId, r.taskTab, r.taskKey === taskId);
+    S.viewingAttempt = r.taskKey === taskId ? taskId : null;
     if (r.taskTab) S.taskTab = r.taskTab;
     return renderTaskPage();
   }
@@ -684,7 +688,7 @@ async function applyRoute() {
 function taskUrl(id, record) {
   const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
-  const keyPart = rec && rec.num != null ? String(rec.num) : id;
+  const keyPart = S.viewingAttempt !== id && rec && rec.num != null ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
@@ -2869,27 +2873,50 @@ async function loadCollaboration() {
   const organizationId = S.organizationId;
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const q = `?organizationId=${encodeURIComponent(organizationId)}`;
-  const [members, teams, users, inbox] = await Promise.all([
+  const [members, teams, users] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
-    api(`/api/inbox${q}`).catch(() => []),
+    loadInbox().catch(() => {}),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
-  S.inbox = inbox || [];
-  // Announce what ARRIVED since the last list. The first load only seeds the
-  // seen set (and switching organization reseeds it), so opening the app never
-  // replays the backlog. See announceInbox for what each urgency does.
+}
+
+async function loadInbox() {
+  const organizationId = S.organizationId;
+  if (!organizationId) return;
+  const epoch = S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+  // A failed request must not erase the inbox or reset arrival tracking.
+  const inbox = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`);
+  if (S.inboxLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   const seen = S.announcedOrganizationId === organizationId ? S.announcedInbox : null;
-  S.announcedInbox = new Set(S.inbox.map((item) => item.id));
+  S.inbox = inbox || [];
+  S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
   S.announcedOrganizationId = organizationId;
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
-  if (S.tab === 'inbox' && !S.selected) bgRenderMain();
+  if (S.tab === 'inbox') bgRenderMain();
+}
+
+function inboxEventChanges(ev) {
+  return ev.type === 'view.updated' || ev.type.includes('escalat')
+    || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
+    || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
+      'credential.approval-requested', 'credential.approval-resolved',
+      'permission.approval-requested', 'permission.approval-resolved',
+      'authorization.approval-requested', 'authorization.approval-resolved'].includes(ev.type);
+}
+let inboxRefreshTimer;
+function scheduleInboxReload() {
+  // Coalesce a burst without starving delivery during continuous task activity.
+  if (inboxRefreshTimer) return;
+  inboxRefreshTimer = setTimeout(() => {
+    inboxRefreshTimer = null;
+    loadInbox().catch(() => {});
+  }, 200);
 }
 
 async function loadTasks() {
@@ -3271,6 +3298,9 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
+    if (S.selected && ev.taskId !== S.selected
+      && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask();
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
@@ -3283,13 +3313,7 @@ function connectWs() {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
-    // Collaboration state changes only for collaboration events. Reloading five
-    // organization endpoints for every workflow view transition multiplied the
-    // websocket refresh storm without changing any of that data.
-    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested',
-      'permission.approval-requested', 'authorization.approval-requested', 'credential.approval-resolved',
-      'permission.approval-resolved', 'authorization.approval-resolved'].includes(ev.type))
-      setTimeout(() => loadCollaboration().catch(() => {}), 450);
+    if (S.organizationId && inboxEventChanges(ev)) scheduleInboxReload();
     if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
@@ -3300,7 +3324,11 @@ function connectWs() {
     wsRetryMs = 1500;
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
-    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
+    if (wsHadDropped) {
+      loadInbox().catch(() => {});
+      refreshTasks().catch(() => {});
+      if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
+    }
     wsHadDropped = false;
   };
   ws.onclose = () => {
@@ -3394,6 +3422,10 @@ const BRAND_ICON_CHOICES = [
   { id: 'knot', label: 'Knot' },
   { id: 'check', label: 'Check' },
   { id: 'check-arrow', label: 'Check arrow' },
+  { id: 'check-knot', label: 'Check knot' },
+  { id: 'check-knot-tilted', label: 'Tilted knot' },
+  { id: 'check-knot-purple', label: 'Purple knot' },
+  { id: 'check-knot-purple-arrow', label: 'Purple arrow' },
   { id: 'clover', label: 'Clover' },
 ];
 
@@ -3424,11 +3456,11 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-async function setOnboardingDisplay(display) {
+async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   try {
     S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
-      method: 'PUT', body: JSON.stringify({ display }),
+      method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
@@ -3486,8 +3518,9 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot"><span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
   </section>`;
+  $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -5500,7 +5533,7 @@ function taskFormLoadingPage(project, draft) {
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
 let activeTaskFormKeyController = null;
-async function openTaskForm(workflow, draft, seedText) {
+async function openTaskForm(workflow, draft, seedText, seedParams) {
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
@@ -5515,7 +5548,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // own box; only fall back to a standalone "Images" section if there isn't one.
   const cf = consumingField(fields);
   const promptField = cf && cf.type === 'text' ? cf : null;
-  const values = draft ? { ...draft.params } : {};
+  const values = draft ? { ...draft.params } : { ...seedParams };
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = !!draft?.params?.repeatable; // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
@@ -6291,48 +6324,56 @@ function runPageRow(r) {
   return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
-// One compact selectable row per execution. The list remains one row per intent;
-// switching here replaces the entire task-page projection with that attempt.
+// Attempt links pin the execution id; the numbered task permalink follows the
+// principal. Keep navigation separate from the selected attempt's stage control.
 function taskAttempts(v) {
   const g = S.attemptGroup;
   if (!g?.attempts?.length) return '';
-  const rows = g.attempts.map((a) => {
-    const av = a.lastView || {};
-    const principal = a.id === g.principalAttemptId;
+  const rows = g.attempts.length > 1 ? g.attempts.map((a) => {
+    const av = a.id === v.taskId ? v : a.lastView || {};
     const committed = a.id === g.committedAttemptId;
     const selected = a.id === v.taskId;
-    const status = av.status || (a.params?.draft ? 'waiting' : 'active');
-    return `<div role="button" tabindex="0" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
-      <span class="attempt-check">${selected ? '✓' : ''}</span>
-      <span class="status-dot ${esc(status)}"></span>
-      <b>Attempt ${a.attemptNumber || 1}</b>
-      ${principal ? '<span class="chip">principal</span>' : ''}
-      ${committed ? '<span class="chip done" title="Selected to merge — the other attempts are stopped.">committed</span>' : ''}
-      <span class="attempt-stage">${stageIndicator(a.params?.draft ? { ...av, state: { ...(av.state || {}), draft: true } } : av, a.id, true)}</span>
-    </div>`;
-  }).join('');
-  return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
+    const draft = !!a.params?.draft;
+    const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
+    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
+    return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+      <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
+      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
+      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+    </a>`;
+  }).join('') : '';
+  return `<section class="attempts" aria-label="Task attempts">
+    <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
+      <button type="button" class="btn sm" id="add-attempt" ${g.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>
+    </div>${rows ? `<nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>` : ''}
+  </section>`;
 }
 
 function wireAttempts(v) {
-  document.getElementById('add-attempt')?.addEventListener('click', async () => {
+  document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
+    if (S.addingAttempt) return;
+    S.addingAttempt = true;
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Creating…';
     try {
       const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
       await refreshTasks();
-      await openTask(draft.id, 'parameters', true);
-      openTaskForm(draft.workflow, draft);
+      if (S.selected !== v.taskId) return;
+      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}/parameters`);
+      if (S.selected === draft.id) await openTaskForm(draft.workflow, draft);
     } catch (e) { toast(e.message, true); }
-  });
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', (event) => {
-    if (event?.target?.closest?.('[data-stage-move]')) return;
-    if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
-  }));
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('keydown', (event) => {
-    if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('[data-stage-move]')) {
-      event.preventDefault();
-      if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+    finally {
+      S.addingAttempt = false;
+      button.disabled = false;
+      button.textContent = '＋ New attempt';
+      const current = document.getElementById('add-attempt');
+      if (current) {
+        current.disabled = !!S.attemptGroup?.committedAttemptId;
+        current.textContent = '＋ New attempt';
+      }
     }
-  }));
+  });
 }
 
 function wireStageTransitions(v) {
@@ -6354,6 +6395,7 @@ function wireStageTransitions(v) {
       await api(`/api/tasks/${taskId}/stage`, { method: 'POST', body: JSON.stringify({ target }) });
       toast(`Moved to ${move?.label || target}`);
       await refreshTasks();
+      if (S.selected !== v.taskId) return;
       if (taskId === v.taskId) await refreshTask();
       else {
         S.attemptGroup = await api(`/api/tasks/${v.taskId}/attempts`);
@@ -6367,7 +6409,53 @@ function wireStageTransitions(v) {
   }));
 }
 
+// History is needed to read Check-in, independently of sessions, credentials,
+// widgets, and other secondary panels. Merge a fetched window with events that
+// arrived while it was loading, preserving explanations and durable ordering.
+function mergeTaskHistory(events) {
+  const currentEvents = S.taskEvents || [];
+  const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
+  const ordinary = [
+    ...events.filter((event) => event.type !== 'conversation.explanation'),
+    ...currentEvents.filter((event) => event.type !== 'conversation.explanation'
+      && (event.seq == null || !durableSeqs.has(event.seq))),
+  ].sort((a, b) => (a.seq ?? a.ts) - (b.seq ?? b.ts)).slice(-400);
+  const explanations = new Map();
+  for (const event of [...events, ...currentEvents]) {
+    if (event.type === 'conversation.explanation')
+      explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
+  }
+  S.taskEvents = [...ordinary, ...explanations.values()];
+}
+
+async function refreshTaskHistory(taskId) {
+  const rec = taskRecord(taskId);
+  if (rec?.params?.draft || rec?.params?.repeatable) return [];
+  const epoch = S.taskHistoryEpoch = (S.taskHistoryEpoch || 0) + 1;
+  S.taskHistoryLoading = true;
+  S.taskHistoryError = null;
+  if (S.taskTab === 'checkin') scheduleTaskPageRender();
+  try {
+    const events = await api(`/api/tasks/${taskId}/events?since=0&limit=300`);
+    if (S.selected !== taskId || S.taskHistoryEpoch !== epoch) return [];
+    mergeTaskHistory(events);
+    return events;
+  } catch (error) {
+    if (S.selected === taskId && S.taskHistoryEpoch === epoch)
+      S.taskHistoryError = error.message || 'Unable to load conversation history';
+    return [];
+  } finally {
+    if (S.selected === taskId && S.taskHistoryEpoch === epoch) {
+      S.taskHistoryLoading = false;
+      if (S.taskTab === 'checkin') scheduleTaskPageRender();
+    }
+  }
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
+  const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
+  S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
+  S.taskHistoryEpoch = (S.taskHistoryEpoch || 0) + 1;
   // Leaving another task's page kills its check-in shell (same as closing does).
   if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; }
   // Per-task page state starts fresh: the tab comes from the URL when pinned
@@ -6387,6 +6475,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     return;
   }
   S.taskEvents = [];
+  S.taskHistoryLoading = false;
+  S.taskHistoryError = null;
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
@@ -6423,7 +6513,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     const details = Promise.all([
       // The websocket keeps this window current. Older history remains durable,
       // but opening a task should have a fixed memory and response-size budget.
-      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0&limit=300`).catch(() => []),
+      draft ? Promise.resolve([]) : refreshTaskHistory(taskId),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
@@ -6436,7 +6526,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
-    if (S.selected !== taskId) return;
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     S.view = pendingCancellationView(view, taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
@@ -6445,22 +6535,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     renderTaskPage();
 
     const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
-    if (S.selected !== taskId) return;
-    // Events may have arrived over the websocket while the bounded durable window
-    // was loading. Preserve those instead of replacing them with the older response.
-    const currentEvents = S.taskEvents;
-    const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
-    const ordinary = [
-      ...events.filter((event) => event.type !== 'conversation.explanation'),
-      ...currentEvents.filter((event) => event.type !== 'conversation.explanation'
-        && (event.seq == null || !durableSeqs.has(event.seq))),
-    ].slice(-400);
-    const explanations = new Map();
-    for (const event of [...explanationEvents, ...events, ...currentEvents]) {
-      if (event.type !== 'conversation.explanation') continue;
-      explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
-    }
-    S.taskEvents = [...ordinary, ...explanations.values()];
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
+    mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
@@ -6471,7 +6547,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
     toast(e.message, true);
-    if (S.selected === taskId) renderTaskLoadingPage(rec, e.message);
+    if (S.selected === taskId && S.taskOpenEpoch === openEpoch) renderTaskLoadingPage(rec, e.message);
     return;
   }
   renderTaskPage();
@@ -6482,7 +6558,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // once, after the first paint, and repaint only if the user is still here and
   // actually looking at the Parameters tab.
   loadParamDefaults(taskId).then((d) => {
-    if (S.selected !== taskId) return; // navigated away before it landed
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return; // navigated away before it landed
     S.paramDefaults = d;
     if (S.taskTab === 'parameters') renderTaskPage();
   });
@@ -6820,6 +6896,9 @@ function renderTaskPage() {
   const fuState = captureFollowupFocus(main);
   const rec = taskRecord(v.taskId);
   const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
+  const previousAttempts = main.querySelector('.attempts-list');
+  const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
+    ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
   main.innerHTML = `
     <div class="task-page">
@@ -6829,7 +6908,7 @@ function renderTaskPage() {
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
+          ${currentAttempt && S.attemptGroup.attempts.length > 1 ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
           ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
@@ -6858,6 +6937,14 @@ function renderTaskPage() {
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">${taskActions(v)}</div></div>
     </div>`;
+  const attemptList = main.querySelector('.attempts-list');
+  if (attemptList) {
+    if (attemptScroll !== null) attemptList.scrollLeft = attemptScroll;
+    else {
+      const selected = attemptList.querySelector('[aria-current="true"]');
+      if (selected) attemptList.scrollLeft = selected.getBoundingClientRect().left - attemptList.getBoundingClientRect().left;
+    }
+  }
   $('#tp-back').addEventListener('click', closeTask);
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
@@ -7838,7 +7925,7 @@ function overviewTab(v) {
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const requestedInput = humanWaitDetail(v);
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${v.waitingFor.kind === 'account' && v.waitingFor.detail ? `<div style="margin-top:8px">${esc(v.waitingFor.detail)}</div>` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
@@ -7946,7 +8033,13 @@ function checkinTab(v) {
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
-  const msgs = entries.map((entry) => renderConversationEntry(entry, v)).join('') || '<div class="msg system">No messages yet</div>';
+  const historyStatus = S.taskHistoryLoading
+    ? '<div class="msg system" role="status">Loading conversation history…</div>'
+    : S.taskHistoryError
+      ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
+      : '';
+  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
+    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -7992,6 +8085,7 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
+      <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
     <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
@@ -8454,11 +8548,17 @@ function terminalPane(v) {
 }
 
 function wireCheckinSidebar(v) {
+  $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
     el.addEventListener('click', () => {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#fork-task-agent')?.addEventListener('click', (event) => {
+    openTaskForm('software-dev', undefined, undefined, {
+      'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
+    });
+  });
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
@@ -9512,8 +9612,9 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open & Confirm PR';
   if (action.name === 'openPr')
-    return hasOpenPullRequest(v) ? 'Return to Review' : 'Manually Open PR';
+    return hasOpenPullRequest(v) ? 'Return to Review & Confirm' : 'Manually Open & Confirm PR';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
     return 'Authorize GitHub merge';
   return action.label || action.name;
@@ -9556,19 +9657,21 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
-  const standard = { confirm: 'confirm', openPr: 'manually open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
-  if (signal === 'openPr' && text.toLowerCase() === 'return to review') return 'Returning to Review';
+  if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 
-const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
-const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.';
+const MANUAL_OPEN_PR_CONFIRMATION = "Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.";
+const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes, open the PR, and confirm it if you are authorized?';
+const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.';
 
 function confirmTaskAction(action, v = S.view) {
-  return action !== 'openPr' || confirm(hasOpenPullRequest(v)
-    ? RETURN_TO_REVIEW_CONFIRMATION
+  return action !== 'openPr' || confirm(v?.stage === 'escalated'
+    ? ERROR_OPEN_PR_CONFIRMATION
+    : hasOpenPullRequest(v) ? RETURN_TO_REVIEW_CONFIRMATION
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
@@ -11590,10 +11693,11 @@ async function hydrateProjectData(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/storage`).catch(() => []),
     ]);
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
+    const readyStorage = storageLocations.filter((location) => location.status === 'ready');
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when krmax should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
-      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
@@ -11601,9 +11705,12 @@ async function hydrateProjectData(proj) {
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
-          <label class="form-row"><span>Storage</span><select id="data-storage">${storageLocations.filter((location) => location.status === 'ready').map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select></label>
+          <div class="form-row"><span>Storage</span>${readyStorage.length > 1
+            ? `<select id="data-storage" aria-label="Storage">${readyStorage.map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select>`
+            : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
+            <small class="field-help">Managed storage is provided by krmax for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
-          <label class="form-row wide"><span>Or upload a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory></label>
+          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
@@ -12177,17 +12284,17 @@ function globalSettingsView(embedded = false) {
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with krmax; workflows installed here are available only to this organization. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with krmax and change only with platform releases. Each task pins its workflow version.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
-      <div class="form-row"><label>Install from a git repo</label>
+      ${S.meta?.hosted ? '<p>Custom workflow code is unavailable on hosted krmax.</p>' : `<div class="form-row"><label>Install from a git repo</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <input id="wf-url" placeholder="git URL or path (e.g. https://github.com/you/my-workflow.git)" style="flex:1;min-width:220px" />
           <input id="wf-ref" placeholder="ref (tag/branch/sha, optional)" style="width:180px" />
           <button class="btn primary" id="wf-install">Install</button>
         </div>
         <div id="wf-install-result" style="font-size:12px;margin-top:6px"></div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
-      </div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Install only code you trust with this server. External workflows share the platform worker; manifest validation and version pins do not isolate them. Packages must supply manifest.json. Merging an edit does not activate it; install the reviewed commit explicitly.</div>
+      </div>`}
     </div>`;
 }
 
@@ -14155,7 +14262,7 @@ function wireGlobalSettings(organizationId) {
 function updateBell() {
   const badge = $('#bell-badge');
   if (!badge) return;
-  const n = S.inbox.filter((item) => item.unread).length;
+  const n = inboxUnreadCount('all');
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
@@ -14210,25 +14317,24 @@ function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
 }
-// Only an above-normal level is worth a chip: the list is already ordered by
-// urgency, so marking every row would label the ordinary case.
+// Every priority is explicit; color and bars make the urgent levels scannable.
 function urgencyChip(urgency) {
-  return urgencyRank(urgency) > urgencyRank('normal')
-    ? `<span class="urgency-chip ${urgency}">${esc(urgency)}</span>` : '';
+  const level = URGENCY_LEVELS[urgencyRank(urgency)];
+  return `<span class="urgency-chip ${level}" aria-label="${level} priority"><span class="priority-bars" aria-hidden="true">${'▮'.repeat(urgencyRank(level) + 1)}</span> ${level}</span>`;
 }
 function inboxView() {
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
     <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
+    ${S.inboxFilter === 'update' ? '<p class="task-sub">Outcomes of tasks you follow. Updates do not count toward the bell badge.</p>' : ''}
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row priority-${URGENCY_LEVELS[urgencyRank(item.urgency)]} ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
       <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.resource?.name || item.kind)}</b>${urgencyChip(item.urgency)}
       <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
-    <p class="task-sub">Sorted by urgency, then by age. What each level does when it arrives — a system
-      notification, a sound, which channels it is delivered on — is set in
+    <p class="task-sub">Sorted by priority, newest first within each level. System notifications and sounds are set in
       <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
 }
 
@@ -14286,15 +14392,16 @@ function setNotifyPref(level, behaviour, on) {
   try { localStorage.setItem('karmax-notify', JSON.stringify(next)); } catch {}
   return next;
 }
-// Only asks that ARRIVED, and only once the browser has seen a first list:
-// opening the app must never replay the backlog as a burst of notifications.
+// Announce new asks and priority increases after the first list; opening the
+// app must never replay the backlog as a burst of notifications.
 function inboxArrivals(previous, items) {
-  return previous ? items.filter((item) => item.unread && !previous.has(item.id)) : [];
+  return previous ? items.filter((item) => item.unread && (!previous.has(item.id)
+    || (previous instanceof Map && urgencyRank(item.urgency) > previous.get(item.id)))) : [];
 }
 function announceInbox(items) {
   const prefs = notifyPrefs();
   let sounded = false;
-  for (const item of items) {
+  for (const item of [...items].sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency))) {
     const behaviour = prefs[item.urgency] || prefs.normal;
     if (behaviour.notify) showSystemNotification(item);
     // One sound per batch. `items` is urgency-ordered, so the first level that
@@ -14308,7 +14415,8 @@ function showSystemNotification(item) {
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
     const notification = new Notification(item.task?.title || item.resource?.name || 'karmax', {
-      body: `${number}${inboxRowLabel(item)}`,
+      body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
+      silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
       requireInteraction: item.urgency === 'critical', // critical waits to be dismissed
     });
@@ -14316,6 +14424,19 @@ function showSystemNotification(item) {
     return true;
   } catch { return false; }
 }
+// Unlock audio during a real gesture, before a background arrival needs it.
+function unlockNotificationAudio() {
+  if (!Object.values(notifyPrefs()).some((pref) => pref.sound)) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    const ctx = S.audio || (S.audio = new Ctx());
+    ctx.resume?.()?.catch?.(() => {});
+  } catch {}
+}
+document.addEventListener('pointerdown', unlockNotificationAudio, { passive: true });
+document.addEventListener('keydown', unlockNotificationAudio);
+
 // Synthesized rather than shipped: no asset to fetch, no volume surprise, and a
 // critical ask simply gets a second blip instead of a different sound to learn.
 function playNotificationSound(urgency = 'normal') {
@@ -14323,7 +14444,7 @@ function playNotificationSound(urgency = 'normal') {
   if (!Ctx) return false;
   try {
     const ctx = S.audio || (S.audio = new Ctx());
-    ctx.resume?.();
+    ctx.resume?.()?.catch?.(() => {});
     for (const offset of urgency === 'critical' ? [0, 0.18] : [0]) {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -14463,7 +14584,23 @@ async function hydrateProfileGithub() {
 
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
+function profileWalkthroughCard(userId) {
+  if (!S.installationAccess || !S.meta?.hosted || !userId) return '';
+  return `<div class="card"><div class="section-h">Walkthrough</div>
+    <p class="task-sub">Show this user's setup walkthrough again in each organization. Existing work and connections are preserved.</p>
+    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Reset walkthrough</button></div>`;
+}
+
 function profileView() {
+  if (S.profileUserId && S.profileUserId !== S.user?.id) {
+    if (!S.installationAccess) return '<div class="empty">Profile unavailable</div>';
+    const user = S.users.find((candidate) => candidate.id === S.profileUserId);
+    if (!user) return '<div class="empty">User not found</div>';
+    return `<div class="profile-page"><h1 class="page-title">Profile</h1>
+      <div class="card profile-card"><div class="profile-name">${esc(user.name)}</div>
+        <div class="profile-email">${esc(user.email)}</div></div>
+      ${profileWalkthroughCard(user.id)}</div>`;
+  }
   const u = S.user && typeof S.user === 'object' ? S.user : null;
   const name = userDisplayName();
   const email = u?.email || '';
@@ -14485,6 +14622,7 @@ function profileView() {
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
+    ${profileWalkthroughCard(u?.id)}
     <div class="card profile-card">
       <div class="profile-identity">
         <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
@@ -14634,6 +14772,7 @@ function notificationsCard() {
       </div>`).join('')}
     </div>
     ${permissionNote}
+    <p class="task-sub">These choices apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
@@ -14668,6 +14807,16 @@ function wireNotificationsCard() {
 }
 
 function wireProfileView() {
+  const reset = $('#profile-reset-onboarding');
+  reset?.addEventListener('click', async () => {
+    reset.disabled = true;
+    try {
+      await api(`/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
+      toast('Walkthrough reset. The user will see it when they next open their workspace.');
+    } catch (error) { toast(error.message, true); }
+    finally { reset.disabled = false; }
+  });
+  if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   hydrateProfileGithub();
   document.querySelectorAll('[data-default-organization]').forEach((button) => button.addEventListener('click', async () => {
@@ -14930,6 +15079,15 @@ async function wireInstallationGithubCard() {
     </div>`;
 }
 
+async function wireInstallationUsers() {
+  const box = $('#installation-users-card');
+  if (!box) return;
+  try {
+    const users = await api('/api/users');
+    box.innerHTML = users.map((user) => `<div class="form-row"><a data-spa href="${profileRoute(user.id)}">${esc(user.name)} · ${esc(user.email)}</a></div>`).join('');
+  } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
+}
+
 function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
@@ -14941,7 +15099,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
@@ -14950,6 +15108,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
+      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
@@ -15064,6 +15223,7 @@ async function hydrateOrganizationSubscription(organizationId) {
 }
 
 function wireInstallationSettings() {
+  wireInstallationUsers();
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();
@@ -15175,7 +15335,7 @@ async function hydrateOrganizationView() {
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
-  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name"><b>${esc(userName(id, embedded))}</b>${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };

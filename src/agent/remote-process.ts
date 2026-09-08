@@ -7,6 +7,8 @@ import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
 import type { World, WorldPty } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
+import { codexSessionWithTools } from './codex-session-tools.js';
+import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 
@@ -54,6 +56,12 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   for (const file of configFiles(localHome, provider, session)) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
+    // Codex resolves rollout identity across the entire home, not by directory.
+    // A cloud fork may already have a newer copy under sessions/forked while the
+    // host cache still has an older dated copy. Never seed a second identity.
+    const rollout = provider === 'codex' ? codexRolloutIdentity(file.relative.split(path.sep).join('/')) : undefined;
+    if (rollout && [...existing].some((candidate) =>
+      codexRolloutIdentity(candidate.slice(relative.length + 1)) === rollout)) continue;
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
     const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
     if (!existing.has(target) || controlledAuth) {
@@ -64,6 +72,11 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
         await world.writeFileBuffer(target, content);
     }
   }
+  // Retries may restore exclusively from the host after the source world has
+  // been deleted. Repair prior duplicate copies here too, before Codex opens its
+  // persistent index; live-world transfer is not guaranteed to run.
+  if (provider === 'codex' && session)
+    await reconcileRemoteCodexSessionCopies(world, { absolute, relative }, session);
   const runtimeBin = await ensureRemoteNode(world);
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = configuredBrowser(localHome, provider);
@@ -103,7 +116,7 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
   for (const remoteFile of files) {
     const relative = remoteFile.slice(homePrefix.length);
     const session = provider === 'codex'
-      ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
+      ? (relative.startsWith('sessions/') || relative.startsWith('archived_sessions/')) && relative.endsWith('.jsonl')
       : relative.startsWith('projects/') && relative.endsWith('.jsonl');
     if (!auth.has(relative) && !session) continue;
     // Remote provider processes receive refresh-token-free projections. They are
@@ -441,7 +454,7 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
       // real E2B filesystem request time out. Durable config, skills, rules,
       // commands, hooks, and plugin manifests continue through this walk; the one
       // requested session is materialized separately below.
-      if (['projects', 'sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
+      if (['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
         || segments.some((segment) => ['cache', '.remote-plugin-install-staging'].includes(segment))
         || /^(?:logs?|state|goals|memories)(?:[_-].*)?\.sqlite(?:-(?:wal|shm))?$/.test(entry.name.toLowerCase())
         || ['history.jsonl', 'models_cache.json'].includes(entry.name.toLowerCase())) continue;
@@ -451,8 +464,12 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
     }
   };
   walk(root);
-  if (session) {
-    const sessionRoot = path.join(root, provider === 'codex' ? 'sessions' : 'projects');
+  if (session && provider === 'codex') {
+    const lineage = codexSessionFiles({ session, forkHome: root });
+    if (lineage) for (const file of lineage)
+      files.push({ relative: path.relative(root, file), content: fs.readFileSync(file) });
+  } else if (session) {
+    const sessionRoot = path.join(root, 'projects');
     const stack = [sessionRoot];
     while (stack.length) {
       const dir = stack.pop()!;
@@ -472,6 +489,14 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
   return files;
 }
 
+/** Rollout filenames retain their UUID even when moved between active, archived,
+ * and imported directories. Legacy non-UUID fixtures use their whole filename. */
+function codexRolloutIdentity(file: string): string | undefined {
+  if (!/^(sessions|archived_sessions)\//.test(file) || !file.endsWith('.jsonl')) return undefined;
+  const name = path.posix.basename(file);
+  return name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1] ?? name;
+}
+
 async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
   const result = await world.exec('bash', ['-lc',
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`]);
@@ -481,38 +506,61 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
     file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
 }
 
-/** Attach Karmax's host-mediated tools to a Codex rollout minted by another
- * client. Codex 0.144.x accepts dynamicTools only on thread/start; native
- * resume/fork reloads them from the first session_meta record instead. Patch
- * only the task-private sandbox copy so the original host transcript remains
- * byte-for-byte untouched. */
-export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
-  session: string, dynamicTools: unknown[]): Promise<boolean> {
-  if (!world.writeFileBuffer) return false;
-  const prefix = `${home.relative}/sessions/`;
-  const candidates = [...await remoteHomeFiles(world, home.absolute)]
-    .filter((file) => file.startsWith(prefix) && file.endsWith('.jsonl') && path.posix.basename(file).includes(session));
-  const sessionFile = candidates[0];
-  if (!sessionFile) return false;
-  const original = (await world.readFileBuffer(sessionFile)).toString('utf8');
-  const newline = original.indexOf('\n');
-  const first = newline < 0 ? original : original.slice(0, newline);
-  let metadata: any;
-  try { metadata = JSON.parse(first); }
-  catch { throw new Error(`Codex session ${session} has invalid rollout metadata`); }
-  if (metadata?.type !== 'session_meta' || !metadata.payload || typeof metadata.payload !== 'object')
-    throw new Error(`Codex session ${session} is missing its leading session_meta record`);
-  metadata.payload.dynamic_tools = dynamicTools;
-  const updated = `${JSON.stringify(metadata)}${newline < 0 ? '' : original.slice(newline)}`;
-  await world.writeFileBuffer(sessionFile, Buffer.from(updated));
-  const protectedFile = path.posix.join(world.handle.root, sessionFile);
-  const chmod = await world.exec('chmod', ['600', protectedFile]);
-  if (chmod.code !== 0) throw new Error(`could not protect patched Codex session ${session}: ${chmod.stderr || chmod.stdout}`);
-  return true;
+/** Repair stale aliases left by earlier seeding, including on host-only retries.
+ * Rollouts are append-only: remove a shorter copy only after verifying it is an
+ * exact byte prefix of the retained copy. Never guess between divergent histories.
+ * Validate the whole selected lineage before removing anything; leave unrelated
+ * sessions and Codex's derived SQLite indexes alone. */
+export async function reconcileRemoteCodexSessionCopies(world: World, home: RemoteAgentHome,
+  session: string): Promise<void> {
+  const prefix = `${home.relative}/`;
+  const files = [...await remoteHomeFiles(world, home.absolute)]
+    .filter((file) => file.startsWith(prefix) && codexRolloutIdentity(file.slice(prefix.length)));
+  const seen = new Set<string>();
+  const obsolete: string[] = [];
+  let current: string | undefined = session;
+  while (current) {
+    if (seen.has(current)) throw new Error(`Cyclic Codex rollout lineage for ${session}`);
+    seen.add(current);
+    const candidates: { file: string; content: Buffer }[] = [];
+    for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${current}.jsonl`)))
+      candidates.push({ file, content: await world.readFileBuffer(file) });
+    if (!candidates.length) break;
+    candidates.sort((a, b) => b.content.length - a.content.length || a.file.localeCompare(b.file));
+    const kept = candidates[0]!;
+    for (const other of candidates.slice(1)) {
+      if (!kept.content.subarray(0, other.content.length).equals(other.content))
+        throw new Error(`Conflicting Codex rollout copies for ${current}: histories diverge; refusing to discard either copy`);
+      obsolete.push(other.file);
+    }
+    current = codexHistoryBase(kept.content);
+  }
+  for (const file of obsolete) {
+    const result = await world.exec('rm', ['-f', '--', path.posix.join(world.handle.root, file)]);
+    if (result.code !== 0) throw new Error(`Could not remove stale Codex rollout copy ${file}: ${result.stderr || result.stdout}`);
+  }
 }
 
-/** Copy one native provider session between persistent cloud worlds. The source
- * remains untouched; only the requested session is exposed in the destination. */
+/** Prepare tools on a new rollout identity; never rewrite source bytes. */
+export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
+  session: string, dynamicTools: unknown[]): Promise<string | undefined> {
+  if (!world.writeFileBuffer) return undefined;
+  const candidates = [...await remoteHomeFiles(world, home.absolute)]
+    .filter((file) => (file.startsWith(`${home.relative}/sessions/`) || file.startsWith(`${home.relative}/archived_sessions/`))
+      && path.posix.basename(file).endsWith(`${session}.jsonl`));
+  const sessionFile = candidates[0];
+  if (!sessionFile) return undefined;
+  const updated = codexSessionWithTools(await world.readFileBuffer(sessionFile), dynamicTools);
+  if (!updated) return session;
+  const destination = `${home.relative}/sessions/forked/${updated.filename}`;
+  await world.writeFileBuffer(destination, updated.content);
+  const chmod = await world.exec('chmod', ['600', path.posix.join(world.handle.root, destination)]);
+  if (chmod.code !== 0) throw new Error(`could not protect prepared Codex session ${updated.session}: ${chmod.stderr || chmod.stdout}`);
+  return updated.session;
+}
+
+/** Copy a native session and its physical history dependencies between worlds.
+ * The source remains untouched; unrelated conversations are never copied. */
 export async function materializeRemoteSession(source: World, destination: World,
   provider: Provider, session: string, destinationLocalHome: string): Promise<boolean> {
   if (!destination.writeFileBuffer) return false;
@@ -530,17 +578,48 @@ export async function materializeRemoteSession(source: World, destination: World
   catch { return false; }
   const sourceFile = files.find((file) => provider === 'claude'
     ? file.includes('/projects/') && path.posix.basename(file) === `${session}.jsonl`
-    : file.includes('/sessions/') && path.posix.basename(file).includes(session) && file.endsWith('.jsonl'));
+    : (file.includes('/sessions/') || file.includes('/archived_sessions/')) && path.posix.basename(file).endsWith(`${session}.jsonl`));
   if (!sourceFile) return false;
   try {
+    const pending: { file: string; content: Buffer }[] = [];
+    let file: string | undefined = sourceFile;
+    const seen = new Set<string>();
+    // Stay within the selected source account home while resolving ancestors.
+    const sourceHome = sourceFile.split(/\/(?:sessions|archived_sessions)\//)[0];
+    while (file) {
+      if (seen.has(file)) return false;
+      seen.add(file);
+      const content = await source.readFileBuffer(file);
+      pending.push({ file, content });
+      const base = provider === 'codex' ? codexHistoryBase(content) : undefined;
+      if (!base) break;
+      file = files.find((candidate) =>
+        (candidate.startsWith(`${sourceHome}/sessions/`) || candidate.startsWith(`${sourceHome}/archived_sessions/`))
+        && path.posix.basename(candidate).endsWith(`${base}.jsonl`));
+      if (!file) return false;
+    }
     const destinationPrefix = `${remoteAgentHomeRelative(provider, destinationLocalHome)}/`;
-    const destinationFile = provider === 'claude'
-      ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
-      : `${destinationPrefix}sessions/forked/${path.posix.basename(sourceFile)}`;
-    await destination.writeFileBuffer(destinationFile, await source.readFileBuffer(sourceFile));
-    const protectedFile = path.posix.join(destination.handle.root, destinationFile);
-    const chmod = await destination.exec('chmod', ['600', protectedFile]);
-    return chmod.code === 0;
+    const existing = provider === 'codex'
+      ? await remoteHomeFiles(destination, path.posix.join(destination.handle.root, destinationPrefix))
+      : new Set<string>();
+    for (const entry of pending.reverse()) {
+      const destinationFile = provider === 'claude'
+        ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
+        : `${destinationPrefix}sessions/forked/${path.posix.basename(entry.file)}`;
+      await destination.writeFileBuffer(destinationFile, entry.content);
+      const protectedFile = path.posix.join(destination.handle.root, destinationFile);
+      const chmod = await destination.exec('chmod', ['600', protectedFile]);
+      if (chmod.code !== 0) return false;
+      // Repair worlds already affected by host seeding a stale duplicate. The
+      // source transfer is authoritative; keep exactly its copy for this ID.
+      const identity = codexRolloutIdentity(destinationFile.slice(destinationPrefix.length));
+      if (identity) for (const old of existing) {
+        if (old === destinationFile || codexRolloutIdentity(old.slice(destinationPrefix.length)) !== identity) continue;
+        const removed = await destination.exec('rm', ['-f', '--', path.posix.join(destination.handle.root, old)]);
+        if (removed.code !== 0) return false;
+      }
+    }
+    return true;
   } catch { return false; }
 }
 

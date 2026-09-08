@@ -50,6 +50,7 @@ import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorl
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
+import { agentTurnId } from './turn-id.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -114,8 +115,9 @@ export const collaborationSettledSignal = defineSignal<[string, Message]>('colla
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
 export const providerChangedSignal = defineSignal(SIG.providerChanged);
 export const confirmSignal = defineSignal('confirm');
-/** Explicit transition from Do/waiting-for-input into PR preparation. */
-export const openPrSignal = defineSignal('openPr');
+/** Explicit transition into PR preparation. Only the platform supplies a human
+ * identity; historical and agent signals have no deferred confirmation. */
+export const openPrSignal = defineSignal<[{ userId: string }?]>('openPr');
 /** Approve ONE branch of a multi-PR task at the head it has right now (SPEC §11.1).
  *  Lets a human confirm the finished branches and send a follow-up about the rest;
  *  the approval lapses by itself if the Do agent moves that branch afterwards. */
@@ -614,6 +616,9 @@ async function softwareDevImpl(
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
   let confirmed = false;
+  let manualPrConfirmer: string | undefined;
+  let escalationAction: 'openPr' | 'confirm' | undefined;
+  let manualEscalationRequested = false;
   let prRequested = recoveryStage === 'pr';
   // checkout name -> head sha it was approved at (multi-PR Review, PLAN-multi-pr.md §3).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
@@ -949,7 +954,9 @@ async function softwareDevImpl(
       case 'resolve':
         return [cancel];
       case 'escalated':
-        return [retry, followUp, cancel];
+        return [retry, ...(escalationAction === 'openPr'
+          ? [{ ...openPr, label: 'Commit changes, open & confirm PR' }]
+          : escalationAction === 'confirm' ? [confirm] : []), followUp, cancel];
       default:
         return [];
     }
@@ -1067,11 +1074,14 @@ async function softwareDevImpl(
     raise?: { type: ChildRaise['type'] };
     messagesSeen: number;
   }): Promise<'approved' | 'do' | 'cancelled'> {
+    let manualConfirmer = manualPrConfirmer;
+    manualPrConfirmer = undefined; // applies only to this proposal and one human layer
     if (clearsConfirmOnGate) confirmed = false;
 
     if (resourceCandidateReview) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
+      if (pending) manualConfirmer = undefined;
       const messagesAtWait = msgs.length;
       while (pending && !cancelled && msgs.length === messagesAtWait) {
         if (resourceResolutionEpoch !== resolutionAtWait) {
@@ -1156,6 +1166,15 @@ async function softwareDevImpl(
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
         };
         await publish();
+        // No new commands are emitted for historical openPr signals (no payload),
+        // so existing histories retain their original Review behavior.
+        if (manualConfirmer && confirmEpoch === epoch && msgs.length === options.messagesSeen && !cancelled) {
+          const userId = manualConfirmer;
+          manualConfirmer = undefined;
+          const approved = await core.confirmManualPr(taskId, userId);
+          if (approved && confirmEpoch === epoch && msgs.length === options.messagesSeen && !cancelled)
+            confirmed = true;
+        }
         await condition(() => confirmed || cancelled || msgs.length > options.messagesSeen || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return 'cancelled';
@@ -1218,6 +1237,7 @@ async function softwareDevImpl(
     return target.slice(Math.max(0, fromIndex));
   });
   setHandler(followUpSignal, (m, role) => {
+    manualPrConfirmer = undefined;
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript). A turn currently
@@ -1252,13 +1272,25 @@ async function softwareDevImpl(
   });
   setHandler(confirmSignal, () => {
     if (awaitingResourceDecision) return;
+    if (stage === 'escalated' && escalationAction) {
+      if (escalationAction === 'confirm') manualEscalationRequested = true;
+      return;
+    }
     confirmed = true;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
   });
-  setHandler(openPrSignal, () => {
+  setHandler(openPrSignal, (request) => {
+    if (stage === 'escalated' && escalationAction) {
+      if (escalationAction === 'openPr') {
+        manualEscalationRequested = true;
+        manualPrConfirmer = request?.userId;
+      }
+      return;
+    }
     if (!explicitPrCycle || stage !== 'do') return;
     prRequested = true;
+    manualPrConfirmer = request?.userId;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'openPr' };
   });
@@ -1301,10 +1333,18 @@ async function softwareDevImpl(
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
   setHandler(parentResponseSignal, (resp) => {
     if (resp.action === 'open_pr') {
+      if (stage === 'escalated' && escalationAction) {
+        if (escalationAction === 'openPr') manualEscalationRequested = true;
+        return;
+      }
       prRequested = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'openPr' };
     } else if (resp.action === 'confirm') {
+      if (stage === 'escalated' && escalationAction) {
+        if (escalationAction === 'confirm') manualEscalationRequested = true;
+        return;
+      }
       confirmed = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'confirm' };
@@ -1415,7 +1455,10 @@ async function softwareDevImpl(
   );
 
   // ── Resolve wrapper (SPEC §5.2) ──
-  async function withResolve<T>(stageName: string, fn: () => Promise<T>): Promise<T> {
+  async function withResolve<T>(stageName: string, fn: () => Promise<T>, manual?: {
+    action: 'openPr' | 'confirm';
+    finish: () => Promise<T>;
+  }): Promise<T> {
     // Usually identical to stageName, except the Confirm agent runs inside the
     // public Review stage. Preserve the actual UI stage for a later human retry.
     const resumeStage = stage;
@@ -1577,6 +1620,14 @@ async function softwareDevImpl(
       // Attempts exhausted → escalate. A child raises `blocked` to its parent (which
       // can retry/answer/cancel it); a top-level task escalates to a human. Either way
       // it stays resolvable — the v1 bug was a child blocking on a hidden human (§5.3).
+      if (manual && world && patched('software-dev-manual-error-proposal-v1')) {
+        const preserved = await core.buildReview(world as any, base).catch(() => undefined);
+        if (preserved?.changedFiles.length) {
+          reviewInfo = { ...reviewInfo, changedFiles: preserved.changedFiles };
+          escalationAction = manual.action;
+        }
+      }
+      manualEscalationRequested = false;
       stage = 'escalated';
       status = 'blocked';
       error = lastError;
@@ -1584,8 +1635,10 @@ async function softwareDevImpl(
       if (input.parentTaskId) {
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', lastError);
+      } else if (escalationAction) {
+        waitingFor = { kind: 'human', audience: ['@creator'] };
       }
-      // `escalated` advertises [retry, followUp, cancel] (see `allowed()`), so a
+      // Escalation keeps Retry and follow-up alongside any manual action, so a
       // follow-up MUST wake this park too. It used to sit invisibly in `msgs` until
       // someone separately clicked Retry — while the parent path already got this
       // right (a `comment` response sets `retryRequested`). Snapshot the transcript
@@ -1593,8 +1646,27 @@ async function softwareDevImpl(
       // the resumed stage re-runs with the follow-up already in the conversation.
       const seenAtEscalation = msgs.length;
       await publish();
-      await condition(() =>
-        retryRequested || cancelled || (followUpWakesEscalation && msgs.length > seenAtEscalation));
+      for (;;) {
+        await condition(() =>
+          retryRequested || cancelled || manualEscalationRequested
+          || (followUpWakesEscalation && msgs.length > seenAtEscalation));
+        if (!manualEscalationRequested || cancelled || !manual) break;
+        manualEscalationRequested = false;
+        try {
+          const result = await manual.finish();
+          escalationAction = undefined;
+          waitingFor = undefined;
+          stage = resumeStage;
+          status = 'active';
+          error = undefined;
+          return result;
+        } catch (err) {
+          if (cancelled || isCancellation(err)) throw err;
+          error = `Manual recovery failed: ${describeError(err)}`;
+          await publish();
+        }
+      }
+      escalationAction = undefined;
       waitingFor = undefined;
       if (cancelled) throw new Cancelled();
       // A human/parent retry resumes the stage that failed. Leaving this as
@@ -1742,13 +1814,13 @@ async function softwareDevImpl(
     // admission even when there is no configured account pool.
     if (accountPool <= 0) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
-      return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
+      return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
     const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
     const credentialProvider = typeof prov === 'string' && prov ? prov : undefined;
     if (!credentialProvider) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
-      return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
+      return await admittedTurn(agentTurnId(taskId, turnSeq++), undefined, status);
     }
     // Credential-policy allow-list for real providers (precedence + enable/disable,
     // resolved global→project→task); mock uses the coordinator's provider fallback.
@@ -1761,7 +1833,7 @@ async function softwareDevImpl(
       || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
         ? credentialProvider
         : undefined;
-    const turnId = `${taskId}#${turnSeq++}`;
+    const turnId = agentTurnId(taskId, turnSeq++);
     const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
     const priorStatus = status;
     status = 'waiting';
@@ -1770,7 +1842,9 @@ async function softwareDevImpl(
     // keep the historical account-wait state.
     waitingFor = lease?.waiting === false
       ? { kind: 'agentSlot', provider: displayProvider, detail: 'Starting agent' }
-      : { kind: 'account', provider: credentialProvider };
+      : { kind: 'account', provider: credentialProvider,
+          ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+          ...(lease?.detail ? { detail: lease.detail } : {}) };
     await publish();
     if (liveAgentStates) {
       // The coordinator owns refresh timers and signals every grant. An arbitrary
@@ -1922,6 +1996,22 @@ async function softwareDevImpl(
           ...admission,
         });
       }),
+      explicitPrCycle && stage === 'do' ? {
+        action: 'openPr',
+        finish: async () => {
+          const readiness = await core.checkProposal(world as any);
+          if (!readiness.ready && !readiness.dirty)
+            throw new Error(readiness.conflict ?? readiness.note ?? 'proposal validation failed');
+          if (readiness.dirty) {
+            const result = await core.commitWork(world as any, `Recover completed work: ${input.title}`);
+            if (!result.committed) throw new Error('could not commit the preserved changes');
+            const committed = await core.checkProposal(world as any);
+            if (!committed.ready)
+              throw new Error(committed.conflict ?? committed.dirty ?? committed.note ?? 'proposal validation failed');
+          }
+          return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
+        },
+      } : undefined,
     );
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
@@ -2034,7 +2124,7 @@ async function softwareDevImpl(
       transcript: lastOutputs(msgs),
     });
     confirmMsgs.push({ id: `c-in-${confirmMsgs.length}`, role: 'user', text: request, ts: confirmMsgs.length });
-    const ct = await withResolve('confirm', () =>
+    const ct = await withResolve<Awaited<ReturnType<typeof agentTurns.runAgentTurn>>>('confirm', () =>
       leasedTurn('confirm', (
         accountConfigHome,
         accountApiKeyHandle,
@@ -2067,6 +2157,13 @@ async function softwareDevImpl(
           ...admission,
         }),
       ),
+      stage === 'review' ? {
+        action: 'confirm',
+        finish: async () => {
+          confirmed = true;
+          return { completed: true, output: '' };
+        },
+      } : undefined,
     ).catch((e) => {
       if (isCancellation(e)) throw e;
       log.warn('confirm agent turn failed; falling back to the human gate', { e: String(e) });
@@ -2873,11 +2970,30 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (cancelled) return await abort();
         targetLocked = true;
         if (githubAuthoritativeMerge) {
-          const opened = await withResolve('pr', () => core.openPr(world as any, target, {
-            title: input.title,
-            summary: reviewInfo?.summary ?? lastOutputs(msgs),
-          }));
-          prs = opened ?? [];
+          const opened = await withResolve('pr', async () => {
+            try {
+              return { prs: await core.openPr(world as any, target, {
+                title: input.title,
+                summary: reviewInfo?.summary ?? lastOutputs(msgs),
+              }) };
+            } catch (err) {
+              if (failureHasType(err, 'task-branch-conflict')
+                && patched('software-dev-publication-conflict-do-repair-v1')) {
+                return { repair: describeError(err) };
+              }
+              throw err;
+            }
+          });
+          if (opened.repair) {
+            msgs.push({ id: `pr-conflict-${msgs.length}`, role: 'user', ts: msgs.length,
+              text: `Open PR needs a branch repair.\n${opened.repair}` });
+            prRequested = false;
+            branchPreparedForPr = false;
+            stage = 'do';
+            status = 'active';
+            continue;
+          }
+          prs = opened.prs ?? [];
           pr = prs[0];
         }
         branchPreparedForPr = true;

@@ -22,6 +22,7 @@ import { Gateway } from '../../src/gateway/server.js';
 import { CredentialBroker } from '../../src/autonomy/broker.js';
 import { Vault } from '../../src/autonomy/vault.js';
 import { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
+import { retryCredentials } from '../../src/agent/credential-health.js';
 import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
 import { LoginManager, type LoginCommand } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
@@ -74,6 +75,7 @@ export async function bootHarness(
   /** Activity-dep overrides a test needs the worker to run with (e.g. a stub
    *  GitHub endpoint for the pull-request integration). */
   overrides: {
+    configHomes?: ConfigHomeManager;
     githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService;
   } = {},
@@ -136,7 +138,11 @@ export async function bootHarness(
   let runPromise = worker.run();
   let serverStopped = false;
 
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds });
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds,
+    refreshCredentialHealth: async (task, credentialProvider) => {
+      if (credentialProvider) await retryCredentials({ store, client, taskQueue: TASK_QUEUE, broker, configHomes: overrides.configHomes }, task, credentialProvider);
+    },
+  });
   const gateways: Array<() => Promise<void>> = [];
 
   return {
@@ -157,7 +163,7 @@ export async function bootHarness(
       runPromise = worker.run();
     },
     async startGateway(opts) {
-      const configHomes = new ConfigHomeManager(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-homes-')));
+      const configHomes = overrides.configHomes ?? new ConfigHomeManager(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-homes-')));
       // fake login command (no real CLI / OAuth): print a device URL then exit
       const login = new LoginManager(configHomes, opts?.loginCommand ?? (() => ({
         cmd: 'bash',

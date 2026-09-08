@@ -7,7 +7,6 @@ import { ExternalWorkflowRef } from './bundle.js';
 import { WORKFLOW_TYPE, qualifiedType } from '../workflows/names.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import { bundledStart, StartResolution } from '../platform/resolve-start.js';
-import { allows } from '../platform/capabilities.js';
 import { isolatedGitEnvironment } from '../world/git.js';
 
 /** One installed package, persisted so it can be reloaded at boot from disk. */
@@ -36,8 +35,8 @@ export interface WorkflowSummary {
  * package loads it, registers it, and rolls the worker (§21e) so new tasks can
  * run it. The bundled built-ins remain compiled-in; installs bring *new*
  * workflow names. Upgrading a built-in over git is deliberately out of scope
- * here — that needs the built-ins to first become loadable packages, and goes
- * through the reviewed-PR edit gate (§4.4), not a blind overwrite.
+ * here: built-ins change only with a platform release. External code is a
+ * trusted self-host extension, never a tenant sandbox.
  */
 export class WorkflowManager {
   private external = new Map<string, ExternalWorkflowRef>(); // type → bundle ref
@@ -53,6 +52,8 @@ export class WorkflowManager {
     private cacheHome?: string,
     /** Organization Git-profile credentials, resolved only for the install fetch. */
     private gitEnvironment?: (organizationId: string) => Record<string, string>,
+    /** External code shares the control-plane worker; never enable it for SaaS tenants. */
+    private hosted = false,
   ) {
     this.stores.set('org_personal', store);
   }
@@ -62,12 +63,8 @@ export class WorkflowManager {
   }
 
   /**
-   * Read the install registry, dropping anything that is not a well-formed
-   * record. `restore()` feeds `r.dir` to the manifest reader (which on a
-   * host-local install may `import()` a `manifest.ts`) and then bundles the
-   * snapshot's workflow code into the worker — so an unvalidated registry would
-   * load whatever a writer of `installed.json` pointed at. Every record must
-   * therefore have string fields and a `dir` confined under the cache home.
+   * Read only well-formed records confined to the package cache. Registry paths
+   * eventually become worker bundle inputs and must not select arbitrary files.
    */
   private readRegistry(): InstalledRecord[] {
     const f = this.registryFile;
@@ -127,14 +124,15 @@ export class WorkflowManager {
    * worker to serve it. Refuses to shadow a built-in name.
    */
   async install(spec: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
+    if (this.hosted) throw new Error('External workflow code is disabled in hosted deployments');
     // Peek at the name to reject built-in collisions before doing the fetch when possible.
-    if (spec.name && isBuiltInWorkflowName(spec.name)) throw new Error(`"${spec.name}" is a built-in workflow; edit it through the PR gate, not install`);
+    if (spec.name && isBuiltInWorkflowName(spec.name)) throw new Error(`"${spec.name}" is a built-in workflow; built-ins change only with a platform release`);
     // Load + validate WITHOUT registering yet — a rejected package must not touch state.
     const pkg = await this.loader.load(spec, undefined, organizationId, {
       ...(organizationId === 'org_personal' ? {} : isolatedGitEnvironment()),
       ...(this.gitEnvironment?.(organizationId) ?? {}),
     });
-    if (isBuiltInWorkflowName(pkg.manifest.name)) throw new Error(`"${pkg.manifest.name}" is a built-in workflow; edit it through the PR gate, not install`);
+    if (isBuiltInWorkflowName(pkg.manifest.name)) throw new Error(`"${pkg.manifest.name}" is a built-in workflow; built-ins change only with a platform release`);
     if (!pkg.workflowEntry) throw new Error(`package "${pkg.manifest.name}" ships no workflow module (workflow.ts|js|mjs)`);
     const type = externalWorkflowType(organizationId, pkg.manifest.name, pkg.manifest.version);
     // Version identity is load-bearing: a task pinned to name@version replays that
@@ -178,12 +176,15 @@ export class WorkflowManager {
    * snapshot that has gone missing is skipped (reported to `onWarn`).
    */
   async restore(onWarn: (msg: string) => void = () => {}): Promise<number> {
+    if (this.hosted) {
+      if (this.readRegistry().length) onWarn('External workflow restore disabled in hosted deployments; existing external executions require migration');
+      return 0;
+    }
     const records = this.readRegistry();
     let loaded = 0;
     for (const r of records) {
       try {
-        // `readRegistry` already confined `dir`, but re-assert here before the
-        // snapshot's workflow code is bundled.
+        // Reassert confinement before reading the manifest and selecting code.
         if (!this.underCacheHome(r.dir)) throw new Error('snapshot outside the workflow cache');
         if (!fs.existsSync(r.dir)) throw new Error('snapshot missing');
         // A version is "pinned by commit SHA", so the record must point at the
@@ -316,45 +317,4 @@ export function externalWorkflowType(organizationId: string, name: string, versi
 /** The workflow module's export to use as the durable function (default when unset). */
 function manifestExport(m: WorkflowManifest): string | undefined {
   return (m as { entrypoint?: string }).entrypoint;
-}
-
-/**
- * The self-healing loop (§4.4): when a workflow-edit merge task completes, this
- * returns the install spec to reload the edited workflow from its now-merged
- * repo — or undefined if the task wasn't a workflow edit or didn't succeed. Kept
- * pure so the boot wiring is a thin bus listener over it. The reload itself is
- * guarded by the version-bump rule in `install`, so a merge that forgot to bump
- * the version fails loudly instead of swapping code under running tasks.
- */
-export function reloadSpecForWorkflowEdit(
-  task: { params?: Record<string, unknown> },
-  status: string,
-): { url: string; ref?: string } | undefined {
-  if (status !== 'done') return undefined;
-  const p = task.params ?? {};
-  if (!p.workflowEdit || typeof p.repo !== 'string' || !p.repo) return undefined;
-  if (!proposerMayInstall(task)) return undefined;
-  return { url: p.repo, ref: typeof p.target === 'string' ? p.target : undefined };
-}
-
-/**
- * Whether the principal who proposed this workflow edit was allowed to *install*
- * workflow code, not merely edit it.
- *
- * `proposeWorkflowEdit` requires only `workflow:edit` and stores the caller's
- * arbitrary `repo` URL on the task. The self-heal loop then feeds that URL to
- * `install()`, which clones and bundles it into the worker — so without this
- * check `workflow:edit` silently reaches `workflow:install`. That is a real
- * escalation: `workflow:edit` sits inside `PROJECT_GRANT_CEILING` while
- * `workflow:install` is deliberately outside it (src/platform/authorization.ts),
- * and the reviewed-PR gate reviews the branch diff, never the repo URL string.
- *
- * The capabilities are read from the `_authorization` snapshot recorded on the
- * task at proposal time, so revoking a grant later cannot retroactively license
- * an install, and a task carrying no snapshot is refused rather than trusted.
- */
-export function proposerMayInstall(task: { params?: Record<string, unknown> }): boolean {
-  const authorization = (task.params ?? {})._authorization as { capabilities?: unknown } | undefined;
-  const caps = Array.isArray(authorization?.capabilities) ? (authorization!.capabilities as string[]) : [];
-  return allows(caps, 'workflow:install');
 }

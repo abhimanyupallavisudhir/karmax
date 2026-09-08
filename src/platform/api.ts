@@ -1,3 +1,5 @@
+import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
+import { recordHumanConfirmation } from './review-confirmation.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
@@ -21,6 +23,7 @@ import {
   SIG_SET_AGENT_CAPACITY,
   QRY_AGENT_QUEUE,
   QRY_ACCOUNT_TASK_LEASES,
+  QRY_ACCOUNT_LEASE,
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
@@ -320,7 +323,7 @@ export interface KarmaxApiDeps {
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
   bus?: KarmaxBus;
-  /** Revalidate provider-native login health before replaying a credential
+  /** Re-arm eligible automatic credential quarantines before replaying a credential
    * escalation. Production supplies this; lightweight API tests may omit it. */
   refreshCredentialHealth?: (task: TaskRecord, provider?: string) => Promise<void>;
 }
@@ -596,7 +599,8 @@ export class KarmaxApi {
       for (const repair of ancestry.repaired) {
         this.deps.store.appendEvent({ taskId: task.id, type: 'branch.ancestry-repaired', ts: Date.now(), payload: repair });
       }
-      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
+      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId),
+        expectedTaskRemoteHeads(this.deps.store, task.id), recordTaskPublication(this.deps.store, task.id));
       if (!result.pushed.length || result.skipped.length)
         throw new Error(`could not publish ${result.skipped.length ? describePublishFailures(result) : 'task branch'}`);
       const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
@@ -2183,8 +2187,23 @@ export class KarmaxApi {
     // Cosmetic notes and the queue-time effective agent snapshot live outside the
     // workflow history, so mirror both onto whichever view we return. Keeping the
     // agent snapshot platform-side avoids changing immutable workflow replay payloads.
-    const enrich = (view: TaskView | undefined): TaskView | undefined => {
+    const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
+      // Existing parked executions recorded only "account". Read the small
+      // coordinator projection to explain that wait without replaying the task
+      // or restarting its agent. New lease results already carry this detail.
+      if (view.waitingFor?.kind === 'account' && !view.waitingFor.detail) {
+        try {
+          const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
+            .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
+              waiting: boolean; earliestResetAt?: number; detail?: string;
+            }>, 500);
+          if (lease.waiting && lease.detail) view = { ...view, waitingFor: {
+            ...view.waitingFor, detail: lease.detail,
+            ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+          } };
+        } catch { /* A coordinator outage must not block reading the task. */ }
+      }
       const agents = this.readAgentSnapshot(taskId);
       const task = this.deps.store.getTask(taskId);
       return {
@@ -3940,10 +3959,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       && heldView.status === 'blocked') {
       const credentialFailure = heldView.error?.match(/No usable\s+([^\s]+)\s+credential\b.*needs attention/i);
       if (credentialFailure) {
-        // Retry is the user's explicit request to try the credential again. A
-        // stale needs-attention bit must not deny the turn before the provider's
-        // native, non-billable health endpoint gets a chance to clear it.
-        await this.deps.refreshCredentialHealth?.(scopedTask, credentialFailure[1]).catch(() => undefined);
+        // Retry explicitly permits another provider attempt, including credentials
+        // with no usage endpoint. Await the quarantine update before signalling;
+        // a failed update must not silently retry against the same denial.
+        await this.deps.refreshCredentialHealth?.(scopedTask, credentialFailure[1]);
       }
     }
     const heldOrigin =
@@ -3974,26 +3993,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         throw new CapabilityError('only a human selected by this workflow step, or an agent authorized with review:approve, can confirm');
       if (userId && !this.deps.store.humanMayAct(taskId, userId))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
-      // Approving one branch and opening the proposal are not Review confirmation
-      // decisions — only `confirm`
-      // passes the gate, so only `confirm` is journalled as the decision.
+      // Opening a proposal defers its confirmation until Review is ready.
+      // Only a direct Confirm decision is journalled at this point.
       if (signal === SIG.confirm) {
-        this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
-          payload: {
-            userId: userId ?? caller.principal, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
-            githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && (scopedTask.lastView.stage === 'review' || scopedTask.lastView.stage === 'merge')),
-            // Current software-dev treats a Review confirmation as durable
-            // authorization of the task intent, including bounded automated
-            // integration repairs. An exceptional Landing confirmation still
-            // records the exact current heads below for strict GitHub policy.
-            githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
-              && scopedTask.lastView.stage === 'review'),
-            githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
-              slug: ref.slug, number: ref.number, headSha: ref.headSha,
-            })),
-          } });
+        recordHumanConfirmation(this.deps.store, taskId, userId ?? caller.principal);
       }
     } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
@@ -4206,6 +4209,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         // accepted message separately so every open conversation can render it
         // mid-turn without changing replay-sensitive workflow command histories.
         this.publishConversationMessage(taskId, role, followUp);
+      } else if (signal === SIG.openPr && caller.principal.startsWith('user:')) {
+        await handle.signal(signal, { userId: caller.principal.slice(5) });
       } else if (signal === SIG.approveCheckout) {
         await handle.signal(signal, { name: text ?? '' });
       } else {
@@ -5072,6 +5077,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     args: { projectId: string; title: string; repo: string; branch: string; target: string },
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'edit_workflow', { projectId: args.projectId });
+    if (this.deps.hosted) throw new CapabilityError('Workflow code editing is disabled in hosted deployments; built-ins change only with a platform release');
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const mergeOnly = MANIFESTS.find((m) => m.name === 'merge-only');
@@ -5090,8 +5096,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       title: args.title,
       workflow: 'merge-only',
       workflowVersion: mergeOnlyVersion,
-      // Record the edit target so the self-healing loop can reload the workflow
-      // from `repo@target` once this merge completes (§4.4).
+      // Record the edit target for review. Activation requires a separate install.
       params: {
         prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
         _authorization: { ...authorization, principal: caller.principal },
@@ -5197,6 +5202,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    */
   async installWorkflow(token: string, args: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
     this.require(token, 'install_workflow', { organizationId });
+    if (this.deps.hosted) throw new CapabilityError('External workflow code is disabled in hosted deployments');
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args, organizationId);
   }

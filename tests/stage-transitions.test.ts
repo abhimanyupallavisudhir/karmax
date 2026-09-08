@@ -108,6 +108,14 @@ describe('task stage transitions', () => {
     expect(order).toEqual(['health', 'retry']);
   });
 
+  it('does not signal Retry when rearming the credential fails', async () => {
+    const f = fixture(async () => { throw new Error('coordinator unavailable'); });
+    f.store.saveView(f.task.id, { ...f.view, stage: 'escalated', status: 'blocked',
+      error: 'No usable claude credential — every allowed login/key needs attention.' });
+    await expect(f.api.signalTask(f.token, f.task.id, 'retry')).rejects.toThrow('coordinator unavailable');
+    expect(f.signalled).toEqual([]);
+  });
+
   it('force-stops a wedged Setup cancellation and releases its runner capacity', async () => {
     const f = fixture();
     f.store.setTaskWorkflowVersion(f.task.id, '1.25.0');
@@ -618,6 +626,26 @@ describe('task stage transitions', () => {
     expect(recovery.pausedForHuman).toBeUndefined();
   });
 
+  it('records manual confirmation of an escalated reviewer as GitHub merge authorization', async () => {
+    const f = fixture();
+    f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));
+    f.store.saveView(f.task.id, {
+      ...f.view, stage: 'escalated', status: 'blocked',
+      prs: [{ repo: 'repo', slug: 'owner/repo', number: 52, url: 'https://github.test/owner/repo/pull/52', state: 'open', headSha: 'abc123' }],
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true }],
+    });
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+    expect(f.signalled).toContainEqual({ id: f.task.id, signal: 'confirm', args: [] });
+    expect(f.starts).toHaveLength(0);
+    expect(f.store.eventsSince(f.task.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'task.confirmation-voted', payload: expect.objectContaining({
+        githubMergeAuthorized: true, githubMergeIntentAuthorized: true,
+        githubPrHeads: [{ slug: 'owner/repo', number: 52, headSha: 'abc123' }],
+      }) }),
+    ]));
+  });
+
   it.each(['1.16.0', '1.17.0', '1.18.0', '1.19.0', '1.20.0'])('upgrades a %s task at its successful Review boundary into participant Landing', async (version) => {
     const f = fixture();
     f.store.setTaskWorkflowVersion(f.task.id, version);
@@ -738,7 +766,7 @@ describe('task stage transitions', () => {
     });
 
     await f.api.signalTask(f.token, f.task.id, 'openPr');
-    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr' });
+    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr', args: [{ userId: 'test' }] });
   });
 
   it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {

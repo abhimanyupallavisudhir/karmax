@@ -1,7 +1,7 @@
 /** The instance-wide brand icon. Each id is a directory under `web/brand/`
  * holding the same asset filenames, so switching the setting reskins the
  * favicon, the installed-app icon and the in-app mark from one place. */
-export const BRAND_ICONS = ['diamond', 'knot', 'check', 'check-arrow', 'clover'] as const;
+export const BRAND_ICONS = ['diamond', 'knot', 'check', 'check-arrow', 'check-knot', 'check-knot-tilted', 'check-knot-purple', 'check-knot-purple-arrow', 'clover'] as const;
 
 export type BrandIcon = (typeof BRAND_ICONS)[number];
 

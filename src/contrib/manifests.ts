@@ -429,7 +429,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { slot: 'project-settings', tier: 2, component: 'software-dev-settings', title: 'Software dev' },
     ],
     commands: [
-      { id: 'task.openPr', title: 'Manually Open PR', keybinding: 'o' },
+      { id: 'task.openPr', title: 'Manually Open & Confirm PR', keybinding: 'o' },
       { id: 'task.confirm', title: 'Confirm PR', keybinding: 'c' },
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
