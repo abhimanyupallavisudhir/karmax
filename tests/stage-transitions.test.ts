@@ -746,6 +746,20 @@ describe('task stage transitions', () => {
     expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr', args: [{ userId: 'test' }] });
   });
 
+  it('does not turn a delegated agent PR request into a human confirmation', async () => {
+    const f = fixture();
+    const agentToken = f.tokens.mint({
+      taskId: f.task.id, profileId: 'do', role: 'do', principal: 'user:test',
+      projectId: f.project.id, ceiling: ['task:signal'], grantorCaps: ['task:signal'],
+    }).token;
+
+    await f.api.signalTask(agentToken, f.task.id, 'openPr');
+
+    expect(f.signalled.at(-1)).toEqual({ id: f.task.id, signal: 'openPr', args: [] });
+    expect(f.store.eventsSince(f.task.id, 0).filter((e) => e.type === 'task.confirmation-voted')).toEqual([]);
+    f.store.close();
+  });
+
   it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {
     const f = fixture();
     f.store.saveView(f.task.id, {

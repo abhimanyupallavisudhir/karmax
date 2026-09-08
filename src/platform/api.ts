@@ -4156,7 +4156,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         // accepted message separately so every open conversation can render it
         // mid-turn without changing replay-sensitive workflow command histories.
         this.publishConversationMessage(taskId, role, followUp);
-      } else if (signal === SIG.openPr && caller.principal.startsWith('user:')) {
+      } else if (signal === SIG.openPr && caller.kind === 'human' && caller.principal.startsWith('user:')) {
+        // Delegated task agents also carry their grantor's user principal.
+        // Only a human action may pre-authorize the subsequent Review gate.
         await handle.signal(signal, { userId: caller.principal.slice(5) });
       } else if (signal === SIG.approveCheckout) {
         await handle.signal(signal, { name: text ?? '' });
