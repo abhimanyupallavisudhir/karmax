@@ -113,23 +113,32 @@ it.each(['live source', 'deleted source'])('forks and resumes nested lineage wit
       const destination = diskWorld(path.join(dir, `destination-${generation}`));
       const relative = remoteAgentHomeRelative('codex', host);
       // Reproduce an already-failed world's stale dated copy as well as a new world.
-      if (generation === 1) await destination.writeFileBuffer!(
+      if (generation === 1 && scenario === 'live source') await destination.writeFileBuffer!(
         `${relative}/${path.relative(host, stale)}`, staleBytes);
       if (generation === 1 && scenario === 'deleted source') {
         // Keep both files and a real persisted Codex index from an earlier
         // attempt. The source task has now landed, so its sandbox is gone and
         // only host-cache preparation can repair these existing aliases.
-        for (const file of rollouts(host)) await destination.writeFileBuffer!(
-          `${relative}/${path.relative(host, file)}`, fs.readFileSync(file));
-        const parentFile = rollouts(host).find((file) => file.endsWith(`${parent}.jsonl`))!;
-        await destination.writeFileBuffer!(`${relative}/sessions/forked/${path.basename(parentFile)}`, fs.readFileSync(parentFile));
-        await destination.writeFileBuffer!(`${relative}/${path.relative(host, parentFile)}`, staleParent!);
+        // Warm the index while the lineage is valid. Installing stale aliases
+        // first makes this setup resume itself fail nondeterministically,
+        // before the production repair has a chance to run.
+        const fromHome = path.join(from.handle.root, relative);
+        for (const file of rollouts(fromHome)) await destination.writeFileBuffer!(
+          `${relative}/sessions/forked/${path.basename(file)}`, fs.readFileSync(file));
+        const parentFile = rollouts(fromHome).find((file) => file.endsWith(`${parent}.jsonl`))!;
         await destination.writeFile(`${relative}/config.toml`, fs.readFileSync(path.join(host, 'config.toml'), 'utf8'));
         await appServer(path.join(destination.handle.root, relative), async (client) => {
           await client.request('thread/resume', { threadId: parent,
             path: path.join(destination.handle.root, relative, 'sessions/forked', path.basename(parentFile)),
             cwd: destination.handle.root, approvalPolicy: 'never', sandbox: 'danger-full-access' });
         });
+        await destination.writeFileBuffer!(`${relative}/${path.relative(host, stale)}`, staleBytes);
+        const staleParentPath = `${relative}/sessions/stale/${path.basename(parentFile)}`;
+        expect(fs.readFileSync(parentFile).length).toBeGreaterThan(staleParent!.length);
+        expect(fs.readFileSync(parentFile).subarray(0, staleParent!.length)).toEqual(staleParent);
+        await destination.writeFileBuffer!(staleParentPath, staleParent!);
+        expect(rollouts(path.join(destination.handle.root, relative))
+          .filter((file) => file.endsWith(`${parent}.jsonl`))).toHaveLength(2);
         fs.rmSync(from.handle.root, { recursive: true, force: true });
       } else {
         expect(await materializeRemoteSession(from, destination, 'codex', parent, host)).toBe(true);
