@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { git, gitOrThrow } from '../world/git.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { parseManifest } from './schema.js';
@@ -26,7 +25,12 @@ export interface LoadedPackage {
 }
 
 /** Manifest filenames tried in order — JSON first (pure data, no code executed). */
-const MANIFEST_NAMES = ['manifest.json', 'manifest.mjs', 'manifest.js', 'manifest.ts'];
+/** A manifest is data. Earlier releases also accepted `manifest.mjs`/`.js`/`.ts`
+ *  and `import()`ed them in the host process at install time — code from any
+ *  git URL a `workflow:install` holder pointed at ran on the control plane with
+ *  no review in between. Workflow code itself is only ever bundled into the
+ *  deterministic sandbox; the manifest gets the same treatment by not executing. */
+const MANIFEST_NAMES = ['manifest.json'];
 const WORKFLOW_NAMES = ['workflow.mjs', 'workflow.js', 'workflow.ts'];
 
 /**
@@ -188,21 +192,11 @@ function firstExisting(dir: string, names: string[]): string | undefined {
   return undefined;
 }
 
-/** Read + validate the package manifest. JSON is parsed; a module is imported. */
+/** Read + validate the package manifest (JSON only; see MANIFEST_NAMES). */
 async function readManifest(dir: string): Promise<WorkflowManifest> {
   const file = firstExisting(dir, MANIFEST_NAMES);
   if (!file) throw new Error(`no manifest (${MANIFEST_NAMES.join(' / ')}) in ${dir}`);
-  let data: unknown;
-  if (file.endsWith('.json')) {
-    data = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } else {
-    // A manifest module exports the manifest as default or as `manifest`. This
-    // runs the module in the host process (not the deterministic sandbox); the
-    // PR review gate (§4.4) is the trust boundary for what gets loaded at all.
-    const mod = await import(pathToFileURL(file).href);
-    data = mod.default ?? mod.manifest ?? mod;
-  }
-  return parseManifest(data);
+  return parseManifest(JSON.parse(fs.readFileSync(file, 'utf8')));
 }
 
 /** Extract a tarball with the `tar` CLI (present on the platforms we target). */

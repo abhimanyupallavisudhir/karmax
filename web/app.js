@@ -76,7 +76,7 @@ const S = {
   selected: null, // taskId of the open task page (null when a list view is showing)
   viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'|'advanced'; null → auto)
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'approvals'|'parameters'; null → auto)
   taskFile: null, // URL-owned agent citation handoff ({ path, line? }); null on the ordinary task page
   taskFileLoad: null, // { key, status, result|error } for the current handoff page
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
@@ -149,12 +149,16 @@ function rememberInteractionOrigin(event) {
   // Keep the original control as the event target (pointer-events:none can send
   // a repeat click through to a clickable row underneath). Swallow repeats at
   // capture time while the first request is visibly pending.
+  // Only activation keys count; ordinary typing must never be swallowed, and a
+  // paste/drop into a text field is an upload, not an action on that field —
+  // marking it pending would disable the field the user is typing in.
+  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+  if ((event.type === 'paste' || event.type === 'drop') && /^(?:INPUT|TEXTAREA)$/.test(control.tagName || '')) return;
   if (control.classList?.contains('action-pending')) {
     event.preventDefault?.();
     event.stopImmediatePropagation?.();
     return;
   }
-  if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
   const epoch = ++interactionOriginEpoch;
   interactionOrigin = control;
   queueMicrotask(() => {
@@ -2885,6 +2889,7 @@ async function loadCollaboration() {
   S.announcedOrganizationId = organizationId;
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
+  if (S.tab === 'inbox' && !S.selected) bgRenderMain();
 }
 
 async function loadTasks() {
@@ -3155,10 +3160,11 @@ function normalizeQuery(q) { return stringifyQuery(parseQueryClient(q || '')); }
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
+// Membership/metadata changes the compact row projection cannot express. A
+// `view.updated` for a task the list has never seen (created elsewhere, or by an
+// agent) is handled separately in connectWs.
 const LIST_RELOAD_EVENTS = new Set([
-  'task.created',
-  'task.deleted',
-  'task.tags-changed',
+  'subtask.created',
   'task.responsibility-changed',
   'credential.approval-requested',
   'credential.approval-resolved',
@@ -3224,6 +3230,10 @@ function patchTaskListFromEvent(ev) {
     || turnKey(previous.agentTurn) !== turnKey(next.agentTurn);
 }
 
+/** Tabs that belong to the selected project (the rail highlights it, the main
+ *  pane shows its tab bar). One list so the two never drift apart again. */
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+
 function scheduleTaskListReload() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
@@ -3251,8 +3261,7 @@ function connectWs() {
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message' || ev.type === 'conversation.explanation') {
-        if (S.taskTab === 'checkin') scheduleTaskPageRender();
-        else renderTaskEvents();
+        scheduleTaskPageRender();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
@@ -3260,7 +3269,7 @@ function connectWs() {
         refreshTask();
       } else if (ev.type === 'session.started') {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
-      } else renderTaskEvents();
+      } else scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
     }
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
@@ -3268,7 +3277,9 @@ function connectWs() {
       if (S.tab === 'tasks' && !S.selected) scheduleSearch();
       if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
       renderRail();
-    } else if (LIST_RELOAD_EVENTS.has(ev.type)) {
+    } else if (LIST_RELOAD_EVENTS.has(ev.type)
+      || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
+        && (!ev.payload?.projectId || ev.payload.projectId === S.projectId))) {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
@@ -3276,24 +3287,33 @@ function connectWs() {
     // organization endpoints for every workflow view transition multiplied the
     // websocket refresh storm without changing any of that data.
     if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested',
-      'permission.approval-requested', 'authorization.approval-requested',
+      'permission.approval-requested', 'authorization.approval-requested', 'credential.approval-resolved',
       'permission.approval-resolved', 'authorization.approval-resolved'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
+    if (ev.type.startsWith('credential.approval-') && refreshVaultRequests) refreshVaultRequests().catch?.(() => {});
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
   // queue, activity feed) is driven only by this socket. A silent drop left the
   // page showing stale state as if it were truth, and events missed during the
   // gap were never re-fetched. Surface the gap, and backfill on reconnect.
   ws.onopen = () => {
+    wsRetryMs = 1500;
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
     wsHadDropped = false;
   };
-  ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
+  ws.onclose = () => {
+    wsHadDropped = true; setWsOnline(false);
+    // Back off while the gateway is down (a restart, an expired session) instead
+    // of hammering it from every open tab at a fixed 1.5 s.
+    setTimeout(connectWs, wsRetryMs);
+    wsRetryMs = Math.min(wsRetryMs * 2, 30_000);
+  };
 }
 
 let wsHadDropped = false;
+let wsRetryMs = 1500; // reconnect delay; doubles per failed attempt up to 30 s, reset on open
 function setWsOnline(online) {
   S.wsOnline = online;
   document.getElementById('ws-offline')?.classList.toggle('hidden', online);
@@ -3753,7 +3773,7 @@ function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
   if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
+  const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
   // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
   // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
@@ -3960,6 +3980,12 @@ function flushBgRender() {
 // WS-driven repaints into one per animation frame: the last state wins and the
 // browser paints once, at a frame boundary.
 let taskPageRenderQueued = false;
+function summarize(p) {
+  if (!p) return '';
+  if (p.text) return p.text.slice(0, 160);
+  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
+}
+
 function scheduleTaskPageRender() {
   if (taskPageRenderQueued) return;
   taskPageRenderQueued = true;
@@ -3992,7 +4018,7 @@ function renderMain() {
   // absent from user-facing navigation.
   const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings'];
   const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', avatars: 'Avatars', settings: 'Project settings' };
-  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'].includes(S.tab);
+  const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
@@ -4755,11 +4781,15 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     clearTimeout(deb);
     deb = setTimeout(run, typing ? 180 : 0); // keystrokes coalesce; clicks apply at once
   };
+  let runEpoch = 0;
   async function run() {
+    const epoch = ++runEpoch;
+    let next;
     try {
-      const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
-      result = r;
-    } catch { result = { tasks: [] }; }
+      next = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
+    } catch { next = { tasks: [] }; }
+    if (epoch !== runEpoch) return; // a newer query (a click after a slow keystroke) already owns the list
+    result = next;
     hi = 0;
     paintList();
   }
@@ -6509,7 +6539,10 @@ function closeTask() {
   const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
   const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('dashboard'));
   S.returnRoute = null;
-  return go(back, { replace: true });
+  // A push, not a replace: Back after closing reopens the task that was just
+  // closed, and Back from the task page returns to the list — the history a
+  // user expects. Replacing left two identical list entries, so Back did nothing.
+  return go(back);
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
@@ -6525,6 +6558,7 @@ function closeTaskDom() {
   S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
+  if (reviewActionWs) { try { reviewActionWs.close(); } catch {} reviewActionWs = null; } // …and stops streaming a review action into the next page
 }
 
 // A task's organizational metadata (priority + tags). Both are purely for
@@ -6855,8 +6889,6 @@ function renderTaskPage() {
     wireParams(v);
     wireTaskAuthorization(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
-  } else if (tab === 'advanced') {
-    renderTaskEvents();
   }
   wireCopyButtons();
   // Restore the pre-render scroll offsets + focus so the box the user was working
@@ -6993,7 +7025,6 @@ function taskTabBody(v, tab) {
   if (tab === 'checkin') return checkinTab(v);
   if (tab === 'approvals') return approvalRequestsTab(v);
   if (tab === 'parameters') return parametersTab(v);
-  if (tab === 'advanced') return advancedTab(v);
   return overviewTab(v);
 }
 
@@ -7348,15 +7379,49 @@ function reviewActionBtn(a, i) {
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
+/** Ask for a secret in a masked field. `window.prompt` shows the value in clear
+ *  and keeps it in the browser's prompt history; every other secret input in the
+ *  console is `type="password"`, so this one is too. Resolves null on cancel. */
+function promptSecret(title, hint) {
+  return new Promise((resolve) => {
+    const host = document.createElement('div'); $('#modal-root').appendChild(host);
+    host.innerHTML = `<div class="palette-scrim secret-prompt-scrim"><form class="palette picker" style="max-width:480px">
+      <div class="fp-head">${esc(title)} <span class="q-spacer"></span><button type="button" class="icon-btn secret-prompt-close">✕</button></div>
+      ${hint ? `<p class="task-sub">${esc(hint)}</p>` : ''}
+      <input type="password" class="secret-prompt-value" autocomplete="off" spellcheck="false" placeholder="New value" style="width:100%">
+      <div class="inline-form" style="margin-top:10px;justify-content:flex-end"><button type="submit" class="btn sm primary">Save</button></div>
+    </form></div>`;
+    const done = (value) => { host.remove(); resolve(value); };
+    host.querySelector('.secret-prompt-close').addEventListener('click', () => done(null));
+    host.querySelector('.secret-prompt-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) done(null); });
+    host.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); done(host.querySelector('.secret-prompt-value').value || null); });
+    host.querySelector('.secret-prompt-value').focus();
+  });
+}
+
 let reviewActionWs = null;
+// Types a browser renders without running anything. A `blob:` URL created here
+// carries THIS page's origin, so an agent-authored HTML/SVG artifact opened that
+// way would execute with the console's session — those are downloaded instead.
+const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
+function safeHref(href) {
+  return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
+}
 async function openArtifact(url, external) {
-  if (external) { window.open(url, '_blank', 'noopener'); return; }
+  if (external) { if (safeHref(url) !== '#') window.open(url, '_blank', 'noopener'); return; }
   // Artifact endpoints need the auth header, so fetch as a blob then open it.
   try {
     const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
     if (!res.ok) { toast('could not open artifact', true); return; }
-    const obj = URL.createObjectURL(await res.blob());
-    window.open(obj, '_blank', 'noopener');
+    const blob = await res.blob();
+    const obj = URL.createObjectURL(blob);
+    if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
+    else {
+      const name = /filename="([^"]*)"/.exec(res.headers.get('content-disposition') || '')?.[1] || 'artifact';
+      const a = document.createElement('a');
+      a.href = obj; a.download = name; a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); a.remove();
+    }
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
 }
@@ -7417,10 +7482,11 @@ function wireReviewActions(v) {
         ws.onclose = () => setStopBtn(false);
         setStopBtn(true, r.procId, v.taskId);
         // A server keeps running — open its pages once it's had a moment to boot.
-        if (r.server && Array.isArray(r.openUrls)) {
-          setTimeout(() => r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
-        } else if (Array.isArray(r.openUrls) && r.openUrls.length) {
-          r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
+        const openable = (Array.isArray(r.openUrls) ? r.openUrls : []).filter((u) => /^https?:/i.test(String(u)));
+        if (r.server && openable.length) {
+          setTimeout(() => openable.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+        } else if (openable.length) {
+          openable.forEach((u) => window.open(u, '_blank', 'noopener'));
         }
       } catch (e) { toast(e.message, true); }
       finally { if (btn.isConnected) btn.disabled = false; }
@@ -8142,7 +8208,7 @@ function renderConversationText(text, role, v = S.view) {
     const fileUrl = worldFileHref(href, v);
     html += fileUrl
       ? `<a href="${esc(fileUrl)}" class="world-file-link" target="_blank" rel="noopener" title="Open this file from its task workspace">${esc(match[1])}</a>`
-      : `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+      : `<a href="${esc(safeHref(href))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
     at = match.index + match[0].length;
   }
   return html + esc(source.slice(at));
@@ -8733,19 +8799,6 @@ async function wireTaskAuthorization(v) {
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
-function advancedTab(v) {
-  return `
-    <div class="section-h">Live events</div>
-    <div class="events" id="tp-events"></div>
-    <div class="section-h">Structured state (the view-model floor)</div>
-    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn,
-      // `localPath` goes through localWorldPath() like every other host-path
-      // affordance. The gateway only strips `worldPath` for REMOTE handles, so a
-      // hosted deployment backed by worktree worlds (explicitly supported) was
-      // printing the karmax host's filesystem layout into a remote browser here —
-      // the one place a raw worldPath escaped the hostLocal() gate.
-      world: { available: v.worldAvailable, provider: v.worldProvider, localPath: localWorldPath(v) || undefined }, pr: v.pr }, null, 2))}</pre>`;
-}
 
 function renderDiff(d) {
   return esc(d)
@@ -9465,7 +9518,7 @@ function taskActions(v) {
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
     // actionToast's standard-verb match and produced "Confirm1 — done" instead
     // of "Confirmed" on the most-used control in the app.
-    html += `<button class="btn ${cls}" data-act="${a.name}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
+    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -9619,20 +9672,6 @@ function updateLiveBubble() {
   if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
-function renderTaskEvents() {
-  const box = document.getElementById('tp-events');
-  if (!box) return;
-  box.innerHTML = S.taskEvents
-    .slice(-120)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span>${esc(summarize(e.payload))}</span></div>`)
-    .join('');
-  box.scrollTop = box.scrollHeight;
-}
-function summarize(p) {
-  if (!p) return '';
-  if (p.text) return p.text.slice(0, 160);
-  return Object.entries(p).map(([k, val]) => `${k}=${typeof val === 'object' ? JSON.stringify(val).slice(0, 40) : val}`).join(' ').slice(0, 160);
-}
 
 // ── queue ────────────────────────────────────────────────────────────────────
 // Fetch the coordinator's authoritative queue order for every domain currently in
@@ -10562,7 +10601,6 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
   );
 }
 
-const quickDefaultsHeader = () => '';
 
 // ── Avatars ──────────────────────────────────────────────────────────────
 function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
@@ -11729,102 +11767,6 @@ async function hydrateProjectEnvironment(proj) {
   } catch (error) { paneError(box, error, () => hydrateProjectEnvironment(proj)); }
 }
 
-async function hydrateProjectResources(proj) {
-  const box = $('#project-resources'); if (!box) return;
-  try {
-    const resources = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
-    const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
-    box.innerHTML = `<div class="section-h">Attached resources</div>
-      <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
-      ${hostLocal() ? '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>' : ''}
-      <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
-        <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
-          <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
-        <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
-      </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
-      <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
-      <div class="settings-grid">
-        <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
-        <label class="form-row">Kind<select id="resource-driver"><option value="volume@1">Versioned files / model / SQLite</option><option value="secret@1">Secret</option><option value="database@1">Shared database URL</option><option value="service@1">External service credential</option></select></label>
-        <label class="form-row">World path or variable<input id="resource-target" placeholder="resources/training-data"></label>
-        <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
-        <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
-        <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
-        ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
-      </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
-    const driverInput = $('#resource-driver');
-    const syncDefaults = () => {
-      const name = $('#resource-name').value.trim() || 'resource';
-      const fileKind = driverInput.value === 'volume@1';
-      $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-      $('#resource-secret').disabled = fileKind;
-      $('#resource-files').disabled = !fileKind;
-      if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
-    };
-    driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
-    $('#resource-scan')?.addEventListener('click', async () => {
-      const button = $('#resource-scan'); const results = $('#resource-scan-results');
-      button.disabled = true; button.textContent = 'Scanning…';
-      try {
-        const scan = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources/scan`);
-        results.innerHTML = scan.proposals.length ? `<div class="section-h">Suggested classifications</div>${scan.proposals.map((proposal, index) =>
-          `<div class="queue-item" data-proposal="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span>
-          <div class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</div></div><button class="btn sm resource-use-proposal">Use suggestion</button></div>`).join('')}`
-          : '<p class="task-sub">No likely resources found. You can still attach one below.</p>';
-        results.querySelectorAll('[data-proposal]').forEach((row) => row.querySelector('.resource-use-proposal').addEventListener('click', () => {
-          const proposal = scan.proposals[Number(row.dataset.proposal)];
-          $('#resource-name').value = proposal.path.split('/').pop().replace(/\.[^.]+$/, '') || proposal.kind;
-          $('#resource-driver').value = proposal.suggested.driver;
-          $('#resource-target').value = proposal.suggested.target.path || proposal.suggested.target.name;
-          $('#resource-access').value = proposal.suggested.access;
-          $('#resource-publish').value = proposal.suggested.publish;
-          if ($('#resource-source-path') && proposal.suggested.driver === 'volume@1')
-            $('#resource-source-path').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
-          $('#resource-driver').dispatchEvent(new Event('change'));
-          if (proposal.suggested.driver === 'secret@1') $('#resource-secret').focus();
-          else $('#resource-add').focus();
-        }));
-      } catch (error) { results.textContent = error.message; }
-      finally { button.disabled = false; button.textContent = 'Scan ignored project files'; }
-    });
-    $('#resource-add').addEventListener('click', async () => {
-      const button = $('#resource-add'); const name = $('#resource-name').value.trim();
-      if (!name) return toast('Resource name is required', true);
-      const driver = driverInput.value; const isFiles = driver === 'volume@1';
-      const enteredTarget = $('#resource-target').value.trim();
-      const target = isFiles ? { kind: 'path', path: enteredTarget || `resources/${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}` }
-        : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
-      button.disabled = true; button.textContent = 'Attaching…';
-      try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files] : [];
-        const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
-          access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
-          publish: $('#resource-publish').value, secret: $('#resource-secret').value,
-          sourcePath: $('#resource-source-path')?.value.trim() || undefined }) });
-        if (selectedFiles.length) {
-          button.textContent = 'Uploading…';
-          await uploadResourceFiles(proj.id, created.id, selectedFiles, (sent, total) => {
-            button.textContent = `Uploading ${Math.round(sent / Math.max(total, 1) * 100)}%…`;
-          });
-        }
-        toast('Resource attached'); await hydrateProjectResources(proj);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Attach resource'; }
-    });
-    box.querySelectorAll('[data-resource]').forEach((row) => {
-      const resource = resources.find((candidate) => candidate.id === row.dataset.resource);
-      row.querySelector('.resource-toggle').addEventListener('click', async () => {
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-      row.querySelector('.resource-delete').addEventListener('click', async () => {
-        if (!confirm(`Remove resource “${resource.name}”? Existing task snapshots and audit history may be retained, but new tasks will no longer receive it.`)) return;
-        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectResources(proj); }
-        catch (error) { toast(error.message, true); }
-      });
-    });
-  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
-}
 
 async function uploadResourceFiles(projectId, resourceId, files, progress) {
   const upload = await api(`/api/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/uploads`, { method: 'POST' });
@@ -11844,11 +11786,6 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
     await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}`, { method: 'DELETE' }).catch(() => {});
     throw error;
   }
-}
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer); let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  return btoa(binary);
 }
 function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   const host = document.createElement('div');
@@ -12175,7 +12112,6 @@ function globalSettingsView(embedded = false) {
     ${settingsForms('global')}
     ${explanationSettingsCard('global')}
     ${profilesCard('global')}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full task form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     ${passwordsCard()}
@@ -13486,7 +13422,7 @@ async function wireVaultCards(organizationId) {
           : item.provenance?.source?.startsWith('connector:')
             ? 'The connected source store is updated too if write-back is on.'
             : 'Metadata and notes are untouched.';
-        const value = prompt(`New ${field} for "${item.label}" (${sourceNote}):`);
+        const value = await promptSecret(`New ${field} for "${item.label}"`, sourceNote);
         if (!value) return;
         try {
           const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
@@ -13763,17 +13699,20 @@ async function wireVaultCards(organizationId) {
   });
   const renderRequests = async () => {
     const rbox = $('#vault-requests-card .vault-requests-list');
-    if (!rbox) return;
+    if (!rbox) { if (refreshVaultRequests === renderRequests) refreshVaultRequests = null; return; }
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
     rbox.innerHTML = credentialRequestRows(requests, items);
     wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
+  refreshVaultRequests = renderRequests; // live: a new/resolved approval repaints this list (connectWs)
   await renderItems();
   await renderConnectors();
   await renderRequests();
 }
+// The organization settings' pending-approvals list, while that page is open.
+let refreshVaultRequests = null;
 
 // ── organization AgentMail inbox ──────────────────────────────────────────────
 function agentMailCard() {

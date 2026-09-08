@@ -67,8 +67,11 @@ describe('saveSkill → listResolveSkills round-trip', () => {
     try {
       const { path: file } = await k.saveSkill(token, { name: 'resolve/npm eresolve!', content: 'Use --legacy-peer-deps.' });
       // Name is sanitized per-segment but the resolve/ subdir is preserved (not flattened).
-      expect(file.replace(/\\/g, '/')).toContain('/skills/resolve/npm-eresolve-.md');
-      expect(listResolveSkills(contentDir).map((s) => s.name)).toContain('resolve/npm-eresolve-');
+      // Saved under the caller's organization, indexed for that organization only.
+      expect(file.replace(/\\/g, '/')).toContain('/skills/organizations/org_personal/resolve/npm-eresolve-.md');
+      expect(listResolveSkills(contentDir, 'org_personal').map((s) => s.name)).toContain('resolve/npm-eresolve-');
+      expect(listResolveSkills(contentDir, 'org_other').map((s) => s.name)).not.toContain('resolve/npm-eresolve-');
+      expect(listResolveSkills(contentDir).map((s) => s.name)).not.toContain('resolve/npm-eresolve-');
     } finally {
       fs.rmSync(contentDir, { recursive: true, force: true });
     }

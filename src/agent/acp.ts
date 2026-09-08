@@ -16,10 +16,9 @@ import {
   type ToolCall,
 } from '@agentclientprotocol/sdk';
 import type { AgentProfile, Provider } from '../domain/types.js';
-import { platformMcpSpec } from '../autonomy/config-homes.js';
+import { platformMcpSpec, scrubbedEnv } from '../autonomy/config-homes.js';
 import {
   apiKeyEnv,
-  acpHomeEnv,
   credentialAliases,
   credentialProvider,
   isAcpProvider,
@@ -153,18 +152,17 @@ function openCodeConfig(profile: AgentProfile, hasApiKey: boolean, systemPrompt:
 function harnessSpec(input: TurnInput): HarnessSpec {
   const provider = input.profile.provider;
   if (!isAcpProvider(provider)) throw new Error(`ACP does not support harness "${provider}"`);
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    ...(input.extraEnv ?? {}),
-  };
+  // The same scrub as the Claude and Codex rails: the vault key, auth secret and
+  // billing keys live in this process's environment and the harness (and every
+  // shell it opens through `terminal.create`) must not inherit them.
+  const env = scrubbedEnv({ provider, configHome: input.resolvedAuth?.configHome, extra: input.extraEnv });
   const credentialEnv = apiKeyEnv(credentialProvider(input.profile));
-  const ambientApiKey = env[credentialEnv];
+  const ambientApiKey = input.extraEnv?.[credentialEnv] ?? process.env[credentialEnv];
   for (const key of [
     'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'KIMI_API_KEY', 'MOONSHOT_API_KEY',
     'XAI_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY',
     'MISTRAL_API_KEY', 'DEEPSEEK_API_KEY', 'KIMI_MODEL_API_KEY',
   ]) delete env[key];
-  if (input.resolvedAuth?.configHome) Object.assign(env, acpHomeEnv(provider, input.resolvedAuth.configHome));
   if (input.resolvedAuth?.apiKey) env[credentialEnv] = input.resolvedAuth.apiKey;
   else if (ambientApiKey) env[credentialEnv] = ambientApiKey;
 

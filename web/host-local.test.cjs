@@ -42,8 +42,6 @@ ok(hostLocal() === false, 'a gateway served elsewhere withdraws them');
 const gated = [
   ['/srv/code/repo', 'repository source accepting a host path'],
   ['id="data-source"', 'data import from a host path'],
-  ['id="resource-source-path"', 'resource import from a host directory'],
-  ['id="resource-scan"', 'scan of the host checkout'],
   ['id="data-discover"', 'discovery of ignored files in the host checkout'],
 ];
 for (const [marker, what] of gated) {

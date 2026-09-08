@@ -53,7 +53,11 @@ export const manifestSchema = z.object({
   commands: z.array(command).max(200),
   entrypoint: z.string().regex(ENTRYPOINT_PATTERN, 'must be a bare JavaScript identifier').optional(),
   roles: z.array(role).max(50).optional(),
-  agentMcp: z.array(agentMcp).max(100).optional(),
+  // An MCP server entry is a command the agent harness spawns on the machine
+  // running it — the control plane for worktree/container worlds. A package from
+  // a git URL is data an administrator installed, not code the operator reviewed
+  // for the host, so it may not declare one (bundled manifests still can).
+  agentMcp: z.array(agentMcp).max(0, 'external workflow packages may not declare agentMcp servers (they would run commands on the karmax host)').optional(),
   resolveRules: z.array(resolveRule).max(500).optional(),
   promptPreamble: z.string().max(200_000).optional(),
   stages: z.array(stage).max(200).optional(),

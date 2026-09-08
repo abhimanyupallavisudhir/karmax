@@ -13,7 +13,6 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "dev": "tsx watch --clear-screen=false src/main.ts",
-    "worker": "tsx src/temporal/run-worker.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

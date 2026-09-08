@@ -58,14 +58,23 @@ export class Vault {
 
   private readDb(): Record<string, string> {
     if (!fs.existsSync(this.dbPath)) return {};
-    try {
-      return JSON.parse(fs.readFileSync(this.dbPath, 'utf8'));
-    } catch {
-      return {};
-    }
+    // A corrupt or truncated file must surface, not read as an empty vault: the
+    // next `put` would rewrite the file with one secret and lose all the others.
+    const raw = fs.readFileSync(this.dbPath, 'utf8');
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); }
+    catch (error) { throw new Error(`vault ${this.dbPath} is unreadable (${(error as Error).message}); restore it from a backup`); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`vault ${this.dbPath} is not a secret map; restore it from a backup`);
+    return parsed as Record<string, string>;
   }
+  /** Write-to-temp + rename so a crash mid-write can never leave a truncated
+   *  vault behind; the mode is applied explicitly because `writeFileSync`'s
+   *  `mode` only affects a file it creates. */
   private writeDb(db: Record<string, string>) {
-    fs.writeFileSync(this.dbPath, JSON.stringify(db), { mode: 0o600 });
+    const tmp = `${this.dbPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, this.dbPath);
   }
 
   private encrypt(plain: string): string {
@@ -76,10 +85,13 @@ export class Vault {
     return `${iv.toString('base64')}.${tag.toString('base64')}.${enc.toString('base64')}`;
   }
   private decrypt(blob: string): string {
-    const [ivB, tagB, encB] = blob.split('.');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, Buffer.from(ivB!, 'base64'));
-    decipher.setAuthTag(Buffer.from(tagB!, 'base64'));
-    return Buffer.concat([decipher.update(Buffer.from(encB!, 'base64')), decipher.final()]).toString('utf8');
+    const parts = typeof blob === 'string' ? blob.split('.') : [];
+    const iv = parts.length === 3 ? Buffer.from(parts[0]!, 'base64') : Buffer.alloc(0);
+    const tag = parts.length === 3 ? Buffer.from(parts[1]!, 'base64') : Buffer.alloc(0);
+    if (iv.length !== 12 || tag.length !== 16) throw new Error('vault entry is corrupt (malformed ciphertext)');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', this.key, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(Buffer.from(parts[2]!, 'base64')), decipher.final()]).toString('utf8');
   }
 
   put(handle: string, secret: string) {

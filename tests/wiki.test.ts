@@ -641,14 +641,23 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       const builtinPage = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
       expect(builtinPage.page.builtin).toBe(true);
       // Editing a built-in writes its override; deleting the override restores the default.
-      k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' });
+      // Built-in and `default`-labelled organization pages reach every prompt in the
+      // organization, so `skill:write` alone (every Do agent) is refused: it takes
+      // an organization administrator.
+      expect(() => k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' }))
+        .toThrow(/organization:edit/);
+      expect(() => k.saveWikiPage(rw, 'organization', organization.id, { path: 'rules/everywhere', content: '---\nlabels: default\n---\nEverywhere.', create: true }))
+        .toThrow(/organization:edit/);
+      const admin = mint(['project:read', 'organization:read', 'skill:write', 'organization:edit']);
+      k.saveWikiPage(admin, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' });
       expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[0])
         .toMatchObject({ version: 2, operation: 'write', content: expect.stringContaining('Our own rules.') });
       expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[1])
         .toMatchObject({ version: 1, operation: 'baseline', content: expect.stringContaining('# How to work') });
       const edited = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
       expect(edited.page).toMatchObject({ builtin: true, overridden: true });
-      expect(k.deleteWikiPage(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).deleted).toBe(true);
+      expect(() => k.deleteWikiPage(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path)).toThrow(/organization:edit/);
+      expect(k.deleteWikiPage(admin, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).deleted).toBe(true);
       expect((k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any).page.overridden).toBeUndefined();
       k.saveWikiPage(rw, 'organization', organization.id, {
         path: 'rules/original',

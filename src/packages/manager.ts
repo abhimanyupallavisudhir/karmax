@@ -63,11 +63,10 @@ export class WorkflowManager {
 
   /**
    * Read the install registry, dropping anything that is not a well-formed
-   * record. `restore()` feeds `r.dir` to the manifest reader, which for a
-   * `manifest.ts` runs `await import(...)` **in the host process** — so an
-   * unvalidated registry is boot-time code execution for anyone who can write
-   * `installed.json`. Every record must therefore have string fields and a `dir`
-   * confined under the cache home.
+   * record. `restore()` feeds `r.dir` to the manifest reader and then bundles
+   * the snapshot's workflow code into the worker — so an unvalidated registry
+   * would load whatever a writer of `installed.json` pointed at. Every record
+   * must therefore have string fields and a `dir` confined under the cache home.
    */
   private readRegistry(): InstalledRecord[] {
     const f = this.registryFile;
@@ -182,8 +181,8 @@ export class WorkflowManager {
     let loaded = 0;
     for (const r of records) {
       try {
-        // `readRegistry` already confined `dir`, but re-assert here: `inspect`
-        // may `await import()` a `manifest.ts` in the host process.
+        // `readRegistry` already confined `dir`, but re-assert here before the
+        // snapshot's workflow code is bundled.
         if (!this.underCacheHome(r.dir)) throw new Error('snapshot outside the workflow cache');
         if (!fs.existsSync(r.dir)) throw new Error('snapshot missing');
         // A version is "pinned by commit SHA", so the record must point at the

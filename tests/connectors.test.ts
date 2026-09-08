@@ -668,10 +668,11 @@ describe('Connectors sync into the vault (§9)', () => {
 
   it('updateSecret for Bitwarden edits one field of the fetched item', async () => {
     const edits: any[] = [];
-    const exec: Exec = async (cmd, args) => {
+    const exec: Exec = async (cmd, args, opts) => {
       const key = [cmd, ...args].join(' ');
       if (key.startsWith('bw get item bw1')) return JSON.stringify({ id: 'bw1', type: 1, name: 'GH', notes: 'keep me', login: { username: 'octo', password: 'old' } });
-      if (key.startsWith('bw edit item bw1')) { edits.push(JSON.parse(Buffer.from(args[3]!, 'base64').toString())); return '{}'; }
+      // The edited item (with the new secret) arrives on stdin, never in argv.
+      if (key === 'bw edit item bw1') { edits.push(JSON.parse(Buffer.from(opts!.input!, 'base64').toString())); return '{}'; }
       throw new Error(`unexpected: ${key}`);
     };
     const c = new BitwardenConnector(() => 'sess', exec);
@@ -689,8 +690,8 @@ describe('Connectors sync into the vault (§9)', () => {
       if (key.startsWith('bw status')) return JSON.stringify({ status: 'unlocked' });
       if (key.startsWith('bw list items')) return JSON.stringify([{ id: 'bw1', type: 1, name: 'GH', login: { password: 'old', uris: [{ uri: 'https://gh.com' }] } }]);
       if (key.startsWith('bw get item bw1')) return JSON.stringify({ id: 'bw1', type: 1, name: 'GH', login: { password: 'old' } });
-      if (key.startsWith('bw edit item bw1')) { updates.push(JSON.parse(Buffer.from(args[3]!, 'base64').toString())); return '{}'; }
-      throw new Error(`unexpected: ${key}${opts ? '' : ''}`);
+      if (key === 'bw edit item bw1') { updates.push(JSON.parse(Buffer.from(opts!.input!, 'base64').toString())); return '{}'; }
+      throw new Error(`unexpected: ${key}`);
     };
     const connectors = new Connectors(store, items, broker);
     connectors.register(new BitwardenConnector(() => 'sess', exec));

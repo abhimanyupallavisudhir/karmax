@@ -166,8 +166,10 @@ export class BitwardenConnector implements CredentialConnector {
     else if (field === 'totp') item.login.totp = value;
     else if (field === 'note') item.notes = value;
     else throw new Error(`Bitwarden write-back does not support the "${field}" field`);
+    // The item JSON now carries the new secret: hand it over on stdin, never in
+    // argv, where every process of the same user could read it from /proc.
     const encoded = Buffer.from(JSON.stringify(item)).toString('base64');
-    await this.exec('bw', ['edit', 'item', externalId, encoded], { env: this.env() });
+    await this.exec('bw', ['edit', 'item', externalId], { env: this.env(), input: encoded });
   }
 }
 
@@ -852,7 +854,13 @@ export class GitPassConnector implements CredentialConnector {
   }
 
   private gitEnv(connection: GitPassConnection): Record<string, string> {
-    return { ...isolatedGitEnvironment(), ...this.gitEnvironment(connection.gitProfile) };
+    return {
+      ...isolatedGitEnvironment(),
+      ...this.gitEnvironment(connection.gitProfile),
+      // Belt to the URL check's braces: git itself refuses any other transport
+      // (`ext::`, `fd::`, or a helper smuggled in through a redirect).
+      GIT_ALLOW_PROTOCOL: this.options.allowLocalRepository ? 'https:ssh:file' : 'https:ssh',
+    };
   }
 
   private async refresh(connection: GitPassConnection, checkout: string, env: Record<string, string>): Promise<void> {
@@ -1008,10 +1016,13 @@ export class GitPassConnector implements CredentialConnector {
   }
 }
 
+/** HTTPS, `ssh://`, or scp-style `[user@]host:path`. The scp form must not be
+ *  followed by a second colon: `ext::<command>` and `fd::<n>` are git transport
+ *  helpers, not hosts, and would run a program instead of contacting one. */
 function isRemoteGitUrl(value: string): boolean {
   return /^https:\/\/[^\s]+$/i.test(value)
     || /^ssh:\/\/[^\s]+$/i.test(value)
-    || /^(?:[^@\s]+@)?[^:\s/]+:[^\s]+$/.test(value);
+    || /^(?:[^@\s]+@)?[^:\s/]+:(?!:)[^\s]+$/.test(value);
 }
 
 function githubRepositorySlug(value: string): string | undefined {

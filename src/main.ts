@@ -682,7 +682,7 @@ async function main() {
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
   try {
     if (deployment.hostLocal) {
-      const remote = await remoteAccessPlan(port, { hasPassword: true });
+      const remote = await remoteAccessPlan(port, { hasPassword: !!process.env.KARMAX_PASSWORD || identity.hasUsers() });
       console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
     }
   } catch {

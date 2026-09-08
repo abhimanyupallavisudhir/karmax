@@ -1044,9 +1044,12 @@ export class CodexAdapter implements AgentAdapter {
         });
       }
       // Usage/session-limit → capture the machine-readable reset (resets_in_seconds).
-      const blob = JSON.stringify(ev);
-      const cls = classifyLimitError(blob, { providerOrigin: true });
-      if (cls.limited) {
+      // Only a failure event is judged: the agent's own command output and prose
+      // (`item.completed`, `agent_message`) mention 401s and rate limits routinely,
+      // and matching them quarantined a healthy login.
+      const failureEvent = t === 'turn.failed' || t === 'error' || ev.error !== undefined;
+      const cls = failureEvent ? classifyLimitError(JSON.stringify(ev), { providerOrigin: true }) : undefined;
+      if (cls?.limited) {
         const secs = ev.error?.resets_in_seconds ?? ev.resets_in_seconds ?? ev.error?.retry_after ?? ev.retry_after;
         const resetHint = typeof secs === 'number' ? `in ${secs}s` : cls.resetHint;
         const diagnostic = nativeProviderDiagnostic(ev, { model, operation: 'codex exec event' });

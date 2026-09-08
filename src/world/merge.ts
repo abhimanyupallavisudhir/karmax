@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { validGitBranch } from '../util/git-ref.js';
 import fs from 'node:fs';
 import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget, orderCheckouts } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
@@ -84,6 +85,8 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
  *  host-local checkout lands through this exact machinery (same conflict/dirty
  *  guards, same target-worktree landing) after importing its branch bundle. */
 export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
+  // `target` is task input; as a positional git argument a leading `-` would be an option.
+  if (!validGitBranch(target)) throw new Error(`invalid target branch "${target}"`);
   const root = worldRepo.root;
   const repo = worldRepo.repo;
   const branch = worldRepo.branch;

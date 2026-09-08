@@ -7,7 +7,7 @@ import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
 import type { World, WorldPty } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
-import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
+import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION, KARMAX_TOKEN_FILE } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
@@ -110,7 +110,12 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
     // intentionally never refresh authority and must never overwrite the one
     // canonical credential shared by every task using this login.
     if (isControlPlaneAuth(provider, relative)) continue;
-    const destination = path.join(localHome, ...relative.split('/'));
+    // The listing came from a shell inside the sandbox, which the agent controls:
+    // a `..` segment would write anywhere the control plane's user can.
+    const segments = relative.split('/');
+    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) continue;
+    const destination = path.join(localHome, ...segments);
+    if (!destination.startsWith(path.resolve(localHome) + path.sep)) continue;
     const data = await world.readFileBuffer(remoteFile);
     // A task cleanup can race a human re-login on the control plane. Do not let
     // an older persistent world restore the token the user just replaced.
@@ -132,6 +137,10 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
 
 function isControlPlaneAuth(provider: Provider, relative: string): boolean {
   const normalized = relative.split(path.sep).join('/');
+  // The captured setup token is injected into every later turn of this login
+  // (`CLAUDE_CODE_OAUTH_TOKEN`); a sandbox that could replace it would make
+  // those turns authenticate as whoever it chose.
+  if (normalized === KARMAX_TOKEN_FILE) return true;
   return provider === 'codex'
     ? normalized === 'auth.json'
     : provider === 'claude'

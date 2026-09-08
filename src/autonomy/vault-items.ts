@@ -183,6 +183,11 @@ export function totpCode(seed: string, nowMs = Date.now(), stepSeconds = 30, dig
     len = Number(u.searchParams.get('digits') ?? len) || len;
     algo = (u.searchParams.get('algorithm') ?? algo).toLowerCase();
   }
+  // The URI comes from an import; bound it before it reaches the HMAC.
+  if (!['sha1', 'sha256', 'sha512'].includes(algo)) throw new Error(`unsupported TOTP algorithm "${algo}"`);
+  if (!Number.isInteger(step) || step < 5 || step > 300) throw new Error(`unsupported TOTP period ${step}`);
+  if (!Number.isInteger(len) || len < 4 || len > 10) throw new Error(`unsupported TOTP digit count ${len}`);
+  if (!secret) throw new Error('TOTP seed is empty');
   const counter = Math.floor(nowMs / 1000 / step);
   const msg = Buffer.alloc(8);
   msg.writeBigUInt64BE(BigInt(counter));
@@ -461,9 +466,12 @@ export class VaultItems {
     caps: Capability[], taskId: string | undefined, item: VaultItem, mode: AccessMode,
     opts: { consume?: boolean; ambient?: boolean } = {},
   ): { status: AccessStatus; reason?: string } {
-    if (taskId && !opts.ambient && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
+    // `never` is absolute: it is checked before a one-shot pass so an approval
+    // that was parked for another reason (a reset report, a mode the human did
+    // not look at) can never be spent on plaintext.
     const policyForTask = this.effectivePolicy(taskId, item);
     if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
+    if (taskId && !opts.ambient && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
     if (!this.covered(caps, taskId, item)) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
     const policy = mode === 'reveal' ? policyForTask.reveal : policyForTask.use;
     if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (${taskId ? 'task' : 'item'} policy)` };
