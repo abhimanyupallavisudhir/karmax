@@ -52,7 +52,7 @@ const developer = [
 const maintainer = [
   ...developer, 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
   'project:resource:shared-write',
-  'workflow:install', 'workflow:edit', 'team:write', 'repository:write',
+  'workflow:edit', 'team:write', 'repository:write',
   'github:actions:write',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
@@ -74,7 +74,8 @@ const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:delete', 'project:settings:*',
   'project:resource:shared-write',
-  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
+  // Loading code into the shared worker is installation authority, never tenant authority.
+  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'github:actions:*',
@@ -121,12 +122,14 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [maintainer.filter((capability) => !capability.startsWith('github:actions:')), [
+  maintainer: [[...maintainer, 'workflow:install'],
+    [...maintainer.filter((capability) => !capability.startsWith('github:actions:')), 'workflow:install'], [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
     'workflow:install', 'workflow:edit',
   ]],
+  administrator: [[...ORGANIZATION_GRANT_CEILING, 'workflow:install']],
   operator: [[
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
