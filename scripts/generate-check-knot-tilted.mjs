@@ -1,9 +1,9 @@
 // Run with node scripts/generate-check-knot-tilted.mjs.
-// Fit the knot to a broad, right-weighted envelope. The extended right loop
-// supplies the upright outer edge; the left side tapers into the distance.
+// Project the original knot as one plane, then fit its overall size to a square
+// icon frame. A projective transform keeps every straight strand straight.
 import { writeFileSync, mkdirSync } from 'node:fs';
 
-const points = [[2, 0], [1.7, -1.3], [4.3, 1.3], [3, 1], [-1, 1], [-1, 2], [4, 2],
+const points = [[2, 0], [3, 0], [3, 1], [-1, 1], [-1, 2], [4, 2],
   [4, 3], [0, 3], [0, -1], [1, -1], [1, 4], [2, 4]];
 const bridges = [
   [[1.61, 1], [2.39, 1]], [[-.39, 1], [.39, 1]],
@@ -11,12 +11,13 @@ const bridges = [
   [[0, 1.61], [0, 2.39]], [[1, .61], [1, 1.39]],
   [[1, 2.61], [1, 3.39]], [[2, 1.61], [2, 2.39]],
 ];
+const yaw = 38 * Math.PI / 180;
+const cameraDistance = 420;
 function project([u, v]) {
   const x = (u - v) * 54 / Math.SQRT2;
   const y = (u + v - 3) * 54 / Math.SQRT2;
-  // Art-directed hull: upper/lower tips sit about 70% across the silhouette,
-  // with a compressed far side and a tall near-side loop.
-  return [x / (1 + .001 * x), y * (.62 + .38 * (x + 115) / 230)];
+  const perspective = cameraDistance / (cameraDistance - x * Math.sin(yaw));
+  return [x * Math.cos(yaw) * perspective, y * perspective];
 }
 function circle([x, y], radius) {
   return Array.from({ length: 48 }, (_, i) => {
@@ -41,13 +42,7 @@ const scaleX = 336 / (bounds[2] - bounds[0]);
 const scaleY = 336 / (bounds[3] - bounds[1]);
 const center = [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2];
 function path(polygons) {
-  // Sample edges as well as round corners so ribbons and crossing masks agree
-  // under the nonlinear taper, including along the long diagonal check arms.
-  return polygons.map(polygon => polygon.flatMap((a, i) => {
-    const b = polygon[(i + 1) % polygon.length];
-    const count = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / .1));
-    return Array.from({ length: count }, (_, j) => [a[0] + (b[0] - a[0]) * j / count, a[1] + (b[1] - a[1]) * j / count]);
-  }).map((point, i) => {
+  return polygons.map(polygon => polygon.map((point, i) => {
     const [x, y] = project(point);
     return `${i ? 'L' : 'M'}${(256 + (x - center[0]) * scaleX).toFixed(3)} ${(256 + (y - center[1]) * scaleY).toFixed(3)}`;
   }).join('') + 'Z').join('\n      ');
