@@ -5004,6 +5004,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     args: { projectId: string; title: string; repo: string; branch: string; target: string },
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'edit_workflow', { projectId: args.projectId });
+    if (this.deps.hosted) throw new CapabilityError('Workflow code editing is disabled in hosted deployments; built-ins change only with a platform release');
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new NotFoundError(`no project ${args.projectId}`);
     const authorization = this.deps.authorization
@@ -5016,8 +5017,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       title: args.title,
       workflow: 'merge-only',
       workflowVersion: mergeOnlyVersion,
-      // Record the edit target so the self-healing loop can reload the workflow
-      // from `repo@target` once this merge completes (§4.4).
+      // Record the edit target for review. Activation requires a separate install.
       params: {
         prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
         _authorization: { ...authorization, principal: caller.principal },
@@ -5123,6 +5123,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    */
   async installWorkflow(token: string, args: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
     this.require(token, 'install_workflow', { organizationId });
+    if (this.deps.hosted) throw new CapabilityError('External workflow code is disabled in hosted deployments');
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args, organizationId);
   }

@@ -6,7 +6,7 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager } from './temporal/worker-pool.js';
 import { TASK_QUEUE } from './temporal/config.js';
-import { WorkflowManager, reloadSpecForWorkflowEdit, proposerMayInstall } from './packages/manager.js';
+import { WorkflowManager } from './packages/manager.js';
 import { WorkflowRepoLoader } from './packages/repo.js';
 import { openStore } from './store/db.js';
 import { WorldRegistry } from './world/registry.js';
@@ -490,6 +490,7 @@ async function main() {
       const profile = profiles.resolve(undefined);
       return profile ? profiles.env(profile, {}) : {};
     },
+    deployment.hosted,
   );
   // Reload workflows installed in previous sessions (SPEC §4.2) and roll the
   // worker once so their tasks — new and in-flight — can run after a restart.
@@ -551,32 +552,8 @@ async function main() {
   });
   mailPoller.start();
 
-  // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
-  // task reaches done), reload the edited workflow from its repo so new tasks pick
-  // up the published version. Runs in this process (not inside a workflow), so
-  // rolling the worker is safe; deduped per task. A merge that forgot to bump the
-  // version fails the reload loudly (version-bump guard) rather than swapping code.
-  const healed = new Set<string>();
-  bus.onAny((ev) => {
-    if (ev.type !== 'view.updated' || (ev.payload as { status?: string })?.status !== 'done' || healed.has(ev.taskId)) return;
-    const task = store.getTask(ev.taskId);
-    const spec = reloadSpecForWorkflowEdit(task ?? {}, 'done');
-    if (!spec) {
-      // Distinguish "not a workflow edit" (the common case, silent) from
-      // "was one, but the proposer may not install" — see proposerMayInstall.
-      if ((task?.params as { workflowEdit?: unknown } | undefined)?.workflowEdit && !proposerMayInstall(task ?? {})) {
-        healed.add(ev.taskId);
-        console.warn(`  • Workflow reload after edit skipped: the proposer of task ${ev.taskId} lacks workflow:install`);
-      }
-      return;
-    }
-    const organizationId = task ? store.getProject(task.projectId)?.organizationId : undefined;
-    healed.add(ev.taskId);
-    workflows
-      .install(spec, organizationId ?? 'org_personal')
-      .then((r) => console.log(`  • Self-healed: reloaded ${r.name}@${r.version} after a workflow edit`))
-      .catch((e) => console.warn(`  • Workflow reload after edit failed: ${e instanceof Error ? e.message : e}`));
-  });
+  // Workflow code activation is an explicit install operation with current
+  // authorization. A completed edit must never activate a moving branch tip.
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();
 

@@ -11,6 +11,36 @@ describe('durable authorization policy', () => {
     expect(CAPABILITY_GROUPS.every((group) => group.description && group.capabilities.every((cap) => cap.label && cap.description))).toBe(true);
   });
 
+  it('reserves workflow code installation for global authority', () => {
+    const store = new Store(':memory:');
+    try {
+      const authz = new AuthorizationService(store);
+      expect(allows(authz.profile('administrator')!.capabilities, 'workflow:install')).toBe(false);
+      expect(allows(authz.profile('maintainer')!.capabilities, 'workflow:install')).toBe(false);
+      expect(allows(authz.profile('god')!.capabilities, 'workflow:install')).toBe(true);
+      const organization = store.createOrganization({ name: 'Acme' });
+      const project = store.createProject('P', {}, organization.id);
+      authz.grant('root', { principalId: 'user:tenant', scopeKey: `organization:${organization.id}`, profileId: 'god' });
+      expect(allows(authz.capabilities('user:tenant', project.id), 'workflow:install')).toBe(false);
+    } finally { store.close(); }
+  });
+
+  it('migrates unchanged built-in profiles that previously allowed workflow installation', () => {
+    const store = new Store(':memory:');
+    try {
+      const authz = new AuthorizationService(store);
+      for (const id of ['maintainer', 'administrator']) {
+        const profile = authz.profile(id)!;
+        store.setAuthorizationProfile('global', { ...profile,
+          capabilities: [...profile.capabilities, 'workflow:install'] });
+      }
+      const upgraded = new AuthorizationService(store);
+      for (const id of ['maintainer', 'administrator']) {
+        expect(allows(upgraded.profile(id)!.capabilities, 'workflow:install')).toBe(false);
+      }
+    } finally { store.close(); }
+  });
+
   it('seeds the five canonical authorization levels and resolves project defaults', () => {
     const store = new Store(':memory:');
     const authz = new AuthorizationService(store);

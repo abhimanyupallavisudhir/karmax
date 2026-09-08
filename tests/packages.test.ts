@@ -111,6 +111,10 @@ describe('package loading is hostile-input safe', () => {
     const pkg = await loader.load({ url: repo, name: 'demo' });
     expect(pkg.manifest.name).toBe('demo');
     expect(pkg.workflowEntry).toMatch(/workflow\.js$/);
+    await expect(loader.load({ url: repo, name: 'demo', ref: 'missing-reviewed-commit' }))
+      .rejects.toThrow(/does not resolve/);
+    await expect(loader.load({ url: path.join(root, 'other'), name: 'demo' }))
+      .rejects.toThrow(/different repository/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

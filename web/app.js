@@ -12347,17 +12347,17 @@ function globalSettingsView(embedded = false) {
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with ${siteNameMarkup()}; workflows installed here are available only to this organization. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with ${siteNameMarkup()} and change only with platform releases. Each task pins its workflow version.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
-      <div class="form-row"><label>Install from a git repo</label>
+      ${S.meta?.hosted ? `<p>Custom workflow code is unavailable on hosted ${siteNameMarkup()}.</p>` : `<div class="form-row"><label>Install from a git repo</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <input id="wf-url" placeholder="git URL or path (e.g. https://github.com/you/my-workflow.git)" style="flex:1;min-width:220px" />
           <input id="wf-ref" placeholder="ref (tag/branch/sha, optional)" style="width:180px" />
           <button class="btn primary" id="wf-install">Install</button>
         </div>
         <div id="wf-install-result" style="font-size:12px;margin-top:6px"></div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
-      </div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Install only code you trust with this server. External workflows share the platform worker; manifest validation and version pins do not isolate them. Packages must supply manifest.json. Merging an edit does not activate it; install the reviewed commit explicitly.</div>
+      </div>`}
     </div>`;
 }
 

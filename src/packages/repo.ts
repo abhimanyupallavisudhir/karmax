@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { git, gitOrThrow } from '../world/git.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { parseManifest } from './schema.js';
@@ -26,7 +25,7 @@ export interface LoadedPackage {
 }
 
 /** Manifest filenames tried in order — JSON first (pure data, no code executed). */
-const MANIFEST_NAMES = ['manifest.json', 'manifest.mjs', 'manifest.js', 'manifest.ts'];
+const MANIFEST_NAMES = ['manifest.json'];
 const WORKFLOW_NAMES = ['workflow.mjs', 'workflow.js', 'workflow.ts'];
 
 /**
@@ -122,15 +121,18 @@ export class WorkflowRepoLoader {
       fs.mkdirSync(path.dirname(work), { recursive: true });
       await gitOrThrow(path.dirname(work), [...GIT_SAFE_CONFIG, 'clone', '--quiet', '--', url, work], { env });
     } else {
-      await git(work, [...GIT_SAFE_CONFIG, 'fetch', '--quiet', '--tags', '--prune', 'origin'], { env });
+      const origin = await gitOrThrow(work, ['remote', 'get-url', 'origin'], { env });
+      if (origin.trim() !== url) throw new Error('workflow cache belongs to a different repository; use a distinct package name');
+      await gitOrThrow(work, [...GIT_SAFE_CONFIG, 'fetch', '--quiet', '--tags', '--prune', 'origin'], { env });
     }
 
     // Resolve the ref to a concrete commit — the pin. `origin/<ref>` first so a
     // branch name tracks the fetched remote tip, not a stale local branch.
     const sha = (await firstOk(work, [
-      ['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`],
-      ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
-    ], env)) ?? (await gitOrThrow(work, ['rev-parse', 'HEAD'], { env }));
+      ['rev-parse', '--verify', '--quiet', '--end-of-options', `origin/${ref}^{commit}`],
+      ['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`],
+    ], env));
+    if (!sha) throw new Error(`workflow ref does not resolve to a commit: ${ref}`);
 
     // Snapshot the exact commit into an immutable, .git-free version dir.
     const dir = path.join(nameDir, sha);
@@ -188,21 +190,13 @@ function firstExisting(dir: string, names: string[]): string | undefined {
   return undefined;
 }
 
-/** Read + validate the package manifest. JSON is parsed; a module is imported. */
+/** Manifests are data. Never import package code into the server to inspect it. */
 async function readManifest(dir: string): Promise<WorkflowManifest> {
   const file = firstExisting(dir, MANIFEST_NAMES);
-  if (!file) throw new Error(`no manifest (${MANIFEST_NAMES.join(' / ')}) in ${dir}`);
-  let data: unknown;
-  if (file.endsWith('.json')) {
-    data = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } else {
-    // A manifest module exports the manifest as default or as `manifest`. This
-    // runs the module in the host process (not the deterministic sandbox); the
-    // PR review gate (§4.4) is the trust boundary for what gets loaded at all.
-    const mod = await import(pathToFileURL(file).href);
-    data = mod.default ?? mod.manifest ?? mod;
-  }
-  return parseManifest(data);
+  if (!file) throw new Error(`no manifest.json in ${dir}; executable manifests are not supported`);
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('manifest.json must be a regular file');
+  return parseManifest(JSON.parse(fs.readFileSync(file, 'utf8')));
 }
 
 /** Extract a tarball with the `tar` CLI (present on the platforms we target). */
