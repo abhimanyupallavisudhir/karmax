@@ -117,8 +117,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // @review sets the terse caption; the git-derived summary/changedFiles are added automatically.
     expect(review.reviewInfo?.caption).toContain('factorial');
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+    const { runId } = await handle.describe();
     expect(review.messages.find((message: any) => message.role === 'agent')?.sourceActivity).toMatchObject({
-      turnId: `${taskId}#0`,
+      turnId: `${taskId}:${runId}#0`,
       id: 'message-1',
       attempt: 1,
     });
