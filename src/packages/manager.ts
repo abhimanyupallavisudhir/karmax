@@ -63,10 +63,11 @@ export class WorkflowManager {
 
   /**
    * Read the install registry, dropping anything that is not a well-formed
-   * record. `restore()` feeds `r.dir` to the manifest reader and then bundles
-   * the snapshot's workflow code into the worker — so an unvalidated registry
-   * would load whatever a writer of `installed.json` pointed at. Every record
-   * must therefore have string fields and a `dir` confined under the cache home.
+   * record. `restore()` feeds `r.dir` to the manifest reader (which on a
+   * host-local install may `import()` a `manifest.ts`) and then bundles the
+   * snapshot's workflow code into the worker — so an unvalidated registry would
+   * load whatever a writer of `installed.json` pointed at. Every record must
+   * therefore have string fields and a `dir` confined under the cache home.
    */
   private readRegistry(): InstalledRecord[] {
     const f = this.registryFile;

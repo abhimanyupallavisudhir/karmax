@@ -7757,20 +7757,24 @@ function isWorldGone(error: unknown): boolean {
   return /(?:not found|does not exist|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
 }
 
-/** Render-safe media types for agent- or repository-authored bytes served on the
- *  console origin. Everything else is delivered as a download: `text/html` and
- *  `image/svg+xml` would otherwise execute as same-origin documents. A CSP
- *  `sandbox` header on every response also drops any document that is rendered
- *  into an opaque origin, so a `blob:` copy opened by the console cannot reach
- *  its session either. */
-const RENDER_SAFE_MEDIA = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/(?:mp4|webm|quicktime)|text\/(?:plain|csv)|application\/json)(?:;|$)/i;
+/** Headers for agent- or repository-authored bytes served on the console origin.
+ *  Inert types (images, PDF, video, text) render inline. Active documents —
+ *  `text/html`, `image/svg+xml` — render inline too, but under a CSP `sandbox`
+ *  that gives the document an opaque origin: scripts run (so an HTML report
+ *  works), but the page cannot read the console's cookies or storage, nor make
+ *  a credentialed request to it. Everything else is a download. */
+const INERT_MEDIA = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/(?:mp4|webm|quicktime)|text\/(?:plain|csv)|application\/json)(?:;|$)/i;
+const ACTIVE_DOCUMENT_MEDIA = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)(?:;|$)/i;
 export function untrustedContentHeaders(mediaType: string, filename: string): Record<string, string> {
   const name = filename.replace(/["\\\r\n]/g, '_');
-  const renderable = RENDER_SAFE_MEDIA.test(mediaType);
+  const inert = INERT_MEDIA.test(mediaType);
+  const active = ACTIVE_DOCUMENT_MEDIA.test(mediaType);
   return {
-    'content-type': renderable ? mediaType : 'application/octet-stream',
-    'content-disposition': `${renderable ? 'inline' : 'attachment'}; filename="${name}"`,
-    'content-security-policy': "sandbox; default-src 'none'",
+    'content-type': inert || active ? mediaType : 'application/octet-stream',
+    'content-disposition': `${inert || active ? 'inline' : 'attachment'}; filename="${name}"`,
+    'content-security-policy': active
+      ? 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads'
+      : "sandbox; default-src 'none'",
     'x-content-type-options': 'nosniff',
   };
 }

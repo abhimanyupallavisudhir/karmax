@@ -570,6 +570,29 @@ describe('task stage transitions', () => {
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
+  it('lets an agent confirm a Review gate only with review:approve (maintainer and above)', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view, stage: 'review', status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true }],
+    });
+    const agent = (caps: string[]) => f.tokens.mint({
+      taskId: f.task.id, profileId: 'do', role: 'do', principal: `task-agent:${f.task.id}:do`,
+      projectId: f.project.id, ceiling: caps, grantorCaps: caps,
+    }).token;
+    // A developer-level agent holds task:* (so task:signal) but not review:approve.
+    await expect(f.api.signalTask(agent(['task:*']), f.task.id, 'confirm')).rejects.toThrow(/review:approve/);
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(0);
+    // The same agent under a maintainer-level authorization stands in for the reviewer.
+    await f.api.signalTask(agent(['task:*', 'review:approve']), f.task.id, 'confirm');
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(1);
+    expect(f.store.eventsSince(f.task.id, 0).filter((e) => e.type === 'task.confirmation-voted').at(-1)?.payload)
+      .toMatchObject({ userId: `task-agent:${f.task.id}:do`, satisfied: true });
+    // Re-routing who reviews follows the same rule.
+    await expect(f.api.updateParams(agent(['task:*']), f.task.id, { confirm: { layers: [] } })).rejects.toThrow(/review:approve/);
+  });
+
   it('consumes a current Review-hold confirmation once instead of restoring the hold again', async () => {
     const f = fixture();
     f.store.setTaskWorkflowVersion(f.task.id, bundledVersion('software-dev'));

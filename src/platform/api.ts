@@ -3954,19 +3954,25 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         : undefined;
     if (signal === SIG.confirm && heldOrigin && heldOrigin !== 'review')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a Review decision; resume it or send the relevant agent a follow-up`);
-    // A Review confirmation is a human's decision. An agent reviews through its
-    // own Confirm turn (`confirm_decision`); letting it send this signal would
-    // pre-satisfy the human layer that follows — the workflow parks on the same
-    // `confirmed` flag whichever layer is playing.
-    if (signal === SIG.confirm && caller.kind === 'agent')
-      throw new CapabilityError('only a human can confirm a Review gate; an agent records its verdict with confirm_decision during its own review turn');
+    // A Review confirmation is a reviewer's decision. A Confirm-role agent
+    // records its verdict with `confirm_decision` in its own turn; any other
+    // agent may send this signal only when its authorization carries
+    // `review:approve` (maintainer and above — not the default developer
+    // profile), because the workflow parks on the same `confirmed` flag
+    // whichever layer is playing and the signal would pre-satisfy the human one.
+    if (signal === SIG.confirm && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
+      throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
     if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
-      if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
-      if (!this.deps.store.humanMayAct(taskId, userId))
+      // An agent authorized with `review:approve` (maintainer and above) stands in
+      // for the human audience; a developer-level agent does not.
+      const delegatedReviewer = !userId && caller.kind === 'agent' && allows(caller.caps, 'review:approve');
+      if (!userId && !delegatedReviewer)
+        throw new CapabilityError('only a human selected by this workflow step, or an agent authorized with review:approve, can confirm');
+      if (userId && !this.deps.store.humanMayAct(taskId, userId))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
       // Approving one branch and opening the proposal are not Review confirmation
       // decisions — only `confirm`
@@ -3974,7 +3980,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (signal === SIG.confirm) {
         this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
           payload: {
-            userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
+            userId: userId ?? caller.principal, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
             githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
               && (scopedTask.lastView.stage === 'review' || scopedTask.lastView.stage === 'merge')),
             // Current software-dev treats a Review confirmation as durable
@@ -4383,17 +4389,20 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // Human routes are the fields whose validity the deterministic sandbox cannot
     // judge: "does @qa resolve to a human here?" is a store question. Assert them
     // up front so a re-route can never park a gate or input pause invisibly.
-    // Who reviews a task, and who answers its questions, is a human decision:
-    // the Do agent holds task:edit for its own parameters, and without this it
-    // could patch `confirm.layers` to `[]` and skip its own Review gate.
+    // Who reviews a task, and who answers its questions, is a reviewer's
+    // decision: the Do agent holds task:edit for its own parameters, and without
+    // this it could patch `confirm.layers` to `[]` and skip its own Review gate.
+    // An agent whose authorization carries `review:approve` (maintainer and
+    // above) may re-route, like the human it stands in for.
+    const mayRoute = caller.kind !== 'agent' || allows(caller.caps, 'review:approve');
     const confirmer = this.confirmerFieldOf(task);
     if (confirmer && patch[confirmer.field.name] !== undefined) {
-      if (caller.kind !== 'human') throw new CapabilityError('only a human may change who reviews a task');
+      if (!mayRoute) throw new CapabilityError('changing who reviews a task needs review:approve (a maintainer-level authorization)');
       this.assertHumanRoutes(task, confirmer.manifest, { [confirmer.field.name]: patch[confirmer.field.name] } as ValueMap);
     }
     const responder = this.responderFieldOf(task);
     if (responder && patch[responder.field.name] !== undefined) {
-      if (caller.kind !== 'human') throw new CapabilityError('only a human may change who answers a task\'s questions');
+      if (!mayRoute) throw new CapabilityError('changing who answers a task\'s questions needs review:approve (a maintainer-level authorization)');
       this.assertHumanRoutes(task, responder.manifest, { [responder.field.name]: patch[responder.field.name] } as ValueMap);
     }
     try {

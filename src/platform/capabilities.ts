@@ -18,7 +18,7 @@ export type Capability = string;
 export const CAPABILITIES = [
   'task:read', 'task:create', 'task:edit', 'task:signal', 'task:escalate', 'task:delete',
   'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
-  'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute',
+  'task:event:read', 'task:git:publish', 'task:git:import', 'task:review:write', 'task:review:execute', 'review:approve',
   'task:assign', 'task:subscribe',
   'project:read', 'project:create', 'project:edit', 'project:delete',
   'project:settings:read', 'project:settings:write',
@@ -112,6 +112,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['task:conversation:fork', 'Fork agent conversations', 'Create a new task from an existing agent conversation.'],
       ['task:conversation:message', 'Message forked agents', 'Continue a forked conversation with additional messages.'],
       ['task:review:write', 'Write review information', 'Publish structured review summaries and evidence.'],
+      ['review:approve', 'Approve Review gates and route reviews', 'Confirm a task at its Review gate and change who reviews or answers it — the decisions a human reviewer makes. Held by maintainers and above; not by the default developer profile.'],
       ['task:review:execute', 'Execute review actions', 'Run and stop workflow-declared review actions.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },

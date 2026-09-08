@@ -3,6 +3,8 @@ import path from 'node:path';
 import { git, gitOrThrow } from '../world/git.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { parseManifest } from './schema.js';
+import { deploymentConfig } from '../config/deployment.js';
+import { pathToFileURL } from 'node:url';
 import { PackageStore } from './store.js';
 
 /**
@@ -25,12 +27,13 @@ export interface LoadedPackage {
 }
 
 /** Manifest filenames tried in order — JSON first (pure data, no code executed). */
-/** A manifest is data. Earlier releases also accepted `manifest.mjs`/`.js`/`.ts`
- *  and `import()`ed them in the host process at install time — code from any
- *  git URL a `workflow:install` holder pointed at ran on the control plane with
- *  no review in between. Workflow code itself is only ever bundled into the
- *  deterministic sandbox; the manifest gets the same treatment by not executing. */
-const MANIFEST_NAMES = ['manifest.json'];
+/** A `manifest.mjs`/`.js`/`.ts` is `import()`ed in the host process at install
+ *  time. On the operator's own machine that is the operator installing code they
+ *  chose (SPEC §4.2 lays packages out with a `manifest.ts`). On a hosted cell the
+ *  installer is a tenant administrator and the host is shared, so only the data
+ *  form is accepted there. */
+const MODULE_MANIFEST_NAMES = ['manifest.mjs', 'manifest.js', 'manifest.ts'];
+const MANIFEST_NAMES = ['manifest.json', ...MODULE_MANIFEST_NAMES];
 const WORKFLOW_NAMES = ['workflow.mjs', 'workflow.js', 'workflow.ts'];
 
 /**
@@ -192,11 +195,25 @@ function firstExisting(dir: string, names: string[]): string | undefined {
   return undefined;
 }
 
-/** Read + validate the package manifest (JSON only; see MANIFEST_NAMES). */
+/** Read + validate the package manifest. JSON is parsed; a module is imported
+ *  (host-local installs only — see MODULE_MANIFEST_NAMES). */
 async function readManifest(dir: string): Promise<WorkflowManifest> {
-  const file = firstExisting(dir, MANIFEST_NAMES);
-  if (!file) throw new Error(`no manifest (${MANIFEST_NAMES.join(' / ')}) in ${dir}`);
-  return parseManifest(JSON.parse(fs.readFileSync(file, 'utf8')));
+  const hosted = deploymentConfig().hosted;
+  const file = firstExisting(dir, hosted ? ['manifest.json'] : MANIFEST_NAMES);
+  if (!file) {
+    const moduleOnly = !hosted ? undefined : firstExisting(dir, MODULE_MANIFEST_NAMES);
+    if (moduleOnly) throw new Error(`hosted karmax installs packages from a manifest.json only (${path.basename(moduleOnly)} would run in the shared control plane)`);
+    throw new Error(`no manifest (${MANIFEST_NAMES.join(' / ')}) in ${dir}`);
+  }
+  let data: unknown;
+  if (file.endsWith('.json')) {
+    data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } else {
+    // A manifest module exports the manifest as default or as `manifest`.
+    const mod = await import(pathToFileURL(file).href);
+    data = mod.default ?? mod.manifest ?? mod;
+  }
+  return parseManifest(data);
 }
 
 /** Extract a tarball with the `tar` CLI (present on the platforms we target). */

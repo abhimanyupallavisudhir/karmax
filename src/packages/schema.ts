@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { WorkflowManifest } from '../contrib/manifests.js';
+import { deploymentConfig } from '../config/deployment.js';
 
 /**
  * Runtime validation for a workflow manifest (PLAN item 21). A loaded package is
@@ -53,11 +54,7 @@ export const manifestSchema = z.object({
   commands: z.array(command).max(200),
   entrypoint: z.string().regex(ENTRYPOINT_PATTERN, 'must be a bare JavaScript identifier').optional(),
   roles: z.array(role).max(50).optional(),
-  // An MCP server entry is a command the agent harness spawns on the machine
-  // running it — the control plane for worktree/container worlds. A package from
-  // a git URL is data an administrator installed, not code the operator reviewed
-  // for the host, so it may not declare one (bundled manifests still can).
-  agentMcp: z.array(agentMcp).max(0, 'external workflow packages may not declare agentMcp servers (they would run commands on the karmax host)').optional(),
+  agentMcp: z.array(agentMcp).max(100).optional(),
   resolveRules: z.array(resolveRule).max(500).optional(),
   promptPreamble: z.string().max(200_000).optional(),
   stages: z.array(stage).max(200).optional(),
@@ -74,12 +71,28 @@ export const manifestSchema = z.object({
 
 /** Validate + type a manifest; throws on malformed. */
 export function parseManifest(data: unknown): WorkflowManifest {
-  return manifestSchema.parse(data) as unknown as WorkflowManifest;
+  const manifest = manifestSchema.parse(data) as unknown as WorkflowManifest;
+  assertHostSafe(manifest);
+  return manifest;
+}
+
+/** An `agentMcp` entry is a command the agent harness spawns on the machine
+ *  running it — the control plane for worktree/container worlds. The operator
+ *  installing a package on their own machine chose that; on a hosted cell the
+ *  installer is a tenant administrator and the host is shared, so the entry is
+ *  refused there (bundled manifests are unaffected). */
+export function assertHostSafe(manifest: WorkflowManifest): void {
+  if (manifest.agentMcp?.length && deploymentConfig().hosted)
+    throw new Error('hosted karmax does not accept workflow packages that declare agentMcp servers (they would run commands on the shared control plane)');
 }
 
 /** Non-throwing validation with a flat, human-readable error string. */
 export function safeParseManifest(data: unknown): { ok: true; manifest: WorkflowManifest } | { ok: false; error: string } {
   const r = manifestSchema.safeParse(data);
-  if (r.success) return { ok: true, manifest: r.data as unknown as WorkflowManifest };
+  if (r.success) {
+    try { assertHostSafe(r.data as unknown as WorkflowManifest); }
+    catch (error) { return { ok: false, error: (error as Error).message }; }
+    return { ok: true, manifest: r.data as unknown as WorkflowManifest };
+  }
   return { ok: false, error: r.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ') };
 }

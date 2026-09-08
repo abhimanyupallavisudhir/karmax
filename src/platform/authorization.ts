@@ -54,6 +54,9 @@ const maintainer = [
   'project:resource:shared-write',
   'workflow:install', 'workflow:edit', 'team:write', 'repository:write',
   'github:actions:write',
+  // A maintainer's agent may stand in for a human at a Review gate; a
+  // developer's may not (it reviews through its own Confirm turn instead).
+  'review:approve',
 ] satisfies Capability[];
 // A project grant can never turn into authority over unrelated projects or the
 // host. Global grants remain the explicit trust root for users, host processes,
@@ -121,7 +124,8 @@ const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capabi
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
   ]],
-  maintainer: [maintainer.filter((capability) => !capability.startsWith('github:actions:')), [
+  maintainer: [maintainer.filter((capability) => capability !== 'review:approve'),
+    maintainer.filter((capability) => !capability.startsWith('github:actions:') && capability !== 'review:approve'), [
     'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
     'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
     'project:edit', 'project:settings:*', 'queue:write', 'profile:write',

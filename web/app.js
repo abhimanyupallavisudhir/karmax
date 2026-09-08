@@ -7400,10 +7400,27 @@ function promptSecret(title, hint) {
 }
 
 let reviewActionWs = null;
-// Types a browser renders without running anything. A `blob:` URL created here
-// carries THIS page's origin, so an agent-authored HTML/SVG artifact opened that
-// way would execute with the console's session — those are downloaded instead.
+// Types a browser renders without running anything: opened straight from a
+// `blob:` URL. Active documents (HTML, SVG) are opened too — inside a sandboxed
+// iframe, because a `blob:` URL carries THIS page's origin and an agent-authored
+// page opened bare would execute with the console's session. Everything else
+// is downloaded.
 const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
+const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
+function openSandboxedDocument(blobUrl, title) {
+  const w = window.open('', '_blank', 'noopener=no');
+  if (!w) return false;
+  w.document.title = title;
+  const frame = w.document.createElement('iframe');
+  // No allow-same-origin: the document gets an opaque origin, so its scripts
+  // cannot read this console's storage or cookies or call its API as the user.
+  frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
+  frame.src = blobUrl;
+  frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0';
+  w.document.body.style.margin = '0';
+  w.document.body.appendChild(frame);
+  return true;
+}
 function safeHref(href) {
   return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
 }
@@ -7415,9 +7432,9 @@ async function openArtifact(url, external) {
     if (!res.ok) { toast('could not open artifact', true); return; }
     const blob = await res.blob();
     const obj = URL.createObjectURL(blob);
+    const name = /filename="([^"]*)"/.exec(res.headers.get('content-disposition') || '')?.[1] || 'artifact';
     if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
-    else {
-      const name = /filename="([^"]*)"/.exec(res.headers.get('content-disposition') || '')?.[1] || 'artifact';
+    else if (!(ACTIVE_ARTIFACT.test(blob.type) && openSandboxedDocument(obj, name))) {
       const a = document.createElement('a');
       a.href = obj; a.download = name; a.rel = 'noopener';
       document.body.appendChild(a); a.click(); a.remove();
