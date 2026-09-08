@@ -591,7 +591,7 @@ describe('buildWikiPromptContext', () => {
       writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\nlabels: default\n---\nHouse variant of the instructions.');
       const ctx = buildWikiPromptContext({ contentDir, organizationId: 'org1', projectId: 'p1' });
       expect(ctx).toContain('House variant of the instructions.');
-      expect(ctx).not.toContain('Do the task completely and correctly.');
+      expect(ctx).not.toContain(GLOBAL_INSTRUCTIONS);
       // Drop the `default` label → its body leaves the standing prompt (still in the org TOC).
       writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\nname: How to work\ndescription: house rules\n---\nHouse variant.');
       const indexed = buildWikiPromptContext({ contentDir, organizationId: 'org1', projectId: 'p1' });
