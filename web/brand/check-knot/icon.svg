@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Endless knot woven from checkmarks">
+  <rect width="512" height="512" rx="112" fill="#191A20"/>
+  <g transform="translate(256 256) rotate(45) scale(54) translate(-1.5 -1.5)" fill="none" stroke="#FFFFFF" stroke-width="0.44" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M2 0H3V1H-1V2H4V3H0V-1H1V4H2Z"/>
+    <!-- Alternating bridges keep the single closed strand readable at crossings. -->
+    <path d="M1.61 1L2.39 1M-0.39 1L0.39 1M0.61 2L1.39 2M1.61 3L2.39 3M0 1.61L0 2.39M1 0.61L1 1.39M1 2.61L1 3.39M2 1.61L2 2.39" stroke="#191A20" stroke-width="0.66" stroke-linecap="butt"/>
+    <path d="M1.61 1L2.39 1M-0.39 1L0.39 1M0.61 2L1.39 2M1.61 3L2.39 3M0 1.61L0 2.39M1 0.61L1 1.39M1 2.61L1 3.39M2 1.61L2 2.39"/>
+  </g>
+</svg>

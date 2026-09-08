@@ -19,6 +19,7 @@ import {
   SIG_SET_AGENT_CAPACITY,
   QRY_AGENT_QUEUE,
   QRY_ACCOUNT_TASK_LEASES,
+  QRY_ACCOUNT_LEASE,
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
@@ -2143,8 +2144,23 @@ export class KarmaxApi {
     // Cosmetic notes and the queue-time effective agent snapshot live outside the
     // workflow history, so mirror both onto whichever view we return. Keeping the
     // agent snapshot platform-side avoids changing immutable workflow replay payloads.
-    const enrich = (view: TaskView | undefined): TaskView | undefined => {
+    const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
+      // Existing parked executions recorded only "account". Read the small
+      // coordinator projection to explain that wait without replaying the task
+      // or restarting its agent. New lease results already carry this detail.
+      if (view.waitingFor?.kind === 'account' && !view.waitingFor.detail) {
+        try {
+          const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
+            .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
+              waiting: boolean; earliestResetAt?: number; detail?: string;
+            }>, 500);
+          if (lease.waiting && lease.detail) view = { ...view, waitingFor: {
+            ...view.waitingFor, detail: lease.detail,
+            ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+          } };
+        } catch { /* A coordinator outage must not block reading the task. */ }
+      }
       const agents = this.readAgentSnapshot(taskId);
       const task = this.deps.store.getTask(taskId);
       return {
@@ -3925,18 +3941,23 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       // decisions — only `confirm`
       // passes the gate, so only `confirm` is journalled as the decision.
       if (signal === SIG.confirm) {
+        // A failed Confirm agent can expose the same human decision from its
+        // escalation frame. Preserve that person's GitHub authorization too.
+        const reviewConfirmation = scopedTask.lastView.stage === 'review'
+          || (scopedTask.lastView.stage === 'escalated'
+            && scopedTask.lastView.actions.some((action) => action.name === 'confirm' && action.enabled));
         this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
           payload: {
             userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
             githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && (scopedTask.lastView.stage === 'review' || scopedTask.lastView.stage === 'merge')),
+              && (reviewConfirmation || scopedTask.lastView.stage === 'merge')),
             // Current software-dev treats a Review confirmation as durable
             // authorization of the task intent, including bounded automated
             // integration repairs. An exceptional Landing confirmation still
             // records the exact current heads below for strict GitHub policy.
             githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
               && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
-              && scopedTask.lastView.stage === 'review'),
+              && reviewConfirmation),
             githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
               slug: ref.slug, number: ref.number, headSha: ref.headSha,
             })),

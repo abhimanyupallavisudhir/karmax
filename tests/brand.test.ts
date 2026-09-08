@@ -55,7 +55,7 @@ describe('brand icon selection', () => {
   });
 
   it('accepts exactly the known icons', () => {
-    expect(BRAND_ICONS).toEqual(['diamond', 'knot', 'check', 'check-arrow', 'clover']);
+    expect(BRAND_ICONS).toEqual(['diamond', 'knot', 'check', 'check-arrow', 'check-knot', 'clover']);
     for (const icon of BRAND_ICONS) expect(isBrandIcon(icon)).toBe(true);
     expect(isBrandIcon('Diamond')).toBe(false);
     expect(isBrandIcon('../../etc/passwd')).toBe(false);

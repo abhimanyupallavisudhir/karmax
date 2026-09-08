@@ -239,6 +239,47 @@ describe('remote subscription agents', () => {
     expect([...destination.files.keys()].some((file) => file.endsWith('/other.jsonl'))).toBe(false);
   });
 
+  it('transfers nested Codex lineage, then restores it from the durable home', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-lineage-'));
+    const source = fakeWorld(), destination = fakeWorld();
+    const prefix = '.karmax-injection/agent/codex/source-account';
+    const rollout = (id: string, base?: string) => Buffer.from(JSON.stringify({ type: 'session_meta',
+      payload: { id, history_mode: 'paginated', ...(base ? { history_base: {
+        thread_id: base, end_ordinal_exclusive: 2, end_byte_offset: 300,
+      } } : {}) } }) + '\n');
+    source.files.set(`${prefix}/sessions/rollout-leaf-session.jsonl`, rollout('leaf-session', 'parent-session'));
+    source.files.set(`${prefix}/sessions/rollout-parent-session.jsonl`, rollout('parent-session', 'root-session'));
+    source.files.set(`${prefix}/archived_sessions/rollout-root-session.jsonl`, rollout('root-session'));
+    source.files.set(`${prefix}/sessions/rollout-unrelated.jsonl`, rollout('unrelated'));
+    expect(await materializeRemoteSession(source, destination, 'codex', 'leaf-session', localHome)).toBe(true);
+    const home = remoteAgentHomeRelative('codex', localHome);
+    expect([...destination.files.keys()].sort()).toEqual(['leaf-session', 'parent-session', 'root-session']
+      .map((id) => `${home}/sessions/forked/rollout-${id}.jsonl`).sort());
+    expect(destination.files.get(`${home}/sessions/forked/rollout-parent-session.jsonl`))
+      .toEqual(rollout('parent-session', 'root-session'));
+    // Codex may archive an ancestor before the world is checkpointed.
+    destination.files.set(`${home}/archived_sessions/rollout-root-session.jsonl`,
+      destination.files.get(`${home}/sessions/forked/rollout-root-session.jsonl`)!);
+    destination.files.delete(`${home}/sessions/forked/rollout-root-session.jsonl`);
+    await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome);
+    const restored = fakeWorld();
+    await seedRemoteAgentHome(restored, 'codex', localHome, 'leaf-session');
+    for (const [file, content] of destination.files) expect(restored.files.get(file)).toEqual(content);
+  });
+
+  it.each(['missing', 'cycle'])('rejects %s remote lineage without exposing a partial session', async (kind) => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-lineage-'));
+    const source = fakeWorld(), destination = fakeWorld();
+    source.files.set('.karmax-injection/agent/codex/source/sessions/rollout-leaf-session.jsonl',
+      Buffer.from(JSON.stringify({ type: 'session_meta', payload: { history_base: {
+        thread_id: kind === 'cycle' ? 'leaf-session' : 'missing-session',
+      } } })));
+    // A different account must not satisfy this dependency.
+    source.files.set('.karmax-injection/agent/codex/other/sessions/rollout-missing-session.jsonl', Buffer.from('{}'));
+    expect(await materializeRemoteSession(source, destination, 'codex', 'leaf-session', localHome)).toBe(false);
+    expect(destination.files.size).toBe(0);
+  });
+
   it('runs Codex app-server inside the remote PTY with the seeded subscription', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
@@ -302,7 +343,8 @@ describe('remote subscription agents', () => {
     }));
   });
 
-  it('centrally refreshes and resumes once when a remote access-only token expires', async () => {
+  it.each(['new', 'resume', 'fork', 'cancelled'])('centrally refreshes and resumes once when a remote access-only token expires (%s)', async (mode) => {
+    const fork = mode === 'fork';
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-refresh-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const usageStub = path.join(localHome, 'refresh-stub.cjs');
@@ -327,17 +369,28 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
     const world = fakeWorld(true, false, true);
     const activities: any[] = [];
+    const controller = new AbortController();
 
     const result = await new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
-      world,
+      world, session: mode === 'new' ? undefined : 'original-thread', fork,
       messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
       systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
-    } as any, { emit() {}, emitActivity: (activity: any) => activities.push(activity),
-      platformRequest: async () => [{ type: 'ok' }] } as any);
+    } as any, { signal: controller.signal, emit() {}, emitActivity: (activity: any) => {
+      activities.push(activity);
+      if (mode === 'cancelled' && activity.id === 'codex-credential-recovery' && activity.phase === 'started') controller.abort();
+    },
+      platformRequest: async () => [{ type: 'ok' }] } as any).catch(error => error);
 
-    expect(result).toMatchObject({ termination: { kind: 'success' }, session: 'remote-thread' });
+    if (mode === 'cancelled') {
+      expect(result).toBeInstanceOf(Error);
+      expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+      return;
+    }
+
+    expect(result).toMatchObject({ termination: { kind: 'success' }, session: fork ? 'forked-remote-thread' : mode === 'new' ? 'remote-thread' : 'original-thread' });
     expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
+    expect(world.requests.filter((request) => request.method === 'thread/fork')).toHaveLength(fork ? 1 : 0);
     expect(activities).toContainEqual(expect.objectContaining({
       id: 'codex-credential-recovery', phase: 'completed',
       title: expect.stringMatching(/resuming turn/i),

@@ -79,7 +79,7 @@ const claudeRefreshes = new Map<string, Promise<string>>();
  * Long turns remain protected by the bounded terminal-401 recovery in codex.ts. */
 export const CODEX_REMOTE_ID_TOKEN_SAFETY_MS = 10 * 60_000;
 /** Leave enough access-token lifetime for sandbox startup and the first Claude
- * request. Mid-turn expiry is still handled by the SDK's host refresh callback. */
+ * request. Mid-turn expiry is handled by the adapter's bounded recovery. */
 export const CLAUDE_REMOTE_ACCESS_TOKEN_SAFETY_MS = 10 * 60_000;
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
@@ -370,14 +370,15 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
     child.stdout?.on('data', (b) => (out += b.toString()));
     child.stderr?.on('data', (b) => (out += b.toString()));
     child.once('error', (e) => finish(e as Error));
-    child.once('exit', () => finish());
+    child.once('exit', (code, signal) => finish(code === 0 ? undefined
+      : new Error(`Claude usage/login refresh process failed (${signal ?? code ?? 'unknown exit'})`)));
   });
 }
 
 /** Refresh the ONE canonical Claude login and return its current access token.
- * Remote turns call this through the Agent SDK's host OAuth-refresh callback;
- * their sandbox projections never receive the rotating refresh token. Concurrent
- * callbacks share one provider process so a refresh-token family has one writer. */
+ * Remote turns call this before projection and after terminal OAuth expiry;
+ * their sandboxes never receive the rotating refresh token. Concurrent calls
+ * share one provider process so a refresh-token family has one writer. */
 export async function refreshClaudeAccessToken(
   opts: { configHome: string; timeoutMs?: number; run?: UsageRunner },
 ): Promise<string> {

@@ -341,7 +341,7 @@ function parseRoute(url) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
-  if (seg[0] === 'profile') return { name: 'profile' };
+  if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
   if (seg[0] === 'installation') return { name: 'installation' };
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
@@ -423,7 +423,7 @@ function organizationLandingRoute(organizationId) {
 function installationRoute() { return '/installation'; }
 
 // The profile belongs to the signed-in user, not to the selected organization.
-function profileRoute() { return '/profile'; }
+function profileRoute(userId) { return userId ? `/profile/${encodeURIComponent(userId)}` : '/profile'; }
 
 // The inbox pinned to one kind of notification: /<org>/inbox/<kind> ('all' is
 // the bare route). Which sub-tab you are on is part of the page, so it lives in
@@ -490,6 +490,9 @@ async function applyRoute() {
   if (r.name === 'profile') {
     if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
     closeTaskDom();
+    if (r.userId && r.userId !== S.user?.id && !S.installationAccess)
+      return go(profileRoute(), { replace: true });
+    S.profileUserId = r.userId || null;
     S.tab = 'profile';
     renderRail();
     renderMain();
@@ -662,7 +665,8 @@ async function applyRoute() {
     const nextTaskFile = r.taskFile || null;
     if (JSON.stringify(S.taskFile) !== JSON.stringify(nextTaskFile)) S.taskFileLoad = null;
     S.taskFile = nextTaskFile;
-    if (S.selected !== taskId) return openTask(taskId, r.taskTab);
+    if (S.selected !== taskId) return openTask(taskId, r.taskTab, r.taskKey === taskId);
+    S.viewingAttempt = r.taskKey === taskId ? taskId : null;
     if (r.taskTab) S.taskTab = r.taskTab;
     return renderTaskPage();
   }
@@ -680,7 +684,7 @@ async function applyRoute() {
 function taskUrl(id, record) {
   const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
-  const keyPart = rec && rec.num != null ? String(rec.num) : id;
+  const keyPart = S.viewingAttempt !== id && rec && rec.num != null ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
@@ -1614,7 +1618,10 @@ function wireCombo(combo, getOptions, onChange) {
   };
   const show = () => { draw(); menu.hidden = false; open = true; };
   const hide = () => { menu.hidden = true; open = false; active = -1; };
-  const choose = (opt) => { input.value = opt.dataset.v; hide(); onChange && onChange(); };
+  const choose = (opt) => {
+    input.value = opt.dataset.v; hide(); onChange && onChange();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
   input.addEventListener('focus', show);
   input.addEventListener('input', () => { show(); onChange && onChange(); });
   input.addEventListener('keydown', (e) => {
@@ -3262,6 +3269,9 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else renderTaskEvents();
     }
+    if (S.selected && ev.taskId !== S.selected
+      && S.attemptGroup?.attempts?.some((a) => a.id === ev.taskId)
+      && ['view.updated', 'task.stage', 'merge.result', 'turn.result'].includes(ev.type)) refreshTask();
     if (patchedList) {
       // Re-evaluate only the active query: stage/status changes can alter filter
       // membership, but they do not require the expensive all-tasks endpoint.
@@ -3287,7 +3297,10 @@ function connectWs() {
   ws.onopen = () => {
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
-    if (wsHadDropped) { refreshTasks().catch(() => {}); if (S.selected) refreshTask().catch(() => {}); }
+    if (wsHadDropped) {
+      refreshTasks().catch(() => {});
+      if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
+    }
     wsHadDropped = false;
   };
   ws.onclose = () => { wsHadDropped = true; setWsOnline(false); setTimeout(connectWs, 1500); };
@@ -3374,6 +3387,7 @@ const BRAND_ICON_CHOICES = [
   { id: 'knot', label: 'Knot' },
   { id: 'check', label: 'Check' },
   { id: 'check-arrow', label: 'Check arrow' },
+  { id: 'check-knot', label: 'Check knot' },
   { id: 'clover', label: 'Clover' },
 ];
 
@@ -3415,11 +3429,11 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-async function setOnboardingDisplay(display) {
+async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   try {
     S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
-      method: 'PUT', body: JSON.stringify({ display }),
+      method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
@@ -3477,8 +3491,9 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot"><span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
   </section>`;
+  $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -6272,48 +6287,56 @@ function runPageRow(r) {
   return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
-// One compact selectable row per execution. The list remains one row per intent;
-// switching here replaces the entire task-page projection with that attempt.
+// Attempt links pin the execution id; the numbered task permalink follows the
+// principal. Keep navigation separate from the selected attempt's stage control.
 function taskAttempts(v) {
   const g = S.attemptGroup;
   if (!g?.attempts?.length) return '';
-  const rows = g.attempts.map((a) => {
-    const av = a.lastView || {};
-    const principal = a.id === g.principalAttemptId;
+  const rows = g.attempts.length > 1 ? g.attempts.map((a) => {
+    const av = a.id === v.taskId ? v : a.lastView || {};
     const committed = a.id === g.committedAttemptId;
     const selected = a.id === v.taskId;
-    const status = av.status || (a.params?.draft ? 'waiting' : 'active');
-    return `<div role="button" tabindex="0" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
-      <span class="attempt-check">${selected ? '✓' : ''}</span>
-      <span class="status-dot ${esc(status)}"></span>
-      <b>Attempt ${a.attemptNumber || 1}</b>
-      ${principal ? '<span class="chip">principal</span>' : ''}
-      ${committed ? '<span class="chip done" title="Selected to merge — the other attempts are stopped.">committed</span>' : ''}
-      <span class="attempt-stage">${stageIndicator(a.params?.draft ? { ...av, state: { ...(av.state || {}), draft: true } } : av, a.id, true)}</span>
-    </div>`;
-  }).join('');
-  return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
+    const draft = !!a.params?.draft;
+    const label = stageLabel(draft ? { ...av, state: { ...av.state, draft: true } } : av);
+    const href = `${projectBase(a.projectId || taskRecord(v.taskId)?.projectId || S.projectId)}/tasks/${encodeURIComponent(a.id)}/${S.taskTab || 'overview'}`;
+    return `<a class="attempt-card${selected ? ' selected' : ''}" data-spa data-attempt-select="${esc(a.id)}" href="${esc(href)}" ${selected ? 'aria-current="true"' : ''}>
+      <span class="attempt-name">Attempt ${a.attemptNumber || 1}</span>
+      <span class="attempt-state"><span class="status-dot ${esc(av.status || (draft ? 'waiting' : 'active'))}"></span>${esc(label)}</span>
+      ${committed ? '<span class="attempt-note">Selected to merge</span>' : a.id === g.principalAttemptId ? '<span class="attempt-note">Shown in task list</span>' : ''}
+    </a>`;
+  }).join('') : '';
+  return `<section class="attempts" aria-label="Task attempts">
+    <div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span>
+      <button type="button" class="btn sm" id="add-attempt" ${g.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>
+    </div>${rows ? `<nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>` : ''}
+  </section>`;
 }
 
 function wireAttempts(v) {
-  document.getElementById('add-attempt')?.addEventListener('click', async () => {
+  document.getElementById('add-attempt')?.addEventListener('click', async (event) => {
+    if (S.addingAttempt) return;
+    S.addingAttempt = true;
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Creating…';
     try {
       const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
       await refreshTasks();
-      await openTask(draft.id, 'parameters', true);
-      openTaskForm(draft.workflow, draft);
+      if (S.selected !== v.taskId) return;
+      await spaNavigate(`${projectBase(draft.projectId || S.projectId)}/tasks/${encodeURIComponent(draft.id)}/parameters`);
+      if (S.selected === draft.id) await openTaskForm(draft.workflow, draft);
     } catch (e) { toast(e.message, true); }
-  });
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', (event) => {
-    if (event?.target?.closest?.('[data-stage-move]')) return;
-    if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
-  }));
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('keydown', (event) => {
-    if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('[data-stage-move]')) {
-      event.preventDefault();
-      if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+    finally {
+      S.addingAttempt = false;
+      button.disabled = false;
+      button.textContent = '＋ New attempt';
+      const current = document.getElementById('add-attempt');
+      if (current) {
+        current.disabled = !!S.attemptGroup?.committedAttemptId;
+        current.textContent = '＋ New attempt';
+      }
     }
-  }));
+  });
 }
 
 function wireStageTransitions(v) {
@@ -6335,6 +6358,7 @@ function wireStageTransitions(v) {
       await api(`/api/tasks/${taskId}/stage`, { method: 'POST', body: JSON.stringify({ target }) });
       toast(`Moved to ${move?.label || target}`);
       await refreshTasks();
+      if (S.selected !== v.taskId) return;
       if (taskId === v.taskId) await refreshTask();
       else {
         S.attemptGroup = await api(`/api/tasks/${v.taskId}/attempts`);
@@ -6348,7 +6372,53 @@ function wireStageTransitions(v) {
   }));
 }
 
+// History is needed to read Check-in, independently of sessions, credentials,
+// widgets, and other secondary panels. Merge a fetched window with events that
+// arrived while it was loading, preserving explanations and durable ordering.
+function mergeTaskHistory(events) {
+  const currentEvents = S.taskEvents || [];
+  const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
+  const ordinary = [
+    ...events.filter((event) => event.type !== 'conversation.explanation'),
+    ...currentEvents.filter((event) => event.type !== 'conversation.explanation'
+      && (event.seq == null || !durableSeqs.has(event.seq))),
+  ].sort((a, b) => (a.seq ?? a.ts) - (b.seq ?? b.ts)).slice(-400);
+  const explanations = new Map();
+  for (const event of [...events, ...currentEvents]) {
+    if (event.type === 'conversation.explanation')
+      explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
+  }
+  S.taskEvents = [...ordinary, ...explanations.values()];
+}
+
+async function refreshTaskHistory(taskId) {
+  const rec = taskRecord(taskId);
+  if (rec?.params?.draft || rec?.params?.repeatable) return [];
+  const epoch = S.taskHistoryEpoch = (S.taskHistoryEpoch || 0) + 1;
+  S.taskHistoryLoading = true;
+  S.taskHistoryError = null;
+  if (S.taskTab === 'checkin') scheduleTaskPageRender();
+  try {
+    const events = await api(`/api/tasks/${taskId}/events?since=0&limit=300`);
+    if (S.selected !== taskId || S.taskHistoryEpoch !== epoch) return [];
+    mergeTaskHistory(events);
+    return events;
+  } catch (error) {
+    if (S.selected === taskId && S.taskHistoryEpoch === epoch)
+      S.taskHistoryError = error.message || 'Unable to load conversation history';
+    return [];
+  } finally {
+    if (S.selected === taskId && S.taskHistoryEpoch === epoch) {
+      S.taskHistoryLoading = false;
+      if (S.taskTab === 'checkin') scheduleTaskPageRender();
+    }
+  }
+}
+
 async function openTask(taskId, wantTab, explicitAttempt = false) {
+  const openEpoch = S.taskOpenEpoch = (S.taskOpenEpoch || 0) + 1;
+  S.taskViewRefreshEpoch = (S.taskViewRefreshEpoch || 0) + 1;
+  S.taskHistoryEpoch = (S.taskHistoryEpoch || 0) + 1;
   // Leaving another task's page kills its check-in shell (same as closing does).
   if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; }
   // Per-task page state starts fresh: the tab comes from the URL when pinned
@@ -6368,6 +6438,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     return;
   }
   S.taskEvents = [];
+  S.taskHistoryLoading = false;
+  S.taskHistoryError = null;
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
@@ -6404,7 +6476,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     const details = Promise.all([
       // The websocket keeps this window current. Older history remains durable,
       // but opening a task should have a fixed memory and response-size budget.
-      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0&limit=300`).catch(() => []),
+      draft ? Promise.resolve([]) : refreshTaskHistory(taskId),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
@@ -6417,7 +6489,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
       draft ? Promise.resolve([]) : api(`/api/tasks/${encodeURIComponent(taskId)}/explanations`).catch(() => []),
     ]);
     const view = await api(`/api/tasks/${taskId}`);
-    if (S.selected !== taskId) return;
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
     S.view = pendingCancellationView(view, taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
@@ -6426,22 +6498,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     renderTaskPage();
 
     const [events, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, explanationSettings, explanationEvents] = await details;
-    if (S.selected !== taskId) return;
-    // Events may have arrived over the websocket while the bounded durable window
-    // was loading. Preserve those instead of replacing them with the older response.
-    const currentEvents = S.taskEvents;
-    const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
-    const ordinary = [
-      ...events.filter((event) => event.type !== 'conversation.explanation'),
-      ...currentEvents.filter((event) => event.type !== 'conversation.explanation'
-        && (event.seq == null || !durableSeqs.has(event.seq))),
-    ].slice(-400);
-    const explanations = new Map();
-    for (const event of [...explanationEvents, ...events, ...currentEvents]) {
-      if (event.type !== 'conversation.explanation') continue;
-      explanations.set(event.seq ?? `${event.payload?.sourceKey}/${event.ts}/${event.payload?.text}`, event);
-    }
-    S.taskEvents = [...ordinary, ...explanations.values()];
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
+    mergeTaskHistory([...explanationEvents, ...events]);
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
@@ -6452,7 +6510,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.explanationSettings = explanationSettings.effective || DEFAULT_EXPLANATION_SETTINGS;
   } catch (e) {
     toast(e.message, true);
-    if (S.selected === taskId) renderTaskLoadingPage(rec, e.message);
+    if (S.selected === taskId && S.taskOpenEpoch === openEpoch) renderTaskLoadingPage(rec, e.message);
     return;
   }
   renderTaskPage();
@@ -6463,7 +6521,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   // once, after the first paint, and repaint only if the user is still here and
   // actually looking at the Parameters tab.
   loadParamDefaults(taskId).then((d) => {
-    if (S.selected !== taskId) return; // navigated away before it landed
+    if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return; // navigated away before it landed
     S.paramDefaults = d;
     if (S.taskTab === 'parameters') renderTaskPage();
   });
@@ -6797,6 +6855,9 @@ function renderTaskPage() {
   const fuState = captureFollowupFocus(main);
   const rec = taskRecord(v.taskId);
   const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
+  const previousAttempts = main.querySelector('.attempts-list');
+  const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
+    ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
   main.innerHTML = `
     <div class="task-page">
@@ -6806,7 +6867,7 @@ function renderTaskPage() {
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
+          ${currentAttempt && S.attemptGroup.attempts.length > 1 ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1}</span>` : ''}
           ${stageIndicator(v, v.taskId)}
           ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
         </div>
@@ -6835,6 +6896,14 @@ function renderTaskPage() {
       <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">${taskActions(v)}</div></div>
     </div>`;
+  const attemptList = main.querySelector('.attempts-list');
+  if (attemptList) {
+    if (attemptScroll !== null) attemptList.scrollLeft = attemptScroll;
+    else {
+      const selected = attemptList.querySelector('[aria-current="true"]');
+      if (selected) attemptList.scrollLeft = selected.getBoundingClientRect().left - attemptList.getBoundingClientRect().left;
+    }
+  }
   $('#tp-back').addEventListener('click', closeTask);
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
@@ -7766,7 +7835,7 @@ function overviewTab(v) {
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const requestedInput = humanWaitDetail(v);
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${v.waitingFor.kind === 'account' && v.waitingFor.detail ? `<div style="margin-top:8px">${esc(v.waitingFor.detail)}</div>` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
@@ -7874,7 +7943,13 @@ function checkinTab(v) {
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
-  const msgs = entries.map((entry) => renderConversationEntry(entry, v)).join('') || '<div class="msg system">No messages yet</div>';
+  const historyStatus = S.taskHistoryLoading
+    ? '<div class="msg system" role="status">Loading conversation history…</div>'
+    : S.taskHistoryError
+      ? `<div class="msg system" role="alert">${esc(S.taskHistoryError)} <button class="btn sm" data-reload-history>Retry loading history</button></div>`
+      : '';
+  const msgs = historyStatus + (entries.map((entry) => renderConversationEntry(entry, v)).join('')
+    || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -8382,6 +8457,7 @@ function terminalPane(v) {
 }
 
 function wireCheckinSidebar(v) {
+  $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
     el.addEventListener('click', () => {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
@@ -8627,7 +8703,8 @@ function authorizationSection(v) {
   const organizationId = S.projects.find((project) => project.id === rec?.projectId)?.organizationId;
   const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const stored = rec?.params?._authorization || {};
-  const selected = { level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
+  const selected = S.authorizationEdits?.[v.taskId]?.values.authorization || {
+    level: stored.level || stored.profileId || 'developer', scope: stored.scope || 'projects',
     projectIds: stored.projectIds || [rec?.projectId].filter(Boolean) };
   return `<div class="section-h">Authorization</div>
     <div id="tp-auth" class="parameter-fields">
@@ -8642,7 +8719,10 @@ function authorizationSection(v) {
           <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
         </button>
       </div>
-      <button class="btn sm primary" id="tp-auth-save">Save authorization</button>
+      <div class="params-save-bar" data-save-state="saved">
+        <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
+        <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
+      </div>
     </div>`;
 }
 
@@ -8657,11 +8737,52 @@ async function wireTaskAuthorization(v) {
   const organizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const projects = S.projects.filter((project) => project.organizationId === organizationId);
   const auth0 = rec?.params?._authorization || {};
-  wireAuthorizationEditor(select, projects);
+  const edits = S.authorizationEdits ||= {};
+  const previous = edits[v.taskId];
+  let syncAuthorization = () => {};
+  wireAuthorizationEditor(select, projects, () => syncAuthorization());
   // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
   const vaultGrantIds = new Set((auth0.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
+  if (previous) {
+    vaultGrantIds.clear();
+    previous.values.credentialGrants.forEach((grant) => vaultGrantIds.add(grant.slice('use-credential:item:'.length)));
+    vaultCredentialPolicies = structuredClone(previous.values.credentialPolicies);
+  }
+  const read = () => ({
+    authorization: readAuthorizationEditor(select),
+    credentialGrants: [...vaultGrantIds].sort().map((id) => `use-credential:item:${id}`),
+    credentialPolicies: structuredClone(vaultCredentialPolicies),
+  });
+  const draft = previous || { saved: read(), values: read(), saving: false };
+  const status = document.getElementById('tp-auth-status');
+  syncAuthorization = () => {
+    draft.values = read();
+    const dirty = !sameJson(draft.saved, draft.values);
+    if (dirty || draft.saving) edits[v.taskId] = draft;
+    else delete edits[v.taskId];
+    saveBtn.disabled = draft.saving || !dirty;
+    saveBtn.textContent = draft.saving ? 'Saving authorization…' : 'Save authorization';
+    status.textContent = draft.saving ? 'Saving authorization…' : dirty ? 'Unsaved authorization changes' : 'All authorization changes saved';
+    saveBtn.closest('.params-save-bar').dataset.saveState = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+  };
+  draft.sync = syncAuthorization;
+  syncAuthorization();
+  saveBtn.addEventListener('click', async () => {
+    if (draft.saving || sameJson(draft.saved, draft.values)) return;
+    const submitted = structuredClone(draft.values);
+    draft.saving = true; draft.sync();
+    try {
+      const updated = await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(submitted) });
+      const currentRecord = taskRecord(v.taskId);
+      if (currentRecord && updated?.params) currentRecord.params = updated.params;
+      draft.saved = submitted;
+      toast('Authorization saved — applies at the next agent turn');
+      setTimeout(refreshTasks, 400);
+    } catch (e) { toast(e.message, true); }
+    finally { draft.saving = false; draft.sync(); }
+  });
   const button = document.getElementById('tp-vault-open');
   const count = document.getElementById('tp-vault-count');
   let refreshVaultCount = () => {};
@@ -8675,12 +8796,14 @@ async function wireTaskAuthorization(v) {
       ids.forEach((id) => vaultGrantIds.add(id));
       vaultCredentialPolicies = policies;
       refreshVaultCount();
+      syncAuthorization();
     },
   });
   const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
   let items = [];
   try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
   catch { button?.closest('[data-row="__vault"]')?.remove(); }
+  if (!select.isConnected) return;
   if (button && count) {
     const refreshCount = () => { count.textContent = `${items.filter((i) => vaultGrantIds.has(i.id)).length} selected`; };
     refreshVaultCount = refreshCount;
@@ -8691,22 +8814,9 @@ async function wireTaskAuthorization(v) {
       picked.forEach((id) => vaultGrantIds.add(id));
       vaultCredentialPolicies = policies;
       refreshCount();
+      syncAuthorization();
     }));
   }
-  saveBtn.addEventListener('click', async () => {
-    try {
-      await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({
-        authorization: readAuthorizationEditor(select),
-        credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
-        credentialPolicies: vaultCredentialPolicies,
-      }) });
-      toast('Authorization updated — applies at the next agent turn');
-      setTimeout(refreshTask, 250);
-      setTimeout(refreshTasks, 400);
-    } catch (e) {
-      toast(e.message, true);
-    }
-  });
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
@@ -9199,10 +9309,10 @@ function paramsSection(v) {
       // an unsaved value, render that value back into its control instead of
       // replacing it with the last server snapshot during the repaint.
       const isEditable = editable.has(f.name);
-      const own = isParamDraftField(editDraft, f.name)
-        ? editDraft.values[f.name]
+      const own = isEditable && isParamDraftField(editDraft, f.name)
+        ? editDraft.values[f.name] ?? ''
         : paramCurrentValue(f, v, rec);
-      const inherited = inheritedAll[f.name];
+      const inherited = isEditable && isParamDraftField(editDraft, f.name) ? undefined : inheritedAll[f.name];
       // Agent fields show the full control (provider · model · effort · resume),
       // exactly like the task form — interactive when editable, disabled when frozen.
       if (f.type === 'agent') {
@@ -9291,14 +9401,7 @@ function collectParamEdits(root, fields) {
       // form's collectForm produces). Editable agent fields always send a spec.
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
-      const spec = { provider: box.querySelector('.af-provider').value };
-      const model = box.querySelector('.af-model').value.trim();
-      const effort = box.querySelector('.af-effort')?.value;
-      if (model) spec.model = model;
-      if (effort) spec.effort = effort;
-      const resumeFrom = readResume(box);
-      if (resumeFrom) spec.resumeFrom = resumeFrom;
-      out[f.name] = spec;
+      out[f.name] = readAgentSpec(box);
       continue;
     }
     if (f.type === 'confirmer') {
@@ -9360,47 +9463,61 @@ function wireParams(v) {
   // Rebase untouched controls onto the newest server render, while preserving
   // the saved comparison value for fields the operator is actively editing.
   let saved = { ...currentAtRender };
-  let saving = false;
+  const draft = existing || { saved, values: currentAtRender, dirtyNames: [], saving: false };
   if (existing) {
     for (const name of existing.dirtyNames) {
       if (Object.prototype.hasOwnProperty.call(existing.saved, name)) saved[name] = existing.saved[name];
       else delete saved[name];
     }
   }
+  draft.saved = saved;
   const sync = () => {
     const current = collectParamEdits(root, fields);
-    const dirtyNames = paramDirtyNames(saved, current, fields);
+    const dirtyNames = paramDirtyNames(draft.saved, current, fields);
     const dirty = dirtyNames.length > 0;
     for (const field of fields) {
       const row = root.querySelector(`.pf-edit-row[data-row="${CSS.escape(field.name)}"]`);
       row?.classList.toggle('param-row-dirty', dirtyNames.includes(field.name));
     }
-    if (dirty) S.paramEditDrafts[v.taskId] = { saved, values: current, dirtyNames };
+    draft.values = current;
+    draft.dirtyNames = dirtyNames;
+    if (dirty || draft.saving) S.paramEditDrafts[v.taskId] = draft;
     else delete S.paramEditDrafts[v.taskId];
-    setParamSaveState(root, saveBtn, status, saving ? 'saving' : dirty ? 'dirty' : 'saved');
+    setParamSaveState(root, saveBtn, status, draft.saving ? 'saving' : dirty ? 'dirty' : 'saved');
     return current;
   };
+  draft.sync = sync;
   root.addEventListener('input', sync);
   root.addEventListener('change', sync);
   sync();
   saveBtn.addEventListener('click', async () => {
-    if (saving) return;
-    const patch = collectParamEdits(root, fields);
-    if (!paramDirtyNames(saved, patch, fields).length) return sync();
-    saving = true;
+    if (draft.saving) return;
+    const submitted = collectParamEdits(root, fields);
+    const names = paramDirtyNames(draft.saved, submitted, fields);
+    if (!names.length) return sync();
+    // Empty scalar values are omitted by the live patch contract. Do not claim
+    // they were saved when the server would receive no change for that field.
+    const empty = fields.find((field) => names.includes(field.name) && submitted[field.name] === undefined);
+    if (empty) return toast(`${empty.label} cannot be saved empty. Enter a value or restore the saved value.`, true);
+    const patch = Object.fromEntries(names.map((name) => [name, submitted[name]]));
+    draft.saving = true;
     setParamSaveState(root, saveBtn, status, 'saving');
     try {
       const updated = await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
-      saved = patch;
+      Object.assign(draft.saved, patch);
+      const currentRecord = taskRecord(v.taskId);
+      if (currentRecord) currentRecord.params = { ...currentRecord.params, ...patch };
+      const confirmer = fields.find((field) => field.type === 'confirmer' && names.includes(field.name));
+      if (confirmer && S.selected === v.taskId && S.attemptGroup) S.attemptGroup.confirmer = patch[confirmer.name];
       if (updated?.view && S.selected === v.taskId) S.view = updated.view;
       toast('Parameter changes saved');
-      saving = false;
-      sync(); // a value changed while the request was running remains visibly unsaved
+      draft.saving = false;
+      draft.sync(); // use the current form, even when a refresh replaced the submitting DOM
       setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) {
-      saving = false;
-      sync();
+      draft.saving = false;
+      draft.sync();
       toast(e.message, true);
     }
   });
@@ -9412,6 +9529,7 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open PR';
   if (action.name === 'openPr')
     return hasOpenPullRequest(v) ? 'Return to Review' : 'Manually Open PR';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
@@ -9464,11 +9582,13 @@ function actionToast(signal, label) {
 }
 
 const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
+const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes and open the PR for review?';
 const returnToReviewConfirmation = () => `Return this pull request to Review? ${siteName()} will first verify that the current proposal is clean and committed.`;
 
 function confirmTaskAction(action, v = S.view) {
-  return action !== 'openPr' || confirm(hasOpenPullRequest(v)
-    ? returnToReviewConfirmation()
+  return action !== 'openPr' || confirm(v?.stage === 'escalated'
+    ? ERROR_OPEN_PR_CONFIRMATION
+    : hasOpenPullRequest(v) ? returnToReviewConfirmation()
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
@@ -11506,10 +11626,11 @@ async function hydrateProjectData(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/storage`).catch(() => []),
     ]);
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
+    const readyStorage = storageLocations.filter((location) => location.status === 'ready');
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when ${siteNameMarkup()} should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
-      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
@@ -11517,9 +11638,12 @@ async function hydrateProjectData(proj) {
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
-          <label class="form-row"><span>Storage</span><select id="data-storage">${storageLocations.filter((location) => location.status === 'ready').map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select></label>
+          <div class="form-row"><span>Storage</span>${readyStorage.length > 1
+            ? `<select id="data-storage" aria-label="Storage">${readyStorage.map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select>`
+            : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
+            <small class="field-help">Managed storage is provided by krmax for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
-          <label class="form-row wide"><span>Or upload a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory></label>
+          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
@@ -14506,7 +14630,23 @@ async function hydrateProfileGithub() {
 
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
+function profileWalkthroughCard(userId) {
+  if (!S.installationAccess || !S.meta?.hosted || !userId) return '';
+  return `<div class="card"><div class="section-h">Walkthrough</div>
+    <p class="task-sub">Show this user's setup walkthrough again in each organization. Existing work and connections are preserved.</p>
+    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Reset walkthrough</button></div>`;
+}
+
 function profileView() {
+  if (S.profileUserId && S.profileUserId !== S.user?.id) {
+    if (!S.installationAccess) return '<div class="empty">Profile unavailable</div>';
+    const user = S.users.find((candidate) => candidate.id === S.profileUserId);
+    if (!user) return '<div class="empty">User not found</div>';
+    return `<div class="profile-page"><h1 class="page-title">Profile</h1>
+      <div class="card profile-card"><div class="profile-name">${esc(user.name)}</div>
+        <div class="profile-email">${esc(user.email)}</div></div>
+      ${profileWalkthroughCard(user.id)}</div>`;
+  }
   const u = S.user && typeof S.user === 'object' ? S.user : null;
   const name = userDisplayName();
   const email = u?.email || '';
@@ -14528,6 +14668,7 @@ function profileView() {
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
+    ${profileWalkthroughCard(u?.id)}
     <div class="card profile-card">
       <div class="profile-identity">
         <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
@@ -14711,6 +14852,16 @@ function wireNotificationsCard() {
 }
 
 function wireProfileView() {
+  const reset = $('#profile-reset-onboarding');
+  reset?.addEventListener('click', async () => {
+    reset.disabled = true;
+    try {
+      await api(`/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
+      toast('Walkthrough reset. The user will see it when they next open their workspace.');
+    } catch (error) { toast(error.message, true); }
+    finally { reset.disabled = false; }
+  });
+  if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   hydrateProfileGithub();
   document.querySelectorAll('[data-default-organization]').forEach((button) => button.addEventListener('click', async () => {
@@ -14973,6 +15124,15 @@ async function wireInstallationGithubCard() {
     </div>`;
 }
 
+async function wireInstallationUsers() {
+  const box = $('#installation-users-card');
+  if (!box) return;
+  try {
+    const users = await api('/api/users');
+    box.innerHTML = users.map((user) => `<div class="form-row"><a data-spa href="${profileRoute(user.id)}">${esc(user.name)} · ${esc(user.email)}</a></div>`).join('');
+  } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
+}
+
 function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
@@ -14984,7 +15144,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
@@ -14993,6 +15153,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
+      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
@@ -15107,6 +15268,7 @@ async function hydrateOrganizationSubscription(organizationId) {
 }
 
 function wireInstallationSettings() {
+  wireInstallationUsers();
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();
@@ -15218,7 +15380,7 @@ async function hydrateOrganizationView() {
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
-  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name"><b>${esc(userName(id, embedded))}</b>${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
