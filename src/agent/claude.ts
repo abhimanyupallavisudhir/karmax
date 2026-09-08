@@ -230,6 +230,43 @@ export class ClaudeAdapter implements AgentAdapter {
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
   private async runAgentSdk(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    const configHome = input.resolvedAuth?.configHome
+      ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+    input = { ...input, resolvedAuth: { ...input.resolvedAuth, configHome } };
+    if (!hasClaudeNativeCredential(configHome)) return this.runAgentSdkAttempt(input, ctx);
+    let latestSession = input.session;
+    let fork = input.fork;
+    const retryCtx: PlatformToolContext = {
+      ...ctx,
+      onSession: (session) => { latestSession = session; fork = false; ctx.onSession?.(session); },
+    };
+    try {
+      return await this.runAgentSdkAttempt(input, retryCtx);
+    } catch (error) {
+      // Native local refresh normally handles expiry; remote projections have
+      // no refresh authority. Recover a terminal expiry once, before the
+      // activity quarantines a refreshable login as a hard credential failure.
+      if (ctx.signal?.aborted || !(error instanceof ProviderFailure)
+        || error.metadata.kind !== 'credential'
+        || !/\b(?:oauth|access) token\b.*\bexpired\b|\bexpired\b.*\b(?:oauth|access) token\b/i.test(error.message)) throw error;
+      ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'started',
+        title: 'Refreshing Claude access token' });
+      try {
+        await refreshClaudeAccessToken({ configHome });
+      } catch (refreshError) {
+        ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'failed',
+          title: 'Could not refresh Claude access token',
+          detail: activityDetail(refreshError instanceof Error ? refreshError.message : refreshError) });
+        throw error;
+      }
+      if (ctx.signal?.aborted) throw error;
+      ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'completed',
+        title: 'Refreshed Claude access token; resuming turn' });
+      return this.runAgentSdkAttempt({ ...input, ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx);
+    }
+  }
+
+  private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     let sdk: any;
     try {
       sdk = await import('@anthropic-ai/claude-agent-sdk');
@@ -257,9 +294,8 @@ export class ClaudeAdapter implements AgentAdapter {
     const remote = isRemoteAgentWorld(input.world);
     const configHome = input.resolvedAuth?.configHome;
     const remoteNativeLogin = !!(remote && configHome && hasClaudeNativeCredential(configHome));
-    // The SDK callback below protects a running turn, but Claude can reject an
-    // already-expired projected token before it requests a replacement. Rotate
-    // the canonical host credential first, then copy only its fresh access token.
+    // Rotate the canonical host credential before projecting it. Mid-turn
+    // expiry is handled by the bounded refresh-and-resume wrapper above.
     if (remoteNativeLogin) {
       let preflightStarted = false;
       try {
@@ -517,14 +553,6 @@ export class ClaudeAdapter implements AgentAdapter {
         },
         strictMcpConfig: true,
         env,
-        // Remote worlds receive an access-only credential projection. If Claude
-        // needs to refresh it, the SDK relays this callback over its bidirectional
-        // control channel and Karmax rotates the ONE canonical host credential.
-        // This prevents parallel sandboxes from consuming the same single-use
-        // refresh token and revoking each other (takehomev2 tasks 24/25).
-        ...(remoteNativeLogin
-          ? { getOAuthToken: async () => refreshClaudeAccessToken({ configHome }) }
-          : {}),
         // Spawn the agent harness ourselves (same call the SDK makes internally:
         // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
         // subprocess pid is visible to karmax. That buys the two things the SDK's
@@ -646,6 +674,9 @@ export class ClaudeAdapter implements AgentAdapter {
           // agent merely discussing a connection error as a failed turn.
           if (/^\s*API Error:/i.test(text) && isTransportError(text)) {
             throw new Error(`Claude provider transport interruption: ${text}`);
+          }
+          if (/^\s*(?:Failed to authenticate\.\s*)?API Error:\s*401\b/i.test(text)) {
+            throw providerErrorFromMessage('claude', text);
           }
           if (text) {
             finalText = text;

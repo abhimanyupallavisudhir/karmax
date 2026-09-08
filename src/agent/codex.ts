@@ -180,10 +180,12 @@ export class CodexAdapter implements AgentAdapter {
     if (!remote || !configHome) return this.runCodexAppServer(input, ctx);
 
     let latestSession = input.session;
+    let fork = input.fork;
     const retryCtx: PlatformToolContext = {
       ...ctx,
       onSession: (session) => {
         latestSession = session;
+        fork = false;
         ctx.onSession?.(session);
       },
     };
@@ -239,11 +241,12 @@ export class CodexAdapter implements AgentAdapter {
         });
         throw error;
       }
+      if (ctx.signal?.aborted) throw error;
       ctx.emitActivity({
         id: 'codex-credential-recovery', kind: 'status', phase: 'completed',
         title: 'Refreshed Codex access token; resuming turn',
       });
-      return this.runCodexAppServer({ ...input, ...(latestSession ? { session: latestSession } : {}) }, retryCtx);
+      return this.runCodexAppServer({ ...input, ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx);
     }
   }
 

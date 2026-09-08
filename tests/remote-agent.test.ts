@@ -302,7 +302,8 @@ describe('remote subscription agents', () => {
     }));
   });
 
-  it('centrally refreshes and resumes once when a remote access-only token expires', async () => {
+  it.each(['new', 'resume', 'fork', 'cancelled'])('centrally refreshes and resumes once when a remote access-only token expires (%s)', async (mode) => {
+    const fork = mode === 'fork';
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-refresh-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), freshCodexAuth());
     const usageStub = path.join(localHome, 'refresh-stub.cjs');
@@ -327,17 +328,28 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
     const world = fakeWorld(true, false, true);
     const activities: any[] = [];
+    const controller = new AbortController();
 
     const result = await new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
-      world,
+      world, session: mode === 'new' ? undefined : 'original-thread', fork,
       messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
       systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
-    } as any, { emit() {}, emitActivity: (activity: any) => activities.push(activity),
-      platformRequest: async () => [{ type: 'ok' }] } as any);
+    } as any, { signal: controller.signal, emit() {}, emitActivity: (activity: any) => {
+      activities.push(activity);
+      if (mode === 'cancelled' && activity.id === 'codex-credential-recovery' && activity.phase === 'started') controller.abort();
+    },
+      platformRequest: async () => [{ type: 'ok' }] } as any).catch(error => error);
 
-    expect(result).toMatchObject({ termination: { kind: 'success' }, session: 'remote-thread' });
+    if (mode === 'cancelled') {
+      expect(result).toBeInstanceOf(Error);
+      expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+      return;
+    }
+
+    expect(result).toMatchObject({ termination: { kind: 'success' }, session: fork ? 'forked-remote-thread' : mode === 'new' ? 'remote-thread' : 'original-thread' });
     expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
+    expect(world.requests.filter((request) => request.method === 'thread/fork')).toHaveLength(fork ? 1 : 0);
     expect(activities).toContainEqual(expect.objectContaining({
       id: 'codex-credential-recovery', phase: 'completed',
       title: expect.stringMatching(/resuming turn/i),
