@@ -1,3 +1,4 @@
+import { expectedTaskRemoteHeads, recordTaskPublication } from './publication.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Store } from '../store/db.js';
@@ -181,7 +182,8 @@ export class WorldHandoffService {
       const access = this.worldAccess ? await this.worldAccess.open(taskId, handle, { dedicated: true }) : undefined;
       const world = access?.world ?? await this.worlds.open(handle);
       try {
-        const published = await brokerPublishBranch(world, auth);
+        const published = await brokerPublishBranch(world, auth,
+          expectedTaskRemoteHeads(this.store, taskId), recordTaskPublication(this.store, taskId));
         if (published.skipped.length) throw new Error(`could not publish committed cloud branch for: ${describePublishFailures(published)}`);
         this.store.appendEvent({ taskId, type: 'push.branch', ts: Date.now(), payload: {
           branch: handle.branch, repos: published.pushed, reason: 'local-materialization',

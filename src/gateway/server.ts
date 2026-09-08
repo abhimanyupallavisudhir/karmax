@@ -6764,7 +6764,7 @@ export class Gateway {
   }
 
   /** Probe usage for pollable subscription logins (all, or just `only`) and cache the
-   *  snapshots in kv under `usage:<credKey>`. Dashboard refreshes and task retries
+   *  snapshots in kv under `usage:<credKey>`. Concurrent Dashboard refreshes
    *  share the same in-flight provider probe. */
   private async refreshUsage(only?: string, organizationId = 'org_personal'): Promise<Record<string, unknown>> {
     const { refreshCredentialHealth } = await import('../agent/credential-health.js');

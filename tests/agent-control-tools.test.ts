@@ -410,7 +410,7 @@ describe('codex app-server dynamic-tool persistence across resume', () => {
     dir = undefined;
   });
 
-  it('rewrites a rollout’s session_meta so a resumed thread still advertises the controls', () => {
+  it('migrates tools into a new identity without changing source history', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-home-'));
     const sessions = path.join(dir, 'sessions', '2026', '07');
     fs.mkdirSync(sessions, { recursive: true });
@@ -420,20 +420,25 @@ describe('codex app-server dynamic-tool persistence across resume', () => {
       JSON.stringify({ type: 'response_item', payload: { role: 'user' } }),
     ].join('\n'));
 
-    expect(ensureLocalCodexSessionTools(dir, 'thread-abc', codexDynamicTools(false))).toBe(true);
-    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    const original = fs.readFileSync(file);
+    const session = ensureLocalCodexSessionTools(dir, 'thread-abc', codexDynamicTools(false));
+    expect(session).toBeTruthy();
+    expect(fs.readFileSync(file)).toEqual(original);
+    expect(ensureLocalCodexSessionTools(dir, session!, codexDynamicTools(false))).toBe(session);
+    const lines = fs.readFileSync(path.join(sessions, fs.readdirSync(sessions).find((name) => name.endsWith(`${session}.jsonl`))!), 'utf8').split('\n');
     const meta = JSON.parse(lines[0]!);
-    expect(meta.payload.id).toBe('thread-abc'); // pre-existing metadata preserved
+    expect(meta.payload.id).toBe(session);
+    expect(meta.payload.cwd).toBe('/w');
     expect(meta.payload.dynamic_tools.map((t: any) => t.name).sort()).toEqual(CONTROL_NAMES);
     expect(JSON.parse(lines[1]!)).toMatchObject({ type: 'response_item' }); // history untouched
   });
 
   it('is best-effort: an unknown session or malformed rollout never fails the turn', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-home-'));
-    expect(ensureLocalCodexSessionTools(dir, 'missing', [])).toBe(false);
+    expect(ensureLocalCodexSessionTools(dir, 'missing', [])).toBeUndefined();
     const sessions = path.join(dir, 'sessions');
     fs.mkdirSync(sessions, { recursive: true });
     fs.writeFileSync(path.join(sessions, 'rollout-thread-bad.jsonl'), 'not json\n');
-    expect(ensureLocalCodexSessionTools(dir, 'thread-bad', [])).toBe(false);
+    expect(ensureLocalCodexSessionTools(dir, 'thread-bad', [])).toBeUndefined();
   });
 });
