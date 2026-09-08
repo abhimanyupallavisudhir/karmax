@@ -343,7 +343,18 @@ cmd_update() {
   cleanup_migration() {
     [ -z "$migration_backup" ] || rm -f "$migration_backup"
   }
-  trap cleanup_migration EXIT HUP INT TERM
+  # Never discard the only pre-migration configuration on an unexpected error.
+  # Explicit rollback/success paths below remove it only after reconciliation.
+  migration_exit() {
+    if [ -n "$migration_backup" ] && [ -f "$migration_backup" ]; then
+      restore_migration
+      note "Migration interrupted; original environment restored. Recovery copy: $migration_backup"
+    fi
+  }
+  trap migration_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   pending_domain=$(env_value KARMAX_PENDING_DOMAIN)
   pending_preview=$(env_value KARMAX_PENDING_PREVIEW_DOMAIN)
   if [ -n "$pending_domain" ]; then
@@ -362,12 +373,16 @@ cmd_update() {
   if ! dc build --pull app; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
+    cleanup_migration
+    migration_backup=''
     die "deployment $target could not be built; production remains at $previous"
   fi
   if ! cmd_backup_candidate; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
     dc build app || true
+    cleanup_migration
+    migration_backup=''
     die "deployment $target could not be backed up; production remains at $previous"
   fi
 
@@ -384,6 +399,8 @@ cmd_update() {
   git -C "$ROOT_DIR" checkout --detach "$previous"
   restore_migration
   if dc build app && dc up -d --remove-orphans && wait_ready; then
+    cleanup_migration
+    migration_backup=''
     die "deployment $target failed; production was restored to $previous"
   fi
   die "deployment $target failed and automatic rollback to $previous also failed"

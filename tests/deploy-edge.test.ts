@@ -103,6 +103,13 @@ describe('public edge (Caddy) canonical host', () => {
 });
 
 describe('public edge (Caddy) image', () => {
+  it('keeps signed legacy webhooks reachable without redirecting their POSTs', () => {
+    const legacy = read('Caddyfile').split('{$KARMAX_LEGACY_DOMAIN:http://127.0.0.1:65535} {')[1]?.split('\n}')[0] ?? '';
+    expect(legacy).toContain('import karmax_ratelimit');
+    expect(legacy).toContain('handle /api/github/webhook {\n\t\treverse_proxy app:4505');
+    expect(legacy).toContain('handle {\n\t\tredir https://{$KARMAX_DOMAIN}{uri} permanent');
+  });
+
   // rate_limit is a third-party module: the stock caddy image does not have it
   // and refuses to start on an unrecognised directive. Building it is what
   // makes the Caddyfile above valid at all.
@@ -113,6 +120,12 @@ describe('public edge (Caddy) image', () => {
   });
 
   for (const compose of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    it(`${compose} never passes empty legacy site addresses to Caddy`, () => {
+      // Caddy's own default only handles UNSET variables, not empty ones.
+      expect(read(compose)).toContain('KARMAX_LEGACY_DOMAIN: ${KARMAX_LEGACY_DOMAIN:-http://127.0.0.1:65535}');
+      expect(read(compose)).toContain('KARMAX_LEGACY_WWW_DOMAIN: ${KARMAX_LEGACY_WWW_DOMAIN:-http://127.0.0.1:65534}');
+    });
+
     it(`${compose} builds that image instead of pulling the stock one`, () => {
       const caddyService = read(compose).split('\n  caddy:')[1] ?? '';
       expect(caddyService, `${compose} has no caddy service`).not.toBe('');

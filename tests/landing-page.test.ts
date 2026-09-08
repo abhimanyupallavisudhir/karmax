@@ -6,6 +6,22 @@ const app = fs.readFileSync(path.resolve('web/app.js'), 'utf8');
 const css = fs.readFileSync(path.resolve('web/styles.css'), 'utf8');
 
 describe('public landing page', () => {
+  it('renders Tavya in the homepage and representative screenshot, including its address bar', () => {
+    const landing = app.slice(app.indexOf('function renderLanding()'), app.indexOf('function renderLogin()'));
+    const root = { innerHTML: '' };
+    const document = { title: '', body: { classList: { add() {} } } };
+    const render = new Function('$', 'document', 'window', 'siteName', 'siteNameMarkup', 'brandMark', 'esc', 'location',
+      `${landing}; renderLanding();`);
+    render((selector: string) => selector === '#app' ? root : undefined, document, {},
+      () => 'tavya', () => 'tavya', () => '<img class="mark">', (value: string) => value, { host: 'tavya.io' });
+    expect(document.title).toBe('tavya — the to-do list for agents');
+    expect(root.innerHTML).toContain('tavya.io / tavya');
+    expect(root.innerHTML).toContain('<strong>tavya</strong></div>');
+    expect(root.innerHTML).toContain('<div class="product-project active"><span>◇</span> tavya</div>');
+    // The existing issue-tracker URL is a repository identifier, not branding.
+    expect(root.innerHTML.replace(/href="[^"]*"/g, '')).not.toMatch(/krmax/i);
+  });
+
   it('is the signed-out root while direct auth and invitation routes stay direct', () => {
     expect(app).toContain('return renderLanding()');
     expect(app).toContain("location.pathname === '/login'");

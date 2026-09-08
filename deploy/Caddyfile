@@ -73,12 +73,20 @@ www.{$KARMAX_DOMAIN} {
 	redir https://{$KARMAX_DOMAIN}{uri} permanent
 }
 
-# A domain migration keeps old bookmarks, OAuth return paths, and emailed links
-# working while making the new origin canonical. The loopback defaults leave
+# A domain migration keeps old bookmarks and emailed links working while making
+# the new origin canonical. Users sign in again on the new cookie origin.
+# GitHub does not follow webhook redirects, so preserve that signed endpoint
+# until its provider configuration has also moved. The loopback defaults leave
 # this inert on installations that have never moved.
 {$KARMAX_LEGACY_DOMAIN:http://127.0.0.1:65535} {
 	import karmax_security
-	redir https://{$KARMAX_DOMAIN}{uri} permanent
+	import karmax_ratelimit
+	handle /api/github/webhook {
+		reverse_proxy app:4505
+	}
+	handle {
+		redir https://{$KARMAX_DOMAIN}{uri} permanent
+	}
 }
 
 {$KARMAX_LEGACY_WWW_DOMAIN:http://127.0.0.1:65534} {
