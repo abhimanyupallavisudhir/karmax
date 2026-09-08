@@ -1,3 +1,4 @@
+import { expectedTaskRemoteHeads } from '../world/publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -399,27 +400,6 @@ export interface PrepareChildArgs {
   parentGrant?: string[];
 }
 
-/** Recover the exact remote heads this task last observed. Integration repair
- * may replace the in-memory view while retaining the durable PR history; a
- * force-with-lease must use that history rather than fall back to an unsafe
- * ordinary push that can never publish a rebased task-owned branch. */
-export function expectedTaskRemoteHeads(store: Store, taskId: string): Record<string, string> {
-  const expected: Record<string, string> = {};
-  const observations = [
-    ...store.eventsOfType(taskId, 'pr.opened'),
-    ...store.eventsOfType(taskId, 'pr.updated'),
-  ].sort((a, b) => a.seq - b.seq);
-  for (const event of observations) {
-    const repo = typeof event.payload?.repo === 'string' ? event.payload.repo : '';
-    const headSha = typeof event.payload?.headSha === 'string' ? event.payload.headSha : '';
-    if (repo && /^[0-9a-f]{40}$/i.test(headSha)) expected[repo] = headSha;
-  }
-  for (const candidate of store.getTask(taskId)?.lastView?.prs ?? []) {
-    if (candidate.headSha && !expected[candidate.repo]) expected[candidate.repo] = candidate.headSha;
-  }
-  return expected;
-}
-
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
@@ -775,7 +755,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return targets;
   }
 
-  /** Publish each changed repo's task branch to origin so its PR can reference it. */
+  /** Record the transported commit before later PR metadata calls can fail. */
+  function recordOriginPublication(taskId: string) {
+    return (repo: ReturnType<typeof worldRepos>[number], headSha: string) => {
+      record(taskId, 'push.head', { repo: repo.name, branch: repo.branch, headSha });
+    };
+  }
+
+  function publishTaskBranch(world: World, taskId: string) {
+    return brokerPublishBranch(world, brokerAuthFor(world.handle, taskId),
+      expectedTaskRemoteHeads(store, taskId), recordOriginPublication(taskId));
+  }
+
   async function pushTaskBranches(
     world: World,
     handle: WorldHandle,
@@ -784,28 +775,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   ) {
     const expectedRemoteHeads = expectedTaskRemoteHeads(store, handle.id);
     if (isRemote(handle.kind))
-      return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos, expectedRemoteHeads);
+      return brokerPushBranches(world, brokerAuthFor(handle, handle.id), repos, expectedRemoteHeads,
+        recordOriginPublication(handle.id));
     const pushed: string[] = [];
     const skipped: string[] = [];
     const errors: Record<string, string> = {};
     for (const repo of repos) {
+      const tip = await world.exec('git', ['rev-parse', '--verify', `refs/heads/${repo.branch}`], { cwd: repo.root });
+      if (tip.code !== 0) throw new Error(`could not resolve task branch ${repo.branch}: ${tip.stderr || tip.stdout}`);
+      const headSha = tip.stdout.trim();
+      const refspec = `${headSha}:refs/heads/${repo.branch}`;
       const repository = await enrolledRepositoryForCheckout(handle, repo);
       // GitHub App installation tokens are short-lived HTTPS credentials. Use
       // them from the trusted host even for a local/container worktree, so a
       // connected repository never needs the person's SSH private key or PAT.
       let push = repository?.gitConnectionId && deps.githubApp
-        ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', '-u', 'origin', repo.branch], env)
-        : await world.exec('git', ['push', '-u', 'origin', repo.branch],
+        ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', 'origin', refspec], env)
+        : await world.exec('git', ['push', 'origin', refspec],
           { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
       const expected = expectedRemoteHeads[repo.name];
       if (push.code !== 0 && expected && /non-fast-forward|fetch first|rejected/i.test(push.stderr || push.stdout)) {
         const lease = `--force-with-lease=refs/heads/${repo.branch}:${expected}`;
         push = repository?.gitConnectionId && deps.githubApp
-          ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', lease, '-u', 'origin', repo.branch], env)
-          : await world.exec('git', ['push', lease, '-u', 'origin', repo.branch],
+          ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', lease, 'origin', refspec], env)
+          : await world.exec('git', ['push', lease, 'origin', refspec],
             { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
       }
-      if (push.code === 0) pushed.push(repo.name);
+      if (push.code === 0) {
+        recordOriginPublication(handle.id)(repo, headSha);
+        pushed.push(repo.name);
+      }
       else {
         skipped.push(repo.name);
         errors[repo.name] = (push.stderr || push.stdout).slice(0, 300);
@@ -2644,7 +2643,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw new Error(`cloud task branch was not persisted for: ${Object.entries(ancestry.errors)
           .map(([repo, detail]) => `${repo}: ${detail}`).join('; ')}`);
       for (const repair of ancestry.repaired) record(handle.id, 'branch.ancestry-repaired', repair);
-      const result = await brokerPublishBranch(world, brokerAuthFor(world.handle, handle.id));
+      const result = await publishTaskBranch(world, handle.id);
       if (!result.pushed.length || result.skipped.length) {
         throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${describePublishFailures(result)}` : ' because it has no remote repository'}`);
       }
@@ -2686,7 +2685,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const world = await openWorld(current, current.id);
             const projectId = String(current.meta?.projectId ?? '');
             if (store.listProjectRepositories(projectId).length) {
-              const pushed = await brokerPublishBranch(world, brokerAuthFor(current, current.id));
+              const pushed = await publishTaskBranch(world, current.id);
               if (pushed.skipped.length)
                 throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
             }
@@ -2808,6 +2807,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             throw ApplicationFailure.create({
               message: `GitHub App workflow permission required for ${slug}. ${guidance}`,
               type: 'github-workflows-permission',
+              nonRetryable: true,
+            });
+          }
+          if (/non-fast-forward|fetch first|stale info/i.test(pushError)) {
+            throw ApplicationFailure.create({
+              message: `Could not publish ${repo.name}/${repo.branch}: ${pushError}\n`
+                + `Use refresh_upstream with branch "${repo.branch}", inspect and integrate origin/${repo.branch} `
+                + 'into the task branch, resolve conflicts, verify the result, then call open_pr again.',
+              type: 'task-branch-conflict',
               nonRetryable: true,
             });
           }
@@ -4451,7 +4459,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const projectId = String(remoteWorld.handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
                   if (store.listProjectRepositories(projectId).length) {
                     await enrollLiveProjectRepositories(remoteWorld, taskId);
-                    const pushed = await brokerPublishBranch(remoteWorld, brokerAuthFor(remoteWorld.handle, taskId));
+                    const pushed = await publishTaskBranch(remoteWorld, taskId);
                     if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                     record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' });
                   }
@@ -4495,7 +4503,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (parentHandle && isRemote(parentHandle.kind)) {
         const parentWorld = await openWorld(parentHandle);
         await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
-        const persisted = await brokerPublishBranch(parentWorld, brokerAuthFor(parentWorld.handle, args.parentTaskId));
+        const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
         if (!persisted.pushed.length || persisted.skipped.length)
           throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
         record(args.parentTaskId, 'push.branch', {

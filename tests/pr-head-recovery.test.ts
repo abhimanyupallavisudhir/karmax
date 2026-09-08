@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { expectedTaskRemoteHeads } from '../src/activities/core.js';
+import { expectedTaskRemoteHeads } from '../src/world/publication.js';
 import { Store } from '../src/store/db.js';
 
 describe('task PR head recovery', () => {
@@ -23,5 +23,10 @@ describe('task PR head recovery', () => {
       payload: { repo: 'ignored', headSha: 'not-a-sha' } });
 
     expect(expectedTaskRemoteHeads(store, task.id)).toEqual({ karmax: latest });
+    const checkpointHead = '3'.repeat(40);
+    store.appendEvent({ taskId: task.id, type: 'push.head', ts: 4,
+      payload: { repo: 'karmax', branch: `karmax/${task.id}`, headSha: checkpointHead } });
+    expect(expectedTaskRemoteHeads(store, task.id)).toEqual({ karmax: checkpointHead });
+    store.close();
   });
 });

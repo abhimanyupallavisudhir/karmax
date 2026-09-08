@@ -10,6 +10,8 @@ import { canonicalRepositoryIdentity } from './repository-identity.js';
 
 export interface GitBrokerCredential extends GitCredential {}
 export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
+/** Called with the immutable tip actually transported, never a later world HEAD. */
+export type OriginPublicationRecorder = (repo: WorldRepo, headSha: string) => void;
 export interface GitBrokerPublishResult {
   pushed: string[];
   skipped: string[];
@@ -220,7 +222,10 @@ function recordedBaseViolation(repo: WorldRepo): string {
  * records the PR-policy exception where GitHub owns base and landing history.
  * Without this distinction, cloud and local operations silently diverge.
  */
-export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Promise<GitBrokerPublishResult> {
+export async function brokerPublishBranch(
+  world: World, auth: GitBrokerAuth, expectedRemoteHeads: Record<string, string> = {},
+  onPublished?: OriginPublicationRecorder,
+): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
@@ -238,7 +243,7 @@ export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Pr
       const local = await localAuthority(repo, shared);
       if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
       else if (local) await importBranchToLocal(world, repo, local);
-      else await pushBranchToOrigin(world, repo, auth);
+      else await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
       pushed.push(repo.name);
     } catch (error) {
       skipped.push(repo.name);
@@ -291,15 +296,18 @@ async function pushBranchToOrigin(
   repo: WorldRepo,
   auth: GitBrokerAuth,
   expectedRemoteHead?: string,
+  onPublished?: OriginPublicationRecorder,
 ): Promise<void> {
   await withTransferredRepo(world, repo, auth, async (clone, env) => {
     const ref = `refs/heads/${repo.branch}`;
+    const tip = await git(clone, ['rev-parse', '--verify', ref]);
+    if (tip.code !== 0) throw new Error(tip.stderr || tip.stdout);
     let result = await git(clone, ['push', 'origin', `${ref}:${ref}`], { env });
     // Integration repair commonly rebases the task-owned proposal branch. That
     // deliberately makes its new tip a non-descendant of the prior PR head, so
     // an ordinary push cannot publish it. Replace only the exact head Karmax
-    // previously observed: a concurrent writer makes the lease fail instead of
-    // being overwritten. With no recorded PR head we never force an existing
+    // recorded at publication: a concurrent writer makes the lease fail instead
+    // of being overwritten. With no recorded head we never force an existing
     // branch—the collision needs investigation rather than an ownership guess.
     if (result.code !== 0 && expectedRemoteHead && NON_FAST_FORWARD.test(result.stderr || result.stdout)) {
       result = await git(clone, [
@@ -315,9 +323,14 @@ async function pushBranchToOrigin(
     // divergence still falls through to the diagnostic below.
     if (result.code !== 0 && NON_FAST_FORWARD.test(result.stderr || result.stdout)) {
       const reconciled = await fastForwardWorldFromOrigin(world, repo, clone, env);
-      if (reconciled) return;
+      if (reconciled) {
+        // This path adopted another writer's advance; it is not authority to
+        // overwrite that writer's commit with a later amended proposal.
+        return;
+      }
     }
     if (result.code !== 0) throw new Error(describeGitPushError(repo, result.stderr || result.stdout || 'push failed'));
+    onPublished?.(repo, tip.stdout.trim());
   });
 }
 
@@ -662,13 +675,14 @@ export async function brokerPushBranches(
   auth: GitBrokerAuth,
   repos: WorldRepo[] = worldRepos(world.handle),
   expectedRemoteHeads: Record<string, string> = {},
+  onPublished?: OriginPublicationRecorder,
 ): Promise<GitBrokerPublishResult> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   const errors: Record<string, string> = {};
   for (const repo of repos) {
     try {
-      await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name]);
+      await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
       pushed.push(repo.name);
     } catch (error) {
       skipped.push(repo.name);

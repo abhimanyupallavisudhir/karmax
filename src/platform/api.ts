@@ -1,3 +1,4 @@
+import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
@@ -596,7 +597,8 @@ export class KarmaxApi {
       for (const repair of ancestry.repaired) {
         this.deps.store.appendEvent({ taskId: task.id, type: 'branch.ancestry-repaired', ts: Date.now(), payload: repair });
       }
-      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
+      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId),
+        expectedTaskRemoteHeads(this.deps.store, task.id), recordTaskPublication(this.deps.store, task.id));
       if (!result.pushed.length || result.skipped.length)
         throw new Error(`could not publish ${result.skipped.length ? describePublishFailures(result) : 'task branch'}`);
       const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
