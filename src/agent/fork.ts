@@ -18,9 +18,9 @@ import { paths } from '../config/paths.js';
  *    (new session id, source untouched). Works across logins — a `.jsonl` is pure
  *    conversation history, no auth. Survives world cleanup (the file lives in the home).
  *  - Codex: a rollout under `<CODEX_HOME>/sessions/<date>/rollout-…-<id>.jsonl`, resolved
- *    by id regardless of cwd. If the rollout isn't already in this turn's home, we copy
- *    it from the source task's recorded home, or (only with host-local admission) from
- *    another installation config home. The adapter then resumes/forks it.
+ *    by id regardless of cwd. We copy it and its history_base ancestors from the
+ *    source task's recorded home, or (only with host-local admission) from another
+ *    installation config home. The adapter then resumes/forks it.
  *
  * Used for task-to-task forks. A host-local install may explicitly opt into an
  * installation search for a pasted provider id; remote/hosted callers never do.
@@ -138,10 +138,10 @@ function codexInstallationHomes(): string[] {
   return homes;
 }
 
-/** Find a Codex rollout file by session id under a home's sessions tree. */
+/** Find an active or archived Codex rollout by its filename identity. */
 function findCodexRollout(session: string, home: string): string | undefined {
   const root = path.join(home, 'sessions');
-  const stack = [root];
+  const stack = [path.join(home, 'archived_sessions'), root];
   while (stack.length) {
     const dir = stack.pop()!;
     let entries: fs.Dirent[];
@@ -149,23 +149,52 @@ function findCodexRollout(session: string, home: string): string | undefined {
     for (const e of entries) {
       const p = path.join(dir, e.name);
       if (e.isDirectory()) stack.push(p);
-      else if (e.isFile() && e.name.includes(session) && e.name.endsWith('.jsonl')) return p;
+      else if (e.isFile() && e.name.endsWith(`${session}.jsonl`)) return p;
     }
   }
   return undefined;
 }
 
+/** Physical history dependency, distinct from the informational forked_from_id.
+ * Keep rollout bytes intact: history_base also contains byte offsets into it. */
+export function codexHistoryBase(content: Buffer): string | undefined {
+  const first = content.toString('utf8').split('\n', 1)[0] ?? '';
+  let record: any;
+  try { record = JSON.parse(first); } catch { return undefined; }
+  const base = record?.type === 'session_meta' ? record.payload?.history_base : undefined;
+  if (base == null) return undefined;
+  if (typeof base.thread_id !== 'string' || !validNativeSessionId(base.thread_id))
+    throw new Error('Invalid Codex history_base thread_id');
+  return base.thread_id;
+}
+
+/** Resolve the entire physical lineage before copying anything. Also checks
+ * ancestors when the selected rollout is already present after a partial copy. */
+export function codexSessionFiles(opts: { session: string; forkHome?: string; srcHome?: string;
+  searchInstallation?: boolean }): string[] | undefined {
+  const files: string[] = [];
+  const seen = new Set<string>();
+  let session: string | undefined = opts.session;
+  while (session) {
+    if (seen.has(session)) return undefined;
+    seen.add(session);
+    const file = findProviderSession({ ...opts, provider: 'codex', session });
+    if (!file) return undefined;
+    files.push(file);
+    session = codexHistoryBase(fs.readFileSync(file));
+  }
+  return files.reverse();
+}
+
 function materializeCodex(opts: { session: string; forkHome: string; srcHome?: string;
   searchInstallation?: boolean }): boolean {
-  // Already resolvable in this turn's home? (codex resumes by id, cwd-independent.)
-  if (findCodexRollout(opts.session, opts.forkHome)) return true;
-  // Otherwise copy it from the source task's recorded home, or from the local
-  // installation only when the caller has explicitly admitted host search.
-  const src = findProviderSession({ provider: 'codex', session: opts.session, srcHome: opts.srcHome,
-    forkHome: opts.forkHome, searchInstallation: opts.searchInstallation });
-  if (!src) return false;
+  const files = codexSessionFiles(opts);
+  if (!files) return false;
   const destDir = path.join(opts.forkHome, 'sessions', 'forked');
-  fs.mkdirSync(destDir, { recursive: true });
-  fs.copyFileSync(src, path.join(destDir, path.basename(src)));
+  for (const src of files) {
+    if (path.resolve(src).startsWith(`${path.resolve(opts.forkHome)}${path.sep}`)) continue;
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.copyFileSync(src, path.join(destDir, path.basename(src)));
+  }
   return true;
 }
