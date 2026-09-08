@@ -246,6 +246,40 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');
   }, 120_000);
 
+  it.each([{ authorized: true, failed: true }, { authorized: false, failed: true },
+    { authorized: true, failed: false }, { authorized: false, failed: false }])('manual opening confirms only an authorized reviewer ($authorized, failed: $failed)', async ({ authorized, failed }) => {
+    const repo = await h.makeRepo(`manual-confirm-${authorized}-${failed}`);
+    h.store.claimPersonalOrganization('manual-owner');
+    const project = h.store.createProject(`Manual confirmation ${authorized} ${failed}`);
+    const task = h.store.createTask({
+      projectId: project.id, title: 'Manual confirmation', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'work' },
+      createdBy: { kind: 'user', userId: 'manual-owner' },
+    });
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [input({ taskId: task.id, projectId: project.id, repo, resolveAgentEnabled: false,
+        prompt: '@write preserved.txt :: completed proposal\n'
+          + (failed ? '@fail provider crashed' : '@run git add -A && git commit -qm proposal\n@incomplete'),
+      })],
+    });
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return failed ? current.stage === 'escalated' : current.stage === 'do' && current.waitingFor?.kind === 'human';
+    }, { timeout: 30_000 }).toBe(true);
+    await handle.signal('openPr', { userId: authorized ? 'manual-owner' : 'other-user' });
+    if (!authorized) {
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+      await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
+      expect(h.store.eventsSince(task.id, 0).some((e) => e.type === 'task.confirmation-voted')).toBe(false);
+      expect((await view(handle)).stage).toBe('review');
+      await handle.signal('confirm');
+    }
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(h.store.eventsSince(task.id, 0).filter((e) => e.type === 'task.confirmation-voted'))
+      .toHaveLength(authorized ? 1 : 0);
+  }, 120_000);
+
   it.each([false, true])('manually opens preserved work after Do fails (committed: %s)', async (committed) => {
     const repo = await h.makeRepo(`manual-error-pr-${committed}`);
     const taskId = newId('task');

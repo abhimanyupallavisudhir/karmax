@@ -3,8 +3,9 @@ import type { Store } from '../store/db.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { makeCoordinatorActivities } from '../activities/coordinator.js';
-import { enumerateCredentials } from '../platform/credentials.js';
-import { gatherCredentialSources } from '../platform/credential-sources.js';
+import { enumerateCredentials, resolveCredentials } from '../platform/credentials.js';
+import { gatherCredentialSources, readPolicyLayers } from '../platform/credential-sources.js';
+import { credentialAliases } from './provider-registry.js';
 import {
   isUsagePollable,
   probeClaudeUsage,
@@ -23,10 +24,38 @@ export interface CredentialHealthDeps {
 
 const usageProbes = new Map<string, Promise<UsageResult>>();
 
+/** Explicit Retry grants another attempt to automatically quarantined credentials.
+ * A usage probe cannot be the gate: setup tokens and API keys have no usage API,
+ * and an expired access-only probe cannot refresh the login it is checking.
+ * Only enabled credentials in this task's policy are eligible. The coordinator's
+ * atomic guard preserves manual disables and known quota-reset waits.
+ */
+export async function retryCredentials(
+  deps: CredentialHealthDeps,
+  task: { id: string; projectId: string },
+  provider: string,
+): Promise<void> {
+  const organizationId = deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
+  const all = enumerateCredentials(gatherCredentialSources({ ...deps, organizationId }));
+  const layers = readPolicyLayers((key) => deps.store.kvGet(key), {
+    organizationId, projectId: task.projectId, taskId: task.id,
+  });
+  const aliases = credentialAliases(provider);
+  const eligible = resolveCredentials(all, layers).filter((credential) =>
+    aliases.includes(credential.provider)
+    || (credential.provider === 'opencode' && !!credential.modelProvider && aliases.includes(credential.modelProvider)));
+  const coordinator = makeCoordinatorActivities(deps);
+  for (const credential of eligible) {
+    await coordinator.setAccountAvailability({
+      accountId: credential.key, status: 'available', onlyIfStatus: 'needs-attention',
+    });
+  }
+}
+
 /**
  * Refresh native subscription health and reconcile stale automatic quarantines.
- * The module-level in-flight map makes Dashboard refreshes and task Retry share a
- * single provider process instead of racing duplicate probes for the same login.
+ * The module-level in-flight map coalesces concurrent Dashboard refreshes into
+ * one provider process. Explicit task Retry uses retryCredentials instead.
  */
 export async function refreshCredentialHealth(
   deps: CredentialHealthDeps,

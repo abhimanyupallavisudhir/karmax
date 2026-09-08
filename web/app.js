@@ -2869,26 +2869,50 @@ async function loadCollaboration() {
   const organizationId = S.organizationId;
   if (!organizationId) return;
   const epoch = S.collaborationLoadEpoch = (S.collaborationLoadEpoch || 0) + 1;
-  const q = `?organizationId=${encodeURIComponent(organizationId)}`;
-  const [members, teams, users, inbox] = await Promise.all([
+  const [members, teams, users] = await Promise.all([
     api(`/api/organizations/${organizationId}/members`).catch(() => []),
     api(`/api/organizations/${organizationId}/teams`).catch(() => []),
     api('/api/users').catch(() => []),
-    api(`/api/inbox${q}`).catch(() => []),
+    loadInbox().catch(() => {}),
   ]);
   if (S.collaborationLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   S.organizationMembers = members || [];
   S.teams = teams || [];
   S.users = users || [];
-  S.inbox = inbox || [];
-  // Announce what ARRIVED since the last list. The first load only seeds the
-  // seen set (and switching organization reseeds it), so opening the app never
-  // replays the backlog. See announceInbox for what each urgency does.
+}
+
+async function loadInbox() {
+  const organizationId = S.organizationId;
+  if (!organizationId) return;
+  const epoch = S.inboxLoadEpoch = (S.inboxLoadEpoch || 0) + 1;
+  // A failed request must not erase the inbox or reset arrival tracking.
+  const inbox = await api(`/api/inbox?organizationId=${encodeURIComponent(organizationId)}`);
+  if (S.inboxLoadEpoch !== epoch || S.organizationId !== organizationId) return;
   const seen = S.announcedOrganizationId === organizationId ? S.announcedInbox : null;
-  S.announcedInbox = new Set(S.inbox.map((item) => item.id));
+  S.inbox = inbox || [];
+  S.announcedInbox = new Map(S.inbox.map((item) => [item.id, urgencyRank(item.urgency)]));
   S.announcedOrganizationId = organizationId;
   announceInbox(inboxArrivals(seen, S.inbox));
   updateBell();
+  if (S.tab === 'inbox') bgRenderMain();
+}
+
+function inboxEventChanges(ev) {
+  return ev.type === 'view.updated' || ev.type.includes('escalat')
+    || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
+    || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
+      'credential.approval-requested', 'credential.approval-resolved',
+      'permission.approval-requested', 'permission.approval-resolved',
+      'authorization.approval-requested', 'authorization.approval-resolved'].includes(ev.type);
+}
+let inboxRefreshTimer;
+function scheduleInboxReload() {
+  // Coalesce a burst without starving delivery during continuous task activity.
+  if (inboxRefreshTimer) return;
+  inboxRefreshTimer = setTimeout(() => {
+    inboxRefreshTimer = null;
+    loadInbox().catch(() => {});
+  }, 200);
 }
 
 async function loadTasks() {
@@ -3279,13 +3303,7 @@ function connectWs() {
       // True membership/metadata changes are rare and do require a durable reload.
       scheduleTaskListReload();
     }
-    // Collaboration state changes only for collaboration events. Reloading five
-    // organization endpoints for every workflow view transition multiplied the
-    // websocket refresh storm without changing any of that data.
-    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned', 'credential.approval-requested',
-      'permission.approval-requested', 'authorization.approval-requested',
-      'permission.approval-resolved', 'authorization.approval-resolved'].includes(ev.type))
-      setTimeout(() => loadCollaboration().catch(() => {}), 450);
+    if (S.organizationId && inboxEventChanges(ev)) scheduleInboxReload();
   };
   // The whole task page (stage chip, streaming agent bubble, conversation, merge
   // queue, activity feed) is driven only by this socket. A silent drop left the
@@ -3295,6 +3313,7 @@ function connectWs() {
     setWsOnline(true);
     if (wsHadDropped) checkConsoleRevision();
     if (wsHadDropped) {
+      loadInbox().catch(() => {});
       refreshTasks().catch(() => {});
       if (S.selected) { refreshTask().catch(() => {}); refreshTaskHistory(S.selected); }
     }
@@ -3385,6 +3404,7 @@ const BRAND_ICON_CHOICES = [
   { id: 'check', label: 'Check' },
   { id: 'check-arrow', label: 'Check arrow' },
   { id: 'check-knot', label: 'Check knot' },
+  { id: 'check-knot-tilted', label: 'Tilted knot' },
   { id: 'clover', label: 'Clover' },
 ];
 
@@ -5482,7 +5502,7 @@ function taskFormLoadingPage(project, draft) {
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
 let activeTaskFormKeyController = null;
-async function openTaskForm(workflow, draft, seedText) {
+async function openTaskForm(workflow, draft, seedText, seedParams) {
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
@@ -5497,7 +5517,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // own box; only fall back to a standalone "Images" section if there isn't one.
   const cf = consumingField(fields);
   const promptField = cf && cf.type === 'text' ? cf : null;
-  const values = draft ? { ...draft.params } : {};
+  const values = draft ? { ...draft.params } : { ...seedParams };
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = !!draft?.params?.repeatable; // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
@@ -7981,6 +8001,7 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
+      <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
     <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
@@ -8449,6 +8470,11 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#fork-task-agent')?.addEventListener('click', (event) => {
+    openTaskForm('software-dev', undefined, undefined, {
+      'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
+    });
+  });
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
@@ -9515,9 +9541,9 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
-  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open PR';
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open & Confirm PR';
   if (action.name === 'openPr')
-    return hasOpenPullRequest(v) ? 'Return to Review' : 'Manually Open PR';
+    return hasOpenPullRequest(v) ? 'Return to Review & Confirm' : 'Manually Open & Confirm PR';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
     return 'Authorize GitHub merge';
   return action.label || action.name;
@@ -9560,16 +9586,16 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
-  const standard = { confirm: 'confirm', openPr: 'manually open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
-  if (signal === 'openPr' && text.toLowerCase() === 'return to review') return 'Returning to Review';
+  if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 
-const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
-const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes and open the PR for review?';
-const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.';
+const MANUAL_OPEN_PR_CONFIRMATION = "Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.";
+const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes, open the PR, and confirm it if you are authorized?';
+const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.';
 
 function confirmTaskAction(action, v = S.view) {
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
@@ -14279,7 +14305,7 @@ function wireGlobalSettings(organizationId) {
 function updateBell() {
   const badge = $('#bell-badge');
   if (!badge) return;
-  const n = S.inbox.filter((item) => item.unread).length;
+  const n = inboxUnreadCount('all');
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
   $('#bell')?.classList.toggle('active', S.tab === 'inbox');
@@ -14334,25 +14360,24 @@ function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   return item.kind === 'update' ? (item.task?.status || 'update') : item.kind.replaceAll('-', ' ');
 }
-// Only an above-normal level is worth a chip: the list is already ordered by
-// urgency, so marking every row would label the ordinary case.
+// Every priority is explicit; color and bars make the urgent levels scannable.
 function urgencyChip(urgency) {
-  return urgencyRank(urgency) > urgencyRank('normal')
-    ? `<span class="urgency-chip ${urgency}">${esc(urgency)}</span>` : '';
+  const level = URGENCY_LEVELS[urgencyRank(urgency)];
+  return `<span class="urgency-chip ${level}" aria-label="${level} priority"><span class="priority-bars" aria-hidden="true">${'▮'.repeat(urgencyRank(level) + 1)}</span> ${level}</span>`;
 }
 function inboxView() {
   const items = inboxItems();
   return `<h1 class="page-title">Inbox</h1>
     <div class="tabs inbox-tabs">${inboxTabs().map((tab) => `<a class="tab${S.inboxFilter === tab.key ? ' active' : ''}" data-spa href="${inboxRoute(tab.key)}">${tab.label}${tab.unread ? `<span class="pill">${tab.unread}</span>` : ''}</a>`).join('')}</div>
+    ${S.inboxFilter === 'update' ? '<p class="task-sub">Outcomes of tasks you follow. Updates do not count toward the bell badge.</p>' : ''}
     <div class="inbox-toolbar"><span>${inboxUnreadCount()} unread</span>
       <span class="inbox-controls"><label class="switch"><input type="checkbox" id="inbox-show-read" ${inboxShowRead() ? 'checked' : ''}/><span>Show read</span></label>
       <button class="btn sm" id="inbox-read-all">Mark all read</button></span></div>
-    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
+    <div class="inbox-list">${items.length ? items.map((item) => `<div class="inbox-row priority-${URGENCY_LEVELS[urgencyRank(item.urgency)]} ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
       <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.resource?.name || item.kind)}</b>${urgencyChip(item.urgency)}
       <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(inboxRowLabel(item))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : `<div class="empty"><div class="big">${S.inbox.length ? 'Nothing left here' : 'Inbox zero'}</div>${S.inbox.length ? 'Everything in this tab has been read.' : 'Only what needs you appears here — asks leave once they are answered.'}</div>`}</div>
-    <p class="task-sub">Sorted by urgency, then by age. What each level does when it arrives — a system
-      notification, a sound, which channels it is delivered on — is set in
+    <p class="task-sub">Sorted by priority, newest first within each level. System notifications and sounds are set in
       <a data-spa href="${profileRoute()}#notifications">your profile</a>.</p>`;
 }
 
@@ -14410,15 +14435,16 @@ function setNotifyPref(level, behaviour, on) {
   try { localStorage.setItem('karmax-notify', JSON.stringify(next)); } catch {}
   return next;
 }
-// Only asks that ARRIVED, and only once the browser has seen a first list:
-// opening the app must never replay the backlog as a burst of notifications.
+// Announce new asks and priority increases after the first list; opening the
+// app must never replay the backlog as a burst of notifications.
 function inboxArrivals(previous, items) {
-  return previous ? items.filter((item) => item.unread && !previous.has(item.id)) : [];
+  return previous ? items.filter((item) => item.unread && (!previous.has(item.id)
+    || (previous instanceof Map && urgencyRank(item.urgency) > previous.get(item.id)))) : [];
 }
 function announceInbox(items) {
   const prefs = notifyPrefs();
   let sounded = false;
-  for (const item of items) {
+  for (const item of [...items].sort((a, b) => urgencyRank(b.urgency) - urgencyRank(a.urgency))) {
     const behaviour = prefs[item.urgency] || prefs.normal;
     if (behaviour.notify) showSystemNotification(item);
     // One sound per batch. `items` is urgency-ordered, so the first level that
@@ -14432,7 +14458,8 @@ function showSystemNotification(item) {
   try {
     const number = item.task?.num != null ? `#${item.task.num} · ` : '';
     const notification = new Notification(item.task?.title || item.resource?.name || 'karmax', {
-      body: `${number}${inboxRowLabel(item)}`,
+      body: `${URGENCY_LEVELS[urgencyRank(item.urgency)].toUpperCase()} · ${number}${inboxRowLabel(item)}`,
+      silent: true, // Sound is controlled separately by this browser’s per-level preference.
       tag: item.id,                                    // a restated ask replaces its own popup
       requireInteraction: item.urgency === 'critical', // critical waits to be dismissed
     });
@@ -14440,6 +14467,19 @@ function showSystemNotification(item) {
     return true;
   } catch { return false; }
 }
+// Unlock audio during a real gesture, before a background arrival needs it.
+function unlockNotificationAudio() {
+  if (!Object.values(notifyPrefs()).some((pref) => pref.sound)) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    const ctx = S.audio || (S.audio = new Ctx());
+    ctx.resume?.()?.catch?.(() => {});
+  } catch {}
+}
+document.addEventListener('pointerdown', unlockNotificationAudio, { passive: true });
+document.addEventListener('keydown', unlockNotificationAudio);
+
 // Synthesized rather than shipped: no asset to fetch, no volume surprise, and a
 // critical ask simply gets a second blip instead of a different sound to learn.
 function playNotificationSound(urgency = 'normal') {
@@ -14447,7 +14487,7 @@ function playNotificationSound(urgency = 'normal') {
   if (!Ctx) return false;
   try {
     const ctx = S.audio || (S.audio = new Ctx());
-    ctx.resume?.();
+    ctx.resume?.()?.catch?.(() => {});
     for (const offset of urgency === 'critical' ? [0, 0.18] : [0]) {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -14775,6 +14815,7 @@ function notificationsCard() {
       </div>`).join('')}
     </div>
     ${permissionNote}
+    <p class="task-sub">These choices apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
