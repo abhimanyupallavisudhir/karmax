@@ -55,6 +55,12 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   for (const file of configFiles(localHome, provider, session)) {
     const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
     if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
+    // Codex resolves rollout identity across the entire home, not by directory.
+    // A cloud fork may already have a newer copy under sessions/forked while the
+    // host cache still has an older dated copy. Never seed a second identity.
+    const rollout = provider === 'codex' ? codexRolloutIdentity(file.relative.split(path.sep).join('/')) : undefined;
+    if (rollout && [...existing].some((candidate) =>
+      codexRolloutIdentity(candidate.slice(relative.length + 1)) === rollout)) continue;
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
     const content = controlledAuth ? remoteAuthProjection(provider, file.relative, file.content) : file.content;
     if (!existing.has(target) || controlledAuth) {
@@ -468,6 +474,14 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
   return files;
 }
 
+/** Rollout filenames retain their UUID even when moved between active, archived,
+ * and imported directories. Legacy non-UUID fixtures use their whole filename. */
+function codexRolloutIdentity(file: string): string | undefined {
+  if (!/^(sessions|archived_sessions)\//.test(file) || !file.endsWith('.jsonl')) return undefined;
+  const name = path.posix.basename(file);
+  return name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1] ?? name;
+}
+
 async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
   const result = await world.exec('bash', ['-lc',
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`]);
@@ -547,6 +561,9 @@ export async function materializeRemoteSession(source: World, destination: World
       if (!file) return false;
     }
     const destinationPrefix = `${remoteAgentHomeRelative(provider, destinationLocalHome)}/`;
+    const existing = provider === 'codex'
+      ? await remoteHomeFiles(destination, path.posix.join(destination.handle.root, destinationPrefix))
+      : new Set<string>();
     for (const entry of pending.reverse()) {
       const destinationFile = provider === 'claude'
         ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
@@ -555,6 +572,14 @@ export async function materializeRemoteSession(source: World, destination: World
       const protectedFile = path.posix.join(destination.handle.root, destinationFile);
       const chmod = await destination.exec('chmod', ['600', protectedFile]);
       if (chmod.code !== 0) return false;
+      // Repair worlds already affected by host seeding a stale duplicate. The
+      // source transfer is authoritative; keep exactly its copy for this ID.
+      const identity = codexRolloutIdentity(destinationFile.slice(destinationPrefix.length));
+      if (identity) for (const old of existing) {
+        if (old === destinationFile || codexRolloutIdentity(old.slice(destinationPrefix.length)) !== identity) continue;
+        const removed = await destination.exec('rm', ['-f', '--', path.posix.join(destination.handle.root, old)]);
+        if (removed.code !== 0) return false;
+      }
     }
     return true;
   } catch { return false; }
