@@ -70,6 +70,11 @@ ok(taskUrl('attempt-2', { num: 14 }) === '/org/project/tasks/attempt-2', 'explic
 S.viewingAttempt = null;
 ok(taskUrl('attempt-2', { num: 14 }) === '/org/project/tasks/14', 'logical task links retain their task number');
 
+const currentHtml = taskAttempts({ taskId: 'attempt-1', stage: 'done', status: 'done', state: {} });
+const currentCard = currentHtml.match(/<a[^>]*aria-current="true"[^>]*>[\s\S]*?<\/a>/)?.[0] || '';
+ok(currentCard.includes('done') && !currentCard.includes('working'),
+  'selected attempt status comes from its current view, not the older group snapshot');
+
 ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft stage is labelled clearly');
 const archivedDraftRow = taskRow({
   id: 'attempt-2', title: 'Task', workflow: 'software-dev', num: 14,
@@ -142,6 +147,9 @@ eval(extractFn('wireAttempts'));
     if (url.endsWith('/attempts')) return S.attemptGroup;
     return [];
   };
+  global.scheduleTaskPageRender = () => {};
+  eval(extractFn('mergeTaskHistory'));
+  eval(extractFn('refreshTaskHistory'));
   eval(extractFn('openTask'));
   const staleOpen = openTask('attempt-1', 'overview', true);
   await openTask('attempt-1', 'overview', true);

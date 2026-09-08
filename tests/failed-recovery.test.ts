@@ -211,7 +211,9 @@ describe('failed software-dev recovery', () => {
     let queries = 0;
     const live = { ...stale, status: 'active' as const, waitingFor: undefined, updatedAt: 2 };
     const client = {
-      workflow: { getHandle: () => ({ query: async () => (queries++, live) }) },
+      workflow: { getHandle: (id: string) => ({ query: async () => id === 'account-coordinator'
+        ? { waiting: true, earliestResetAt: 123_000, detail: 'Provider usage limit reached' }
+        : (queries++, live) }) },
     } as any;
     const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
 
@@ -220,7 +222,8 @@ describe('failed software-dev recovery', () => {
 
     store.setTaskWorkflowVersion(task.id, '1.1.0');
     store.saveView(task.id, stale);
-    expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'waiting', updatedAt: 1 });
+    expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'waiting', updatedAt: 1,
+      waitingFor: { kind: 'account', earliestResetAt: 123_000, detail: 'Provider usage limit reached' } });
     expect(queries).toBe(1);
   });
 });

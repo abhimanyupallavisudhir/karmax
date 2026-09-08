@@ -5,6 +5,30 @@ import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
 describe('agent turn admission', () => {
+  it('does not release another admission when a colliding turn is rejected', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Collision');
+    const task = store.createTask({ projectId: project.id, title: 'Collision', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const id = `${task.id}#0`;
+    store.admitAgentUsage({ id, organizationId: project.organizationId!, projectId: project.id,
+      taskId: task.id, provider: 'anthropic', model: 'original-model', fundingSource: 'customer' });
+    const core = makeCoreActivities({ store, worlds, adapters: new Map() as any,
+      profiles: new ProfileResolver(store, 'claude') });
+    try {
+      await expect(core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: id,
+        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {},
+          workflow: 'just-do', agents: { do: { provider: 'claude', model: 'replacement-model' } } },
+      } as any)).rejects.toThrow('different attributed work');
+      expect(store.db.prepare('SELECT state FROM usage_admissions WHERE id=?').get(id))
+        .toMatchObject({ state: 'active' });
+    } finally { await world.destroy(); store.close(); }
+  });
+
   it('actualizes a managed reservation from configured provider token pricing', async () => {
     const previousCeilings = process.env.KARMAX_MANAGED_MODEL_REQUEST_CEILINGS;
     const previousPricing = process.env.KARMAX_MANAGED_MODEL_PRICING;

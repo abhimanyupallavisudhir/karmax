@@ -11,6 +11,7 @@ import { limitFailureClassification } from './failures.js';
 import { SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 import type { AgentRole, TaskInput, TaskView, WorldHandleLike } from './contract.js';
+import { agentTurnId } from './turn-id.js';
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
 type CredentialKind = 'login' | 'ambient' | 'key';
@@ -229,7 +230,7 @@ export function createAgentTurnLeaser(
       role: AgentRole,
       fn: (ctx: AgentTurnContext) => Promise<T>,
     ): Promise<T> {
-      const turnId = `${host.taskId}#${turnSeq++}`;
+      const turnId = agentTurnId(host.taskId, turnSeq++);
       if (accountPool <= 0) return admitted(turnId, role, undefined, fn);
 
       const resolved = await core.resolveProvider({ role, task: host.task() }).catch(() => undefined);
@@ -253,7 +254,9 @@ export function createAgentTurnLeaser(
       // from an immediate grant without changing the workflow command sequence.
       host.setWaitingFor(lease?.waiting === false
         ? { kind: 'agentSlot', provider, detail: 'Starting agent' }
-        : { kind: 'account', provider: credentialProvider });
+        : { kind: 'account', provider: credentialProvider,
+            ...(lease?.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+            ...(lease?.detail ? { detail: lease.detail } : {}) });
       await host.publish();
       await condition(() => grants.has(turnId) || host.cancelled());
       const grant = grants.get(turnId);
