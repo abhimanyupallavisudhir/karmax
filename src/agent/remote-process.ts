@@ -72,6 +72,11 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
         await world.writeFileBuffer(target, content);
     }
   }
+  // Retries may restore exclusively from the host after the source world has
+  // been deleted. Repair prior duplicate copies here too, before Codex opens its
+  // persistent index; live-world transfer is not guaranteed to run.
+  if (provider === 'codex' && session)
+    await reconcileRemoteCodexSessionCopies(world, { absolute, relative }, session);
   const runtimeBin = await ensureRemoteNode(world);
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = configuredBrowser(localHome, provider);
@@ -490,6 +495,41 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
   const root = world.handle.root.replace(/\/+$/, '');
   return new Set(result.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
     file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
+}
+
+/** Repair stale aliases left by earlier seeding, including on host-only retries.
+ * Rollouts are append-only: remove a shorter copy only after verifying it is an
+ * exact byte prefix of the retained copy. Never guess between divergent histories.
+ * Validate the whole selected lineage before removing anything; leave unrelated
+ * sessions and Codex's derived SQLite indexes alone. */
+export async function reconcileRemoteCodexSessionCopies(world: World, home: RemoteAgentHome,
+  session: string): Promise<void> {
+  const prefix = `${home.relative}/`;
+  const files = [...await remoteHomeFiles(world, home.absolute)]
+    .filter((file) => file.startsWith(prefix) && codexRolloutIdentity(file.slice(prefix.length)));
+  const seen = new Set<string>();
+  const obsolete: string[] = [];
+  let current: string | undefined = session;
+  while (current) {
+    if (seen.has(current)) throw new Error(`Cyclic Codex rollout lineage for ${session}`);
+    seen.add(current);
+    const candidates: { file: string; content: Buffer }[] = [];
+    for (const file of files.filter((candidate) => path.posix.basename(candidate).endsWith(`${current}.jsonl`)))
+      candidates.push({ file, content: await world.readFileBuffer(file) });
+    if (!candidates.length) break;
+    candidates.sort((a, b) => b.content.length - a.content.length || a.file.localeCompare(b.file));
+    const kept = candidates[0]!;
+    for (const other of candidates.slice(1)) {
+      if (!kept.content.subarray(0, other.content.length).equals(other.content))
+        throw new Error(`Conflicting Codex rollout copies for ${current}: histories diverge; refusing to discard either copy`);
+      obsolete.push(other.file);
+    }
+    current = codexHistoryBase(kept.content);
+  }
+  for (const file of obsolete) {
+    const result = await world.exec('rm', ['-f', '--', path.posix.join(world.handle.root, file)]);
+    if (result.code !== 0) throw new Error(`Could not remove stale Codex rollout copy ${file}: ${result.stderr || result.stdout}`);
+  }
 }
 
 /** Prepare tools on a new rollout identity; never rewrite source bytes. */
