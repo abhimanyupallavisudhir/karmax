@@ -12,6 +12,8 @@ import { worldRepos } from '../src/world/types.js';
 import { mergeQueueId } from '../src/coordinators/names.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
 import { GithubActionsApi, githubRequiredCheckKey } from '../src/integrations/github-actions.js';
+import { brokerPublishBranch } from '../src/world/git-broker.js';
+import { expectedTaskRemoteHeads, recordTaskPublication } from '../src/world/publication.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -214,6 +216,7 @@ const view = (h: any) => h.query('view') as Promise<any>;
 
 describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub)', () => {
   let h: Harness;
+  let publicationTurn: AgentAdapter['runTurn'] | undefined;
   beforeAll(async () => {
     process.env.GH_TOKEN = 'ghp_pipeline';
     originDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pr-origin-'));
@@ -221,6 +224,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        if (publicationTurn && input.role === 'do') return publicationTurn(input, ctx);
         if (input.role === 'do' && blockFrontHeldRepair
           && input.messages.at(-1)?.text.includes('retains the front landing slot')) {
           frontHeldRepairStarted = true;
@@ -311,6 +315,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     if (originDir) fs.rmSync(originDir, { recursive: true, force: true });
   });
   beforeEach(() => {
+    publicationTurn = undefined;
     prs.length = 0;
     comments.length = 0;
     afterPrOpened = undefined;
@@ -476,6 +481,79 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect((await git(repo, ['rev-parse', 'main'])).stdout.trim())
       .toBe((await git(origin, ['rev-parse', 'main'])).stdout.trim());
   }, 120_000);
+
+  it.each(['recorded checkpoint', 'unrecorded checkpoint'])(
+    'publishes an amended %s through real Git and exposes Confirm PR', async (scenario) => {
+      const repo = await repoWithOrigin(`checkpoint-${scenario.split(' ')[0]}`);
+      const project = h.store.createProject(`Checkpoint publication ${scenario}`, { repos: [repo], remote: 'pr' });
+      const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+        installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+      const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+        owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+      h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+      const task = h.store.createTask({ projectId: project.id, title: 'Amended checkpoint', workflow: 'software-dev',
+        workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+        createdBy: { kind: 'user', userId: 'a' } });
+      let turns = 0;
+      let amendedHead = '';
+      publicationTurn = async (input, ctx) => {
+        const checkout = worldRepos(input.world.handle)[0]!;
+        const cwd = checkout.root;
+        if (++turns === 1) {
+          fs.writeFileSync(path.join(cwd, 'proposal.md'), 'original checkpoint\n');
+          await gitOrThrow(cwd, ['add', '-A']);
+          await gitOrThrow(cwd, ['commit', '-qm', 'checkpoint']);
+          // Same broker transport as a parked cloud world: the credential lives
+          // in the trusted host and only the bundle leaves the world.
+          const origin = remoteBySlug.get(SLUG)!;
+          const remoteCheckout = { ...checkout, repo: REMOTE, source: REMOTE, sourceAuthority: 'origin' as const };
+          const remoteWorld = Object.assign(Object.create(input.world), {
+            handle: { ...input.world.handle, root: cwd, repos: [remoteCheckout] },
+            readFileBuffer: (file: string) => fs.promises.readFile(path.join(cwd, file)),
+          });
+          const result = await brokerPublishBranch(remoteWorld, {
+            GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_0: REMOTE,
+          }, {}, scenario === 'recorded checkpoint' ? recordTaskPublication(h.store, task.id) : undefined);
+          expect(result.skipped, JSON.stringify(result.errors)).toEqual([]);
+          fs.writeFileSync(path.join(cwd, 'proposal.md'), 'final amended proposal\n');
+          await gitOrThrow(cwd, ['add', '-A']);
+          await gitOrThrow(cwd, ['commit', '--amend', '--no-edit', '-q']);
+          amendedHead = (await git(cwd, ['rev-parse', 'HEAD'])).stdout.trim();
+        } else {
+          expect(scenario).toBe('unrecorded checkpoint');
+          expect(turns).toBe(2);
+          expect(input.messages.at(-1)?.text).toMatch(/Open PR needs a branch repair/);
+          // The old commit is the agent's superseded checkpoint. Preserve the
+          // final tree while reconnecting ancestry, without overwriting origin.
+          await gitOrThrow(cwd, ['fetch', 'origin', checkout.branch]);
+          await gitOrThrow(cwd, ['merge', '-s', 'ours', '--no-edit', `origin/${checkout.branch}`]);
+        }
+        ctx.openPr();
+        return { termination: { kind: 'success' as const, status: 'completed' }, output: 'Ready for review' };
+      };
+      const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+        taskQueue: TASK_QUEUE, workflowId: task.id,
+        args: [{ taskId: task.id, projectId: project.id, title: task.title, prompt: 'Amend the checkpoint',
+          base: 'main', target: 'main', project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' } }],
+      });
+      await expect.poll(async () => {
+        const current = await view(handle);
+        return `${current.stage}/${current.prs?.length ?? 0}`;
+      }, { timeout: 30_000 }).toBe('review/1');
+      const review = await view(handle);
+      expect(review.status).toBe('waiting');
+      expect(review.actions).toContainEqual(expect.objectContaining({ name: 'confirm', label: 'Confirm PR', enabled: true }));
+      expect(turns).toBe(scenario === 'recorded checkpoint' ? 1 : 2);
+      expect(h.store.eventsOfType(task.id, 'resolve.auto')).toHaveLength(0);
+      const origin = remoteBySlug.get(SLUG)!;
+      const head = (await git(origin, ['rev-parse', `karmax/${task.id}`])).stdout.trim();
+      expect(review.pr.headSha).toBe(head);
+      expect((await git(origin, ['rev-parse', `${head}^{tree}`])).stdout.trim())
+        .toBe((await git(repo, ['rev-parse', `${amendedHead}^{tree}`])).stdout.trim());
+      expect(Object.values(expectedTaskRemoteHeads(h.store, task.id))).toContain(head);
+      await handle.signal('cancel');
+      await handle.result();
+    }, 120_000);
 
   it('v1.22 restores a cancelled Review by reopening the same exact PR before Review', async () => {
     const repo = await repoWithOrigin('cancelled-review-restore');

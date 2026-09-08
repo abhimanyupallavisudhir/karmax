@@ -2951,11 +2951,30 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (cancelled) return await abort();
         targetLocked = true;
         if (githubAuthoritativeMerge) {
-          const opened = await withResolve('pr', () => core.openPr(world as any, target, {
-            title: input.title,
-            summary: reviewInfo?.summary ?? lastOutputs(msgs),
-          }));
-          prs = opened ?? [];
+          const opened = await withResolve('pr', async () => {
+            try {
+              return { prs: await core.openPr(world as any, target, {
+                title: input.title,
+                summary: reviewInfo?.summary ?? lastOutputs(msgs),
+              }) };
+            } catch (err) {
+              if (failureHasType(err, 'task-branch-conflict')
+                && patched('software-dev-publication-conflict-do-repair-v1')) {
+                return { repair: describeError(err) };
+              }
+              throw err;
+            }
+          });
+          if (opened.repair) {
+            msgs.push({ id: `pr-conflict-${msgs.length}`, role: 'user', ts: msgs.length,
+              text: `Open PR needs a branch repair.\n${opened.repair}` });
+            prRequested = false;
+            branchPreparedForPr = false;
+            stage = 'do';
+            status = 'active';
+            continue;
+          }
+          prs = opened.prs ?? [];
           pr = prs[0];
         }
         branchPreparedForPr = true;
