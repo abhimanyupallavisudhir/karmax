@@ -735,7 +735,7 @@ describe('task stage transitions', () => {
     });
 
     await f.api.signalTask(f.token, f.task.id, 'openPr');
-    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr' });
+    expect(f.signalled.at(-1)).toMatchObject({ id: f.task.id, signal: 'openPr', args: [{ userId: 'test' }] });
   });
 
   it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {

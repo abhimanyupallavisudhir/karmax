@@ -1,3 +1,4 @@
+import { recordHumanConfirmation } from './review-confirmation.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
@@ -3937,31 +3938,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
       if (!this.deps.store.humanMayAct(taskId, userId))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
-      // Approving one branch and opening the proposal are not Review confirmation
-      // decisions — only `confirm`
-      // passes the gate, so only `confirm` is journalled as the decision.
+      // Opening a proposal defers its confirmation until Review is ready.
+      // Only a direct Confirm decision is journalled at this point.
       if (signal === SIG.confirm) {
-        // A failed Confirm agent can expose the same human decision from its
-        // escalation frame. Preserve that person's GitHub authorization too.
-        const reviewConfirmation = scopedTask.lastView.stage === 'review'
-          || (scopedTask.lastView.stage === 'escalated'
-            && scopedTask.lastView.actions.some((action) => action.name === 'confirm' && action.enabled));
-        this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
-          payload: {
-            userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true,
-            githubMergeAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && (reviewConfirmation || scopedTask.lastView.stage === 'merge')),
-            // Current software-dev treats a Review confirmation as durable
-            // authorization of the task intent, including bounded automated
-            // integration repairs. An exceptional Landing confirmation still
-            // records the exact current heads below for strict GitHub policy.
-            githubMergeIntentAuthorized: Boolean(scopedTask.lastView.prs?.length
-              && Number(String(scopedTask.workflowVersion ?? '').split('.')[1] ?? 0) >= 16
-              && reviewConfirmation),
-            githubPrHeads: (scopedTask.lastView.prs ?? []).map((ref) => ({
-              slug: ref.slug, number: ref.number, headSha: ref.headSha,
-            })),
-          } });
+        recordHumanConfirmation(this.deps.store, taskId, userId);
       }
     } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
@@ -4174,6 +4154,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         // accepted message separately so every open conversation can render it
         // mid-turn without changing replay-sensitive workflow command histories.
         this.publishConversationMessage(taskId, role, followUp);
+      } else if (signal === SIG.openPr && caller.principal.startsWith('user:')) {
+        await handle.signal(signal, { userId: caller.principal.slice(5) });
       } else if (signal === SIG.approveCheckout) {
         await handle.signal(signal, { name: text ?? '' });
       } else {

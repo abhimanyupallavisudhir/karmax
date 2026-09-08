@@ -115,8 +115,9 @@ export const collaborationSettledSignal = defineSignal<[string, Message]>('colla
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
 export const providerChangedSignal = defineSignal(SIG.providerChanged);
 export const confirmSignal = defineSignal('confirm');
-/** Explicit transition from Do/waiting-for-input into PR preparation. */
-export const openPrSignal = defineSignal('openPr');
+/** Explicit transition into PR preparation. Only the platform supplies a human
+ * identity; historical and agent signals have no deferred confirmation. */
+export const openPrSignal = defineSignal<[{ userId: string }?]>('openPr');
 /** Approve ONE branch of a multi-PR task at the head it has right now (SPEC §11.1).
  *  Lets a human confirm the finished branches and send a follow-up about the rest;
  *  the approval lapses by itself if the Do agent moves that branch afterwards. */
@@ -615,6 +616,7 @@ async function softwareDevImpl(
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let goalMode = !!input.goalMode;
   let confirmed = false;
+  let manualPrConfirmer: string | undefined;
   let escalationAction: 'openPr' | 'confirm' | undefined;
   let manualEscalationRequested = false;
   let prRequested = recoveryStage === 'pr';
@@ -953,7 +955,7 @@ async function softwareDevImpl(
         return [cancel];
       case 'escalated':
         return [retry, ...(escalationAction === 'openPr'
-          ? [{ ...openPr, label: 'Commit changes and open PR' }]
+          ? [{ ...openPr, label: 'Commit changes, open & confirm PR' }]
           : escalationAction === 'confirm' ? [confirm] : []), followUp, cancel];
       default:
         return [];
@@ -1072,11 +1074,14 @@ async function softwareDevImpl(
     raise?: { type: ChildRaise['type'] };
     messagesSeen: number;
   }): Promise<'approved' | 'do' | 'cancelled'> {
+    let manualConfirmer = manualPrConfirmer;
+    manualPrConfirmer = undefined; // applies only to this proposal and one human layer
     if (clearsConfirmOnGate) confirmed = false;
 
     if (resourceCandidateReview) {
       let resolutionAtWait = resourceResolutionEpoch;
       let pending = await core.pendingResourceCandidates(taskId);
+      if (pending) manualConfirmer = undefined;
       const messagesAtWait = msgs.length;
       while (pending && !cancelled && msgs.length === messagesAtWait) {
         if (resourceResolutionEpoch !== resolutionAtWait) {
@@ -1161,6 +1166,15 @@ async function softwareDevImpl(
           audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'],
         };
         await publish();
+        // No new commands are emitted for historical openPr signals (no payload),
+        // so existing histories retain their original Review behavior.
+        if (manualConfirmer && confirmEpoch === epoch && msgs.length === options.messagesSeen && !cancelled) {
+          const userId = manualConfirmer;
+          manualConfirmer = undefined;
+          const approved = await core.confirmManualPr(taskId, userId);
+          if (approved && confirmEpoch === epoch && msgs.length === options.messagesSeen && !cancelled)
+            confirmed = true;
+        }
         await condition(() => confirmed || cancelled || msgs.length > options.messagesSeen || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return 'cancelled';
@@ -1223,6 +1237,7 @@ async function softwareDevImpl(
     return target.slice(Math.max(0, fromIndex));
   });
   setHandler(followUpSignal, (m, role) => {
+    manualPrConfirmer = undefined;
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript). A turn currently
@@ -1265,13 +1280,17 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
   });
-  setHandler(openPrSignal, () => {
+  setHandler(openPrSignal, (request) => {
     if (stage === 'escalated' && escalationAction) {
-      if (escalationAction === 'openPr') manualEscalationRequested = true;
+      if (escalationAction === 'openPr') {
+        manualEscalationRequested = true;
+        manualPrConfirmer = request?.userId;
+      }
       return;
     }
     if (!explicitPrCycle || stage !== 'do') return;
     prRequested = true;
+    manualPrConfirmer = request?.userId;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'openPr' };
   });
