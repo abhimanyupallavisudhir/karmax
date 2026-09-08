@@ -341,7 +341,7 @@ function parseRoute(url) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
-  if (seg[0] === 'profile') return { name: 'profile' };
+  if (seg[0] === 'profile') return { name: 'profile', ...(seg[1] ? { userId: seg[1] } : {}) };
   if (seg[0] === 'installation') return { name: 'installation' };
   // Pre-organization URLs — resolved, then canonicalised to the org form.
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
@@ -423,7 +423,7 @@ function organizationLandingRoute(organizationId) {
 function installationRoute() { return '/installation'; }
 
 // The profile belongs to the signed-in user, not to the selected organization.
-function profileRoute() { return '/profile'; }
+function profileRoute(userId) { return userId ? `/profile/${encodeURIComponent(userId)}` : '/profile'; }
 
 // The inbox pinned to one kind of notification: /<org>/inbox/<kind> ('all' is
 // the bare route). Which sub-tab you are on is part of the page, so it lives in
@@ -490,6 +490,9 @@ async function applyRoute() {
   if (r.name === 'profile') {
     if (r.legacy) return go(`${profileRoute()}${location.hash || ''}`, { replace: true });
     closeTaskDom();
+    if (r.userId && r.userId !== S.user?.id && !S.installationAccess)
+      return go(profileRoute(), { replace: true });
+    S.profileUserId = r.userId || null;
     S.tab = 'profile';
     renderRail();
     renderMain();
@@ -14538,7 +14541,23 @@ async function hydrateProfileGithub() {
 
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
+function profileWalkthroughCard(userId) {
+  if (!S.installationAccess || !S.meta?.hosted || !userId) return '';
+  return `<div class="card"><div class="section-h">Walkthrough</div>
+    <p class="task-sub">Show this user's setup walkthrough again in each organization. Existing work and connections are preserved.</p>
+    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Reset walkthrough</button></div>`;
+}
+
 function profileView() {
+  if (S.profileUserId && S.profileUserId !== S.user?.id) {
+    if (!S.installationAccess) return '<div class="empty">Profile unavailable</div>';
+    const user = S.users.find((candidate) => candidate.id === S.profileUserId);
+    if (!user) return '<div class="empty">User not found</div>';
+    return `<div class="profile-page"><h1 class="page-title">Profile</h1>
+      <div class="card profile-card"><div class="profile-name">${esc(user.name)}</div>
+        <div class="profile-email">${esc(user.email)}</div></div>
+      ${profileWalkthroughCard(user.id)}</div>`;
+  }
   const u = S.user && typeof S.user === 'object' ? S.user : null;
   const name = userDisplayName();
   const email = u?.email || '';
@@ -14560,6 +14579,7 @@ function profileView() {
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
+    ${profileWalkthroughCard(u?.id)}
     <div class="card profile-card">
       <div class="profile-identity">
         <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
@@ -14743,6 +14763,16 @@ function wireNotificationsCard() {
 }
 
 function wireProfileView() {
+  const reset = $('#profile-reset-onboarding');
+  reset?.addEventListener('click', async () => {
+    reset.disabled = true;
+    try {
+      await api(`/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
+      toast('Walkthrough reset. The user will see it when they next open their workspace.');
+    } catch (error) { toast(error.message, true); }
+    finally { reset.disabled = false; }
+  });
+  if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   hydrateProfileGithub();
   document.querySelectorAll('[data-default-organization]').forEach((button) => button.addEventListener('click', async () => {
@@ -15010,15 +15040,7 @@ async function wireInstallationUsers() {
   if (!box) return;
   try {
     const users = await api('/api/users');
-    box.innerHTML = `<p class="task-sub">Show the setup walkthrough again in each of a user's organizations. Existing work and connections are preserved.</p>${users.map((user) => `<div class="form-row"><span>${esc(user.name)} · ${esc(user.email)}</span><button class="btn sm" data-reset-onboarding="${esc(user.id)}">Reset walkthrough</button></div>`).join('')}`;
-    box.querySelectorAll('[data-reset-onboarding]').forEach((button) => button.addEventListener('click', async () => {
-      button.disabled = true;
-      try {
-        await api(`/api/users/${encodeURIComponent(button.dataset.resetOnboarding)}/onboarding/reset`, { method: 'POST' });
-        toast('Walkthrough reset. The user will see it when they next open their workspace.');
-      } catch (error) { toast(error.message, true); }
-      finally { button.disabled = false; }
-    }));
+    box.innerHTML = users.map((user) => `<div class="form-row"><a data-spa href="${profileRoute(user.id)}">${esc(user.name)} · ${esc(user.email)}</a></div>`).join('');
   } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
 }
 
@@ -15042,7 +15064,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
-      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>Reset the setup walkthrough for any account</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
+      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
@@ -15269,7 +15291,7 @@ async function hydrateOrganizationView() {
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
   const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
-  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name"><b>${esc(userName(id, embedded))}</b>${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name">${S.installationAccess ? `<a data-spa href="${profileRoute(id)}"><b>${esc(userName(id, embedded))}</b></a>` : `<b>${esc(userName(id, embedded))}</b>`}${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
   const authorizationProjects = S.projects.filter((project) => project.organizationId === organizationId);
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
