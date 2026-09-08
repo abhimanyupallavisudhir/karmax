@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -68,6 +68,34 @@ describe('turnkey update deploys an exact validated revision', () => {
     expect(script).toContain('pg_dump -U temporal -Fc karmax');
     expect(script).toContain('pg_restore -U temporal -d karmax');
     expect(script).toContain('for database in karmax temporal temporal_visibility');
+  });
+
+  it('applies a staged domain migration transactionally with the validated update', () => {
+    expect(update).toContain('pending_domain=$(env_value KARMAX_PENDING_DOMAIN)');
+    expect(update).toContain('configure "$pending_domain" "$pending_preview"');
+    expect(update).toContain('restore_migration');
+    expect(script).toContain('KARMAX_LEGACY_DOMAIN');
+  });
+
+  it.each(['exit 1', 'kill -TERM $$'])('restores and retains the migration backup on %s', (stop) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-migration-recovery-'));
+    const envFile = path.join(dir, '.turnkey.env');
+    const backup = `${envFile}.migration.test`;
+    const original = 'KARMAX_DOMAIN=krmax.example.com\nPOSTGRES_PASSWORD=preserved\n';
+    fs.writeFileSync(envFile, 'KARMAX_DOMAIN=tavya.example.com\n');
+    fs.writeFileSync(backup, original, { mode: 0o600 });
+    const recovery = update.slice(update.indexOf("migration_backup=''"), update.indexOf('pending_domain='));
+    try {
+      const result = spawnSync('sh', ['-c', `set -eu\nnote() { :; }\n${recovery}\nmigration_backup="$ENV_FILE.migration.test"\n${stop}`], {
+        env: { ...process.env, ENV_FILE: envFile }, encoding: 'utf8',
+      });
+      expect(result.status).toBe(stop === 'exit 1' ? 1 : 143);
+      expect(fs.readFileSync(envFile, 'utf8')).toBe(original);
+      expect(fs.readFileSync(backup, 'utf8')).toBe(original);
+      expect(fs.statSync(envFile).mode & 0o777).toBe(0o600);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -65,6 +65,16 @@ configure() {
   valid_domain "$preview" || die "invalid preview domain: $preview"
   [ "$domain" != "$preview" ] || die 'the preview domain must be different from the application domain'
 
+  legacy=$(env_value KARMAX_LEGACY_DOMAIN)
+  if [ -z "$legacy" ] && [ -n "$existing_domain" ] && [ "$domain" != "$existing_domain" ]; then
+    legacy=$existing_domain
+  fi
+  if [ -n "$legacy" ]; then
+    legacy=$(printf '%s' "$legacy" | tr '[:upper:]' '[:lower:]')
+    valid_domain "$legacy" || die "invalid legacy domain: $legacy"
+    [ "$legacy" != "$domain" ] || legacy=''
+  fi
+
   old_password=$(env_value POSTGRES_PASSWORD)
   password=${old_password:-$(random_hex 32)}
   old_provider=$(env_value KARMAX_CLOUD_WORLD_PROVIDER)
@@ -74,7 +84,7 @@ configure() {
   old_postgres=$(env_value POSTGRES_VERSION)
   postgres=${old_postgres:-16}
 
-  # This file is rewritten wholesale below, so anything the six managed keys
+  # This file is rewritten wholesale below, so anything the managed keys
   # above do not carry over is deleted. Operators legitimately add their own
   # settings here (a social OAuth client, a mailer), and losing one at the next
   # `up` is invisible: no error, the feature just quietly stops existing. So
@@ -82,7 +92,7 @@ configure() {
   carried=''
   if [ -f "$ENV_FILE" ]; then
     carried=$(awk '
-      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
+      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_LEGACY_DOMAIN KARMAX_LEGACY_WWW_DOMAIN KARMAX_PENDING_DOMAIN KARMAX_PENDING_PREVIEW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
         POSTGRES_PASSWORD TEMPORAL_VERSION POSTGRES_VERSION", m, " ")
         for (i in m) managed[m[i]] = 1 }
       /^[A-Za-z_][A-Za-z0-9_]*=/ {
@@ -99,6 +109,10 @@ configure() {
   {
     printf 'KARMAX_DOMAIN=%s\n' "$domain"
     printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
+    if [ -n "$legacy" ]; then
+      printf 'KARMAX_LEGACY_DOMAIN=%s\n' "$legacy"
+      printf 'KARMAX_LEGACY_WWW_DOMAIN=www.%s\n' "$legacy"
+    fi
     printf 'KARMAX_CLOUD_WORLD_PROVIDER=%s\n' "$provider"
     printf 'POSTGRES_PASSWORD=%s\n' "$password"
     printf 'TEMPORAL_VERSION=%s\n' "$temporal"
@@ -316,6 +330,40 @@ cmd_update() {
     || [ "$previous" = "$target" ] \
     || die "deployment source $previous and requested revision $target have diverged"
 
+  # A domain migration can be staged in the environment without changing the
+  # running service. The first validated update that understands these keys
+  # applies it together with the new application/Caddy revision, so there is no
+  # interval where the new origin serves an old, differently branded build.
+  # Keep an exact copy because the normal deployment rollback must restore the
+  # old origin as well as the old source and image.
+  migration_backup=''
+  restore_migration() {
+    [ -z "$migration_backup" ] || [ ! -f "$migration_backup" ] || cp -p "$migration_backup" "$ENV_FILE"
+  }
+  cleanup_migration() {
+    [ -z "$migration_backup" ] || rm -f "$migration_backup"
+  }
+  # Never discard the only pre-migration configuration on an unexpected error.
+  # Explicit rollback/success paths below remove it only after reconciliation.
+  migration_exit() {
+    if [ -n "$migration_backup" ] && [ -f "$migration_backup" ]; then
+      restore_migration
+      note "Migration interrupted; original environment restored. Recovery copy: $migration_backup"
+    fi
+  }
+  trap migration_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  pending_domain=$(env_value KARMAX_PENDING_DOMAIN)
+  pending_preview=$(env_value KARMAX_PENDING_PREVIEW_DOMAIN)
+  if [ -n "$pending_domain" ]; then
+    migration_backup="$ENV_FILE.migration.$$"
+    cp -p "$ENV_FILE" "$migration_backup"
+    configure "$pending_domain" "$pending_preview"
+    note "Staged domain migration to $pending_domain for this deployment."
+  fi
+
   note "Checking out validated revision $target…"
   git -C "$ROOT_DIR" checkout --detach "$target"
 
@@ -324,15 +372,23 @@ cmd_update() {
   # continues serving the previous image.
   if ! dc build --pull app; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
+    cleanup_migration
+    migration_backup=''
     die "deployment $target could not be built; production remains at $previous"
   fi
   if ! cmd_backup_candidate; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
     dc build app || true
+    cleanup_migration
+    migration_backup=''
     die "deployment $target could not be backed up; production remains at $previous"
   fi
 
   if dc up -d --remove-orphans && wait_ready; then
+    cleanup_migration
+    migration_backup=''
     note "Update complete at $target."
     return 0
   fi
@@ -341,7 +397,10 @@ cmd_update() {
   # rebuild it from the previous exact source before bringing the service back.
   note "Deployment $target failed; rolling back to $previous…"
   git -C "$ROOT_DIR" checkout --detach "$previous"
+  restore_migration
   if dc build app && dc up -d --remove-orphans && wait_ready; then
+    cleanup_migration
+    migration_backup=''
     die "deployment $target failed; production was restored to $previous"
   fi
   die "deployment $target failed and automatic rollback to $previous also failed"

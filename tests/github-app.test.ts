@@ -28,7 +28,7 @@ describe('GitHub App integration', () => {
         html_url: 'https://github.com/organizations/acme/settings/installations/42' });
       return new Response('not found', { status: 404 });
     };
-    const service = new GitHubAppService(store, broker, { appId: '123', appSlug: 'krmax-hosted', fetch: fakeFetch as typeof fetch });
+    const service = new GitHubAppService(store, broker, { appId: '123', appSlug: 'retired-brand', fetch: fakeFetch as typeof fetch });
     const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
     const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
       installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
@@ -40,6 +40,8 @@ describe('GitHub App integration', () => {
       app: 'none', installation: 'none', ready: false,
       appSettingsUrl: 'https://github.com/organizations/acme/settings/apps/krmax-hosted/permissions',
     });
+    expect(store.kvGet('github-app:slug')).toBe('krmax-hosted');
+    expect(service.installationUrl('state')).toContain('/apps/krmax-hosted/installations/new');
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/installation operator must grant/i);
     appPermissions.workflows = 'write';
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/has not approved/i);

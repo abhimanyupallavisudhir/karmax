@@ -39,6 +39,7 @@ describe('installation-wide settings report who may manage them', () => {
 
   beforeAll(async () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-instsettings-'));
+    fs.copyFileSync(new URL('../web/index.html', import.meta.url), path.join(home, 'index.html'));
     store = new Store(':memory:');
     tokens = new TokenAuthority();
     const gateway = new Gateway({
@@ -112,5 +113,43 @@ describe('installation-wide settings report who may manage them', () => {
 
     const refused = await fetch(`${base}/api/settings/installation`, { headers: as(tenant) });
     expect(refused.status).toBe(403);
+  });
+
+  it('changes the public installation name without clobbering its icon', async () => {
+    store.setSettings('global', 'appearance', { icon: 'knot' });
+    const changed = await fetch(`${base}/api/settings/installation`, {
+      method: 'PUT', headers: as(operator), body: JSON.stringify({ siteName: '  tavya  ' }),
+    });
+    expect(changed.status).toBe(200);
+    expect(await changed.json()).toMatchObject({ ok: true, siteName: 'tavya' });
+    expect(store.getSettings('global', 'appearance')).toEqual({ icon: 'knot', siteName: 'tavya' });
+
+    const meta = await (await fetch(`${base}/api/meta`)).json() as any;
+    expect(meta.siteName).toBe('tavya');
+    const manifest = await (await fetch(`${base}/app.webmanifest`)).json() as any;
+    expect(manifest).toMatchObject({ name: 'tavya', short_name: 'tavya' });
+    const shell = await (await fetch(base)).text();
+    expect(shell).toContain('<title>tavya</title>');
+    expect(shell).toContain('apple-mobile-web-app-title" content="tavya"');
+    expect(shell).not.toContain('<title>krmax</title>');
+    fs.copyFileSync(new URL('../web/llms.txt', import.meta.url), path.join(home, 'llms.txt'));
+    const llms = await (await fetch(`${base}/llms.txt`)).text();
+    expect(llms).toContain('# tavya');
+    expect(llms).toContain(`${base}/pricing`);
+    expect(llms).not.toContain('https://krmax.io');
+  });
+
+  it('validates the name and enforces installation write authority', async () => {
+    for (const siteName of ['', 'bad\nname', 'x'.repeat(49)]) {
+      const invalid = await fetch(`${base}/api/settings/installation`, {
+        method: 'PUT', headers: as(operator), body: JSON.stringify({ siteName }),
+      });
+      expect(invalid.status).toBe(400);
+    }
+    const refused = await fetch(`${base}/api/settings/installation`, {
+      method: 'PUT', headers: as(tenant), body: JSON.stringify({ siteName: 'not-allowed' }),
+    });
+    expect(refused.status).toBe(403);
+    expect(store.getSettings('global', 'appearance')?.siteName).toBe('tavya');
   });
 });

@@ -2694,6 +2694,8 @@ function watchConsoleRevision() {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  S.meta = S.meta || await api('/api/meta');
+  applyDocumentBrand();
   S.launch = S.launch || await (await feedbackFetch('/api/launch')).json();
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
   if (legalSlug) return renderLegalPage(legalSlug);
@@ -2763,6 +2765,7 @@ async function boot() {
     }
   }
   S.meta = await api('/api/meta');
+  applyDocumentBrand();
   watchConsoleRevision();
   try {
     S.installationInfo = await api('/api/settings/installation');
@@ -3410,6 +3413,17 @@ const BRAND_ICON_CHOICES = [
   { id: 'clover', label: 'Clover' },
 ];
 
+/** Installation branding arrives from the public metadata endpoint so it is
+ * available on landing, sign-in, setup and authenticated screens alike. */
+function siteName() { return S.meta?.siteName || 'krmax'; }
+function siteNameMarkup() { return esc(siteName()); }
+
+function applyDocumentBrand() {
+  document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', siteName());
+  document.querySelector('meta[name="description"]')?.setAttribute('content',
+    `${siteName()} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.`);
+}
+
 // The gateway resolves /brand/* against the instance-wide icon setting, so the
 // mark carries no client state — which is also what lets it render on the
 // pre-auth login screens. The counter only busts the HTTP cache after a switch.
@@ -3488,12 +3502,12 @@ function renderOnboarding() {
   const settings = globalRoute('organization');
   const optional = state.steps.optional || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
-    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get krmax ready</h2></div>
+    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get ${siteNameMarkup()} ready</h2></div>
       <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
     <ol class="onboarding-list">
-      ${onboardingStep(1, 'github', 'Connect GitHub', 'Import repositories and let krmax work through reviewed pull requests.', `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
+      ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
       ${onboardingStep(3, 'e2b', 'Add an E2B API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-compute">${state.steps.e2b.complete ? 'Manage E2B' : 'Set up E2B'}</a>`)}
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
@@ -3522,7 +3536,7 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
-      <div class="brand">${brandMark()} krmax</div>
+      <div class="brand">${brandMark()} ${siteNameMarkup()}</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
         <option value="__new">＋ New organization</option>
@@ -5712,7 +5726,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
         ? `<div class="task-sub" style="color:var(--ok)">✓ Your connected GitHub account can request merges for ${esc((eligibility.repositories || []).join(', '))}. GitHub still enforces branch rules at Merge.</div>`
         : routed
           ? `<div class="task-sub" style="color:var(--ok)">✓ A selected human reviewer has live GitHub merge access (${esc(names.join(', '))}). Their confirmation can sponsor the merge.</div>`
-          : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub merge reviewer recommended</b><div class="task-sub" style="margin-top:4px">Your connected GitHub account cannot merge every repository in this task. ${names.length ? `Add a <b>Human confirms</b> step for ${esc(names.join(', '))}.` : 'No connected project member currently has merge access; grant access on GitHub or connect an eligible account.'} You can still queue the task—krmax will stop at Merge and ask for an eligible human.</div></div>`;
+          : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub merge reviewer recommended</b><div class="task-sub" style="margin-top:4px">Your connected GitHub account cannot merge every repository in this task. ${names.length ? `Add a <b>Human confirms</b> step for ${esc(names.join(', '))}.` : 'No connected project member currently has merge access; grant access on GitHub or connect an eligible account.'} You can still queue the task—${siteNameMarkup()} will stop at Merge and ask for an eligible human.</div></div>`;
     };
     api(`/api/projects/${encodeURIComponent(projectId)}/github-merge-eligibility`)
       .then((value) => { eligibility = value; paintEligibility(); })
@@ -6729,7 +6743,7 @@ function renderTaskFilePage(v, target) {
         <div class="${state?.status === 'ready' ? 'current' : ''}"><i>3</i><span>Editor</span></div>
       </div>
       <section class="fh-panel">${fileHandoffResultHtml(state, target)}</section>
-      <p class="fh-footnote">This permalink is scoped to this task. krmax resolves the agent’s world path server-side and refuses paths outside the task repositories.</p>
+      <p class="fh-footnote">This permalink is scoped to this task. ${siteNameMarkup()} resolves the agent’s world path server-side and refuses paths outside the task repositories.</p>
     </main></div>`;
   $('#fh-retry')?.addEventListener('click', () => { S.taskFileLoad = null; renderTaskFilePage(v, target); });
   main.querySelectorAll('.fh-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
@@ -7567,7 +7581,7 @@ async function wireResourceReview(v, force = false) {
       return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
         <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
     }).join('')}${inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
-      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; krmax did not upload their contents.</div>
+      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; ${siteNameMarkup()} did not upload their contents.</div>
       <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : ''}`;
     wrap.querySelectorAll('.candidate-adopt').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Adopt this staged candidate as a project resource? It will materialize into future task worlds.')) return;
@@ -8587,13 +8601,13 @@ async function openLocalCheckout(v) {
   const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">The task branch is the handoff boundary. krmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    <p class="task-sub">The task branch is the handoff boundary. ${siteNameMarkup()} never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
     <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
     ${localConversationHandoff(v, plan.repositories.length === 1 ? `${plan.workspace}/${plan.repositories[0].name}` : plan.workspace, true)}
     <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
     <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
-    <p class="task-sub">krmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
+    <p class="task-sub">${siteNameMarkup()} accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
     <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
   </div></div>`;
   wireClose();
@@ -8630,7 +8644,7 @@ async function openProjectCheckout(project) {
   if (!host.isConnected) return;
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to krmax.</p>
+    <p class="task-sub">Check out ${esc(project.name)} on your machine. These commands use each repository's default branch and never send your GitHub credentials to ${siteNameMarkup()}.</p>
     <div class="section-h">First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
     <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
   </div></div>`;
@@ -8655,7 +8669,7 @@ async function materializeLocalCheckout(v) {
   if (!host.isConnected) return null;
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">krmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+    <p class="task-sub">${siteNameMarkup()} published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${localConversationHandoff(v, checkout.cwd)}
@@ -9597,12 +9611,12 @@ function actionToast(signal, label) {
 
 const MANUAL_OPEN_PR_CONFIRMATION = "Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.";
 const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes, open the PR, and confirm it if you are authorized?';
-const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.';
+const returnToReviewConfirmation = () => `Return this pull request to Review and confirm it if you are authorized? ${siteName()} will first verify that the current proposal is clean and committed.`;
 
 function confirmTaskAction(action, v = S.view) {
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
-    : hasOpenPullRequest(v) ? RETURN_TO_REVIEW_CONFIRMATION
+    : hasOpenPullRequest(v) ? returnToReviewConfirmation()
     : MANUAL_OPEN_PR_CONFIRMATION);
 }
 
@@ -10128,7 +10142,8 @@ async function refreshHostDiag() {
 // typed into them), the Temporal server, git/exec helpers — grouped by owning
 // entity with live CPU% / RSS. Kill via POST /api/processes/kill (SIGTERM;
 // shift-click for SIGKILL). Protected infrastructure gets no kill button.
-const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe', app: 'krmax', untracked: 'misc' };
+const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe',
+  get app() { return siteName(); }, untracked: 'misc' };
 
 function fmtDur(sec) {
   if (!sec || sec < 0) return '—';
@@ -10145,7 +10160,7 @@ function procPanelHtml(sample) {
   // A row is either killable (button) or protected (visible lock, so the kill
   // affordance is discoverable even on an idle instance where only protected
   // infrastructure — karmax itself + Temporal — is running).
-  const LOCK = `<span class="proc-lock" title="Protected — krmax can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
+  const LOCK = `<span class="proc-lock" title="Protected — ${siteNameMarkup()} can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
   const killBtn = (pid, label, killable) =>
     killable
       ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
@@ -10188,7 +10203,7 @@ function procPanelHtml(sample) {
       <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (krmax core &amp; Temporal); everything else gets a ✕ kill button</div>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (${siteNameMarkup()} core &amp; Temporal); everything else gets a ✕ kill button</div>
   </div>`;
 }
 
@@ -10262,7 +10277,7 @@ async function renderDashboard() {
       ${!isOperator ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
-      <div class="section-h">Processes — everything krmax is running</div>
+      <div class="section-h">Processes — everything ${siteNameMarkup()} is running</div>
       <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
@@ -10724,7 +10739,7 @@ async function openAvatarEditor(proj, avatar) {
     <label class="form-row"><span>Name</span><input id="avatar-name" maxlength="80" value="${esc(avatar?.name || '')}" placeholder="Atlas"></label><label class="form-row"><span>Purpose</span><input id="avatar-purpose" maxlength="240" value="${esc(avatar?.purpose || '')}" placeholder="Handles implementation and routine approvals"></label><label class="form-row"><span>Instructions</span><textarea id="avatar-prompt" rows="12" placeholder="You are my trusted engineering delegate…">${esc(avatar?.prompt || '')}</textarea></label>
     <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(`${runtime.provider}${runtime.model ? ` · ${runtime.model}` : ''}`)}</b></div></div>
     <details class="settings-disclosure avatar-customize" ${avatar && (avatar.authorityMode === 'restricted' || callMode !== 'me' || roles.size) ? 'open' : ''}><summary><b>Customize…</b></summary><div class="avatar-custom-section"><div class="section-h">Authority</div>
-      <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All krmax, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
+      <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All ${siteNameMarkup()}, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
       <div id="avatar-restricted" ${avatar?.authorityMode === 'restricted' ? '' : 'hidden'}>${authorizationEditorHtml('avatar-authorization', selectedAuth, S.projects.filter((item) => item.organizationId === proj.organizationId), proj.id)}<button class="btn tf-vault-button" id="avatar-vault" type="button"><span>Vault credentials</span><span id="avatar-vault-count">${selectedCredentialIds.size} selected</span></button></div>${activeGithub ? `<label class="choice-row compact"><input id="avatar-github" type="checkbox" ${avatar?.githubAccountId ? 'checked' : ''}><span><b>Use GitHub account ${esc(activeGithub.login)}</b><small>Delegate this connected account to the Avatar.</small></span></label>` : ''}</div>
       <div class="avatar-custom-section"><div class="section-h">Callable by</div><select id="avatar-call-mode"><option value="me" ${callMode === 'me' ? 'selected' : ''}>Only me</option><option value="project" ${callMode === 'project' ? 'selected' : ''}>Everyone in this project</option><option value="specific" ${callMode === 'specific' ? 'selected' : ''}>Specific people and teams</option></select><input id="avatar-callers" value="${esc(callMode === 'specific' ? avatar.callableBy.join(', ') : '')}" placeholder="user:id, @team:engineering" ${callMode === 'specific' ? '' : 'hidden'}></div>
       <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Working'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
@@ -11513,7 +11528,7 @@ function settingsView(proj) {
     <div class="project-kind-guide" aria-label="Project dependency guide">
       <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
       <button type="button" data-project-jump="project-secrets"><b>Secret</b><span>A sensitive value</span></button>
-      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files krmax versions</span></button>
+      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files ${siteNameMarkup()} versions</span></button>
       <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
     </div>
@@ -11521,7 +11536,7 @@ function settingsView(proj) {
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files krmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
     <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
@@ -11597,7 +11612,7 @@ async function hydrateProjectSecrets(proj) {
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
       <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
         <div class="project-form-grid">
-          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in krmax.</small></label>
+          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in ${siteNameMarkup()}.</small></label>
           <label class="form-row"><span>Value</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"><small class="field-help">Encrypted immediately and never returned by the API.</small></label>
           <label class="form-row wide"><span>Deliver as a private file <small>(optional)</small></span><input id="project-secret-file" placeholder=".secrets/service-account.json"><small class="field-help">Leave blank to inject it as an environment variable with the name above. File secrets are mode 0600 and privately Git-excluded.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
@@ -11642,7 +11657,7 @@ async function hydrateProjectData(proj) {
     const readyStorage = storageLocations.filter((location) => location.status === 'ready');
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
-    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when krmax should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
+    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when ${siteNameMarkup()} should capture and version the files. The Storage field only decides where those encrypted revisions live. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
       ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
@@ -11654,7 +11669,7 @@ async function hydrateProjectData(proj) {
           <div class="form-row"><span>Storage</span>${readyStorage.length > 1
             ? `<select id="data-storage" aria-label="Storage">${readyStorage.map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select>`
             : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
-            <small class="field-help">Managed storage is provided by krmax for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
+            <small class="field-help">Managed storage is provided by ${siteNameMarkup()} for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
           <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
@@ -11679,7 +11694,7 @@ async function hydrateProjectData(proj) {
         const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
-          || '<div class="project-empty">Nothing looks like project data. krmax checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>';
+          || `<div class="project-empty">Nothing looks like project data. ${siteNameMarkup()} checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>`;
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
           $('#data-add-panel').open = true;
@@ -11732,12 +11747,12 @@ async function hydrateProjectServices(proj) {
           <label class="form-row"><span>Container image</span><input id="service-image" placeholder="postgres:16"></label>
           <label class="form-row"><span>Container port</span><input id="service-port" inputmode="numeric" placeholder="5432"></label>
           <label class="form-row"><span>Give its URL to tasks as</span><input id="service-url-env" placeholder="DATABASE_URL"><small class="field-help">The environment-variable name, not the secret value.</small></label>
-          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">krmax replaces host and port for each isolated world.</small></label>
+          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">${siteNameMarkup()} replaces host and port for each isolated world.</small></label>
           <label class="form-row"><span>Optional seed data</span><select id="service-seed"><option value="">No seed data</option>${data.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)} · ${esc(resource.target.path)}</option>`).join('')}</select></label>
           <label class="form-row"><span>Seed destination in container</span><input id="service-seed-path" placeholder="/docker-entrypoint-initdb.d/seed.sql"></label>
         </div></div>
         <div class="service-fields" data-service-kind="external" hidden><div class="project-form-grid">
-          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. krmax passes only an opaque credential handle to the task world.</small></label>
+          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. ${siteNameMarkup()} passes only an opaque credential handle to the task world.</small></label>
         </div></div>
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
       </details>`;
@@ -12238,8 +12253,12 @@ async function hydrateExecutionProviders(proj) {
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
   return `<div class="card" id="appearance-card">
-      <div class="section-h">Icon <span class="chip">whole instance</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The mark in the top bar and on the sign-in screen, the browser favicon, and the installed app icon.</p>
+      <div class="section-h">Site identity <span class="chip">whole instance</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The name and mark shown in the console, sign-in screen, browser tab, installed app, and account email.</p>
+      <div class="inline-form" style="margin-bottom:16px">
+        <label class="form-row" style="flex:1">Site name<input id="site-name" maxlength="48" autocomplete="off" /></label>
+        <button class="btn sm primary" id="site-name-save" type="button">Save name</button>
+      </div>
       <div class="brand-picker" id="brand-picker">
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
@@ -12256,9 +12275,33 @@ async function wireAppearanceCard() {
   let current = 'diamond';
   // The mark is instance-wide, so only the operator (settings:*) may change it —
   // below that the read fails and the card hides entirely, as outbound email does.
-  try { current = (await api('/api/settings/global/appearance')).icon || 'diamond'; }
+  let installation;
+  try {
+    [current, installation] = await Promise.all([
+      api('/api/settings/global/appearance').then((value) => value.icon || 'diamond'),
+      api('/api/settings/installation'),
+    ]);
+  }
   catch { $('#appearance-card').style.display = 'none'; return; }
   mark(current);
+  const nameInput = $('#site-name');
+  if (nameInput) nameInput.value = installation.siteName || siteName();
+  $('#site-name-save')?.addEventListener('click', async () => {
+    const name = nameInput.value.trim();
+    try {
+      const result = await api('/api/settings/installation', {
+        method: 'PUT', body: JSON.stringify({ siteName: name }),
+      });
+      S.meta.siteName = result.siteName;
+      if (S.installationInfo) S.installationInfo.siteName = result.siteName;
+      applyDocumentBrand();
+      toast('Site name saved');
+      await go(currentPath(), { replace: true });
+    } catch (e) { toast(e.message, true); }
+  });
+  nameInput?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); $('#site-name-save')?.click(); }
+  });
   picker.querySelectorAll('.brand-option').forEach((b) =>
     b.addEventListener('click', async () => {
       const icon = b.dataset.icon;
@@ -12332,9 +12375,9 @@ function globalSettingsView(embedded = false) {
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with krmax and change only with platform releases. Each task pins its workflow version.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with ${siteNameMarkup()} and change only with platform releases. Each task pins its workflow version.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
-      ${S.meta?.hosted ? '<p>Custom workflow code is unavailable on hosted krmax.</p>' : `<div class="form-row"><label>Install from a git repo</label>
+      ${S.meta?.hosted ? `<p>Custom workflow code is unavailable on hosted ${siteNameMarkup()}.</p>` : `<div class="form-row"><label>Install from a git repo</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <input id="wf-url" placeholder="git URL or path (e.g. https://github.com/you/my-workflow.git)" style="flex:1;min-width:220px" />
           <input id="wf-ref" placeholder="ref (tag/branch/sha, optional)" style="width:180px" />
@@ -12350,8 +12393,8 @@ function phoneInstallHelp() {
   if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
     return '<span class="phone-installed">Installed on this device ✓</span>';
   }
-  return `<button class="btn sm" id="install-karmax">Add krmax to this phone</button>
-    <span class="task-sub" id="phone-install-note">No native krmax app is needed.</span>`;
+  return `<button class="btn sm" id="install-karmax">Add ${siteNameMarkup()} to this phone</button>
+    <span class="task-sub" id="phone-install-note">No native ${siteNameMarkup()} app is needed.</span>`;
 }
 
 function isFetchInterruption(error) {
@@ -12370,10 +12413,10 @@ function renderPhoneAccess(status) {
     : status.state === 'conflict'
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
-    ? `<div class="phone-access-address"><span>Access your krmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your krmax at</span><b>Tailscale not set up</b></div>`;
+    ? `<div class="phone-access-address"><span>Access your ${siteNameMarkup()} at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Access your ${siteNameMarkup()} at</span><b>Tailscale not set up</b></div>`;
   const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
-       <li>Open the private krmax address shown here in your phone’s browser.</li>`;
+       <li>Open the private ${siteNameMarkup()} address shown here in your phone’s browser.</li>`;
   const recovery = ready
     ? `<details class="phone-troubleshooting">
         <summary>Address won’t open?</summary>
@@ -12381,7 +12424,7 @@ function renderPhoneAccess(status) {
           <li>Disconnect Mullvad or any other VPN on both devices, then reconnect Tailscale. Android and iOS allow only one active VPN.</li>
           <li>On Android, check Tailscale → Settings → App-based split tunneling. Your browser must not bypass Tailscale.</li>
           <li>If the error mentions DNS or “name not found,” set Android Private DNS to Automatic, turn off browser Secure DNS temporarily, and reconnect Tailscale.</li>
-          <li>Keep this computer awake with krmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
+          <li>Keep this computer awake with ${siteNameMarkup()} running, then retry the exact <code>https://…ts.net</code> address above.</li>
         </ol>
        </details>`
     : '';
@@ -12391,9 +12434,9 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? 'Why this krmax is not being served' : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? `Why this ${siteName()} is not being served` : 'Set up instructions';
   const setupIntro = status.state === 'conflict'
-    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or krmax instance.</p>'
+    ? `<p>Tailscale is already configured on this computer; its address currently belongs to another local service or ${siteNameMarkup()} instance.</p>`
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
         (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
@@ -12419,21 +12462,21 @@ function renderPhoneAccess(status) {
             <button class="btn sm" id="remote-refresh">Check again</button>
             ${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}
           </div>
-          ${status.canSetup ? '<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. krmax never sees your OS or Tailscale password.</p>' : ''}
+          ${status.canSetup ? `<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. ${siteNameMarkup()} never sees your OS or Tailscale password.</p>` : ''}
           ${fallback}
         </div>
        </details>`;
   box.innerHTML = `${address}
     ${setupPanel}
-    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use krmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use ${siteNameMarkup()} in the browser, or add it to your Home Screen for an app-like window.</li></ol>
       <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">This uses Tailscale Serve—not Funnel. krmax stays bound to localhost and is never made public.</p>`;
+    <p class="phone-security">This uses Tailscale Serve—not Funnel. ${siteNameMarkup()} stays bound to localhost and is never made public.</p>`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
     if (approvalTab) {
       approvalTab.document.title = 'Tailscale setup';
-      approvalTab.document.body.textContent = 'Waiting for krmax to start Tailscale…';
+      approvalTab.document.body.textContent = `Waiting for ${siteName()} to start Tailscale…`;
     }
     button.disabled = true;
     button.textContent = action === 'setup' ? 'Starting…' : action === 'enable' ? 'Turning on…' : 'Turning off…';
@@ -12460,7 +12503,7 @@ function renderPhoneAccess(status) {
           missedChecks++;
           if (missedChecks === 1) {
             renderPhoneAccess(pollingStatus(
-              'Tailscale is reconnecting this computer. A brief interruption is normal; krmax will keep checking.',
+              `Tailscale is reconnecting this computer. A brief interruption is normal; ${siteName()} will keep checking.`,
             ));
           }
         }
@@ -12495,7 +12538,7 @@ function renderPhoneAccess(status) {
     } catch (error) {
       if (action === 'setup' && isFetchInterruption(error)) {
         const reconnecting = pollingStatus(
-          'The connection changed while Tailscale started. This can be normal; krmax will reconnect and keep checking.',
+          `The connection changed while Tailscale started. This can be normal; ${siteName()} will reconnect and keep checking.`,
         );
         renderPhoneAccess(reconnecting);
         await finishSetup(reconnecting);
@@ -12534,7 +12577,7 @@ function renderPhoneAccess(status) {
       await installPrompt.prompt();
       await installPrompt.userChoice;
       installPrompt = null;
-      if (note) note.textContent = 'krmax can now open from your Home Screen.';
+      if (note) note.textContent = `${siteName()} can now open from your Home Screen.`;
       return;
     }
     const ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
@@ -12564,14 +12607,14 @@ async function hydratePhoneAccess() {
     revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
-        <span>Access your krmax at</span>
-        <b>${disconnected ? 'Could not reach krmax' : 'Could not check Phone Access'}</b>
+        <span>Access your ${siteNameMarkup()} at</span>
+        <b>${disconnected ? `Could not reach ${siteNameMarkup()}` : 'Could not check Phone Access'}</b>
       </div>
       <div class="phone-setup-body">
         <div class="phone-access-head"><span class="remote-state">Needs attention</span><span>${
           disconnected
             ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
-            : esc(error?.message || 'krmax could not check Tailscale.')
+            : esc(error?.message || `${siteName()} could not check Tailscale.`)
         }</span></div>
         <div class="phone-access-actions"><button class="btn sm" id="remote-retry">Check again</button></div>
       </div>`;
@@ -12630,7 +12673,7 @@ function paymentsCard(scope) {
     <button class="btn primary" data-addcard="${scope}">Add card</button>
     <details class="pay-stripe" style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
-      <p class="task-sub">For registered businesses. Lets krmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
+      <p class="task-sub">For registered businesses. Lets ${siteNameMarkup()} issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
       ${scope === 'global' ? `<div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
       <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
@@ -12733,11 +12776,11 @@ async function wirePaidLaunchCard() {
       <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
       <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
   box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
-    <p class="task-sub">This is the control center for selling krmax.io subscriptions. Values are saved with the installation; Stripe secrets are encrypted in the krmax vault and are never returned to the browser. No paid-launch environment variables are required.</p>
+    <p class="task-sub">This is the control center for selling subscriptions on ${esc(location.host)}. Values are saved with the installation; Stripe secrets are encrypted in the ${siteNameMarkup()} vault and are never returned to the browser. No paid-launch environment variables are required.</p>
     ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
 
     <div class="section-h" style="margin-top:18px">Stripe Billing</div>
-    <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. krmax uses hosted Stripe Checkout, so it does not need a publishable key.</p>
+    <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. ${siteNameMarkup()} uses hosted Stripe Checkout, so it does not need a publishable key.</p>
     <ol class="task-sub"><li>Create the live recurring products/prices described in the founder checklist below.</li><li>In Stripe Workbench, create a snapshot webhook destination at <span class="mono">${esc(stripe.webhookUrl || '')}</span>, select API version <span class="mono">${esc(stripe.apiVersion || '')}</span>, and subscribe to: <span class="mono">${esc((stripe.webhookEvents || []).join(', '))}</span>.</li><li>Paste the live secret key, webhook signing secret, and IDs here. Blank secret fields keep the encrypted values already saved.</li><li>Configure and test the Stripe customer portal, then exercise the full lifecycle in test mode before enabling checkout.</li></ol>
     <div class="settings-grid">
       <label class="form-row">Stripe secret key<input class="paid-stripe-secret" type="password" autocomplete="new-password" placeholder="${stripe.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_live_…'}" /></label>
@@ -12767,7 +12810,7 @@ async function wirePaidLaunchCard() {
     <label class="card" style="display:flex;gap:10px;padding:12px;margin-top:14px"><input type="checkbox" class="paid-founder-reviewed" ${state.founderReviewed ? 'checked' : ''} /><span><b>I reviewed and approved policy version ${esc(state.policyVersion)}</b><span class="task-sub" style="display:block">This records founder approval; it is not a substitute for legal advice.</span></span></label>
 
     <div class="section-h" style="margin-top:22px">Real-world founder checklist</div>
-    <p class="task-sub">These items happen outside krmax. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that krmax verified the work.</p>
+    <p class="task-sub">These items happen outside ${siteNameMarkup()}. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that ${siteNameMarkup()} verified the work.</p>
     ${taskMarkup}
 
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
@@ -13038,7 +13081,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — krmax only mirrors the figure.');
+      const amt = prompt(`Raise this card’s limit by how much (USD)? Raise it with your bank first — ${siteName()} only mirrors the figure.`);
       if (amt == null) return;
       if (!Number(amt) || Number(amt) < 0) return toast('Enter an amount greater than zero.', true);
       try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
@@ -13237,7 +13280,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
-          ${request.kind === 'reset' ? '<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; krmax will resume the agent automatically.</div>' : ''}
+          ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>` : ''}
         </div>
         <div class="approval-request-actions">
           ${request.itemId ? '' : `<select class="vreq-bind" aria-label="Credential to grant"><option value="">Choose credential…</option>${items.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select>`}
@@ -13402,7 +13445,7 @@ function passwordsCard() {
     </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Import or sync from a password manager
-      ${policyTip('krmax mirrors selected credentials into its own encrypted vault (a snapshot, not a live link), so agents keep working if the source store is offline and you choose exactly what they can touch. Hosted users can import a Bitwarden JSON export; available live connectors appear below.')}</div>
+      ${policyTip(`${siteName()} mirrors selected credentials into its own encrypted vault (a snapshot, not a live link), so agents keep working if the source store is offline and you choose exactly what they can touch. Hosted users can import a Bitwarden JSON export; available live connectors appear below.`)}</div>
     <div class="queue-item bitwarden-file-import" style="margin-bottom:8px">
       <div style="flex:1"><b>Bitwarden JSON export</b>
         <span class="chip">one-way import</span>
@@ -13675,7 +13718,7 @@ async function wireVaultCards(organizationId) {
     overlay.innerHTML = `<div class="modal-card" style="max-width:620px;width:92%" role="dialog" aria-modal="true" aria-labelledby="git-pass-title">
       <div style="display:flex;align-items:start;gap:10px"><div style="flex:1">
         <div class="section-h" id="git-pass-title">Connect unix pass through Git</div>
-        <p class="task-sub" style="color:var(--ink-2);margin-top:2px">krmax clones the repository into isolated organization storage, decrypts entries only while syncing, and commits and pushes write-back changes.</p>
+        <p class="task-sub" style="color:var(--ink-2);margin-top:2px">${siteNameMarkup()} clones the repository into isolated organization storage, decrypts entries only while syncing, and commits and pushes write-back changes.</p>
       </div><button class="icon-btn" data-git-pass-close aria-label="Close">×</button></div>
       <div class="form-row"><label>Repository URL</label><input class="git-pass-repo" placeholder="git@github.com:you/password-store.git" autocomplete="off" /></div>
       <div class="form-row"><label>Password-store path in repository <span class="task-sub">(optional; auto-detects .password-store)</span></label><input class="git-pass-path" placeholder=".password-store" autocomplete="off" /></div>
@@ -13975,14 +14018,14 @@ async function wireOutboundEmailCard() {
   return hydrateInstallationCard('#outbound-email-card', '/api/email', (card, data) => {
     card.innerHTML = `
     <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let krmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let ${siteNameMarkup()} email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
     <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
     <div class="form-row"><label>Provider</label><select id="oe-provider">
       <option value="resend">Resend — one API key (simplest)</option>
       <option value="smtp">SMTP server — any provider or relay</option>
     </select></div>
     <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
-    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="krmax &lt;noreply@yourdomain.com&gt;"></div>
+    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
     <div id="oe-smtp" style="display:none">
       <div class="form-row"><label>SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
       <div class="inline-form" style="align-items:center">
@@ -14245,7 +14288,7 @@ function wireGlobalSettings(organizationId) {
         const codeEntry = r.requiresCode
           ? '<br><label class="form-row">Authorization code shown after sign-in<input id="login-authorization-code" autocomplete="off" /></label><button class="btn sm" id="login-code-submit">Submit code</button>'
           : '';
-        out.innerHTML = `Open this URL to finish signing in (krmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`;
+        out.innerHTML = `Open this URL to finish signing in (${siteNameMarkup()} won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}${codeEntry}`;
         out.style.color = 'var(--ink-1)';
         out.querySelector('#login-code-submit')?.addEventListener('click', async () => {
           const code = out.querySelector('#login-authorization-code')?.value.trim();
@@ -14673,7 +14716,7 @@ function profileView() {
         <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
         <div class="profile-meta">
           <div class="profile-name">${esc(name)}</div>
-          <div class="profile-email">Your krmax profile</div>
+          <div class="profile-email">Your ${siteNameMarkup()} profile</div>
         </div>
       </div>
       <div class="profile-rows">
@@ -14770,7 +14813,7 @@ function profileView() {
       <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
       <div class="data-export-copy">
         <div class="section-h">Your data</div>
-        <p class="task-sub">Download a readable JSON archive of your profile and the krmax records directly linked to you across organizations.</p>
+        <p class="task-sub">Download a readable JSON archive of your profile and the ${siteNameMarkup()} records directly linked to you across organizations.</p>
         <p class="data-export-note">Passwords, session tokens, OAuth tokens, and stored credentials are never included.</p>
       </div>
       <button class="btn" id="export-user-data" type="button">Export your data</button>
@@ -14891,7 +14934,7 @@ function wireProfileView() {
   document.querySelectorAll('[data-profile-cancel]').forEach((button) => button.addEventListener('click', () => setProfileEditor(null)));
   $('#profile-resend-confirmation')?.addEventListener('click', (event) => resendConfirmationEmail(event.currentTarget));
   $('#request-account-deletion')?.addEventListener('click', async () => {
-    if (!confirm('Request deletion of this krmax account? Cancel any active subscription first. We will verify organization and resource ownership before irreversible deletion.')) return;
+    if (!confirm(`Request deletion of this ${siteName()} account? Cancel any active subscription first. We will verify organization and resource ownership before irreversible deletion.`)) return;
     try {
       const result = await api('/api/user/account-deletion-request', { method: 'POST', body: '{}' });
       toast(`Deletion request recorded${result.privacyContact ? `. Questions: ${result.privacyContact}` : '.'}`);
@@ -15113,9 +15156,9 @@ async function wireInstallationGithubCard() {
   const permissionCard = permissionStatus?.unavailable
     ? `<div class="card" style="padding:10px;border-color:var(--warn)"><b>Could not verify GitHub access</b><div class="task-sub">${esc(permissionStatus.error || 'GitHub did not return the App permissions.')}</div></div>`
     : permissionReady ? ''
-      : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub App permissions need updating</b><div class="task-sub" style="margin:4px 0 8px">krmax uses a broad repository-scoped App grant, while its own capabilities decide which operations an agent may invoke. Add the missing permissions${missingApp.length ? `: <b>${esc(missingApp.join(', '))}</b>` : ''}. GitHub requires every existing installation owner to approve the expansion afterwards.</div>${permissionStatus?.appSettingsUrl ? `<a class="btn sm primary" href="${esc(permissionStatus.appSettingsUrl)}" target="_blank" rel="noopener noreferrer">Update permissions on GitHub</a>` : ''}</div>`;
+      : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub App permissions need updating</b><div class="task-sub" style="margin-top:4px">${siteNameMarkup()} uses a broad repository-scoped App grant, while its own capabilities decide which operations an agent may invoke. Add the missing permissions${missingApp.length ? `: <b>${esc(missingApp.join(', '))}</b>` : ''}. GitHub requires every existing installation owner to approve the expansion afterwards.</div>${permissionStatus?.appSettingsUrl ? `<a class="btn sm primary" href="${esc(permissionStatus.appSettingsUrl)}" target="_blank" rel="noopener noreferrer">Update permissions on GitHub</a>` : ''}</div>`;
   box.innerHTML = `<div class="section-h">GitHub App <span class="chip" style="color:${permissionReady ? 'var(--ok,#4ec9a3)' : 'var(--warn)'}">${permissionReady ? 'ready' : 'action required'}</span></div>
-    <p class="task-sub">Shared by every organization for repository transport and personal GitHub authorization. krmax capabilities remain the per-agent authorization boundary.</p>${permissionCard}
+    <p class="task-sub">Shared by every organization for repository transport and personal GitHub authorization. ${siteNameMarkup()} capabilities remain the per-agent authorization boundary.</p>${permissionCard}
     <div class="settings-grid">
       <label class="form-row">App slug<input value="${esc(status.appSlug || '')}" readonly /></label>
       <label class="form-row">App ID<input value="${esc(status.appId || '')}" readonly /></label>
@@ -15136,9 +15179,9 @@ async function wireInstallationUsers() {
 function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
-    : '<div class="card"><p class="task-sub">Phone Access can be changed only from a browser on the machine running krmax.</p></div>';
+    : `<div class="card"><p class="task-sub">Phone Access can be changed only from a browser on the machine running ${siteNameMarkup()}.</p></div>`;
   return `<div class="organization-settings installation-settings"><div class="settings-header"><div>
-    <h1 class="page-title">Installation</h1><p class="settings-intro">Controls that affect every organization and the machine running krmax</p>
+    <h1 class="page-title">Installation</h1><p class="settings-intro">Controls that affect every organization and the machine running ${siteNameMarkup()}</p>
   </div><span class="chip">operator only</span></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
@@ -15465,14 +15508,14 @@ async function hydrateOrganizationView() {
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${hostLocal() ? `${r.capacity.activeWorlds} worlds` : `concurrency capacity ${usagePolicy?.maxActiveWorlds || r.capacity.activeWorlds}`}</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
     <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select>${hostLocal() ? '<input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds">' : ''}<button class="btn sm" id="runner-create">Add pool</button></div>`;
-  $('#org-storage').innerHTML = `<div class="project-help-callout"><span class="callout-mark">i</span><div><b>Managed storage is intentionally bounded.</b> Connect your own bucket for large versioned datasets. For live or frequently changing data, add the bucket as a project Service instead of copying it into krmax.</div></div>
+  $('#org-storage').innerHTML = `<div class="project-help-callout"><span class="callout-mark">i</span><div><b>Managed storage is intentionally bounded.</b> Connect your own bucket for large versioned datasets. For live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteNameMarkup()}.</div></div>
     ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress"><i style="width:${pct}%"></i></div>` : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
     <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
       <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
       <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-karmax"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
       <label class="form-row">Restricted prefix<input id="storage-prefix" value="karmax/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
       <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
-      <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the krmax vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
+      <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
   const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
   const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
     : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
@@ -16451,7 +16494,7 @@ function readPolicyAcceptance(context) {
 }
 
 function legalFooter() {
-  return `<footer class="legal-footer"><a href="/">krmax</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
+  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
     <a href="/legal/security">Security</a><a href="/legal/dpa">DPA requests</a></footer>`;
 }
 
@@ -16460,10 +16503,10 @@ async function renderLegalPage(slug) {
   const response = await feedbackFetch(`/api/legal/${encodeURIComponent(slug)}`);
   if (!response.ok) { history.replaceState({}, '', '/legal'); return renderLegalIndex(); }
   const policy = await response.json();
-  document.title = `${policy.title} · krmax`;
+  document.title = `${policy.title} · ${siteName()}`;
   const contactRows = Object.entries(policy.contacts || {}).filter(([, email]) => email)
     .map(([kind, email]) => `<a href="mailto:${esc(email)}">${esc(kind)}: ${esc(email)}</a>`).join('');
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/legal">All policies</a></header>
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/legal">All policies</a></header>
     <main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
     <h1>${esc(policy.title)}</h1><p class="legal-summary">${esc(policy.summary)}</p>
     <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>
@@ -16477,8 +16520,8 @@ async function renderLegalPage(slug) {
 
 function renderLegalIndex() {
   document.body.classList.remove('landing-active');
-  document.title = 'Policies · krmax';
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/pricing">Pricing</a></header>
+  document.title = `Policies · ${siteName()}`;
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/pricing">Pricing</a></header>
     <main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
     <p class="legal-summary">Versioned product, billing, privacy, and operational disclosures for the initial paid launch.</p>
     <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch?.draftNotice)}</span></div>
@@ -16494,7 +16537,7 @@ function formatCatalogPrice(cents, currency = 'usd') {
 
 function renderPricing() {
   document.body.classList.remove('landing-active');
-  document.title = 'Pricing · krmax';
+  document.title = `Pricing · ${siteName()}`;
   const catalog = S.launch?.pricingCatalog || [];
   const checkoutReady = S.launch?.paidLaunch && S.launch?.ready;
   const team = catalog.find((plan) => plan.id === 'team');
@@ -16509,7 +16552,7 @@ function renderPricing() {
       <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ` shared across the organization + ${esc(plan.additionalActiveUserAgentRuns)} per additional active user` : ''}</li></ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>krmax</span></a><a href="/login">Sign in</a></header>
+  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/login">Sign in</a></header>
     <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
       <div class="pricing-grid">${cards}</div>
@@ -16526,11 +16569,11 @@ function openPublicAuth(path, render) {
 
 function renderLanding() {
   document.body.classList.add('landing-active');
-  document.title = 'krmax — the to-do list for agents';
+  document.title = `${siteName()} — the to-do list for agents`;
   $('#app').innerHTML = `<div class="landing-page">
     <a class="landing-skip" href="#landing-main">Skip to content</a>
     <header class="landing-nav" aria-label="Primary navigation">
-      <a class="landing-brand" href="/" aria-label="krmax home">${brandMark()}<span>krmax</span></a>
+      <a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a>
       <div class="landing-nav-actions">
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
@@ -16544,7 +16587,7 @@ function renderLanding() {
         <div class="landing-hero-copy">
           <h1 id="landing-title" class="landing-analogy">
             <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
-            <span><strong>krmax</strong><span>is a fancy <b>to-do list.</b></span></span>
+            <span><strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b></span></span>
           </h1>
           <p class="landing-intro">The <em>correct</em> interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
@@ -16552,13 +16595,13 @@ function renderLanding() {
           </div>
         </div>
 
-        <figure class="product-frame" aria-label="krmax task list showing agents working in parallel">
-          <div class="product-browserbar"><i></i><i></i><i></i><span>krmax.io / krmax</span><b>⌘ K</b></div>
+        <figure class="product-frame" aria-label="${siteNameMarkup()} task list showing agents working in parallel">
+          <div class="product-browserbar"><i></i><i></i><i></i><span>${esc(location.host)} / ${siteNameMarkup()}</span><b>⌘ K</b></div>
           <div class="product-shell">
             <aside class="product-rail">
-              <div class="product-wordmark">${brandMark()}<strong>krmax</strong></div>
+              <div class="product-wordmark">${brandMark()}<strong>${siteNameMarkup()}</strong></div>
               <small>PROJECTS</small>
-              <div class="product-project active"><span>◇</span> krmax</div>
+              <div class="product-project active"><span>◇</span> ${siteNameMarkup()}</div>
               <div class="product-project"><span>◇</span> Website</div>
               <div class="product-project"><span>◇</span> Research</div>
               <div class="product-rail-spacer"></div>
@@ -16616,7 +16659,7 @@ function renderLanding() {
             <article><h3>Agents work parallelly in isolated cloud worlds.</h3></article>
             <article><h3>Yes, gitignored files are handled correctly.</h3><p>secrets, databases, big files</p></article>
             <article><h3>Bring your own key or OpenAI/Claude subscription</h3></article>
-            <article><h3>krmax MCP lets agents access and manage your krmax projects</h3><p>if you authorize it.</p></article>
+            <article><h3>${siteNameMarkup()} MCP lets agents access and manage your ${siteNameMarkup()} projects</h3><p>if you authorize it.</p></article>
             <article class="wide"><h3>Connect a password vault and a payment card, and let agents Just Do Things.</h3><p>E.g. just create a task &quot;buy me a website and deploy to it&quot; or &quot;run the experiment on vast.ai&quot;</p></article>
           </div>
         </div>
@@ -16625,23 +16668,23 @@ function renderLanding() {
       <section class="landing-control" aria-labelledby="control-title">
         <div class="landing-control-copy">
           <h2 id="control-title">As human-in-the-loop<br>as <em>you</em> like.</h2>
-          <p>Want a human-managed to-do list of AI engineers? Want the automated company? krmax can do both.</p>
+          <p>Want a human-managed to-do list of AI engineers? Want the automated company? ${siteNameMarkup()} can do both.</p>
         </div>
         <div class="landing-control-list">
-          <article><p>krmax MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
+          <article><p>${siteNameMarkup()} MCP lets agents create new tasks, manage tasks, manage settings—<strong>anything a human can do.</strong></p></article>
           <article><p><strong>Review and human input stages</strong> can be assigned to either a human or an agent.</p></article>
-          <article><p>krmax comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
+          <article><p>${siteNameMarkup()} comes with a robust <strong>authorization system</strong>, so you decide whether to give agents these permissions.</p></article>
         </div>
       </section>
 
       <section class="landing-final" aria-labelledby="final-title">
         <span class="landing-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
         <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
-        <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with krmax <span aria-hidden="true">→</span></button>
+        <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></button>
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>krmax</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Everything is a to-do list.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
@@ -16653,13 +16696,13 @@ function renderLanding() {
 
 function renderLogin() {
   document.body.classList.remove('landing-active');
-  document.title = 'Sign in · krmax';
+  document.title = `Sign in · ${siteName()}`;
   window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <a href="/" id="login-home" class="login-home">← About krmax</a>
-    <div class="brand" style="margin-bottom:18px">${brandMark()} krmax</div>
+    <a href="/" id="login-home" class="login-home">← About ${siteNameMarkup()}</a>
+    <div class="brand" style="margin-bottom:18px">${brandMark()} ${siteNameMarkup()}</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
-    ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a krmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
+    ${S.pendingInvite ? `<p class="task-sub">You've been invited to a ${siteNameMarkup()} organization. Sign in — or <b>create an account</b> — to accept it.</p>` : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
@@ -16772,7 +16815,7 @@ function renderResetPassword(token) {
 
 function renderSignup() {
   document.body.classList.remove('landing-active');
-  document.title = 'Create account · krmax';
+  document.title = `Create account · ${siteName()}`;
   window.onpopstate = () => boot();
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
@@ -16835,7 +16878,7 @@ function renderSignup() {
 
 function renderPolicyCompletion() {
   document.body.classList.remove('landing-active');
-  document.title = 'Review policies · krmax';
+  document.title = `Review policies · ${siteName()}`;
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px">${brandMark()} Finish account setup</div>
     <p class="task-sub">Review and accept the current launch policies before using this paid service.</p>
@@ -16863,7 +16906,7 @@ function renderAccessPending() {
     <div class="brand" style="margin-bottom:12px">${brandMark()} No project access</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your account is active, but you're not on any project yet.</p>
-    <p class="task-sub">Ask a krmax admin to add you to a project, or create your own organization below. Any new access shows up as soon as you check again.</p>
+    <p class="task-sub">Ask a ${siteNameMarkup()} admin to add you to a project, or create your own organization below. Any new access shows up as soon as you check again.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
     <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>
@@ -16886,7 +16929,7 @@ function renderAccessPending() {
 
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up krmax</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up ${siteNameMarkup()}</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>

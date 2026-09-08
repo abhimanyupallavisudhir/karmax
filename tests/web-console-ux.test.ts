@@ -202,7 +202,7 @@ describe('manual PR opening', () => {
   it('confirms the context-specific action before signaling it', () => {
     expect(app).toContain('Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.');
     expect(app).toContain('Commit all preserved changes, open the PR, and confirm it if you are authorized?');
-    expect(app).toContain('Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.');
+    expect(app).toContain('Return this pull request to Review and confirm it if you are authorized? ${siteName()} will first verify that the current proposal is clean and committed.');
     expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act, v)) return;');
     expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name, S.view)) return;');
   });
@@ -287,13 +287,9 @@ describe('verification banner', () => {
 
 describe('copy', () => {
   /**
-   * INTENDED, and the reason this is not a blanket "never capitalize" rule:
-   * `Krmax` is correct in the two *app-name* positions — the PWA manifest
-   * (`name`/`short_name`) and `apple-mobile-web-app-title` — because an OS
-   * install prompt and a home-screen label are proper-noun slots rendered by
-   * the platform, not our prose. `tests/brand.test.ts` owns and asserts that
-   * split. Everywhere a human reads the name *in a sentence* it is lowercase
-   * `krmax`, matching the wordmark. This test guards the prose half only.
+   * The checked-in shell uses the lowercase default; the gateway and SPA replace
+   * it with the installation's exact chosen casing everywhere a human sees it.
+   * This test prevents an old capitalized fallback from leaking into prose.
    */
   it('spells the product name one way in prose', () => {
     const proseFiles = fs.readdirSync(webDir)
