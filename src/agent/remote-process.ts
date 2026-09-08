@@ -7,6 +7,7 @@ import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
 import type { World, WorldPty } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
+import { codexSessionWithTools } from './codex-session-tools.js';
 import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
@@ -491,34 +492,22 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
     file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
 }
 
-/** Attach Karmax's host-mediated tools to a Codex rollout minted by another
- * client. Codex 0.144.x accepts dynamicTools only on thread/start; native
- * resume/fork reloads them from the first session_meta record instead. Patch
- * only the task-private sandbox copy so the original host transcript remains
- * byte-for-byte untouched. */
+/** Prepare tools on a new rollout identity; never rewrite source bytes. */
 export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
-  session: string, dynamicTools: unknown[]): Promise<boolean> {
-  if (!world.writeFileBuffer) return false;
-  const prefix = `${home.relative}/sessions/`;
+  session: string, dynamicTools: unknown[]): Promise<string | undefined> {
+  if (!world.writeFileBuffer) return undefined;
   const candidates = [...await remoteHomeFiles(world, home.absolute)]
-    .filter((file) => file.startsWith(prefix) && file.endsWith('.jsonl') && path.posix.basename(file).includes(session));
+    .filter((file) => (file.startsWith(`${home.relative}/sessions/`) || file.startsWith(`${home.relative}/archived_sessions/`))
+      && path.posix.basename(file).endsWith(`${session}.jsonl`));
   const sessionFile = candidates[0];
-  if (!sessionFile) return false;
-  const original = (await world.readFileBuffer(sessionFile)).toString('utf8');
-  const newline = original.indexOf('\n');
-  const first = newline < 0 ? original : original.slice(0, newline);
-  let metadata: any;
-  try { metadata = JSON.parse(first); }
-  catch { throw new Error(`Codex session ${session} has invalid rollout metadata`); }
-  if (metadata?.type !== 'session_meta' || !metadata.payload || typeof metadata.payload !== 'object')
-    throw new Error(`Codex session ${session} is missing its leading session_meta record`);
-  metadata.payload.dynamic_tools = dynamicTools;
-  const updated = `${JSON.stringify(metadata)}${newline < 0 ? '' : original.slice(newline)}`;
-  await world.writeFileBuffer(sessionFile, Buffer.from(updated));
-  const protectedFile = path.posix.join(world.handle.root, sessionFile);
-  const chmod = await world.exec('chmod', ['600', protectedFile]);
-  if (chmod.code !== 0) throw new Error(`could not protect patched Codex session ${session}: ${chmod.stderr || chmod.stdout}`);
-  return true;
+  if (!sessionFile) return undefined;
+  const updated = codexSessionWithTools(await world.readFileBuffer(sessionFile), dynamicTools);
+  if (!updated) return session;
+  const destination = `${home.relative}/sessions/forked/${updated.filename}`;
+  await world.writeFileBuffer(destination, updated.content);
+  const chmod = await world.exec('chmod', ['600', path.posix.join(world.handle.root, destination)]);
+  if (chmod.code !== 0) throw new Error(`could not protect prepared Codex session ${updated.session}: ${chmod.stderr || chmod.stdout}`);
+  return updated.session;
 }
 
 /** Copy a native session and its physical history dependencies between worlds.

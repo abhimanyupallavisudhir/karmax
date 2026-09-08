@@ -26,6 +26,8 @@ import { activityDetail, codexItemActivity, toolActivityDetail } from './activit
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
   spawnRemoteAgentProcess, syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
+import { codexSessionWithTools } from './codex-session-tools.js';
+import { findProviderSession } from './fork.js';
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
 import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
@@ -88,55 +90,19 @@ export function codexDynamicTools(remote: boolean): Array<{ type: string; name: 
   }));
 }
 
-/**
- * Local twin of `ensureRemoteCodexSessionTools`: rewrite a rollout's leading
- * `session_meta` record so a RESUMED (or forked) thread advertises the current
- * dynamic tools. `thread/start` is the only call that takes `dynamicTools`, so
- * without this every thread created before this registration existed — which is
- * every local Codex-subscription thread karmax has ever started — would keep
- * running without turn-local controls forever.
- *
- * Best-effort by design: a missing/odd rollout costs the turn its controls, and
- * must never cost it the turn. (The remote twin throws because a remote world is
- * seeded from scratch each turn, so a malformed file there is a real bug.)
- */
-export function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools: unknown[]): boolean {
+/** Return a tools-compatible session without rewriting a rollout that another
+ * thread may reference. Unknown/legacy malformed sessions remain best-effort. */
+export function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools: unknown[]): string | undefined {
   try {
-    const sessions = path.join(configHome, 'sessions');
-    if (!fs.existsSync(sessions)) return false;
-    const stack = [sessions];
-    let file: string | undefined;
-    while (stack.length && !file) {
-      const dir = stack.pop()!;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) stack.push(full);
-        else if (entry.name.endsWith('.jsonl') && entry.name.includes(session)) { file = full; break; }
-      }
-    }
-    if (!file) return false;
-    const original = fs.readFileSync(file, 'utf8');
-    const newline = original.indexOf('\n');
-    const metadata = JSON.parse(newline < 0 ? original : original.slice(0, newline));
-    if (metadata?.type !== 'session_meta' || !metadata.payload || typeof metadata.payload !== 'object') return false;
-    metadata.payload.dynamic_tools = dynamicTools;
-    // Write through a temp file + rename, NOT in place. Unlike the remote twin
-    // (which patches a per-turn copy seeded from scratch), this rewrites the
-    // user's real, leased, persistent rollout — a crash or SIGKILL part-way
-    // through an in-place `writeFileSync` truncates the very session history the
-    // resume depends on. `rename` within the same directory is atomic, so the
-    // file is either the old rollout or the new one, never a half of either.
-    const temp = `${file}.karmax-${process.pid}.tmp`;
-    fs.writeFileSync(temp, `${JSON.stringify(metadata)}${newline < 0 ? '' : original.slice(newline)}`, { mode: 0o600 });
-    try {
-      fs.renameSync(temp, file);
-    } catch (error) {
-      fs.rmSync(temp, { force: true });
-      throw error;
-    }
-    return true;
+    const file = findProviderSession({ provider: 'codex', session, forkHome: configHome });
+    if (!file) return undefined;
+    const updated = codexSessionWithTools(fs.readFileSync(file), dynamicTools);
+    if (!updated) return session;
+    const destination = path.join(path.dirname(file), updated.filename);
+    fs.writeFileSync(destination, updated.content, { mode: 0o600, flag: 'wx' });
+    return updated.session;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -435,15 +401,13 @@ export class CodexAdapter implements AgentAdapter {
       ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session)
       : undefined;
     const dynamicTools = codexDynamicTools(remote);
-    // app-server exposes dynamicTools only on thread/start. A thread created by
-    // an ordinary Codex client — or by a karmax old enough to predate this
-    // registration — has no persisted Karmax definitions, so enrich its rollout
-    // metadata before a true native resume/fork. Remote worlds patch the
-    // sandbox-side copy; local subscriptions patch the leased CODEX_HOME.
+    // Resume/fork cannot override dynamicTools. Migrate into a new rollout
+    // identity instead of changing bytes referenced by existing descendants.
+    let preparedSession = input.session;
     if (remoteHome && input.session)
-      await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools);
+      preparedSession = await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools) ?? input.session;
     else if (!remote && input.session && input.resolvedAuth?.configHome)
-      ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools);
+      preparedSession = ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools) ?? input.session;
     let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
       extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
     if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
@@ -520,7 +484,7 @@ export class CodexAdapter implements AgentAdapter {
       }
     });
 
-    let threadId: string | undefined = input.session;
+    let threadId: string | undefined = preparedSession;
     let currentTurnId: string | undefined;
     let turnActive = false;
     let finalText = '';
@@ -783,7 +747,7 @@ export class CodexAdapter implements AgentAdapter {
       const resuming = !!input.session;
       if (resuming && input.fork) {
         const forked = await client.request<any>('thread/fork', {
-          threadId: input.session,
+          threadId: preparedSession,
           cwd,
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
@@ -795,7 +759,7 @@ export class CodexAdapter implements AgentAdapter {
         // Resume otherwise reloads the CLI/config defaults (`:workspace` +
         // on-request in current Codex), discarding karmax's headless posture.
         await client.request('thread/resume', {
-          threadId: input.session,
+          threadId: preparedSession,
           cwd,
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
