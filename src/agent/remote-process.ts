@@ -7,6 +7,7 @@ import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
 import type { World, WorldPty } from '../world/types.js';
 import { fileURLToPath } from 'node:url';
+import { codexHistoryBase, codexSessionFiles } from './fork.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
 import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 
@@ -103,7 +104,7 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
   for (const remoteFile of files) {
     const relative = remoteFile.slice(homePrefix.length);
     const session = provider === 'codex'
-      ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
+      ? (relative.startsWith('sessions/') || relative.startsWith('archived_sessions/')) && relative.endsWith('.jsonl')
       : relative.startsWith('projects/') && relative.endsWith('.jsonl');
     if (!auth.has(relative) && !session) continue;
     // Remote provider processes receive refresh-token-free projections. They are
@@ -432,7 +433,7 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
       // real E2B filesystem request time out. Durable config, skills, rules,
       // commands, hooks, and plugin manifests continue through this walk; the one
       // requested session is materialized separately below.
-      if (['projects', 'sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
+      if (['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
         || segments.some((segment) => ['cache', '.remote-plugin-install-staging'].includes(segment))
         || /^(?:logs?|state|goals|memories)(?:[_-].*)?\.sqlite(?:-(?:wal|shm))?$/.test(entry.name.toLowerCase())
         || ['history.jsonl', 'models_cache.json'].includes(entry.name.toLowerCase())) continue;
@@ -442,8 +443,12 @@ function configFiles(root: string, provider: Provider, session?: string): Array<
     }
   };
   walk(root);
-  if (session) {
-    const sessionRoot = path.join(root, provider === 'codex' ? 'sessions' : 'projects');
+  if (session && provider === 'codex') {
+    const lineage = codexSessionFiles({ session, forkHome: root });
+    if (lineage) for (const file of lineage)
+      files.push({ relative: path.relative(root, file), content: fs.readFileSync(file) });
+  } else if (session) {
+    const sessionRoot = path.join(root, 'projects');
     const stack = [sessionRoot];
     while (stack.length) {
       const dir = stack.pop()!;
@@ -502,8 +507,8 @@ export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAg
   return true;
 }
 
-/** Copy one native provider session between persistent cloud worlds. The source
- * remains untouched; only the requested session is exposed in the destination. */
+/** Copy a native session and its physical history dependencies between worlds.
+ * The source remains untouched; unrelated conversations are never copied. */
 export async function materializeRemoteSession(source: World, destination: World,
   provider: Provider, session: string, destinationLocalHome: string): Promise<boolean> {
   if (!destination.writeFileBuffer) return false;
@@ -521,17 +526,37 @@ export async function materializeRemoteSession(source: World, destination: World
   catch { return false; }
   const sourceFile = files.find((file) => provider === 'claude'
     ? file.includes('/projects/') && path.posix.basename(file) === `${session}.jsonl`
-    : file.includes('/sessions/') && path.posix.basename(file).includes(session) && file.endsWith('.jsonl'));
+    : (file.includes('/sessions/') || file.includes('/archived_sessions/')) && path.posix.basename(file).endsWith(`${session}.jsonl`));
   if (!sourceFile) return false;
   try {
+    const pending: { file: string; content: Buffer }[] = [];
+    let file: string | undefined = sourceFile;
+    const seen = new Set<string>();
+    // Stay within the selected source account home while resolving ancestors.
+    const sourceHome = sourceFile.split(/\/(?:sessions|archived_sessions)\//)[0];
+    while (file) {
+      if (seen.has(file)) return false;
+      seen.add(file);
+      const content = await source.readFileBuffer(file);
+      pending.push({ file, content });
+      const base = provider === 'codex' ? codexHistoryBase(content) : undefined;
+      if (!base) break;
+      file = files.find((candidate) =>
+        (candidate.startsWith(`${sourceHome}/sessions/`) || candidate.startsWith(`${sourceHome}/archived_sessions/`))
+        && path.posix.basename(candidate).endsWith(`${base}.jsonl`));
+      if (!file) return false;
+    }
     const destinationPrefix = `${remoteAgentHomeRelative(provider, destinationLocalHome)}/`;
-    const destinationFile = provider === 'claude'
-      ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
-      : `${destinationPrefix}sessions/forked/${path.posix.basename(sourceFile)}`;
-    await destination.writeFileBuffer(destinationFile, await source.readFileBuffer(sourceFile));
-    const protectedFile = path.posix.join(destination.handle.root, destinationFile);
-    const chmod = await destination.exec('chmod', ['600', protectedFile]);
-    return chmod.code === 0;
+    for (const entry of pending.reverse()) {
+      const destinationFile = provider === 'claude'
+        ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
+        : `${destinationPrefix}sessions/forked/${path.posix.basename(entry.file)}`;
+      await destination.writeFileBuffer(destinationFile, entry.content);
+      const protectedFile = path.posix.join(destination.handle.root, destinationFile);
+      const chmod = await destination.exec('chmod', ['600', protectedFile]);
+      if (chmod.code !== 0) return false;
+    }
+    return true;
   } catch { return false; }
 }
 
