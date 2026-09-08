@@ -505,7 +505,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 
     expect(world.requests.some((request) => request.method === method)).toBe(true);
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
-    const rollout = world.files.get(`${remoteHome}/sessions/2026/07/19/rollout-${session}.jsonl`)!.toString();
+    const original = fs.readFileSync(path.join(directory, `rollout-${session}.jsonl`));
+    expect(world.files.get(`${remoteHome}/sessions/2026/07/19/rollout-${session}.jsonl`)).toEqual(original);
+    const prepared = world.requests.find((request) => request.method === method).params.threadId;
+    expect(prepared).not.toBe(session);
+    const rollout = world.files.get([...world.files.keys()].find((file) => file.endsWith(`${prepared}.jsonl`))!)!.toString();
     const metadata = JSON.parse(rollout.split('\n')[0]!);
     expect(metadata.payload.dynamic_tools).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'function', name: 'list_events' }),

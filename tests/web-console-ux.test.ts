@@ -191,18 +191,18 @@ describe('manual PR opening', () => {
     };
     const action = { name: 'openPr', label: 'Open PR' };
 
-    expect(helpers.taskActionLabel({ stage: 'escalated' }, { ...action, label: 'Commit changes and open PR' }))
-      .toBe('Commit changes and open PR');
-    expect(helpers.taskActionLabel({}, action)).toBe('Manually Open PR');
-    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Return to Review');
-    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually Open PR');
+    expect(helpers.taskActionLabel({ stage: 'escalated' }, { ...action, label: 'Commit changes, open & confirm PR' }))
+      .toBe('Commit changes, open & confirm PR');
+    expect(helpers.taskActionLabel({}, action)).toBe('Manually Open & Confirm PR');
+    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Return to Review & Confirm');
+    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually Open & Confirm PR');
     expect(helpers.hasOpenPullRequest({ prs: [{ state: 'open', merged: true }] })).toBe(false);
   });
 
   it('confirms the context-specific action before signaling it', () => {
-    expect(app).toContain('Are you sure the agent\'s work here is complete? You could cancel and ask the agent to open the PR itself.');
-    expect(app).toContain('Commit all preserved changes and open the PR for review?');
-    expect(app).toContain('Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.');
+    expect(app).toContain('Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.');
+    expect(app).toContain('Commit all preserved changes, open the PR, and confirm it if you are authorized?');
+    expect(app).toContain('Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.');
     expect(handlerAfter('function wireActions(v)')).toContain('if (!confirmTaskAction(act, v)) return;');
     expect(handlerAfter('async function runDeclaredAction(a)')).toContain('if (!confirmTaskAction(a.name, S.view)) return;');
   });

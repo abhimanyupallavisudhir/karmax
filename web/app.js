@@ -9541,9 +9541,9 @@ function hasOpenPullRequest(v) {
 }
 
 function taskActionLabel(v, action) {
-  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open PR';
+  if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open & Confirm PR';
   if (action.name === 'openPr')
-    return hasOpenPullRequest(v) ? 'Return to Review' : 'Manually Open PR';
+    return hasOpenPullRequest(v) ? 'Return to Review & Confirm' : 'Manually Open & Confirm PR';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
     return 'Authorize GitHub merge';
   return action.label || action.name;
@@ -9586,16 +9586,16 @@ function taskActions(v) {
  * both toasted "Confirmed", contradicting the button the user had just clicked.
  */
 function actionToast(signal, label) {
-  const standard = { confirm: 'confirm', openPr: 'manually open pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
-  if (signal === 'openPr' && text.toLowerCase() === 'return to review') return 'Returning to Review';
+  if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 
-const MANUAL_OPEN_PR_CONFIRMATION = "Are you sure the agent's work here is complete? You could cancel and ask the agent to open the PR itself.";
-const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes and open the PR for review?';
-const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review? krmax will first verify that the current proposal is clean and committed.';
+const MANUAL_OPEN_PR_CONFIRMATION = "Open and confirm this proposal if you are authorized? Make sure the agent’s work is complete.";
+const ERROR_OPEN_PR_CONFIRMATION = 'Commit all preserved changes, open the PR, and confirm it if you are authorized?';
+const RETURN_TO_REVIEW_CONFIRMATION = 'Return this pull request to Review and confirm it if you are authorized? krmax will first verify that the current proposal is clean and committed.';
 
 function confirmTaskAction(action, v = S.view) {
   return action !== 'openPr' || confirm(v?.stage === 'escalated'

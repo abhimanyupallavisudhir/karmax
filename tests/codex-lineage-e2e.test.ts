@@ -135,10 +135,11 @@ it.each(['live source', 'deleted source'])('forks and resumes nested lineage wit
         expect(await materializeRemoteSession(from, destination, 'codex', parent, host)).toBe(true);
       }
       const home = await seedRemoteAgentHome(destination, 'codex', host, parent);
-      expect(await ensureRemoteCodexSessionTools(destination, home, parent, codexDynamicTools(true))).toBe(true);
+      const prepared = await ensureRemoteCodexSessionTools(destination, home, parent, codexDynamicTools(true));
+      expect(prepared).toBeTruthy();
       let child = '';
       await appServer(home.absolute, async (client) => {
-        child = (await client.request('thread/fork', { threadId: parent, cwd: destination.handle.root,
+        child = (await client.request('thread/fork', { threadId: prepared, cwd: destination.handle.root,
           developerInstructions: 'Continue the inherited conversation.', approvalPolicy: 'never', sandbox: 'danger-full-access' })).thread.id;
         await turn(client, child, `generation-${generation}-marker`);
         expect(requests.at(-1)).toContain('inherited-root-marker');
