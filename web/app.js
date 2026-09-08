@@ -3385,6 +3385,7 @@ const BRAND_ICON_CHOICES = [
   { id: 'check', label: 'Check' },
   { id: 'check-arrow', label: 'Check arrow' },
   { id: 'check-knot', label: 'Check knot' },
+  { id: 'check-knot-tilted', label: 'Tilted knot' },
   { id: 'clover', label: 'Clover' },
 ];
 
