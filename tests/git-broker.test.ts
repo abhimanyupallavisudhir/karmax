@@ -267,7 +267,10 @@ describe('cloud Git broker', () => {
       GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
       GIT_CONFIG_VALUE_0: 'git@example:',
     };
-    expect(await brokerPushBranches(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+    const observed: Record<string, string> = {};
+    const record = (repo: { name: string }, head: string) => { observed[repo.name] = head; };
+    expect(await brokerPublishBranch(world, env, observed, record)).toEqual({ pushed: ['source'], skipped: [] });
+    expect(observed).toEqual({ source: firstHead });
 
     // Model a repair rebase: replace the proposal commit instead of merging the
     // old task branch, making an ordinary push non-fast-forward by design.
@@ -280,8 +283,9 @@ describe('cloud Git broker', () => {
     expect(unleased.pushed).toEqual([]);
     expect(unleased.errors?.source).toMatch(/remote task branch non-fast-forward.*Reconnect GitHub will not fix/i);
     expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(firstHead);
-    expect(await brokerPushBranches(world, env, undefined, { source: firstHead }))
+    expect(await brokerPublishBranch(world, env, observed, record))
       .toEqual({ pushed: ['source'], skipped: [] });
+    expect(observed).toEqual({ source: repairedHead });
     expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
 
     // A stale lease cannot overwrite a newer writer.
@@ -293,6 +297,7 @@ describe('cloud Git broker', () => {
     expect(refused.pushed).toEqual([]);
     expect(refused.skipped).toEqual(['source']);
     expect(refused.errors?.source).toMatch(/remote task branch non-fast-forward.*Reconnect GitHub will not fix/i);
+    expect(observed).toEqual({ source: repairedHead });
     expect((await git(remote, ['rev-parse', 'refs/heads/karmax/lease-repair'])).stdout.trim()).toBe(repairedHead);
   });
 

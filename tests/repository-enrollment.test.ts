@@ -95,6 +95,15 @@ describe('live project repository enrollment', () => {
     expect(published.pushed).toEqual(['first', 'second', 'empty']);
     expect((await git(empty, ['rev-parse', '--verify', `refs/heads/${parent.handle.branch}`])).code).toBe(0);
 
+    // A collaboration publication can be amended before the first PR exists.
+    fs.writeFileSync(path.join(parentRepo.root, 'implementation.txt'), 'from parent, amended\n');
+    await gitOrThrow(parentRepo.root, ['add', '-A']);
+    await gitOrThrow(parentRepo.root, ['commit', '--amend', '--no-edit', '-q']);
+    const amendedHead = (await git(parentRepo.root, ['rev-parse', 'HEAD'])).stdout.trim();
+    expect((await api.publishTaskBranch(parentToken)).pushed).toEqual(published.pushed);
+    expect((await git(empty, ['rev-parse', `refs/heads/${parent.handle.branch}`])).stdout.trim()).toBe(amendedHead);
+    expect(store.eventsOfType(parentTask.id, 'push.head').at(-1)?.payload.headSha).toBe(amendedHead);
+
     const imported = await api.importTaskBranch(childToken, parentTask.id);
     expect(imported.refs).toEqual(expect.arrayContaining([
       expect.objectContaining({ repo: 'empty', branch: parent.handle.branch }),

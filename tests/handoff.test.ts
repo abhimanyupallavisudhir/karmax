@@ -198,6 +198,8 @@ describe('hosted/local Git handoff', () => {
     expect(result.command).toBe(`code --goto '${path.join(localRoot, task.id, 'app', 'cloud.txt')}:7'`);
     expect(result.materialized).toBe(true);
     expect(fs.readFileSync(result.path, 'utf8')).toBe('from E2B\n');
+    expect(store.eventsOfType(task.id, 'push.head').at(-1)?.payload.headSha)
+      .toBe((await git(cloud, ['rev-parse', 'HEAD'])).stdout.trim());
     expect(store.eventsSince(task.id, 0).some((event) => event.type === 'push.branch')).toBe(true);
 
     const portable = new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
