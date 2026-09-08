@@ -12,6 +12,8 @@ export interface HostedOnboardingFacts {
 export interface HostedOnboardingRecord {
   display: HostedOnboardingDisplay;
   completedAt?: number;
+  /** Operator-requested replay stays visible until the user selects Done. */
+  replay?: boolean;
 }
 
 export const hostedOnboardingKey = (userId: string, organizationId: string) =>
@@ -22,6 +24,7 @@ export function parseHostedOnboardingRecord(raw: string | undefined): HostedOnbo
   try {
     const value = JSON.parse(raw) as Partial<HostedOnboardingRecord>;
     return {
+      ...(value.replay === true ? { replay: true } : {}),
       display: value.display === 'minimized' ? 'minimized' : 'expanded',
       ...(Number.isFinite(value.completedAt) ? { completedAt: Number(value.completedAt) } : {}),
     };
@@ -37,12 +40,13 @@ export function hostedOnboardingStatus(input: {
   facts: HostedOnboardingFacts;
 }) {
   const requiredComplete = input.facts.github && input.facts.agentLogin && input.facts.e2b && input.facts.project;
-  const complete = Boolean(input.record?.completedAt) || requiredComplete;
+  const complete = Boolean(input.record?.completedAt) || (requiredComplete && !input.record?.replay);
   return {
     organizationId: input.organizationId,
     eligible: input.hosted && Boolean(input.record),
     visible: input.hosted && Boolean(input.record) && !complete,
     complete,
+    replay: input.record?.replay === true,
     display: input.record?.display ?? 'expanded' as HostedOnboardingDisplay,
     completedRequired: [input.facts.github, input.facts.agentLogin, input.facts.e2b, input.facts.project]
       .filter(Boolean).length,
