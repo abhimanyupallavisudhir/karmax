@@ -134,7 +134,7 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     try {
       await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx);
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
-      expect(sdkState.options.getOAuthToken).toBeTypeOf('function');
+      expect(sdkState.options).not.toHaveProperty('getOAuthToken');
       expect(sdkState.options.mcpServers.karmax).toBeUndefined();
       expect(sdkState.options.mcpServers.karmax_control.tools.map((tool: any) => tool.name))
         .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'propose_project_resource']));
