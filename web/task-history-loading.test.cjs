@@ -94,11 +94,12 @@ async function main() {
   assert.equal(c.S.taskHistoryLoading, false);
   assert.ok(c.S.taskEvents.length, 'a failed reload preserves already visible conversation');
 
-  let backfills = 0;
+  let backfills = 0, inboxReloads = 0;
   Object.assign(c, {
     location: { protocol: 'https:', host: 'example.test' },
     WebSocket: function () {}, setWsOnline() {}, checkConsoleRevision() {},
     refreshTasks: async () => {}, refreshTask: async () => {},
+    loadInbox: async () => { inboxReloads++; },
     refreshTaskHistory: async id => { assert.equal(id, 'task'); backfills++; },
     wsHadDropped: true,
   });
@@ -106,8 +107,10 @@ async function main() {
   c.connectWs();
   c.S.ws.onopen();
   assert.equal(backfills, 1, 'reconnect reloads missed conversation events');
+  assert.equal(inboxReloads, 1, 'reconnect reloads missed inbox notifications');
   c.S.ws.onopen();
   assert.equal(backfills, 1, 'ordinary connection open does not reload history');
+  assert.equal(inboxReloads, 1, 'ordinary connection open does not reload the inbox');
   console.log('Task history loading, request races, errors, and reconnect backfill passed');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
