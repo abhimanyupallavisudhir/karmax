@@ -5482,7 +5482,7 @@ function taskFormLoadingPage(project, draft) {
 // form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
 let activeFormToken = null;
 let activeTaskFormKeyController = null;
-async function openTaskForm(workflow, draft, seedText) {
+async function openTaskForm(workflow, draft, seedText, seedParams) {
   activeTaskFormKeyController?.abort();
   activeTaskFormKeyController = null;
   const formToken = (activeFormToken = {});
@@ -5497,7 +5497,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // own box; only fall back to a standalone "Images" section if there isn't one.
   const cf = consumingField(fields);
   const promptField = cf && cf.type === 'text' ? cf : null;
-  const values = draft ? { ...draft.params } : {};
+  const values = draft ? { ...draft.params } : { ...seedParams };
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = !!draft?.params?.repeatable; // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
@@ -7981,6 +7981,7 @@ function conversationPane(v, t) {
       <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
       <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
+      <button class="btn sm" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">⑂ Fork</button>
       ${copy}
     </div>
     <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}${request}</div></div>
@@ -8449,6 +8450,11 @@ function wireCheckinSidebar(v) {
       selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#fork-task-agent')?.addEventListener('click', (event) => {
+    openTaskForm('software-dev', undefined, undefined, {
+      'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
+    });
+  });
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
