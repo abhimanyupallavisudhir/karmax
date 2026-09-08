@@ -1735,6 +1735,8 @@ export class Gateway {
           const b = await this.body(req);
           const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
           record = { ...record, display };
+          if (b.finishReplay === true && record.replay)
+            record = { display, completedAt: Date.now() };
           store.kvSet(key, JSON.stringify(record));
         }
         const credentials = enumerateCredentials(gatherCredentialSources({
@@ -2585,6 +2587,19 @@ export class Gateway {
         const user = await this.deps.identity.createUser({ name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') });
         if (b.profileId) this.deps.authorization?.grant(`user:${subject.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
         return this.json(res, 200, user);
+      }
+      const resetOnboarding = p.match(/^\/api\/users\/([^/]+)\/onboarding\/reset$/);
+      if (resetOnboarding && method === 'POST') {
+        requireInteractiveHuman(callerIdentity);
+        if (!this.deps.hosted)
+          return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
+        const userId = resetOnboarding[1]!;
+        if (!this.deps.identity?.listUsers().some((user) => user.id === userId))
+          return this.json(res, 404, { error: 'user not found' });
+        // Only presentation state changes. Live setup facts and user work remain intact.
+        for (const organization of store.listOrganizations(userId))
+          store.kvSet(hostedOnboardingKey(userId, organization.id), JSON.stringify({ display: 'expanded', replay: true }));
+        return this.json(res, 200, { ok: true });
       }
       const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
       if (userMatch && method === 'DELETE') {

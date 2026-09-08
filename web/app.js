@@ -3408,11 +3408,11 @@ async function refreshOnboarding() {
   renderOnboarding();
 }
 
-async function setOnboardingDisplay(display) {
+async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
   try {
     S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
-      method: 'PUT', body: JSON.stringify({ display }),
+      method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
@@ -3470,8 +3470,9 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot"><span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
   </section>`;
+  $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-minimize-foot')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
   $('#onboarding-new-project')?.addEventListener('click', newProject);
@@ -15004,6 +15005,23 @@ async function wireInstallationGithubCard() {
     </div>`;
 }
 
+async function wireInstallationUsers() {
+  const box = $('#installation-users-card');
+  if (!box) return;
+  try {
+    const users = await api('/api/users');
+    box.innerHTML = `<p class="task-sub">Show the setup walkthrough again in each of a user's organizations. Existing work and connections are preserved.</p>${users.map((user) => `<div class="form-row"><span>${esc(user.name)} · ${esc(user.email)}</span><button class="btn sm" data-reset-onboarding="${esc(user.id)}">Reset walkthrough</button></div>`).join('')}`;
+    box.querySelectorAll('[data-reset-onboarding]').forEach((button) => button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        await api(`/api/users/${encodeURIComponent(button.dataset.resetOnboarding)}/onboarding/reset`, { method: 'POST' });
+        toast('Walkthrough reset. The user will see it when they next open their workspace.');
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    }));
+  } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
+}
+
 function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
@@ -15015,7 +15033,7 @@ function installationView() {
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      <a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
+      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a><a href="#installation-recovery">Recovery</a>
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
@@ -15024,6 +15042,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
+      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>Reset the setup walkthrough for any account</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
       <div class="settings-section-title" id="installation-recovery"><div>Recovery<small>Return the whole installation to bundled behavior</small></div></div><div class="card" id="resilience-card" hidden></div>
     </div>
   </div></div>`;
@@ -15138,6 +15157,7 @@ async function hydrateOrganizationSubscription(organizationId) {
 }
 
 function wireInstallationSettings() {
+  wireInstallationUsers();
   wireSettingsNavigation();
   wireAppearanceCard();
   wireHostCapacityCard();

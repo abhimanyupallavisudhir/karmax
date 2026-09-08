@@ -66,7 +66,7 @@ async function boot(hosted: boolean) {
     },
   );
   const request = (method = 'GET', body?: object) => onboarding('org_personal', method, body);
-  return { store, broker, providers, request, onboarding, base: running.url, cookie };
+  return { store, identity, broker, providers, request, onboarding, base: running.url, cookie };
 }
 
 describe('hosted onboarding status API', () => {
@@ -105,6 +105,55 @@ describe('hosted onboarding status API', () => {
       label: 'Workspace card', cap: 10_000, available: 10_000, createdAt: Date.now() });
     const withOptional = await (await request()).json() as any;
     expect(withOptional.steps.optional).toMatchObject({ complete: true, blocking: false, vault: true, card: true });
+  });
+
+  it('lets an operator replay a completed user’s guide without changing their work', async () => {
+    const { store, identity, broker, providers, request, base, cookie } = await boot(true);
+    const userId = identity.listUsers()[0]!.id;
+    store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
+      installationId: 'keep-installation', accountLogin: 'alice', accountType: 'User' });
+    broker.registerHandle('openai:first', 'sk-test');
+    providers.save({ organizationId: 'org_personal', provider: 'e2b', apiKey: 'e2b-test' });
+    const project = store.createProject('Keep my work', {}, 'org_personal');
+    expect(await (await request()).json()).toMatchObject({ complete: true, visible: false });
+    const reset = (id: string) => fetch(`${base}/api/users/${id}/onboarding/reset`, {
+      method: 'POST', headers: { cookie },
+    });
+    const other = await identity.createUser({ name: 'Other', email: 'other@example.com', password: 'long-enough-password' });
+    const untouchedKey = `hosted:onboarding:${other.id}:org_personal`;
+    store.kvSet(untouchedKey, JSON.stringify({ display: 'minimized', completedAt: 123 }));
+    expect((await reset('missing')).status).toBe(404);
+    expect((await reset(userId)).status).toBe(200);
+    for (let i = 0; i < 2; i++)
+      expect(await (await request()).json()).toMatchObject({ complete: false, visible: true,
+        replay: true, display: 'expanded', completedRequired: 4 });
+    expect(store.kvGet(untouchedKey)).toBe(JSON.stringify({ display: 'minimized', completedAt: 123 }));
+    expect(store.listProjects()).toContainEqual(project);
+    expect(store.listGitConnections('org_personal')[0]!.installationId).toBe('keep-installation');
+    expect(await (await request('PUT', { display: 'minimized' })).json())
+      .toMatchObject({ replay: true, visible: true, display: 'minimized' });
+    expect(await (await request('PUT', { finishReplay: true })).json())
+      .toMatchObject({ replay: false, complete: true, visible: false });
+  });
+
+  it('refuses walkthrough resets from an ordinary account', async () => {
+    const { identity, base, store } = await boot(true);
+    const target = identity.listUsers()[0]!.id;
+    await identity.createUser({ name: 'Bob', email: 'bob@example.com', password: 'long-enough-password' });
+    const login = await fetch(`${base}/api/auth/sign-in/email`, {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ email: 'bob@example.com', password: 'long-enough-password' }),
+    });
+    expect(login.status).toBe(200);
+    const bobCookie = login.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
+    expect(bobCookie).not.toBe('');
+    const key = `hosted:onboarding:${target}:org_personal`;
+    const before = store.kvGet(key);
+    const denied = await fetch(`${base}/api/users/${target}/onboarding/reset`, {
+      method: 'POST', headers: { cookie: bobCookie },
+    });
+    expect(denied.status).toBe(403);
+    expect(store.kvGet(key)).toBe(before);
   });
 
   it('never enrolls a self-hosted account into the hosted walkthrough', async () => {
