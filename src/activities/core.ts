@@ -86,6 +86,7 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
+import type { ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
 import { syncLocalTarget, type LocalTargetSyncResult } from '../world/target-sync.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
@@ -985,6 +986,52 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       record(args.taskId, 'world.provisioning', { provider: args.kind });
       const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const project = projectId ? store.getProject(projectId) : undefined;
+      const forkPlan = store.getTask(args.taskId)?.params._forkWorld as ForkWorldSource | undefined;
+      const forkSource = forkPlan && forkPlan.base === args.base ? forkPlan : undefined;
+      let forkCheckpoint: import('../domain/types.js').WorldCheckpoint | undefined;
+      if (forkSource) {
+        const sourceTask = store.getTask(forkSource.taskId);
+        if (!sourceTask || sourceTask.projectId !== projectId)
+          throw new Error('fork world does not belong to this project');
+        if (forkSource.unpublished) {
+          if (!deps.checkpoints) throw new Error('world checkpoints are required to fork unpublished work');
+          const saved = store.kvGet(`fork-checkpoint:${args.taskId}`);
+          if (saved) forkCheckpoint = store.getWorldCheckpoint(saved);
+          if (!forkCheckpoint) {
+            // Wait for an idle source, including workflow-owned Git operations.
+            // A gap between two agent turns is not an idle world.
+            const sourceBusy = () => {
+              const view = store.getTask(forkSource.taskId)?.lastView;
+              if (view && ['done', 'cancelled', 'failed'].includes(view.status)) return false;
+              return view?.status === 'active' || Boolean(view?.agentTurn);
+            };
+            if (sourceBusy()) record(args.taskId, 'world.fork-waiting', { sourceTaskId: forkSource.taskId });
+            while (sourceBusy()) {
+              let context: ReturnType<typeof activityContext.current> | undefined;
+              try { context = activityContext.current(); } catch { /* direct activity test */ }
+              context?.cancellationSignal.throwIfAborted();
+              context?.heartbeat({ waitingFor: 'fork-source', taskId: forkSource.taskId });
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+            const source = store.currentWorld(forkSource.taskId) as WorldHandle | undefined;
+            if (!source) throw new Error('source world is unavailable; choose another starting branch to fork only the conversation');
+            const state = await worlds.status(source);
+            if (state !== 'ready' && source.checkpointId)
+              forkCheckpoint = store.getWorldCheckpoint(source.checkpointId);
+            if (!forkCheckpoint) {
+              const sourceWorld = await openWorld(source, source.id);
+              if (isRemote(source.kind)) {
+                const pushed = await publishTaskBranch(sourceWorld, source.id);
+                if (pushed.skipped.length) throw new Error(`could not persist fork branch: ${describePublishFailures(pushed)}`);
+              }
+              forkCheckpoint = await deps.checkpoints.checkpoint(sourceWorld.handle, { scrubSecrets: false });
+            }
+            store.kvSet(`fork-checkpoint:${args.taskId}`, forkCheckpoint.id);
+          }
+          if (forkCheckpoint.worldId !== forkSource.taskId || forkCheckpoint.projectId !== projectId)
+            throw new Error('fork checkpoint does not belong to the source task');
+        }
+      }
       const organizationId = project?.organizationId ?? 'org_personal';
       // Resolve the human creator's profile. A tenant-wide identity is only valid
       // for a system-created task with no human ancestor.
@@ -1093,6 +1140,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
         base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
       };
+      if (forkSource) {
+        for (const [index, source] of worldSources.entries()) {
+          const saved = forkSource.repos.find((repo) => sameRepository(repo.source, source)
+            || sameRepository(repo.source, transportSources[index]!));
+          if (saved) repositoryBranches[source] = { base: saved.base,
+            target: typeof taskRecord?.params.target === 'string' ? args.target || args.base
+              : saved.target || args.target || args.base };
+        }
+      }
       if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const httpsTokens: Record<string, string> = {};
@@ -1124,7 +1180,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
       }
       const environmentSelection = projectId
-        ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
+        ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment)
         : { built: false, environment: executionConfig?.environment };
       let activitySignal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
@@ -1200,12 +1256,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        if (forkCheckpoint) {
+          await deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!);
+          if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
+            world.handle.warnings = [...(world.handle.warnings ?? []),
+              'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
+        }
         if (projectId && deps.resources) {
-          world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
+          const revisions = Object.fromEntries((forkCheckpoint?.resources ?? [])
+            .map((resource) => [resource.attachmentId, resource.revisionId]));
+          world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation, revisions);
         }
         if (projectId) {
           const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
-            selection: environmentSelection, resources: deps.resources, runSetupIfUnbuilt: true });
+            selection: environmentSelection, resources: deps.resources, services: forkCheckpoint?.services, runSetupIfUnbuilt: true });
           world.handle = runtime.handle;
           for (const warning of runtime.warnings) record(args.taskId, 'world.warning', { warning });
         }
@@ -1237,11 +1301,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }) as WorldHandle;
         }
         record(args.taskId, 'world.created', { handle: world.handle });
+        if (forkPlan) record(args.taskId, 'world.forked', { sourceTaskId: forkPlan.taskId,
+          base: args.base, checkpointId: forkCheckpoint?.id, unpublished: Boolean(forkCheckpoint) });
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
       } catch (error) {
         // `world` is still live on this path — pass it, or teardown addresses the
         // HOST daemon while the containers live inside the world (a silent no-op).
+        await deps.resources?.release(world.handle).catch(() => undefined);
         await destroyWorldServices(args.taskId, world).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
@@ -1867,12 +1934,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const promptTask = liveTarget && liveTarget !== args.task.target
         ? { ...args.task, target: liveTarget }
         : args.task;
+      const forkOrigin = store.getTask(args.taskId)?.params._forkWorld as ForkWorldSource | undefined;
+      const forkContext = forkOrigin ? `\n\nThis task forks the conversation of ${forkOrigin.taskId}. Starting branch: ${args.task.base}. `
+        + (forkOrigin.base !== args.task.base
+          ? 'The starting branch was changed. This world uses normal project initialization; the source task’s unpublished files and private resource snapshots were not copied. Verify remembered work against the files present here.'
+          : forkOrigin.unpublished
+            ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
+            : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
         world: args.worldHandle,
-        globalInstructions,
+        globalInstructions: globalInstructions + forkContext,
         projectInstructions,
         bindings,
       });

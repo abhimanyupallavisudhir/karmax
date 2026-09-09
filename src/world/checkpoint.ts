@@ -69,7 +69,7 @@ export class WorldCheckpointService {
     this.runners = runners ?? new RunnerPoolService(store);
   }
 
-  async checkpoint(handleInput: WorldHandleRef): Promise<WorldCheckpoint> {
+  async checkpoint(handleInput: WorldHandleRef, options: { scrubSecrets?: boolean } = {}): Promise<WorldCheckpoint> {
     const handle = (this.store.currentWorld(handleInput.id) ?? handleInput) as WorldHandle;
     this.store.assertCurrentWorld(handle);
     const projectId = String(handle.meta?.projectId ?? '');
@@ -88,7 +88,7 @@ export class WorldCheckpointService {
       ? handle.meta.ephemeralPaths.filter((value): value is string => typeof value === 'string')
       : []);
     for (const repo of worldRepos(world.handle)) {
-      const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
+      const status = await world.exec('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
@@ -112,6 +112,16 @@ export class WorldCheckpointService {
         base: repo.base, ...(repo.target ? { target: repo.target } : {}),
         ...(repo.targetPinned !== undefined ? { targetPinned: repo.targetPinned } : {}),
         ...(repo.role ? { role: repo.role } : {}) });
+    }
+    // A repositoryless task still owns ordinary output files. Resource-backed
+    // paths have their own revisions; injected credentials are never outputs.
+    if (!worldRepos(world.handle).length) {
+      for (const file of await world.listFiles()) {
+        if (!safeDeltaPath(file) || file === '.env' || file.startsWith('.karmax-injection/')
+          || ephemeralPaths.has(file)
+          || resourcePaths.some((target) => target === '.' || file === target || file.startsWith(`${target}/`))) continue;
+        files.push({ repo: '', path: file, data: (await world.readFileBuffer(file)).toString('base64') });
+      }
     }
     const delta: PortableDelta = { version: 1, files };
     const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
@@ -145,7 +155,7 @@ export class WorldCheckpointService {
       fundingSource: 'managed',
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
       metadata: { checkpointId, generation: checkpoint.generation } });
-    await this.resources?.scrubSecrets(handle);
+    if (options.scrubSecrets !== false) await this.resources?.scrubSecrets(handle);
     return checkpoint;
   }
 
@@ -278,6 +288,47 @@ export class WorldCheckpointService {
       await world.destroy().catch(() => undefined);
       if (acquired) this.runners.release(acquired.leaseId, selected);
       throw error;
+    }
+  }
+
+  /** Apply saved work to a freshly provisioned, independent task. Never registers
+   * a new generation of the source world or reuses its branches/resource leases. */
+  async applyFork(checkpointId: string, world: World, projectId: string): Promise<void> {
+    const checkpoint = this.store.getWorldCheckpoint(checkpointId);
+    if (!checkpoint?.filesystemDelta || checkpoint.projectId !== projectId)
+      throw new Error('fork checkpoint is unavailable in this project');
+    if (checkpoint.worldId === world.handle.id) throw new Error('fork requires an independent world');
+    const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
+    if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
+    const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
+    if (delta.version !== 1) throw new Error('unsupported checkpoint delta version');
+    const destinations = new Map<string, WorldRepo>();
+    for (const repo of checkpoint.repos) {
+      const destination = worldRepos(world.handle).find((candidate) =>
+        repo.source && sameRepository(worldRepoSource(candidate), repo.source)
+        && (repo.checkoutPath === '.' || candidate.name === repo.checkoutPath));
+      if (!destination || !repo.headSha) throw new Error(`fork checkout is unavailable: ${repo.checkoutPath}`);
+      if (destination.branch === repo.branch) throw new Error('fork cannot reuse a source branch');
+      const reset = await world.exec('git', ['reset', '--hard', repo.headSha], { cwd: destination.root });
+      if (reset.code !== 0) throw new Error(`fork commit ${repo.headSha} is unavailable: ${reset.stderr}`);
+      destination.baseSha = repo.headSha;
+      destinations.set(repo.checkoutPath === '.' ? worldRepos(world.handle)[0]!.name : repo.checkoutPath, destination);
+      // Single-repo legacy deltas store the checkout name even though the manifest says '.'.
+      if (checkpoint.repos.length === 1) for (const file of delta.files) destinations.set(file.repo, destination);
+    }
+    for (const file of delta.files) {
+      const repo = destinations.get(file.repo);
+      const plain = checkpoint.repos.length === 0 && file.repo === '' && worldRepos(world.handle).length === 0;
+      if ((!repo && !plain) || !safeDeltaPath(file.path)) throw new Error('invalid fork delta path');
+      const relative = worldRepos(world.handle).length > 1 ? `${repo!.name}/${file.path}` : file.path;
+      if (file.deleted) {
+        const removed = await world.exec('rm', ['-f', '--', file.path], { cwd: repo?.root ?? world.handle.root });
+        if (removed.code !== 0) throw new Error(`could not restore deletion: ${file.path}`);
+      } else {
+        const content = Buffer.from(file.data ?? '', 'base64');
+        if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
+        else await world.writeFile(relative, content.toString('utf8'));
+      }
     }
   }
 

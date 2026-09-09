@@ -573,12 +573,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'fork_agent',
-    description: 'Branch an attached agent into an independent new task/session, optionally with a different provider/model. The source remains untouched. reauthorize=true starts the fork with the grants the source task ended with (authorization level/scope and approved vault credentials), checked against your own authority.',
+    description: 'Branch an attached agent into an independent new task/session, optionally with a different provider/model. Defaults to the source task branch and unpublished checkpoint, or its merge target after landing. Set base to another branch for normal project initialization. The source remains untouched. reauthorize=true starts the fork with the grants the source task ended with (authorization level/scope and approved vault credentials), checked against your own authority.',
     parameters: {
       type: 'object',
       properties: {
         task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' },
-        target: { type: 'string' }, authorization_profile: { type: 'string' }, reauthorize: { type: 'boolean' },
+        base: { type: 'string', description: 'Starting branch; defaults to the source task branch, or its merge target after landing. Changing it excludes unpublished source state.' }, target: { type: 'string' }, authorization_profile: { type: 'string' }, reauthorize: { type: 'boolean' },
         provider: { type: 'string', enum: ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'] },
         model: { type: 'string' }, effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
       },
@@ -1174,7 +1174,7 @@ export function platformToolHandlers(
     async fork_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       return JSON.stringify(await platformRequest('POST', `/api/tasks/${taskId}/fork-agent`, {
-        role: args?.role ?? 'do', title: args?.title, message: args?.message, target: args?.target,
+        role: args?.role ?? 'do', title: args?.title, message: args?.message, base: args?.base, target: args?.target,
         authorizationProfile: args?.authorization_profile, reauthorize: args?.reauthorize === true,
         provider: args?.provider, model: args?.model, effort: args?.effort,
       }));

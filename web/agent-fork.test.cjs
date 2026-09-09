@@ -38,12 +38,32 @@ eval(extractFn('agentRoleLabel'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('renderAgentField'));
+eval(extractFn('forkBranchDefaults'));
+eval(extractFn('prefillForkBranch'));
+eval(extractFn('showForkWorldHelp'));
+eval(extractFn('collectForm'));
 eval(extractFn('readResume'));
 eval(extractFn('readAuthorizationEditor'));
 
 let pass = 0;
 let fail = 0;
 const ok = (condition, message) => condition ? pass++ : (fail++, console.error('FAIL:', message));
+
+ok(forkBranchDefaults({ lastView: { status: 'cancelled', branch: 'karmax/source', targetBranch: 'main' } }).base === 'karmax/source', 'cancelled forks default to the source branch');
+ok(forkBranchDefaults({ status: 'done', branch: 'karmax/source', targetBranch: 'release' }).base === 'release', 'landed forks default to their merge destination');
+ok(!forkBranchDefaults({}).base, 'a conversation without a branch keeps ordinary defaults');
+global.CSS = { escape: (value) => value };
+global.sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const baseInput = { value: 'main', getAttribute: () => '"main"' };
+const branchForm = { querySelector: (selector) => selector === '[data-field="base"]' ? baseInput : {} };
+ok(collectForm(branchForm, [{ name: 'base', type: 'branch' }]).base === 'main', 'changing a fork to the inherited base remains an explicit branch choice');
+baseInput.value = '';
+ok(collectForm(branchForm, [{ name: 'base', type: 'branch' }]).base === 'main', 'clearing a fork base uses the inherited branch without reselecting the source branch');
+let branchChanges = 0;
+const forkBranchInput = { value: 'main', dispatchEvent: () => branchChanges++ };
+const forkForm = { querySelector: (selector) => selector === '[data-field="base"]' ? forkBranchInput : {} };
+prefillForkBranch({ dataset: { agent: 'do' }, closest: () => forkForm }, { lastView: { status: 'waiting', branch: 'karmax/source' } });
+ok(forkBranchInput.value === 'karmax/source' && branchChanges === 1, 'picking a source fills the branch field and announces the change');
 
 const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
@@ -126,6 +146,7 @@ const hostRoot = { dataset: {}, querySelectorAll: () => [], addEventListener(typ
 let hostAttached = false;
 const dispatched = [];
 const box = {
+  dataset: { agent: 'do' },
   querySelector(selector) {
     return {
       '.af-model-combo': null, '.af-provider': provider, '.af-model': model,
