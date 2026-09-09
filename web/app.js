@@ -1042,6 +1042,34 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
+function forkBranchDefaults(task) {
+  const view = task?.lastView || task;
+  const base = view?.status === 'done' ? view.targetBranch || task?.params?.target : view?.branch;
+  return base ? { base } : {};
+}
+
+function prefillForkBranch(box, task) {
+  if (!['do', 'unified'].includes(box.dataset.agent)) return;
+  const root = box.closest('#tf-body');
+  const input = root?.querySelector('[data-field="base"]');
+  const base = forkBranchDefaults(task).base;
+  if (!input || !base || (task.projectId && task.projectId !== S.projectId)) return;
+  input.value = base;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  showForkWorldHelp(root);
+}
+
+function showForkWorldHelp(root) {
+  const input = root?.querySelector('[data-field="base"]');
+  if (!input) return;
+  if (!root.querySelector('.fork-world-help')) {
+    const help = document.createElement('p');
+    help.className = 'task-sub fork-world-help';
+    help.textContent = 'Changing the starting branch excludes the original task’s unpublished files and resources.';
+    input.closest('.form-row')?.append(help);
+  }
+}
+
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
 // The task reference is a real permalink to the source (Ctrl/⌘-click opens it
@@ -1331,9 +1359,11 @@ function collectForm(root, fields) {
     else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
     else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
     else val = el.value === '' ? undefined : el.value;
+    const forkBase = f.name === 'base' && root.querySelector('.agent-field[data-agent="do"] .af-resume-enabled:checked, .agent-field[data-agent="unified"] .af-resume-enabled:checked');
+    if (forkBase && val === undefined) val = inh;
     if (val === undefined) continue;
     // store only when changed from the inherited default (required fields always)
-    if (f.required || !sameJson(val, inh)) out[f.name] = val;
+    if (forkBase || f.required || !sameJson(val, inh)) out[f.name] = val;
   }
   return out;
 }
@@ -1751,6 +1781,7 @@ function wireAgentBox(box) {
     chosen._sourceTask = rf ? task : undefined;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    if (rf && task) prefillForkBranch(box, task);
     syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -5792,6 +5823,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams) {
     wireWikiMention(contextTa, projectId);
   }
   paintFormChips();
+  if ((values['agent:do'] || values['agent:unified'])?.resumeFrom?.taskId) showForkWorldHelp($('#tf-body'));
   // Focus the consuming field (prompt/command) with the caret at the end, so
   // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
   // (the consuming field) is resolved once at the top of this function.
@@ -8524,6 +8556,7 @@ function wireCheckinSidebar(v) {
   );
   $('#fork-task-agent')?.addEventListener('click', (event) => {
     openTaskForm('software-dev', undefined, undefined, {
+      ...forkBranchDefaults(v),
       'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
     });
   });
