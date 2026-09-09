@@ -4512,6 +4512,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const key = lifecycleReplacementKey(taskId);
         if (lifecycleReplacementMatches(store.kvGet(key), runId)) return;
       }
+      // A replacement paused for human input first publishes its bootstrap
+      // frame, before setting waitingFor. That is not a real resumption: the
+      // humanPauseOrigin marker remains until the hold actually wakes. Publishing
+      // it deletes the live escalation and recreates it at normal urgency on the
+      // next frame (Task 201). It can also overwrite the platform's audience
+      // before task.escalated is routed. Suppress only this transient frame at
+      // the activity boundary so existing workflow histories receive the fix.
+      // Persist conversation snapshots above even for suppressed frames: the
+      // next publication may reference the same immutable snapshot.
+      if (view.state?.humanPauseOrigin && view.status === 'active' && !view.waitingFor) return;
       store.saveView(taskId, view);
       // Entering Merge is the logical commitment boundary. The SQLite compare-and-
       // set is the winner lease: exactly one attempt may get past this awaited
