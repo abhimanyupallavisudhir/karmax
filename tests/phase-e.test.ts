@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git, gitOrThrow, ensureIdentity, defaultBranch } from '../src/world/git.js';
 import { reconcileTasks } from '../src/platform/reconcile.js';
+import { WorkflowFailedError } from '@temporalio/client';
+import { TerminatedFailure } from '@temporalio/common';
 import { Store } from '../src/store/db.js';
 
 describe('defaultBranch detection', () => {
@@ -21,6 +23,28 @@ describe('defaultBranch detection', () => {
 });
 
 describe('reconcileTasks (settle lost workflows on restart)', () => {
+  it('preserves the server termination reason without fetching the full history', async () => {
+    const store = new Store(':memory:');
+    const p = store.createProject('P', {});
+    const t = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: 'x' } });
+    store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'merge', status: 'active',
+      messages: [], actions: [], state: {}, updatedAt: 0 });
+    const handles: (string | undefined)[] = [];
+    const client: any = { workflow: { getHandle: (_id: string, runId?: string) => {
+      handles.push(runId);
+      return {
+        describe: async () => ({ status: { name: 'TERMINATED' }, runId: 'terminated-run' }),
+        result: async () => { throw new WorkflowFailedError('Workflow execution failed',
+          new TerminatedFailure('Workflow history size exceeds limit.'), 'NON_RETRYABLE_FAILURE'); },
+      };
+    } } };
+    try {
+      expect((await reconcileTasks(store, client)).settled).toBe(1);
+      expect(handles).toEqual([undefined, 'terminated-run']);
+      expect(store.getTask(t.id)?.lastView?.error).toBe('workflow terminated: Workflow history size exceeds limit.');
+    } finally { store.close(); }
+  });
+
   it('marks a non-terminal task whose workflow is gone as failed', async () => {
     const store = new Store(':memory:');
     const p = store.createProject('P', {});
