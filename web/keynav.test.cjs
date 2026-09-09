@@ -253,7 +253,7 @@ global.S = { selected: 'one', view: {}, tab: 'tasks' };
 global.HOST_COMMANDS = [];
 global.inRail = () => false;
 global.openCursorRow = global.archiveCursorRow = () => {};
-let newAttempts = 0, taskMoves = 0, keydown;
+let newAttempts = 0, taskMoves = 0, attemptKeydown;
 global.openAdjacentTask = () => taskMoves++;
 const addAttempt = { disabled: false, click: () => newAttempts++ };
 let links = ['one', 'two', 'three'].map((id) => ({
@@ -268,12 +268,12 @@ global.$ = (selector) => {
 };
 global.document = {
   querySelectorAll: (selector) => selector === '[data-attempt-select]' ? links : [],
-  addEventListener: (name, handler) => { keydown = handler; },
+  addEventListener: (name, handler) => { attemptKeydown = handler; },
 };
 global.CHORD = { pending: [], timer: null };
 for (const name of ['cycleAttempt', 'allCommands', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
 bindKeys();
-const press = (key, typing = false) => keydown({
+const press = (key, typing = false) => attemptKeydown({
   ...ev(key), preventDefault() {},
   target: { matches: () => typing },
 });
