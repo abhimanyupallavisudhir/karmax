@@ -10,11 +10,11 @@ const LIMIT = 1600;
  * detail is a convenience, a durably archived secret is a breach.
  */
 const SECRET =
-  /token|secret|password|passphrase|authorization|api[-_]?key|cookie|credential|priv(?:ate)?[-_]?key|totp|(?:^|[^a-z])value(?:[^a-z]|$)/i;
+  /notes?|token|secret|password|passphrase|authorization|api[-_]?key|cookie|credential|priv(?:ate)?[-_]?key|totp|(?:^|[^a-z])value(?:[^a-z]|$)/i;
 
 /** Textual `key: value` / `key=value` pairs in a non-JSON string payload. */
 const SECRET_PAIR = new RegExp(
-  '("?)([A-Za-z0-9_.-]*(?:token|secret|password|passphrase|authorization|api[-_]?key|cookie|credential|priv(?:ate)?[-_]?key|totp|value)[A-Za-z0-9_.-]*)\\1\\s*([:=])\\s*("(?:[^"\\\\]|\\\\.)*"|[^\\s,;&}]+)',
+  '("?)([A-Za-z0-9_.-]*(?:notes?|token|secret|password|passphrase|authorization|api[-_]?key|cookie|credential|priv(?:ate)?[-_]?key|totp|value)[A-Za-z0-9_.-]*)\\1\\s*([:=])\\s*("(?:[^"\\\\]|\\\\.)*"|[^\\s,;&}]+)',
   'gi',
 );
 

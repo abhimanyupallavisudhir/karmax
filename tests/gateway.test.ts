@@ -1442,7 +1442,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, {
       method: 'POST', headers: auth(), body: JSON.stringify({
         type: 'login', label: 'Task-specific policy', domains: 'policy.example.com',
-        policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'task-secret' },
+        policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'task-secret', note: 'Username: administrator\nprivate recovery text' },
       }),
     })).json();
     const project: any = await (await fetch(`${base}/api/projects`, {
@@ -1466,6 +1466,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const asked: any = await (await fetch(`${base}/api/vault/resolve`, {
       method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }),
     })).json();
+    expect(JSON.stringify(asked)).not.toContain('private recovery text');
     expect(asked.status).toBe('needs_approval'); // task "ask" overrides global "never"
 
     const patched: any = await (await fetch(`${base}/api/tasks/${task.id}/authorization`, {
@@ -1478,7 +1479,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const revealed: any = await (await fetch(`${base}/api/vault/resolve`, {
       method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }),
     })).json();
-    expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret' });
+    expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret', notes: 'Username: administrator\nprivate recovery text' });
+    const explicit: any = await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, field: 'password' }),
+    })).json();
+    expect(explicit.value).toBe('task-secret');
+    expect(explicit.notes).toBeUndefined();
+    const notes: any = await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, field: 'note' }),
+    })).json();
+    expect(notes.value).toBe(revealed.notes);
   });
 
   it('changes a running task authorization + vault grants in-flight, freezes once terminal', async () => {

@@ -279,7 +279,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'get_credential',
     description:
-      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {
@@ -304,7 +304,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
         secrets: {
           type: 'object',
-          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI); api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
+          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI), note; api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
         },
       },
       required: ['type', 'label'],
