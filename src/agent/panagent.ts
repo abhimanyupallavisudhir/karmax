@@ -115,7 +115,8 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
         : path.join(temporary, safeSourceName(opts.source.name));
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });
     if (!('url' in opts.source)) {
-      const content = fs.readFileSync(source);
+      const raw = fs.readFileSync(source);
+      const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
       let first: any;
       try { first = JSON.parse(content.subarray(0, content.indexOf(10) < 0 ? content.length : content.indexOf(10)).toString()); }
       catch { /* Other formats are handled by panagent. */ }
