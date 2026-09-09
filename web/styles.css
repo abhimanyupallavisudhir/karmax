@@ -913,6 +913,9 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .msg-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
 .msg-meta-gap { flex: 1; }
 .msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; font-family: var(--font-mono); }
+.msg.input-request { background: var(--accent-weak); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); border-inline-start: 3px solid var(--accent); }
+.msg.input-request .msg-meta { margin-bottom: 7px; }
+.msg.input-request .role { color: var(--accent); font-weight: 600; opacity: 1; }
 .msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
 /* A little copy control per message — faint until the bubble is hovered. */
