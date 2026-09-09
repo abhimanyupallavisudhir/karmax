@@ -4742,8 +4742,8 @@ function openFilterPicker(fieldKey, onAdd) {
 // One full-featured task finder shared by every "pick a task" control: the same
 // query language, view chips and filter/group/sort toolbar as the task list, in
 // a modal with its OWN query state (the list's search is untouched). mode 'task'
-// picks a task row; mode 'agent' expands a clicked task into its resumable
-// per-role agent sessions and picks one → onPick({ task, role, session }).
+// picks a task row; mode 'agent' picks an unambiguous session directly or shows
+// attempts with compact agent choices → onPick({ task, role, session }).
 // `defaults` are the facets hidden unless the query mentions them (the list's
 // transparent -is:archived -is:run treatment, parameterized per caller — the
 // fork search deliberately keeps archived tasks in).
@@ -4767,12 +4767,15 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   </div></div>`;
   const search = $('#pk-search', host);
   const list = $('#pk-list', host);
-  const close = () => host.remove();
+  let closed = false;
+  let selection = 0; // ignore agent lookups after closing, searching or choosing another task
+  const close = () => { closed = true; selection++; host.remove(); };
   let q = '';
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
-  const sessions = new Map(); // taskId → role→session (agent mode, fetched on expand)
-  const expanded = new Set(); // taskIds whose sessions are shown
+  const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
+  const pending = new Map(); // share in-flight lookups on repeated clicks
+  const expanded = new Set(); // taskIds whose attempts are shown
 
   // View chips (All + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
@@ -4797,6 +4800,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
 
   let deb = null;
   const setQ = (nq, typing) => {
+    selection++;
     q = nq || '';
     if (search.value !== q) search.value = q;
     paintControls();
@@ -4828,19 +4832,14 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   };
 
   const sessionsHtml = (t) => {
-    const s = sessions.get(t.id);
-    if (!s) return `<div class="pk-empty">Loading agent sessions…</div>`;
-    const roles = Object.keys(s);
-    if (!roles.length) return `<div class="pk-empty">No earlier agent to continue from — this will start fresh.</div>`;
-    return roles
-      .map((role) => `<div class="pick-row pk-session" data-nav data-task="${t.id}" data-role="${esc(role)}">
-        <span class="pk-fork">⑂</span>
-        <div class="task-main">
-          <div class="task-title">${esc(agentRoleLabel(role))}</div>
-          <div class="task-sub">${s[role].provider ? `<span class="wf">${esc(s[role].provider)}</span>` : ''}<span class="mono">${esc(String(s[role].id || '').slice(0, 20))}…</span></div>
-        </div>
-      </div>`)
-      .join('');
+    const attempts = sessions.get(t.id) || [];
+    return attempts.map(({ task, sessions: agents }) => `<div class="pk-attempt">
+      <span class="pk-attempt-label">Attempt ${esc(task.attemptNumber || 1)}</span>
+      <div class="pk-agents">${Object.entries(agents).map(([role, session]) => `<button type="button" class="pick-row pk-agent" data-nav data-task="${esc(t.id)}" data-attempt="${esc(task.id)}" data-role="${esc(role)}"
+        title="${esc([agentRoleLabel(role), session.provider, session.model].filter(Boolean).join(' · '))}">
+        <span class="pk-fork">⑂</span><span>${esc(agentRoleLabel(role))}</span>${session.provider ? `<span class="wf">${esc(session.provider)}</span>` : ''}
+      </button>`).join('') || '<span class="pk-empty">No agent to fork yet. Choose another attempt or task.</span>'}</div>
+    </div>`).join('');
   };
 
   const navRows = () => [...list.querySelectorAll('[data-nav]')];
@@ -4867,28 +4866,52 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
 
   const activate = async (el) => {
     const tid = el.dataset.task;
-    const task = (result?.tasks || []).find((t) => t.id === tid);
-    if (el.dataset.role !== undefined) { // a session sub-row → the actual pick
-      onPick({ task, role: el.dataset.role, session: sessions.get(tid)?.[el.dataset.role] });
-      return close();
+    const task = (result?.tasks || []).find((t) => t.id === tid)
+      || result?.groups?.flatMap((g) => g.tasks).find((t) => t.id === tid);
+    if (!task || closed) return;
+    const request = ++selection;
+    if (el.dataset.role !== undefined) {
+      const attempt = sessions.get(tid)?.find((a) => a.task.id === el.dataset.attempt);
+      const session = attempt?.sessions[el.dataset.role];
+      if (!session) return;
+      close();
+      onPick({ task: attempt.task, role: el.dataset.role, session });
+      return;
     }
-    if (mode === 'task') { onPick(task); return close(); }
-    // Agent mode: fetch on the first click. A task with one resumable agent is
-    // unambiguous, so pick it immediately; only zero/multiple-agent tasks need
-    // the expanded detail list.
+    if (mode === 'task') { close(); onPick(task); return; }
     if (expanded.has(tid)) { expanded.delete(tid); return paintList(); }
-    expanded.add(tid);
+    // Keep the task row collapsed until all attempts are known. In particular,
+    // a single agent must never briefly open a loading menu before being picked.
     if (!sessions.has(tid)) {
-      paintList(); // shows "Loading…" while the fetch is in flight
-      sessions.set(tid, await api(`/api/tasks/${tid}/sessions`).catch(() => ({})));
+      if (!pending.has(tid)) pending.set(tid, (async () => {
+        const group = await api(`/api/tasks/${tid}/attempts`);
+        const attempts = group?.attempts?.length ? group.attempts : [task];
+        return Promise.all(attempts.map(async (attempt) => ({
+          task: attempt,
+          sessions: await api(`/api/tasks/${attempt.id}/sessions`),
+        })));
+      })());
+      el.setAttribute('aria-busy', 'true');
+      try {
+        sessions.set(tid, await pending.get(tid));
+      } catch (error) {
+        if (!closed && request === selection) toast(`Could not load agents: ${error.message}`, true);
+        return;
+      } finally {
+        pending.delete(tid);
+        el.removeAttribute('aria-busy');
+      }
     }
-    const sourceSessions = sessions.get(tid) || {};
-    const roles = Object.keys(sourceSessions);
+    if (closed || request !== selection) return;
+    const attempts = sessions.get(tid);
+    const roles = attempts.length === 1 ? Object.keys(attempts[0].sessions) : [];
     if (roles.length === 1) {
       const role = roles[0];
-      onPick({ task, role, session: sourceSessions[role] });
-      return close();
+      close();
+      onPick({ task: attempts[0].task, role, session: attempts[0].sessions[role] });
+      return;
     }
+    expanded.add(tid);
     paintList();
   };
 
@@ -4898,6 +4921,9 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, navRows().length - 1); paintHi(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(hi - 1, 0); paintHi(); }
     else if (e.key === 'Enter') { e.preventDefault(); const r = navRows()[hi]; if (r) activate(r); }
+  });
+  host.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
   });
   $('#pk-scrim', host).addEventListener('click', (e) => { if (e.target.id === 'pk-scrim') close(); });
   $('#pk-close', host).addEventListener('click', close);

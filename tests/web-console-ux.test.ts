@@ -315,7 +315,7 @@ describe('copy', () => {
   });
 
   it('points empty states at their next action', () => {
-    expect(app).toContain('No earlier agent to continue from — this will start fresh.');
+    expect(app).toContain('No agent to fork yet. Choose another attempt or task.');
     expect(app).toContain('No vault items yet. Add one in ');
     expect(app).toContain('No tags yet. Create one with the 🏷 Tags button.');
   });
