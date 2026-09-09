@@ -3533,7 +3533,7 @@ function renderOnboarding() {
   const settings = globalRoute('organization');
   const optional = state.steps.optional || {};
   host.innerHTML = `<section class="onboarding-card" aria-labelledby="onboarding-title">
-    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Get ${siteNameMarkup()} ready</h2></div>
+    <div class="onboarding-head"><div><span class="onboarding-eyebrow">Workspace setup</span><h2 id="onboarding-title">Set up ${siteNameMarkup()}</h2></div>
       <button class="icon-btn onboarding-dismiss" id="onboarding-minimize" type="button" aria-label="Minimize setup guide" title="Minimize">×</button></div>
     <div class="onboarding-progress" role="progressbar" aria-valuemin="0" aria-valuemax="${state.totalRequired}" aria-valuenow="${state.completedRequired}" aria-label="${state.completedRequired} of ${state.totalRequired} required setup steps complete"><span style="width:${Math.round(state.completedRequired / state.totalRequired * 100)}%"></span></div>
     <p class="onboarding-intro">A few real connections turn this workspace into a place your agents can work.</p>
@@ -12485,8 +12485,8 @@ function renderPhoneAccess(status) {
     : status.state === 'conflict'
       ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
       : status.url
-    ? `<div class="phone-access-address"><span>Access your ${siteNameMarkup()} at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Access your ${siteNameMarkup()} at</span><b>Tailscale not set up</b></div>`;
+    ? `<div class="phone-access-address"><span>Open your ${siteNameMarkup()} workspace at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : `<div class="phone-access-address missing"><span>Open your ${siteNameMarkup()} workspace at</span><b>Tailscale not set up</b></div>`;
   const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private ${siteNameMarkup()} address shown here in your phone’s browser.</li>`;
   const recovery = ready
@@ -12506,7 +12506,7 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? `Why this ${siteName()} is not being served` : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? 'Why this workspace address is unavailable' : 'Set up instructions';
   const setupIntro = status.state === 'conflict'
     ? `<p>Tailscale is already configured on this computer; its address currently belongs to another local service or ${siteNameMarkup()} instance.</p>`
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
@@ -12679,7 +12679,7 @@ async function hydratePhoneAccess() {
     revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
     box.innerHTML = `<div class="phone-access-address missing">
-        <span>Access your ${siteNameMarkup()} at</span>
+        <span>Open your ${siteNameMarkup()} workspace at</span>
         <b>${disconnected ? `Could not reach ${siteNameMarkup()}` : 'Could not check Phone Access'}</b>
       </div>
       <div class="phone-setup-body">
