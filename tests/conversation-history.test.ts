@@ -137,8 +137,14 @@ describe('codex exec sends only the delta when resuming a thread', () => {
       msg('a0', 'agent', 'AGENT_REPLY'),
       msg('m1', 'user', 'FOLLOW_UP_MESSAGE'),
     ];
-    const argv = await argvFor({ profile, world, messages, session: 'th_prior', deliveredMessages: 2, systemPrompt: 'SYS', role: 'do', resolvedAuth: { configHome: dir } });
-    expect(argv.slice(0, 3)).toEqual(['exec', 'resume', 'th_prior']);
+    const id = '11111111-1111-4111-8111-111111111111';
+    const sessions = path.join(dir, 'sessions');
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(path.join(sessions, `rollout-2026-09-09T00-00-00-${id}.jsonl`), JSON.stringify({
+      ordinal: 0, type: 'session_meta', payload: { id, history_mode: 'paginated', timestamp: '2026-09-09T00:00:00Z' },
+    }) + '\n');
+    const argv = await argvFor({ profile, world, messages, session: '11111111-1111-4111-8111-111111111111', deliveredMessages: 2, systemPrompt: 'SYS', role: 'do', resolvedAuth: { configHome: dir } });
+    expect(argv.slice(0, 3)).toEqual(['exec', 'resume', '11111111-1111-4111-8111-111111111111']);
     const prompt = argv[argv.length - 1]!;
     expect(prompt).toContain('FOLLOW_UP_MESSAGE');
     expect(prompt).not.toContain('ORIGINAL_TASK');

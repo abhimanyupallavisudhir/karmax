@@ -8526,7 +8526,7 @@ function wireCheckinSidebar(v) {
 }
 
 function nativeConversationFilename(session) {
-  return `${session.provider}-${session.exportId || session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return session.filename || `${session.provider}-${session.exportId || session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
 
 // A downloaded native history becomes locally forkable once it is placed where
@@ -8534,17 +8534,18 @@ function nativeConversationFilename(session) {
 // CLI homes because the control-plane config-home path has no meaning on the
 // developer's laptop.
 function portableForkCommandFor(session, cwd) {
+  const shellQuote = (value) => "\'" + String(value).replaceAll("\'", "\'\"\'\"\'") + "\'";
   const filename = nativeConversationFilename(session);
   const sessionId = session.exportId || session.id;
   const source = `$HOME/Downloads/${filename}`;
   if (session.provider === 'codex') return [
     'mkdir -p "$HOME/.codex/sessions/karmax"',
-    `cp "${source}" "$HOME/.codex/sessions/karmax/rollout-karmax-${sessionId}.jsonl"`,
-    `cd ${JSON.stringify(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" codex fork ${JSON.stringify(sessionId)}`,
+    `cp -n "${source}" "$HOME/.codex/sessions/karmax/${filename}"`,
+    `cd ${shellQuote(cwd)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.154.0-alpha.11"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
-    `krmax_cwd="$(cd ${JSON.stringify(cwd)} && pwd -P)"`,
+    `krmax_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
     `krmax_slug="$(printf '%s' "$krmax_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
     'mkdir -p "$HOME/.claude/projects/$krmax_slug"',
     `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${sessionId}.jsonl"`,
@@ -8583,23 +8584,25 @@ async function downloadNativeConversation(button) {
 }
 
 function localConversationHandoff(v, cwd, portable = false) {
+  const errors = Object.entries(S.sessions || {}).filter(([, session]) => session?.exportError)
+    .map(([role, session]) => `<p class="task-sub" role="alert">${esc(role)} conversation export: ${esc(session.exportError)}</p>`).join('');
   const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
   const sessions = Object.entries(S.sessions || {})
     .filter(([, session]) => session?.id && session?.downloadable && ['codex', 'claude'].includes(session.provider))
     .map(([role, session]) => {
-      const installDownloaded = portable || !session.home || session.generated;
+      const installDownloaded = portable || !session.home || session.generated || session.provider === 'codex';
       return { role, session, installDownloaded, command: installDownloaded
         ? portableForkCommandFor(session, cwd)
         : forkCommandFor({ ...session, id: session.exportId || session.id }, cwd) };
     })
     .filter((item) => item.command);
-  if (!sessions.length) return '';
+  if (!sessions.length) return errors;
   const installsDownload = sessions.some((item) => item.installDownloaded);
-  return `<div class="section-h" style="margin-top:18px">Fork an agent locally</div>
+  return `${errors}<div class="section-h" style="margin-top:18px">Fork an agent locally</div>
     <p class="task-sub">Download a native JSONL, then fork it without changing the cloud conversation.${installsDownload ? ' Commands expect the browser download in <span class="mono">~/Downloads</span>; replace that path if you saved it elsewhere.' : ''}</p>
     <div class="local-agent-forks">${sessions.map(({ role, session, command }) => {
       const label = transcripts.get(role) || role;
-      const href = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation.jsonl?role=${encodeURIComponent(role)}`;
+      const href = session.downloadUrl || `/api/tasks/${encodeURIComponent(v.taskId)}/conversation.jsonl?role=${encodeURIComponent(role)}`;
       return `<div class="local-agent-fork">
         <div class="local-agent-fork-head"><div><b>${esc(label)}</b><span class="chip">${esc(session.provider)}</span></div><button type="button" class="btn sm native-conversation-download" data-url="${esc(href)}" data-filename="${esc(nativeConversationFilename(session))}">Download conversation</button></div>
         <pre class="raw">${esc(command)}</pre>

@@ -117,7 +117,7 @@ describe('materializeFork — Codex (by id in the home)', () => {
       fs.writeFileSync(path.join(srcHome, 'sessions', `rollout-${session}.jsonl`), JSON.stringify({
         type: 'session_meta', payload: { history_base: { thread_id: kind === 'cycle' ? session : sid() } },
       }));
-      expect(materializeFork({ provider: 'codex', session, srcHome, forkHome, worldPath: '/tmp/w' })).toBe(false);
+      expect(() => materializeFork({ provider: 'codex', session, srcHome, forkHome, worldPath: '/tmp/w' })).toThrow(/missing ancestor|cyclic lineage/);
       expect(fs.readdirSync(forkHome)).toEqual([]);
     } finally {
       fs.rmSync(srcHome, { recursive: true, force: true });

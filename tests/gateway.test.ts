@@ -68,7 +68,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect((await invalid.json() as any).error).toContain('Codex or Claude');
   });
 
-  it('downloads the exact native provider conversation as JSONL', async () => {
+  it('downloads a frozen standalone native Codex history with matching handoff metadata', async () => {
     const project = h.store.createProject('Native conversation export');
     const task = h.store.createTask({
       projectId: project.id, title: 'Export this agent', workflow: 'software-dev', workflowVersion: '1.0.0',
@@ -92,14 +92,22 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     h.store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: nativeHome }));
     try {
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
-      expect(sessions.do).toMatchObject({ id: sessionId, exportId: sessionId, provider: 'codex', downloadable: true });
-      const response = await fetch(`${base}/api/tasks/${task.id}/conversation.jsonl?role=do`, { headers: auth() });
+      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.154.0-alpha.11' });
+      const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
       expect(response.status).toBe(200);
       expect(response.headers.get('content-type')).toContain('application/x-ndjson');
-      expect(response.headers.get('content-disposition')).toContain(`codex-${sessionId}.jsonl`);
+      expect(response.headers.get('content-disposition')).toContain(sessions.do.filename);
       expect(response.headers.get('cache-control')).toBe('private, no-store');
       expect(response.headers.get('x-karmax-conversation-source')).toBe('native');
-      expect(Buffer.from(await response.arrayBuffer())).toEqual(nativeHistory);
+      const downloaded = Buffer.from(await response.arrayBuffer());
+      const records = downloaded.toString().trim().split('\n').map((line) => JSON.parse(line));
+      expect(records[0].payload.id).toBe(sessions.do.exportId);
+      expect(records[0].payload.history_base).toBeUndefined();
+      expect(records[1].payload).toEqual(JSON.parse(nativeHistory.toString().trim().split('\n')[1]!).payload);
+      expect(fs.readFileSync(path.join(sessionDir, `rollout-2026-08-25T00-00-00-${sessionId}.jsonl`))).toEqual(nativeHistory);
+      fs.appendFileSync(path.join(sessionDir, `rollout-2026-08-25T00-00-00-${sessionId}.jsonl`), '{"type":"response_item","payload":{"role":"user"}}\n');
+      const again = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
+      expect(Buffer.from(await again.arrayBuffer())).toEqual(downloaded);
     } finally {
       fs.rmSync(nativeHome, { recursive: true, force: true });
     }
@@ -129,10 +137,10 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(sessions.do.exportId).toMatch(/^[a-f0-9-]{36}$/);
     expect(sessions.do.home).toBeUndefined();
 
-    const response = await fetch(`${base}/api/tasks/${task.id}/conversation.jsonl?role=do`, { headers: auth() });
+    const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
     expect(response.status).toBe(200);
     expect(response.headers.get('x-karmax-conversation-source')).toBe('generated');
-    expect(response.headers.get('content-disposition')).toContain(`codex-${sessions.do.exportId}.jsonl`);
+    expect(response.headers.get('content-disposition')).toContain(sessions.do.filename);
     const data = Buffer.from(await response.arrayBuffer());
     expect(detectConversationImport(data)).toBe('codex');
     expect(data.toString('utf8')).toContain('It is still portable.');
