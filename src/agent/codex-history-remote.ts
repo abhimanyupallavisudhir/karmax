@@ -8,25 +8,12 @@ import { CodexHistoryError, type CodexHistoryFile, validCodexSessionId } from '.
 export const REMOTE_CODEX_PUBLISH = String.raw`
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const [home, staged, session, name] = process.argv.slice(1);
-const lock = path.join(home, '.karmax-history.lock'), deadline = Date.now() + 15000;
-for (;;) {
-  try { fs.mkdirSync(lock, {mode: 448}); break; }
-  catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    try {
-      const pid = Number(fs.readFileSync(path.join(lock, 'pid'), 'utf8'));
-      try { process.kill(pid, 0); }
-      catch (probe) { if (probe.code === 'ESRCH') { fs.rmSync(lock, {recursive:true}); continue; } }
-    } catch {
-      try { if (Date.now() - fs.statSync(lock).mtimeMs > 60000) { fs.rmSync(lock, {recursive:true, force:true}); continue; } }
-      catch {}
-    }
-    if (Date.now() >= deadline) throw Error('history publication lock timed out');
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-  }
-}
+const lockFile = path.join(home, '.karmax-history-publish.sqlite');
+const publication = new (require('node:sqlite').DatabaseSync)(lockFile);
+fs.chmodSync(lockFile, 384);
+publication.exec('PRAGMA busy_timeout = 15000');
+publication.exec('BEGIN IMMEDIATE');
 try {
-  fs.writeFileSync(path.join(lock, 'pid'), String(process.pid));
   const copies = [];
   function walk(dir) {
     if (!fs.existsSync(dir)) return;
@@ -76,16 +63,16 @@ try {
     } else fs.unlinkSync(other.file);
   }
   fs.unlinkSync(staged);
-} finally { fs.rmSync(lock, {recursive:true, force:true}); }
+} finally { publication.exec('ROLLBACK'); publication.close(); }
 `;
 
-export async function publishRemoteCodexHistory(world: World, home: { relative: string; absolute: string },
+export async function publishRemoteCodexHistory(world: World, home: { relative: string; absolute: string; runtimeBin?: string },
   incoming: CodexHistoryFile, session: string): Promise<void> {
   if (!validCodexSessionId(session)) throw new CodexHistoryError('invalid session identity');
   if (!world.writeFileBuffer) throw new CodexHistoryError('sandbox cannot receive native history');
   const staged = `${home.relative}/.karmax-history-staging/${crypto.randomUUID()}`;
   await world.writeFileBuffer(staged, incoming.content);
-  const result = await world.exec('node', ['-e', REMOTE_CODEX_PUBLISH, home.absolute,
+  const result = await world.exec(home.runtimeBin ? path.posix.join(home.runtimeBin, 'node') : 'node', ['-e', REMOTE_CODEX_PUBLISH, home.absolute,
     path.posix.join(world.handle.root, staged), session, path.posix.basename(incoming.file)]);
   if (result.code !== 0) throw new CodexHistoryError(`could not publish ${session}: ${result.stderr || result.stdout}`);
 }

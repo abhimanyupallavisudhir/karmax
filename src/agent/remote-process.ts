@@ -51,6 +51,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
   const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
+  const runtimeBin = await ensureRemoteNode(world);
   if (provider === 'codex') await quiesceRemoteCodexHome(world, absolute);
   // A single-repo world's root is itself a checkout. Keep injected auth out of
   // `git add -A` without modifying the user's tracked .gitignore.
@@ -66,7 +67,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     if (rollout) {
       const id = path.posix.basename(file.relative).replace(/\.jsonl$/, '').match(/([0-9a-f-]{36})$/i)?.[1]
         ?? path.posix.basename(file.relative).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
-      await publishRemoteCodexHistory(world, { absolute, relative }, { file: file.relative, content: file.content }, id);
+      await publishRemoteCodexHistory(world, { absolute, relative, runtimeBin }, { file: file.relative, content: file.content }, id);
       continue;
     }
     const controlledAuth = isControlPlaneAuth(provider, file.relative);
@@ -83,8 +84,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   // been deleted. Repair prior duplicate copies here too, before Codex opens its
   // persistent index; live-world transfer is not guaranteed to run.
   if (provider === 'codex' && session)
-    await reconcileRemoteCodexSessionCopies(world, { absolute, relative }, session);
-  const runtimeBin = await ensureRemoteNode(world);
+    await reconcileRemoteCodexSessionCopies(world, { absolute, relative, runtimeBin }, session);
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = configuredBrowser(localHome, provider);
   const browserMcp = browser ? await ensureRemoteBrowser(world, browser, runtimeBin) : undefined;
@@ -628,13 +628,14 @@ export async function materializeRemoteSession(source: World, destination: World
       if (!file) throw new CodexHistoryError(`missing ancestor ${base}`);
     }
     const destinationPrefix = `${remoteAgentHomeRelative(provider, destinationLocalHome)}/`;
+    const runtimeBin = provider === 'codex' ? await ensureRemoteNode(destination) : undefined;
     if (provider === 'codex') await quiesceRemoteCodexHome(destination, path.posix.join(destination.handle.root, destinationPrefix));
     for (const entry of pending.reverse()) {
       if (provider === 'codex') {
         const id = path.posix.basename(entry.file).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]
           ?? path.posix.basename(entry.file).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
         await publishRemoteCodexHistory(destination, { relative: destinationPrefix.slice(0, -1),
-          absolute: path.posix.join(destination.handle.root, destinationPrefix) }, entry, id);
+          absolute: path.posix.join(destination.handle.root, destinationPrefix), runtimeBin }, entry, id);
       } else {
         const file = `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`;
         await destination.writeFileBuffer(file, entry.content);

@@ -253,7 +253,7 @@ describe('remote subscription agents', () => {
     source.files.set(`${prefix}/sessions/rollout-unrelated.jsonl`, rollout('unrelated'));
     expect(await materializeRemoteSession(source, destination, 'codex', 'leaf-session', localHome)).toBe(true);
     const home = remoteAgentHomeRelative('codex', localHome);
-    expect([...destination.files.keys()].sort()).toEqual(['leaf-session', 'parent-session', 'root-session']
+    expect([...destination.files.keys()].filter((file) => !file.endsWith('.karmax-history-publish.sqlite')).sort()).toEqual(['leaf-session', 'parent-session', 'root-session']
       .map((id) => `${home}/sessions/forked/rollout-${id}.jsonl`).sort());
     expect(destination.files.get(`${home}/sessions/forked/rollout-parent-session.jsonl`))
       .toEqual(rollout('parent-session', 'root-session'));
@@ -264,7 +264,7 @@ describe('remote subscription agents', () => {
     await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome);
     const restored = fakeWorld();
     await seedRemoteAgentHome(restored, 'codex', localHome, 'leaf-session');
-    for (const [file, content] of destination.files) expect(restored.files.get(`${home}/sessions/forked/${path.basename(file)}`)).toEqual(content);
+    for (const [file, content] of destination.files) if (!file.includes('.karmax-history-publish.sqlite')) expect(restored.files.get(`${home}/sessions/forked/${path.basename(file)}`)).toEqual(content);
   });
 
   it.each(['missing', 'cycle'])('rejects %s remote lineage without exposing a partial session', async (kind) => {
@@ -294,7 +294,7 @@ describe('remote subscription agents', () => {
     world.files.set(`${relative}/archived_sessions/rollout-root-session.jsonl`, Buffer.from(root));
     world.files.set(`${relative}/sessions/rollout-unrelated-session.jsonl`, Buffer.from('unrelated'));
     await reconcileRemoteCodexSessionCopies(world, { relative, absolute: `/workspace/${relative}` }, 'leaf-session');
-    expect([...world.files.keys()].filter((file) => !file.includes('.karmax-history-backups')).sort()).toEqual([
+    expect([...world.files.keys()].filter((file) => !file.includes('.karmax-history-backups') && !file.endsWith('.karmax-history-publish.sqlite')).sort()).toEqual([
       `${relative}/sessions/forked/rollout-leaf-session.jsonl`,
       `${relative}/sessions/forked/rollout-root-session.jsonl`,
       `${relative}/sessions/rollout-unrelated-session.jsonl`,
@@ -540,7 +540,7 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
         for (const file of args.slice(2)) files.delete(file.replace('/workspace/', ''));
         return { stdout: '', stderr: '', code: 0 };
       }
-      if (command === 'node' && args[0] === '-e' && args[1]?.includes('.karmax-history.lock')) {
+      if (command === 'node' && args[0] === '-e' && args[1]?.includes('.karmax-history-publish.sqlite')) {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-publish-'));
         try {
           for (const [file, content] of files) {

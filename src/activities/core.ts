@@ -1792,6 +1792,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   sourceProvider: srcProvider, provider: profile.provider,
                 });
               } catch (error) {
+                if (error instanceof CodexHistoryError) throw error;
                 record(args.taskId, 'session.fork-conversion-failed', {
                   from: spec.resumeFrom,
                   reason: error instanceof Error ? error.message : String(error),

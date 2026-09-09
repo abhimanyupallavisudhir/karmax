@@ -43,28 +43,18 @@ export function atomicPrivateWrite(file: string, content: Buffer): void {
  */
 function withHistoryLock<T>(home: string, action: () => T): T {
   fs.mkdirSync(home, { recursive: true });
-  const lock = path.join(home, '.karmax-history.lock');
-  const deadline = Date.now() + 15_000;
-  for (;;) {
-    try { fs.mkdirSync(lock, { mode: 0o700 }); break; }
-    catch (error: any) {
-      if (error.code !== 'EEXIST') throw error;
-      try {
-        const owner = Number(fs.readFileSync(path.join(lock, 'pid'), 'utf8'));
-        try { process.kill(owner, 0); }
-        catch (probe: any) { if (probe.code === 'ESRCH') { fs.rmSync(lock, { recursive: true }); continue; } }
-      } catch {
-        // A process can die between mkdir and writing its pid. A live publisher
-        // installs that record synchronously, so an old ownerless lock is stale.
-        try { if (Date.now() - fs.statSync(lock).mtimeMs > 60_000) { fs.rmSync(lock, { recursive: true, force: true }); continue; } }
-        catch { /* another publisher released it */ }
-      }
-      if (Date.now() >= deadline) throw new CodexHistoryError('timed out waiting for history publication');
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-    }
-  }
-  try { fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); return action(); }
-  finally { fs.rmSync(lock, { recursive: true, force: true }); }
+  const file = path.join(home, '.karmax-history-publish.sqlite');
+  const db = new DatabaseSync(file);
+  fs.chmodSync(file, 0o600);
+  let acquired = false;
+  try {
+    // SQLite owns the OS lock and releases it on process death, including after
+    // container restarts/PID reuse. No stale-lock cleanup can race a new owner.
+    db.exec('PRAGMA busy_timeout = 15000');
+    try { db.exec('BEGIN IMMEDIATE'); acquired = true; }
+    catch { throw new CodexHistoryError('timed out waiting for history publication'); }
+    return action();
+  } finally { if (acquired) db.exec('ROLLBACK'); db.close(); }
 }
 
 /** Retain the existing discoverable path (Codex may have indexed it), extend it

@@ -92,7 +92,7 @@ export function codexDynamicTools(remote: boolean): Array<{ type: string; name: 
 
 /** Return a tools-compatible session without rewriting a rollout that another
  * thread may reference. Invalid native history fails before starting a turn. */
-export async function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools: unknown[]): Promise<string> {
+export async function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools?: unknown[]): Promise<string> {
   const sources = new Map<string, ReturnType<typeof readLocalCodexHistory>>();
   const snapshot = await prepareCodexHistory(session, async (id) => {
     const source = readLocalCodexHistory(configHome, id); sources.set(id, source); return source;
@@ -874,8 +874,7 @@ export class CodexAdapter implements AgentAdapter {
   private async runCodexExec(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     if (input.session && input.resolvedAuth?.configHome) {
       const home = input.resolvedAuth.configHome;
-      const snapshot = await prepareCodexHistory(input.session, async (id) => readLocalCodexHistory(home, id));
-      if (snapshot) input = { ...input, session: installLocalCodexSnapshot(home, input.session, snapshot) };
+      input = { ...input, session: await ensureLocalCodexSessionTools(home, input.session) };
     }
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? 'gpt-5.5';
