@@ -803,6 +803,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 /* A native session handoff is a small bundle: identity, exact bytes, then the
    command that consumes them. Keep each role together when a task has several
    agent conversations so the wrong JSONL cannot be paired with a command. */
+.local-handoff-scrim pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; }
 .local-agent-forks { display: grid; gap: 10px; }
 .local-agent-fork { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .local-agent-fork-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
