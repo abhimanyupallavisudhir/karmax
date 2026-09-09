@@ -54,6 +54,41 @@ describe('durable conversation publication', () => {
     } finally { store.close(); }
   });
 
+  it.each(['before', 'after'])('keeps critical escalation intact when replacement bootstrap publishes %s the ask', async (order) => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Notifications', ownerUserId: 'owner' });
+    const project = store.createProject('P', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Approve sign-in', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    const held: TaskView = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do',
+      status: 'waiting', waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Approve sign-in now' },
+      messages: [], actions: [], state: { humanPauseOrigin: 'do' }, updatedAt: 1 };
+    const bootstrap = { ...held, status: 'active' as const, waitingFor: undefined };
+    const publish = conversationPublisher('replacement', (view, ref) => core.publishView(task.id, view, ref));
+    const inbox = () => store.listInbox('owner', organization.id);
+    try {
+      store.saveView(task.id, held); // Platform projection before the replacement starts publishing.
+      if (order === 'before') await publish(bootstrap);
+      store.appendEvent({ taskId: task.id, type: 'task.escalated', ts: 2,
+        payload: { audience: ['@creator'], detail: held.waitingFor!.detail, urgency: 'critical' } });
+      const ask = inbox()[0]!;
+      expect(ask).toMatchObject({ urgency: 'critical', unread: true });
+      if (order === 'after') await publish(bootstrap);
+      await publish(held); // Uses the bootstrap's conversation reference, even when it was suppressed.
+      expect(inbox()).toHaveLength(1);
+      expect(inbox()[0]).toMatchObject({ id: ask.id, urgency: 'critical', unread: true, createdAt: ask.createdAt });
+      expect(store.getTask(task.id)?.lastView?.waitingFor).toEqual(held.waitingFor);
+      expect(store.eventsSince(task.id, 0).filter((event) => event.type === 'view.updated')
+        .every((event) => event.payload.waitingFor === 'human')).toBe(true);
+      // A real resume drops the pause marker and must still discharge the ask.
+      await publish({ ...bootstrap, state: {} });
+      expect(inbox()).toEqual([]);
+      expect(store.getTask(task.id)?.lastView?.status).toBe('active');
+    } finally { store.close(); }
+  });
+
   it('does not reference an unacknowledged write', async () => {
     let fail = true;
     const publications: PublishedView[] = [];
