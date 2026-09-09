@@ -5481,7 +5481,9 @@ export class Gateway {
           const value = field === 'totp'
             ? vault.totp(item, { taskId: callerTaskId, principal })
             : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
-          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+          const notes = b.field == null && item.type === 'login' && item.fields.includes('note')
+            ? vault.resolveField(item, 'note', { taskId: callerTaskId, principal, mode: 'reveal' }) : undefined;
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value, ...(notes !== undefined ? { notes } : {}) });
         }
         // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
         // never through the agent. `username` fills metadata; `totp` fills the

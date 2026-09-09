@@ -577,7 +577,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'get_credential',
     {
       description:
-        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),

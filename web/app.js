@@ -13200,7 +13200,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
 const VAULT_SECRET_LABELS = {
-  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)']],
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
   'ssh-key': [['privateKey', 'private key (PEM)']],
   env: [['env', '.env contents (KEY=VALUE per line)']],
