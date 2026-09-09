@@ -40,7 +40,7 @@ export async function fillCardInWorld(world: World, args: {
   selectors: CardFillSelectors;
   details: CardFillDetails;
 }): Promise<{ origin: string }> {
-  const result = await world.exec('node', ['-e', REMOTE_CARD_FILL], {
+  const result = await world.exec('node', ['--input-type=module', '-e', REMOTE_CARD_FILL], {
     timeoutMs: 30_000,
     input: JSON.stringify({
       number: args.details.number,
