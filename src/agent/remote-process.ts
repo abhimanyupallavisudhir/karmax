@@ -816,6 +816,10 @@ async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBi
       KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT),
       KARMAX_CDP_NO_SANDBOX: '1',
       KARMAX_CDP_SET_OVERCOMMIT: '1',
+      // A human approval ends the provider/MCP turn, not the browser session.
+      // The task-isolated world owns this process and its private profile.
+      KARMAX_CDP_KEEP_ALIVE: '1',
+      KARMAX_CDP_USER_DATA_DIR: path.posix.join(world.handle.root, REMOTE_ROOT, 'browser-profile'),
     },
   } };
 }
