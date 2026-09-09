@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CodexAdapter, isRecoverableRemoteCodexCredentialFailure } from '../src/agent/codex.js';
+import { CodexAdapter, codexDynamicTools, isRecoverableRemoteCodexCredentialFailure } from '../src/agent/codex.js';
 import { providerFailure } from '../src/agent/limits.js';
 import { SDK_CONTROL_TOOL_NAMES } from '../src/agent/tools.js';
 
@@ -99,6 +99,15 @@ describe('CodexAdapter app-server security policy', () => {
     process.env.STUB_REQUESTS_OUT = requests;
     if (mode) process.env.STUB_MODE = mode;
 
+    if (session) {
+      const sessions = path.join(dir, 'sessions', 'forked');
+      fs.mkdirSync(sessions, { recursive: true });
+      fs.writeFileSync(path.join(sessions, `rollout-2026-09-09T00-00-00-${session}.jsonl`), JSON.stringify({
+        ordinal: 0, type: 'session_meta', payload: { id: session, timestamp: '2026-09-09T00:00:00Z',
+          history_mode: 'paginated', dynamic_tools: codexDynamicTools(false) },
+      }) + '\n');
+    }
+
     await new CodexAdapter().runTurn(
       {
         profile: { id: 'p', name: 'codex', provider: 'codex', model: 'gpt-5.5', role: 'merge', capabilities: [] },
@@ -154,9 +163,9 @@ describe('CodexAdapter app-server security policy', () => {
   });
 
   it('reapplies unrestricted, non-interactive execution when resuming a thread', async () => {
-    const requests = await run('thread-existing');
+    const requests = await run('11111111-1111-4111-8111-111111111111');
     expect(requests.find((r) => r.method === 'thread/resume')?.params).toMatchObject({
-      threadId: 'thread-existing',
+      threadId: '11111111-1111-4111-8111-111111111111',
       sandbox: 'danger-full-access',
       approvalPolicy: 'never',
     });
@@ -167,9 +176,9 @@ describe('CodexAdapter app-server security policy', () => {
   });
 
   it('forks into a new Codex thread instead of appending to the source', async () => {
-    const requests = await run('thread-existing', undefined, true);
+    const requests = await run('11111111-1111-4111-8111-111111111111', undefined, true);
     expect(requests.find((r) => r.method === 'thread/fork')?.params).toMatchObject({
-      threadId: 'thread-existing', sandbox: 'danger-full-access', approvalPolicy: 'never',
+      threadId: '11111111-1111-4111-8111-111111111111', sandbox: 'danger-full-access', approvalPolicy: 'never',
     });
     expect(requests.some((r) => r.method === 'thread/resume')).toBe(false);
     expect(requests.find((r) => r.method === 'turn/start')?.params.threadId).toBe('thread-forked');

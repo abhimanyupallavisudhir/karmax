@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { CodexHistoryError, type CodexHistoryFile, type CodexHistorySnapshot,
   selectCodexHistoryCopy, validCodexSessionId } from './codex-history.js';
 
@@ -73,7 +74,8 @@ export function publishLocalCodexHistory(home: string, incoming: CodexHistoryFil
   return withHistoryLock(home, () => {
     const copies = localCodexCopies(home, session);
     const kept = selectCodexHistoryCopy([...copies, incoming], session);
-    const destination = copies.find((copy) => copy.file === kept.file)?.file
+    const indexed = indexedRollout(home, session);
+    const destination = indexed.file ?? copies.find((copy) => copy.file === kept.file)?.file
       ?? copies[0]?.file ?? path.join(home, 'sessions', 'forked', path.basename(incoming.file));
     const prior = copies.find((copy) => copy.file === destination);
     if (!prior?.content.equals(kept.content)) atomicPrivateWrite(destination, kept.content);
@@ -82,10 +84,34 @@ export function publishLocalCodexHistory(home: string, incoming: CodexHistoryFil
       const digest = crypto.createHash('sha256').update(other.content).digest('hex');
       const backup = path.join(home, '.karmax-history-backups', digest, path.basename(other.file));
       if (!fs.existsSync(backup)) atomicPrivateWrite(backup, other.content);
-      fs.unlinkSync(other.file);
+      if (indexed.uncertain) atomicPrivateWrite(other.file, kept.content);
+      else fs.unlinkSync(other.file);
     }
     return destination;
   });
+}
+
+/** Read the pinned CLI's derived index without modifying it. A moved alias can
+ * otherwise leave thread/fork pointing at a deleted source. With an unreadable
+ * or unknown index, retain synchronized aliases instead of guessing its path. */
+function indexedRollout(home: string, session: string): { file?: string; uncertain: boolean } {
+  let uncertain = false;
+  for (const name of fs.readdirSync(home).filter((name) => /^state_\d+\.sqlite$/.test(name)).sort().reverse()) {
+    let db: DatabaseSync | undefined;
+    try {
+      db = new DatabaseSync(path.join(home, name), { readOnly: true });
+      const row = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(session) as { rollout_path: string } | undefined;
+      if (row) {
+        const file = path.resolve(row.rollout_path);
+        if ((file.startsWith(path.join(path.resolve(home), 'sessions') + path.sep)
+          || file.startsWith(path.join(path.resolve(home), 'archived_sessions') + path.sep))
+          && path.basename(file).endsWith(`${session}.jsonl`)) return { file, uncertain: false };
+        uncertain = true;
+      }
+    } catch { uncertain = true; }
+    finally { db?.close(); }
+  }
+  return { uncertain };
 }
 
 export function installLocalCodexSnapshot(home: string, original: string, snapshot: CodexHistorySnapshot): string {

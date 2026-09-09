@@ -43,7 +43,23 @@ try {
   const kept = all[0];
   for (const other of all.slice(1)) if (!kept.content.subarray(0, other.content.length).equals(other.content))
     throw Error('conflicting Codex copies for ' + session + ': histories diverge; preserving both');
-  const destination = copies[0]?.file || path.join(home, 'sessions', 'forked', name);
+  let indexed, uncertain = false;
+  for (const database of fs.readdirSync(home).filter(n => /^state_\d+\.sqlite$/.test(n)).sort().reverse()) {
+    let db;
+    try {
+      db = new (require('node:sqlite').DatabaseSync)(path.join(home, database), {readOnly:true});
+      const row = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(session);
+      if (row) {
+        const file = path.resolve(row.rollout_path);
+        if ((file.startsWith(path.join(path.resolve(home), 'sessions') + path.sep)
+          || file.startsWith(path.join(path.resolve(home), 'archived_sessions') + path.sep))
+          && path.basename(file).endsWith(session + '.jsonl')) { indexed = file; break; }
+        uncertain = true;
+      }
+    } catch { uncertain = true; }
+    finally { if (db) db.close(); }
+  }
+  const destination = indexed || copies[0]?.file || path.join(home, 'sessions', 'forked', name);
   fs.mkdirSync(path.dirname(destination), {recursive:true, mode:448});
   if (!copies.find(c => c.file === destination)?.content.equals(kept.content)) {
     const temp = staged + '.publish';
@@ -55,7 +71,9 @@ try {
     const backup = path.join(home, '.karmax-history-backups', hash, path.basename(other.file));
     fs.mkdirSync(path.dirname(backup), {recursive:true, mode:448});
     fs.writeFileSync(backup, other.content, {mode:384});
-    fs.unlinkSync(other.file);
+    if (uncertain && !indexed) {
+      const temp = staged + '.alias'; fs.writeFileSync(temp, kept.content, {mode:384}); fs.renameSync(temp, other.file);
+    } else fs.unlinkSync(other.file);
   }
   fs.unlinkSync(staged);
 } finally { fs.rmSync(lock, {recursive:true, force:true}); }

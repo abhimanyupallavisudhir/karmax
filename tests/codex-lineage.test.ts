@@ -11,6 +11,8 @@ import { findProviderSession, materializeFork } from '../src/agent/fork.js';
 import { ensureRemoteCodexSessionTools, materializeRemoteSession, remoteAgentHomeRelative,
   seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import type { World } from '../src/world/types.js';
+import { readLocalCodexHistory, publishLocalCodexHistory } from '../src/agent/codex-history-files.js';
+import { publishRemoteCodexHistory } from '../src/agent/codex-history-remote.js';
 
 const roots: string[] = [];
 const stops: Array<() => Promise<void>> = [];
@@ -74,6 +76,32 @@ async function history(home: string) {
   await stop();
   return { root, child };
 }
+
+it.each(['local', 'remote'])('preserves and restores indexed paths during %s publication', async (mode) => {
+  const world = diskWorld(temp());
+  const home = path.join(world.handle.root, 'codex');
+  fs.mkdirSync(home);
+  const { root, child } = await history(home);
+  const original = readLocalCodexHistory(home, root);
+  const last = JSON.parse(original.content.toString().trim().split('\n').at(-1)!).ordinal;
+  const alias = path.join(home, 'sessions', 'forked', path.basename(original.file));
+  const content = Buffer.concat([original.content, Buffer.from(JSON.stringify({ ordinal: last + 1,
+    timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: 'newer alias content' }] } }) + '\n')]);
+  fs.mkdirSync(path.dirname(alias), { recursive: true }); fs.writeFileSync(alias, content);
+  const publish = () => mode === 'local'
+    ? publishLocalCodexHistory(home, { file: alias, content }, root)
+    : publishRemoteCodexHistory(world, { relative: 'codex', absolute: home }, { file: alias, content }, root);
+  await publish();
+  expect(fs.readFileSync(original.file)).toEqual(content);
+  // Recover a dangling index left by an older alias cleanup as well.
+  fs.renameSync(original.file, alias);
+  await publish();
+  expect(fs.readFileSync(original.file)).toEqual(content);
+  const { client } = await server(home);
+  await expect(client.request('thread/fork', { threadId: root })).resolves.toHaveProperty('thread.id');
+  await expect(client.request('thread/fork', { threadId: child })).resolves.toHaveProperty('thread.id');
+}, 30_000);
 
 it.each(['0.0', '1.5'])('does not reuse an ordinal after a decimal %s tail on resume', async (decimal) => {
   const home = temp();

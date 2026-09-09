@@ -164,11 +164,12 @@ export async function prepareCodexHistory(session: string,
   const meta = metadata.payload;
   if (meta.subagent_history_start_ordinal != null) {
     const boundary = meta.subagent_history_start_ordinal;
-    if (!Number.isSafeInteger(boundary) || boundary < 1)
+    if (!Number.isSafeInteger(boundary) || boundary < 0
+      || body.some((line) => !Number.isSafeInteger(line.value.ordinal))
+      || boundary > leaf.lines.at(-1)!.value.ordinal + 1)
       throw new CodexHistoryError('invalid subagent history boundary');
-    const beforeLeaf = segments.slice(0, -1).reduce((n, segment) => n + segment.lines.length - 1, 0);
-    const inherited = leaf.lines.slice(1).filter((line) => line.value.ordinal < boundary).length;
-    meta.subagent_history_start_ordinal = 1 + beforeLeaf + inherited;
+    meta.subagent_history_start_ordinal = boundary === 0 ? 0
+      : 1 + body.filter((line) => line.value.ordinal < boundary).length;
   }
   meta.id = next;
   if ('session_id' in meta) meta.session_id = next;

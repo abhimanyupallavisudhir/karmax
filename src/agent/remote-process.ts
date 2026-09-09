@@ -551,7 +551,7 @@ export async function reconcileRemoteCodexSessionCopies(world: World, home: Remo
       candidates.push({ file, content: await world.readFileBuffer(file) });
     if (!candidates.length && current === session) break;
     const kept = selectCodexHistoryCopy(candidates, current);
-    if (candidates.length > 1) publications.push({ session: current, ...kept });
+    publications.push({ session: current, ...kept });
     current = codexHistoryBase(kept.content);
   }
   for (const entry of publications) await publishRemoteCodexHistory(world, home, entry, entry.session);

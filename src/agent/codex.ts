@@ -27,7 +27,7 @@ import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seed
   spawnRemoteAgentProcess, syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
 import { prepareCodexHistory } from './codex-history.js';
-import { readLocalCodexHistory, installLocalCodexSnapshot } from './codex-history-files.js';
+import { readLocalCodexHistory, installLocalCodexSnapshot, publishLocalCodexHistory } from './codex-history-files.js';
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
 import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
@@ -93,8 +93,13 @@ export function codexDynamicTools(remote: boolean): Array<{ type: string; name: 
 /** Return a tools-compatible session without rewriting a rollout that another
  * thread may reference. Invalid native history fails before starting a turn. */
 export async function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools: unknown[]): Promise<string> {
-  const snapshot = await prepareCodexHistory(session, async (id) => readLocalCodexHistory(configHome, id), { dynamicTools });
-  return snapshot ? installLocalCodexSnapshot(configHome, session, snapshot) : session;
+  const sources = new Map<string, ReturnType<typeof readLocalCodexHistory>>();
+  const snapshot = await prepareCodexHistory(session, async (id) => {
+    const source = readLocalCodexHistory(configHome, id); sources.set(id, source); return source;
+  }, { dynamicTools });
+  if (snapshot) return installLocalCodexSnapshot(configHome, session, snapshot);
+  for (const [id, source] of sources) publishLocalCodexHistory(configHome, source, id);
+  return session;
 }
 
 export class CodexAdapter implements AgentAdapter {

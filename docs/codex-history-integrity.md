@@ -27,7 +27,9 @@ missing ancestors, divergent copies, and partial tails produce explicit errors.
 Source histories are never rewritten to change metadata, tools, or ordinals.
 Recovery manifests under `.karmax-history-recovery` record old/new identities,
 source lengths and hashes. Publication uses atomic prefix-checked updates;
-obsolete aliases are backed up outside Codex's discovery directories. Remote
+Codex's indexed rollout path is retained or restored, and obsolete aliases are
+backed up outside its discovery directories. An unreadable index keeps all
+aliases synchronized instead of deleting a potentially indexed path. Remote
 writers are stopped before destination publication and their exit is confirmed
 before synchronization to the host.
 

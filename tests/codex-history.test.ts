@@ -53,10 +53,14 @@ it('freezes ancestor byte cutoffs, removes ancestor metadata, and keeps native t
     { ordinal: 3, type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_1', output: 'native tool output' } }]);
   const files = new Map([[root, Buffer.concat([prefix, jsonl([message(4, 'future parent suffix excluded')])])],
     [child, jsonl([meta(child, 4, { thread_id: root, end_byte_offset: prefix.length, end_ordinal_exclusive: 4 }), message(5, 'leaf')])]]);
+  const leaf = JSON.parse(files.get(child)!.toString().split('\n')[0]!);
+  leaf.payload.subagent_history_start_ordinal = 2;
+  files.set(child, jsonl([leaf, message(5, 'leaf')]));
   const snapshot = (await prepareCodexHistory(child, async (id) => ({ file: `${id}.jsonl`, content: files.get(id)! }), { snapshot: true }))!;
   const records = snapshot.content.toString().trim().split('\n').map((line) => JSON.parse(line));
   expect(records.filter((record) => record.type === 'session_meta')).toHaveLength(1);
   expect(records[0].payload.history_base).toBeUndefined();
+  expect(records[0].payload.subagent_history_start_ordinal).toBe(2);
   expect(records.map((record) => record.ordinal)).toEqual([0, 1, 2, 3, 4]);
   expect(snapshot.content.toString()).toContain('雪 inherited');
   expect(snapshot.content.toString()).toContain('native tool output');
