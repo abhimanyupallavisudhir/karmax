@@ -50,8 +50,16 @@ function encryptedRemote() {
 describe('Git-backed unix pass connector', () => {
   it('clones, decrypts, updates, commits and pushes a password store', async () => {
     const fixture = encryptedRemote();
-    const connector = new GitPassConnector(() => fixture.secret, 'org_test', () => ({}),
-      path.join(fixture.root, 'connector-state'), { allowLocalRepository: true });
+    const hooks = path.join(fixture.root, 'hooks');
+    fs.mkdirSync(hooks);
+    // Exercise the credential during the asynchronous push, after GPG has run.
+    fs.writeFileSync(path.join(hooks, 'pre-push'), '#!/bin/sh\n[ -x "$GIT_ASKPASS" ] && [ "$("$GIT_ASKPASS" Password)" = test-transport-token ]\n', { mode: 0o700 });
+    const connectorRoot = path.join(fixture.root, 'connector-state');
+    const connector = new GitPassConnector(() => fixture.secret, 'org_test', () => ({
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: hooks,
+    }), connectorRoot, { allowLocalRepository: true,
+      repositoryCredential: async () => ({ httpsToken: 'test-transport-token' }),
+    });
 
     expect(await connector.describe()).toMatchObject({ available: true, canPush: true });
     expect((await connector.list()).map((item) => item.externalId)).toEqual(['sites/example.com']);
@@ -73,6 +81,7 @@ describe('Git-backed unix pass connector', () => {
       .toContain('generated-password\nusername: new-user');
     expect(Number(run('git', ['rev-list', '--count', 'HEAD'], { cwd: audit }).trim())).toBe(3);
 
+    expect(fs.readdirSync(connectorRoot).filter((name) => name.startsWith('.git-auth-'))).toEqual([]);
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }, 30_000);
 

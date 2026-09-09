@@ -839,7 +839,8 @@ export class GitPassConnector implements CredentialConnector {
         });
         await this.refresh(connection, checkout, env);
         const store = this.findStore(checkout, connection.storePath);
-        return work(connection, checkout, store, env);
+        // Keep transport credentials alive through asynchronous encryption and push.
+        return await work(connection, checkout, store, env);
       } finally {
         fs.rmSync(credentialDir, { recursive: true, force: true });
       }
