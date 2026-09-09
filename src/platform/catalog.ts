@@ -33,6 +33,14 @@ export const PLATFORM_API_CATALOG = {
     ],
   },
   resources: ['GET /api/resource-drivers'],
+  storage: [
+    'GET /api/organizations/:organizationId/storage (locations, connection status, and byte usage)',
+    'POST /api/organizations/:organizationId/storage (connect S3: body {name, endpoint, bucket, region?, prefix?, accessKeyId, secretAccessKey, sessionToken?}; credentials are vaulted)',
+    'PUT /api/organizations/:organizationId/storage/:storageId (update connection; re-test before use)',
+    'POST /api/organizations/:organizationId/storage/:storageId/test (write/read/delete connection probe)',
+    'PUT /api/organizations/:organizationId/storage/:storageId/default (requires a tested connection)',
+    'DELETE /api/organizations/:organizationId/storage/:storageId (refuses managed or in-use storage)',
+  ],
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId (PATCH body {name} or {config})',
     // The org-scoped spelling is the ONLY project-create that works on a hosted
