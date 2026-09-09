@@ -1844,7 +1844,14 @@ html[data-theme="dark"] .github-signin-btn:active,
 .pk-caret { color: var(--ink-3); font-size: 12px; }
 .pk-sessions { margin: 0 0 4px 26px; border-left: 1px solid var(--line); padding-left: 8px; }
 .pk-fork { color: var(--accent); }
-.pk-session .task-sub .mono { font-size: 11px; }
+.pk-attempt { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; padding: 6px 10px; }
+.pk-attempt-label { flex: 0 0 72px; color: var(--ink-3); font-size: 12px; }
+.pk-agents { display: flex; flex: 1; flex-wrap: wrap; min-width: 0; gap: 4px; }
+.pk-agent { border: 1px solid var(--line); background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; gap: 6px; padding: 5px 8px; max-width: 100%; overflow-wrap: anywhere; }
+.pk-agent .wf { color: var(--ink-3); font-size: 11px; }
+.pk-agent:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pk-agents .pk-empty { padding: 5px 0; font-size: 12px; }
+.pick-row[aria-busy="true"] { cursor: progress; }
 .pk-empty { padding: 10px; color: var(--ink-3); font-size: 13px; }
 
 /* the chosen fork source under "Fork a previous agent" (task form / task page) */
