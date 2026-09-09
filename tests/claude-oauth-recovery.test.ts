@@ -81,7 +81,8 @@ ${mode === 'refresh-failed' ? 'process.exit(1);' : `fs.writeFileSync(${JSON.stri
           async resize() {},
         };
       },
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async (command: string, args: string[]) => ({ stdout: '', stderr: '',
+        code: command === 'test' && !fs.existsSync(args[1]!) ? 1 : 0 }),
       writeFileBuffer: async (name: string, value: Buffer) => { const dest = path.join(root, name); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, value); },
       readFile: async (name: string) => fs.readFileSync(path.join(root, name), 'utf8'),
       readFileBuffer: async (name: string) => fs.readFileSync(path.join(root, name)),
