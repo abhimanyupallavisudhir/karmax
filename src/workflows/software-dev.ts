@@ -51,6 +51,7 @@ import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorl
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
+import { conversationPublisher } from '../domain/view-publication.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -1048,8 +1049,15 @@ async function softwareDevImpl(
     };
   }
 
+  const publishConversation = conversationPublisher(workflowInfo().runId,
+    (view, reference) => core.publishView(taskId, view, reference));
   async function publish() {
-    await core.publishView(taskId, buildView());
+    // Apply at the live edge of existing executions as well as new task pins.
+    if (patched('software-dev-conversation-publication-v1')) {
+      await publishConversation(buildView());
+    } else {
+      await core.publishView(taskId, buildView());
+    }
   }
 
   /** Publish an honest point-of-no-return interlock only around an activity that

@@ -1,4 +1,5 @@
 import { expectedTaskRemoteHeads } from '../world/publication.js';
+import type { PublishedView, ViewConversation } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
@@ -4390,7 +4391,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return true;
     },
 
-    async publishView(taskId: string, view: TaskView): Promise<void> {
+    async publishView(taskId: string, publication: PublishedView, conversationReference?: string): Promise<void> {
+      let view: TaskView;
+      if (conversationReference) {
+        // Immutable, task-scoped snapshots survive worker restarts and activity
+        // retries, including retries after another publication has completed.
+        const key = `view-conversation:${taskId}:${conversationReference}`;
+        if (publication.messages !== undefined) {
+          const json = JSON.stringify({ messages: publication.messages, transcripts: publication.transcripts });
+          const existing = store.kvGet(key);
+          if (existing !== undefined && existing !== json)
+            throw ApplicationFailure.nonRetryable('Conversation publication reference was reused', 'view-publication');
+          store.kvSet(key, json);
+        }
+        const stored = store.kvGet(key);
+        if (!stored)
+          throw ApplicationFailure.nonRetryable('Conversation publication snapshot is missing', 'view-publication');
+        const conversation: ViewConversation = JSON.parse(stored);
+        view = { ...publication, ...conversation };
+      } else {
+        if (publication.messages === undefined)
+          throw ApplicationFailure.nonRetryable('Full view publication requires messages', 'view-publication');
+        view = publication as TaskView;
+      }
       // A platform lifecycle replacement asks the old workflow to wind down via
       // its cancellation cleanup so turns, children, leases, and worlds settle
       // cleanly. Its final `cancelled` view is an implementation frame, not a
