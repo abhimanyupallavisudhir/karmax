@@ -216,5 +216,63 @@ ok(openTaskFormSource.includes('activeTaskFormKeyController?.abort()') && openTa
 ok(openTaskFormSource.includes("activeFormToken !== formToken || !root.querySelector('#tf-page')"),
   'a detached form cannot retain a live document-level submit shortcut');
 
+// Exercise attempt chords through the real command registry and key dispatcher.
+global.S = { selected: 'one', view: {}, tab: 'tasks' };
+global.HOST_COMMANDS = [];
+global.inRail = () => false;
+global.openCursorRow = global.archiveCursorRow = () => {};
+let newAttempts = 0, taskMoves = 0, keydown;
+global.openAdjacentTask = () => taskMoves++;
+const addAttempt = { disabled: false, click: () => newAttempts++ };
+let links = ['one', 'two', 'three'].map((id) => ({
+  dataset: { attemptSelect: id },
+  click: () => { S.selected = id; },
+}));
+let overlayCount = 0;
+global.$ = (selector) => {
+  if (selector === '#overlay-root' || selector === '#modal-root') return { childElementCount: overlayCount };
+  if (selector === '#add-attempt:not(:disabled)') return addAttempt.disabled ? null : addAttempt;
+  return null;
+};
+global.document = {
+  querySelectorAll: (selector) => selector === '[data-attempt-select]' ? links : [],
+  addEventListener: (name, handler) => { keydown = handler; },
+};
+global.CHORD = { pending: [], timer: null };
+for (const name of ['cycleAttempt', 'allCommands', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
+bindKeys();
+const press = (key, typing = false) => keydown({
+  ...ev(key), preventDefault() {},
+  target: { matches: () => typing },
+});
+const chord = (key) => { press('a'); press(key); };
+chord('j');
+ok(S.selected === 'two' && taskMoves === 0, 'a j selects the next attempt without switching tasks');
+chord('k');
+ok(S.selected === 'one', 'a k selects the previous attempt');
+chord('k');
+ok(S.selected === 'three', 'previous attempt wraps to the last');
+chord('j');
+ok(S.selected === 'one', 'next attempt wraps to the first');
+chord('n');
+ok(newAttempts === 1, 'a n invokes the existing draft creation control');
+addAttempt.disabled = true;
+chord('n');
+ok(newAttempts === 1, 'disabled creation cannot be invoked by shortcut');
+addAttempt.disabled = false;
+press('a', true); press('n', true);
+ok(newAttempts === 1, 'typing a n does not create an attempt');
+overlayCount = 1;
+chord('n');
+ok(newAttempts === 1, 'overlays retain ownership of attempt chords');
+overlayCount = 0;
+links = [links[0]];
+ok(allCommands().filter((c) => ['task.attempt.next', 'task.attempt.prev'].includes(c.id)).every((c) => !c.available),
+  'a single attempt has no navigation commands');
+S.selected = null;
+ok(allCommands().filter((c) => c.id.startsWith('task.attempt.')).every((c) => !c.available),
+  'attempt commands are unavailable outside a task');
+resetChord();
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
