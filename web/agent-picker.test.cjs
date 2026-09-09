@@ -88,7 +88,7 @@ test('multiple attempts remain visible even when only one has an agent', async (
   const h = harness({ tasks: [b], attempts: { b: [a, b] }, agents: { a: session('one'), b: {} } });
   await tick(); await h.click();
   assert.equal(h.picks.length, 0);
-  assert.ok(h.nodes['pk-list'].innerHTML.includes('No agent to fork yet.'));
+  assert.ok(h.nodes['pk-list'].innerHTML.includes('No agent to fork yet. Choose another attempt or task.'));
   await h.click(1); assert.equal(h.picks[0].task.id, 'a');
 });
 

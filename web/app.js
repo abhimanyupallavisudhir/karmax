@@ -4838,7 +4838,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <div class="pk-agents">${Object.entries(agents).map(([role, session]) => `<button type="button" class="pick-row pk-agent" data-nav data-task="${esc(t.id)}" data-attempt="${esc(task.id)}" data-role="${esc(role)}"
         title="${esc([agentRoleLabel(role), session.provider, session.model].filter(Boolean).join(' · '))}">
         <span class="pk-fork">⑂</span><span>${esc(agentRoleLabel(role))}</span>${session.provider ? `<span class="wf">${esc(session.provider)}</span>` : ''}
-      </button>`).join('') || '<span class="pk-empty">No agent to fork yet.</span>'}</div>
+      </button>`).join('') || '<span class="pk-empty">No agent to fork yet. Choose another attempt or task.</span>'}</div>
     </div>`).join('');
   };
 
