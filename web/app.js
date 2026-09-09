@@ -8066,7 +8066,7 @@ function conversationPane(v, t) {
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
   const request = requestedInput
-    ? `<div class="msg system"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderMessageBody(requestedInput)}</div></div>`
+    ? `<div class="msg agent input-request"><div class="msg-meta"><span class="role">Input requested</span></div><div class="msg-text md">${renderAgentMessageBody(requestedInput, v)}</div></div>`
     : '';
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
@@ -9002,8 +9002,8 @@ function conversationTextKey(value) {
 // A normal Do turn uses its final reply as waitingFor.detail so responders and
 // the Overview tab retain the full request. That reply is already the last
 // agent message in the conversation, however, so appending the detail again as
-// an italic "Input requested" row only repeats the same content. Preserve the
-// row when a targeted hold carries a genuinely separate question.
+// an "Input requested" message only repeats the same content. Preserve the
+// message when a targeted hold carries a genuinely separate question.
 function conversationInputRequest(v, entries) {
   const detail = humanWaitDetail(v);
   if (!detail) return '';
