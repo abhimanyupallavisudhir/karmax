@@ -137,6 +137,38 @@ ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('
 ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (overlayOpen)', src.indexOf('function bindKeys()')), 'focused custom controls also activate inside overlays');
 ok(src.includes("id: 'list.quickAdd'") && src.includes("keybinding: 'meta+Enter'") && src.includes("run: () => $('#add-task')?.click()"), 'Ctrl/Cmd+Enter clicks quick-add from anywhere on the task list');
 
+// Exercise the actual document handler: a focused row must activate its anchor,
+// whereas a draft or a nested custom control owns a direct click. Native key
+// events, focus, routing and rendering are covered by the Chromium companion:
+// node scripts/test-task-list-keyboard.cjs
+eval(extractFn('openListRow'));
+let keydown;
+new Function('document', '$', 'focusedEnterAction', 'openListRow',
+  `${extractFn('bindKeys')}\nbindKeys();`)(
+  { addEventListener: (_type, handler) => { keydown = handler; } },
+  () => ({ childElementCount: 0 }), focusedEnterAction, openListRow,
+);
+for (const kind of ['task', 'queue', 'draft', 'nested']) {
+  const clicks = [];
+  const control = {
+    matches: () => kind !== 'nested',
+    querySelector: () => ['task', 'queue'].includes(kind) ? { click: () => clicks.push('link') } : null,
+    click: () => clicks.push('control'),
+  };
+  const event = {
+    ...ev('Enter'),
+    target: {
+      matches: () => false,
+      closest: (selector) => selector.includes('[tabindex="0"]') ? control : null,
+    },
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  keydown(event);
+  ok(clicks.join() === (['task', 'queue'].includes(kind) ? 'link' : 'control'),
+    `focused ${kind} Enter activates its intended target exactly once`);
+  ok(event.defaultPrevented, `focused ${kind} Enter prevents a second default action`);
+}
+
 // ── shifted chords survive the Shift keydown (g P / g W / g D / g S) ──
 // The dispatcher skips bare-modifier keydowns so pressing Shift for the second
 // step of a shifted chord doesn't reset the pending prefix. Model `g` → `Shift`
