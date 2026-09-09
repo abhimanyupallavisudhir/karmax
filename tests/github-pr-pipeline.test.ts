@@ -1241,6 +1241,64 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
   }, 120_000);
 
+  it('keeps large conversations out of landing polls through worker replay and successful landing', async () => {
+    const repo = await repoWithOrigin('github-history-size');
+    const project = h.store.createProject('Bounded landing history', { repos: [repo], remote: 'pr' });
+    const connection = h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'history-size', accountLogin: 'acme', accountType: 'Organization' });
+    const enrolled = h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'history-size-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE,
+      defaultBranch: 'main', private: true, gitConnectionId: connection.id });
+    h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id });
+    const task = h.store.createTask({ projectId: project.id, title: 'Large CI conversation', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } });
+    const log = 'CI diagnostic detail '.repeat(15_000);
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: `${log}\n@write history.md :: preserved proposal\n@review Ready`, base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 1,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' };
+    await handle.signal('confirm');
+    const publications = () => h.store.eventsSince(task.id, 0).filter((e) => e.type === 'view.updated').length;
+    await expect.poll(publications, { timeout: 60_000 }).toBeGreaterThan(30);
+    await h.restartWorker();
+    await expect.poll(publications, { timeout: 120_000 }).toBeGreaterThan(100);
+    const live = await view(handle);
+    expect(live.stage).toBe('merge');
+    expect(live.messages.map((m: any) => m.text).join('\n')).toContain(log);
+    expect(h.store.getTask(task.id)?.lastView?.messages).toEqual(live.messages);
+    githubReadiness = {};
+    await handle.signal('providerChanged');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
+    expect((await git(remoteBySlug.get(SLUG)!, ['show', 'main:history.md'])).stdout).toContain('preserved proposal');
+    // Keep each diagnostic response below gRPC's 4MB limit even with the large
+    // initial prompt. Fetching the default 1000-event page can exceed it.
+    const events = [];
+    let nextPageToken: Uint8Array | undefined;
+    do {
+      const page = await h.client.workflowService.getWorkflowExecutionHistory({
+        namespace: h.client.options.namespace, execution: { workflowId: task.id },
+        maximumPageSize: 50, nextPageToken,
+      });
+      events.push(...(page.history?.events ?? []));
+      nextPageToken = page.nextPageToken ?? undefined;
+    } while (nextPageToken?.length);
+    const scheduled = events.flatMap((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'publishView'
+      ? [e.activityTaskScheduledEventAttributes] : []);
+    const decode = (payload: any) => JSON.parse(Buffer.from(payload.data).toString());
+    const bodies = scheduled.map((e) => decode(e.input!.payloads![1]));
+    expect(bodies.filter((v) => v.messages === undefined).length).toBeGreaterThan(90);
+    expect(JSON.stringify(events).length).toBeLessThan(10_000_000);
+    // The previous protocol crossed Temporal's 50MB limit with this workload.
+    expect(Buffer.byteLength(JSON.stringify(live)) * scheduled.length).toBeGreaterThan(50 * 1024 * 1024);
+    expect(h.store.getTask(task.id)?.lastView?.messages).toEqual(live.messages);
+  }, 240_000);
+
   it('unsticks a v1.12 execution when GitHub reports a conflict only in the merge refusal', async () => {
     const repo = await repoWithOrigin('github-legacy-conflict');
     const project = h.store.createProject('Legacy GitHub conflict', { repos: [repo], remote: 'pr' });
