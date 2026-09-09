@@ -43,7 +43,8 @@ import { hostLocal } from '../config/deployment.js';
 import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
-import type { ObjectStore } from '../store/objects.js';
+import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
+import { createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
 import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault-items.js';
 import { defaultCdpUrl } from '../autonomy/cdp-endpoint.js';
 import { newId } from '../util/id.js';
@@ -4664,36 +4665,44 @@ export class Gateway {
         // can actually fork; a re-serialized UI transcript is not resumable.
         const conversation = await api.taskConversation(token, taskId, requestedRole);
         const view = await api.getTaskView(token, taskId).catch(() => task.lastView);
-        const stored = storedConversationSession(store, taskId, task.intentId, requestedRole,
-          view?.agents?.[requestedRole]?.provider);
-        const provider = stored.provider;
-        if (!provider || (!stored.source && !conversation.messages.length))
-          return this.json(res, 404, { error: 'this agent does not have a downloadable conversation' });
-        const sessionId = stored.source && stored.id
-          ? stored.id
-          : conversationExportSessionId(taskId, requestedRole, provider);
         try {
-          const data = stored.source
-            ? await fs.promises.readFile(stored.source)
-            : await exportConversationWithPanagent({
-                messages: conversation.messages, provider, sessionId, title: `${task.title} · ${requestedRole}`,
-                cwd: view?.worldPath,
-              });
-          const filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+          const objects = this.deps.objects ?? new LocalObjectStore(paths().objects);
+          const boundId = url.searchParams.get('exportId');
+          let data: Buffer, filename: string, source: string;
+          if (boundId) {
+            const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId);
+            ({ data, filename, source } = exported);
+          } else {
+            const stored = storedConversationSession(store, taskId, task.intentId, requestedRole,
+              view?.agents?.[requestedRole]?.provider);
+            const provider = stored.provider;
+            if (!provider || (!stored.source && !conversation.messages.length))
+              return this.json(res, 404, { error: 'this agent does not have a downloadable conversation' });
+            const sessionId = stored.id ?? conversationExportSessionId(taskId, requestedRole, provider);
+            const generate = () => exportConversationWithPanagent({ messages: conversation.messages,
+              provider, sessionId, title: `${task.title} · ${requestedRole}`, cwd: view?.worldPath });
+            if (provider === 'codex') {
+              const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
+                stored.home && stored.id ? { home: stored.home } : { generated: await generate() });
+              ({ data, filename, source } = exported);
+            } else {
+              data = stored.source ? await fs.promises.readFile(stored.source) : await generate();
+              filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+              source = stored.source ? 'native' : 'generated';
+            }
+          }
           res.writeHead(200, {
             'content-type': 'application/x-ndjson; charset=utf-8',
             'content-disposition': `attachment; filename="${filename}"`,
             'content-length': String(data.length),
             'cache-control': 'private, no-store',
             'x-content-type-options': 'nosniff',
-            'x-karmax-conversation-source': stored.source ? 'native' : 'generated',
+            'x-karmax-conversation-source': source,
             'x-karmax-cell': this.deps.cellId ?? 'local',
           });
           return void res.end(data);
         } catch (error) {
-          return this.json(res, stored.source ? 404 : 502, { error: stored.source
-            ? 'the native conversation file is no longer available'
-            : `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
+          return this.json(res, 409, { error: `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
         }
       }
       const explanationMatch = p.match(/^\/api\/tasks\/([^/]+)\/explanations$/);
@@ -4799,7 +4808,8 @@ export class Gateway {
         const transcriptRoles = (view?.transcripts ?? []).map((transcript) => transcript.role);
         const roles = [...new Set(['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm', ...transcriptRoles])];
         const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'];
-          exportId?: string; downloadable?: boolean; generated?: boolean }> = {};
+          exportId?: string; downloadable?: boolean; generated?: boolean; filename?: string;
+          downloadUrl?: string; requiredCodexVersion?: string; exportError?: string }> = {};
         for (const role of roles) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
@@ -4818,24 +4828,42 @@ export class Gateway {
             } catch { /* ignore */ }
           }
           const spec = agents?.[role];
-          const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
-          const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
-          const transcript = role === 'do'
-            ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
-            : (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? []);
-          const generated = !stored.source && !!downloadableProvider(resolvedProvider) && transcript.length > 0;
-          const exportId = stored.source && stored.id
-            ? stored.id
-            : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
-          if (!s && !exportId) continue;
-          out[role] = {
-            id: s ?? exportId!,
-            ...((stored.home ?? home) ? { home: stored.home ?? home } : {}),
-            ...(resolvedProvider ? { provider: resolvedProvider } : {}),
-            ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
-            ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
-            ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
-          };
+          try {
+            const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
+            const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
+            const transcript = role === 'do'
+              ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
+              : (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? []);
+            const generated = !stored.source && !!downloadableProvider(resolvedProvider) && transcript.length > 0;
+            let exportId = stored.source && stored.id
+              ? stored.id
+              : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
+            let exportMetadata = {};
+            if (resolvedProvider === 'codex' && (exportId || (stored.id && stored.home))) {
+              const sessionId = stored.id ?? exportId!;
+              const exported = await createCodexConversationExport(this.deps.objects ?? new LocalObjectStore(paths().objects),
+                id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
+                  generated: await exportConversationWithPanagent({ messages: transcript, provider: 'codex',
+                    sessionId, title: `${t?.title} · ${role}`, cwd: view?.worldPath }),
+                });
+              exportId = exported.exportId;
+              exportMetadata = { filename: exported.filename, requiredCodexVersion: exported.requiredCodexVersion,
+                downloadUrl: `/api/tasks/${encodeURIComponent(id)}/conversation.jsonl?role=${encodeURIComponent(role)}&exportId=${exportId}` };
+            }
+            if (!s && !exportId) continue;
+            out[role] = {
+              id: s ?? exportId!,
+              ...exportMetadata,
+              ...((stored.home ?? home) ? { home: stored.home ?? home } : {}),
+              ...(resolvedProvider ? { provider: resolvedProvider } : {}),
+              ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
+              ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
+              ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
+            };
+          } catch (error) {
+            if (s) out[role] = { id: s, provider: spec?.provider ?? provider, downloadable: false,
+              exportError: error instanceof Error ? error.message : String(error) };
+          }
         }
         return this.json(res, 200, out);
       }
@@ -5453,7 +5481,9 @@ export class Gateway {
           const value = field === 'totp'
             ? vault.totp(item, { taskId: callerTaskId, principal })
             : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
-          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+          const notes = b.field == null && item.type === 'login' && item.fields.includes('note')
+            ? vault.resolveField(item, 'note', { taskId: callerTaskId, principal, mode: 'reveal' }) : undefined;
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value, ...(notes !== undefined ? { notes } : {}) });
         }
         // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
         // never through the agent. `username` fills metadata; `totp` fills the

@@ -233,7 +233,14 @@ def _to_claude_blocks(blocks: list[dict[str, Any]], role: str) -> tuple[list[dic
             result.append({"type": "text", "text": f"[Imported visible reasoning summary]\n{block.get('text', '')}"})
             warnings.append(_target_warning("claude_reasoning_flattened", "Reasoning summaries were converted to labelled text."))
         elif kind == "tool_call":
-            result.append({"type": "tool_use", "id": str(block.get("id") or f"tool_{uuid4().hex}"), "name": str(block.get("name") or "unknown"), "input": block.get("arguments", {})})
+            arguments = block.get("arguments", {})
+            # Codex custom tools accept free-form text; Claude requires an object.
+            # Preserve the historical payload rather than dropping it or guessing
+            # the schema of a tool that will not be re-executed during resume.
+            if not isinstance(arguments, dict):
+                arguments = {"input": arguments}
+                warnings.append(_target_warning("claude_tool_input_wrapped", "Non-object tool arguments were preserved under the input key to satisfy Claude's tool_use schema."))
+            result.append({"type": "tool_use", "id": str(block.get("id") or f"tool_{uuid4().hex}"), "name": str(block.get("name") or "unknown"), "input": arguments})
         elif kind == "tool_result":
             result.append({"type": "tool_result", "tool_use_id": str(block.get("tool_call_id") or "unknown"), "content": str(block.get("content", "")), "is_error": bool(block.get("is_error", False))})
         elif kind in {"image", "attachment"}:

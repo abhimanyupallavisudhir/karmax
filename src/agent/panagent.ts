@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { Message, Provider } from '../domain/types.js';
 import { claudeCwdSlug } from './fork.js';
+import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
+import { installLocalCodexSnapshot, readLocalCodexHistory } from './codex-history-files.js';
 
 const pexec = promisify(execFile);
 const VENDORED_PANAGENT = fileURLToPath(new URL('../../vendor/panagent/src', import.meta.url));
@@ -106,12 +108,34 @@ export function looksLikeConversationUrl(value: string): boolean {
 export async function importWithPanagent(opts: PanagentImportOptions): Promise<PanagentImportResult> {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-'));
   try {
-    const source = 'url' in opts.source
+    let source = 'url' in opts.source
       ? opts.source.url
       : 'path' in opts.source
         ? opts.source.path
         : path.join(temporary, safeSourceName(opts.source.name));
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });
+    if (!('url' in opts.source)) {
+      const raw = fs.readFileSync(source);
+      const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
+      let first: any;
+      try { first = JSON.parse(content.subarray(0, content.indexOf(10) < 0 ? content.length : content.indexOf(10)).toString()); }
+      catch { /* Other formats are handled by panagent. */ }
+      if (first?.type === 'session_meta') {
+        const id = codexHistoryMetadata(content).id ?? first.payload.session_id;
+        const home = 'path' in opts.source ? source.split(/\/(?:sessions|archived_sessions)\//)[0] : undefined;
+        const snapshot = (await prepareCodexHistory(id, async (session) => {
+          if (home && home !== source) return readLocalCodexHistory(home, session);
+          if (session !== id) throw new CodexHistoryError(`uploaded history requires missing ancestor ${session}; download a complete conversation snapshot`);
+          return { file: source, content };
+        }, { snapshot: true, identity: crypto.randomUUID() }))!;
+        if (opts.native && opts.provider === 'codex') {
+          installLocalCodexSnapshot(opts.forkHome, id, snapshot);
+          return { kind: 'native', sessionId: snapshot.session };
+        }
+        source = path.join(temporary, snapshot.filename);
+        fs.writeFileSync(source, snapshot.content, { mode: 0o600 });
+      }
+    }
     if (opts.native && (opts.provider === 'claude' || opts.provider === 'codex')) {
       const sessionId = crypto.randomUUID();
       const output = path.join(temporary, `${sessionId}.jsonl`);
@@ -179,7 +203,7 @@ function installNativeImport(provider: 'claude' | 'codex', source: string, sessi
   if (actual !== sessionId) throw new PanagentError('panagent native session id did not match the requested fork id');
   const destination = provider === 'claude'
     ? path.join(forkHome, 'projects', claudeCwdSlug(worldPath), `${sessionId}.jsonl`)
-    : path.join(forkHome, 'sessions', 'forked', `rollout-panagent-${sessionId}.jsonl`);
+    : path.join(forkHome, 'sessions', 'forked', codexRolloutFilename(record.payload.timestamp, sessionId));
   fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
   fs.copyFileSync(source, destination);
   fs.chmodSync(destination, 0o600);

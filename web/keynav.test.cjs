@@ -137,6 +137,38 @@ ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('
 ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (overlayOpen)', src.indexOf('function bindKeys()')), 'focused custom controls also activate inside overlays');
 ok(src.includes("id: 'list.quickAdd'") && src.includes("keybinding: 'meta+Enter'") && src.includes("run: () => $('#add-task')?.click()"), 'Ctrl/Cmd+Enter clicks quick-add from anywhere on the task list');
 
+// Exercise the actual document handler: a focused row must activate its anchor,
+// whereas a draft or a nested custom control owns a direct click. Native key
+// events, focus, routing and rendering are covered by the Chromium companion:
+// node scripts/test-task-list-keyboard.cjs
+eval(extractFn('openListRow'));
+let keydown;
+new Function('document', '$', 'focusedEnterAction', 'openListRow',
+  `${extractFn('bindKeys')}\nbindKeys();`)(
+  { addEventListener: (_type, handler) => { keydown = handler; } },
+  () => ({ childElementCount: 0 }), focusedEnterAction, openListRow,
+);
+for (const kind of ['task', 'queue', 'draft', 'nested']) {
+  const clicks = [];
+  const control = {
+    matches: () => kind !== 'nested',
+    querySelector: () => ['task', 'queue'].includes(kind) ? { click: () => clicks.push('link') } : null,
+    click: () => clicks.push('control'),
+  };
+  const event = {
+    ...ev('Enter'),
+    target: {
+      matches: () => false,
+      closest: (selector) => selector.includes('[tabindex="0"]') ? control : null,
+    },
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  keydown(event);
+  ok(clicks.join() === (['task', 'queue'].includes(kind) ? 'link' : 'control'),
+    `focused ${kind} Enter activates its intended target exactly once`);
+  ok(event.defaultPrevented, `focused ${kind} Enter prevents a second default action`);
+}
+
 // ── shifted chords survive the Shift keydown (g P / g W / g D / g S) ──
 // The dispatcher skips bare-modifier keydowns so pressing Shift for the second
 // step of a shifted chord doesn't reset the pending prefix. Model `g` → `Shift`
@@ -215,6 +247,64 @@ ok(openTaskFormSource.includes('activeTaskFormKeyController?.abort()') && openTa
   'the expanded-form document listener is removed when the form is replaced or dismissed');
 ok(openTaskFormSource.includes("activeFormToken !== formToken || !root.querySelector('#tf-page')"),
   'a detached form cannot retain a live document-level submit shortcut');
+
+// Exercise attempt chords through the real command registry and key dispatcher.
+global.S = { selected: 'one', view: {}, tab: 'tasks' };
+global.HOST_COMMANDS = [];
+global.inRail = () => false;
+global.openCursorRow = global.archiveCursorRow = () => {};
+let newAttempts = 0, taskMoves = 0, keydown;
+global.openAdjacentTask = () => taskMoves++;
+const addAttempt = { disabled: false, click: () => newAttempts++ };
+let links = ['one', 'two', 'three'].map((id) => ({
+  dataset: { attemptSelect: id },
+  click: () => { S.selected = id; },
+}));
+let overlayCount = 0;
+global.$ = (selector) => {
+  if (selector === '#overlay-root' || selector === '#modal-root') return { childElementCount: overlayCount };
+  if (selector === '#add-attempt:not(:disabled)') return addAttempt.disabled ? null : addAttempt;
+  return null;
+};
+global.document = {
+  querySelectorAll: (selector) => selector === '[data-attempt-select]' ? links : [],
+  addEventListener: (name, handler) => { keydown = handler; },
+};
+global.CHORD = { pending: [], timer: null };
+for (const name of ['cycleAttempt', 'allCommands', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
+bindKeys();
+const press = (key, typing = false) => keydown({
+  ...ev(key), preventDefault() {},
+  target: { matches: () => typing },
+});
+const chord = (key) => { press('a'); press(key); };
+chord('j');
+ok(S.selected === 'two' && taskMoves === 0, 'a j selects the next attempt without switching tasks');
+chord('k');
+ok(S.selected === 'one', 'a k selects the previous attempt');
+chord('k');
+ok(S.selected === 'three', 'previous attempt wraps to the last');
+chord('j');
+ok(S.selected === 'one', 'next attempt wraps to the first');
+chord('n');
+ok(newAttempts === 1, 'a n invokes the existing draft creation control');
+addAttempt.disabled = true;
+chord('n');
+ok(newAttempts === 1, 'disabled creation cannot be invoked by shortcut');
+addAttempt.disabled = false;
+press('a', true); press('n', true);
+ok(newAttempts === 1, 'typing a n does not create an attempt');
+overlayCount = 1;
+chord('n');
+ok(newAttempts === 1, 'overlays retain ownership of attempt chords');
+overlayCount = 0;
+links = [links[0]];
+ok(allCommands().filter((c) => ['task.attempt.next', 'task.attempt.prev'].includes(c.id)).every((c) => !c.available),
+  'a single attempt has no navigation commands');
+S.selected = null;
+ok(allCommands().filter((c) => c.id.startsWith('task.attempt.')).every((c) => !c.available),
+  'attempt commands are unavailable outside a task');
+resetChord();
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

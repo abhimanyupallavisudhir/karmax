@@ -11,7 +11,7 @@ describe('deployment profiles', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
     expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBeTruthy();
-    expect(pkg.dependencies['@openai/codex']).toBe('0.153.4');
+    expect(pkg.dependencies['@openai/codex']).toBe('0.154.0-alpha.11');
     expect(pkg.dependencies.pg).toBeTruthy();
     expect(dockerfile).toContain('npm ci --omit=dev');
   });

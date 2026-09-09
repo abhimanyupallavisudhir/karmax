@@ -4773,8 +4773,8 @@ function openFilterPicker(fieldKey, onAdd) {
 // One full-featured task finder shared by every "pick a task" control: the same
 // query language, view chips and filter/group/sort toolbar as the task list, in
 // a modal with its OWN query state (the list's search is untouched). mode 'task'
-// picks a task row; mode 'agent' expands a clicked task into its resumable
-// per-role agent sessions and picks one → onPick({ task, role, session }).
+// picks a task row; mode 'agent' picks an unambiguous session directly or shows
+// attempts with compact agent choices → onPick({ task, role, session }).
 // `defaults` are the facets hidden unless the query mentions them (the list's
 // transparent -is:archived -is:run treatment, parameterized per caller — the
 // fork search deliberately keeps archived tasks in).
@@ -4798,12 +4798,15 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   </div></div>`;
   const search = $('#pk-search', host);
   const list = $('#pk-list', host);
-  const close = () => host.remove();
+  let closed = false;
+  let selection = 0; // ignore agent lookups after closing, searching or choosing another task
+  const close = () => { closed = true; selection++; host.remove(); };
   let q = '';
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
-  const sessions = new Map(); // taskId → role→session (agent mode, fetched on expand)
-  const expanded = new Set(); // taskIds whose sessions are shown
+  const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
+  const pending = new Map(); // share in-flight lookups on repeated clicks
+  const expanded = new Set(); // taskIds whose attempts are shown
 
   // View chips (All + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
@@ -4828,6 +4831,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
 
   let deb = null;
   const setQ = (nq, typing) => {
+    selection++;
     q = nq || '';
     if (search.value !== q) search.value = q;
     paintControls();
@@ -4859,19 +4863,14 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   };
 
   const sessionsHtml = (t) => {
-    const s = sessions.get(t.id);
-    if (!s) return `<div class="pk-empty">Loading agent sessions…</div>`;
-    const roles = Object.keys(s);
-    if (!roles.length) return `<div class="pk-empty">No earlier agent to continue from — this will start fresh.</div>`;
-    return roles
-      .map((role) => `<div class="pick-row pk-session" data-nav data-task="${t.id}" data-role="${esc(role)}">
-        <span class="pk-fork">⑂</span>
-        <div class="task-main">
-          <div class="task-title">${esc(agentRoleLabel(role))}</div>
-          <div class="task-sub">${s[role].provider ? `<span class="wf">${esc(s[role].provider)}</span>` : ''}<span class="mono">${esc(String(s[role].id || '').slice(0, 20))}…</span></div>
-        </div>
-      </div>`)
-      .join('');
+    const attempts = sessions.get(t.id) || [];
+    return attempts.map(({ task, sessions: agents }) => `<div class="pk-attempt">
+      <span class="pk-attempt-label">Attempt ${esc(task.attemptNumber || 1)}</span>
+      <div class="pk-agents">${Object.entries(agents).map(([role, session]) => `<button type="button" class="pick-row pk-agent" data-nav data-task="${esc(t.id)}" data-attempt="${esc(task.id)}" data-role="${esc(role)}"
+        title="${esc([agentRoleLabel(role), session.provider, session.model].filter(Boolean).join(' · '))}">
+        <span class="pk-fork">⑂</span><span>${esc(agentRoleLabel(role))}</span>${session.provider ? `<span class="wf">${esc(session.provider)}</span>` : ''}
+      </button>`).join('') || '<span class="pk-empty">No agent to fork yet. Choose another attempt or task.</span>'}</div>
+    </div>`).join('');
   };
 
   const navRows = () => [...list.querySelectorAll('[data-nav]')];
@@ -4898,28 +4897,52 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
 
   const activate = async (el) => {
     const tid = el.dataset.task;
-    const task = (result?.tasks || []).find((t) => t.id === tid);
-    if (el.dataset.role !== undefined) { // a session sub-row → the actual pick
-      onPick({ task, role: el.dataset.role, session: sessions.get(tid)?.[el.dataset.role] });
-      return close();
+    const task = (result?.tasks || []).find((t) => t.id === tid)
+      || result?.groups?.flatMap((g) => g.tasks).find((t) => t.id === tid);
+    if (!task || closed) return;
+    const request = ++selection;
+    if (el.dataset.role !== undefined) {
+      const attempt = sessions.get(tid)?.find((a) => a.task.id === el.dataset.attempt);
+      const session = attempt?.sessions[el.dataset.role];
+      if (!session) return;
+      close();
+      onPick({ task: attempt.task, role: el.dataset.role, session });
+      return;
     }
-    if (mode === 'task') { onPick(task); return close(); }
-    // Agent mode: fetch on the first click. A task with one resumable agent is
-    // unambiguous, so pick it immediately; only zero/multiple-agent tasks need
-    // the expanded detail list.
+    if (mode === 'task') { close(); onPick(task); return; }
     if (expanded.has(tid)) { expanded.delete(tid); return paintList(); }
-    expanded.add(tid);
+    // Keep the task row collapsed until all attempts are known. In particular,
+    // a single agent must never briefly open a loading menu before being picked.
     if (!sessions.has(tid)) {
-      paintList(); // shows "Loading…" while the fetch is in flight
-      sessions.set(tid, await api(`/api/tasks/${tid}/sessions`).catch(() => ({})));
+      if (!pending.has(tid)) pending.set(tid, (async () => {
+        const group = await api(`/api/tasks/${tid}/attempts`);
+        const attempts = group?.attempts?.length ? group.attempts : [task];
+        return Promise.all(attempts.map(async (attempt) => ({
+          task: attempt,
+          sessions: await api(`/api/tasks/${attempt.id}/sessions`),
+        })));
+      })());
+      el.setAttribute('aria-busy', 'true');
+      try {
+        sessions.set(tid, await pending.get(tid));
+      } catch (error) {
+        if (!closed && request === selection) toast(`Could not load agents: ${error.message}`, true);
+        return;
+      } finally {
+        pending.delete(tid);
+        el.removeAttribute('aria-busy');
+      }
     }
-    const sourceSessions = sessions.get(tid) || {};
-    const roles = Object.keys(sourceSessions);
+    if (closed || request !== selection) return;
+    const attempts = sessions.get(tid);
+    const roles = attempts.length === 1 ? Object.keys(attempts[0].sessions) : [];
     if (roles.length === 1) {
       const role = roles[0];
-      onPick({ task, role, session: sourceSessions[role] });
-      return close();
+      close();
+      onPick({ task: attempts[0].task, role, session: attempts[0].sessions[role] });
+      return;
     }
+    expanded.add(tid);
     paintList();
   };
 
@@ -4929,6 +4952,9 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, navRows().length - 1); paintHi(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(hi - 1, 0); paintHi(); }
     else if (e.key === 'Enter') { e.preventDefault(); const r = navRows()[hi]; if (r) activate(r); }
+  });
+  host.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
   });
   $('#pk-scrim', host).addEventListener('click', (e) => { if (e.target.id === 'pk-scrim') close(); });
   $('#pk-close', host).addEventListener('click', close);
@@ -6364,6 +6390,16 @@ function taskAttempts(v) {
       <button type="button" class="btn sm" id="add-attempt" ${g.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>
     </div>${rows ? `<nav class="attempts-list" aria-label="Choose an attempt">${rows}</nav>` : ''}
   </section>`;
+}
+
+// Follow the rendered links so keyboard navigation uses the same pinned routes
+// and tab selection as clicking an attempt card.
+function cycleAttempt(delta) {
+  if (!S.selected || !S.view) return;
+  const links = [...document.querySelectorAll('[data-attempt-select]')];
+  const index = links.findIndex((link) => link.dataset.attemptSelect === S.selected);
+  if (links.length < 2 || index < 0) return;
+  links[(index + delta + links.length) % links.length].click();
 }
 
 function wireAttempts(v) {
@@ -8533,7 +8569,7 @@ function wireCheckinSidebar(v) {
 }
 
 function nativeConversationFilename(session) {
-  return `${session.provider}-${session.exportId || session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return session.filename || `${session.provider}-${session.exportId || session.id}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
 
 // A downloaded native history becomes locally forkable once it is placed where
@@ -8541,17 +8577,18 @@ function nativeConversationFilename(session) {
 // CLI homes because the control-plane config-home path has no meaning on the
 // developer's laptop.
 function portableForkCommandFor(session, cwd) {
+  const shellQuote = (value) => "\'" + String(value).replaceAll("\'", "\'\"\'\"\'") + "\'";
   const filename = nativeConversationFilename(session);
   const sessionId = session.exportId || session.id;
   const source = `$HOME/Downloads/${filename}`;
   if (session.provider === 'codex') return [
     'mkdir -p "$HOME/.codex/sessions/karmax"',
-    `cp "${source}" "$HOME/.codex/sessions/karmax/rollout-karmax-${sessionId}.jsonl"`,
-    `cd ${JSON.stringify(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" codex fork ${JSON.stringify(sessionId)}`,
+    `cp -n "${source}" "$HOME/.codex/sessions/karmax/${filename}"`,
+    `cd ${shellQuote(cwd)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.154.0-alpha.11"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
-    `krmax_cwd="$(cd ${JSON.stringify(cwd)} && pwd -P)"`,
+    `krmax_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
     `krmax_slug="$(printf '%s' "$krmax_cwd" | sed 's/[^a-zA-Z0-9]/-/g')"`,
     'mkdir -p "$HOME/.claude/projects/$krmax_slug"',
     `cp "${source}" "$HOME/.claude/projects/$krmax_slug/${sessionId}.jsonl"`,
@@ -8590,23 +8627,25 @@ async function downloadNativeConversation(button) {
 }
 
 function localConversationHandoff(v, cwd, portable = false) {
+  const errors = Object.entries(S.sessions || {}).filter(([, session]) => session?.exportError)
+    .map(([role, session]) => `<p class="task-sub" role="alert">${esc(role)} conversation export: ${esc(session.exportError)}</p>`).join('');
   const transcripts = new Map(taskTranscripts(v).map((transcript) => [transcript.role, transcript.label || transcript.role]));
   const sessions = Object.entries(S.sessions || {})
     .filter(([, session]) => session?.id && session?.downloadable && ['codex', 'claude'].includes(session.provider))
     .map(([role, session]) => {
-      const installDownloaded = portable || !session.home || session.generated;
+      const installDownloaded = portable || !session.home || session.generated || session.provider === 'codex';
       return { role, session, installDownloaded, command: installDownloaded
         ? portableForkCommandFor(session, cwd)
         : forkCommandFor({ ...session, id: session.exportId || session.id }, cwd) };
     })
     .filter((item) => item.command);
-  if (!sessions.length) return '';
+  if (!sessions.length) return errors;
   const installsDownload = sessions.some((item) => item.installDownloaded);
-  return `<div class="section-h" style="margin-top:18px">Fork an agent locally</div>
+  return `${errors}<div class="section-h" style="margin-top:18px">Fork an agent locally</div>
     <p class="task-sub">Download a native JSONL, then fork it without changing the cloud conversation.${installsDownload ? ' Commands expect the browser download in <span class="mono">~/Downloads</span>; replace that path if you saved it elsewhere.' : ''}</p>
     <div class="local-agent-forks">${sessions.map(({ role, session, command }) => {
       const label = transcripts.get(role) || role;
-      const href = `/api/tasks/${encodeURIComponent(v.taskId)}/conversation.jsonl?role=${encodeURIComponent(role)}`;
+      const href = session.downloadUrl || `/api/tasks/${encodeURIComponent(v.taskId)}/conversation.jsonl?role=${encodeURIComponent(role)}`;
       return `<div class="local-agent-fork">
         <div class="local-agent-fork-head"><div><b>${esc(label)}</b><span class="chip">${esc(session.provider)}</span></div><button type="button" class="btn sm native-conversation-download" data-url="${esc(href)}" data-filename="${esc(nativeConversationFilename(session))}">Download conversation</button></div>
         <pre class="raw">${esc(command)}</pre>
@@ -13204,7 +13243,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
 const VAULT_SECRET_LABELS = {
-  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)']],
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
   'ssh-key': [['privateKey', 'private key (PEM)']],
   env: [['env', '.env contents (KEY=VALUE per line)']],
@@ -15955,6 +15994,10 @@ function allCommands() {
   // page's tabs. Documented in the help panel's static "On a task page" section
   // (help: false here) so they're discoverable before a page is open.
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
+  const attemptsAvailable = !!(S.selected && S.view && document.querySelectorAll('[data-attempt-select]').length > 1);
+  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: 'a j', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
+  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: 'a k', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
+  add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
   add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
@@ -16079,7 +16122,8 @@ function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId)
 // A data-id row navigates through its .row-link `<a>` overlay (the delegated
 // link router only fires for anchors), so click that; draft rows carry their
 // own click handler on the div, so fall back to the row itself.
-function openCursorRow() { const r = cursorRow(); if (r) (r.querySelector('a.row-link') || r).click(); }
+function openListRow(row) { if (row) (row.querySelector('a.row-link') || row).click(); }
+function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
@@ -16181,7 +16225,11 @@ function bindKeys() {
     if (focusedAction === 'native') return;
     if (focusedAction === 'click') {
       e.preventDefault();
-      t.closest('[role="button"], [tabindex="0"]').click();
+      const control = t.closest('[role="button"], [tabindex="0"]');
+      // List rows navigate through their link overlay, not a container click.
+      // Use the focused control so buttons/chips inside a row keep their action.
+      if (control.matches('#main .task-row, #main .queue-item')) openListRow(control);
+      else control.click();
       return;
     }
     if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
@@ -16411,6 +16459,8 @@ function openHelp() {
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
       ${row('[ / ]', 'Previous / next tab')}
+      ${row('a j / a k', 'Next / previous attempt')}
+      ${row('a n', 'New attempt (open editable draft)')}
       ${row('{ / }', 'Previous / next Check-in pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}

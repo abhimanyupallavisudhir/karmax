@@ -32,11 +32,23 @@ ok(taskModal.includes('Download conversation'), 'task handoff offers a native co
 ok(taskModal.includes('/conversation.jsonl?role='), 'download is scoped to the selected agent role');
 ok(!taskModal.includes('session?.home &&'), 'API-backed conversations are not hidden when they lack a config home');
 ok(taskModal.includes('session?.downloadable'), 'server-confirmed generated or retained histories are offered');
-ok(taskModal.includes('codex fork') && taskModal.includes('--fork-session'), 'hosted handoff includes Codex and Claude fork commands');
+ok(taskModal.includes('@openai/codex@') && taskModal.includes('--fork-session'), 'hosted handoff includes Codex and Claude fork commands');
 ok(taskModal.includes('localConversationHandoff(v,'), 'hosted task checkout renders agent handoffs');
 ok(projectModal.includes('/checkout`'), 'project action loads a server-generated checkout plan');
 ok(projectModal.includes('plan.cloneScript') && projectModal.includes('plan.updateScript'), 'project modal offers clone and update commands');
 ok(localModal.includes('localConversationHandoff(v, checkout.cwd)'), 'local materialization renders agent handoffs');
+
+// Execute the command builder against a bound snapshot, including shell metacharacters.
+const vm = require('node:vm');
+const snapshot = { id: 'old-session', exportId: '11111111-1111-4111-8111-111111111111', provider: 'codex',
+  filename: 'rollout-2026-09-09T00-00-00-11111111-1111-4111-8111-111111111111.jsonl', requiredCodexVersion: '0.154.0-alpha.11' };
+const context = { snapshot, cwd: "/tmp/user's checkout $(false)" };
+vm.runInNewContext(slice('function nativeConversationFilename(session)', 'async function downloadNativeConversation')
+  + '\nresult = portableForkCommandFor(snapshot, cwd);', context);
+ok(context.result.includes(`sessions/karmax/${snapshot.filename}`), 'copy preserves the canonical filename');
+ok(context.result.includes('@openai/codex@0.154.0-alpha.11 fork'), 'fork uses the decoder-fixed pinned CLI');
+ok(context.result.includes(snapshot.exportId) && !context.result.includes('old-session'), 'fork identity matches the downloaded snapshot');
+ok(require('child_process').spawnSync('bash', ['-n', '-c', context.result]).status === 0, 'commands safely quote paths containing shell metacharacters');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

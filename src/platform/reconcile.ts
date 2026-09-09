@@ -1,4 +1,6 @@
 import type { Client } from '@temporalio/client';
+import { WorkflowFailedError } from '@temporalio/client';
+import { TerminatedFailure } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TaskView, TaskRecord } from '../domain/types.js';
 import { withTimeout } from '../util/timeout.js';
@@ -106,10 +108,24 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
           }
           continue;
         }
+        let terminationReason: string | undefined;
+        if (name === 'TERMINATED') {
+          try {
+            // result() requests only the close event, not a potentially 50MB
+            // history. Bind to the described run in case recovery starts another.
+            await withTimeout(client.workflow.getHandle(t.id, desc.runId).result(), DESCRIBE_TIMEOUT_MS);
+          } catch (error) {
+            if (error instanceof WorkflowFailedError && error.cause instanceof TerminatedFailure)
+              terminationReason = error.cause.message;
+            // Diagnostics failure must not turn a known termination into "lost".
+          }
+        }
         const next: TaskView =
           name === 'COMPLETED'
             ? { ...base, status: 'done', stage: 'done', updatedAt: base.updatedAt }
-            : { ...base, status: 'failed', stage: 'failed', error: base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
+            : { ...base, status: 'failed', stage: 'failed', error: terminationReason
+              ? `workflow terminated: ${terminationReason}`
+              : base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
         store.saveView(t.id, next);
         settled++;
       } catch (e) {
