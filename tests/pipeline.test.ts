@@ -1259,6 +1259,32 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('from child');
   }, 90_000);
 
+  it('spawns more than 50 children without per-parent concurrent or lifetime caps', async () => {
+    const repo = await h.makeRepo('app-sub-unlimited');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId, repo, title: 'Parent',
+        prompt: Array.from({ length: 51 }, (_, i) => `@subtask Child ${i} :: @incomplete`).join('\n'),
+      })],
+    });
+    try {
+      // Children cannot complete without input, so all 51 remain outstanding.
+      // This crosses both former limits (8 concurrent and 50 over the task's life).
+      await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 120_000 }).toBe(51);
+      expect((await view(handle)).messages.some((m: any) => m.text.includes('was NOT spawned'))).toBe(false);
+    } finally {
+      await handle.signal('cancel');
+      expect((await handle.result()).stage).toBe('cancelled');
+      const children = (await view(handle)).subTasks ?? [];
+      for (const childId of children) {
+        expect((await h.client.workflow.getHandle(childId).result() as any).stage).toBe('cancelled');
+      }
+    }
+  }, 180_000);
+
   it('an unanswered child raise re-prompts the parent instead of dead-parking it (no deadlock)', async () => {
     // Regression for the observed stall: a child reaches Review and raises to the
     // parent, but the parent's agent does NOT respond that turn. The parent must keep
