@@ -358,7 +358,7 @@ export function spawnRemoteAgentProcess(opts: {
     "printf '\\036KARMAX_AGENT_%s\\036\\n' READY",
     `exec ${commandLine} 2>${quote(stderr)}`,
   ].join('; ');
-  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal);
+  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal, stderr);
 }
 
 export class RemoteSpawnedProcess extends EventEmitter {
@@ -375,8 +375,10 @@ export class RemoteSpawnedProcess extends EventEmitter {
   private preamble = '';
   private protocolReady = false;
   private finished = false;
+  private finishing = false;
 
-  constructor(world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal) {
+  constructor(private world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal,
+    private stderrFile?: string) {
     super();
     this.protocolGate = new Promise<void>((resolve) => { this.openProtocolGate = resolve; });
     this.ready = world.openPty({ command, cwd, env, cols: 200, rows: 40 }).then((pty) => {
@@ -435,11 +437,20 @@ export class RemoteSpawnedProcess extends EventEmitter {
     return true;
   }
 
-  private finish(code: number | null): void {
-    if (this.finished) return;
-    this.finished = true;
+  private async finish(code: number | null): Promise<void> {
+    if (this.finishing) return;
+    this.finishing = true;
     this.exitCode = code;
     this.openProtocolGate();
+    // The protocol owns PTY stdout; native stderr is redirected to a file.
+    // Recover a bounded tail before close so startup failures retain their cause.
+    if (this.stderrFile) {
+      try {
+        const result = await this.world.exec('tail', ['-c', '8192', this.stderrFile], { timeoutMs: 5000 });
+        if (result.code === 0 && result.stdout) this.stderr.write(result.stdout);
+      } catch { /* diagnostics must not replace the process failure */ }
+    }
+    this.finished = true;
     this.stdout.end();
     this.stderr.end();
     this.emit('exit', code, null);
@@ -823,11 +834,13 @@ async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBi
 /** Bring stock provider images up to the minimum runtime required by the pinned
  * Codex/Claude and browser MCP packages. The runtime is installed from npm into
  * the world injection surface, so users do not need to rebuild their selected
- * E2B template merely because its system Node is stale. Baked Karmax images skip
- * this entirely. */
-async function ensureRemoteNode(world: World): Promise<string | undefined> {
+ * E2B template merely because its system Node is stale. Reuse the paired runtime
+ * on later turns even if task commands replace system Node/npm. */
+async function ensureRemoteNode(world: World): Promise<string> {
   const acceptable = "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>22||(a===22&&b>=12)?0:1)";
-  if ((await world.exec('node', ['-e', acceptable], { timeoutMs: 30_000 })).code === 0) return undefined;
+  // Task commands can replace system Node with an npx-cache symlink. Its
+  // version still passes while npm's inferred prefix is unusable (task 201).
+  // Keep the paired, pinned runtime stable across every turn.
   const root = path.posix.join(world.handle.root, `${REMOTE_ROOT}/tools/node-${REMOTE_NODE_VERSION}`);
   const bin = path.posix.join(root, 'bin');
   const node = path.posix.join(bin, 'node');

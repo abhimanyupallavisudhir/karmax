@@ -370,6 +370,17 @@ describe('E2B cloud world provider', () => {
     expect(streamStarts).toBe(1);
   });
 
+  it('preserves the native exit code from a rejected PTY wait', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.pty.create = async () => ({ pid: 9, async wait() {
+      throw Object.assign(new Error('exit status 254'), { exitCode: 254 });
+    } });
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'failed-exit', base: 'main' });
+    const pty = await world.openPty();
+    expect(await new Promise<number | null>((resolve) => pty.onExit(resolve))).toBe(254);
+  });
+
   it('replays a PTY exit that happens before the caller attaches', async () => {
     const sandbox = fakeSandbox(() => undefined);
     sandbox.pty.create = async () => ({ pid: 9, async wait() { return { exitCode: 23 }; } });
