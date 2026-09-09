@@ -75,6 +75,26 @@ async function history(home: string) {
   return { root, child };
 }
 
+it.each(['0.0', '1.5'])('does not reuse an ordinal after a decimal %s tail on resume', async (decimal) => {
+  const home = temp();
+  const { root } = await history(home);
+  const file = findProviderSession({ provider: 'codex', session: root, forkHome: home })!;
+  const records = () => fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  let last = records().at(-1)!.ordinal;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    fs.appendFileSync(file, `{"timestamp":"2026-09-09T00:00:00Z","ordinal":${last + 1},"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":${decimal},"window_minutes":300,"resets_at":1999999999},"secondary":null,"credits":null,"plan_type":"pro"}}}\n`);
+    const { client, stop } = await server(home);
+    await client.request('thread/resume', { threadId: root });
+    await client.request('thread/inject_items', { threadId: root, items: [{ type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: `retry ${attempt}` }] }] });
+    await expect(client.request('thread/fork', { threadId: root })).resolves.toHaveProperty('thread.id');
+    await stop();
+    const ordinals = records().map((record) => record.ordinal);
+    expect(ordinals).toEqual(ordinals.map((_, ordinal) => ordinal));
+    last = ordinals.at(-1)!;
+  }
+}, 30_000);
+
 it('reproduces the cutoff error with the real pinned Codex after rewriting an ancestor', async () => {
   const home = temp();
   const { root, child } = await history(home);
@@ -94,7 +114,7 @@ it('forks, migrates tools, transfers, checkpoints, restores, and completes a rea
   const { root, child } = await history(origin);
   const sourceFile = findProviderSession({ provider: 'codex', session: root, forkHome: origin })!;
   const original = fs.readFileSync(sourceFile);
-  const migrated = ensureLocalCodexSessionTools(origin, root, [])!;
+  const migrated = await ensureLocalCodexSessionTools(origin, root, [])!;
   expect(migrated).not.toBe(root);
   expect(fs.readFileSync(sourceFile)).toEqual(original);
   const { client: migratedClient, stop: stopMigrated } = await server(origin);

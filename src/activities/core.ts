@@ -64,6 +64,7 @@ import { fillViaCdp } from '../autonomy/fill.js';
 import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
+import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import { materializeFileAttachments } from '../agent/files.js';
@@ -1761,7 +1762,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   try {
                     const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
                     prepared = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
-                  } catch { /* source world may have expired; try the durable local home below */ }
+                  } catch (error) {
+                    if (error instanceof CodexHistoryError) throw error;
+                    /* Source world may have expired; try the durable local home. */
+                  }
                 }
               }
               if (!prepared) prepared = materializeFork({ provider: profile.provider, session: srcSession,
@@ -1796,6 +1800,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           }
           if (!prepared) {
+            if (srcSession && srcHome && profile.provider === 'codex' && !apiRail)
+              throw new CodexHistoryError(`native source ${srcSession} is unavailable; preserving the task for recovery`);
             // Degraded fallback (no real source session file — e.g. the mock adapter,
             // a cleaned source, or a cross-provider jump): replay the source transcript
             // as context. NOT a native fork — flagged `native: false`.

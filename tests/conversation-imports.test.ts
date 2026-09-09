@@ -121,7 +121,7 @@ describe('Krmax panagent bridge', () => {
       expect(result.kind).toBe('native');
       if (result.kind !== 'native') return;
       expect(result.sessionId).not.toBe(SOURCE_SESSION);
-      const file = path.join(home, 'sessions', 'forked', `rollout-panagent-${result.sessionId}.jsonl`);
+      const file = path.join(home, 'sessions', 'forked', fs.readdirSync(path.join(home, 'sessions', 'forked')).find((name) => name.endsWith(`${result.sessionId}.jsonl`))!);
       const records = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
       expect(records[0].payload.id).toBe(result.sessionId);
       expect(records.some((record) => record.type === 'response_item'
