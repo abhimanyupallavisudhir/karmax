@@ -4629,7 +4629,7 @@ export class Store {
 
   retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>, storageLocationId?: string): void {
     const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, storageLocationId, refs, bytes)
-      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+      VALUES (?, ?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=resource_snapshot_chunks.refs+1`);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       if (storageLocationId) {
