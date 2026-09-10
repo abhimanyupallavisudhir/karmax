@@ -8,6 +8,8 @@ export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
   /** Stream incremental output to the task's live event log. */
   onEmit?: (text: string) => void;
+  /** Persist attachments before acknowledging the tool, including turns stopped by escalation. */
+  onReviewInfo?: (info: ReviewInfo) => void | Promise<void>;
   /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
   onActivity?: (activity: AgentActivity) => void;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
@@ -96,11 +98,13 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       confirmDecision = d;
       completed = true; // a verdict ends the confirm turn
     },
-    createReviewInfo(info) {
+    async createReviewInfo(info) {
       // Accumulate `actions` across calls (an agent may attach them incrementally);
       // every other field is last-write-wins.
       const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
-      reviewInfo = { ...reviewInfo, ...info, ...(actions ? { actions } : {}) };
+      const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+      reviewInfo = { ...reviewInfo, ...supplied, ...(actions ? { actions } : {}) };
+      await deps.onReviewInfo?.(reviewInfo);
     },
     createSubTask(t) {
       subTasks.push(t);

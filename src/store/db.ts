@@ -15,6 +15,7 @@ import {
   TaskParams,
   AgentProfile,
   TaskView,
+  ReviewInfo,
   KarmaxEvent,
   Tag,
   SavedView,
@@ -2990,7 +2991,31 @@ export class Store {
     return tasks;
   }
 
+  /** Turn-local review tools must survive cancellation before TurnResult is returned.
+   * Keep only explicitly supplied fields; workflow-owned completion/diffs stay intact. */
+  checkpointReviewInfo(taskId: string, info: ReviewInfo): void {
+    const previous = this.kvGet(`pending-review:${taskId}`);
+    const supplied = Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+    this.kvSet(`pending-review:${taskId}`, JSON.stringify({ ...(previous ? JSON.parse(previous) : {}), ...supplied }));
+    const view = this.getTask(taskId)?.lastView;
+    if (view) this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?')
+      .run(JSON.stringify(this.withPendingReviewInfo(taskId, view)), taskId);
+  }
+
+  withPendingReviewInfo(taskId: string, view: TaskView): TaskView {
+    const raw = this.kvGet(`pending-review:${taskId}`);
+    return raw ? { ...view, reviewInfo: { ...view.reviewInfo, ...JSON.parse(raw) } } : view;
+  }
+
   saveView(taskId: string, view: TaskView) {
+    const pending = this.kvGet(`pending-review:${taskId}`);
+    if (pending && Object.entries(JSON.parse(pending)).every(([key, value]) =>
+      JSON.stringify(view.reviewInfo?.[key as keyof ReviewInfo]) === JSON.stringify(value))) {
+      // The workflow has incorporated the checkpoint (normal turn completion or
+      // lifecycle recovery). Future workflow updates own these fields again.
+      this.kvDelete(`pending-review:${taskId}`);
+    }
+    view = this.withPendingReviewInfo(taskId, view);
     // Auto-archive on resolution: the moment a task reaches a terminal, no-further-
     // action status (done or cancelled) it drops out of the default active list
     // without a manual archive step — the same effect the /archive endpoint has, but
@@ -4072,7 +4097,7 @@ export class Store {
     }
     for (const taskId of taskIds) {
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
-        `permission:grant:${taskId}`]) exact.run(key);
+        `permission:grant:${taskId}`, `pending-review:${taskId}`]) exact.run(key);
       for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
         `view-conversation:${taskId}:`]) prefix.run(value, value);
     }

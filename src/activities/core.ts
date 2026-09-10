@@ -2213,6 +2213,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             lastEmit = t;
             record(args.taskId, 'agent.output', { text: t });
           },
+          onReviewInfo: (info) => {
+            signal?.throwIfAborted();
+            store.checkpointReviewInfo(args.taskId, info);
+            record(args.taskId, 'review.updated', {});
+          },
           onActivity: (activity) => {
             const turnId = args.agentTurnId ?? legacyAgentTurnId;
             if (activity.kind === 'message' && turnId) {

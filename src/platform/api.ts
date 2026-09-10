@@ -2169,6 +2169,7 @@ export class KarmaxApi {
     // agent snapshot platform-side avoids changing immutable workflow replay payloads.
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
+      view = this.deps.store.withPendingReviewInfo(taskId, view);
       // Existing parked executions recorded only "account". Read the small
       // coordinator projection to explain that wait without replaying the task
       // or restarting its agent. New lease results already carry this detail.
@@ -2239,14 +2240,14 @@ export class KarmaxApi {
   private async transitionSourceView(task: TaskRecord): Promise<TaskView> {
     const snapshot = task.lastView;
     if (!snapshot) throw new Error('task has no lifecycle state yet');
-    if (['done', 'cancelled', 'failed'].includes(snapshot.status)) return snapshot;
+    if (['done', 'cancelled', 'failed'].includes(snapshot.status)) return this.deps.store.withPendingReviewInfo(task.id, snapshot);
     try {
       const query = this.workflowHandle(task.id).query('view') as Promise<TaskView>;
       query.catch(() => undefined);
       const view = await withTimeout(query, QUERY_TIMEOUT_MS);
       if (!view || typeof view !== 'object' || !view.stage || !view.status)
         throw new Error('the workflow returned no lifecycle view');
-      return view;
+      return this.deps.store.withPendingReviewInfo(task.id, view);
     } catch (error) {
       throw new Error(`Cannot move ${task.title}: the live workflow stage is unavailable (${unwrapCause(error)}). Try again once the worker is healthy.`);
     }
