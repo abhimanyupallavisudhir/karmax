@@ -2592,7 +2592,13 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(subject.userId, requestedScope.organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (b.emailUrgencies !== undefined && (!b.emailUrgencies || typeof b.emailUrgencies !== 'object'
+            || Array.isArray(b.emailUrgencies) || Object.entries(b.emailUrgencies).some(([key, value]) =>
+              !['low', 'normal', 'high', 'critical'].includes(key) || typeof value !== 'boolean')))
+            return this.json(res, 400, { error: 'emailUrgencies must map urgency levels to booleans' });
+          const previous = store.getDeliveryPreferences(subject.userId, requestedScope.organizationId);
           return this.json(res, 200, store.setDeliveryPreferences({ userId: subject.userId, organizationId: requestedScope.organizationId,
+            emailUrgencies: b.emailUrgencies ?? previous.emailUrgencies,
             browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
         }
       }
