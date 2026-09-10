@@ -1147,8 +1147,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const saved = forkSource.repos.find((repo) => sameRepository(repo.source, source)
             || sameRepository(repo.source, transportSources[index]!));
           if (saved) repositoryBranches[source] = { base: saved.base,
-            target: typeof taskRecord?.params.target === 'string' ? args.target || args.base
-              : saved.target || args.target || args.base };
+            // Companion and explicit repository destinations outrank the
+            // task-wide target, including when an attempt inherits that field.
+            target: repositoryBranches[source]?.target
+              ?? (typeof taskRecord?.params.target === 'string' ? args.target || args.base
+                : saved.target || args.target || args.base) };
         }
       }
       if (linkedRepositories.length || wikiRepository || hasCatalogedLocalSource) {
