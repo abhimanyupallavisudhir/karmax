@@ -3152,6 +3152,7 @@ export class Store {
       this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId);
       this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId);
       this.db.prepare('DELETE FROM world_instances WHERE worldId = ?').run(taskId);
+      this.deleteProjectKv([], [taskId]);
       this.deletePermissionRequestKv(
         prior ? this.getProject(prior.projectId)?.organizationId : undefined,
         [taskId],
@@ -4075,7 +4076,8 @@ export class Store {
     for (const taskId of taskIds) {
       for (const key of [`task-agents:${taskId}`, `confirm-transcript:${taskId}`, `spent:${taskId}`, `credpolicy:task:${taskId}`,
         `permission:grant:${taskId}`]) exact.run(key);
-      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`]) prefix.run(value, value);
+      for (const value of [`session:${taskId}:`, `sessionmeta:${taskId}:`, `turnsession:${taskId}#`,
+        `view-conversation:${taskId}:`]) prefix.run(value, value);
     }
   }
 

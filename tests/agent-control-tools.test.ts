@@ -410,7 +410,7 @@ describe('codex app-server dynamic-tool persistence across resume', () => {
     dir = undefined;
   });
 
-  it('migrates tools into a new identity without changing source history', () => {
+  it('migrates tools into a new identity without changing source history', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-home-'));
     const sessions = path.join(dir, 'sessions', '2026', '07');
     fs.mkdirSync(sessions, { recursive: true });
@@ -418,14 +418,14 @@ describe('codex app-server dynamic-tool persistence across resume', () => {
     fs.writeFileSync(file, [
       JSON.stringify({ type: 'session_meta', payload: { id: 'thread-abc', cwd: '/w' } }),
       JSON.stringify({ type: 'response_item', payload: { role: 'user' } }),
-    ].join('\n'));
+    ].join('\n') + '\n');
 
     const original = fs.readFileSync(file);
-    const session = ensureLocalCodexSessionTools(dir, 'thread-abc', codexDynamicTools(false));
+    const session = await ensureLocalCodexSessionTools(dir, 'thread-abc', codexDynamicTools(false));
     expect(session).toBeTruthy();
     expect(fs.readFileSync(file)).toEqual(original);
-    expect(ensureLocalCodexSessionTools(dir, session!, codexDynamicTools(false))).toBe(session);
-    const lines = fs.readFileSync(path.join(sessions, fs.readdirSync(sessions).find((name) => name.endsWith(`${session}.jsonl`))!), 'utf8').split('\n');
+    expect(await ensureLocalCodexSessionTools(dir, session!, codexDynamicTools(false))).toBe(session);
+    const lines = fs.readFileSync(path.join(dir, 'sessions', 'forked', fs.readdirSync(path.join(dir, 'sessions', 'forked')).find((name) => name.endsWith(`${session}.jsonl`))!), 'utf8').split('\n');
     const meta = JSON.parse(lines[0]!);
     expect(meta.payload.id).toBe(session);
     expect(meta.payload.cwd).toBe('/w');
@@ -433,12 +433,12 @@ describe('codex app-server dynamic-tool persistence across resume', () => {
     expect(JSON.parse(lines[1]!)).toMatchObject({ type: 'response_item' }); // history untouched
   });
 
-  it('is best-effort: an unknown session or malformed rollout never fails the turn', () => {
+  it('rejects unknown sessions and malformed histories before a turn', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-home-'));
-    expect(ensureLocalCodexSessionTools(dir, 'missing', [])).toBeUndefined();
+    await expect(ensureLocalCodexSessionTools(dir, 'missing-session', [])).rejects.toThrow('missing source');
     const sessions = path.join(dir, 'sessions');
     fs.mkdirSync(sessions, { recursive: true });
     fs.writeFileSync(path.join(sessions, 'rollout-thread-bad.jsonl'), 'not json\n');
-    expect(ensureLocalCodexSessionTools(dir, 'thread-bad', [])).toBeUndefined();
+    await expect(ensureLocalCodexSessionTools(dir, 'thread-bad', [])).rejects.toThrow('invalid JSONL');
   });
 });

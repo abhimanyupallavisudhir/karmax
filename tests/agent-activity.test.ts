@@ -97,3 +97,7 @@ describe('credential leakage into the durable timeline', () => {
     expect(item.title).toContain('get_credential');
   });
 });
+
+it('redacts notes from generic JSON activity details', () => {
+  expect(activityDetail({ status: 'granted', notes: 'private recovery text' })).not.toContain('private recovery text');
+});

@@ -31,10 +31,11 @@ export interface Mailer {
 }
 
 /** A small, provider-agnostic HTML body for a one-action transactional email. */
-export function emailHtml(heading: string, body: string, cta: string, url: string, footer: string): string {
+export function emailHtml(heading: string, body: string, cta: string, url: string, footer: string,
+  siteName = 'krmax'): string {
   const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
   return `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a">
-  <div style="font-size:20px;font-weight:600;margin-bottom:16px">◇ krmax</div>
+  <div style="font-size:20px;font-weight:600;margin-bottom:16px">◇ ${esc(siteName)}</div>
   <h1 style="font-size:18px;margin:0 0 12px">${esc(heading)}</h1>
   <p style="font-size:14px;line-height:1.5;color:#444;margin:0 0 20px">${esc(body)}</p>
   <p style="margin:0 0 24px"><a href="${esc(url)}" style="display:inline-block;background:#1a1a1a;color:#fff;text-decoration:none;padding:10px 20px;border-radius:6px;font-size:14px;font-weight:500">${esc(cta)}</a></p>
@@ -76,6 +77,9 @@ export interface IdentityOptions {
   databaseUrl?: string;
   baseURL?: string | { allowedHosts: string[]; fallback?: string };
   secret?: string;
+    /** Read lazily so changing Installation → Site identity applies to new mail
+   * immediately, without restarting the identity service. */
+  siteName?: () => string;
   oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] };
   google?: { clientId: string; clientSecret: string };
   github?: {
@@ -164,8 +168,9 @@ export class IdentityService {
         console.error('[github] could not connect sign-in authorization:', error instanceof Error ? error.message : error);
       }
     };
+    const siteName = () => opts.siteName?.() || 'krmax';
     this.auth = betterAuth({
-      appName: 'krmax',
+      appName: siteName(),
       database: this.pool ?? this.db.native,
       secret: secretFor(dbFile, opts.secret),
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
@@ -214,14 +219,15 @@ export class IdentityService {
         // don't disclose which addresses exist).
         sendResetPassword: async ({ user, url }: { user: IdentityUser; url: string }) => {
           if (!this.mailer?.configured()) return;
+          const brand = siteName();
           await this.mailer.send({
             to: user.email,
-            subject: 'Reset your krmax password',
-            text: `Hi ${user.name || ''},\n\nSomeone asked to reset the password for your krmax account. Open the link below to choose a new one:\n\n${url}\n\nIf you didn't request this, you can ignore this email — your password won't change.`,
-            html: emailHtml('Reset your krmax password',
-              `Someone asked to reset the password for your krmax account. Click below to choose a new one.`,
+            subject: `Reset your ${brand} password`,
+            text: `Hi ${user.name || ''},\n\nSomeone asked to reset the password for your ${brand} account. Open the link below to choose a new one:\n\n${url}\n\nIf you didn't request this, you can ignore this email — your password won't change.`,
+            html: emailHtml(`Reset your ${brand} password`,
+              `Someone asked to reset the password for your ${brand} account. Click below to choose a new one.`,
               'Reset password', url,
-              `If you didn't request this, you can ignore this email — your password won't change.`),
+              `If you didn't request this, you can ignore this email — your password won't change.`, brand),
           }).catch((e) => console.error('[email] password reset send failed:', e instanceof Error ? e.message : e));
         },
       },
@@ -230,14 +236,15 @@ export class IdentityService {
         autoSignInAfterVerification: true,
         sendVerificationEmail: async ({ user, url }: { user: IdentityUser; url: string }) => {
           if (!this.mailer?.configured()) return;
+          const brand = siteName();
           await this.mailer.send({
             to: user.email,
-            subject: 'Confirm your krmax email',
-            text: `Hi ${user.name || ''},\n\nConfirm this email address to finish setting up your krmax account:\n\n${url}\n\nIf you didn't create this account, you can ignore this email.`,
-            html: emailHtml('Confirm your krmax email',
-              `Confirm this email address to finish setting up your krmax account.`,
+            subject: `Confirm your ${brand} email`,
+            text: `Hi ${user.name || ''},\n\nConfirm this email address to finish setting up your ${brand} account:\n\n${url}\n\nIf you didn't create this account, you can ignore this email.`,
+            html: emailHtml(`Confirm your ${brand} email`,
+              `Confirm this email address to finish setting up your ${brand} account.`,
               'Confirm email', url,
-              `If you didn't create this account, you can ignore this email.`),
+              `If you didn't create this account, you can ignore this email.`, brand),
           }).catch((e) => {
             // Deliberately rethrown, unlike the password-reset send above.
             // Swallowing this answered the explicit "Resend link" button with

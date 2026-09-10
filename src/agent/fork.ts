@@ -2,6 +2,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { paths } from '../config/paths.js';
+import { CodexHistoryError } from './codex-history.js';
+import { localCodexCopies, publishLocalCodexHistory } from './codex-history-files.js';
+import { selectCodexHistoryCopy } from './codex-history.js';
 
 /**
  * Fork a prior agent's session (SPEC §10.5) — branch a NEW conversation from the
@@ -40,7 +43,8 @@ export function materializeFork(opts: {
     if (!validNativeSessionId(opts.session)) return false;
     if (opts.provider === 'codex') return materializeCodex(opts);
     return materializeClaude(opts); // claude (and any subscription-CLI provider)
-  } catch {
+  } catch (error) {
+    if (error instanceof CodexHistoryError) throw error;
     return false; // any fs hiccup → caller replays
   }
 }
@@ -95,14 +99,9 @@ export function findProviderSession(opts: {
   if (opts.provider === 'claude')
     return findClaudeSession(opts.session, opts.srcHome, opts.forkHome, opts.searchInstallation);
   if (opts.provider === 'codex') {
-    if (opts.forkHome) {
-      const local = findCodexRollout(opts.session, opts.forkHome);
-      if (local) return local;
-    }
-    if (opts.srcHome) {
-      const source = findCodexRollout(opts.session, opts.srcHome);
-      if (source) return source;
-    }
+    const homes = [...new Set([opts.forkHome, opts.srcHome].filter((home): home is string => !!home))];
+    const copies = homes.flatMap((home) => localCodexCopies(home, opts.session));
+    if (copies.length) return selectCodexHistoryCopy(copies, opts.session).file;
     if (opts.searchInstallation) {
       for (const home of codexInstallationHomes()) {
         if (home === opts.srcHome || home === opts.forkHome) continue;
@@ -140,19 +139,8 @@ function codexInstallationHomes(): string[] {
 
 /** Find an active or archived Codex rollout by its filename identity. */
 function findCodexRollout(session: string, home: string): string | undefined {
-  const root = path.join(home, 'sessions');
-  const stack = [path.join(home, 'archived_sessions'), root];
-  while (stack.length) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) stack.push(p);
-      else if (e.isFile() && e.name.endsWith(`${session}.jsonl`)) return p;
-    }
-  }
-  return undefined;
+  const copies = localCodexCopies(home, session);
+  return copies.length ? selectCodexHistoryCopy(copies, session).file : undefined;
 }
 
 /** Physical history dependency, distinct from the informational forked_from_id.
@@ -164,7 +152,7 @@ export function codexHistoryBase(content: Buffer): string | undefined {
   const base = record?.type === 'session_meta' ? record.payload?.history_base : undefined;
   if (base == null) return undefined;
   if (typeof base.thread_id !== 'string' || !validNativeSessionId(base.thread_id))
-    throw new Error('Invalid Codex history_base thread_id');
+    throw new CodexHistoryError('invalid history_base thread_id');
   return base.thread_id;
 }
 
@@ -176,10 +164,13 @@ export function codexSessionFiles(opts: { session: string; forkHome?: string; sr
   const seen = new Set<string>();
   let session: string | undefined = opts.session;
   while (session) {
-    if (seen.has(session)) return undefined;
+    if (seen.has(session)) throw new CodexHistoryError(`cyclic lineage at ${session}`);
     seen.add(session);
     const file = findProviderSession({ ...opts, provider: 'codex', session });
-    if (!file) return undefined;
+    if (!file) {
+      if (files.length) throw new CodexHistoryError(`missing ancestor ${session}`);
+      return undefined;
+    }
     files.push(file);
     session = codexHistoryBase(fs.readFileSync(file));
   }
@@ -194,7 +185,9 @@ function materializeCodex(opts: { session: string; forkHome: string; srcHome?: s
   for (const src of files) {
     if (path.resolve(src).startsWith(`${path.resolve(opts.forkHome)}${path.sep}`)) continue;
     fs.mkdirSync(destDir, { recursive: true });
-    fs.copyFileSync(src, path.join(destDir, path.basename(src)));
+    const id = path.basename(src).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]
+      ?? path.basename(src).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
+    publishLocalCodexHistory(opts.forkHome, { file: path.basename(src), content: fs.readFileSync(src) }, id);
   }
   return true;
 }

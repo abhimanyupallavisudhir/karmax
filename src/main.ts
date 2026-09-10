@@ -28,6 +28,7 @@ import { withTimeout } from './util/timeout.js';
 import { duplicateInstanceMessage, registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService, type GitHubAuthorization } from './auth/identity.js';
+import { siteNameOf } from './domain/brand.js';
 import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
   GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
 import { GitHubDeploymentMonitor } from './integrations/github-deployment-monitor.js';
@@ -197,6 +198,7 @@ async function main() {
       allowedHosts: authHosts,
       fallback: publicUrl ?? `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
     },
+    siteName: () => siteNameOf(store.getSettings('global', 'appearance')),
     ...(process.env.KARMAX_OIDC_DISCOVERY_URL && process.env.KARMAX_OIDC_CLIENT_ID && process.env.KARMAX_OIDC_CLIENT_SECRET
       ? { oidc: { providerId: process.env.KARMAX_OIDC_PROVIDER_ID ?? 'enterprise',
           discoveryUrl: process.env.KARMAX_OIDC_DISCOVERY_URL, issuer: process.env.KARMAX_OIDC_ISSUER,

@@ -7,7 +7,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
-import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
@@ -43,7 +43,8 @@ import { hostLocal } from '../config/deployment.js';
 import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
-import type { ObjectStore } from '../store/objects.js';
+import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
+import { createCodexConversationExport, readCodexConversationExport } from '../store/conversation-exports.js';
 import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault-items.js';
 import { defaultCdpUrl } from '../autonomy/cdp-endpoint.js';
 import { newId } from '../util/id.js';
@@ -142,7 +143,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
   if (p === '/api/user/export' || p === '/api/user/default-organization'
-    || p === '/api/user/onboarding' || p === '/api/user/account-deletion-request') return 'none';
+    || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -593,6 +594,7 @@ export class Gateway {
   /** Host-machine affordances (`pass` import, host filesystem paths, a local
    *  checkout to `cd` into) are only offered to the machine karmax runs on. */
   private get hostLocal(): boolean { return this.deps.hostLocal ?? hostLocal(); }
+  private get siteName(): string { return siteNameOf(this.deps.store.getSettings('global', 'appearance')); }
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
@@ -1196,9 +1198,10 @@ export class Gateway {
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res);
+    if (p === '/app.webmanifest' && req.method === 'GET') return this.webManifest(res);
     if (p.startsWith('/api/')) return this.api(req, res, url);
     if (p === '/ws') return; // handled by ws
-    return this.static(p, res);
+    return this.static(p, res, req);
   }
 
   private async api(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
@@ -1252,10 +1255,12 @@ export class Gateway {
       return this.json(res, 200, { authRequired: true });
     }
     if (p === '/api/launch' && method === 'GET')
-      return this.json(res, 200, this.deps.paidLaunchSettings?.publicLaunchInfo() ?? publicLaunchInfo());
+      return this.json(res, 200, this.deps.paidLaunchSettings?.publicLaunchInfo(this.siteName)
+        ?? publicLaunchInfo(process.env, undefined, this.siteName));
     const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
     if (legalMatch && method === 'GET') {
-      const document = this.deps.paidLaunchSettings?.policyDocument(legalMatch[1]!) ?? policyDocument(legalMatch[1]!);
+      const document = this.deps.paidLaunchSettings?.policyDocument(legalMatch[1]!, this.siteName)
+        ?? policyDocument(legalMatch[1]!, process.env, undefined, this.siteName);
       return document ? this.json(res, 200, document) : this.json(res, 404, { error: 'policy not found' });
     }
     if (p === '/api/legal/preaccept' && method === 'POST') {
@@ -1424,7 +1429,7 @@ export class Gateway {
       // time inside); an installation-wide legacy secret still reaches every one.
       const scope = mailMod.ingestScope(this.deps.store, presented, process.env.KARMAX_AGENT_MAIL_SECRET);
       if (!scope)
-        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL krmax shows the operator)' });
+        return this.json(res, 401, { error: `agent-mail ingest requires the webhook secret (the ?secret= in the URL ${this.siteName} shows the operator)` });
       // Providers POST different shapes/encodings; parse by content-type and
       // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
       // MIME from the Cloudflare Email Worker).
@@ -1559,7 +1564,7 @@ export class Gateway {
       return this.json(res, 401, { error: 'invalid password' });
     }
     if (p === '/api/setup' && method === 'POST' && this.deps.identity) {
-      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'krmax has already been set up' });
+      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: `${this.siteName} has already been set up` });
       const b = await this.body(req);
       try {
         const { response, user } = await this.deps.identity.bootstrap(
@@ -1621,6 +1626,7 @@ export class Gateway {
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
         hostLocal: this.hostLocal,
+        siteName: this.siteName,
         worldProviders: this.deps.worlds.catalog(),
         // Which inbox delivery channels actually have an adapter wired. The console
         // used to render Email/Slack switches unconditionally and toast "saved" for
@@ -1756,7 +1762,7 @@ export class Gateway {
         const request = { requestedAt: Date.now(), userId: subject.userId, email: session.email };
         store.kvSet(`account-deletion:${subject.userId}`, JSON.stringify(request));
         if (privacyContact && this.deps.email?.configured()) {
-          await this.deps.email.send({ to: privacyContact, subject: 'krmax account deletion request',
+          await this.deps.email.send({ to: privacyContact, subject: `${this.siteName} account deletion request`,
             text: `A signed-in user requested account deletion.\n\nUser id: ${subject.userId}\nEmail: ${session.email ?? 'not available'}\nRequested at: ${new Date(request.requestedAt).toISOString()}\n\nVerify ownership and organization/resource transfer before deleting data.` })
             .catch((error) => console.error('[privacy] deletion-request notification failed:', error instanceof Error ? error.message : error));
         }
@@ -1784,15 +1790,17 @@ export class Gateway {
         if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
           return this.json(res, 404, { error: 'organization not found' });
         const key = hostedOnboardingKey(subject.userId, organizationId);
+        // Recover older accounts and interrupted signup provisioning on every read.
+        if (this.deps.hosted) this.enableHostedOnboarding(subject.userId, organizationId);
         let record = parseHostedOnboardingRecord(store.kvGet(key));
+        let finishReplay = false;
         if (method === 'PUT') {
           if (!this.deps.hosted || !record)
             return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
           const b = await this.body(req);
           const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
           record = { ...record, display };
-          if (b.finishReplay === true && record.replay)
-            record = { display, completedAt: Date.now() };
+          finishReplay = b.finishReplay === true;
           store.kvSet(key, JSON.stringify(record));
         }
         const credentials = enumerateCredentials(gatherCredentialSources({
@@ -1816,6 +1824,10 @@ export class Gateway {
           card: store.listOrganizationCards(organizationId).length > 0,
           project: store.listProjects().some((project) => project.organizationId === organizationId),
         };
+        if (finishReplay && record?.replay && facts.github && facts.agentLogin && facts.e2b && facts.project) {
+          record = { display: record.display, completedAt: Date.now() };
+          store.kvSet(key, JSON.stringify(record));
+        }
         let status = hostedOnboardingStatus({
           hosted: this.deps.hosted === true,
           organizationId,
@@ -1874,7 +1886,16 @@ export class Gateway {
       }
       if (p === '/api/settings/installation' && method === 'GET') {
         return this.json(res, 200, { canManage: this.deps.tokens.check(token, 'settings:write').ok,
-          hostLocal: this.hostLocal });
+          hostLocal: this.hostLocal, siteName: this.siteName });
+      }
+      if (p === '/api/settings/installation' && method === 'PUT') {
+        const b = await this.body(req);
+        const error = siteNameError(b.siteName);
+        if (error) return this.json(res, 400, { error });
+        const appearance = store.getSettings('global', 'appearance') ?? {};
+        const siteName = String(b.siteName).trim();
+        store.setSettings('global', 'appearance', { ...appearance, siteName });
+        return this.json(res, 200, { ok: true, siteName });
       }
       if (p === '/api/settings/paid-launch') {
         if (!this.deps.paidLaunchSettings)
@@ -1886,7 +1907,7 @@ export class Gateway {
         });
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'settings:write').ok)
-            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure paid launch' });
+            return this.json(res, 403, { error: `Only a ${this.siteName} installation administrator can configure paid launch` });
           try {
             return this.json(res, 200, { ...this.deps.paidLaunchSettings.configure(await this.body(req), publicUrl),
               canManage: true });
@@ -2236,16 +2257,17 @@ export class Gateway {
           if (this.deps.email?.configured() && result.invitation.email) {
             const link = `${this.publicUrl(req)}/invite?token=${encodeURIComponent(result.token)}`;
             const organization = store.getOrganization(organizationId);
-            const orgName = organization?.name ?? 'a krmax organization';
+            const orgName = organization?.name ?? `a ${this.siteName} organization`;
             const { emailHtml } = await import('../auth/identity.js');
             try {
               await this.deps.email.send({
                 to: result.invitation.email,
-                subject: `You've been invited to ${orgName} on krmax`,
-                text: `You've been invited to join ${orgName} on krmax.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
+                subject: `You've been invited to ${orgName} on ${this.siteName}`,
+                text: `You've been invited to join ${orgName} on ${this.siteName}.\n\nAccept the invitation:\n\n${link}\n\nThis is a one-time link. If you weren't expecting this, you can ignore it.`,
                 html: emailHtml(`You've been invited to ${orgName}`,
-                  `You've been invited to join ${orgName} on krmax. Accept the invitation to get started.`,
-                  'Accept invitation', link, `This is a one-time link. If you weren't expecting this, you can ignore it.`),
+                  `You've been invited to join ${orgName} on ${this.siteName}. Accept the invitation to get started.`,
+                  'Accept invitation', link, `This is a one-time link. If you weren't expecting this, you can ignore it.`,
+                  this.siteName),
               });
               emailed = true;
             } catch (e) { console.error('[invite] email send failed:', e instanceof Error ? e.message : e); }
@@ -2362,7 +2384,7 @@ export class Gateway {
         }
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'settings:write').ok)
-            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared GitHub App' });
+            return this.json(res, 403, { error: `Only a ${this.siteName} installation administrator can configure the shared GitHub App` });
           const b = await this.body(req);
           try {
             return this.json(res, 200, this.deps.githubApp.configure({ appId: b.appId, appSlug: String(b.appSlug ?? ''),
@@ -2376,7 +2398,7 @@ export class Gateway {
         const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!this.deps.tokens.check(token, 'settings:write').ok)
-          return this.json(res, 403, { error: 'Only a Krmax installation administrator can create the shared GitHub App' });
+          return this.json(res, 403, { error: `Only a ${this.siteName} installation administrator can create the shared GitHub App` });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = store.createGithubInstallState(githubManifest[1]!, subject.userId,
@@ -2651,11 +2673,13 @@ export class Gateway {
         return this.json(res, 200, user);
       }
       const resetOnboarding = p.match(/^\/api\/users\/([^/]+)\/onboarding\/reset$/);
-      if (resetOnboarding && method === 'POST') {
-        requireInteractiveHuman(callerIdentity);
+      if ((resetOnboarding || p === '/api/user/onboarding/reset') && method === 'POST') {
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.hosted)
           return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
-        const userId = resetOnboarding[1]!;
+        // The self-service route takes its target solely from the browser session.
+        // The operator route retains its user:write capability requirement.
+        const userId = resetOnboarding?.[1] ?? subject.userId;
         if (!this.deps.identity?.listUsers().some((user) => user.id === userId))
           return this.json(res, 404, { error: 'user not found' });
         // Only presentation state changes. Live setup facts and user work remain intact.
@@ -3379,7 +3403,7 @@ export class Gateway {
                 // the host are the same machine. Gating on `hosted` alone let a
                 // remote caller on a public self-host import `/etc` or `~/.ssh`
                 // and download it back as a resource revision.
-                if (!this.hostLocal) throw new Error('resource imports must upload bytes; a browser-local path is not available unless Krmax runs on your machine');
+                if (!this.hostLocal) throw new Error(`resource imports must upload bytes; a browser-local path is not available unless ${this.siteName} runs on your machine`);
                 revision = await this.deps.resources.importDirectory(resource.id, expandPath(b.sourcePath));
               } else if (Array.isArray(b.files)) {
                 revision = await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
@@ -3474,7 +3498,7 @@ export class Gateway {
         // filesystem, and the console hides it on `hostLocal()` — gate the server
         // on the same predicate, or a remote user still gets the host's file tree.
         if (!this.hostLocal) return this.json(res, 200, { proposals: [], unavailable: project.config.repos ?? [],
-          note: 'Krmax is not running on your machine, so it cannot see this workstation’s ignored files. Choose files or use the uploader.' });
+          note: `${this.siteName} is not running on your machine, so it cannot see this workstation’s ignored files. Choose files or use the uploader.` });
         return this.json(res, 200, await scanProjectResources(project));
       }
       const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
@@ -3570,7 +3594,7 @@ export class Gateway {
           const revision = typeof b.sourcePath === 'string'
             // Same host-filesystem gate as the create path above: `hostLocal`,
             // not `hosted`.
-            ? !this.hostLocal ? (() => { throw new Error('imports require uploaded files unless Krmax runs on your machine'); })()
+            ? !this.hostLocal ? (() => { throw new Error(`imports require uploaded files unless ${this.siteName} runs on your machine`); })()
               : await this.deps.resources.importDirectory(resource.id, expandPath(b.sourcePath))
             : await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
           return this.json(res, 200, redactResourceRevision(revision));
@@ -3718,7 +3742,7 @@ export class Gateway {
         const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp) return this.json(res, 200, {
           remotePolicy: store.effectiveProjectConfig(project).remote ?? 'none', repositories: [], creatorCanMerge: false, eligibleUserIds: [],
-          detail: 'GitHub is not connected for this krmax organization.',
+          detail: `GitHub is not connected for this ${this.siteName} organization.`,
         });
         const repositories = [...new Set([
           ...store.listProjectRepositories(project.id).map((linked) => `${linked.repository.owner}/${linked.repository.name}`),
@@ -4182,7 +4206,7 @@ export class Gateway {
       const materializeMatch = p.match(/^\/api\/tasks\/([^/]+)\/materialize-local$/);
       if (materializeMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
-        if (!this.hostLocal) return this.json(res, 409, { error: 'use the Git checkout handoff when Krmax is not running on your machine' });
+        if (!this.hostLocal) return this.json(res, 409, { error: `use the Git checkout handoff when ${this.siteName} is not running on your machine` });
         const taskId = materializeMatch[1]!;
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
@@ -4192,7 +4216,7 @@ export class Gateway {
       const openCommandMatch = p.match(/^\/api\/tasks\/([^/]+)\/open-command$/);
       if (openCommandMatch && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
-        if (!this.hostLocal) return this.json(res, 409, { error: 'file open commands are available only on the machine running Krmax' });
+        if (!this.hostLocal) return this.json(res, 409, { error: `file open commands are available only on the machine running ${this.siteName}` });
         const taskId = openCommandMatch[1]!;
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
@@ -4717,36 +4741,44 @@ export class Gateway {
         // can actually fork; a re-serialized UI transcript is not resumable.
         const conversation = await api.taskConversation(token, taskId, requestedRole);
         const view = await api.getTaskView(token, taskId).catch(() => task.lastView);
-        const stored = storedConversationSession(store, taskId, task.intentId, requestedRole,
-          view?.agents?.[requestedRole]?.provider);
-        const provider = stored.provider;
-        if (!provider || (!stored.source && !conversation.messages.length))
-          return this.json(res, 404, { error: 'this agent does not have a downloadable conversation' });
-        const sessionId = stored.source && stored.id
-          ? stored.id
-          : conversationExportSessionId(taskId, requestedRole, provider);
         try {
-          const data = stored.source
-            ? await fs.promises.readFile(stored.source)
-            : await exportConversationWithPanagent({
-                messages: conversation.messages, provider, sessionId, title: `${task.title} · ${requestedRole}`,
-                cwd: view?.worldPath,
-              });
-          const filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+          const objects = this.deps.objects ?? new LocalObjectStore(paths().objects);
+          const boundId = url.searchParams.get('exportId');
+          let data: Buffer, filename: string, source: string;
+          if (boundId) {
+            const exported = await readCodexConversationExport(objects, taskId, requestedRole, boundId);
+            ({ data, filename, source } = exported);
+          } else {
+            const stored = storedConversationSession(store, taskId, task.intentId, requestedRole,
+              view?.agents?.[requestedRole]?.provider);
+            const provider = stored.provider;
+            if (!provider || (!stored.source && !conversation.messages.length))
+              return this.json(res, 404, { error: 'this agent does not have a downloadable conversation' });
+            const sessionId = stored.id ?? conversationExportSessionId(taskId, requestedRole, provider);
+            const generate = () => exportConversationWithPanagent({ messages: conversation.messages,
+              provider, sessionId, title: `${task.title} · ${requestedRole}`, cwd: view?.worldPath });
+            if (provider === 'codex') {
+              const exported = await createCodexConversationExport(objects, taskId, requestedRole, sessionId,
+                stored.home && stored.id ? { home: stored.home } : { generated: await generate() });
+              ({ data, filename, source } = exported);
+            } else {
+              data = stored.source ? await fs.promises.readFile(stored.source) : await generate();
+              filename = `${provider}-${sessionId}.jsonl`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+              source = stored.source ? 'native' : 'generated';
+            }
+          }
           res.writeHead(200, {
             'content-type': 'application/x-ndjson; charset=utf-8',
             'content-disposition': `attachment; filename="${filename}"`,
             'content-length': String(data.length),
             'cache-control': 'private, no-store',
             'x-content-type-options': 'nosniff',
-            'x-karmax-conversation-source': stored.source ? 'native' : 'generated',
+            'x-karmax-conversation-source': source,
             'x-karmax-cell': this.deps.cellId ?? 'local',
           });
           return void res.end(data);
         } catch (error) {
-          return this.json(res, stored.source ? 404 : 502, { error: stored.source
-            ? 'the native conversation file is no longer available'
-            : `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
+          return this.json(res, 409, { error: `conversation export failed: ${error instanceof Error ? error.message : String(error)}` });
         }
       }
       const explanationMatch = p.match(/^\/api\/tasks\/([^/]+)\/explanations$/);
@@ -4852,7 +4884,8 @@ export class Gateway {
         const transcriptRoles = (view?.transcripts ?? []).map((transcript) => transcript.role);
         const roles = [...new Set(['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm', ...transcriptRoles])];
         const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'];
-          exportId?: string; downloadable?: boolean; generated?: boolean }> = {};
+          exportId?: string; downloadable?: boolean; generated?: boolean; filename?: string;
+          downloadUrl?: string; requiredCodexVersion?: string; exportError?: string }> = {};
         for (const role of roles) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
@@ -4871,24 +4904,42 @@ export class Gateway {
             } catch { /* ignore */ }
           }
           const spec = agents?.[role];
-          const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
-          const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
-          const transcript = role === 'do'
-            ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
-            : (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? []);
-          const generated = !stored.source && !!downloadableProvider(resolvedProvider) && transcript.length > 0;
-          const exportId = stored.source && stored.id
-            ? stored.id
-            : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
-          if (!s && !exportId) continue;
-          out[role] = {
-            id: s ?? exportId!,
-            ...((stored.home ?? home) ? { home: stored.home ?? home } : {}),
-            ...(resolvedProvider ? { provider: resolvedProvider } : {}),
-            ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
-            ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
-            ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
-          };
+          try {
+            const stored = storedConversationSession(store, id, t?.intentId, role, spec?.provider ?? provider);
+            const resolvedProvider = stored.provider ?? spec?.provider ?? provider;
+            const transcript = role === 'do'
+              ? (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? view?.messages ?? [])
+              : (view?.transcripts?.find((candidate) => candidate.role === role)?.messages ?? []);
+            const generated = !stored.source && !!downloadableProvider(resolvedProvider) && transcript.length > 0;
+            let exportId = stored.source && stored.id
+              ? stored.id
+              : generated ? conversationExportSessionId(id, role, downloadableProvider(resolvedProvider)!) : undefined;
+            let exportMetadata = {};
+            if (resolvedProvider === 'codex' && (exportId || (stored.id && stored.home))) {
+              const sessionId = stored.id ?? exportId!;
+              const exported = await createCodexConversationExport(this.deps.objects ?? new LocalObjectStore(paths().objects),
+                id, role, sessionId, stored.home && stored.id ? { home: stored.home } : {
+                  generated: await exportConversationWithPanagent({ messages: transcript, provider: 'codex',
+                    sessionId, title: `${t?.title} · ${role}`, cwd: view?.worldPath }),
+                });
+              exportId = exported.exportId;
+              exportMetadata = { filename: exported.filename, requiredCodexVersion: exported.requiredCodexVersion,
+                downloadUrl: `/api/tasks/${encodeURIComponent(id)}/conversation.jsonl?role=${encodeURIComponent(role)}&exportId=${exportId}` };
+            }
+            if (!s && !exportId) continue;
+            out[role] = {
+              id: s ?? exportId!,
+              ...exportMetadata,
+              ...((stored.home ?? home) ? { home: stored.home ?? home } : {}),
+              ...(resolvedProvider ? { provider: resolvedProvider } : {}),
+              ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
+              ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
+              ...(exportId ? { exportId, downloadable: true, ...(generated ? { generated: true } : {}) } : {}),
+            };
+          } catch (error) {
+            if (s) out[role] = { id: s, provider: spec?.provider ?? provider, downloadable: false,
+              exportError: error instanceof Error ? error.message : String(error) };
+          }
         }
         return this.json(res, 200, out);
       }
@@ -5154,7 +5205,7 @@ export class Gateway {
         });
         if (method === 'PUT') {
           if (!this.deps.tokens.check(token, 'settings:write').ok)
-            return this.json(res, 403, { error: 'Only a Krmax installation administrator can configure the shared Stripe Connect application' });
+            return this.json(res, 403, { error: `Only a ${this.siteName} installation administrator can configure the shared Stripe Connect application` });
           const b = await this.body(req);
           try {
             return this.json(res, 200, {
@@ -5506,7 +5557,9 @@ export class Gateway {
           const value = field === 'totp'
             ? vault.totp(item, { taskId: callerTaskId, principal })
             : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
-          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+          const notes = b.field == null && item.type === 'login' && item.fields.includes('note')
+            ? vault.resolveField(item, 'note', { taskId: callerTaskId, principal, mode: 'reveal' }) : undefined;
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value, ...(notes !== undefined ? { notes } : {}) });
         }
         // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
         // never through the agent. `username` fills metadata; `totp` fills the
@@ -5588,8 +5641,8 @@ export class Gateway {
             const item = resolved.itemId ? vault.get(resolved.itemId) : undefined;
             const label = item?.label ?? resolved.domain ?? 'credential';
             const message = action === 'deny'
-              ? `[Krmax credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
-              : `[Krmax credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
+              ? `[${this.siteName} credential decision]\n\nAccess to "${label}" was denied. Do not request it again; continue without it or explain why the task cannot proceed.`
+              : `[${this.siteName} credential decision]\n\nAccess to "${label}" was approved (${action}). Retry the blocked ${resolved.mode} operation now; the grant is already active.`;
             const resume = await api.resumeAfterCredentialDecision(resolved.taskId, message);
             const task = store.getTask(resolved.taskId);
             if (task && store.getProject(task.projectId)?.organizationId === organizationId) {
@@ -5793,8 +5846,8 @@ export class Gateway {
         const to = String(b.to ?? session.email ?? '').trim();
         if (!to) return this.json(res, 400, { error: 'no recipient — pass { to } or sign in with an email' });
         try {
-          await this.deps.email.send({ to, subject: 'krmax test email',
-            text: 'This is a test email from karmax. Outbound email is working.' });
+          await this.deps.email.send({ to, subject: `${this.siteName} test email`,
+            text: `This is a test email from ${this.siteName}. Outbound email is working.` });
           return this.json(res, 200, { ok: true, to });
         } catch (e) { return this.json(res, 502, { error: e instanceof Error ? e.message : String(e) }); }
       }
@@ -6482,7 +6535,12 @@ export class Gateway {
             return this.json(res, 400, { error: 'Unknown brand icon' });
           }
           const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
-          store.setSettings('global', wf, values);
+          // Appearance is installation identity rather than a replace-all task
+          // default. Its name and icon have separate controls and API routes, so
+          // changing either must retain the other.
+          store.setSettings('global', wf, wf === 'appearance'
+            ? { ...(store.getSettings('global', wf) ?? {}), ...values }
+            : values);
           if (wf === 'agent-queue') await api.setAgentCapacity(token, Number(values.capacity));
           return this.json(res, 200, { ok: true });
         }
@@ -6702,7 +6760,7 @@ export class Gateway {
         // name is only for the first provisioning attempt.
         const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
         const repository = await githubApp.ensureRepository(connection.id, actor, {
-          name, description: `Krmax project wiki for ${project.name}`,
+          name, description: `${this.siteName} project wiki for ${project.name}`,
           private: true, defaultBranch: 'main', autoInit: false,
         });
         // Link before the push so even a transient network failure keeps this
@@ -6961,15 +7019,61 @@ export class Gateway {
     }
   }
 
+  /** Unlike the static asset shell, the installable-app name follows the live
+   * installation setting. Icons keep their stable setting-resolved URLs. */
+  private webManifest(res: http.ServerResponse) {
+    const name = this.siteName;
+    const body = JSON.stringify({
+      name,
+      short_name: name,
+      description: 'Your agent task board',
+      start_url: '/',
+      scope: '/',
+      display: 'standalone',
+      background_color: '#f6f7f9',
+      theme_color: '#5b5bd6',
+      icons: [
+        { src: '/brand/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' },
+        { src: '/brand/icon-192.png', sizes: '192x192', type: 'image/png' },
+        { src: '/brand/icon-512.png', sizes: '512x512', type: 'image/png' },
+      ],
+    });
+    res.writeHead(200, { 'content-type': MIME['.webmanifest']!, 'cache-control': 'no-cache',
+      'content-length': String(Buffer.byteLength(body)) });
+    res.end(body);
+  }
+
   // ── static SPA ──
-  private async static(p: string, res: http.ServerResponse) {
+  private async static(p: string, res: http.ServerResponse, req?: http.IncomingMessage) {
     let rel = p === '/' ? '/index.html' : p;
     let file = path.join(this.deps.staticDir, rel);
     if (!file.startsWith(this.deps.staticDir) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
       file = path.join(this.deps.staticDir, 'index.html'); // SPA fallback
     }
     try {
-      const data = await fs.promises.readFile(file);
+      let data = await fs.promises.readFile(file);
+      // Brand the HTML response itself, not just the hydrated SPA. That avoids a
+      // flash of the default name and gives crawlers/non-JS clients the current
+      // installation identity. The checked-in shell remains a portable fallback.
+      if (path.basename(file) === 'index.html') {
+        const name = escapeHtml(this.siteName);
+        data = Buffer.from(data.toString('utf8')
+          .replace(/(<meta name="description" content=")[^"]*(" \/>)/, `$1${name} is the to-do list for managing AI agents: parallel cloud worlds, review gates, permissions, credentials, and payments in one calm interface.$2`)
+          .replace(/(<meta name="apple-mobile-web-app-title" content=")[^"]*(" \/>)/, `$1${name}$2`)
+          .replace(/<title>[^<]*<\/title>/, `<title>${name}</title>`));
+      }
+      // `llms.txt` is also public product copy. Keep its checked-in version a
+      // useful default, then brand both its prose and same-origin links at the
+      // edge so hosted and self-hosted installations describe themselves.
+      if (path.basename(file) === 'llms.txt') {
+        const name = this.siteName;
+        const origin = req ? this.publicUrl(req) : process.env.KARMAX_PUBLIC_URL?.replace(/\/$/, '') ?? '';
+        data = Buffer.from(data.toString('utf8')
+          .replace(/^# krmax$/m, `# ${name}`)
+          .replace(/^> krmax is /m, `> ${name} is `)
+          .replace(/^krmax gives /m, `${name} gives `)
+          .replace(/https:\/\/krmax\.io/g, origin || 'https://krmax.io'));
+      }
       res.writeHead(200, staticAssetHeaders(file));
       res.end(data);
     } catch {
@@ -7426,6 +7530,11 @@ export class Gateway {
       this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value);
       return value;
     }
+    // A deployment-domain migration is authoritative. The persisted browser
+    // origin belongs to the original manifest setup and otherwise keeps OAuth
+    // callbacks pinned to the retired host forever after a move.
+    const configured = process.env.KARMAX_PUBLIC_URL?.trim();
+    if (configured) return new URL(configured).origin;
     return this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY) ?? this.publicUrl(req);
   }
 
@@ -7631,13 +7740,15 @@ export class Gateway {
     res.end(body);
   }
   private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {
-    const body = `<!doctype html><meta charset="utf-8"><title>Krmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
+    const name = escapeHtml(this.siteName);
+    const body = `<!doctype html><meta charset="utf-8"><title>${name} · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to ${name}</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
       'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private paymentCallbackPage(res: http.ServerResponse, status: number, message: string) {
-    const body = `<!doctype html><meta charset="utf-8"><title>Krmax · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Krmax</a></p></main>`;
+    const name = escapeHtml(this.siteName);
+    const body = `<!doctype html><meta charset="utf-8"><title>${name} · Stripe</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>Stripe connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to ${name}</a></p></main>`;
     res.writeHead(status, { 'content-type': 'text/html; charset=utf-8',
       'content-length': String(Buffer.byteLength(body)), 'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);

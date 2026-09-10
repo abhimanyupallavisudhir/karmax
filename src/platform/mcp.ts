@@ -57,7 +57,7 @@ export interface PlatformOps {
   findTask(projectId: string, num: number): Promise<unknown>;
   listAgents(taskId: string): Promise<unknown>;
   getConversation(taskId: string, role?: string): Promise<unknown>;
-  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string;
+  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; base?: string; authorizationProfile?: string;
     reauthorize?: boolean; target?: string; provider?: Provider; model?: string; effort?: AgentSpec['effort'] }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
   listGithubActionsRuns(a: { repository?: string; branch?: string; event?: string; status?: string;
@@ -415,10 +415,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool(
     'fork_agent',
     {
-      description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. The source remains untouched. Use message_agent for later back-and-forth with the fork. reauthorize=true starts the fork with the grants the source task ended with (its authorization level/scope and approved vault credentials) instead of the project default; the grant is checked against your own authority like any new task.',
+      description: 'Branch an attached agent into a new independent task, optionally with a different provider/model. Defaults to the source task branch and unpublished checkpoint, or its merge target after landing. Set base to another branch for normal project initialization. The source remains untouched. Use message_agent for later back-and-forth with the fork. reauthorize=true starts the fork with the grants the source task ended with (its authorization level/scope and approved vault credentials) instead of the project default; the grant is checked against your own authority like any new task.',
       inputSchema: {
         taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(),
-        target: z.string().optional(), authorizationProfile: z.string().optional(), reauthorize: z.boolean().optional(),
+        base: z.string().optional(), target: z.string().optional(), authorizationProfile: z.string().optional(), reauthorize: z.boolean().optional(),
         provider: z.enum(['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock']).optional(),
         model: z.string().optional(), effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
       },
@@ -577,7 +577,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'get_credential',
     {
       description:
-        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),

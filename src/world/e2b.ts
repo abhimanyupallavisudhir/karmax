@@ -542,11 +542,11 @@ class E2BWorld implements World {
       exited = true;
       exitCode = code;
       for (const listener of exits) listener(code);
-    }).catch(() => {
+    }).catch((error) => {
       stopKeepAlive();
       exited = true;
-      exitCode = -1;
-      for (const listener of exits) listener(-1);
+      exitCode = typeof error?.exitCode === 'number' ? error.exitCode : -1;
+      for (const listener of exits) listener(exitCode);
     });
     return {
       onData(listener) {

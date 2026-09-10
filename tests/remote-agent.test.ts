@@ -3,10 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CodexAdapter } from '../src/agent/codex.js';
+import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
-  reconcileRemoteCodexSessionCopies, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
+  reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
@@ -66,7 +66,43 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('subscription');
     expect(world.commands.some((command) => command.includes('find') && command.includes('chmod 600'))).toBe(true);
     await seedRemoteAgentHome(world, 'codex', localHome, 'host-task');
-    expect(world.files.get(`${remoteHome}/sessions/host-task.jsonl`)?.toString()).toBe('host-only conversation');
+    expect(world.files.get(`${remoteHome}/sessions/forked/host-task.jsonl`)?.toString()).toBe('host-only conversation');
+  });
+
+  it('keeps a managed runtime even when task-installed system Node reports a modern version', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-runtime-'));
+    const world = fakeWorld();
+    // All commands, including an ambient version probe, report success.
+    const first = await seedRemoteAgentHome(world, 'codex', localHome);
+    const second = await seedRemoteAgentHome(world, 'codex', localHome);
+    expect(first.runtimeBin).toBe('/workspace/.karmax-injection/agent/tools/node-22.16.0/bin');
+    expect(second.runtimeBin).toBe(first.runtimeBin);
+  });
+
+  it('delivers remote stderr before close, including when diagnostics cannot be read', async () => {
+    for (const readable of [true, false]) {
+      let exit!: (code: number | null) => void;
+      const world = fakeWorld();
+      world.openPty = async () => ({
+        onData: () => () => {}, onExit: (listener) => { exit = listener; return () => {}; },
+        write: async () => {}, resize: async () => {}, close: async () => {},
+      });
+      world.exec = async () => {
+        if (!readable) throw new Error('sandbox unavailable');
+        return { code: 0, stdout: 'npm ENOENT: missing node/lib', stderr: '' };
+      };
+      const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {}, undefined, '/home/agent-stderr.log');
+      let diagnostic = '';
+      child.stderr.on('data', (chunk) => { diagnostic += chunk; });
+      const closed = new Promise<void>((resolve) => child.once('close', (code) => {
+        expect(code).toBe(254);
+        expect(diagnostic).toBe(readable ? 'npm ENOENT: missing node/lib' : '');
+        resolve();
+      }));
+      await Promise.resolve();
+      exit(254);
+      await closed;
+    }
   });
 
   it('keeps Claude refresh authority on the control plane across parallel worlds', async () => {
@@ -152,7 +188,7 @@ describe('remote subscription agents', () => {
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
       .toEqual(expect.arrayContaining([`@anthropic-ai/claude-code@${pinned}`, '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
-      .toEqual(expect.arrayContaining(['@openai/codex@0.153.4', 'app-server']));
+      .toEqual(expect.arrayContaining(['@openai/codex@0.154.0-alpha.11', 'app-server']));
   });
 
   it('isolates accounts and exports native sessions without importing task-local OAuth state', async () => {
@@ -171,7 +207,7 @@ describe('remote subscription agents', () => {
     world.files.set(`${a.relative}/sessions/2026/session-a.jsonl`, Buffer.from('durable native session'));
     await syncRemoteAgentHome(world, 'codex', a, first);
     expect(fs.readFileSync(path.join(first, 'auth.json'), 'utf8')).toContain('a-old');
-    expect(fs.readFileSync(path.join(first, 'sessions/2026/session-a.jsonl'), 'utf8')).toBe('durable native session');
+    expect(fs.readFileSync(path.join(first, 'sessions/forked/session-a.jsonl'), 'utf8')).toBe('durable native session');
     fs.rmSync(second, { recursive: true, force: true });
   });
 
@@ -213,7 +249,7 @@ describe('remote subscription agents', () => {
     // launcher sets vm.overcommit_memory=1 first so Chrome's V8 renderer can run
     // in the memory-constrained sandbox (findings/e2b-headless-chrome-overcommit).
     expect(seeded.browserMcp?.['chrome-devtools']).toMatchObject({
-      command: 'node',
+      command: `${seeded.runtimeBin}/node`,
       args: ['/workspace/.karmax-injection/agent/chrome-cdp-launcher.mjs'],
       env: {
         PLAYWRIGHT_BROWSERS_PATH: '/opt/karmax/browsers',
@@ -253,7 +289,7 @@ describe('remote subscription agents', () => {
     source.files.set(`${prefix}/sessions/rollout-unrelated.jsonl`, rollout('unrelated'));
     expect(await materializeRemoteSession(source, destination, 'codex', 'leaf-session', localHome)).toBe(true);
     const home = remoteAgentHomeRelative('codex', localHome);
-    expect([...destination.files.keys()].sort()).toEqual(['leaf-session', 'parent-session', 'root-session']
+    expect([...destination.files.keys()].filter((file) => !file.endsWith('.karmax-history-publish.sqlite')).sort()).toEqual(['leaf-session', 'parent-session', 'root-session']
       .map((id) => `${home}/sessions/forked/rollout-${id}.jsonl`).sort());
     expect(destination.files.get(`${home}/sessions/forked/rollout-parent-session.jsonl`))
       .toEqual(rollout('parent-session', 'root-session'));
@@ -264,7 +300,7 @@ describe('remote subscription agents', () => {
     await syncRemoteAgentHome(destination, 'codex', { absolute: `/workspace/${home}`, relative: home }, localHome);
     const restored = fakeWorld();
     await seedRemoteAgentHome(restored, 'codex', localHome, 'leaf-session');
-    for (const [file, content] of destination.files) expect(restored.files.get(file)).toEqual(content);
+    for (const [file, content] of destination.files) if (!file.includes('.karmax-history-publish.sqlite')) expect(restored.files.get(`${home}/sessions/forked/${path.basename(file)}`)).toEqual(content);
   });
 
   it.each(['missing', 'cycle'])('rejects %s remote lineage without exposing a partial session', async (kind) => {
@@ -276,7 +312,7 @@ describe('remote subscription agents', () => {
       } } })));
     // A different account must not satisfy this dependency.
     source.files.set('.karmax-injection/agent/codex/other/sessions/rollout-missing-session.jsonl', Buffer.from('{}'));
-    expect(await materializeRemoteSession(source, destination, 'codex', 'leaf-session', localHome)).toBe(false);
+    await expect(materializeRemoteSession(source, destination, 'codex', 'leaf-session', localHome)).rejects.toThrow(/missing ancestor|cyclic lineage/);
     expect(destination.files.size).toBe(0);
   });
 
@@ -294,7 +330,7 @@ describe('remote subscription agents', () => {
     world.files.set(`${relative}/archived_sessions/rollout-root-session.jsonl`, Buffer.from(root));
     world.files.set(`${relative}/sessions/rollout-unrelated-session.jsonl`, Buffer.from('unrelated'));
     await reconcileRemoteCodexSessionCopies(world, { relative, absolute: `/workspace/${relative}` }, 'leaf-session');
-    expect([...world.files.keys()].sort()).toEqual([
+    expect([...world.files.keys()].filter((file) => !file.includes('.karmax-history-backups') && !file.endsWith('.karmax-history-publish.sqlite')).sort()).toEqual([
       `${relative}/sessions/forked/rollout-leaf-session.jsonl`,
       `${relative}/sessions/forked/rollout-root-session.jsonl`,
       `${relative}/sessions/rollout-unrelated-session.jsonl`,
@@ -332,8 +368,8 @@ describe('remote subscription agents', () => {
     } as any, { emit() {}, emitActivity() {}, onSession: (id: string) => sessions.push(id),
       platformRequest: async (method: string, requestPath: string) => { platformCalls.push(`${method} ${requestPath}`); return [{ type: 'ok' }]; } } as any);
 
-    expect(result).toMatchObject({ termination: { kind: 'success', status: 'completed' }, session: 'remote-thread', output: 'done remotely' });
-    expect(world.openedPty?.command).toContain('@openai/codex@0.153.4');
+    expect(result).toMatchObject({ termination: { kind: 'success', status: 'completed' }, session: '22222222-2222-4222-8222-222222222222', output: 'done remotely' });
+    expect(world.openedPty?.command).toContain('@openai/codex@0.154.0-alpha.11');
     expect(world.openedPty?.command).toContain('/opt/karmax/bin/codex');
     expect(world.openedPty?.command).toContain('app-server');
     expect(world.openedPty?.command).toContain('stty raw -echo');
@@ -344,7 +380,7 @@ describe('remote subscription agents', () => {
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
     expect(world.openedPty?.env).toMatchObject({ CODEX_HOME: `/workspace/${remoteHome}` });
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('chatgpt');
-    expect(sessions).toContain('remote-thread');
+    expect(sessions).toContain('22222222-2222-4222-8222-222222222222');
     expect(platformCalls).toEqual(['GET /api/tasks/task/events?since=0']);
     expect(world.dynamicTools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'list_events' })]));
   });
@@ -372,7 +408,7 @@ describe('remote subscription agents', () => {
 
     expect(result).toMatchObject({
       termination: { kind: 'success', status: 'completed' },
-      session: 'remote-thread', output: 'done remotely',
+      session: '22222222-2222-4222-8222-222222222222', output: 'done remotely',
     });
     expect(activities).toContainEqual(expect.objectContaining({
       kind: 'error', phase: 'failed', title: expect.stringMatching(/remote Codex state/i),
@@ -405,12 +441,13 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     fs.chmodSync(usageStub, 0o755);
     process.env.KARMAX_CODEX_USAGE_CMD = usageStub;
     const world = fakeWorld(true, false, true);
+    if (mode !== 'new') writeFakeHistory(world, localHome, '11111111-1111-4111-8111-111111111111');
     const activities: any[] = [];
     const controller = new AbortController();
 
     const result = await new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
-      world, session: mode === 'new' ? undefined : 'original-thread', fork,
+      world, session: mode === 'new' ? undefined : '11111111-1111-4111-8111-111111111111', fork,
       messages: [{ id: 'm', role: 'user', text: 'continue safely', ts: 0 }],
       systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
     } as any, { signal: controller.signal, emit() {}, emitActivity: (activity: any) => {
@@ -425,7 +462,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       return;
     }
 
-    expect(result).toMatchObject({ termination: { kind: 'success' }, session: fork ? 'forked-remote-thread' : mode === 'new' ? 'remote-thread' : 'original-thread' });
+    expect(result).toMatchObject({ termination: { kind: 'success' }, session: fork ? '33333333-3333-4333-8333-333333333333' : mode === 'new' ? '22222222-2222-4222-8222-222222222222' : '11111111-1111-4111-8111-111111111111' });
     expect(world.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
     expect(world.requests.filter((request) => request.method === 'thread/fork')).toHaveLength(fork ? 1 : 0);
     expect(activities).toContainEqual(expect.objectContaining({
@@ -506,7 +543,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     expect(world.requests.some((request) => request.method === method)).toBe(true);
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
     const original = fs.readFileSync(path.join(directory, `rollout-${session}.jsonl`));
-    expect(world.files.get(`${remoteHome}/sessions/2026/07/19/rollout-${session}.jsonl`)).toEqual(original);
+    expect(world.files.get(`${remoteHome}/sessions/forked/rollout-${session}.jsonl`)).toEqual(original);
     const prepared = world.requests.find((request) => request.method === method).params.threadId;
     expect(prepared).not.toBe(session);
     const rollout = world.files.get([...world.files.keys()].find((file) => file.endsWith(`${prepared}.jsonl`))!)!.toString();
@@ -539,9 +576,29 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
         for (const file of args.slice(2)) files.delete(file.replace('/workspace/', ''));
         return { stdout: '', stderr: '', code: 0 };
       }
-      if (command === 'node' && args[0] === '-e' && args[1]?.includes('process.versions.node'))
+      if (path.posix.basename(command) === 'node' && args[0] === '-e' && args[1]?.includes('.karmax-history-publish.sqlite')) {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-publish-'));
+        try {
+          for (const [file, content] of files) {
+            const target = path.join(root, file);
+            fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, content);
+          }
+          const result = spawnSync(process.execPath, [args[0]!, args[1]!, ...args.slice(2).map((arg) => arg.replace('/workspace/', root + '/'))], { encoding: 'utf8' });
+          files.clear();
+          const walk = (dir: string) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) walk(file);
+              else files.set(path.relative(root, file), fs.readFileSync(file));
+            }
+          };
+          walk(root);
+          return { stdout: result.stdout, stderr: result.stderr, code: result.status ?? 1 };
+        } finally { fs.rmSync(root, { recursive: true, force: true }); }
+      }
+      if (path.posix.basename(command) === 'node' && args[0] === '-e' && args[1]?.includes('process.versions.node'))
         return { stdout: '', stderr: '', code: 0 };
-      if (browserReady && command === 'node' && args[0] === '-e' && args[1]?.includes('executablePath'))
+      if (browserReady && path.posix.basename(command) === 'node' && args[0] === '-e' && args[1]?.includes('executablePath'))
         return { stdout: '/opt/karmax/browsers/chromium', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     },
@@ -584,12 +641,15 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
             else if (request.method === 'mcpServerStatus/list') send({ id: request.id, result: { data: [], nextCursor: null } });
             else if (request.method === 'thread/start') {
               world.dynamicTools = request.params.dynamicTools;
-              send({ id: request.id, result: { thread: { id: 'remote-thread' } } });
+              writeFakeHistory(world, undefined, '22222222-2222-4222-8222-222222222222');
+              send({ id: request.id, result: { thread: { id: '22222222-2222-4222-8222-222222222222' } } });
             }
             else if (request.method === 'thread/resume')
               send({ id: request.id, result: { thread: { id: request.params.threadId } } });
-            else if (request.method === 'thread/fork')
-              send({ id: request.id, result: { thread: { id: 'forked-remote-thread' } } });
+            else if (request.method === 'thread/fork') {
+              writeFakeHistory(world, undefined, '33333333-3333-4333-8333-333333333333');
+              send({ id: request.id, result: { thread: { id: '33333333-3333-4333-8333-333333333333' } } });
+            }
             else if (request.method === 'turn/start') {
               turnStarts++;
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
@@ -605,7 +665,7 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
                 } } });
                 continue;
               }
-              send({ id: 99, method: 'item/tool/call', params: { threadId: 'remote-thread', turnId: 'remote-turn',
+              send({ id: 99, method: 'item/tool/call', params: { threadId: '22222222-2222-4222-8222-222222222222', turnId: 'remote-turn',
                 callId: 'call-1', namespace: null, tool: 'list_events', arguments: { task_id: 'task', since: 0 } } });
             } else if (request.id === 99 && request.result?.success) {
               send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done remotely' } } });
@@ -621,4 +681,12 @@ function fakeWorld(appServer = false, browserReady = false, expireFirstTurn = fa
     async destroy() {},
   };
   return world;
+}
+
+function writeFakeHistory(world: ReturnType<typeof fakeWorld>, localHome: string | undefined, id: string) {
+  const prefix = localHome ? remoteAgentHomeRelative('codex', localHome)
+    : String(world.openedPty?.env?.CODEX_HOME).replace('/workspace/', '');
+  world.files.set(`${prefix}/sessions/forked/rollout-2026-09-09T00-00-00-${id}.jsonl`, Buffer.from(JSON.stringify({
+    ordinal: 0, type: 'session_meta', payload: { id, timestamp: '2026-09-09T00:00:00Z', history_mode: 'paginated', dynamic_tools: codexDynamicTools(true) },
+  }) + '\n'));
 }

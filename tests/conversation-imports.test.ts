@@ -94,6 +94,32 @@ describe('conversation import storage', () => {
 });
 
 describe('Krmax panagent bridge', () => {
+  it('preserves native Codex tool and compaction payloads on upload under a fresh identity', async () => {
+    const home = temporary('karmax-native-codex-import-');
+    const records = [
+      { ordinal: 0, type: 'session_meta', payload: { id: SOURCE_SESSION, timestamp: '2026-09-09T00:00:00Z', history_mode: 'paginated' } },
+      { ordinal: 1, type: 'response_item', payload: { type: 'function_call', name: 'exec', call_id: 'call1', arguments: '{"cmd":"pwd"}' } },
+      { ordinal: 2, type: 'response_item', payload: { type: 'function_call_output', call_id: 'call1', output: 'native output' } },
+      { ordinal: 3, type: 'compacted', payload: { message: 'compact context', replacement_history: [] } },
+    ];
+    try {
+      const source = { data: Buffer.from('\uFEFF' + records.map((record) => JSON.stringify(record)).join('\n') + '\n') };
+      const options = { source, provider: 'codex' as const, forkHome: home, worldPath: '/tmp/imported', mode: 'transcript' as const, native: true };
+      const first = await importWithPanagent(options), second = await importWithPanagent(options);
+      expect(first.kind).toBe('native'); expect(second.kind).toBe('native');
+      if (first.kind !== 'native' || second.kind !== 'native') return;
+      expect(first.sessionId).not.toBe(second.sessionId);
+      const dir = path.join(home, 'sessions', 'forked');
+      const file = path.join(dir, fs.readdirSync(dir).find((name) => name.endsWith(`${first.sessionId}.jsonl`))!);
+      const imported = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(imported.slice(1)).toEqual(records.slice(1));
+      expect(source.data.toString().startsWith('\uFEFF')).toBe(true);
+      const paginated = Buffer.from(JSON.stringify({ ...records[0], payload: { ...records[0]!.payload,
+        history_base: { thread_id: '99999999-9999-4999-8999-999999999999', end_byte_offset: 200, end_ordinal_exclusive: 1 } } }) + '\n');
+      await expect(importWithPanagent({ ...options, source: { data: paginated } })).rejects.toThrow('missing ancestor');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   it.each(['codex', 'claude'] as const)('exports a durable Karmax transcript as resumable %s JSONL', async (provider) => {
     const sessionId = provider === 'codex'
       ? '33333333-3333-4333-8333-333333333333'
@@ -121,7 +147,7 @@ describe('Krmax panagent bridge', () => {
       expect(result.kind).toBe('native');
       if (result.kind !== 'native') return;
       expect(result.sessionId).not.toBe(SOURCE_SESSION);
-      const file = path.join(home, 'sessions', 'forked', `rollout-panagent-${result.sessionId}.jsonl`);
+      const file = path.join(home, 'sessions', 'forked', fs.readdirSync(path.join(home, 'sessions', 'forked')).find((name) => name.endsWith(`${result.sessionId}.jsonl`))!);
       const records = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
       expect(records[0].payload.id).toBe(result.sessionId);
       expect(records.some((record) => record.type === 'response_item'

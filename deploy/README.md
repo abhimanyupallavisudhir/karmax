@@ -36,6 +36,28 @@ manage. You can choose another preview base as the second argument:
 ./deploy/karmax up karmax.example.com previews.example.net
 ```
 
+Running `up` with a different application domain records the previous domain as
+`KARMAX_LEGACY_DOMAIN`. Caddy keeps the old apex and `www` host on HTTPS and
+permanently redirects them to the new canonical origin. Keep both domains'
+DNS records pointed at the VPS. Also update exact callback URLs registered with
+Google, GitHub, or an OIDC provider before relying on sign-in at the new origin.
+Users must sign in again because browser cookies do not cross domains. The old
+`/api/github/webhook` endpoint remains proxied (not redirected) so deliveries
+continue while the GitHub App's webhook URL is being updated.
+
+To activate a domain change with the next reviewed, CI-validated release, set
+`KARMAX_PENDING_DOMAIN` and `KARMAX_PENDING_PREVIEW_DOMAIN` in `.turnkey.env`.
+`update` consumes them and records the old domain; existing running containers
+are unchanged until the release starts. Failed deployments restore the old
+environment. An interrupted update retains `.turnkey.env.migration.*` for
+operator recovery; inspect container/source state before retrying.
+
+The human-facing name is independent of the domain: use **Installation →
+Appearance → Site identity**, or authenticated `PUT /api/settings/installation`
+with `{"siteName":"tavya"}` (`settings:write`). `GET` requires `settings:read`;
+the public `/api/meta` includes the effective `siteName`. This does not rename
+real projects, repositories, environment variables, or stored identifiers.
+
 Open the URL, create the first administrator, then use **Organization settings**
 to:
 

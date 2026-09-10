@@ -17,7 +17,7 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
     ],
     interactiveHuman: [
-      'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding',
+      'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
       'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
       'DELETE /api/organizations/:organizationId',
       'POST /api/users', 'DELETE /api/users/:userId',
@@ -59,8 +59,9 @@ export const PLATFORM_API_CATALOG = {
   organizations: [
     'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
     'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display preference)',
+    'POST /api/user/onboarding/reset (restart the signed-in user’s hosted walkthrough in each organization)',
     'GET /api/settings/access?organizationId= (UI-safe write access summary; accepts projectId instead)',
-    'GET /api/settings/installation (global operator-only Installation page probe)',
+    'GET|PUT /api/settings/installation (global operator-only installation identity; PUT body {siteName})',
     'GET|POST /api/organizations (POST requires a verified human subject; delegation accepted)',
     'GET|PATCH|DELETE /api/organizations/:organizationId (PATCH body {name}; DELETE body {confirmSlug})',
     'GET /api/organizations/:organizationId/entitlements (current hosted plan, limits, and live usage; private installs are unlimited)',

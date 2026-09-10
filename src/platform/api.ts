@@ -55,6 +55,7 @@ import type { WorldHandle } from '../world/types.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
+import { forkWorldSource, type ForkWorldSource } from '../world/fork.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { ensureTaskBranchAncestry } from '../world/task-branch.js';
 import type { WorldAccessService } from '../world/access.js';
@@ -963,6 +964,23 @@ export class KarmaxApi {
     return selected;
   }
 
+  private prepareForkWorld(projectId: string, params: ValueMap, previous?: ValueMap): void {
+    // Never accept a caller-supplied checkpoint or repository manifest.
+    delete params._forkWorld;
+    const spec = (params['agent:do'] ?? params['agent:unified']) as AgentSpec | undefined;
+    const sourceId = spec?.resumeFrom?.taskId;
+    if (!sourceId) return;
+    const source = this.deps.store.getTask(sourceId);
+    // Cross-project conversation reuse does not grant access to private worlds.
+    if (!source || source.projectId !== projectId) return;
+    const retained = previous?._forkWorld as ForkWorldSource | undefined;
+    const start = retained?.taskId === sourceId ? retained
+      : forkWorldSource(source, this.deps.store.currentWorld(sourceId) as WorldHandle | undefined);
+    if (!start) return;
+    params._forkWorld = start;
+    if (!previous && params.base === undefined) params.base = start.base;
+  }
+
   async createTask(
     token: string,
     args: {
@@ -1062,6 +1080,7 @@ export class KarmaxApi {
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     this.validateAndAuthorizeResumeSources(token, taskOverrides);
+    this.prepareForkWorld(args.projectId, taskOverrides);
     const inheritedFiles = this.inheritedResumeFiles(taskOverrides);
     // Resume authorization above grants conversation-read authority. Extend each
     // inherited content hash into the destination project before validating it.
@@ -2150,6 +2169,7 @@ export class KarmaxApi {
       }
     }
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
+    this.prepareForkWorld(task.projectId, base, task.params);
     // Authorization is platform metadata, never a workflow-form field.
     if (_authorization !== undefined) base._authorization = _authorization;
     delete base.triggerState; // lifecycle flags are managed below, never taken from the form
@@ -3548,7 +3568,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * the fork more than it could grant a fresh task, so an over-broad source
    * fails loudly rather than silently attenuating. */
   async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string;
-    target?: string; authorizationProfile?: string; reauthorize?: boolean; provider?: Provider; model?: string;
+    base?: string; target?: string; authorizationProfile?: string; reauthorize?: boolean; provider?: Provider; model?: string;
     effort?: AgentSpec['effort'] }): Promise<TaskRecord> {
     const source = this.deps.store.getTask(args.taskId);
     this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
@@ -3563,7 +3583,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       workflow: 'software-dev',
       params: {
         prompt: args.message,
-        ...(args.target ? { base: args.target, target: args.target } : {}),
+        ...(args.target ? { target: args.target } : {}),
+        // Existing callers use target as a combined base/target override.
+        // The new base field can override that legacy shorthand independently.
+        ...(args.base || args.target ? { base: args.base ?? args.target } : {}),
         'agent:do': {
           ...(args.provider ? { provider: args.provider } : {}),
           ...(args.model ? { model: args.model } : {}),
@@ -4209,7 +4232,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         // accepted message separately so every open conversation can render it
         // mid-turn without changing replay-sensitive workflow command histories.
         this.publishConversationMessage(taskId, role, followUp);
-      } else if (signal === SIG.openPr && caller.principal.startsWith('user:')) {
+      } else if (signal === SIG.openPr && caller.kind === 'human' && caller.principal.startsWith('user:')) {
+        // Delegated task agents also carry their grantor's user principal.
+        // Only a human action may pre-authorize the subsequent Review gate.
         await handle.signal(signal, { userId: caller.principal.slice(5) });
       } else if (signal === SIG.approveCheckout) {
         await handle.signal(signal, { name: text ?? '' });

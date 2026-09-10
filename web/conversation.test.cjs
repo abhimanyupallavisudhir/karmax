@@ -213,28 +213,33 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 // Forking addresses the conversation being viewed, including completed agents
 // and sessions without a native CLI/config home.
 eval(extractFn('conversationPane'));
+eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
 global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
 global.openTaskForm = (...args) => { global.openedForkForm = args; };
-const forkView = { taskId: 'source-task', status: 'completed', actions: [] };
-for (const role of ['do', 'merge', 'confirm', 'resolve']) {
-  const html = conversationPane(forkView, { role, messages: [] });
-  ok(html.includes('id="fork-task-agent"') && html.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
-  let click;
-  global.$ = (selector) => selector === '#main'
-    ? { querySelector: () => null, querySelectorAll: () => [] }
-    : selector === '#fork-task-agent'
-      ? { addEventListener: (_type, handler) => { click = handler; } }
-      : null;
-  wireCheckinSidebar(forkView);
-  click({ currentTarget: { dataset: { role } } });
-  const [workflow, draft, prompt, params] = global.openedForkForm;
-  ok(workflow === 'software-dev' && !draft && !prompt
-    && params['agent:do'].resumeFrom.taskId === 'source-task'
-    && params['agent:do'].resumeFrom.role === role,
-    `${role} fork opens a new task form with the correct source and an empty next instruction`);
+const forkView = { taskId: 'source-task', status: 'done', branch: 'karmax/source-task', targetBranch: 'release', actions: [] };
+for (const status of ['done', 'cancelled', 'waiting']) {
+  forkView.status = status;
+  for (const role of ['do', 'merge', 'confirm', 'resolve']) {
+    const html = conversationPane(forkView, { role, messages: [] });
+    ok(html.includes('id="fork-task-agent"') && html.includes(`data-role="${role}"`), `${role} conversation offers a task fork without a CLI session`);
+    let click;
+    global.$ = (selector) => selector === '#main'
+      ? { querySelector: () => null, querySelectorAll: () => [] }
+      : selector === '#fork-task-agent'
+        ? { addEventListener: (_type, handler) => { click = handler; } }
+        : null;
+    wireCheckinSidebar(forkView);
+    click({ currentTarget: { dataset: { role } } });
+    const [workflow, draft, prompt, params] = global.openedForkForm;
+    ok(workflow === 'software-dev' && !draft && !prompt
+      && params['agent:do'].resumeFrom.taskId === 'source-task'
+      && params['agent:do'].resumeFrom.role === role
+      && params.base === (status === 'done' ? 'release' : 'karmax/source-task'),
+      `${status} ${role} fork opens a new task form with the correct source, branch and an empty next instruction`);
+  }
 }
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
 

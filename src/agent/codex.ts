@@ -26,8 +26,8 @@ import { activityDetail, codexItemActivity, toolActivityDetail } from './activit
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
   spawnRemoteAgentProcess, syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
-import { codexSessionWithTools } from './codex-session-tools.js';
-import { findProviderSession } from './fork.js';
+import { prepareCodexHistory } from './codex-history.js';
+import { readLocalCodexHistory, installLocalCodexSnapshot, publishLocalCodexHistory } from './codex-history-files.js';
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
 import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
@@ -91,19 +91,15 @@ export function codexDynamicTools(remote: boolean): Array<{ type: string; name: 
 }
 
 /** Return a tools-compatible session without rewriting a rollout that another
- * thread may reference. Unknown/legacy malformed sessions remain best-effort. */
-export function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools: unknown[]): string | undefined {
-  try {
-    const file = findProviderSession({ provider: 'codex', session, forkHome: configHome });
-    if (!file) return undefined;
-    const updated = codexSessionWithTools(fs.readFileSync(file), dynamicTools);
-    if (!updated) return session;
-    const destination = path.join(path.dirname(file), updated.filename);
-    fs.writeFileSync(destination, updated.content, { mode: 0o600, flag: 'wx' });
-    return updated.session;
-  } catch {
-    return undefined;
-  }
+ * thread may reference. Invalid native history fails before starting a turn. */
+export async function ensureLocalCodexSessionTools(configHome: string, session: string, dynamicTools?: unknown[]): Promise<string> {
+  const sources = new Map<string, ReturnType<typeof readLocalCodexHistory>>();
+  const snapshot = await prepareCodexHistory(session, async (id) => {
+    const source = readLocalCodexHistory(configHome, id); sources.set(id, source); return source;
+  }, { dynamicTools });
+  if (snapshot) return installLocalCodexSnapshot(configHome, session, snapshot);
+  for (const [id, source] of sources) publishLocalCodexHistory(configHome, source, id);
+  return session;
 }
 
 export class CodexAdapter implements AgentAdapter {
@@ -407,7 +403,7 @@ export class CodexAdapter implements AgentAdapter {
     if (remoteHome && input.session)
       preparedSession = await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools) ?? input.session;
     else if (!remote && input.session && input.resolvedAuth?.configHome)
-      preparedSession = ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools) ?? input.session;
+      preparedSession = await ensureLocalCodexSessionTools(input.resolvedAuth.configHome, input.session, dynamicTools) ?? input.session;
     let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
       extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
     if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
@@ -841,7 +837,7 @@ export class CodexAdapter implements AgentAdapter {
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       client.close();
       if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
-      else child.kill('SIGTERM');
+      else await child.stop();
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
       if (remoteHome && input.resolvedAuth?.configHome) {
         const failure = await syncRemoteAgentHomeBestEffort(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
@@ -876,6 +872,10 @@ export class CodexAdapter implements AgentAdapter {
 
   // ─── Codex CLI on a ChatGPT subscription (`codex exec --json`) ───────────────
   private async runCodexExec(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    if (input.session && input.resolvedAuth?.configHome) {
+      const home = input.resolvedAuth.configHome;
+      input = { ...input, session: await ensureLocalCodexSessionTools(home, input.session) };
+    }
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
     const model = input.profile.model ?? 'gpt-5.5';
     const effort = codexReasoningEffort(model, input.profile.effort);

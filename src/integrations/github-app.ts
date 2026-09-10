@@ -396,6 +396,15 @@ export class GitHubAppService {
     };
   }
 
+  /** GitHub changes an App's URL slug when its display name is renamed. Keep
+   * the locally cached slug aligned with the authenticated `/app` response so
+   * later installation links do not keep pointing at the retired brand URL. */
+  private rememberAppSlug(slug: string): void {
+    if (slug === this.options.appSlug) return;
+    this.options.appSlug = slug;
+    this.store.kvSet(GITHUB_APP_SLUG_KEY, slug);
+  }
+
   configure(input: { appId: string | number; appSlug: string; privateKey: string; webhookSecret?: string;
     clientId?: string; clientSecret?: string }): ReturnType<GitHubAppService['status']> {
     const appId = String(input.appId).trim();
@@ -707,6 +716,7 @@ export class GitHubAppService {
     const app = await this.appRequest<GitHubAppPayload>('/app');
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
+    this.rememberAppSlug(slug);
     const owner = String(app.owner?.login ?? '').trim();
     const appSettingsUrl = app.owner?.type === 'Organization' && owner
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`
@@ -739,6 +749,7 @@ export class GitHubAppService {
     const app = await this.appRequest<GitHubAppPayload>('/app');
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
+    this.rememberAppSlug(slug);
     const owner = String(app.owner?.login ?? '').trim();
     const appSettingsUrl = app.owner?.type === 'Organization' && owner
       ? `https://github.com/organizations/${encodeURIComponent(owner)}/settings/apps/${encodeURIComponent(slug)}/permissions`

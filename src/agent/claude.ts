@@ -25,6 +25,7 @@ import { hasClaudeNativeCredential, platformMcpSpec } from '../autonomy/config-h
 import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess,
   syncRemoteAgentHomeBestEffort } from './remote-process.js';
 import { worldWorkingDirectory } from '../world/types.js';
+import { recoverClaudeToolInputs } from './claude-history.js';
 import { ensureClaudeAccessTokenFresh, refreshClaudeAccessToken } from './usage.js';
 
 /**
@@ -233,6 +234,14 @@ export class ClaudeAdapter implements AgentAdapter {
     const configHome = input.resolvedAuth?.configHome
       ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
     input = { ...input, resolvedAuth: { ...input.resolvedAuth, configHome } };
+    if (input.session) {
+      const repaired = await recoverClaudeToolInputs({ session: input.session, configHome, world: input.world });
+      if (repaired) {
+        input = { ...input, session: repaired, fork: false };
+        ctx.emitActivity?.({ id: 'claude-history-recovery', kind: 'status', phase: 'completed',
+          title: 'Recovered imported Claude tool inputs; resuming a repaired copy' });
+      }
+    }
     if (!hasClaudeNativeCredential(configHome)) return this.runAgentSdkAttempt(input, ctx);
     let latestSession = input.session;
     let fork = input.fork;

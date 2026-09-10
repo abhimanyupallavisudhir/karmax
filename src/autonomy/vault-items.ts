@@ -31,7 +31,7 @@ export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'en
  * values; the gateway's separate human-administrator inspection route resolves
  * one field explicitly and records the reveal in the audit log. */
 export const ITEM_FIELDS: Record<VaultItemType, VaultFieldName[]> = {
-  login: ['password', 'totp'],
+  login: ['password', 'totp', 'note'],
   'api-key': ['secret'],
   'ssh-key': ['privateKey'],
   env: ['env'],
@@ -80,6 +80,8 @@ export interface VaultItem {
     externalId?: string;
     externalIds?: Record<string, string>;
     at: number;
+    /** Import format marker: older pass entries need one complete notes refresh. */
+    passNotesVersion?: number;
     syncedAt?: number;
   };
   updatedAt: number;
@@ -258,7 +260,7 @@ export class VaultItems {
     envVar?: string;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
-    provenance?: { source: string; taskId?: string; externalId?: string; syncedAt?: number };
+    provenance?: { source: string; taskId?: string; externalId?: string; passNotesVersion?: number; syncedAt?: number };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? this.get(args.id) : undefined;
@@ -270,6 +272,12 @@ export class VaultItems {
     const fields = new Set<VaultFieldName>(prior?.fields ?? []);
     for (const field of ITEM_FIELDS[args.type]) {
       const value = args.secrets?.[field];
+      // Pass notes are a complete snapshot, including an empty replacement.
+      if (field === 'note' && value !== undefined) {
+        this.requireBroker().registerHandle(itemHandle(id, field), value);
+        fields.add(field);
+        continue;
+      }
       if (value?.trim()) {
         this.requireBroker().registerHandle(itemHandle(id, field), value);
         fields.add(field);
@@ -293,10 +301,10 @@ export class VaultItems {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',
         reveal: args.policy?.reveal ?? prior?.policy.reveal ?? 'ask',
       },
-      // Provenance is birth-data: only the mirror clock moves on a re-sync.
+      // Preserve origin identity; only import format and mirror clock change on sync.
       provenance: prior
-        ? { ...prior.provenance, ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
-        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
+        ? { ...prior.provenance, ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}) }
+        : { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), ...(args.provenance?.passNotesVersion ? { passNotesVersion: args.provenance.passNotesVersion } : {}), ...(args.provenance?.syncedAt ? { syncedAt: args.provenance.syncedAt } : {}), at: Date.now() },
       updatedAt: Date.now(),
     };
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));

@@ -51,6 +51,7 @@ import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorl
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
+import { conversationPublisher } from '../domain/view-publication.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -207,10 +208,6 @@ const MAX_RESOLVE_ATTEMPTS = 2;
 /** Historical workflow pins loop rejected merges through their Merge agent this
  * many times. Current explicit-PR runs return to Do and replay PR + Review. */
 const MAX_MERGE_ATTEMPTS = 3;
-/** Sub-task fan-out bounds (SPEC §5.3): concurrent children, and children over the
- *  task's whole life. Non-blocking spawn makes runaway delegation cheap without these. */
-const MAX_CONCURRENT_SUBTASKS = 8;
-const MAX_TOTAL_SUBTASKS = 50;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
@@ -1048,8 +1045,15 @@ async function softwareDevImpl(
     };
   }
 
+  const publishConversation = conversationPublisher(workflowInfo().runId,
+    (view, reference) => core.publishView(taskId, view, reference));
   async function publish() {
-    await core.publishView(taskId, buildView());
+    // Apply at the live edge of existing executions as well as new task pins.
+    if (patched('software-dev-conversation-publication-v1')) {
+      await publishConversation(buildView());
+    } else {
+      await core.publishView(taskId, buildView());
+    }
   }
 
   /** Publish an honest point-of-no-return interlock only around an activity that
@@ -2332,13 +2336,14 @@ Inspect the complete current diff and specifically compare its delta from the re
   async function spawnSubTasks(list: { title: string; prompt: string }[]) {
     await core.commitWork(world as any, `karmax: snapshot before sub-tasks for ${taskId}`);
     for (const s of list) {
-      // Bound the fan-out (SPEC §5.3): non-blocking spawn makes runaway delegation
-      // cheap, so cap concurrent + lifetime children. Surface drops (never silent).
-      if (outstanding.size >= MAX_CONCURRENT_SUBTASKS || subTaskIds.length >= MAX_TOTAL_SUBTASKS) {
+      // Preserve recorded spawn/drop decisions during replay. New decisions have
+      // no per-parent child cap; execution is governed by shared admission control.
+      if (!patched('software-dev-unlimited-subtasks-v1')
+        && (outstanding.size >= 8 || subTaskIds.length >= 50)) {
         const reason =
-          subTaskIds.length >= MAX_TOTAL_SUBTASKS
-            ? `this task's sub-task limit (${MAX_TOTAL_SUBTASKS} total) is reached`
-            : `too many sub-tasks are running at once (${MAX_CONCURRENT_SUBTASKS} max) — wait for some to finish`;
+          subTaskIds.length >= 50
+            ? "this task's sub-task limit (50 total) is reached"
+            : 'too many sub-tasks are running at once (8 max) — wait for some to finish';
         msgs.push({ id: `st-${msgs.length}`, role: 'user', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: msgs.length });
         continue;
       }

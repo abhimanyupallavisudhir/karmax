@@ -152,6 +152,17 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
   },
 };
 
+const withSiteName = (text: string, siteName: string) => text.replace(/krmax|Karmax/g, siteName);
+const namedPolicy = (document: Omit<PolicyDocument, 'version' | 'effectiveDate'>, siteName: string) => ({
+  ...document,
+  summary: withSiteName(document.summary, siteName),
+  sections: document.sections.map((section) => ({
+    ...section,
+    paragraphs: section.paragraphs.map((paragraph) => withSiteName(paragraph, siteName)),
+    ...(section.bullets ? { bullets: section.bullets.map((bullet) => withSiteName(bullet, siteName)) } : {}),
+  })),
+});
+
 export const POLICY_SLUGS = Object.keys(docs) as PolicySlug[];
 export const ACCEPTANCE_POLICIES: Record<AcceptanceContext, PolicySlug[]> = {
   signup: ['terms', 'acceptable-use', 'privacy'],
@@ -248,11 +259,13 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: Stor
   };
 }
 
-export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig) {
+export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig,
+  siteName = 'krmax') {
   const config = launchConfig(env, stored);
   return {
     policyVersion: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE, draftNotice: POLICY_DRAFT_NOTICE,
-    policies: POLICY_SLUGS.map((slug) => ({ slug, title: docs[slug].title, summary: docs[slug].summary, version: POLICY_VERSION })),
+    policies: POLICY_SLUGS.map((slug) => ({ slug, title: docs[slug].title,
+      summary: withSiteName(docs[slug].summary, siteName), version: POLICY_VERSION })),
     acceptance: { signup: policyVersions('signup'), checkout: policyVersions('checkout') },
     pricingCatalog: Object.values(HOSTED_PLANS).map((plan) => ({ ...plan, currency: 'usd' as const,
       billingInterval: 'month' as const })),
@@ -271,9 +284,10 @@ export function assertPaidLaunchReady(env: NodeJS.ProcessEnv = process.env, stor
   return config;
 }
 
-export function policyDocument(slug: string, env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
+export function policyDocument(slug: string, env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig,
+  siteName = 'krmax'): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
   if (!POLICY_SLUGS.includes(slug as PolicySlug)) return undefined;
-  const info = publicLaunchInfo(env, stored);
-  return { ...docs[slug as PolicySlug], version: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,
+  const info = publicLaunchInfo(env, stored, siteName);
+  return { ...namedPolicy(docs[slug as PolicySlug], siteName), version: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,
     draftNotice: POLICY_DRAFT_NOTICE, operator: info.operator, contacts: info.contacts };
 }

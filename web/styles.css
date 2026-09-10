@@ -792,6 +792,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 /* A native session handoff is a small bundle: identity, exact bytes, then the
    command that consumes them. Keep each role together when a task has several
    agent conversations so the wrong JSONL cannot be paired with a command. */
+.local-handoff-scrim pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; }
 .local-agent-forks { display: grid; gap: 10px; }
 .local-agent-fork { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .local-agent-fork-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
@@ -901,6 +902,9 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .msg-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
 .msg-meta-gap { flex: 1; }
 .msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; font-family: var(--font-mono); }
+.msg.input-request { background: var(--accent-weak); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); border-inline-start: 3px solid var(--accent); }
+.msg.input-request .msg-meta { margin-bottom: 7px; }
+.msg.input-request .role { color: var(--accent); font-weight: 600; opacity: 1; }
 .msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
 /* A little copy control per message — faint until the bubble is hovered. */
@@ -1817,7 +1821,14 @@ html[data-theme="dark"] .github-signin-btn:active,
 .pk-caret { color: var(--ink-3); font-size: 12px; }
 .pk-sessions { margin: 0 0 4px 26px; border-left: 1px solid var(--line); padding-left: 8px; }
 .pk-fork { color: var(--accent); }
-.pk-session .task-sub .mono { font-size: 11px; }
+.pk-attempt { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; padding: 6px 10px; }
+.pk-attempt-label { flex: 0 0 72px; color: var(--ink-3); font-size: 12px; }
+.pk-agents { display: flex; flex: 1; flex-wrap: wrap; min-width: 0; gap: 4px; }
+.pk-agent { border: 1px solid var(--line); background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; gap: 6px; padding: 5px 8px; max-width: 100%; overflow-wrap: anywhere; }
+.pk-agent .wf { color: var(--ink-3); font-size: 11px; }
+.pk-agent:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pk-agents .pk-empty { padding: 5px 0; font-size: 12px; }
+.pick-row[aria-busy="true"] { cursor: progress; }
 .pk-empty { padding: 10px; color: var(--ink-3); font-size: 13px; }
 
 /* the chosen fork source under "Fork a previous agent" (task form / task page) */
