@@ -143,7 +143,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
   if (p === '/api/user/export' || p === '/api/user/default-organization'
-    || p === '/api/user/onboarding' || p === '/api/user/account-deletion-request') return 'none';
+    || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
   // project only as a Developer (or before they join any project at all).
@@ -1734,15 +1734,17 @@ export class Gateway {
         if (!organizationId || !store.organizationMembership(organizationId, subject.userId))
           return this.json(res, 404, { error: 'organization not found' });
         const key = hostedOnboardingKey(subject.userId, organizationId);
+        // Recover older accounts and interrupted signup provisioning on every read.
+        if (this.deps.hosted) this.enableHostedOnboarding(subject.userId, organizationId);
         let record = parseHostedOnboardingRecord(store.kvGet(key));
+        let finishReplay = false;
         if (method === 'PUT') {
           if (!this.deps.hosted || !record)
             return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
           const b = await this.body(req);
           const display: HostedOnboardingDisplay = b.display === 'minimized' ? 'minimized' : 'expanded';
           record = { ...record, display };
-          if (b.finishReplay === true && record.replay)
-            record = { display, completedAt: Date.now() };
+          finishReplay = b.finishReplay === true;
           store.kvSet(key, JSON.stringify(record));
         }
         const credentials = enumerateCredentials(gatherCredentialSources({
@@ -1766,6 +1768,10 @@ export class Gateway {
           card: store.listOrganizationCards(organizationId).length > 0,
           project: store.listProjects().some((project) => project.organizationId === organizationId),
         };
+        if (finishReplay && record?.replay && facts.github && facts.agentLogin && facts.e2b && facts.project) {
+          record = { display: record.display, completedAt: Date.now() };
+          store.kvSet(key, JSON.stringify(record));
+        }
         let status = hostedOnboardingStatus({
           hosted: this.deps.hosted === true,
           organizationId,
@@ -2605,11 +2611,13 @@ export class Gateway {
         return this.json(res, 200, user);
       }
       const resetOnboarding = p.match(/^\/api\/users\/([^/]+)\/onboarding\/reset$/);
-      if (resetOnboarding && method === 'POST') {
-        requireInteractiveHuman(callerIdentity);
+      if ((resetOnboarding || p === '/api/user/onboarding/reset') && method === 'POST') {
+        const subject = requireInteractiveHuman(callerIdentity);
         if (!this.deps.hosted)
           return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
-        const userId = resetOnboarding[1]!;
+        // The self-service route takes its target solely from the browser session.
+        // The operator route retains its user:write capability requirement.
+        const userId = resetOnboarding?.[1] ?? subject.userId;
         if (!this.deps.identity?.listUsers().some((user) => user.id === userId))
           return this.json(res, 404, { error: 'user not found' });
         // Only presentation state changes. Live setup facts and user work remain intact.

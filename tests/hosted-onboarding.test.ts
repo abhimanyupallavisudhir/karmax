@@ -5,7 +5,7 @@ import path from 'node:path';
 import { IdentityService } from '../src/auth/identity.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
 import { Gateway } from '../src/gateway/server.js';
-import { hostedOnboardingStatus } from '../src/gateway/hosted-onboarding.js';
+import { hostedOnboardingStatus, parseHostedOnboardingRecord } from '../src/gateway/hosted-onboarding.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxBus } from '../src/contrib/bus.js';
@@ -107,6 +107,62 @@ describe('hosted onboarding status API', () => {
     expect(withOptional.steps.optional).toMatchObject({ complete: true, blocking: false, vault: true, card: true });
   });
 
+  it('recovers missing enrollment and retains unfinished progress across logout and login', async () => {
+    const { store, identity, request, base, cookie } = await boot(true);
+    const userId = identity.listUsers()[0]!.id;
+    const key = `hosted:onboarding:${userId}:org_personal`;
+    store.kvDelete(key);
+    expect(await (await request()).json()).toMatchObject({ visible: true, complete: false, display: 'expanded' });
+    store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
+      installationId: 'persist-installation', accountLogin: 'alice', accountType: 'User' });
+    await request('PUT', { display: 'minimized' });
+    const logout = await fetch(`${base}/api/logout`, { method: 'POST', headers: { cookie } });
+    expect(logout.status).toBe(200);
+    expect((await request()).status).toBe(401);
+    const login = await fetch(`${base}/api/auth/sign-in/email`, {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ email: 'alice@example.com', password: 'long-enough-password' }),
+    });
+    expect(login.status).toBe(200);
+    const nextCookie = login.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
+    expect(nextCookie).not.toBe('');
+    const status = await fetch(`${base}/api/user/onboarding?organizationId=org_personal`, { headers: { cookie: nextCookie } });
+    expect(await status.json()).toMatchObject({ visible: true, complete: false, display: 'minimized', completedRequired: 1 });
+  });
+
+  it('lets ordinary users restart only their own guide, without closing an incomplete replay', async () => {
+    const { identity, base, store } = await boot(true);
+    const operator = identity.listUsers()[0]!.id;
+    const bob = await identity.createUser({ name: 'Bob', email: 'bob@example.com', password: 'long-enough-password' });
+    const login = await fetch(`${base}/api/auth/sign-in/email`, {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ email: 'bob@example.com', password: 'long-enough-password' }),
+    });
+    const cookie = login.headers.get('set-cookie')?.match(/better-auth\.session_token=[^;]+/)?.[0] ?? '';
+    expect(cookie).not.toBe('');
+    // A real session provisions the ordinary user's personal organization.
+    expect((await fetch(`${base}/api/session`, { headers: { cookie } })).status).toBe(200);
+    const organization = store.listOrganizations(bob.id)[0]!;
+    const key = `hosted:onboarding:${bob.id}:${organization.id}`;
+    store.kvSet(key, JSON.stringify({ display: 'minimized', completedAt: 123 }));
+    const operatorKey = `hosted:onboarding:${operator}:org_personal`;
+    const before = store.kvGet(operatorKey);
+    const reset = await fetch(`${base}/api/user/onboarding/reset`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ userId: operator }),
+    });
+    expect(reset.status).toBe(200);
+    expect(store.kvGet(operatorKey)).toBe(before);
+    const endpoint = `${base}/api/user/onboarding?organizationId=${organization.id}`;
+    expect(await (await fetch(endpoint, { headers: { cookie } })).json())
+      .toMatchObject({ visible: true, complete: false, display: 'expanded', replay: true });
+    expect(await (await fetch(endpoint, { method: 'PUT', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ finishReplay: true }) })).json())
+      .toMatchObject({ visible: true, complete: false, replay: true });
+    expect((await fetch(`${base}/api/user/onboarding?organizationId=org_personal`, { headers: { cookie } })).status).toBe(404);
+    expect((await fetch(`${base}/api/user/onboarding/reset`, { method: 'POST' })).status).toBe(401);
+  });
+
   it('lets an operator replay a completed user’s guide without changing their work', async () => {
     const { store, identity, broker, providers, request, base, cookie } = await boot(true);
     const userId = identity.listUsers()[0]!.id;
@@ -197,6 +253,29 @@ describe('hosted onboarding status API', () => {
 });
 
 describe('hosted onboarding completion semantics', () => {
+  it('retains incomplete, completed, and replay records across a database restart', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-onboarding-restart-'));
+    tempDirs.push(dir);
+    const database = path.join(dir, 'store.db');
+    const records = [
+      { display: 'expanded' }, { display: 'minimized' },
+      { display: 'expanded', completedAt: 123 }, { display: 'expanded', replay: true },
+    ];
+    const first = new Store(database);
+    records.forEach((record, i) => first.kvSet(`hosted:onboarding:user${i}:org1`, JSON.stringify(record)));
+    first.close();
+    const reopened = new Store(database);
+    try {
+      records.forEach((record, i) => {
+        const saved = parseHostedOnboardingRecord(reopened.kvGet(`hosted:onboarding:user${i}:org1`));
+        expect(saved).toEqual(record);
+        expect(hostedOnboardingStatus({ hosted: true, organizationId: 'org1', record: saved,
+          facts: { github: true, agentLogin: false, e2b: false, vault: false, card: false, project: true },
+        }).visible).toBe(i !== 2);
+      });
+    } finally { reopened.close(); }
+  });
+
   it('does not count the optional password/card item toward the required total', () => {
     const status = hostedOnboardingStatus({
       hosted: true,
@@ -208,7 +287,7 @@ describe('hosted onboarding completion semantics', () => {
     expect(status.steps.optional).toMatchObject({ complete: false, blocking: false });
   });
 
-  it('does not burden a pre-existing hosted account without an onboarding enrollment record', () => {
+  it('requires an enrollment record (the hosted API repairs missing records)', () => {
     const status = hostedOnboardingStatus({
       hosted: true,
       organizationId: 'org_established',
