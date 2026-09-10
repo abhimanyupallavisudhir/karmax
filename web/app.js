@@ -3320,8 +3320,9 @@ function connectWs() {
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         S.liveOutput = '';
         refreshTask();
-      } else if (ev.type === 'session.started') {
-        refreshTask(); // the session id was just published mid-turn → show the live fork command
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated') {
+        // Mid-turn metadata changes must not clear output or patch lifecycle state.
+        refreshTask();
       } else renderTaskEvents();
     }
     if (S.selected && ev.taskId !== S.selected

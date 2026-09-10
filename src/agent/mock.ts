@@ -174,21 +174,21 @@ export class MockAdapter implements AgentAdapter {
         }
         case 'review': {
           // @review <caption>  — a terse orientation line.
-          ctx.createReviewInfo({ caption: rest });
+          await ctx.createReviewInfo({ caption: rest });
           outputs.push(`review: ${rest}`);
           break;
         }
         case 'runaction': {
           // @runaction <label> :: <command>  — a click-to-run review action.
           const [label, command = ''] = splitOn(rest, '::');
-          ctx.createReviewInfo({ actions: [{ kind: 'run', label: label.trim(), command: command.trim() }] });
+          await ctx.createReviewInfo({ actions: [{ kind: 'run', label: label.trim(), command: command.trim() }] });
           outputs.push(`runaction: ${label.trim()}`);
           break;
         }
         case 'openaction': {
           // @openaction <label> :: <target>  — a click-to-open file/URL review action.
           const [label, target = ''] = splitOn(rest, '::');
-          ctx.createReviewInfo({ actions: [{ kind: 'open', label: label.trim(), target: target.trim() }] });
+          await ctx.createReviewInfo({ actions: [{ kind: 'open', label: label.trim(), target: target.trim() }] });
           outputs.push(`openaction: ${label.trim()}`);
           break;
         }

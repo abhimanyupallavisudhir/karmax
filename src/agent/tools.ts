@@ -868,7 +868,7 @@ export function platformToolHandlers(
           return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
         }
       }
-      ctx.createReviewInfo({
+      await ctx.createReviewInfo({
         caption: args?.caption,
         actions: Array.isArray(args?.actions) ? args.actions : undefined,
         summary: args?.summary,
@@ -972,7 +972,7 @@ export function platformToolHandlers(
       });
       // Mirror request_spend: a parked request surfaces at the Review gate.
       if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {
-        ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+        await ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       }
       return JSON.stringify(r);
     },
@@ -1007,7 +1007,7 @@ export function platformToolHandlers(
           : args.target_service ? { kind: 'service', name: String(args.target_service) }
             : { kind: 'environment', name: String(args.target_environment) },
       });
-      ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      await ctx.createReviewInfo({ summary: `Project resource proposed: ${String(args.name ?? '')}. Review must Adopt or Discard it.`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
       return JSON.stringify(result);
     },
     async check_agent_mail(args) {

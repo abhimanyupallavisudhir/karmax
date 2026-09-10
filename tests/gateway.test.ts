@@ -894,6 +894,21 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       materialized: false,
     });
 
+    // A still-running tool can checkpoint another attachment before TurnResult.
+    // The drawer reads the snapshot; clicking the button queries the live workflow,
+    // which still has its old actions. Both must resolve the checkpoint.
+    h.store.checkpointReviewInfo(task.id, { caption: 'New attachment before turn completion',
+      actions: [{ kind: 'open', label: 'New attachment', target: 'out.txt' }] });
+    const updated: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(updated.reviewInfo.actions[0].label).toBe('New attachment');
+    const pendingOpen: any = await (await fetch(`${base}/api/tasks/${task.id}/review-action`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ index: 0 }),
+    })).json();
+    expect(pendingOpen.kind).toBe('open');
+    const pendingArtifact = await fetch(`${base}${pendingOpen.url}`, { headers: auth() });
+    expect(pendingArtifact.status).toBe(200);
+    expect(await pendingArtifact.text()).toContain('hello-artifact');
+
     // A bad index is rejected; neither artifact nor conversation-file paths may
     // traverse outside the task world.
     const bad = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 99 }) });

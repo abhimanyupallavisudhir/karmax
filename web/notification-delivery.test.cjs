@@ -93,3 +93,17 @@ test('failed fetch preserves arrivals and inbox instead of replaying the backlog
   await b.ctx.loadInbox();
   assert.deepEqual(b.alerts.map((item) => item.id), ['new']);
 });
+
+test('review checkpoint refreshes the selected task without clearing streaming output or notifying the inbox', () => {
+  const b = browser();
+  b.state.selected = 'task';
+  b.state.taskEvents = [];
+  b.state.liveOutput = 'Still working';
+  let refreshes = 0;
+  b.ctx.refreshTask = () => { refreshes++; };
+  b.ctx.connectWs();
+  b.state.ws.onmessage({ data: JSON.stringify({ type: 'review.updated', taskId: 'task', payload: {} }) });
+  assert.equal(refreshes, 1);
+  assert.equal(b.state.liveOutput, 'Still working');
+  assert.equal(b.timers.length, 0);
+});
