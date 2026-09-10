@@ -11700,7 +11700,8 @@ async function hydrateProjectData(proj) {
             : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
             <small class="field-help">Managed storage is provided by ${siteNameMarkup()} for encrypted data revisions. Connect your own S3 bucket in <a data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-storage">Organization → Data storage</a> to add another option.</small></div>
           ${hostLocal() ? '<label class="form-row wide"><span>Import from local path <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"></label>' : ''}
-          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
+          <label class="form-row wide"><span>Upload files <small>(optional)</small></span><input id="data-files" type="file" multiple></label>
+          <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-folder" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
@@ -11738,8 +11739,8 @@ async function hydrateProjectData(proj) {
     });
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
-      const files = [...$('#data-files').files];
-      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a path or a browser folder, not both', true);
+      const files = [...$('#data-files').files, ...$('#data-folder').files];
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a local path or browser uploads, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
@@ -11903,7 +11904,8 @@ async function hydrateProjectResources(proj) {
         <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
         <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
         ${hostLocal() ? '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>' : ''}
-        <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
+        <label class="form-row">Upload files<input id="resource-files" type="file" multiple></label>
+        <label class="form-row">Upload a folder<input id="resource-folder" type="file" multiple webkitdirectory></label>
       </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
     const driverInput = $('#resource-driver');
     const syncDefaults = () => {
@@ -11912,6 +11914,7 @@ async function hydrateProjectResources(proj) {
       $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
       $('#resource-secret').disabled = fileKind;
       $('#resource-files').disabled = !fileKind;
+      $('#resource-folder').disabled = !fileKind;
       if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
     };
     driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
@@ -11949,7 +11952,7 @@ async function hydrateProjectResources(proj) {
         : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
       button.disabled = true; button.textContent = 'Attaching…';
       try {
-        const selectedFiles = isFiles ? [...$('#resource-files').files] : [];
+        const selectedFiles = isFiles ? [...$('#resource-files').files, ...$('#resource-folder').files] : [];
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
           access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
           publish: $('#resource-publish').value, secret: $('#resource-secret').value,
@@ -11984,7 +11987,7 @@ async function uploadResourceFiles(projectId, resourceId, files, progress) {
   try {
     for (const file of files) {
       const relative = file.webkitRelativePath ? file.webkitRelativePath.split('/').slice(1).join('/') || file.name : file.name;
-      for (let part = 0, offset = 0; offset < file.size; part++, offset += upload.partBytes) {
+      for (let part = 0, offset = 0; offset < file.size || part === 0; part++, offset += upload.partBytes) {
         const chunk = file.slice(offset, Math.min(file.size, offset + upload.partBytes));
         await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relative)}&part=${part}`,
           { method: 'PUT', body: chunk, headers: { 'content-type': 'application/octet-stream' } });

@@ -3470,7 +3470,8 @@ export class Gateway {
           const part = Number(url.searchParams.get('part'));
           if (!safeUploadPath(relative) || !Number.isInteger(part) || part < 0) return this.json(res, 400, { error: 'invalid upload path or part' });
           const data = await this.rawBody(req, RESOURCE_UPLOAD_PART_BYTES);
-          if (!data.length) return this.json(res, 400, { error: 'empty upload part' });
+          // A zero-byte first part represents an empty file.
+          if (!data.length && part !== 0) return this.json(res, 400, { error: 'empty upload part' });
           const record = upload.files[relative] ?? { parts: [], bytes: 0 };
           if (part !== record.parts.length) return this.json(res, 409, { error: `expected part ${record.parts.length}` });
           const objectKey = resourceUploadObjectKey(upload, relative, part);

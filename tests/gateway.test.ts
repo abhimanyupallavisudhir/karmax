@@ -1245,6 +1245,12 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const part = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=model.bin&part=0`,
       { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: bytes });
     expect(part.status).toBe(200);
+    const empty = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=empty.txt&part=0`,
+      { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: Buffer.alloc(0) });
+    expect(empty.status).toBe(200);
+    const extraEmpty = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=model.bin&part=1`,
+      { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: Buffer.alloc(0) });
+    expect(extraEmpty.status).toBe(400);
     const complete = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}`,
       { method: 'POST', headers: auth() });
     expect(complete.status).toBe(200);
