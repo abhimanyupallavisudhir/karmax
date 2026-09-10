@@ -3464,30 +3464,39 @@ function brandMark() {
 }
 
 async function refreshOnboarding() {
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
+  const userId = S.user?.id;
   const organizationId = S.organizationId;
   if (!S.meta?.hosted || !organizationId || !S.user) {
     S.onboarding = null;
     renderOnboarding();
     return;
   }
-  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
     const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`);
-    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
     S.onboarding = status;
   } catch {
-    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId) return;
-    S.onboarding = null;
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    // Keep the last known guide and retry even when the first request failed.
+    renderOnboarding();
+    pollOnboarding();
+    return;
   }
   renderOnboarding();
 }
 
 async function setOnboardingDisplay(display, finishReplay = false) {
   if (!S.organizationId) return;
+  const organizationId = S.organizationId;
+  const userId = S.user?.id;
+  const epoch = S.onboardingEpoch = (S.onboardingEpoch || 0) + 1;
   try {
-    S.onboarding = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(S.organizationId)}`, {
+    const status = await api(`/api/user/onboarding?organizationId=${encodeURIComponent(organizationId)}`, {
       method: 'PUT', body: JSON.stringify({ display, finishReplay }),
     });
+    if (epoch !== S.onboardingEpoch || organizationId !== S.organizationId || userId !== S.user?.id) return;
+    S.onboarding = status;
     renderOnboarding();
   } catch (error) { toast(error.message, true); }
 }
@@ -3505,7 +3514,7 @@ function pollOnboarding() {
   clearTimeout(S.onboardingTimer);
   S.onboardingTimer = setTimeout(() => {
     if (document.hidden) return pollOnboarding();
-    refreshOnboarding();
+    return refreshOnboarding();
   }, 4_000);
 }
 
@@ -3518,6 +3527,10 @@ function renderOnboarding() {
     S.onboardingTimer = null;
     host.hidden = true;
     host.innerHTML = '';
+    // The shell can repaint after a failed initial load. Keep recovery alive
+    // until this organization's status is known, even without a visible card.
+    if (S.meta?.hosted && S.user && S.organizationId
+      && (!state || state.organizationId !== S.organizationId)) pollOnboarding();
     return;
   }
   host.hidden = false;
@@ -3544,7 +3557,7 @@ function renderOnboarding() {
       ${onboardingStep(4, 'optional', 'Add passwords and a payment card', 'Give agents approved access to sites and purchases. This never blocks setup.', `<div class="onboarding-actions"><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault ? 'Manage passwords' : 'Add passwords'}</a><a class="btn sm" data-spa href="${settings}#settings-payments">${optional.card ? 'Manage cards' : 'Add payment card'}</a></div>`)}
       ${onboardingStep(5, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
     </ol>
-    <div class="onboarding-foot">${state.replay ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
+    <div class="onboarding-foot">${state.replay && state.completedRequired === state.totalRequired ? '<button class="btn sm" id="onboarding-done" type="button">Done</button>' : ''}<span>Optional items do not count toward completion.</span><button class="btn sm" id="onboarding-minimize-foot" type="button">Minimize</button></div>
   </section>`;
   $('#onboarding-done')?.addEventListener('click', () => setOnboardingDisplay('expanded', true));
   $('#onboarding-minimize')?.addEventListener('click', () => setOnboardingDisplay('minimized'));
@@ -14745,10 +14758,10 @@ async function hydrateProfileGithub() {
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileWalkthroughCard(userId) {
-  if (!S.installationAccess || !S.meta?.hosted || !userId) return '';
+  if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
   return `<div class="card"><div class="section-h">Walkthrough</div>
-    <p class="task-sub">Show this user's setup walkthrough again in each organization. Existing work and connections are preserved.</p>
-    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Reset walkthrough</button></div>`;
+    <p class="task-sub">Restart the setup walkthrough in each organization. Existing work and connections are preserved.</p>
+    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Restart walkthrough</button></div>`;
 }
 
 function profileView() {
@@ -14971,8 +14984,11 @@ function wireProfileView() {
   reset?.addEventListener('click', async () => {
     reset.disabled = true;
     try {
-      await api(`/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
-      toast('Walkthrough reset. The user will see it when they next open their workspace.');
+      const ownProfile = reset.dataset.userId === S.user?.id;
+      await api(ownProfile ? '/api/user/onboarding/reset'
+        : `/api/users/${encodeURIComponent(reset.dataset.userId)}/onboarding/reset`, { method: 'POST' });
+      if (ownProfile) await refreshOnboarding();
+      toast(ownProfile ? 'Walkthrough restarted.' : 'Walkthrough restarted. The user will see it when they next open their workspace.');
     } catch (error) { toast(error.message, true); }
     finally { reset.disabled = false; }
   });

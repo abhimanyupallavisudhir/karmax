@@ -22,7 +22,7 @@ test('operator sees a reset on the selected user profile, without own-account co
 test('non-operators never see the reset control or another user profile', () => {
   const ctx = context(false);
   assert.equal(vm.runInContext("profileWalkthroughCard('target')", ctx), '');
-  assert.doesNotMatch(vm.runInContext('profileView()', ctx), /Target User|Reset walkthrough/);
+  assert.doesNotMatch(vm.runInContext('profileView()', ctx), /Target User|Restart walkthrough/);
 });
 test('profile reset targets the displayed user and restores the button after completion', async () => {
   const ctx = context(true);
@@ -36,4 +36,80 @@ test('profile reset targets the displayed user and restores the button after com
   assert.equal(calls[0][0], '/api/users/target/onboarding/reset');
   assert.equal(calls[0][1].method, 'POST');
   assert.equal(button.disabled, false);
+});
+
+test('ordinary users can restart their own walkthrough and immediately refresh it', async () => {
+  const ctx = context(false);
+  assert.match(vm.runInContext("profileWalkthroughCard('operator')", ctx), /Restart walkthrough/);
+  ctx.S.profileUserId = null;
+  let click;
+  const calls = [];
+  let refreshed = false;
+  const button = { dataset: { userId: 'operator' }, disabled: false,
+    addEventListener: (_event, callback) => { click = callback; } };
+  Object.assign(ctx, { $: () => button, toast: () => {}, api: async (...args) => calls.push(args),
+    refreshOnboarding: async () => { refreshed = true; } });
+  // Only exercise the restart handler; the remaining profile controls are separate.
+  vm.runInContext(wiring.slice(0, wiring.indexOf('  if (S.profileUserId')) + '\n}', ctx);
+  vm.runInContext('wireProfileView()', ctx);
+  await click();
+  assert.equal(calls[0][0], '/api/user/onboarding/reset');
+  assert.equal(refreshed, true);
+  assert.equal(button.disabled, false);
+});
+
+function onboardingContext() {
+  const host = { hidden: false, innerHTML: '' };
+  let timer;
+  const ctx = vm.createContext({
+    S: { meta: { hosted: true }, organizationId: 'org1', user: { id: 'user1' } },
+    $: (selector) => selector === '#hosted-onboarding' ? host : null,
+    document: { hidden: false }, encodeURIComponent,
+    clearTimeout: () => { timer = undefined; },
+    setTimeout: (callback) => { timer = callback; return 1; },
+  });
+  vm.runInContext(source.slice(source.indexOf('async function refreshOnboarding()'),
+    source.indexOf('/** Re-point the favicon')), ctx);
+  return { ctx, host, tick: async () => { assert.ok(timer); await timer(); } };
+}
+
+test('an initial status failure retries and restores the guide', async () => {
+  const { ctx, host, tick } = onboardingContext();
+  let failed = true;
+  ctx.api = async () => {
+    if (failed) throw new Error('offline');
+    return { organizationId: 'org1', visible: true, display: 'minimized', completedRequired: 1, totalRequired: 4 };
+  };
+  await vm.runInContext('refreshOnboarding()', ctx);
+  assert.equal(host.hidden, true);
+  // Boot renders the shell after the initial status request.
+  vm.runInContext('renderOnboarding()', ctx);
+  failed = false;
+  await tick();
+  assert.equal(host.hidden, false);
+  assert.match(host.innerHTML, /Finish setup/);
+});
+
+test('a transient status failure preserves the visible guide', async () => {
+  const { ctx, host, tick } = onboardingContext();
+  ctx.S.onboarding = { organizationId: 'org1', visible: true, display: 'minimized', completedRequired: 1, totalRequired: 4 };
+  ctx.api = async () => { throw new Error('offline'); };
+  await vm.runInContext('refreshOnboarding()', ctx);
+  assert.equal(host.hidden, false);
+  assert.match(host.innerHTML, /Finish setup/);
+  await tick();
+  assert.equal(host.hidden, false);
+});
+
+test('late status responses cannot replace another organization or signed-in user', async () => {
+  for (const change of [ctx => { ctx.S.organizationId = 'org2'; }, ctx => { ctx.S.user = { id: 'user2' }; }]) {
+    const { ctx } = onboardingContext();
+    let resolve;
+    ctx.api = () => new Promise(done => { resolve = done; });
+    const pending = vm.runInContext('refreshOnboarding()', ctx);
+    change(ctx);
+    resolve({ organizationId: 'org1', visible: true, display: 'minimized' });
+    await pending;
+    assert.equal(ctx.S.onboarding, undefined);
+  }
 });
