@@ -313,7 +313,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'propose_project_resource',
     description:
-      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service).',
+      'Stage newly-created non-Git task output as a durable candidate for Review. A path is immediately captured into encrypted object storage and must contain no secrets; a vault_item_id references a credential this task just stored without revealing it. This does NOT expose the resource to future tasks: Review must Adopt or Discard it. Provide exactly one source (path or vault_item_id) and one target (target_path, target_environment, or target_service). For direct administration, agents with project:settings:write can instead use platform_request on project resources, including storageLocationId and other authorized projects.',
     parameters: {
       type: 'object',
       properties: {

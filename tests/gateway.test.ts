@@ -1,3 +1,4 @@
+import { AuthorizationService } from '../src/platform/authorization.js';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -439,8 +440,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(await noSubjectResponse.json()).toMatchObject({ error: expect.stringMatching(/verified human subject/i) });
 
     const interactiveOnly = await fetch(`${base}/api/user/export`, { headers: delegatedAuth });
-    expect(interactiveOnly.status).toBe(401);
-    expect(await interactiveOnly.json()).toMatchObject({ error: expect.stringMatching(/interactive human/i) });
+    expect(interactiveOnly.status).toBe(403);
+    expect(await interactiveOnly.json()).toMatchObject({ error: expect.stringMatching(/user:read/) });
 
     const audit = h.store.auditSince(0, 2000).find((event) =>
       event.action === 'http.post.repository:write' && event.detail.path.endsWith('/repositories/create')
@@ -1239,10 +1240,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }
   });
 
-  it('attaches redacted resources and completes a resumable binary upload', async () => {
+  it.each(['human', 'agent'])('%s attaches redacted resources and completes a resumable binary upload', async (kind) => {
     const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());
-    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: `Resource API ${kind}` }) }).then((response) => response.json());
+    const agent = h.tokens.mint({ taskId: 'resource-admin', profileId: 'maintainer',
+      principal: 'task:resource-admin', organizationId: project.organizationId,
+      ceiling: ['project:settings:read', 'project:settings:write'],
+      grantorCaps: ['project:settings:read', 'project:settings:write'] });
+    const resourceAuth = () => kind === 'agent'
+      ? { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' } : auth();
+    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: resourceAuth(),
       body: JSON.stringify({ name: 'Token', driver: 'secret@1', target: { kind: 'environment', name: 'MODEL_TOKEN' },
         access: 'read', isolation: 'fork', publish: 'discard', secret: 'never-return-this' }) });
     expect(secretResponse.status).toBe(200);
@@ -1251,24 +1258,99 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(secret)).not.toContain('never-return-this');
     expect(secret.credentialHandles).toBeUndefined();
 
-    const volume: any = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+    const volume: any = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: resourceAuth(),
       body: JSON.stringify({ name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' },
         access: 'write', isolation: 'fork', publish: 'review' }) }).then((response) => response.json());
     const upload: any = await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}/uploads`,
-      { method: 'POST', headers: auth() }).then((response) => response.json());
+      { method: 'POST', headers: resourceAuth() }).then((response) => response.json());
     const bytes = Buffer.from('fine-tuned-model-weights');
     const part = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=model.bin&part=0`,
-      { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: bytes });
+      { method: 'PUT', headers: { ...resourceAuth(), 'content-type': 'application/octet-stream' }, body: bytes });
     expect(part.status).toBe(200);
     const complete = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}`,
-      { method: 'POST', headers: auth() });
+      { method: 'POST', headers: resourceAuth() });
     expect(complete.status).toBe(200);
     const revision: any = await complete.json();
     expect(revision.bytes).toBe(bytes.length);
     expect(revision.sealedRef).toBeUndefined();
-    const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() }).then((response) => response.json()) as any[];
+    const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: resourceAuth() }).then((response) => response.json()) as any[];
     expect(listed.find((resource) => resource.id === volume.id).revision.bytes).toBe(bytes.length);
     expect(JSON.stringify(listed)).not.toContain('sealedRef');
+    expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}`, {
+      method: 'PATCH', headers: resourceAuth(), body: JSON.stringify({ name: 'Updated model' }),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}/import`, {
+      method: 'POST', headers: resourceAuth(), body: JSON.stringify({ files: [{ path: 'new.txt', data: Buffer.from('new').toString('base64') }] }),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/secrets`, {
+      method: 'POST', headers: resourceAuth(), body: JSON.stringify({ name: 'EXTRA_KEY', value: 'secret-value' }),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/secrets/EXTRA_KEY`, {
+      method: 'DELETE', headers: resourceAuth(),
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}`, {
+      method: 'DELETE', headers: resourceAuth(),
+    })).status).toBe(200);
+  });
+
+  it('keeps direct resource administration scoped and unavailable to proposal-only agents', async () => {
+    const project = h.store.createProject('Scoped resources');
+    const other = h.store.createProject('Other resources');
+    const headersFor = (caps: string[], projectId: string) => ({
+      authorization: `Bearer ${h.tokens.mint({ taskId: 'scoped-resource-agent', profileId: 'do',
+        principal: 'task:scoped-resource-agent', projectId, organizationId: project.organizationId,
+        ceiling: caps, grantorCaps: caps }).token}`, 'content-type': 'application/json',
+    });
+    const routes = [
+      `/api/projects/${project.id}/resources`, `/api/projects/${project.id}/secrets`,
+    ];
+    for (const route of routes) {
+      expect((await fetch(`${base}${route}`, { method: 'POST',
+        headers: headersFor(['task:review:write'], project.id), body: '{}' })).status).toBe(403);
+      expect((await fetch(`${base}${route}`, { method: 'POST',
+        headers: headersFor(['project:settings:write'], other.id), body: '{}' })).status).toBe(403);
+    }
+  });
+
+  it('permits delegated personal settings only with explicit user authority', async () => {
+    const human = h.tokens.mintPrincipal('user:personal-owner', ['user:read', 'user:write']);
+    const delegation = h.tokens.delegateHuman(human.token, { taskId: 'personal-agent' })!;
+    const mint = (caps: string[], delegated = true) => h.tokens.mint({ taskId: 'personal-agent', profileId: 'do',
+      principal: 'task:personal-agent', ceiling: caps, grantorCaps: caps,
+      ...(delegated ? { delegationId: delegation.id } : {}) });
+    const call = (agent: ReturnType<typeof mint>) => fetch(`${base}/api/user/default-organization`, {
+      headers: { authorization: `Bearer ${agent.token}` },
+    });
+    expect((await call(mint([]))).status).toBe(403);
+    expect((await call(mint(['user:read'], false))).status).toBe(403);
+    const response = await call(mint(['user:read']));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toHaveProperty('organizationId');
+  });
+
+  it('allows delegated Avatar administration without widening the agent grant', async () => {
+    const project = h.store.createProject('Delegated Avatars');
+    h.store.setOrganizationMembership(project.organizationId!, 'avatar-owner', 'member');
+    const authorization = new AuthorizationService(h.store);
+    authorization.grant('system:test', { principalId: 'user:avatar-owner', scopeKey: `project:${project.id}`,
+      profileId: 'maintainer' });
+    const ownerCaps = authorization.capabilities('user:avatar-owner', project.id, project.organizationId);
+    const human = h.tokens.mintPrincipal('user:avatar-owner', ownerCaps, project.id, undefined, project.organizationId);
+    const delegation = h.tokens.delegateHuman(human.token, { taskId: 'avatar-admin', projectId: project.id,
+      organizationId: project.organizationId })!;
+    const mint = (caps: string[]) => h.tokens.mint({ taskId: 'avatar-admin', profileId: 'do',
+      principal: 'task:avatar-admin', projectId: project.id, organizationId: project.organizationId,
+      ceiling: caps, grantorCaps: caps, delegationId: delegation.id });
+    const create = (caps: string[]) => fetch(`${base}/api/projects/${project.id}/avatars`, {
+      method: 'POST', headers: { authorization: `Bearer ${mint(caps).token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Delegated helper', prompt: 'Help with project work.', runtime: { provider: 'mock' } }),
+    });
+    const limited = await create(['task:create']);
+    expect(limited.status).toBe(403);
+    expect(h.store.listAvatars(project.id)).toHaveLength(0);
+    const permitted = await create(ownerCaps);
+    expect(permitted.status).toBe(201);
+    expect(h.store.listAvatars(project.id)).toHaveLength(1);
   });
 
   it('offers proposal-driven secrets, environment, and per-world services over typed resources', async () => {
@@ -1574,9 +1656,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(h.store.auditSince().some((entry: any) => entry.action === 'vault.revealed'
       && entry.detail.itemId === created.id && entry.detail.field === 'password')).toBe(true);
 
-    // This administrative endpoint must never become a shortcut around the
-    // item grant/policy checks for a task-agent, even if its role happens to
-    // carry credential:write.
+    // Explicit administrative authority permits inspection for agents too.
     const taskAgent = h.tokens.mint({
       taskId: 'task_admin_reveal', profileId: 'do', principal: 'user:test', organizationId: 'org_personal',
       ceiling: ['credential:write'], grantorCaps: ['credential:write'],
@@ -1586,9 +1666,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       headers: { authorization: `Bearer ${taskAgent.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ field: 'password' }),
     });
-    expect(agentInspection.status).toBe(403);
+    expect(agentInspection.status).toBe(200);
     const agentInspectionBody: any = await agentInspection.json();
-    expect(agentInspectionBody.error).toMatch(/human vault administrator/);
+    expect(agentInspectionBody).toMatchObject({ itemId: created.id, value: 'hunter2' });
 
     // reveal policy 'ask' gates even an all-capability caller
     const asked: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();

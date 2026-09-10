@@ -522,7 +522,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
   server.registerTool('propose_project_resource', {
-    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored.',
+    description: 'Stage newly-created non-Git task output as an encrypted, task/world-generation-bound candidate for Review. This does not make it a project default: a reviewer must Adopt or Discard it. Use path for declared non-secret files/directories, or vaultItemId for a credential this task just stored. Agents with project:settings:write may instead administer resources directly through platform_request, including storageLocationId and other authorized projects.',
     inputSchema: {
       path: z.string().optional(), vaultItemId: z.string().optional(), field: z.string().optional(), name: z.string(),
       driver: z.enum(['volume@1', 'object-tree@1', 'secret@1', 'service@1', 'database@1']).optional(),

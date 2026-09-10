@@ -7,32 +7,30 @@
  * *and* untested. When a route is added to `src/gateway/server.ts`, add it here.
  */
 export const PLATFORM_API_CATALOG = {
-  note: 'Every route is authenticated and capability checked. Identity requirements are independent: human-subject accepts secure task-agent delegation; interactive-human requires a live browser session. Colon-prefixed names are path parameters.',
+  note: 'Every route is authenticated and capability checked. Identity requirements are independent: personal operations require an authority-verified user subject and accept secure task-agent delegation. Administrative operations accept any actor with sufficient scoped capabilities. Colon-prefixed names are path parameters.',
   identityRequirements: {
-    capability: 'Default. No user identity is implied by a capability grant.',
+    capability: 'Default. No user identity is implied by a capability grant. Agent calls to personal /api/user/* and invitation acceptance routes additionally require user:read or user:write where the browser self-service route needs no capability.',
     humanSubject: [
       'POST /api/organizations',
       'POST /api/organizations/:organizationId/repositories/create',
       'GET /api/projects/:projectId/github-merge-eligibility',
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
-    ],
-    interactiveHuman: [
       'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
       'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
-      'DELETE /api/organizations/:organizationId',
       'POST /api/users', 'DELETE /api/users/:userId',
+      'POST|PUT|DELETE /api/projects/:projectId/avatars/:avatarId (owner delegation; may not grant beyond token authority)',
+      'PUT /api/organizations/:organizationId/usage-policy (funding/concurrency changes require owner delegation)',
       'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
       'GET|POST|PUT|DELETE /api/user/github-accounts|git-profiles',
       'POST /api/organizations/:organizationId/subscription/checkout|portal|change|cancel|sync-seats (owner only)',
       'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize',
       'POST /api/organizations/:organizationId/payments/connect',
-      'POST /api/vault/items/:itemId/reveal',
-      'POST /api/tasks/:taskId/explanations',
       'POST /api/authorization/escalation-targets',
       'POST /api/authorization-requests',
     ],
   },
   resources: ['GET /api/resource-drivers'],
+  resourceAuthorization: 'Direct project resource and secret administration uses project:settings:write, including storageLocationId and uploads. Agents with this capability may act directly in any project covered by their token. Narrow task agents use propose_project_resource; adoption/discard requires task:review:execute.',
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId (PATCH body {name} or {config})',
     // The org-scoped spelling is the ONLY project-create that works on a hosted
@@ -70,7 +68,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/organizations/:organizationId/identity-policy', 'POST /api/organizations/:organizationId/scim-token',
     'GET|POST /api/organizations/:organizationId/members', 'DELETE /api/organizations/:organizationId/members/:userId',
     'GET|POST /api/organizations/:organizationId/invitations',
-    'POST /api/invitations/accept (body {token}; interactive human + verified email required)',
+    'POST /api/invitations/accept (body {token}; verified user subject and account email required)',
     'GET|POST /api/organizations/:organizationId/teams', 'PATCH|DELETE /api/organizations/:organizationId/teams/:teamId',
     'GET|POST /api/organizations/:organizationId/teams/:teamId/members',
     'DELETE /api/organizations/:organizationId/teams/:teamId/members/:userId',
@@ -88,7 +86,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/organizations/:organizationId/repositories/create (verified human subject; delegation accepted only with the authority-pinned GitHub account)',
     'GET /api/organizations/:organizationId/git-connections',
     'GET|PUT /api/organizations/:organizationId/github/app',
-    'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize (interactive human required for OAuth/install redirects); refresh is capability-only',
+    'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize (verified user subject; delegation accepted for OAuth/install redirects); refresh is capability-only',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
@@ -119,10 +117,10 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/permission-requests (body {capabilities, audience, reason, urgency?}; exact task elevation routed to people, teams, or Avatars; high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
-    'POST /api/permission-requests/:id/resolve?organizationId= (routed human or Avatar: body {action: approve|deny})',
-    'POST /api/authorization/escalation-targets (interactive grantor chooser; body {projectId, authorization})',
+    'POST /api/permission-requests/:id/resolve?organizationId= (routed user delegate or Avatar: body {action: approve|deny})',
+    'POST /api/authorization/escalation-targets (delegated grantor chooser; body {projectId, authorization})',
     'GET|POST /api/authorization-requests (GET by taskId or avatarId; POST routes an over-authorization request)',
-    'POST /api/authorization-requests/:id/resolve?organizationId= (routed human or authorizer Avatar: body {action: approve|deny})',
+    'POST /api/authorization-requests/:id/resolve?organizationId= (routed user delegate or authorizer Avatar: body {action: approve|deny})',
     'POST /api/agent/collaboration/request',
   ],
   conversations: [
@@ -184,13 +182,13 @@ export const PLATFORM_API_CATALOG = {
   ],
   vault: [
     'GET /api/vault/available (non-secret metadata for credentials granted to the calling task)',
-    'GET|POST /api/vault/items (typed credential items; list/save responses never contain secrets)', 'POST /api/vault/items/:id/reveal (human vault administrator only; audited)', 'DELETE /api/vault/items/:id',
+    'GET|POST /api/vault/items (typed credential items; list/save responses never contain secrets)', 'POST /api/vault/items/:id/reveal (credential:write administration; audited)', 'DELETE /api/vault/items/:id',
     'POST /api/vault/import/bitwarden (one-time plaintext Bitwarden JSON export; idempotent by Bitwarden item id; encrypted immediately and the request body is not retained as a file)',
     'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
     'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; body {itemId?|domain?, field?})',
     'POST /api/vault/fill (zero-exposure browser fill via CDP; body {itemId?|domain?, field?, selector, cdpUrl?})',
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why, urgency?}; approval is high urgency by default)',
-    'POST /api/vault/requests/:id/resolve (human: body {action: once|task|always|deny, itemId?})',
+    'POST /api/vault/requests/:id/resolve (credential:write: body {action: once|task|always|deny, itemId?})',
     'GET /api/vault/connectors (hosted 1Password + Git-backed pass; host-local Bitwarden/1Password/pass where available)',
     'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
     'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
@@ -236,8 +234,8 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/cards/:id',
   ],
   administration: [
-    'GET /api/user/export (human identity only; all data directly linked to the signed-in user)',
-    'POST /api/user/account-deletion-request (human identity only; records a verified deletion/offboarding request)',
+    'GET /api/user/export (verified user subject; delegation accepted; all data directly linked to the signed-in user)',
+    'POST /api/user/account-deletion-request (verified user subject; delegation accepted; records a verified deletion/offboarding request)',
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
@@ -260,9 +258,9 @@ export const PLATFORM_API_CATALOG = {
     // The inbox is per-USER by construction, so these three are the human surface:
     // a scoped agent token has no session.userId and gets a 400, whatever its
     // capabilities. An agent watches work through /ws and the task view instead.
-    'GET /api/inbox?since= (human identity only — the inbox is per-user)',
-    'PATCH /api/inbox/:itemId (human identity only)',
-    'GET|PUT /api/inbox/preferences (human identity only)',
+    'GET /api/inbox?since= (verified user subject; delegation accepted — the inbox is per-user)',
+    'PATCH /api/inbox/:itemId (verified user subject; delegation accepted)',
+    'GET|PUT /api/inbox/preferences (verified user subject; delegation accepted)',
     'GET /api/meta (deployment flags: hosted, hostLocal, safeMode — tells you which host-local routes exist here)',
     'POST /api/attachments (JSON dataUrl or image bytes)', 'POST /api/files (raw prompt file bytes)',
     'GET /api/attachments/:attachmentId',

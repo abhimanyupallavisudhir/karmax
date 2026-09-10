@@ -145,7 +145,7 @@ export function platformRequestPathError(path: string): string | undefined {
     prefix.endsWith('/') ? bare.startsWith(prefix) : bare === prefix || bare.startsWith(`${prefix}/`));
   if (excluded)
     return `${bare} is excluded from platform_request: the gateway answers it before the session gate, so it performs no capability check. `
-      + 'Account creation and sign-in are human operations — ask a human, or use the authorization/user administration routes if you hold user:write.';
+      + 'Use the authenticated authorization/user administration routes with user:write for account administration; authentication callbacks retain their own protocol checks.';
   return undefined;
 }
 

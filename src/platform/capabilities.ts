@@ -147,7 +147,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['process:read', 'View processes', 'Inspect processes managed by karmax.'],
       ['process:kill', 'Stop processes', 'Terminate processes managed by karmax.'],
       ['credential:read', 'View credential metadata', 'Discover credential handles, vault items, and non-secret policy.'],
-      ['credential:write', 'Manage credentials', 'Create, replace, delete, and configure credential handles and vault items, and resolve credential access requests.'],
+      ['credential:write', 'Manage credentials', 'Create, replace, delete, configure, and inspect plaintext credentials and vault items; resolve credential access requests.'],
       ['vault:store', 'Store new credentials', 'Write newly created credentials (accounts an agent registered) back into the vault as items.'],
       ['payment:read', 'View payments', 'Inspect payment methods, limits, and transactions.'],
       ['payment:write', 'Manage payments', 'Create payment resources and authorize spending within policy.'],
@@ -163,7 +163,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['authorization:read', 'View authorization', 'Read profiles, grants, defaults, and the audit log.'],
       ['authorization:write', 'Manage authorization', 'Change profiles, grants, and authorization defaults.'],
       ['user:read', 'View user accounts', 'List human accounts and their access grants.'],
-      ['user:write', 'Manage user accounts', 'Create and remove human accounts.'],
+      ['user:write', 'Manage user accounts', 'Create and remove user accounts; administer a securely delegated personal account.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
   {

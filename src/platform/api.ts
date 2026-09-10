@@ -1,3 +1,4 @@
+import { requireHumanSubject } from './identity.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
@@ -651,7 +652,7 @@ export class KarmaxApi {
     if (!item) throw new NotFoundError('vault item not found');
     // The narrow vault:store capability lets an agent preserve credentials it
     // created, not silently repurpose somebody else's credential as a project
-    // default. Existing-item attachment remains a human settings operation.
+    // default. Existing-item attachment requires explicit credential administration.
     if (item.provenance.taskId !== task.id)
       throw new CapabilityError('only a vault item created by this task can be proposed as a project resource');
     const field = input.source.field ?? item.fields[0];
@@ -674,7 +675,6 @@ export class KarmaxApi {
     const project = this.deps.store.getProject(task.projectId);
     const caller = this.require(token, 'adopt_project_resource', { taskId, projectId: task.projectId,
       organizationId: project?.organizationId });
-    if (caller.kind !== 'human') throw new CapabilityError('project resource adoption requires a human review token');
     if (!this.deps.resources) throw new Error('project resources are unavailable');
     const result = this.deps.resources.adoptCandidate(taskId, candidateId, caller.principal);
     // The durable store transition is authoritative. The signal only wakes a
@@ -691,7 +691,6 @@ export class KarmaxApi {
     const project = this.deps.store.getProject(task.projectId);
     const caller = this.require(token, 'discard_project_resource', { taskId, projectId: task.projectId,
       organizationId: project?.organizationId });
-    if (caller.kind !== 'human') throw new CapabilityError('project resource discard requires a human review token');
     if (!this.deps.resources) throw new Error('project resources are unavailable');
     const result = await this.deps.resources.discardCandidate(taskId, candidateId, caller.principal);
     try { await this.workflowHandle(taskId).signal(SIG.resourceResolved); }
@@ -3126,14 +3125,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     avatars: Array<{ id: string; name: string; purpose?: string; selector: string }>;
   } {
     const caller = this.require(token, 'create_task', { projectId: input.projectId });
-    if (caller.kind !== 'human' || !caller.principal.startsWith('user:'))
-      throw new CapabilityError('an interactive human is required to route an authorization request');
+    const subject = requireHumanSubject(caller);
     const project = this.deps.store.getProject(input.projectId);
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
     const authorization = this.deps.authorization;
     if (!authorization) throw new Error('authorization service is unavailable');
     const requestedCapabilities = authorization.requestedCapabilities(input.projectId, input.authorization);
-    const missingCapabilities = authorization.missingCapabilities(caller.principal, input.projectId, input.authorization);
+    const missingCapabilities = caller.kind === 'human'
+      ? authorization.missingCapabilities(caller.principal, input.projectId, input.authorization)
+      : requestedCapabilities.filter((capability) => !allows(caller.caps, capability));
     const memberIds = this.deps.store.listOrganizationMemberships(project.organizationId).map((member) => member.userId);
     const eligibleUserIds = memberIds.filter((userId) =>
       allows(authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId), 'task:create')
@@ -3148,7 +3148,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         selector: `@team:${team.slug}`, eligibleUserIds: team.eligibleUserIds }));
     const ownerIds = this.deps.store.listOrganizationMemberships(project.organizationId)
       .filter((member) => member.role === 'owner' && eligible.has(member.userId)).map((member) => member.userId);
-    const initiatingUserId = caller.principal.slice(5);
+    const initiatingUserId = subject.userId;
     const avatars = this.deps.store.listAvatars(input.projectId)
       .filter((avatar) => avatarEnabled(this.deps.store, avatar)
         && (!avatar.roles.length || avatar.roles.includes('authorize'))
@@ -3183,11 +3183,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     },
   ): Promise<AuthorizationRequest> {
     const caller = this.require(token, 'create_task', { projectId: input.projectId });
-    if (caller.kind !== 'human' || !caller.principal.startsWith('user:'))
-      throw new CapabilityError('an interactive human is required to request delegated authorization');
+    const subject = requireHumanSubject(caller);
     const project = this.deps.store.getProject(input.projectId);
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
-    const requesterId = caller.principal.slice(5);
+    const requesterId = subject.userId;
     if (input.target.kind === 'task') {
       const task = this.deps.store.getTask(input.target.taskId);
       if (!task || task.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
@@ -3310,8 +3309,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const request = service.requests().find((candidate) => candidate.id === input.requestId);
     if (!request) throw new NotFoundError(`no authorization request ${input.requestId}`);
     const caller = this.require(token, 'task:read', { projectId: request.projectId, organizationId: input.organizationId });
-    const humanUserId = caller.kind === 'human' && caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
     const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:') ? caller.principal.slice(7) : undefined;
+    const humanUserId = avatarId ? undefined : caller.humanSubject?.userId;
     if (!humanUserId && !avatarId) throw new CapabilityError('a routed human or Avatar is required to resolve this request');
     if (humanUserId && !request.recipients.includes(humanUserId)
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
@@ -3399,10 +3398,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       projectId: request.projectId,
       organizationId: input.organizationId,
     });
-    const humanUserId = caller.kind === 'human' && caller.principal.startsWith('user:')
-      ? caller.principal.slice(5) : undefined;
     const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:')
       ? caller.principal.slice(7) : undefined;
+    const humanUserId = avatarId ? undefined : caller.humanSubject?.userId;
     if (!humanUserId && !avatarId)
       throw new CapabilityError('a routed human or Avatar principal is required to resolve a permission request');
     if (humanUserId && !request.recipients.includes(humanUserId)
@@ -3960,7 +3958,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
     if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
-      const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+      const userId = caller.humanSubject?.userId;
       if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
       if (!this.deps.store.humanMayAct(taskId, userId))
         throw new CapabilityError('this workflow confirmation step is assigned to someone else');
@@ -3970,7 +3968,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         recordHumanConfirmation(this.deps.store, taskId, userId);
       }
     } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
-      const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+      const userId = caller.humanSubject?.userId;
       if (!userId) throw new CapabilityError('only an explicitly targeted human can satisfy this confirmation policy');
       const vote = this.deps.store.voteConfirmation(taskId, userId);
       if (!vote.authorized) throw new CapabilityError('you are not a reviewer for this task');
