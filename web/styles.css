@@ -2570,3 +2570,11 @@ html[data-theme="dark"] .github-signin-btn:active,
   .avatar-defaults { grid-template-columns: 1fr; }
   .avatar-role-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
+
+/* Review documents use the same Markdown typography as conversation messages. */
+.artifact-reader { width: min(900px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; color: var(--ink); }
+.artifact-reader::backdrop { background: rgba(0, 0, 0, .45); }
+.artifact-reader-header { display: flex; align-items: center; gap: 10px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+.artifact-reader-header h2 { flex: 1; min-width: 0; margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.artifact-reader-content { padding: 20px; max-height: calc(100dvh - 150px); overflow: auto; }
+.artifact-reader-content > pre { margin: 0; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
