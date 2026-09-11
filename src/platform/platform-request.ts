@@ -94,6 +94,9 @@ export const PLATFORM_REQUEST_EXCLUDED_PATHS = [
   '/api/github/oauth/callback',
   '/api/github/manifest/callback',
   '/api/tls/preview-allow', // Caddy on-demand TLS probe
+  '/api/subscriptions/webhook', // Stripe subscription webhook, signature-verified
+  '/api/meta',
+  '/api/health/',
 ] as const;
 
 /**

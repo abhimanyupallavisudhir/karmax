@@ -192,7 +192,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
-  if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return 'task:conversation:read';
+  // Requesting an explanation spends the organization's model credit and
+  // appends to the timeline, so it is a conversation write, not a read.
+  if (/^\/api\/tasks\/[^/]+\/explanations$/.test(p)) return read ? 'task:conversation:read' : 'task:conversation:message';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
   if (p === '/api/authorization/escalation-targets' || p === '/api/authorization-requests')
     return read ? 'task:read' : 'task:create';
@@ -488,6 +490,9 @@ export function toPublicPayload(value: unknown): unknown {
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
  *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
 export const DEFAULT_GATEWAY_PORT = 4505;
+/** Online password guessing: this many failures per address or account lock sign-in for the window. */
+const LOGIN_MAX_FAILURES = 10;
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
 
 const USER_CAPS = ['*'];
@@ -581,6 +586,10 @@ interface Session {
 export class Gateway {
   private sessions = new Map<string, Session>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
+  /** Failed sign-ins per client address and per account. Better Auth's own
+   *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
+   *  directly, so without this a password could be guessed online. */
+  private loginFailures = new Map<string, { count: number; until: number }>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Host-machine affordances (`pass` import, host filesystem paths, a local
@@ -630,6 +639,35 @@ export class Gateway {
       // coordinator's compare-and-set transition only needs-attention → available.
       if (credential) await this.refreshUsage(credential.key, state.organizationId).catch(() => undefined);
     });
+  }
+
+  /** The live event stream (`/ws`): every durable event the caller may read. */
+  private async eventStream(ws: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const auth = await this.socketAuth(req, url);
+    if (!auth) { ws.close(4401, 'unauthorized'); return; }
+    const scoped = this.deps.tokens.verify(auth.apiToken);
+    const off = this.fanout.on((ev) => {
+      const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
+      if (scoped?.projectId && projectId !== scoped.projectId) return;
+      if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
+        const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
+        if (!allows(humanCaps ?? [], 'task:event:read')) return;
+      }
+      try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
+    });
+    ws.on('close', off);
+    ws.on('error', off);
+  }
+
+  /** Whether a review-action process id was started for `taskId`. Ids are
+   *  guessable, so the task in the route is the authority, not the id. */
+  private reviewActionBelongsTo(procId: string, taskId: string): boolean {
+    const live = this.reviewActions.get(procId);
+    if (live) return live.taskId === taskId;
+    const durable = this.deps.store.execution(procId);
+    return !!durable && durable.taskId === taskId && durable.kind === 'review-action';
   }
 
   private pendingCredentialRequests(taskId: string): CredentialAccessRequest[] {
@@ -744,6 +782,28 @@ export class Gateway {
       if (value !== undefined && to) this.deps.store.kvSet(`${prefix}${to}`, value);
       this.deps.store.kvDelete(`${prefix}${from}`);
     }
+  }
+
+  private clientAddress(req: http.IncomingMessage): string {
+    // Only a hosted cell sits behind a proxy whose forwarded header is trustworthy.
+    const forwarded = this.deps.hosted ? String(req.headers['x-forwarded-for'] ?? '').split(',')[0]!.trim() : '';
+    return forwarded || req.socket.remoteAddress || 'unknown';
+  }
+  private loginBlocked(keys: string[]): boolean {
+    const now = Date.now();
+    for (const [key, record] of this.loginFailures) if (record.until <= now) this.loginFailures.delete(key);
+    return keys.some((key) => (this.loginFailures.get(key)?.count ?? 0) >= LOGIN_MAX_FAILURES);
+  }
+  private noteLoginFailure(keys: string[]): void {
+    const now = Date.now();
+    for (const key of keys) {
+      const record = this.loginFailures.get(key);
+      if (record && record.until > now) record.count += 1;
+      else this.loginFailures.set(key, { count: 1, until: now + LOGIN_FAILURE_WINDOW_MS });
+    }
+  }
+  private clearLoginFailures(keys: string[]): void {
+    for (const key of keys) this.loginFailures.delete(key);
   }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
@@ -900,28 +960,18 @@ export class Gateway {
         wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
       else socket.destroy();
     });
-    wssEvents.on('connection', async (ws, req) => {
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      const auth = await this.socketAuth(req, url);
-      if (!auth) { ws.close(4401, 'unauthorized'); return; }
-      const scoped = this.deps.tokens.verify(auth.apiToken);
-      const off = this.fanout.on((ev) => {
-        const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
-        if (scoped?.projectId && projectId !== scoped.projectId) return;
-        if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
-          const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
-          if (!allows(humanCaps ?? [], 'task:event:read')) return;
-        }
-        try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
-      });
-      ws.on('close', off);
-      ws.on('error', off);
+    wssEvents.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.eventStream(ws, req).catch(() => { try { ws.close(); } catch {} });
     });
     wssTerm.on('connection', (ws, req) => {
       ws.on('error', () => {});
       void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
     });
-    wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
+    wssAction.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.reviewActionStream(ws, req).catch(() => { try { ws.close(); } catch {} });
+    });
     wssPreview.on('connection', (ws, req) => {
       ws.on('error', () => {});
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
@@ -1374,14 +1424,12 @@ export class Gateway {
       // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
       // header) — forwarding services can rarely set custom headers, so the
       // query form is the primary one. Legacy env secret stays accepted.
-      const minted = mailMod.ingestSecret(this.deps.store);
       const presented = url.searchParams.get('secret')
         ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
-      const legacy = process.env.KARMAX_AGENT_MAIL_SECRET;
-      // Constant-time compare so the secret can't be recovered byte-by-byte via
-      // response timing (matches the Stripe webhook check).
-      const secretOk = !!presented && (timingSafeEqualStr(presented, minted) || (!!legacy && timingSafeEqualStr(presented, legacy)));
-      if (!secretOk)
+      // The secret names the organization it may deliver to (compared in constant
+      // time inside); an installation-wide legacy secret still reaches every one.
+      const scope = mailMod.ingestScope(this.deps.store, presented, process.env.KARMAX_AGENT_MAIL_SECRET);
+      if (!scope)
         return this.json(res, 401, { error: `agent-mail ingest requires the webhook secret (the ?secret= in the URL ${this.siteName} shows the operator)` });
       // Providers POST different shapes/encodings; parse by content-type and
       // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
@@ -1401,7 +1449,8 @@ export class Gateway {
       // Routed by recipient to the owning organization; unknown recipients are
       // dropped (never leaked into any tenant's inbox). Never echo the message.
       const { delivered } = new mailMod.AgentMail(this.deps.store)
-        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') });
+        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') },
+          scope.organizationId);
       return this.json(res, 200, { delivered });
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
@@ -1493,19 +1542,26 @@ export class Gateway {
     }
     if (p === '/api/login' && method === 'POST') {
       const b = await this.body(req);
+      const email = String(b.email ?? '').trim().toLowerCase();
+      const throttleKeys = [`ip:${this.clientAddress(req)}`, ...(email ? [`email:${email}`] : [])];
+      if (this.loginBlocked(throttleKeys))
+        return this.json(res, 429, { error: 'too many failed sign-in attempts; try again in a few minutes' });
       if (this.deps.identity) {
         try {
           const response = await this.deps.identity.signIn(String(b.email ?? ''), String(b.password ?? ''), requestHeaders(req.headers));
+          if (response.ok) this.clearLoginFailures(throttleKeys); else this.noteLoginFailure(throttleKeys);
           return this.sendWebResponse(res, response);
-        } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
+        } catch { this.noteLoginFailure(throttleKeys); return this.json(res, 401, { error: 'invalid email or password' }); }
       }
       if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       // Constant-time, like the Stripe webhook and the agent-mail ingest secret:
       // this compares a shared secret on an unauthenticated route.
       if (this.deps.password && timingSafeEqualStr(String(b.password ?? ''), this.deps.password)) {
+        this.clearLoginFailures(throttleKeys);
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
       }
+      this.noteLoginFailure(throttleKeys);
       return this.json(res, 401, { error: 'invalid password' });
     }
     if (p === '/api/setup' && method === 'POST' && this.deps.identity) {
@@ -2430,7 +2486,13 @@ export class Gateway {
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
       if (organizationProjects) {
         const organizationId = organizationProjects[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
+        if (method === 'GET') {
+          // Same per-project filter as GET /api/projects: an organization member
+          // sees the projects they can read, not every project in the tenant.
+          const principal = session.userId && this.deps.authorization && !authRecord?.projectId ? `user:${session.userId}` : undefined;
+          return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId
+            && (!principal || allows(this.deps.authorization!.capabilities(principal, project.id), 'project:read'))));
+        }
         if (method === 'POST') {
           const b = await this.body(req);
           let project;
@@ -4505,13 +4567,17 @@ export class Gateway {
         });
         return this.json(res, 200, { kind: 'run', procId: rec.procId, server: rec.server, openUrls: rec.openUrls });
       }
+      // The capability check above scoped to the task in the path; the process
+      // id must belong to that task too, or a caller could read (or stop) another
+      // tenant's review action — or interactive terminal — by guessing its id.
       const raStopMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)\/stop$/);
       if (raStopMatch && method === 'POST') {
+        if (!this.reviewActionBelongsTo(raStopMatch[2]!, raStopMatch[1]!)) return this.json(res, 404, { error: 'no such action process' });
         return this.json(res, 200, { ok: this.reviewActions.stop(raStopMatch[2]!) });
       }
       const raStatusMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)$/);
       if (raStatusMatch && method === 'GET') {
-        const st = this.reviewActions.status(raStatusMatch[2]!);
+        const st = this.reviewActionBelongsTo(raStatusMatch[2]!, raStatusMatch[1]!) ? this.reviewActions.status(raStatusMatch[2]!) : undefined;
         return this.json(res, st ? 200 : 404, st ?? { error: 'no such action process' });
       }
       const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
@@ -4539,7 +4605,9 @@ export class Gateway {
           if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
           const id = newId('artifact');
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
-          const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
+          // The type is derived from the name, never taken from the request: a
+          // caller-chosen `text/html` would be echoed back inline on this origin.
+          const mediaType = ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
           const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
           const managedStorage = store.listStorageLocations(project.organizationId).find((location) => location.kind === 'managed');
           if (managedStorage) store.reserveStorageUpload(`artifact:${id}`, project.organizationId, managedStorage.id,
@@ -4572,9 +4640,8 @@ export class Gateway {
           const data = await this.deps.objects.get(artifact.objectKey);
           if (crypto.createHash('sha256').update(data).digest('hex') !== artifact.sha256)
             return this.json(res, 502, { error: 'artifact integrity check failed' });
-          res.writeHead(200, { 'content-type': artifact.mediaType, 'content-length': String(data.length),
-            'content-disposition': `inline; filename="${artifact.name.replace(/["\\\r\n]/g, '_')}"`,
-            'cache-control': 'private, no-store' });
+          res.writeHead(200, { ...untrustedContentHeaders(artifact.mediaType, artifact.name),
+            'content-length': String(data.length), 'cache-control': 'private, no-store' });
           return void res.end(data);
         }
         if (method === 'DELETE') {
@@ -4617,7 +4684,8 @@ export class Gateway {
           `${previewMatch[3] ?? '/'}${url.search}`, `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`);
       }
       const previewLeases = p.match(/^\/api\/tasks\/([^/]+)\/preview-leases$/);
-      if (previewLeases && method === 'GET') return this.json(res, 200, store.listPreviewLeases(previewLeases[1]!));
+      if (previewLeases && method === 'GET') return this.json(res, 200,
+        store.listPreviewLeases(previewLeases[1]!).map((lease) => ({ ...lease, tokenHash: undefined })));
       if (previewLeases && method === 'POST') {
         const taskId = previewLeases[1]!;
         const task = store.getTask(taskId);
@@ -5715,7 +5783,7 @@ export class Gateway {
           // The push webhook URL (secret included) + Cloudflare worker are still
           // returned for the operator who wants them; the UI hides them for now.
           const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
-          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
+          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store, organizationId)}`;
           return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider, webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
         }
         if (sub === 'connect' && method === 'POST') {
@@ -6555,8 +6623,25 @@ export class Gateway {
       // activity feed (all events)
       if (p === '/api/activity' && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
-        let events = store.allEventsSince(since, 300);
-        if (authRecord?.projectId) events = events.filter((e) => store.getTask(e.taskId)?.projectId === authRecord?.projectId);
+        // The event log is installation-wide; scope it to the caller's tenant.
+        // A bearer pinned to one project sees that project; an organization- or
+        // multi-project-scoped one sees its own organization/projects; a caller
+        // with no resolvable scope sees nothing rather than everyone's events.
+        const visibleProjects = authRecord?.projectId ? new Set([authRecord.projectId])
+          : authRecord?.projectIds?.length ? new Set(authRecord.projectIds) : undefined;
+        const visibleOrganization = authRecord?.organizationId ?? requestedScope.organizationId;
+        if (!visibleProjects && !visibleOrganization) return this.json(res, 200, []);
+        const projectCache = new Map<string, Project | undefined>();
+        const projectOf = (id: string) => {
+          if (!projectCache.has(id)) projectCache.set(id, store.getProject(id));
+          return projectCache.get(id);
+        };
+        const events = store.allEventsSince(since, 300).filter((e) => {
+          const projectId = store.getTask(e.taskId)?.projectId;
+          if (!projectId) return false;
+          if (visibleProjects) return visibleProjects.has(projectId);
+          return (projectOf(projectId)?.organizationId ?? 'org_personal') === visibleOrganization;
+        });
         return this.json(res, 200, events);
       }
 
@@ -7045,11 +7130,10 @@ export class Gateway {
       const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
       const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {
-        'content-type': inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+        ...untrustedContentHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+          path.basename(relPath)),
         'content-length': String(data.length),
-        'content-disposition': `inline; filename="${path.basename(relPath).replace(/["\\\r\n]/g, '_')}"`,
         'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff',
       });
       res.end(data);
     } catch (error) {
@@ -7264,19 +7348,21 @@ export class Gateway {
           return this.scimJson(res, 201, scimUser(user));
         }
         if ((method === 'PATCH' || method === 'PUT') && id) {
+          // An IdP administers its own organization's users only; `revokeUserSessions`
+          // is installation-wide, so membership is checked before either branch.
+          if (!this.deps.store.organizationMembership(organizationId, id)) return this.scimJson(res, 404, { detail: 'user not found' });
           const activeOperation = body.Operations?.find((operation: any) => String(operation.path ?? '').toLowerCase() === 'active');
           const active = activeOperation ? activeOperation.value !== false : body.active !== false;
           if (!active) {
             this.deps.store.deprovisionOrganizationUser(organizationId, id);
             this.deps.identity.revokeUserSessions(id);
-          } else if (!this.deps.store.organizationMembership(organizationId, id)) {
-            this.deps.store.setOrganizationMembership(organizationId, id, 'member');
           }
           void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
           const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
           return this.scimJson(res, 200, user ? scimUser(user, active) : { id, active });
         }
         if (method === 'DELETE' && id) {
+          if (!this.deps.store.organizationMembership(organizationId, id)) return this.scimJson(res, 404, { detail: 'user not found' });
           this.deps.store.deprovisionOrganizationUser(organizationId, id);
           this.deps.identity.revokeUserSessions(id);
           void this.deps.subscriptions?.syncSeats(organizationId).catch(() => undefined);
@@ -7501,6 +7587,10 @@ export class Gateway {
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !this.deps.tokens.verify(cached.apiToken)) {
       if (cached) this.deps.tokens.revoke(cached.apiToken);
+      // Entries are keyed by session; a session that ended never comes back to
+      // evict its own, so sweep the expired ones when the cache has grown.
+      if (this.identityTokens.size >= 2_000)
+        for (const [key, entry] of this.identityTokens) if (!this.deps.tokens.verify(entry.apiToken)) this.identityTokens.delete(key);
       cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000, resolvedOrganizationId).token, fingerprint };
       this.identityTokens.set(cacheKey, cached);
     }
@@ -7800,6 +7890,28 @@ function isWorkflowGone(error: unknown): boolean {
 function isWorldGone(error: unknown): boolean {
   const value = error as { message?: string };
   return /(?:not found|does not exist|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
+}
+
+/** Headers for agent- or repository-authored bytes served on the console origin.
+ *  Inert types (images, PDF, video, text) render inline. Active documents —
+ *  `text/html`, `image/svg+xml` — render inline too, but under a CSP `sandbox`
+ *  that gives the document an opaque origin: scripts run (so an HTML report
+ *  works), but the page cannot read the console's cookies or storage, nor make
+ *  a credentialed request to it. Everything else is a download. */
+const INERT_MEDIA = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/(?:mp4|webm|quicktime)|text\/(?:plain|csv)|application\/json)(?:;|$)/i;
+const ACTIVE_DOCUMENT_MEDIA = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)(?:;|$)/i;
+export function untrustedContentHeaders(mediaType: string, filename: string): Record<string, string> {
+  const name = filename.replace(/["\\\r\n]/g, '_');
+  const inert = INERT_MEDIA.test(mediaType);
+  const active = ACTIVE_DOCUMENT_MEDIA.test(mediaType);
+  return {
+    'content-type': inert || active ? mediaType : 'application/octet-stream',
+    'content-disposition': `${inert || active ? 'inline' : 'attachment'}; filename="${name}"`,
+    'content-security-policy': active
+      ? 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads'
+      : "sandbox; default-src 'none'",
+    'x-content-type-options': 'nosniff',
+  };
 }
 
 function escapeHtml(value: string): string {

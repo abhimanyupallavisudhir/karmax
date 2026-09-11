@@ -24,7 +24,10 @@ export class ConfigHomeManager {
    * Historical flat homes belong only to the personal organization. */
   ensure(provider: Provider, account: string, organizationId = 'org_personal'): string {
     const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
-    fs.mkdirSync(dir, { recursive: true });
+    // Provider CLIs write OAuth tokens here at their own default modes; the
+    // directory itself is what keeps other local users out.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch { /* not the owner; leave it */ }
     return dir;
   }
 
@@ -397,6 +400,26 @@ export function hasClaudeNativeCredential(home: string): boolean {
   return false;
 }
 
+/** Names the control plane must never hand to an agent subprocess: every
+ *  `KARMAX_*` variable except the few an agent legitimately reads (its gateway
+ *  address, the runtime protocol, provider command overrides), plus any
+ *  secret-shaped name from another service (Stripe, sandbox providers, cloud
+ *  credentials, GitHub tokens). The `*_FILE` indirections are stripped with
+ *  their targets so the path to a mounted secret does not leak either. */
+const AGENT_VISIBLE_KARMAX_ENV = new Set([
+  'KARMAX_GATEWAY_URL', 'KARMAX_PUBLIC_URL', 'KARMAX_TOKEN', 'KARMAX_RUNTIME_PROTOCOL',
+  'KARMAX_HOME', 'KARMAX_DEPLOYMENT', 'KARMAX_HOST_LOCAL', 'KARMAX_CELL_ID',
+  'KARMAX_ANTHROPIC_BASE_URL', 'KARMAX_OPENAI_BASE_URL', 'KARMAX_KIMI_BASE_URL',
+  'KARMAX_CODEX_USE_EXEC', 'KARMAX_CODEX_EXEC_CMD', 'KARMAX_OPENCODE_CMD', 'KARMAX_KIMI_CMD', 'KARMAX_GROK_CMD',
+  'KARMAX_AGENT_BG_SETTLE_MS', 'KARMAX_CLAUDE_MODEL', 'KARMAX_OPENAI_MODEL', 'KARMAX_AGENT_PROVIDER',
+]);
+const FOREIGN_SECRET_ENV = /^(?:STRIPE_|E2B_|DAYTONA_|AWS_(?:SECRET|SESSION|ACCESS)|GH_TOKEN$|GITHUB_TOKEN$|GITHUB_APP_|NPM_TOKEN$|VAULT_TOKEN$|OP_SERVICE_ACCOUNT_TOKEN$|BW_SESSION$)/;
+export function isControlPlaneSecretEnv(key: string): boolean {
+  const base = key.endsWith('_FILE') ? key.slice(0, -5) : key;
+  if (base.startsWith('KARMAX_')) return !AGENT_VISIBLE_KARMAX_ENV.has(base);
+  return FOREIGN_SECRET_ENV.test(base);
+}
+
 /** Build a clean, isolated environment for an agent spawn (SPEC §7.3 gotcha). */
 export function scrubbedEnv(opts: { provider: Provider; configHome?: string; extra?: Record<string, string> }): Record<string, string> {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
@@ -417,6 +440,12 @@ export function scrubbedEnv(opts: { provider: Provider; configHome?: string; ext
   delete env.KIMI_MODEL_NAME;
   delete env.KIMI_MODEL_BASE_URL;
   for (const provider of MODEL_PROVIDERS) delete env[apiKeyEnv(provider)];
+  // Nor the control plane's own secrets: the agent runs untrusted code, and the
+  // vault key, auth secret, database URL, provider and billing keys all live in
+  // this process's environment (deployment.ts hydrates them from *_FILE too).
+  // Remote worlds cross an allowlist (remote-process.ts); local worlds inherit
+  // the host shell, so strip by name and by shape.
+  for (const key of Object.keys(env)) if (isControlPlaneSecretEnv(key)) delete env[key];
   if (opts.configHome) {
     if (opts.provider === 'claude') env.CLAUDE_CONFIG_DIR = opts.configHome;
     if (opts.provider === 'codex') env.CODEX_HOME = opts.configHome;

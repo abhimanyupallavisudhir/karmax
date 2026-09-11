@@ -1895,7 +1895,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (args.role === 'resolve') {
         const { listResolveSkills, renderSkillsIndex } = await import('../resolve/skills.js');
         const { paths } = await import('../config/paths.js');
-        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
+        const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
+        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content, organizationId)) };
       }
       // Goal mode: the do agent is told to keep driving across turns until the
       // objective is verifiably complete. Appended to the built-in working

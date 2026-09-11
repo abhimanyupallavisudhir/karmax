@@ -39,7 +39,8 @@ function browser() {
     refreshTasks: async () => {},
     setTimeout: (fn) => { timers.push(fn); return timers.length; },
   });
-  vm.runInContext('let inboxRefreshTimer; let wsHadDropped = false;\n' +
+  // Module-level state connectWs reads: reconnect backoff and the vault-approvals repaint hook.
+  vm.runInContext('let inboxRefreshTimer; let wsHadDropped = false; let wsRetryMs = 1500; let refreshVaultRequests = null;\n' +
     ['urgencyRank', 'inboxArrivals', 'loadInbox', 'inboxEventChanges', 'scheduleInboxReload', 'connectWs']
       .map(extractFn).join('\n'), ctx);
   return { ctx, state, alerts, timers, respond: (value) => { response = value; } };

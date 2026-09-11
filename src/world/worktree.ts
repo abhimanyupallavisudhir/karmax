@@ -292,7 +292,9 @@ export class WorktreeProvider implements WorldProvider {
       env: baseEnv,
     });
     try {
-      if (!key && !httpsToken && /^(?:ssh:\/\/|[^\s/@]+@[^\s/:]+:)/i.test(source) && !process.env.GIT_SSH_COMMAND) {
+      // `env` already carries the isolated ssh command for a tenant clone; only a
+      // host-shell clone with no ssh command of its own gets the fallback.
+      if (!key && !httpsToken && /^(?:ssh:\/\/|[^\s/@]+@[^\s/:]+:)/i.test(source) && !env.GIT_SSH_COMMAND && !process.env.GIT_SSH_COMMAND) {
         // A first-ever GitHub clone must not stop on an interactive host-key
         // question; accept-new preserves mismatch protection on later connects.
         env.GIT_SSH_COMMAND = 'ssh -o StrictHostKeyChecking=accept-new';

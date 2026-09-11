@@ -3,7 +3,9 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
 const start = source.indexOf('async function uploadResourceFiles(');
-const end = source.indexOf('\nfunction arrayBufferToBase64', start);
+// Up to the next top-level declaration, whatever it is (the helper that used to
+// follow uploadResourceFiles was removed as dead code).
+const end = start + 1 + source.slice(start + 1).search(/\n(?:async )?function /);
 const requests = [];
 const context = { encodeURIComponent, api: async (url, options = {}) => {
   requests.push({ url, ...options });

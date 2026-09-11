@@ -176,8 +176,12 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
       || (!modern && processed >= LEGACY_CONTINUE_AS_NEW_AFTER && current.length === 0);
     const changed = current.length ? await condition(ready, LEASE_TIMEOUT) : (await condition(ready), true);
     if (!changed && current.length) {
-      const alive = await Promise.all(current.map((item) => act.isTaskAlive(item.taskId)));
-      current = current.filter((_, i) => alive[i]);
+      // Signals land during the probe (a release shrinks `current`, a grant grows
+      // it), so drop the dead leases by identity, never by the probed index.
+      const probed = current;
+      const alive = await Promise.all(probed.map((item) => act.isTaskAlive(item.taskId)));
+      const dead = new Set(probed.filter((_, i) => !alive[i]).map((item) => item.turnId));
+      if (dead.size) current = current.filter((item) => !dead.has(item.turnId));
       continue;
     }
     if (shouldRotate() || (!modern && processed >= LEGACY_CONTINUE_AS_NEW_AFTER && current.length === 0)) {
