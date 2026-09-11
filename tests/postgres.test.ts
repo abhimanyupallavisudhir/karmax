@@ -16,6 +16,20 @@ integration('PostgreSQL cutover', () => {
   });
   afterAll(async () => { await admin?.end(); });
 
+  it('patches task fields without replacing unrelated metadata or merging revoked grants', () => {
+    const store = new Store(url!);
+    try {
+      const project = store.createProject('Parameter patches');
+      const task = store.createTask({ projectId: project.id, title: 'Resume', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'work', _workflowRunId: 'live-run',
+          _authorization: { capabilities: ['old'], delegationId: 'revoked' } } });
+      store.patchTaskParams(task.id, { base: 'main', _authorization: { capabilities: ['new'] },
+        nullable: null, ignored: undefined });
+      expect(store.getTask(task.id)?.params).toEqual({ prompt: 'work', _workflowRunId: 'live-run',
+        base: 'main', _authorization: { capabilities: ['new'] }, nullable: null });
+    } finally { store.close(); }
+  });
+
   it('retains shared snapshot chunks and releases only the last reference', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-postgres-chunks-'));
     const { store } = openStore(path.join(home, 'karmax.db'), url!);

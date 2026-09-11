@@ -3056,6 +3056,20 @@ export class Store {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
   }
 
+  /** Atomically replace only the supplied top-level fields. Use after awaits:
+   * a whole-record write can restore a superseded execution or authorization. */
+  patchTaskParams(taskId: string, patch: Record<string, unknown>) {
+    const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
+    if (!entries.length) return;
+    if (this.db.dialect === 'postgres') {
+      this.db.prepare('UPDATE tasks SET params = (params::jsonb || ?::jsonb)::text WHERE id = ?')
+        .run(JSON.stringify(Object.fromEntries(entries)), taskId);
+    } else {
+      this.db.prepare(`UPDATE tasks SET params = json_set(params, ${entries.map(() => '?, json(?)').join(', ')}) WHERE id = ?`)
+        .run(...entries.flatMap(([key, value]) => [`$.${JSON.stringify(key)}`, JSON.stringify(value)]), taskId);
+    }
+  }
+
   /** Archive/unarchive the logical task, regardless of which attempt initiated it.
    * List and search surfaces project only the current principal attempt, so letting
    * siblings carry different archive flags can put the same task in neither list
