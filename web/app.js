@@ -8390,13 +8390,23 @@ function conversationEntries(t) {
       sourceKey: `message:${message.id}`, conversationRole: t.role });
   }
   // Explanations retain their input prompt after the human wait is resolved.
+  // sourceRequest.ts can be a workflow revision (e.g. 17), not wall time.
+  // Recover the wait's timestamp where available, otherwise anchor to the first
+  // explanation. Never sort a revision as 1970 or move a request on re-explain.
   const requests = new Map();
   for (const event of orderedEvents) {
     const e = event.payload;
     if (event.type !== 'conversation.explanation' || e?.role !== t.role || !e.sourceRequest) continue;
+    if (requests.has(e.sourceKey)) continue;
+    const wait = orderedEvents.filter((candidate) => candidate.type === 'view.updated'
+      && candidate.payload?.waitingFor === 'human'
+      && candidate.payload?.waitingDetail?.trim() === e.sourceRequest.text
+      && Number(candidate.ts) <= Number(event.ts)).at(-1);
+    const ts = Number(e.sourceRequest.ts) > 100000000000
+      ? Number(e.sourceRequest.ts) : (wait?.ts ?? event.ts);
     requests.set(e.sourceKey, { type: 'input-request', request: e.sourceRequest,
-      sourceKey: e.sourceKey, conversationRole: t.role, ts: e.sourceRequest.ts,
-      sortTs: e.sourceRequest.ts, order: event.seq ?? event.ts });
+      sourceKey: e.sourceKey, conversationRole: t.role, ts,
+      sortTs: ts, order: wait?.seq ?? event.seq ?? event.ts });
   }
   const combined = [...messages, ...posted.values(), ...visibleActivities, ...requests.values()];
   combined.sort((a, b) => (Number(a.sortTs || 0) - Number(b.sortTs || 0)) || (Number(a.order || 0) - Number(b.order || 0)));

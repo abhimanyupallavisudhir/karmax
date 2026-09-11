@@ -272,5 +272,50 @@ const resolvedHtml = conversationPane({ ...requestView, status: 'active', waitin
 ok(resolvedHtml.includes('Choose a deployment target.') && resolvedHtml.includes('Pick where the update should go.'), 'resolved prompt and explanation survive reload');
 ok(!conversationPane(requestView, { role: 'merge', messages: [] }).includes('input-request'), 'input explanation stays in its own conversation');
 
+// Task 219 stored updatedAt=17: a workflow revision must not send an explained
+// request to the start of the thread. Include surrounding history (the original
+// input-request fixture had no messages and used an epoch timestamp).
+const revisionView = { ...requestView, updatedAt: 17 };
+const revisionKey = 'input-request:17';
+const revisionTranscript = { role: 'do', messages: [
+  { id: 'before', role: 'user', text: 'Earlier question', ts: 1710000000000 },
+] };
+const annotation = { seq: 40, ts: 1710000011000, type: 'conversation.explanation', payload: {
+  role: 'do', sourceKey: revisionKey,
+  sourceRequest: { text: revisionView.waitingFor.detail, ts: 17 },
+  text: 'First explanation',
+} };
+S.taskEvents = [];
+const beforeExplanation = conversationPane(revisionView, revisionTranscript);
+ok(beforeExplanation.indexOf('Earlier question') < beforeExplanation.indexOf('Choose a deployment target.'),
+  'unexplained revision-stamped request follows prior messages');
+S.taskEvents = [annotation];
+const afterExplanation = conversationPane(revisionView, revisionTranscript);
+ok(afterExplanation.indexOf('Earlier question') < afterExplanation.indexOf('Choose a deployment target.'),
+  'explaining a revision-stamped request keeps it after prior messages');
+ok((afterExplanation.match(/class="msg agent input-request"/g) || []).length === 1,
+  'revision-stamped request remains visible exactly once');
+let revisionEntries = conversationEntries(revisionTranscript);
+ok(revisionEntries[1].type === 'input-request' && revisionEntries[2].type === 'explanation',
+  'explanation stays directly beneath revision-stamped request');
+const laterTranscript = { role: 'do', messages: [...revisionTranscript.messages,
+  { id: 'later', role: 'user', text: 'Later follow-up', ts: 1710000020000 },
+] };
+S.taskEvents = [{ ...annotation, seq: 50, ts: 1710000030000,
+  payload: { ...annotation.payload, text: 'Second explanation' } }, annotation];
+revisionEntries = conversationEntries(laterTranscript);
+ok(revisionEntries.map((entry) => entry.type).join(',') === 'message,input-request,explanation,explanation,message',
+  'reload and repeated explanation preserve the original request position before later follow-ups');
+S.taskEvents.push({ seq: 39, ts: 1710000010000, type: 'view.updated', payload: {
+  waitingFor: 'human', waitingDetail: revisionView.waitingFor.detail,
+} });
+revisionEntries = conversationEntries(laterTranscript);
+ok(revisionEntries.find((entry) => entry.type === 'input-request').ts === 1710000010000,
+  'durable human-wait event supplies the actual request time when available');
+S.taskEvents = [annotation];
+ok(conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
+  .indexOf('Choose a deployment target.') < conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
+  .indexOf('Later follow-up'), 'resolved revision-stamped request survives a bounded history reload in order');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
