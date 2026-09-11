@@ -440,8 +440,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(await noSubjectResponse.json()).toMatchObject({ error: expect.stringMatching(/verified human subject/i) });
 
     const interactiveOnly = await fetch(`${base}/api/user/export`, { headers: delegatedAuth });
-    expect(interactiveOnly.status).toBe(403);
-    expect(await interactiveOnly.json()).toMatchObject({ error: expect.stringMatching(/user:read/) });
+    expect(interactiveOnly.status).toBe(401);
+    expect(await interactiveOnly.json()).toMatchObject({ error: 'a signed-in user account is required' });
 
     const audit = h.store.auditSince(0, 2000).find((event) =>
       event.action === 'http.post.repository:write' && event.detail.path.endsWith('/repositories/create')
@@ -539,6 +539,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       if (url.pathname === '/orgs/acme/repos' && init.method === 'POST' && authorization === 'Bearer pinned-token')
         return Response.json({ id: 77, name: 'delegated-repo', private: true,
           ssh_url: 'git@github.com:acme/delegated-repo.git', default_branch: 'main', owner: { login: 'acme' } });
+      if (url.pathname === '/orgs/acme/repos' && init.method === 'POST' && authorization === 'Bearer active-token')
+        return Response.json({ id: 78, name: 'unpinned-repo', private: true,
+          ssh_url: 'git@github.com:acme/unpinned-repo.git', default_branch: 'main', owner: { login: 'acme' } });
+      if (url.pathname === '/user/installations/123/repositories/78' && init.method === 'PUT'
+        && authorization === 'Bearer active-token') return new Response(null, { status: 204 });
       if (url.pathname === '/user/installations/123/repositories/77' && init.method === 'PUT'
         && authorization === 'Bearer pinned-token') return new Response(null, { status: 204 });
       if (url.pathname === '/app/installations/123/access_tokens' && init.method === 'POST')
@@ -611,8 +616,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       method: 'POST', headers: { authorization: `Bearer ${unpinned.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ gitConnectionId: connection.id, name: 'unpinned-repo' }),
     });
-    expect(unpinnedResponse.status).toBe(403);
-    expect(await unpinnedResponse.json()).toMatchObject({ error: expect.stringMatching(/no pinned GitHub account/i) });
+    expect(unpinnedResponse.status).toBe(200);
+    expect(await unpinnedResponse.json()).toMatchObject({ name: 'unpinned-repo' });
+    expect(calls).toContainEqual({ path: '/orgs/acme/repos', method: 'POST', authorization: 'Bearer active-token' });
 
     const substitutedDelegation = h.tokens.delegateHuman(human.token, {
       taskId: 'task-repository-substituted', projectId: project.id, organizationId: organization.id,
@@ -627,7 +633,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     expect(substitutedResponse.status).toBe(400);
     expect(await substitutedResponse.json()).toMatchObject({ error: expect.stringMatching(/pinned GitHub account is not connected/i) });
-    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toHaveLength(1);
+    expect(calls.filter((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toHaveLength(2);
 
     const audits = h.store.auditSince(0, 5000).filter((event) =>
       event.principalId === 'task-agent:task-create-repository:do');
@@ -1312,7 +1318,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }
   });
 
-  it('permits delegated personal settings only with explicit user authority', async () => {
+  it('uses verified identity for personal settings without extra agent permissions', async () => {
     const human = h.tokens.mintPrincipal('user:personal-owner', ['user:read', 'user:write']);
     const delegation = h.tokens.delegateHuman(human.token, { taskId: 'personal-agent' })!;
     const mint = (caps: string[], delegated = true) => h.tokens.mint({ taskId: 'personal-agent', profileId: 'do',
@@ -1321,7 +1327,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const call = (agent: ReturnType<typeof mint>) => fetch(`${base}/api/user/default-organization`, {
       headers: { authorization: `Bearer ${agent.token}` },
     });
-    expect((await call(mint([]))).status).toBe(403);
+    expect((await call(mint([]))).status).toBe(200);
     expect((await call(mint(['user:read'], false))).status).toBe(403);
     const response = await call(mint(['user:read']));
     expect(response.status).toBe(200);

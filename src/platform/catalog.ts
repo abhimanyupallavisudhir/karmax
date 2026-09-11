@@ -8,8 +8,9 @@
  */
 export const PLATFORM_API_CATALOG = {
   note: 'Every route is authenticated and capability checked. Identity requirements are independent: personal operations require an authority-verified user subject and accept secure task-agent delegation. Administrative operations accept any actor with sufficient scoped capabilities. Colon-prefixed names are path parameters.',
+  authorizationParity: 'The same authorization level and scope permit the same operations for humans and agents. All declared agent roles preserve the selected task grant. Account ownership and workflow-stage validation apply independently of actor type.',
   identityRequirements: {
-    capability: 'Default. No user identity is implied by a capability grant. Agent calls to personal /api/user/* and invitation acceptance routes additionally require user:read or user:write where the browser self-service route needs no capability.',
+    capability: 'Default. No user identity is implied by a capability grant. Self-service account operations require the same verified subject for humans and delegated agents; neither needs user-administration authority for its own account.',
     humanSubject: [
       'POST /api/organizations',
       'POST /api/organizations/:organizationId/repositories/create',
@@ -17,7 +18,6 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
       'GET /api/user/export', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
       'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
-      'POST /api/users', 'DELETE /api/users/:userId',
       'POST|PUT|DELETE /api/projects/:projectId/avatars/:avatarId (owner delegation; may not grant beyond token authority)',
       'PUT /api/organizations/:organizationId/usage-policy (funding/concurrency changes require owner delegation)',
       'GET|PATCH /api/inbox', 'GET|PUT /api/inbox/preferences',
@@ -83,7 +83,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/projects/:projectId/github-merge-eligibility (verified human subject; delegation accepted; live external GitHub permission preflight)',
     'DELETE /api/projects/:projectId/repositories/:repositoryId',
     'GET|POST /api/organizations/:organizationId/repositories',
-    'POST /api/organizations/:organizationId/repositories/create (verified human subject; delegation accepted only with the authority-pinned GitHub account)',
+    'POST /api/organizations/:organizationId/repositories/create (verified human subject; uses the explicitly scoped GitHub account or the represented user’s active account)',
     'GET /api/organizations/:organizationId/git-connections',
     'GET|PUT /api/organizations/:organizationId/github/app',
     'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize (verified user subject; delegation accepted for OAuth/install redirects); refresh is capability-only',

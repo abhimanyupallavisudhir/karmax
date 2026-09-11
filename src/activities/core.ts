@@ -1543,12 +1543,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         /* not running inside a Temporal activity (e.g. a direct unit test) */
       }
 
-      // The workflow mints the agent's scoped credential (SPEC §8.3): effective
-      // capabilities = intersection(role ceiling, granting principal). The two are
-      // orthogonal axes — the ceiling is what this ROLE could ever need (declared by
-      // the workflow), the grant is what the task's authorization profile delegated —
-      // so a Merge agent stays a Merge agent even on an administrator-authorized task.
-      // Human-approved credential escalations recorded after creation
+      // The workflow mints the agent's scoped credential (SPEC §8.3).
+      // Every declared agent role preserves the selected task authorization.
+      // Workflow duty is enforced by stage/decision handlers, not a hidden lower
+      // permission level for Confirm, Resolve, or legacy Merge turns.
+      // Approved credential escalations recorded after creation
       // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
       const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
@@ -1586,10 +1585,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...approvedPermissions,
         'task:escalate',
       ])];
-      // An explicit human approval is the only way to extend the task beyond
-      // the workflow role's ordinary ceiling. Fold it into both token axes: the
-      // normal stored task grant remains least-privilege, while the approved
-      // exception is exact, task-scoped, durable, and audited.
+      // Approved permission extensions join the task grant. The role ceiling
+      // admits that grant for declared agent roles; it does not raise the
+      // selected level or bypass the task's scope and durable approval checks.
       const ceiling = avatar
         ? [...new Set(grant)]
         : [...new Set([...roleCeiling(args.role), ...approvedPermissions])];

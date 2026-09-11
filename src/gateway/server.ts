@@ -1658,13 +1658,9 @@ export class Gateway {
       ? `/api/${organizationResource[2]}${organizationResource[3] ?? ''}`
       : p;
 
-    const routeCapability = capabilityForRequest(method, p, url);
-    // A browser owns its personal account. Delegating a task identity alone
-    // does not delegate account administration: agents need explicit user
-    // authority as well as the verified subject on these self-service routes.
-    const required = !routeCapability && authRecord.kind !== 'human'
-      && (p.startsWith('/api/user/') || p === '/api/invitations/accept')
-      ? (method === 'GET' || method === 'HEAD' ? 'user:read' : 'user:write') : routeCapability;
+    // Authorization is independent of actor type. Personal self-service routes
+    // below require the same verified account subject for browsers and delegates.
+    const required = capabilityForRequest(method, p, url);
     if (required) {
       const scope = requestedScope;
       const checked = this.deps.tokens.check(token, required, scope);
@@ -2422,10 +2418,9 @@ export class Gateway {
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
           return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
         try {
-          const githubAccountId = callerIdentity.actor.kind === 'task-agent'
-            ? subject.externalIdentities?.githubAccountId : undefined;
-          if (callerIdentity.actor.kind === 'task-agent' && !githubAccountId)
-            return this.json(res, 403, { error: 'the delegated task has no pinned GitHub account' });
+          // Honor an explicit account scope for either actor; otherwise use
+          // the represented user's active account, including after onboarding.
+          const githubAccountId = subject.externalIdentities?.githubAccountId;
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
               private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
@@ -2609,10 +2604,9 @@ export class Gateway {
         return this.json(res, 200, (this.deps.identity?.listUsers() ?? []).map((u) => ({ ...u, grants: this.deps.authorization?.grants(`user:${u.id}`) ?? [] })));
       }
       if (p === '/api/users' && method === 'POST') {
-        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.identity) return this.json(res, 400, { error: 'identity service unavailable' });
         const b = await this.body(req);
-        if (b.profileId && authRecord.kind !== 'human') {
+        if (b.profileId) {
           const profile = this.deps.authorization?.profile(String(b.profileId), b.projectId);
           if (!profile) return this.json(res, 400, { error: 'unknown authorization profile' });
           if (!b.projectId && (authRecord.projectId || authRecord.projectIds?.length || authRecord.organizationId))
@@ -2624,17 +2618,16 @@ export class Gateway {
           }
         }
         const user = await this.deps.identity.createUser({ name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') });
-        if (b.profileId) this.deps.authorization?.grant(`user:${subject.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
+        if (b.profileId) this.deps.authorization?.grant(actorPrincipal(callerIdentity.actor), { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
         return this.json(res, 200, user);
       }
       const resetOnboarding = p.match(/^\/api\/users\/([^/]+)\/onboarding\/reset$/);
       if ((resetOnboarding || p === '/api/user/onboarding/reset') && method === 'POST') {
-        const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.hosted)
           return this.json(res, 404, { error: 'hosted onboarding is unavailable' });
         // The self-service route takes its target solely from the verified subject.
         // The operator route retains its user:write capability requirement.
-        const userId = resetOnboarding?.[1] ?? subject.userId;
+        const userId = resetOnboarding?.[1] ?? requireHumanSubject(callerIdentity).userId;
         if (!this.deps.identity?.listUsers().some((user) => user.id === userId))
           return this.json(res, 404, { error: 'user not found' });
         // Only presentation state changes. Live setup facts and user work remain intact.
@@ -2644,10 +2637,9 @@ export class Gateway {
       }
       const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
       if (userMatch && method === 'DELETE') {
-        const subject = requireHumanSubject(callerIdentity);
-        if (userMatch[1] === subject.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
+        if (userMatch[1] === callerIdentity.humanSubject?.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
         await this.deps.identity?.removeUser(userMatch[1]!);
-        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(`user:${subject.userId}`, g.principalId, g.scopeKey);
+        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(actorPrincipal(callerIdentity.actor), g.principalId, g.scopeKey);
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/authorization/profiles' && method === 'GET') {
@@ -2966,27 +2958,25 @@ export class Gateway {
             }
           }
           authorization.capabilities = [...new Set(authorization.capabilities)];
-          // Delegated ownership never widens the task's actual grant. This also
-          // covers edits to Avatars previously authorized by someone else.
-          if (authRecord.kind !== 'human') {
-            if (authorization.scope === 'organization'
-              && (authRecord.organizationId !== organizationId || authRecord.projectId || authRecord.projectIds?.length)
-              || authorization.scope === 'global'
-              && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length))
-              throw new AuthorizationGrantError('this token cannot delegate the selected scope');
-            for (const selectedProject of authorization.projectIds?.length ? authorization.projectIds : [projectId]) {
-              for (const capability of authorization.capabilities) {
-                if (!this.deps.tokens.check(token, capability, { projectId: selectedProject, organizationId }).ok)
-                  throw new AuthorizationGrantError(`you cannot delegate ${capability} in project ${selectedProject}`);
-              }
+          // No caller may delegate beyond its grant, including when editing an
+          // Avatar previously authorized by someone else.
+          if (authorization.scope === 'organization'
+            && (authRecord.organizationId && authRecord.organizationId !== organizationId || authRecord.projectId || authRecord.projectIds?.length)
+            || authorization.scope === 'global'
+            && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length))
+            throw new AuthorizationGrantError('this token cannot delegate the selected scope');
+          for (const selectedProject of authorization.projectIds?.length ? authorization.projectIds : [projectId]) {
+            for (const capability of authorization.capabilities) {
+              if (!this.deps.tokens.check(token, capability, { projectId: selectedProject, organizationId }).ok)
+                throw new AuthorizationGrantError(`you cannot delegate ${capability} in project ${selectedProject}`);
             }
           }
 
           const githubAccountId = b.githubAccountId === null ? undefined
             : b.githubAccountId ? String(b.githubAccountId) : existing?.githubAccountId;
-          if (authRecord.kind !== 'human' && githubAccountId
-            && githubAccountId !== authRecord.externalIdentities?.githubAccountId)
-            throw new AuthorizationGrantError('an agent may only delegate its authority-pinned GitHub account');
+          if (githubAccountId && authRecord.externalIdentities?.githubAccountId
+            && githubAccountId !== authRecord.externalIdentities.githubAccountId)
+            throw new AuthorizationGrantError('the selected GitHub account is outside this caller’s account scope');
           if (githubAccountId && this.deps.githubApp?.activeUserAccountId(subject.userId) !== githubAccountId)
             throw new Error('the selected GitHub account is not your active connected account');
 
@@ -5116,8 +5106,8 @@ export class Gateway {
           modelProvider: _legacyModelProvider,
           allowedAccounts: _legacyAllowedAccounts,
           auth: _legacyAuth,
-          // The role's workflow owns the capability ceiling (roleCeiling); a submitted
-          // one must neither narrow nor escalate what the role's turns are minted with.
+          // Task authorization owns permissions. A runtime profile must neither
+          // narrow nor escalate the grant selected for the task.
           capabilities: _legacyCapabilities,
           ...rest
         } = b;
