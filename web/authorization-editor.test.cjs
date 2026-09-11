@@ -104,5 +104,26 @@ ok(wired.includes('root._setAuthorization = (next) =>') && wired.includes('value
   'the wired editor exposes a normalizing programmatic setter');
 ok(/_setAuthorization = \(next\) => \{[\s\S]*?drawChips\(\); emit\(\);/.test(wired), 'the setter redraws the chips and announces the change');
 
+
+for (const level of authorizationLevels()) {
+  const html = authorizationEditorHtmlFn('description', { level: level.id, scope: 'projects', projectIds: ['p1'] }, projects);
+  ok(html.includes(level.description) && html.includes('aria-describedby="description-description"'),
+    `${level.name} has an associated plain-language description`);
+}
+const normalized = Function(`${extractFunction('authorizationLevels')}; ${extractFunction('normalizedAuthorization')}; return normalizedAuthorization;`)();
+ok(normalized({ level: 'role_unavailable', scope: 'organization' }).level === 'role_unavailable',
+  'catalog failure never silently widens a custom role to Developer');
+const scopedLevels = Function('S', `${extractFunction('authorizationLevels')}; return authorizationLevels();`);
+const roleState = { organizationId: 'one', authorizationCatalogOrganization: 'one',
+  authorizationCatalog: { profiles: [{ id: 'role_one', name: 'Custom', builtin: false, scopeKey: 'organization:one' }] } };
+ok(scopedLevels(roleState).some((level) => level.id === 'role_one'), 'organization custom roles are selectable');
+ok(!scopedLevels({ ...roleState, organizationId: 'two' }).some((level) => level.id === 'role_one'),
+  'roles from another organization are never offered');
+const roleAllows = Function(`${extractFunction('roleAllows')}; return roleAllows;`)();
+ok(roleAllows(['task:*'], 'task:conversation:read') && !roleAllows(['task:*'], 'project:read'),
+  'the capability browser expands wildcard grants without crossing namespaces');
+ok(roleAllows(['*'], 'settings:write') && !roleAllows(['task:read'], 'task:delete'),
+  'the capability browser distinguishes unrestricted and exact grants');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -2572,3 +2572,15 @@ html[data-theme="dark"] .github-signin-btn:active,
 .artifact-reader-header h2 { flex: 1; min-width: 0; margin: 0; font-size: 16px; overflow-wrap: anywhere; }
 .artifact-reader-content { padding: 20px; max-height: calc(100dvh - 150px); overflow: auto; }
 .artifact-reader-content > pre { margin: 0; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.authz-editor .authz-description { margin: 0; line-height: 1.45; }
+.authorization-role { border-top: 1px solid var(--line); padding: 12px 0; }
+.authorization-role > summary { display: list-item; cursor: pointer; }
+.authorization-role > summary .chip { margin-left: 8px; }
+.role-capability-group { margin: 8px 0 8px 12px; padding: 6px 0; }
+.role-capability-group > summary { cursor: pointer; }
+.role-capability-group ul { list-style: none; margin: 8px 0; padding-left: 16px; border-left: 1px solid var(--line); }
+.role-capability-group li { padding: 6px 0; overflow-wrap: anywhere; }
+.role-capability-group code { display: block; color: var(--ink-3); font-size: 11px; }
+.role-capability-group label { display: flex; align-items: center; gap: 8px; }
+.role-capability-group p { margin: 3px 0; }

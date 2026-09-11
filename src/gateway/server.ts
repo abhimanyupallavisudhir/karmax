@@ -35,7 +35,7 @@ import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModels, opencodeModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
-import { AuthorizationGrantError, type AuthorizationService } from '../platform/authorization.js';
+import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -1989,6 +1989,25 @@ export class Gateway {
         }
       }
 
+      const organizationRoles = p.match(/^\/api\/organizations\/([^/]+)\/roles$/);
+      if (organizationRoles && this.deps.authorization) {
+        const organizationId = organizationRoles[1]!;
+        const actor = actorPrincipal(callerIdentity.actor);
+        const caps = authRecord.caps;
+        if (method === 'GET') return this.json(res, 200, {
+          profiles: this.deps.authorization.profiles(undefined, organizationId),
+          capabilityGroups: CAPABILITY_GROUPS,
+          creatableCapabilities: CAPABILITY_GROUPS.flatMap((group) => group.capabilities)
+            .filter((cap) => allows(ORGANIZATION_GRANT_CEILING, cap.id)
+              && allows(caps, cap.id)).map((cap) => cap.id),
+          canCreate: allows(caps, 'organization:edit'),
+        });
+        if (method === 'POST') {
+          const body = await this.body(req);
+          try { return this.json(res, 201, this.deps.authorization.createOrganizationRole(actor, organizationId, body, caps)); }
+          catch (error) { return this.json(res, error instanceof AuthorizationGrantError ? 403 : 400, { error: (error as Error).message }); }
+        }
+      }
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
       const organizationEntitlementsMatch = p.match(/^\/api\/organizations\/([^/]+)\/entitlements$/);
@@ -3701,8 +3720,9 @@ export class Gateway {
           if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
           const principal = projectPrincipalFromBody(b.principal, project.organizationId);
           const profileId = String(b.profileId ?? 'developer');
-          if (!['viewer', 'developer', 'maintainer'].includes(profileId))
-            return this.json(res, 400, { error: 'project access must be Viewer, Developer, or Project maintainer' });
+          if (!['viewer', 'developer', 'maintainer'].includes(profileId)
+            && !store.getAuthorizationProfile(`organization:${project.organizationId}`, profileId))
+            return this.json(res, 400, { error: 'choose a project authorization role' });
           this.deps.authorization?.assertCanGrantSelection(actorPrincipal(callerIdentity.actor),
             project.organizationId, { level: profileId, scope: 'projects', projectIds: [projectId] },
             authRecord?.kind === 'human' ? undefined : authRecord?.caps);
